@@ -1,0 +1,69 @@
+[
+  {
+    "object_id": "01234567-89ab-cdef-0123-000000000000",
+    "caller_object_id": "asset-000",
+    "content_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+    "logical_size_bytes": 11,
+    "body_format": "rem-tar-v1",
+    "caller_metadata": {
+      "campaign": "fixture"
+    },
+    "content_b64": "aGVsbG8gd29ybGQ=",
+    "copies": [
+      {
+        "tape_uuid": "aaaa00001234567890abcdef12345678",
+        "tape_file_number": 1,
+        "first_body_lba": 0,
+        "health": "ok",
+        "last_verified_at": "2026-05-27T12:00:00+00:00"
+      }
+    ]
+  },
+  {
+    "object_id": "01234567-89ab-cdef-0123-000000000001",
+    "caller_object_id": "asset-001",
+    "content_sha256": "68f8bdd7d4b91e02f93e9373558fd108799cb811a6a8d5a4dd65d3b1d98ebf3b",
+    "logical_size_bytes": 18,
+    "body_format": "rem-tar-v1",
+    "caller_metadata": {
+      "campaign": "fixture"
+    },
+    "content_b64": "c2Vjb25kIGFzc2V0IGJ5dGVz",
+    "copies": [
+      {
+        "tape_uuid": "aaaa00011234567890abcdef12345678",
+        "tape_file_number": 3,
+        "first_body_lba": 0,
+        "health": "ok",
+        "last_verified_at": "2026-05-27T12:00:00+00:00"
+      }
+    ]
+  },
+  {
+    "object_id": "01234567-89ab-cdef-0123-000000000002",
+    "caller_object_id": "asset-002",
+    "content_sha256": "e12573b1ceb8f9cabaed99e4a4eccc11f1f5cc2735e8287eb7196d691dc25ed2",
+    "logical_size_bytes": 18,
+    "body_format": "rem-tar-v1",
+    "caller_metadata": {
+      "campaign": "fixture"
+    },
+    "content_b64": "bXVsdGktY29weSBjb250ZW50",
+    "copies": [
+      {
+        "tape_uuid": "aaaa00021234567890abcdef12345678",
+        "tape_file_number": 5,
+        "first_body_lba": 0,
+        "health": "ok",
+        "last_verified_at": "2026-05-27T12:00:00+00:00"
+      },
+      {
+        "tape_uuid": "bbbb00021234567890abcdef12345678",
+        "tape_file_number": 99,
+        "first_body_lba": 0,
+        "health": "ok",
+        "last_verified_at": "2026-05-27T13:00:00+00:00"
+      }
+    ]
+  }
+]

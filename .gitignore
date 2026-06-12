@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local databases / runtime state
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+var/
+logs/
+
+# Node / frontend (when frontend is added)
+node_modules/
+.next/
+.cache/
+.parcel-cache/
+dist-frontend/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Working notes that should not be committed
+SCRATCH.md
+TODO.local.md

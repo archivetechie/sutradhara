@@ -1,0 +1,884 @@
+"""Job engine tests — submit, dispatch, verify handler, CLI round-trip."""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner, Result
+from sqlalchemy import Engine, select
+
+from sutradhara.backend import factory as backend_factory
+from sutradhara.backend.memory import MemoryBackend
+from sutradhara.backend.port import StorageBackend
+from sutradhara.catalog.models import Backend, Copy, LogicalAsset
+from sutradhara.catalog.session import (
+    create_all,
+    locator_key,
+    make_engine,
+    session_scope,
+)
+from sutradhara.catalog.types import (
+    BackendKind,
+    BackendTier,
+    CopyHealth,
+    CopySource,
+)
+from sutradhara.cli.main import cli
+from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
+from sutradhara.jobs.engine import claim_pending, run_one, run_pending, submit
+from sutradhara.jobs.models import Job, JobStatus
+from sutradhara.jobs.registry import (
+    JobContext,
+    JobResult,
+    register_handler,
+    registered_kinds,
+)
+
+
+@pytest.fixture
+def engine() -> Iterator[Engine]:
+    eng = make_engine("sqlite:///:memory:")
+    create_all(eng)
+    yield eng
+    eng.dispose()
+
+
+# -------------------------------------------------------------------------
+# submit + dispatch
+# -------------------------------------------------------------------------
+
+
+def test_submit_creates_pending_job(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        job = submit(s, "verify", {"copy_id": 1})
+        assert job.id is not None
+        assert job.status == JobStatus.PENDING
+        assert job.kind == "verify"
+        assert job.params == {"copy_id": 1}
+        assert job.attempts == 0
+
+
+def test_claim_pending_returns_oldest_first(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        j1 = submit(s, "verify", {"copy_id": 1})
+        j2 = submit(s, "verify", {"copy_id": 2})
+        first = claim_pending(s)
+        assert first is not None
+        assert first.id == j1.id
+        # Mark first running so claim returns the next one.
+        first.status = JobStatus.RUNNING
+        s.flush()
+        second = claim_pending(s)
+        assert second is not None
+        assert second.id == j2.id
+
+
+def test_claim_pending_returns_none_when_empty(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        assert claim_pending(s) is None
+
+
+def test_run_unknown_kind_marks_failed(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        job = submit(s, "nonexistent_kind", {})
+
+    with session_scope(engine) as s:
+        result = run_one(s, job.id)
+        assert not result.ok
+        assert "no handler registered" in result.detail
+        fetched = s.get(Job, job.id)
+        assert fetched is not None
+        assert fetched.status == JobStatus.FAILED
+        assert fetched.attempts == 1
+        assert fetched.last_error is not None
+        assert "no handler registered" in fetched.last_error
+
+
+def test_run_pending_bad_kind_does_not_block_later_jobs(engine: Engine) -> None:
+    @register_handler("_test_after_bad_kind")
+    def _ok(_ctx: JobContext) -> JobResult:
+        return JobResult(ok=True, detail="valid ran")
+
+    try:
+        with session_scope(engine) as s:
+            bad = submit(s, "nonexistent_kind", {})
+            good = submit(s, "_test_after_bad_kind", {})
+
+        with session_scope(engine) as s:
+            results = run_pending(s, limit=0)
+            assert [jid for jid, _ in results] == [bad.id, good.id]
+            assert [r.ok for _, r in results] == [False, True]
+
+            bad_row = s.get(Job, bad.id)
+            good_row = s.get(Job, good.id)
+            assert bad_row is not None
+            assert good_row is not None
+            assert bad_row.status == JobStatus.FAILED
+            assert good_row.status == JobStatus.SUCCEEDED
+    finally:
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_after_bad_kind", None)
+
+
+def test_handler_exception_marks_failed_and_captures_traceback(
+    engine: Engine,
+) -> None:
+    """A handler that raises must leave the job in FAILED with last_error set."""
+
+    @register_handler("_test_raises")
+    def _raises(_ctx: JobContext) -> JobResult:
+        raise RuntimeError("intentional test failure")
+
+    try:
+        with session_scope(engine) as s:
+            job = submit(s, "_test_raises", {})
+            result = run_one(s, job.id)
+            assert not result.ok
+            assert "intentional test failure" in result.detail
+            assert job.status == JobStatus.FAILED
+            assert job.attempts == 1
+            assert job.last_error is not None
+            assert "RuntimeError" in job.last_error
+            assert job.finished_at is not None
+            assert job.started_at is not None
+    finally:
+        registered_kinds()  # touch
+        # Best-effort cleanup of the test-only handler so other tests
+        # don't see leakage across runs in the same process.
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_raises", None)
+
+
+def test_run_one_on_terminal_job_raises(engine: Engine) -> None:
+    """Re-running a SUCCEEDED job is rejected — terminal states are sticky."""
+
+    @register_handler("_test_succeeds")
+    def _ok(_ctx: JobContext) -> JobResult:
+        return JobResult(ok=True, detail="ok")
+
+    try:
+        with session_scope(engine) as s:
+            job = submit(s, "_test_succeeds", {})
+            run_one(s, job.id)
+            assert job.status == JobStatus.SUCCEEDED
+            with pytest.raises(ValueError, match="terminal status"):
+                run_one(s, job.id)
+    finally:
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_succeeds", None)
+
+
+def test_run_pending_drains_queue(engine: Engine) -> None:
+    """`limit=0` runs everything currently pending."""
+
+    counter = {"n": 0}
+
+    @register_handler("_test_counter")
+    def _counter(_ctx: JobContext) -> JobResult:
+        counter["n"] += 1
+        return JobResult(ok=True)
+
+    try:
+        with session_scope(engine) as s:
+            for i in range(3):
+                submit(s, "_test_counter", {"i": i})
+
+        with session_scope(engine) as s:
+            results = run_pending(s, limit=0)
+            assert len(results) == 3
+            assert all(r.ok for _, r in results)
+            assert counter["n"] == 3
+    finally:
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_counter", None)
+
+
+# -------------------------------------------------------------------------
+# dispatch_write_to_tape + copy handler
+# -------------------------------------------------------------------------
+
+
+def _register_tape_backend(engine: Engine, name: str = "tape-1") -> None:
+    with session_scope(engine) as s:
+        s.add(
+            Backend(
+                name=name,
+                kind=BackendKind.REM_TAPE,
+                tier=BackendTier.SELF_DESCRIBING,
+            )
+        )
+
+
+def _register_asset(engine: Engine, content: bytes) -> bytes:
+    h = hashlib.sha256(content).digest()
+    with session_scope(engine) as s:
+        if s.get(LogicalAsset, h) is None:
+            s.add(LogicalAsset(content_sha256=h, size_bytes=len(content)))
+    return h
+
+
+def test_copy_kind_is_registered() -> None:
+    assert "copy" in registered_kinds()
+
+
+def test_copy_handler_fails_loudly_does_not_fake_success(engine: Engine) -> None:
+    """A copy job must FAIL (not SUCCEED) — no bytes are actually moved yet."""
+    with session_scope(engine) as s:
+        job = submit(s, "copy", {"asset_hash": "ab" * 32, "target_backend": "tape-1"})
+        result = run_one(s, job.id)
+        assert not result.ok
+        assert job.status == JobStatus.FAILED
+        assert job.last_error is not None
+        assert "not implemented" in job.last_error
+        assert "NotImplementedError" in job.last_error
+
+
+def test_dispatch_write_to_tape_creates_pending_copy_job(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import dispatch_write_to_tape
+
+    _register_tape_backend(engine, "tape-1")
+    h = _register_asset(engine, b"to-be-archived")
+
+    with session_scope(engine) as s:
+        handle = dispatch_write_to_tape(s, h)
+
+    assert handle["kind"] == "copy"
+    assert handle["target_backend"] == "tape-1"
+    assert handle["params"] == {"asset_hash": h.hex(), "target_backend": "tape-1"}
+
+    with session_scope(engine) as s:
+        job = s.get(Job, handle["job_id"])
+        assert job is not None
+        assert job.status == JobStatus.PENDING  # dispatch does NOT run the job
+        assert job.kind == "copy"
+        assert job.params["asset_hash"] == h.hex()
+
+
+def test_dispatch_write_to_tape_uses_explicit_target_backend(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import dispatch_write_to_tape
+
+    _register_tape_backend(engine, "tape-a")
+    _register_tape_backend(engine, "tape-b")
+    h = _register_asset(engine, b"explicit-library")
+
+    with session_scope(engine) as s:
+        handle = dispatch_write_to_tape(s, h, target_backend="tape-b")
+
+    assert handle["target_backend"] == "tape-b"
+    assert handle["params"] == {"asset_hash": h.hex(), "target_backend": "tape-b"}
+
+
+def test_dispatch_requires_explicit_target_for_multiple_tape_backends(
+    engine: Engine,
+) -> None:
+    from sutradhara.jobs.dispatch import AmbiguousBackend, dispatch_write_to_tape
+
+    _register_tape_backend(engine, "tape-a")
+    _register_tape_backend(engine, "tape-b")
+    h = _register_asset(engine, b"ambiguous-library")
+
+    with session_scope(engine) as s, pytest.raises(AmbiguousBackend) as excinfo:
+        dispatch_write_to_tape(s, h)
+
+    message = str(excinfo.value)
+    assert "tape-a" in message
+    assert "tape-b" in message
+    assert "target_backend" in message
+
+
+def test_dispatch_explicit_target_must_exist(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import NoEligibleBackend, dispatch_write_to_tape
+
+    h = _register_asset(engine, b"missing-target")
+    with session_scope(engine) as s, pytest.raises(NoEligibleBackend, match="not registered"):
+        dispatch_write_to_tape(s, h, target_backend="missing-tape")
+
+
+def test_dispatch_explicit_target_must_be_rem_tape(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import NoEligibleBackend, dispatch_write_to_tape
+
+    with session_scope(engine) as s:
+        s.add(Backend(name="mem", kind=BackendKind.MEMORY, tier=BackendTier.SELF_DESCRIBING))
+    h = _register_asset(engine, b"wrong-kind-target")
+
+    with session_scope(engine) as s, pytest.raises(NoEligibleBackend, match="rem_tape"):
+        dispatch_write_to_tape(s, h, target_backend="mem")
+
+
+def test_dispatch_picks_a_rem_tape_backend_even_among_others(engine: Engine) -> None:
+    """Dispatch must target a rem_tape backend, ignoring memory/other kinds."""
+    from sutradhara.jobs.dispatch import dispatch_write_to_tape
+
+    with session_scope(engine) as s:
+        s.add(Backend(name="mem", kind=BackendKind.MEMORY, tier=BackendTier.SELF_DESCRIBING))
+        s.add(Backend(name="tape-x", kind=BackendKind.REM_TAPE, tier=BackendTier.SELF_DESCRIBING))
+    h = _register_asset(engine, b"pick-the-tape")
+
+    with session_scope(engine) as s:
+        handle = dispatch_write_to_tape(s, h)
+    assert handle["target_backend"] == "tape-x"
+
+
+def test_dispatch_fails_when_no_tape_backend_registered(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import NoEligibleBackend, dispatch_write_to_tape
+
+    h = _register_asset(engine, b"no-backend")
+    with session_scope(engine) as s, pytest.raises(NoEligibleBackend, match="no rem_tape backend"):
+        dispatch_write_to_tape(s, h)
+
+
+def test_dispatch_fails_when_asset_not_in_catalog(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import AssetNotInCatalog, dispatch_write_to_tape
+
+    _register_tape_backend(engine, "tape-1")
+    phantom = hashlib.sha256(b"never-registered").digest()
+    with session_scope(engine) as s, pytest.raises(AssetNotInCatalog, match="no LogicalAsset"):
+        dispatch_write_to_tape(s, phantom)
+
+
+def test_dispatch_rejects_non_content_hash(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import dispatch_write_to_tape
+
+    _register_tape_backend(engine, "tape-1")
+    with session_scope(engine) as s, pytest.raises(ValueError, match="32-byte"):
+        dispatch_write_to_tape(s, b"too-short")
+
+
+# -------------------------------------------------------------------------
+# verify handler — integration with catalog + MemoryBackend
+# -------------------------------------------------------------------------
+
+
+def _seed_memory_backend(
+    engine: Engine,
+    content: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[int, MemoryBackend]:
+    """Insert a backend row + an asset/copy row pointing into a MemoryBackend.
+
+    Because the `backend_from_row` factory builds a fresh MemoryBackend per
+    call (it has no way to know about pre-seeded test instances), this helper
+    also monkeypatches the factory to return the seeded backend.
+
+    Returns (copy_id, in-memory backend instance).
+    """
+    backend_impl = MemoryBackend("test-mem")
+    h = backend_impl.add(content)
+
+    locator = {"hash_hex": h.hex()}
+    with session_scope(engine) as s:
+        backend_row = Backend(
+            name="test-mem",
+            kind=BackendKind.MEMORY,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        s.add(backend_row)
+        s.add(LogicalAsset(content_sha256=h, size_bytes=len(content)))
+        s.flush()
+        copy = Copy(
+            logical_asset_hash=h,
+            backend_id=backend_row.id,
+            native_locator=locator,
+            native_locator_key=locator_key(locator),
+            integrity_hash=h,
+            health=CopyHealth.OK,
+            source=CopySource.INGEST,
+        )
+        s.add(copy)
+        s.flush()
+        copy_id = copy.id
+
+    monkeypatch.setattr(
+        backend_factory,
+        "backend_from_row",
+        lambda row: backend_impl if row.name == "test-mem" else None,
+    )
+    return copy_id, backend_impl
+
+
+def test_verify_happy_marks_copy_ok_and_records_timestamp(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy_id, _ = _seed_memory_backend(engine, b"verifiable bytes", monkeypatch)
+
+    with session_scope(engine) as s:
+        job = submit(s, "verify", {"copy_id": copy_id})
+        result = run_one(s, job.id)
+        assert result.ok
+        assert result.detail == "verified ok"
+        assert job.status == JobStatus.SUCCEEDED
+
+        copy = s.get(Copy, copy_id)
+        assert copy is not None
+        assert copy.health == CopyHealth.OK
+        assert copy.last_verified_at is not None
+        assert copy.last_verified_at.tzinfo is dt.UTC
+
+        # step_state captures the verify answer for inspection.
+        assert job.step_state["verify_result"]["ok"] is True
+        assert job.step_state["copy_health_after"] == "ok"
+
+
+def test_verify_detects_corruption_marks_suspect_and_succeeds(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify on a corrupted copy: handler still succeeds; copy.health → SUSPECT."""
+    from sutradhara.backend.port import (
+        BackendLocator,
+        ByteRange,
+        VerifyResult,
+    )
+    from sutradhara.catalog.types import content_hash
+
+    h = content_hash(hashlib.sha256(b"original").digest())
+
+    class _AlwaysFailsBackend:
+        @property
+        def name(self) -> str:
+            return "always-fails"
+
+        def enumerate(self) -> Iterator[object]:  # pragma: no cover
+            return iter([])
+
+        def read_range(self, _l: BackendLocator, _r: ByteRange) -> bytes:  # pragma: no cover
+            raise NotImplementedError
+
+        def verify(self, _l: BackendLocator) -> VerifyResult:
+            return VerifyResult(
+                ok=False,
+                actual_hash=content_hash(hashlib.sha256(b"tampered").digest()),
+                detail="hash mismatch",
+            )
+
+    monkeypatch.setattr(
+        backend_factory,
+        "backend_from_row",
+        lambda row: _AlwaysFailsBackend() if row.name == "broken-backend" else None,
+    )
+    if True:
+        with session_scope(engine) as s:
+            backend_row = Backend(
+                name="broken-backend",
+                kind=BackendKind.MEMORY,
+                tier=BackendTier.SELF_DESCRIBING,
+            )
+            s.add(backend_row)
+            s.add(LogicalAsset(content_sha256=h, size_bytes=8))
+            s.flush()
+            locator = {"hash_hex": h.hex()}
+            copy = Copy(
+                logical_asset_hash=h,
+                backend_id=backend_row.id,
+                native_locator=locator,
+                native_locator_key=locator_key(locator),
+                integrity_hash=h,
+                health=CopyHealth.OK,
+                source=CopySource.INGEST,
+            )
+            s.add(copy)
+            s.flush()
+            copy_id = copy.id
+
+        with session_scope(engine) as s:
+            job = submit(s, "verify", {"copy_id": copy_id})
+            result = run_one(s, job.id)
+            # Job machinery succeeded; the bad-integrity outcome lives in catalog.
+            assert result.ok
+            assert "integrity mismatch" in result.detail
+            assert job.status == JobStatus.SUCCEEDED
+
+            refreshed = s.get(Copy, copy_id)
+            assert refreshed is not None
+            assert refreshed.health == CopyHealth.SUSPECT
+            assert refreshed.last_verified_at is not None
+            assert job.step_state["verify_result"]["ok"] is False
+            assert job.step_state["copy_health_after"] == "suspect"
+
+
+def test_verify_with_missing_copy_id_marks_failed(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        job = submit(s, "verify", {"copy_id": 99999})
+        result = run_one(s, job.id)
+        assert not result.ok
+        assert "no copy with id" in result.detail
+        assert job.status == JobStatus.FAILED
+        assert job.last_error is not None
+        assert "no copy with id" in job.last_error
+
+
+def test_verify_with_bad_params_marks_failed(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        job = submit(s, "verify", {})  # missing copy_id
+        result = run_one(s, job.id)
+        assert not result.ok
+        assert "copy_id" in result.detail
+        assert job.status == JobStatus.FAILED
+
+
+def test_verify_recovers_a_previously_missing_copy(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy marked MISSING that now verifies clean should be set back to OK."""
+    copy_id, _ = _seed_memory_backend(engine, b"recoverable", monkeypatch)
+
+    with session_scope(engine) as s:
+        stale = s.get(Copy, copy_id)
+        assert stale is not None
+        stale.health = CopyHealth.MISSING
+
+    with session_scope(engine) as s:
+        job = submit(s, "verify", {"copy_id": copy_id})
+        run_one(s, job.id)
+        refreshed = s.get(Copy, copy_id)
+        assert refreshed is not None
+        assert refreshed.health == CopyHealth.OK
+
+
+# -------------------------------------------------------------------------
+# CLI
+# -------------------------------------------------------------------------
+
+FIXTURE = Path(__file__).parent / "fixtures" / "remanence_objects.json"
+
+
+@pytest.fixture
+def cli_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    db_path = tmp_path / "sutradhara.db"
+    monkeypatch.setenv("SUTRADHARA_DB_URL", f"sqlite:///{db_path}")
+    monkeypatch.chdir(tmp_path)
+    return {"db": str(db_path)}
+
+
+def _run_cli(args: list[str], expect_exit: int = 0) -> Result:
+    runner = CliRunner()
+    result = runner.invoke(cli, args)
+    if result.exit_code != expect_exit:
+        pytest.fail(
+            f"CLI args {args!r} exited {result.exit_code}, expected {expect_exit}\n"
+            f"output:\n{result.output}"
+        )
+    return result
+
+
+def test_jobs_help_lists_subcommands(cli_env: dict[str, str]) -> None:
+    result = _run_cli(["jobs", "--help"])
+    for sub in ("submit", "list", "show", "run"):
+        assert sub in result.output
+
+
+def test_backends_add_merges_config_and_library_uuid(cli_env: dict[str, str]) -> None:
+    _run_cli(["db", "init"])
+    _run_cli(
+        [
+            "backends", "add", "rem-specific",
+            "--kind", "rem_tape",
+            "--fixture", str(FIXTURE),
+            "--config", "priority=7",
+            "--config", "enabled=true",
+            "--config", "label=archive",
+            "--library-uuid", "library-123",
+        ]
+    )
+
+    eng = make_engine()
+    with session_scope(eng) as s:
+        row = s.scalars(select(Backend).where(Backend.name == "rem-specific")).one()
+        assert row.config == {
+            "priority": 7,
+            "enabled": True,
+            "label": "archive",
+            "fixture_path": str(FIXTURE),
+            "library_uuid": "library-123",
+        }
+
+
+def test_backends_add_rejects_colliding_config_keys(cli_env: dict[str, str]) -> None:
+    _run_cli(["db", "init"])
+
+    fixture_collision = _run_cli(
+        [
+            "backends", "add", "rem-fixture-collision",
+            "--kind", "rem_tape",
+            "--config", "fixture_path=elsewhere.json",
+            "--fixture", str(FIXTURE),
+        ],
+        expect_exit=2,
+    )
+    assert "fixture_path" in fixture_collision.output
+    assert "overwrite" in fixture_collision.output
+
+    library_collision = _run_cli(
+        [
+            "backends", "add", "rem-library-collision",
+            "--kind", "rem_tape",
+            "--config", "library_uuid=from-config",
+            "--library-uuid", "from-flag",
+        ],
+        expect_exit=2,
+    )
+    assert "library_uuid" in library_collision.output
+    assert "overwrite" in library_collision.output
+
+    config_collision = _run_cli(
+        [
+            "backends", "add", "rem-config-collision",
+            "--kind", "rem_tape",
+            "--config", "priority=1",
+            "--config", "priority=2",
+        ],
+        expect_exit=2,
+    )
+    assert "priority" in config_collision.output
+    assert "overwrite" in config_collision.output
+
+
+def test_jobs_list_empty(cli_env: dict[str, str]) -> None:
+    _run_cli(["db", "init"])
+    result = _run_cli(["jobs", "list"])
+    assert "(no jobs)" in result.output
+
+
+def test_jobs_submit_unknown_kind_exits_nonzero(cli_env: dict[str, str]) -> None:
+    _run_cli(["db", "init"])
+    result = _run_cli(["jobs", "submit", "nonexistent_kind"], expect_exit=2)
+    assert "no handler registered" in result.output
+
+
+def test_jobs_run_missing_id_exits_nonzero_without_traceback(
+    cli_env: dict[str, str],
+) -> None:
+    _run_cli(["db", "init"])
+    result = _run_cli(["jobs", "run", "--id", "999"], expect_exit=2)
+    assert "no job with id=999" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_jobs_run_terminal_id_exits_nonzero_without_traceback(
+    cli_env: dict[str, str],
+) -> None:
+    _run_cli(["db", "init"])
+    _run_cli(["jobs", "submit", "verify", "-p", "copy_id=999"])
+    first = _run_cli(["jobs", "run", "--id", "1"])
+    assert "FAILED" in first.output
+
+    second = _run_cli(["jobs", "run", "--id", "1"], expect_exit=2)
+    assert "terminal status" in second.output
+    assert "Traceback" not in second.output
+
+
+def test_jobs_round_trip(cli_env: dict[str, str]) -> None:
+    """Full CLI round-trip: scrub populates catalog, submit verify, run, show."""
+    _run_cli(["db", "init"])
+    _run_cli(
+        [
+            "backends", "add", "tape-primary",
+            "--kind", "rem_tape",
+            "--tier", "self_describing",
+            "--fixture", str(FIXTURE),
+        ]
+    )
+    _run_cli(["scrub", "--backend", "tape-primary"])
+
+    # Find a copy_id to verify. (List assets JSON doesn't expose copy_id;
+    # query the catalog directly.)
+    from sqlalchemy import select as _sel
+
+    from sutradhara.catalog.models import Copy as _C
+
+    eng = make_engine()
+    with session_scope(eng) as s:
+        copy_id = s.scalars(_sel(_C.id).limit(1)).one()
+
+    submit_result = _run_cli(["jobs", "submit", "verify", "-p", f"copy_id={copy_id}"])
+    assert "kind='verify'" in submit_result.output
+    assert "status=pending" in submit_result.output
+
+    list_result = _run_cli(["jobs", "list"])
+    assert "verify" in list_result.output
+    assert "pending" in list_result.output
+
+    run_result = _run_cli(["jobs", "run"])
+    assert "ok" in run_result.output
+    assert "verified ok" in run_result.output
+
+    # show emits JSON detail including step_state.
+    show_result = _run_cli(["jobs", "show", "1"])
+    payload = json.loads(show_result.output)
+    assert payload["kind"] == "verify"
+    assert payload["status"] == "succeeded"
+    assert payload["step_state"]["verify_result"]["ok"] is True
+    assert payload["attempts"] == 1
+
+
+def test_jobs_run_drains_queue_with_limit_zero(cli_env: dict[str, str]) -> None:
+    _run_cli(["db", "init"])
+    _run_cli(
+        [
+            "backends", "add", "tape-primary",
+            "--kind", "rem_tape",
+            "--fixture", str(FIXTURE),
+        ]
+    )
+    _run_cli(["scrub", "--backend", "tape-primary"])
+
+    # Submit one verify per copy.
+    from sqlalchemy import select as _sel
+
+    from sutradhara.catalog.models import Copy as _C
+
+    eng = make_engine()
+    with session_scope(eng) as s:
+        copy_ids = list(s.scalars(_sel(_C.id)))
+
+    for cid in copy_ids:
+        _run_cli(["jobs", "submit", "verify", "-p", f"copy_id={cid}"])
+
+    list_pending = _run_cli(["jobs", "list", "--status", "pending"])
+    assert list_pending.output.count("verify") == len(copy_ids)
+
+    run_all = _run_cli(["jobs", "run", "--limit", "0"])
+    assert run_all.output.count("verified ok") == len(copy_ids)
+
+    list_succeeded = _run_cli(["jobs", "list", "--status", "succeeded"])
+    assert list_succeeded.output.count("verify") == len(copy_ids)
+
+
+def test_jobs_submit_with_string_param(cli_env: dict[str, str]) -> None:
+    """Non-JSON --param values are passed through as strings."""
+
+    @register_handler("_test_string_param")
+    def _h(ctx: JobContext) -> JobResult:
+        return JobResult(ok=True, detail=str(ctx.job.params))
+
+    try:
+        _run_cli(["db", "init"])
+        result = _run_cli(
+            ["jobs", "submit", "_test_string_param", "-p", "label=hello-world"]
+        )
+        assert "submitted job" in result.output
+        run_result = _run_cli(["jobs", "run"])
+        assert "hello-world" in run_result.output
+    finally:
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_string_param", None)
+
+
+# Use StorageBackend in a type assertion so the import isn't flagged unused.
+def test_memory_backend_still_protocol() -> None:
+    assert isinstance(MemoryBackend("x"), StorageBackend)
+
+
+# -------------------------------------------------------------------------
+# dispatch_restore + restore handler
+# -------------------------------------------------------------------------
+
+
+def _register_restorable_copy(
+    engine: Engine,
+    *,
+    content: bytes = b"restore-me",
+    backend_name: str = "tape-1",
+    health: CopyHealth = CopyHealth.OK,
+) -> int:
+    """Register an asset + backend + one Copy; return the copy's id."""
+    asset_hash = hashlib.sha256(content).digest()
+    locator = {"hash_hex": asset_hash.hex()}
+    with session_scope(engine) as s:
+        if s.get(LogicalAsset, asset_hash) is None:
+            s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(content)))
+        backend = Backend(
+            name=backend_name,
+            kind=BackendKind.REM_TAPE,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        s.add(backend)
+        s.flush()
+        copy = Copy(
+            logical_asset_hash=asset_hash,
+            backend_id=backend.id,
+            native_locator=locator,
+            native_locator_key=locator_key(locator),
+            integrity_hash=asset_hash,
+            source=CopySource.SCRUB,
+            health=health,
+        )
+        s.add(copy)
+        s.flush()
+        return copy.id
+
+
+def test_dispatch_restore_creates_pending_restore_job(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import dispatch_restore
+
+    copy_id = _register_restorable_copy(engine, backend_name="tape-1")
+
+    with session_scope(engine) as s:
+        handle = dispatch_restore(s, copy_id)
+
+    assert handle["kind"] == "restore"
+    assert handle["copy_id"] == copy_id
+    assert handle["source_backend"] == "tape-1"
+    assert handle["params"] == {"copy_id": copy_id}
+
+    with session_scope(engine) as s:
+        job = s.get(Job, handle["job_id"])
+        assert job is not None
+        assert job.status == JobStatus.PENDING
+        assert job.kind == "restore"
+        assert job.params == {"copy_id": copy_id}
+
+
+def test_dispatch_restore_raises_for_unknown_copy(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import UnknownCopy, dispatch_restore
+
+    with session_scope(engine) as s, pytest.raises(UnknownCopy, match="no Copy with id"):
+        dispatch_restore(s, 999)
+
+
+def test_dispatch_restore_rejects_missing_copy(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import CopyNotRestorable, dispatch_restore
+
+    copy_id = _register_restorable_copy(engine, health=CopyHealth.MISSING)
+
+    with session_scope(engine) as s, pytest.raises(CopyNotRestorable, match="missing"):
+        dispatch_restore(s, copy_id)
+
+
+def test_dispatch_restore_allows_suspect_copy(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import dispatch_restore
+
+    copy_id = _register_restorable_copy(engine, health=CopyHealth.SUSPECT)
+
+    with session_scope(engine) as s:
+        handle = dispatch_restore(s, copy_id)
+
+    assert handle["kind"] == "restore"
+    assert handle["copy_id"] == copy_id
+
+
+def test_restore_kind_is_registered() -> None:
+    assert "restore" in registered_kinds()
+
+
+def test_restore_handler_fails_loudly_does_not_fake_success(
+    engine: Engine,
+) -> None:
+    """A restore job must FAIL (not SUCCEED) - no bytes are actually read yet."""
+    with session_scope(engine) as s:
+        job = submit(s, "restore", {"copy_id": 1})
+        result = run_one(s, job.id)
+        assert not result.ok
+        assert job.status == JobStatus.FAILED
+        assert job.last_error is not None
+        assert "not implemented" in job.last_error
+        assert "NotImplementedError" in job.last_error
