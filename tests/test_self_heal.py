@@ -1,6 +1,6 @@
 """Tests for multi-copy self-heal from surviving backend copies.
 
-Scenario Q rebuilds missing target placements from an existing healthy copy,
+Scenario Q rebuilds missing target pools from an existing healthy copy,
 not from an external original source. These tests use a readable in-process
 write backend for deterministic control-flow coverage, plus one real RAO round
 trip to prove an encrypted copy rebuilt from a plaintext survivor opens to the
@@ -22,11 +22,10 @@ from sutradhara.backend.port import (
     BackendLocator,
     ByteRange,
     CopyRecord,
-    TaggedPlacement,
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_copy
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset
+from sutradhara.catalog.models import ArtifactClassPool, Backend, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import (
     BackendKind,
@@ -45,7 +44,6 @@ from sutradhara.replication import (
     self_heal,
 )
 from sutradhara.sealing.rao import RaoCliOpener, RaoCliSealer, resolve_rem_bin
-from sutradhara.sealing.policy import o_archive_policy
 from sutradhara.sealing.port import Representation, SealResult
 
 
@@ -61,13 +59,11 @@ class _ReadableTaggedWriteBackend:
     def __init__(
         self,
         name: str,
-        placements: list[TaggedPlacement],
         *,
-        tape_by_placement: dict[str, str] | None = None,
+        tape_by_pool: dict[str, str] | None = None,
     ) -> None:
         self._name = name
-        self._placements = placements
-        self._tape_by_placement = tape_by_placement or {}
+        self._tape_by_pool = tape_by_pool or {}
         self._objects: dict[str, bytes] = {}
         self._records: list[CopyRecord] = []
         self.writes: list[str] = []
@@ -76,13 +72,10 @@ class _ReadableTaggedWriteBackend:
     def name(self) -> str:
         return self._name
 
-    def list_tagged_placements(self) -> list[TaggedPlacement]:
-        return list(self._placements)
-
     def put_object(self, pool: str, data: bytes) -> CopyRecord:
         digest = content_hash(hashlib.sha256(data).digest())
         object_id = f"{len(self._records) + 1:032x}"
-        tape_uuid = self._tape_by_placement.get(pool, f"{len(self._records) + 1:032x}")
+        tape_uuid = self._tape_by_pool.get(pool, f"{len(self._records) + 1:032x}")
         locator = {
             "pool_id": pool,
             "tape_uuid": tape_uuid,
@@ -183,18 +176,6 @@ class _FakeOpener:
             yield plaintext_path
 
 
-def _placement(
-    placement_id: str,
-    copy_class: str,
-) -> TaggedPlacement:
-    return TaggedPlacement(
-        placement_id=placement_id,
-        content_class="o-archive",
-        copy_class=copy_class,
-        backend_name="rem",
-    )
-
-
 def _add_backend(engine: Engine) -> int:
     with session_scope(engine) as s:
         row = Backend(
@@ -215,14 +196,46 @@ def _add_asset(engine: Engine, data: bytes) -> ContentHash:
     return digest
 
 
+def _add_o_archive_pools(engine: Engine, backend_id: int) -> None:
+    with session_scope(engine) as s:
+        s.add(
+            Pool(
+                id="o-copy-1-pool",
+                backend_id=backend_id,
+                representation=Representation.RAO_PLAIN_V1.value,
+            )
+        )
+        s.add(
+            Pool(
+                id="o-copy-2-pool",
+                backend_id=backend_id,
+                representation=Representation.RAO_AEAD_V1.value,
+            )
+        )
+        s.add(
+            ArtifactClassPool(
+                artifactclass="o-archive",
+                pool_id="o-copy-1-pool",
+                sort_order=1,
+            )
+        )
+        s.add(
+            ArtifactClassPool(
+                artifactclass="o-archive",
+                pool_id="o-copy-2-pool",
+                sort_order=2,
+            )
+        )
+
+
+def _metadata(representation: Representation) -> dict[str, object]:
+    return {"representation": representation.value}
+
+
 def _backend() -> _ReadableTaggedWriteBackend:
     return _ReadableTaggedWriteBackend(
         "rem",
-        [
-            _placement("o-copy-1-pool", "o-copy-1"),
-            _placement("o-copy-2-pool", "o-copy-2"),
-        ],
-        tape_by_placement={
+        tape_by_pool={
             "o-copy-1-pool": "1" * 32,
             "o-copy-2-pool": "2" * 32,
         },
@@ -233,6 +246,7 @@ def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
     data = b"complete asset"
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
     backend = _backend()
     copy1 = backend.put_object("o-copy-1-pool", b"copy-one")
     copy2 = backend.put_object("o-copy-2-pool", b"copy-two")
@@ -246,13 +260,18 @@ def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
                 native_locator=record.native_locator,
                 integrity_hash=record.integrity_hash,
                 source=CopySource.INGEST,
+                pool_id=str(record.native_locator["pool_id"]),
+                storage_metadata=_metadata(
+                    Representation.RAO_PLAIN_V1
+                    if record.native_locator["pool_id"] == "o-copy-1-pool"
+                    else Representation.RAO_AEAD_V1
+                ),
             )
         repaired = self_heal(
             s,
             asset_hash,
             "o-archive",
             backends={backend_id: backend},
-            policy=o_archive_policy(),
             key_epoch="1" * 32,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
@@ -265,6 +284,7 @@ def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
 def test_self_heal_raises_when_no_healthy_source_remains(engine: Engine) -> None:
     asset_hash = _add_asset(engine, b"lost asset")
     backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
 
     with session_scope(engine) as s, pytest.raises(SelfHealUnavailable, match="no healthy"):
         self_heal(
@@ -272,7 +292,6 @@ def test_self_heal_raises_when_no_healthy_source_remains(engine: Engine) -> None
             asset_hash,
             "o-archive",
             backends={backend_id: _backend()},
-            policy=o_archive_policy(),
             key_epoch="1" * 32,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
@@ -285,6 +304,7 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
     data = b"heal from surviving copy"
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
     backend = _backend()
     opener = _FakeOpener()
     sealer = _FakeSealer()
@@ -302,6 +322,8 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
             native_locator=source_record.native_locator,
             integrity_hash=source_record.integrity_hash,
             source=CopySource.INGEST,
+            pool_id="o-copy-1-pool",
+            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
         )
         add_copy(
             s,
@@ -311,6 +333,8 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
             integrity_hash=missing_record.integrity_hash,
             source=CopySource.INGEST,
             health=CopyHealth.MISSING,
+            pool_id="o-copy-2-pool",
+            storage_metadata=_metadata(Representation.RAO_AEAD_V1),
         )
 
         repaired = self_heal(
@@ -318,7 +342,6 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
             asset_hash,
             "o-archive",
             backends={backend_id: backend},
-            policy=o_archive_policy(),
             key_epoch=key_id,
             opener=opener,
             sealer=sealer,
@@ -328,7 +351,6 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
             asset_hash,
             "o-archive",
             {backend_id: backend},
-            policy=o_archive_policy(),
             key_epoch=key_id,
         )
 
@@ -346,6 +368,7 @@ def test_self_heal_rejects_source_that_opens_to_wrong_plaintext(
     data = b"original"
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
     backend = _backend()
     source_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::tampered")
 
@@ -357,6 +380,8 @@ def test_self_heal_rejects_source_that_opens_to_wrong_plaintext(
             native_locator=source_record.native_locator,
             integrity_hash=source_record.integrity_hash,
             source=CopySource.INGEST,
+            pool_id="o-copy-1-pool",
+            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
         )
 
         with pytest.raises(ReplicationInvariantError, match="source plaintext hash"):
@@ -365,7 +390,6 @@ def test_self_heal_rejects_source_that_opens_to_wrong_plaintext(
                 asset_hash,
                 "o-archive",
                 backends={backend_id: backend},
-                policy=o_archive_policy(),
                 key_epoch="1" * 32,
                 opener=_FakeOpener(),
                 sealer=_FakeSealer(),
@@ -384,6 +408,7 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
     data = b"real rao self heal"
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
     backend = _backend()
     source = tmp_path / "asset.bin"
     source.write_bytes(data)
@@ -398,7 +423,6 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
             "o-archive",
             backends={backend_id: backend},
             sealer=RaoCliSealer(registry),
-            policy=o_archive_policy(),
             key_epoch=epoch.key_id,
         )
         copy2 = next(
@@ -416,7 +440,6 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
             backends={backend_id: backend},
             opener=RaoCliOpener(registry),
             sealer=RaoCliSealer(registry),
-            policy=o_archive_policy(),
             key_epoch=epoch.key_id,
         )
         [rebuilt] = repaired

@@ -28,22 +28,16 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
     Day-1 supports:
       - `memory`     — in-process test backend (config ignored)
       - `rem_tape`   — Remanence daemon Catalog (`daemon_endpoint`) or dev fixture
-      - `d2_tape`    — d2tape CLI adapter with registration-declared placements
+      - `d2_tape`    — d2tape CLI adapter
 
     Future kinds (`rem_disk`, `s3`, `gcs`, `azure_blob`, `plain_disk`)
     will land alongside their adapter implementations.
     """
     cfg: dict[str, object] = row.config or {}
+    _reject_obsolete_placements(row, cfg)
 
     if row.kind == BackendKind.MEMORY:
-        placements_raw = cfg.get("placements")
-        if placements_raw is None:
-            return MemoryBackend(row.name)
-        if not isinstance(placements_raw, list):
-            raise BackendNotConfigured(
-                f"backend {row.name!r} (kind=memory) config.placements must be a list"
-            )
-        return MemoryBackend(row.name, placements=placements_raw)
+        return MemoryBackend(row.name)
 
     if row.kind == BackendKind.REM_TAPE:
         daemon_endpoint = cfg.get("daemon_endpoint")
@@ -63,11 +57,6 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
         )
 
     if row.kind == BackendKind.D2_TAPE:
-        placements_raw = cfg.get("placements")
-        if placements_raw is not None and not isinstance(placements_raw, list):
-            raise BackendNotConfigured(
-                f"backend {row.name!r} (kind=d2_tape) config.placements must be a list"
-            )
         return D2TapeBackend(
             row.name,
             jar_path=_optional_str(cfg, "jar_path"),
@@ -79,7 +68,6 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
             state_dir=str(
                 cfg.get("state_dir", "/var/lib/replica/d2tape/volumes")
             ),
-            placements=placements_raw,
             timeout_seconds=_optional_float(cfg, "timeout_seconds", 300.0),
             file_backed=bool(cfg.get("file_backed", False)),
             temp_dir=_optional_str(cfg, "temp_dir"),
@@ -99,6 +87,15 @@ def _optional_str(cfg: dict[str, object], key: str) -> str | None:
     if not isinstance(value, str):
         raise BackendNotConfigured(f"config.{key} must be a string")
     return value
+
+
+def _reject_obsolete_placements(row: BackendRow, cfg: dict[str, object]) -> None:
+    if "placements" not in cfg:
+        return
+    raise BackendNotConfigured(
+        f"backend {row.name!r}: config.placements is obsolete; declare pool "
+        "and artifactclass_pool rows in the catalog"
+    )
 
 
 def _optional_float(

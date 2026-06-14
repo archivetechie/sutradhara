@@ -10,7 +10,6 @@ import pytest
 from sutradhara.backend.d2tape import D2TapeBackend
 from sutradhara.backend.factory import BackendNotConfigured, backend_from_row
 from sutradhara.backend.memory import MemoryBackend
-from sutradhara.backend.port import TaggedPlacement
 from sutradhara.backend.remanence import RemanenceBackend
 from sutradhara.catalog.models import Backend
 from sutradhara.catalog.types import BackendKind, BackendTier
@@ -43,25 +42,28 @@ def _d2_tape_row(config: dict[str, Any] | None) -> Backend:
     )
 
 
-def test_memory_backend_gets_declared_placements_from_config() -> None:
-    backend = backend_from_row(
-        _memory_row(
-            {
-                "placements": [
-                    {
-                        "placement_id": "mem-copy-1",
-                        "content_class": "video-priv",
-                        "copy_class": "copy-1",
-                    }
-                ]
-            }
-        )
-    )
+def test_memory_backend_ignores_empty_config() -> None:
+    backend = backend_from_row(_memory_row({}))
 
     assert isinstance(backend, MemoryBackend)
-    assert backend.list_tagged_placements() == [
-        TaggedPlacement("mem-copy-1", "video-priv", "copy-1", "mem")
-    ]
+    assert backend.name == "mem"
+
+
+def test_obsolete_placements_config_is_rejected() -> None:
+    with pytest.raises(BackendNotConfigured, match="obsolete"):
+        backend_from_row(
+            _memory_row(
+                {
+                    "placements": [
+                        {
+                            "placement_id": "mem-copy-1",
+                            "content_class": "video-priv",
+                            "copy_class": "copy-1",
+                        }
+                    ]
+                }
+            )
+        )
 
 
 def test_daemon_endpoint_builds_live_adapter() -> None:
@@ -93,7 +95,7 @@ def test_neither_key_raises_not_configured() -> None:
         backend_from_row(_rem_tape_row({}))
 
 
-def test_d2_tape_backend_gets_declared_placements_from_config(tmp_path: Path) -> None:
+def test_d2_tape_backend_builds_adapter(tmp_path: Path) -> None:
     jar = tmp_path / "d2tape.jar"
     fake_java = tmp_path / "fake-java"
     jar.write_text("fake\n")
@@ -105,26 +107,15 @@ def test_d2_tape_backend_gets_declared_placements_from_config(tmp_path: Path) ->
                 "java_bin": str(fake_java),
                 "device_env_path": str(tmp_path / "device.env"),
                 "state_dir": str(tmp_path / "state"),
-                "placements": [
-                    {
-                        "placement_id": "n-copy-3",
-                        "content_class": "n-archive",
-                        "copy_class": "copy-3",
-                        "representation": "d2tar-raw",
-                    }
-                ],
             }
         )
     )
 
     assert isinstance(backend, D2TapeBackend)
-    assert backend.list_tagged_placements() == [
-        TaggedPlacement("n-copy-3", "n-archive", "copy-3", "d2-tape", "d2tar-raw")
-    ]
 
 
-def test_d2_tape_placements_must_be_a_list(tmp_path: Path) -> None:
+def test_d2_tape_rejects_obsolete_placements_config(tmp_path: Path) -> None:
     jar = tmp_path / "d2tape.jar"
     jar.write_text("fake\n")
-    with pytest.raises(BackendNotConfigured, match="placements"):
+    with pytest.raises(BackendNotConfigured, match="obsolete"):
         backend_from_row(_d2_tape_row({"jar_path": str(jar), "placements": {}}))

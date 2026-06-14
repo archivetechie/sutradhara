@@ -16,29 +16,18 @@ from sutradhara.backend.port import (
     BackendNotFoundError,
     ByteRange,
     CopyRecord,
-    TaggedPlacement,
     VerifyResult,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
-
-PlacementConfig = TaggedPlacement | dict[str, Any]
 
 
 class MemoryBackend:
     """In-process backend storing raw bytes keyed by content hash."""
 
-    def __init__(
-        self,
-        name: str,
-        placements: list[PlacementConfig] | None = None,
-    ) -> None:
+    def __init__(self, name: str) -> None:
         self._name = name
         self._objects: dict[ContentHash, bytes] = {}
         self._extra_metadata: dict[ContentHash, dict[str, Any]] = {}
-        self._placements = tuple(
-            _placement_from_config(name, placement)
-            for placement in (placements or [])
-        )
 
     @property
     def name(self) -> str:
@@ -74,9 +63,6 @@ class MemoryBackend:
                 size_bytes=len(data),
                 metadata=dict(self._extra_metadata.get(h, {})),
             )
-
-    def list_tagged_placements(self) -> list[TaggedPlacement]:
-        return list(self._placements)
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         h = self._locator_to_hash(locator)
@@ -120,36 +106,3 @@ class MemoryBackend:
         if h not in self._objects:
             raise BackendNotFoundError(f"no object with hash {hex_value[:12]}…")
         return h
-
-
-def _placement_from_config(
-    backend_name: str,
-    placement: PlacementConfig,
-) -> TaggedPlacement:
-    if isinstance(placement, TaggedPlacement):
-        return TaggedPlacement(
-            placement.placement_id,
-            placement.content_class,
-            placement.copy_class,
-            backend_name,
-            placement.representation,
-            placement.key_epoch,
-        )
-    try:
-        return TaggedPlacement(
-            placement_id=str(placement["placement_id"]),
-            content_class=str(placement["content_class"]),
-            copy_class=str(placement["copy_class"]),
-            backend_name=backend_name,
-            representation=str(placement.get("representation", "raw-bytes")),
-            key_epoch=(
-                None
-                if placement.get("key_epoch") is None
-                else str(placement.get("key_epoch"))
-            ),
-        )
-    except KeyError as e:
-        raise ValueError(
-            "memory backend placement config must include placement_id, "
-            "content_class, and copy_class"
-        ) from e

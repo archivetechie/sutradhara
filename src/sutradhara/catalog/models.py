@@ -5,7 +5,8 @@ Day-1 vertical slice tables only (docs/spec-v0.1.md §4):
   - backend        (registered storage backends)
   - copy           (one row per realization of an asset on a backend)
 
-Derivations, recipes, and jobs land in later slices.
+Pool membership and archive bundle tables are layered on this base as the
+archive path moves from scenario-era routing tags to explicit storage pools.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import datetime as dt
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     JSON,
     BigInteger,
     DateTime,
@@ -102,7 +104,7 @@ class Backend(Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
-    placement_tag_pins: Mapped[list[PlacementTagPin]] = relationship(
+    pools: Mapped[list[Pool]] = relationship(
         back_populates="backend",
         cascade="all, delete-orphan",
         lazy="selectin",
@@ -112,45 +114,252 @@ class Backend(Base):
         return f"<Backend id={self.id} name={self.name!r} kind={self.kind} tier={self.tier}>"
 
 
-class PlacementTagPin(Base):
-    """Pinned placement routing tags for drift detection.
+class Pool(Base):
+    """A durable storage pool owned by a backend.
 
-    Placement identity is backend-specific, so the durable key is
-    `(backend_id, placement_id)`. The stored tags are sutradhara's routing
-    vocabulary and are checked against future backend discovery before acting.
+    Pool identity is the storage policy surface. A pool owns its byte
+    representation; copies point at the pool they were written through.
     """
 
-    __tablename__ = "placement_tag_pin"
+    __tablename__ = "pool"
     __table_args__ = (
         UniqueConstraint(
             "backend_id",
-            "placement_id",
-            name="uq_placement_tag_pin_backend_placement",
+            "id",
+            name="uq_pool_backend_id",
         ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
     backend_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("backend.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
-    placement_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    content_class: Mapped[str] = mapped_column(String(128), nullable=False)
-    copy_class: Mapped[str] = mapped_column(String(128), nullable=False)
-    pinned_at: Mapped[dt.datetime] = mapped_column(
+    representation: Mapped[str] = mapped_column(String(64), nullable=False)
+    location: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    offsite_gate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    tier: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
-    backend: Mapped[Backend] = relationship(back_populates="placement_tag_pins")
+    backend: Mapped[Backend] = relationship(back_populates="pools")
+    artifactclass_memberships: Mapped[list[ArtifactClassPool]] = relationship(
+        back_populates="pool",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    copies: Mapped[list[Copy]] = relationship(
+        back_populates="pool",
+        lazy="selectin",
+    )
 
     def __repr__(self) -> str:
         return (
-            f"<PlacementTagPin backend={self.backend_id} "
-            f"placement={self.placement_id!r} "
-            f"content_class={self.content_class!r} copy_class={self.copy_class!r}>"
+            f"<Pool id={self.id!r} backend={self.backend_id} "
+            f"representation={self.representation!r}>"
         )
+
+
+class ArtifactClassPool(Base):
+    """Active membership from an artifactclass to a storage pool."""
+
+    __tablename__ = "artifactclass_pool"
+    __table_args__ = (
+        UniqueConstraint(
+            "artifactclass",
+            "pool_id",
+            name="uq_artifactclass_pool_artifactclass_pool",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    pool_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("pool.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    role: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    pool: Mapped[Pool] = relationship(back_populates="artifactclass_memberships")
+
+    def __repr__(self) -> str:
+        return (
+            f"<ArtifactClassPool artifactclass={self.artifactclass!r} "
+            f"pool={self.pool_id!r} active={self.active}>"
+        )
+
+
+class Bundle(Base):
+    """A synthetic archive object containing one or more logical assets."""
+
+    __tablename__ = "bundle"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    representation: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    closed_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    members: Mapped[list[BundleMember]] = relationship(
+        back_populates="bundle",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    locators: Mapped[list[AssetLocator]] = relationship(
+        back_populates="bundle",
+        lazy="selectin",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Bundle id={self.id!r} artifactclass={self.artifactclass!r} "
+            f"status={self.status!r}>"
+        )
+
+
+class BundleMember(Base):
+    """Membership of one logical asset inside a synthetic archive bundle."""
+
+    __tablename__ = "bundle_member"
+    __table_args__ = (
+        UniqueConstraint(
+            "bundle_id",
+            "logical_asset_hash",
+            name="uq_bundle_member_bundle_asset",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bundle_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("bundle.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    logical_asset_hash: Mapped[bytes] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    member_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    file_sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    added_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    bundle: Mapped[Bundle] = relationship(back_populates="members")
+    logical_asset: Mapped[LogicalAsset] = relationship()
+
+
+class AssetLocator(Base):
+    """A per-asset locator, including bundle-derived locations."""
+
+    __tablename__ = "asset_locator"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    logical_asset_hash: Mapped[bytes] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    pool_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("pool.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    copy_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("copy.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    bundle_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("bundle.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    native_locator: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    representation: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    logical_asset: Mapped[LogicalAsset] = relationship()
+    pool: Mapped[Pool] = relationship()
+    copy: Mapped[Copy | None] = relationship()
+    bundle: Mapped[Bundle | None] = relationship(back_populates="locators")
+
+
+class BlobRoot(Base):
+    """Content root for a generated blob or bundle manifest."""
+
+    __tablename__ = "blob_root"
+    __table_args__ = (
+        UniqueConstraint(
+            "logical_asset_hash",
+            "algorithm",
+            name="uq_blob_root_asset_algorithm",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    logical_asset_hash: Mapped[bytes] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    algorithm: Mapped[str] = mapped_column(String(64), nullable=False)
+    root_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    logical_asset: Mapped[LogicalAsset] = relationship()
+
+
+class ExclusionRecord(Base):
+    """A durable record explaining why material was excluded from bundling."""
+
+    __tablename__ = "exclusion_record"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    logical_asset_hash: Mapped[bytes | None] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    logical_asset: Mapped[LogicalAsset | None] = relationship()
 
 
 class Copy(Base):
@@ -185,6 +394,12 @@ class Copy(Base):
         nullable=False,
         index=True,
     )
+    pool_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("pool.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # The locator itself is structured per-backend; we store the JSON for
     # querying/display AND a deterministic string key for the UNIQUE
@@ -210,6 +425,7 @@ class Copy(Base):
 
     logical_asset: Mapped[LogicalAsset] = relationship(back_populates="copies")
     backend: Mapped[Backend] = relationship(back_populates="copies")
+    pool: Mapped[Pool | None] = relationship(back_populates="copies")
 
     def __repr__(self) -> str:
         return (

@@ -1,10 +1,4 @@
-"""Multi-placement replication tests.
-
-These tests exercise sutradhara's first multi-pool fan-out layer: placements are
-selected by universal content/copy tags, writes reuse the backend port, copies
-are recorded through catalog.add_copy, and completeness is evaluated from
-healthy copy rows without promoting tape-specific fields to catalog columns.
-"""
+"""Pool-backed replication tests."""
 
 from __future__ import annotations
 
@@ -20,11 +14,10 @@ from sutradhara.backend.port import (
     BackendLocator,
     ByteRange,
     CopyRecord,
-    TaggedPlacement,
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_copy
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset, PlacementTagPin
+from sutradhara.catalog.models import ArtifactClassPool, Backend, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import (
     BackendKind,
@@ -35,16 +28,14 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.keys import KeyEpoch
 from sutradhara.replication import (
-    DuplicatePlacementClass,
-    PlacementTagDrift,
+    PoolRepresentationError,
     ReplicationInvariantError,
     repair,
     replicate_asset,
     replication_status,
     select_restore_source,
-    target_placements,
+    target_pools,
 )
-from sutradhara.sealing.policy import n_archive_policy, o_archive_policy
 from sutradhara.sealing.port import Representation, SealResult
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 
@@ -57,31 +48,26 @@ def engine() -> Iterator[Engine]:
     eng.dispose()
 
 
-class _TaggedWriteBackend:
+class _PoolWriteBackend:
     def __init__(
         self,
         name: str,
-        placements: list[TaggedPlacement],
         *,
-        tape_by_placement: dict[str, str] | None = None,
+        tape_by_pool: dict[str, str] | None = None,
     ) -> None:
         self._name = name
-        self._placements = placements
-        self._tape_by_placement = tape_by_placement or {}
+        self._tape_by_pool = tape_by_pool or {}
         self.writes: list[str] = []
 
     @property
     def name(self) -> str:
         return self._name
 
-    def list_tagged_placements(self) -> list[TaggedPlacement]:
-        return list(self._placements)
-
     def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
         self.writes.append(pool)
-        tape_uuid = self._tape_by_placement.get(pool, f"{len(self.writes):032x}")
+        tape_uuid = self._tape_by_pool.get(pool, f"{len(self.writes):032x}")
         return CopyRecord(
             logical_id=digest,
             native_locator={
@@ -106,7 +92,7 @@ class _TaggedWriteBackend:
         raise NotImplementedError
 
 
-class _WrongHashBackend(_TaggedWriteBackend):
+class _WrongHashBackend(_PoolWriteBackend):
     def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
         record = super().write_object_to_pool(source, pool)
         wrong = content_hash(hashlib.sha256(b"different").digest())
@@ -118,7 +104,7 @@ class _WrongHashBackend(_TaggedWriteBackend):
         )
 
 
-class _D2TapeFakeBackend(_TaggedWriteBackend):
+class _D2TapeFakeBackend(_PoolWriteBackend):
     def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
@@ -169,12 +155,7 @@ class _FakeSealer:
         self.calls.append((representation, key_id))
 
         if representation in {Representation.RAW_BYTES, Representation.D2TAR_RAW}:
-            result = SealResult(
-                sealed_path=source,
-                stored_digest=plaintext,
-                plaintext_digest=plaintext,
-                representation=representation,
-            )
+            result = SealResult(source, plaintext, plaintext, representation)
             self.results.append(result)
             yield result
             return
@@ -202,20 +183,6 @@ class _FakeSealer:
                 sealed_path.unlink()
 
 
-def _placement(
-    placement_id: str,
-    content_class: str,
-    copy_class: str,
-    backend_name: str = "rem",
-) -> TaggedPlacement:
-    return TaggedPlacement(
-        placement_id=placement_id,
-        content_class=content_class,
-        copy_class=copy_class,
-        backend_name=backend_name,
-    )
-
-
 def _add_backend(
     engine: Engine,
     name: str = "rem",
@@ -233,6 +200,32 @@ def _add_backend(
         return row.id
 
 
+def _add_pool(
+    engine: Engine,
+    *,
+    backend_id: int,
+    pool_id: str,
+    artifactclass: str,
+    representation: Representation,
+    sort_order: int = 0,
+) -> None:
+    with session_scope(engine) as s:
+        s.add(
+            Pool(
+                id=pool_id,
+                backend_id=backend_id,
+                representation=representation.value,
+            )
+        )
+        s.add(
+            ArtifactClassPool(
+                artifactclass=artifactclass,
+                pool_id=pool_id,
+                sort_order=sort_order,
+            )
+        )
+
+
 def _add_asset(engine: Engine, data: bytes) -> bytes:
     digest = hashlib.sha256(data).digest()
     with session_scope(engine) as s:
@@ -240,88 +233,55 @@ def _add_asset(engine: Engine, data: bytes) -> bytes:
     return digest
 
 
-def test_target_placements_filters_by_content_class_and_copy_class() -> None:
-    backend = _TaggedWriteBackend(
-        "rem",
-        [
-            _placement("private-copy-1", "video-priv", "copy-1"),
-            _placement("private-copy-2", "video-priv", "copy-2"),
-            _placement("public-copy-1", "video-pub", "copy-1"),
-        ],
+def _metadata(representation: Representation) -> dict[str, object]:
+    metadata: dict[str, object] = {"representation": representation.value}
+    if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
+        metadata["chunk_size"] = RAO_CHUNK_SIZE
+    return metadata
+
+
+def test_target_pools_reads_active_memberships_and_representations(
+    engine: Engine,
+) -> None:
+    backend_id = _add_backend(engine)
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="o-copy-1-pool",
+        artifactclass="o-archive",
+        representation=Representation.RAO_PLAIN_V1,
+        sort_order=1,
     )
-
-    targets = target_placements("video-priv", {1: backend})
-
-    assert {placement.placement_id for _, placement in targets} == {
-        "private-copy-1",
-        "private-copy-2",
-    }
-    assert {placement.copy_class for _, placement in targets} == {"copy-1", "copy-2"}
-
-
-def test_target_placements_applies_o_archive_representation_policy() -> None:
-    backend = _TaggedWriteBackend(
-        "rem",
-        [
-            _placement("copy-1-pool", "o-archive", "o-copy-1"),
-            _placement("copy-2-pool", "o-archive", "o-copy-2"),
-        ],
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="o-copy-2-pool",
+        artifactclass="o-archive",
+        representation=Representation.RAO_AEAD_V1,
+        sort_order=2,
     )
+    backend = _PoolWriteBackend("rem")
 
-    targets = target_placements(
-        "o-archive",
-        {1: backend},
-        policy=o_archive_policy(),
-        key_epoch="1" * 32,
-    )
+    with session_scope(engine) as s:
+        targets = target_pools(
+            s,
+            "o-archive",
+            {backend_id: backend},
+            key_epoch="1" * 32,
+        )
 
-    by_copy = {placement.copy_class: placement for _, placement in targets}
-    assert by_copy["o-copy-1"].representation == Representation.RAO_PLAIN_V1.value
-    assert by_copy["o-copy-1"].key_epoch is None
-    assert by_copy["o-copy-2"].representation == Representation.RAO_AEAD_V1.value
-    assert by_copy["o-copy-2"].key_epoch == "1" * 32
-
-
-def test_target_placements_applies_n_archive_representation_policy() -> None:
-    backend = _TaggedWriteBackend(
-        "rem",
-        [
-            _placement("n-copy-1", "n-archive", "copy-1"),
-            _placement("n-copy-2", "n-archive", "copy-2"),
-            _placement("n-copy-3", "n-archive", "copy-3"),
-        ],
-    )
-
-    targets = target_placements(
-        "n-archive",
-        {1: backend},
-        policy=n_archive_policy(),
-        key_epoch="1" * 32,
-    )
-
-    by_copy = {placement.copy_class: placement for _, placement in targets}
-    assert by_copy["copy-1"].representation == Representation.RAO_PLAIN_V1.value
-    assert by_copy["copy-1"].key_epoch is None
-    assert by_copy["copy-2"].representation == Representation.RAO_AEAD_V1.value
-    assert by_copy["copy-2"].key_epoch == "1" * 32
-    assert by_copy["copy-3"].representation == Representation.D2TAR_RAW.value
-    assert by_copy["copy-3"].key_epoch is None
+    assert [target.pool_id for _, target in targets] == [
+        "o-copy-1-pool",
+        "o-copy-2-pool",
+    ]
+    assert [target.representation for _, target in targets] == [
+        Representation.RAO_PLAIN_V1.value,
+        Representation.RAO_AEAD_V1.value,
+    ]
+    assert [target.key_epoch for _, target in targets] == [None, "1" * 32]
 
 
-def test_target_placements_rejects_duplicate_copy_class() -> None:
-    backend = _TaggedWriteBackend(
-        "rem",
-        [
-            _placement("private-copy-a", "video-priv", "copy-1"),
-            _placement("private-copy-b", "video-priv", "copy-1"),
-        ],
-    )
-
-    with pytest.raises(DuplicatePlacementClass, match="copy-1"):
-        target_placements("video-priv", {1: backend})
-
-
-def test_replicate_asset_fans_out_and_records_each_copy(
+def test_replicate_asset_fans_out_and_records_each_pool_copy(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -330,17 +290,23 @@ def test_replicate_asset_fans_out_and_records_each_copy(
     source.write_bytes(data)
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _TaggedWriteBackend(
+    for index, pool_id in enumerate(("private-copy-1", "private-copy-2")):
+        _add_pool(
+            engine,
+            backend_id=backend_id,
+            pool_id=pool_id,
+            artifactclass="video-priv",
+            representation=Representation.RAW_BYTES,
+            sort_order=index,
+        )
+    backend = _PoolWriteBackend(
         "rem",
-        [
-            _placement("private-copy-1", "video-priv", "copy-1"),
-            _placement("private-copy-2", "video-priv", "copy-2"),
-        ],
-        tape_by_placement={
+        tape_by_pool={
             "private-copy-1": "1" * 32,
             "private-copy-2": "2" * 32,
         },
     )
+    sealer = _FakeSealer(tmp_path)
 
     with session_scope(engine) as s:
         copies = replicate_asset(
@@ -349,33 +315,25 @@ def test_replicate_asset_fans_out_and_records_each_copy(
             source,
             "video-priv",
             backends={backend_id: backend},
+            sealer=sealer,
         )
 
     assert backend.writes == ["private-copy-1", "private-copy-2"]
     assert len(copies) == 2
     with session_scope(engine) as s:
         rows = list(s.scalars(select(Copy).order_by(Copy.id)))
-        assert {row.native_locator["pool_id"] for row in rows} == {
-            "private-copy-1",
-            "private-copy-2",
+        assert {row.pool_id for row in rows} == {"private-copy-1", "private-copy-2"}
+        assert {row.storage_metadata["representation"] for row in rows} == {
+            Representation.RAW_BYTES.value
         }
         assert {row.native_locator["tape_uuid"] for row in rows} == {
             "1" * 32,
             "2" * 32,
         }
-        assert {row.source for row in rows} == {CopySource.INGEST}
-        assert {row.health for row in rows} == {CopyHealth.OK}
-        pins = list(s.scalars(select(PlacementTagPin).order_by(PlacementTagPin.id)))
-        assert [
-            (pin.placement_id, pin.content_class, pin.copy_class)
-            for pin in pins
-        ] == [
-            ("private-copy-1", "video-priv", "copy-1"),
-            ("private-copy-2", "video-priv", "copy-2"),
-        ]
+        assert list(s.scalars(select(ArtifactClassPool))).pop().artifactclass == "video-priv"
 
 
-def test_replicate_asset_records_stored_digest_for_o_archive_sealed_copies(
+def test_replicate_asset_records_stored_digest_for_rao_pool_copies(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -384,13 +342,25 @@ def test_replicate_asset_records_stored_digest_for_o_archive_sealed_copies(
     source.write_bytes(data)
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _TaggedWriteBackend(
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="o-copy-1-pool",
+        artifactclass="o-archive",
+        representation=Representation.RAO_PLAIN_V1,
+        sort_order=1,
+    )
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="o-copy-2-pool",
+        artifactclass="o-archive",
+        representation=Representation.RAO_AEAD_V1,
+        sort_order=2,
+    )
+    backend = _PoolWriteBackend(
         "rem",
-        [
-            _placement("o-copy-1-pool", "o-archive", "o-copy-1"),
-            _placement("o-copy-2-pool", "o-archive", "o-copy-2"),
-        ],
-        tape_by_placement={
+        tape_by_pool={
             "o-copy-1-pool": "1" * 32,
             "o-copy-2-pool": "2" * 32,
         },
@@ -405,7 +375,6 @@ def test_replicate_asset_records_stored_digest_for_o_archive_sealed_copies(
             "o-archive",
             backends={backend_id: backend},
             sealer=sealer,
-            policy=o_archive_policy(),
             key_epoch="1" * 32,
         )
 
@@ -416,12 +385,7 @@ def test_replicate_asset_records_stored_digest_for_o_archive_sealed_copies(
     ]
     assert len(copies) == 2
     with session_scope(engine) as s:
-        rows = {
-            row.native_locator["pool_id"]: row
-            for row in s.scalars(select(Copy).order_by(Copy.id))
-        }
-        assert rows["o-copy-1-pool"].logical_asset_hash == asset_hash
-        assert rows["o-copy-2-pool"].logical_asset_hash == asset_hash
+        rows = {row.pool_id: row for row in s.scalars(select(Copy).order_by(Copy.id))}
         assert rows["o-copy-1-pool"].integrity_hash == sealer.results[0].stored_digest
         assert rows["o-copy-2-pool"].integrity_hash == sealer.results[1].stored_digest
         assert rows["o-copy-1-pool"].storage_metadata == {
@@ -444,21 +408,35 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
     asset_hash = _add_asset(engine, data)
     rem_backend_id = _add_backend(engine, name="mem-rem", kind=BackendKind.MEMORY)
     d2_backend_id = _add_backend(engine, name="d2-tape", kind=BackendKind.D2_TAPE)
-    rem_backend = _TaggedWriteBackend(
+    _add_pool(
+        engine,
+        backend_id=rem_backend_id,
+        pool_id="n-copy-1",
+        artifactclass="n-archive",
+        representation=Representation.RAO_PLAIN_V1,
+        sort_order=1,
+    )
+    _add_pool(
+        engine,
+        backend_id=rem_backend_id,
+        pool_id="n-copy-2",
+        artifactclass="n-archive",
+        representation=Representation.RAO_AEAD_V1,
+        sort_order=2,
+    )
+    _add_pool(
+        engine,
+        backend_id=d2_backend_id,
+        pool_id="n-copy-3",
+        artifactclass="n-archive",
+        representation=Representation.D2TAR_RAW,
+        sort_order=3,
+    )
+    rem_backend = _PoolWriteBackend(
         "mem-rem",
-        [
-            _placement("n-copy-1", "n-archive", "copy-1", "mem-rem"),
-            _placement("n-copy-2", "n-archive", "copy-2", "mem-rem"),
-        ],
-        tape_by_placement={
-            "n-copy-1": "1" * 32,
-            "n-copy-2": "2" * 32,
-        },
+        tape_by_pool={"n-copy-1": "1" * 32, "n-copy-2": "2" * 32},
     )
-    d2_backend = _D2TapeFakeBackend(
-        "d2-tape",
-        [_placement("n-copy-3", "n-archive", "copy-3", "d2-tape")],
-    )
+    d2_backend = _D2TapeFakeBackend("d2-tape")
     sealer = _FakeSealer(tmp_path)
 
     with session_scope(engine) as s:
@@ -469,7 +447,6 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
             "n-archive",
             backends={rem_backend_id: rem_backend, d2_backend_id: d2_backend},
             sealer=sealer,
-            policy=n_archive_policy(),
             key_epoch="1" * 32,
         )
         status = replication_status(
@@ -477,7 +454,6 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
             asset_hash,
             "n-archive",
             {rem_backend_id: rem_backend, d2_backend_id: d2_backend},
-            policy=n_archive_policy(),
             key_epoch="1" * 32,
         )
 
@@ -485,7 +461,7 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
     assert d2_backend.writes == ["n-copy-3"]
     assert len(copies) == 3
     assert status["complete"] is True
-    assert {placement.placement_id for placement in status["have"]} == {
+    assert {target.pool_id for target in status["have"]} == {
         "n-copy-1",
         "n-copy-2",
         "n-copy-3",
@@ -499,23 +475,9 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
     with session_scope(engine) as s:
         rows = list(s.scalars(select(Copy).order_by(Copy.id)))
         assert {row.backend.name for row in rows} == {"mem-rem", "d2-tape"}
-        rem_rows = [row for row in rows if row.backend.name == "mem-rem"]
-        assert [row.storage_metadata["representation"] for row in rem_rows] == [
-            Representation.RAO_PLAIN_V1.value,
-            Representation.RAO_AEAD_V1.value,
-        ]
-        assert {row.storage_metadata["chunk_size"] for row in rem_rows} == {
-            RAO_CHUNK_SIZE,
-        }
         [d2_copy] = [row for row in rows if row.backend.name == "d2-tape"]
-        assert set(d2_copy.native_locator) == {
-            "barcode",
-            "volume_uuid",
-            "artifact_name",
-            "start_block",
-            "end_block",
-            "volume_blocksize",
-            "pool_id",
+        assert d2_copy.storage_metadata == {
+            "representation": Representation.D2TAR_RAW.value
         }
         assert d2_copy.integrity_hash == asset_hash
 
@@ -529,10 +491,14 @@ def test_replicate_asset_rejects_rao_plaintext_digest_mismatch(
     source.write_bytes(data)
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _TaggedWriteBackend(
-        "rem",
-        [_placement("o-copy-1-pool", "o-archive", "o-copy-1")],
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="o-copy-1-pool",
+        artifactclass="o-archive",
+        representation=Representation.RAO_PLAIN_V1,
     )
+    backend = _PoolWriteBackend("rem")
     sealer = _FakeSealer(
         tmp_path,
         plaintext_digest_override=hashlib.sha256(b"different").digest(),
@@ -549,7 +515,6 @@ def test_replicate_asset_rejects_rao_plaintext_digest_mismatch(
             "o-archive",
             backends={backend_id: backend},
             sealer=sealer,
-            policy={("o-archive", "o-copy-1"): Representation.RAO_PLAIN_V1.value},
         )
 
 
@@ -562,10 +527,14 @@ def test_replicate_asset_rejects_rao_stored_digest_mismatch(
     source.write_bytes(data)
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _TaggedWriteBackend(
-        "rem",
-        [_placement("o-copy-1-pool", "o-archive", "o-copy-1")],
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="o-copy-1-pool",
+        artifactclass="o-archive",
+        representation=Representation.RAO_PLAIN_V1,
     )
+    backend = _PoolWriteBackend("rem")
     sealer = _FakeSealer(
         tmp_path,
         stored_digest_override=hashlib.sha256(b"different").digest(),
@@ -582,11 +551,10 @@ def test_replicate_asset_rejects_rao_stored_digest_mismatch(
             "o-archive",
             backends={backend_id: backend},
             sealer=sealer,
-            policy={("o-archive", "o-copy-1"): Representation.RAO_PLAIN_V1.value},
         )
 
 
-def test_replicate_asset_rerun_skips_existing_healthy_placements(
+def test_replicate_asset_rerun_skips_existing_healthy_pools(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -595,16 +563,26 @@ def test_replicate_asset_rerun_skips_existing_healthy_placements(
     source.write_bytes(data)
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _TaggedWriteBackend(
-        "rem",
-        [
-            _placement("private-copy-1", "video-priv", "copy-1"),
-            _placement("private-copy-2", "video-priv", "copy-2"),
-        ],
-    )
+    for index, pool_id in enumerate(("private-copy-1", "private-copy-2")):
+        _add_pool(
+            engine,
+            backend_id=backend_id,
+            pool_id=pool_id,
+            artifactclass="video-priv",
+            representation=Representation.RAW_BYTES,
+            sort_order=index,
+        )
+    backend = _PoolWriteBackend("rem")
 
     with session_scope(engine) as s:
-        replicate_asset(s, asset_hash, source, "video-priv", backends={backend_id: backend})
+        replicate_asset(
+            s,
+            asset_hash,
+            source,
+            "video-priv",
+            backends={backend_id: backend},
+            sealer=_FakeSealer(tmp_path),
+        )
     with session_scope(engine) as s:
         copies = replicate_asset(
             s,
@@ -612,6 +590,7 @@ def test_replicate_asset_rerun_skips_existing_healthy_placements(
             source,
             "video-priv",
             backends={backend_id: backend},
+            sealer=_FakeSealer(tmp_path),
         )
 
     assert backend.writes == ["private-copy-1", "private-copy-2"]
@@ -627,10 +606,14 @@ def test_replicate_asset_rejects_backend_hash_mismatch(
     source.write_bytes(data)
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _WrongHashBackend(
-        "rem",
-        [_placement("private-copy-1", "video-priv", "copy-1")],
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="private-copy-1",
+        artifactclass="video-priv",
+        representation=Representation.RAW_BYTES,
     )
+    backend = _WrongHashBackend("rem")
 
     with session_scope(engine) as s, pytest.raises(
         ReplicationInvariantError, match="differs"
@@ -641,42 +624,41 @@ def test_replicate_asset_rejects_backend_hash_mismatch(
             source,
             "video-priv",
             backends={backend_id: backend},
+            sealer=_FakeSealer(tmp_path),
         )
 
 
-def test_tag_drift_raises_reconciliation_halt(
+def test_replication_status_rejects_copy_representation_mismatch(
     engine: Engine,
-    tmp_path: Path,
 ) -> None:
-    data = b"drift"
-    source = tmp_path / "asset.bin"
-    source.write_bytes(data)
+    data = b"representation drift"
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="o-copy-1-pool",
+        artifactclass="o-archive",
+        representation=Representation.RAO_PLAIN_V1,
+    )
 
     with session_scope(engine) as s:
-        replicate_asset(
+        add_copy(
             s,
-            asset_hash,
-            source,
-            "video-priv",
-            backends={
-                backend_id: _TaggedWriteBackend(
-                    "rem",
-                    [_placement("private-copy-1", "video-priv", "copy-1")],
-                )
-            },
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            pool_id="o-copy-1-pool",
+            native_locator={"pool_id": "o-copy-1-pool", "tape_uuid": "1" * 32},
+            integrity_hash=asset_hash,
+            source=CopySource.INGEST,
+            storage_metadata=_metadata(Representation.RAW_BYTES),
         )
 
-    drifted = _TaggedWriteBackend(
-        "rem",
-        [_placement("private-copy-1", "video-pub", "copy-1")],
-    )
-    with session_scope(engine) as s, pytest.raises(PlacementTagDrift, match="halt"):
-        replication_status(s, asset_hash, "video-priv", {backend_id: drifted})
+        with pytest.raises(PoolRepresentationError, match="requires"):
+            replication_status(s, asset_hash, "o-archive", {backend_id: _PoolWriteBackend("rem")})
 
 
-def test_repair_writes_only_missing_placements(
+def test_repair_writes_only_missing_pools(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -685,25 +667,27 @@ def test_repair_writes_only_missing_placements(
     source.write_bytes(data)
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _TaggedWriteBackend(
-        "rem",
-        [
-            _placement("private-copy-1", "video-priv", "copy-1"),
-            _placement("private-copy-2", "video-priv", "copy-2"),
-        ],
-        tape_by_placement={
-            "private-copy-2": "2" * 32,
-        },
-    )
+    for index, pool_id in enumerate(("private-copy-1", "private-copy-2")):
+        _add_pool(
+            engine,
+            backend_id=backend_id,
+            pool_id=pool_id,
+            artifactclass="video-priv",
+            representation=Representation.RAW_BYTES,
+            sort_order=index,
+        )
+    backend = _PoolWriteBackend("rem", tape_by_pool={"private-copy-2": "2" * 32})
 
     with session_scope(engine) as s:
         add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
+            pool_id="private-copy-1",
             native_locator={"pool_id": "private-copy-1", "tape_uuid": "1" * 32},
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
+            storage_metadata=_metadata(Representation.RAW_BYTES),
         )
         repaired = repair(
             s,
@@ -711,12 +695,13 @@ def test_repair_writes_only_missing_placements(
             source,
             "video-priv",
             backends={backend_id: backend},
+            sealer=_FakeSealer(tmp_path),
         )
         status = replication_status(s, asset_hash, "video-priv", {backend_id: backend})
 
     assert backend.writes == ["private-copy-2"]
     assert len(repaired) == 1
-    assert repaired[0].native_locator["pool_id"] == "private-copy-2"
+    assert repaired[0].pool_id == "private-copy-2"
     assert status["complete"] is True
 
 
@@ -726,54 +711,63 @@ def test_replication_status_reports_missing_and_complete(
     data = b"status asset"
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _TaggedWriteBackend(
-        "rem",
-        [
-            _placement("private-copy-1", "video-priv", "copy-1"),
-            _placement("private-copy-2", "video-priv", "copy-2"),
-        ],
-    )
+    for index, pool_id in enumerate(("private-copy-1", "private-copy-2")):
+        _add_pool(
+            engine,
+            backend_id=backend_id,
+            pool_id=pool_id,
+            artifactclass="video-priv",
+            representation=Representation.RAW_BYTES,
+            sort_order=index,
+        )
+    backend = _PoolWriteBackend("rem")
 
     with session_scope(engine) as s:
         add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
+            pool_id="private-copy-1",
             native_locator={"pool_id": "private-copy-1", "tape_uuid": "1" * 32},
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
+            storage_metadata=_metadata(Representation.RAW_BYTES),
         )
         status = replication_status(s, asset_hash, "video-priv", {backend_id: backend})
         assert status["complete"] is False
-        assert {p.placement_id for p in status["have"]} == {"private-copy-1"}
-        assert {p.placement_id for p in status["missing"]} == {"private-copy-2"}
+        assert {p.pool_id for p in status["have"]} == {"private-copy-1"}
+        assert {p.pool_id for p in status["missing"]} == {"private-copy-2"}
 
         add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
+            pool_id="private-copy-2",
             native_locator={"pool_id": "private-copy-2", "tape_uuid": "2" * 32},
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
+            storage_metadata=_metadata(Representation.RAW_BYTES),
         )
         status = replication_status(s, asset_hash, "video-priv", {backend_id: backend})
         assert status["complete"] is True
         assert status["missing"] == set()
 
 
-def test_replication_status_rejects_same_tape_for_multiple_placements(
+def test_replication_status_rejects_same_tape_for_multiple_pools(
     engine: Engine,
 ) -> None:
     data = b"same tape"
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _TaggedWriteBackend(
-        "rem",
-        [
-            _placement("private-copy-1", "video-priv", "copy-1"),
-            _placement("private-copy-2", "video-priv", "copy-2"),
-        ],
-    )
+    for index, pool_id in enumerate(("private-copy-1", "private-copy-2")):
+        _add_pool(
+            engine,
+            backend_id=backend_id,
+            pool_id=pool_id,
+            artifactclass="video-priv",
+            representation=Representation.RAW_BYTES,
+            sort_order=index,
+        )
 
     with session_scope(engine) as s:
         for pool in ("private-copy-1", "private-copy-2"):
@@ -781,16 +775,23 @@ def test_replication_status_rejects_same_tape_for_multiple_placements(
                 s,
                 logical_asset_hash=asset_hash,
                 backend_id=backend_id,
+                pool_id=pool,
                 native_locator={
                     "pool_id": pool,
                     "tape_uuid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 },
                 integrity_hash=asset_hash,
                 source=CopySource.INGEST,
+                storage_metadata=_metadata(Representation.RAW_BYTES),
             )
 
         with pytest.raises(ReplicationInvariantError, match="distinct tape_uuid"):
-            replication_status(s, asset_hash, "video-priv", {backend_id: backend})
+            replication_status(
+                s,
+                asset_hash,
+                "video-priv",
+                {backend_id: _PoolWriteBackend("rem")},
+            )
 
 
 def test_replication_status_rejects_missing_tape_uuid(
@@ -799,9 +800,12 @@ def test_replication_status_rejects_missing_tape_uuid(
     data = b"missing tape"
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
-    backend = _TaggedWriteBackend(
-        "rem",
-        [_placement("private-copy-1", "video-priv", "copy-1")],
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="private-copy-1",
+        artifactclass="video-priv",
+        representation=Representation.RAW_BYTES,
     )
 
     with session_scope(engine) as s:
@@ -809,13 +813,20 @@ def test_replication_status_rejects_missing_tape_uuid(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
+            pool_id="private-copy-1",
             native_locator={"pool_id": "private-copy-1"},
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
+            storage_metadata=_metadata(Representation.RAW_BYTES),
         )
 
         with pytest.raises(ReplicationInvariantError, match="missing tape_uuid"):
-            replication_status(s, asset_hash, "video-priv", {backend_id: backend})
+            replication_status(
+                s,
+                asset_hash,
+                "video-priv",
+                {backend_id: _PoolWriteBackend("rem")},
+            )
 
 
 def test_select_restore_source_picks_first_healthy_copy(

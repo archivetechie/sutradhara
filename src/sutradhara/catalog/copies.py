@@ -31,6 +31,10 @@ class UnknownLogicalAsset(CatalogError):
     """The given content hash does not name a registered LogicalAsset."""
 
 
+class CopyPoolMismatch(CatalogError):
+    """An existing backend locator is already associated with another pool."""
+
+
 class CopyLookup(TypedDict):
     locator: dict[str, Any]
     integrity_hash: bytes
@@ -48,6 +52,7 @@ def add_copy(
     *,
     logical_asset_hash: bytes,
     backend_id: int,
+    pool_id: str | None = None,
     native_locator: dict[str, Any],
     integrity_hash: bytes,
     source: CopySource,
@@ -82,11 +87,17 @@ def add_copy(
         )
     ).one_or_none()
     if existing is not None:
+        if pool_id is not None and existing.pool_id != pool_id:
+            raise CopyPoolMismatch(
+                f"copy id={existing.id} locator already belongs to pool "
+                f"{existing.pool_id!r}, not {pool_id!r}"
+            )
         return existing, False
 
     copy = Copy(
         logical_asset_hash=logical_asset_hash,
         backend_id=backend_id,
+        pool_id=pool_id,
         native_locator=native_locator,
         native_locator_key=key,
         storage_metadata=storage_metadata or {},

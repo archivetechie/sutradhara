@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from sutradhara.catalog.types import ContentHash
-from sutradhara.sealing.port import Representation
 
 # A locator is backend-specific structured data. Each backend defines its
 # own shape (e.g. tape: {tape_uuid, tape_file_number}; s3: {bucket, key};
@@ -73,23 +72,6 @@ class CopyRecord:
 
 
 @dataclass(frozen=True)
-class TaggedPlacement:
-    """A policy-addressable destination hosted by one storage backend.
-
-    Sutradhara's general layer routes by `content_class` and `copy_class`. The
-    `placement_id` is backend-native: a rem_tape pool id today, a bucket/prefix
-    or legacy adapter slot later.
-    """
-
-    placement_id: str
-    content_class: str
-    copy_class: str
-    backend_name: str
-    representation: str = Representation.RAW_BYTES.value
-    key_epoch: str | None = None
-
-
-@dataclass(frozen=True)
 class VerifyResult:
     """Outcome of a backend.verify() call."""
 
@@ -119,14 +101,6 @@ class StorageBackend(Protocol):
         catalog can be rebuilt from the union of every backend's
         enumeration. This is the load-bearing operation that makes the
         rebuildable-index discipline real (spec-v0.1.md §2 principle 1).
-        """
-        ...
-
-    def list_tagged_placements(self) -> list[TaggedPlacement]:
-        """Return destinations this backend hosts with sutradhara routing tags.
-
-        Adapters may discover tags from their backing system (rem_tape pools) or
-        return registration-declared tags (memory tests, future legacy adapters).
         """
         ...
 

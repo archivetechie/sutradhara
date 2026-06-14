@@ -27,13 +27,19 @@ from sqlalchemy.orm import Session
 
 from sutradhara.backend.port import CopyRecord, StorageBackend
 from sutradhara.catalog.copies import add_copy
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset
+from sutradhara.catalog.models import Backend, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import locator_key
 from sutradhara.catalog.types import (
     BackendKind,
     CopyHealth,
     CopySource,
 )
+from sutradhara.sealing.port import Representation
+from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+
+
+class ScrubInvariantError(Exception):
+    """A backend enumeration row violates catalog storage-policy invariants."""
 
 
 @dataclass
@@ -108,6 +114,8 @@ def _ingest_record(
     key = locator_key(record.native_locator)
     existing = catalog_copies.pop(key, None)
     record_health = _health_for_record(record, backend_row, report)
+    pool = _pool_for_record(session, backend_row, record)
+    storage_metadata = _storage_metadata_for_record(record, pool)
 
     if existing is not None:
         _update_existing_copy(
@@ -115,6 +123,7 @@ def _ingest_record(
             record=record,
             backend_row=backend_row,
             record_health=record_health,
+            pool=pool,
             now=now,
             report=report,
         )
@@ -138,13 +147,14 @@ def _ingest_record(
         session,
         logical_asset_hash=record.logical_id,
         backend_id=backend_row.id,
+        pool_id=pool.id if pool is not None else None,
         native_locator=record.native_locator,
         integrity_hash=record.integrity_hash,
         source=CopySource.SCRUB,
         health=record_health,
         last_verified_at=now,
         first_observed_at=now,
-        storage_metadata=record.metadata,
+        storage_metadata=storage_metadata,
     )
     if created:
         report.copies_added += 1
@@ -156,10 +166,18 @@ def _update_existing_copy(
     record: CopyRecord,
     backend_row: Backend,
     record_health: CopyHealth,
+    pool: Pool | None,
     now: dt.datetime,
     report: ScrubReport,
 ) -> None:
     """Refresh a cataloged copy found again by backend-native locator."""
+    if pool is not None:
+        if existing.pool_id != pool.id:
+            raise ScrubInvariantError(
+                f"copy id={existing.id} locator belongs to pool {existing.pool_id!r}, "
+                f"but backend enumerated pool {pool.id!r}"
+            )
+        _assert_copy_representation_matches_pool(existing, pool)
     existing.last_verified_at = now
     if existing.health == CopyHealth.MISSING:
         existing.health = record_health
@@ -188,6 +206,63 @@ def _health_for_record(
         f"{record.integrity_hash.hex()[:12]}…"
     )
     return CopyHealth.SUSPECT
+
+
+def _pool_for_record(
+    session: Session,
+    backend_row: Backend,
+    record: CopyRecord,
+) -> Pool | None:
+    pool_id = record.native_locator.get("pool_id")
+    if pool_id in {None, ""}:
+        return None
+    if not isinstance(pool_id, str) or not pool_id:
+        raise ScrubInvariantError(
+            f"backend {backend_row.name!r} yielded invalid pool_id {pool_id!r}"
+        )
+    pool = session.get(Pool, pool_id)
+    if pool is None:
+        raise ScrubInvariantError(
+            f"backend {backend_row.name!r} yielded unknown pool_id {pool_id!r}"
+        )
+    if pool.backend_id != backend_row.id:
+        raise ScrubInvariantError(
+            f"pool {pool_id!r} belongs to backend_id={pool.backend_id}, "
+            f"not backend_id={backend_row.id}"
+        )
+    return pool
+
+
+def _storage_metadata_for_record(
+    record: CopyRecord,
+    pool: Pool | None,
+) -> dict[str, object]:
+    metadata: dict[str, object] = dict(record.metadata)
+    if pool is None:
+        return metadata
+
+    observed = metadata.get("representation")
+    if observed is not None and observed != pool.representation:
+        raise ScrubInvariantError(
+            f"backend record for pool {pool.id!r} declares representation "
+            f"{observed!r}, but pool requires {pool.representation!r}"
+        )
+
+    representation = Representation(pool.representation)
+    metadata["representation"] = representation.value
+    if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
+        metadata.setdefault("chunk_size", RAO_CHUNK_SIZE)
+    return metadata
+
+
+def _assert_copy_representation_matches_pool(copy: Copy, pool: Pool) -> None:
+    observed = copy.storage_metadata.get("representation")
+    if observed == pool.representation:
+        return
+    raise ScrubInvariantError(
+        f"copy id={copy.id} has representation {observed!r}, "
+        f"but pool {pool.id!r} requires {pool.representation!r}"
+    )
 
 
 # --- helpers for non-CLI callers / tests ---------------------------------

@@ -24,7 +24,6 @@ from sutradhara.backend.port import (
     ByteRange,
     CopyRecord,
     StorageBackend,
-    TaggedPlacement,
 )
 from sutradhara.backend.remanence import RemanenceBackend
 from sutradhara.catalog.session import locator_key
@@ -324,42 +323,6 @@ def test_proto_native_locator_matches_write_path_locator_key(
         "body_format": "rem-tar-v1",
     }
     assert locator_key(record.native_locator) == locator_key(expected)
-
-
-def test_live_list_tagged_placements_discovers_tape_pool_tags(
-    proto_object: layer5_pb2.ObjectRecord,
-) -> None:
-    servicer = _Catalog(
-        proto_object,
-        pools=[
-            layer5_pb2.TapePool(
-                pool_id="private-copy-1",
-                display_name="Private copy 1",
-                content_class="video-priv",
-                copy_class="copy-1",
-            ),
-            layer5_pb2.TapePool(
-                pool_id="private-copy-2",
-                display_name="Private copy 2",
-                content_class="video-priv",
-                copy_class="copy-2",
-            ),
-        ],
-    )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
-    layer5_pb2_grpc.add_CatalogServicer_to_server(servicer, server)
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    try:
-        backend = RemanenceBackend.from_grpc("primary-tape", f"127.0.0.1:{port}")
-        placements = backend.list_tagged_placements()
-    finally:
-        server.stop(grace=None)
-
-    assert placements == [
-        TaggedPlacement("private-copy-1", "video-priv", "copy-1", "primary-tape"),
-        TaggedPlacement("private-copy-2", "video-priv", "copy-2", "primary-tape"),
-    ]
 
 
 _TAPE_UUID_HEX = "b8f6123456784e90aabbccddeeff0011"

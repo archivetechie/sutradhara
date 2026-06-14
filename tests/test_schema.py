@@ -36,7 +36,14 @@ engine.dispose()
 
     tables = _tables(db_path)
     assert "job" in tables
-    assert "placement_tag_pin" in tables
+    assert "pool" in tables
+    assert "artifactclass_pool" in tables
+    assert "bundle" in tables
+    assert "bundle_member" in tables
+    assert "asset_locator" in tables
+    assert "blob_root" in tables
+    assert "exclusion_record" in tables
+    assert "placement_tag_pin" not in tables
 
 
 def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
@@ -54,4 +61,11 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
 
     tables = _tables(db_path)
     assert "job" in tables
-    assert "placement_tag_pin" in tables
+    assert "pool" in tables
+    assert "artifactclass_pool" in tables
+    assert "bundle" in tables
+    assert "bundle_member" in tables
+    assert "asset_locator" in tables
+    assert "blob_root" in tables
+    assert "exclusion_record" in tables
+    assert "placement_tag_pin" not in tables

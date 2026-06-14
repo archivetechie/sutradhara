@@ -32,7 +32,6 @@ from sutradhara.backend.port import (
     BackendUnavailableError,
     ByteRange,
     CopyRecord,
-    TaggedPlacement,
     VerifyResult,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
@@ -50,8 +49,6 @@ _DEFAULT_JAR_GLOB = (
 _DEFAULT_TIMEOUT_SECONDS = 300.0
 _PAYLOAD_NAME = "payload.bin"
 _STATE_VERSION = 1
-
-PlacementConfig = TaggedPlacement | dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -76,7 +73,6 @@ class D2TapeBackend:
         java_bin: Path | str | None = None,
         device_env_path: Path | str = _DEFAULT_DEVICE_ENV,
         state_dir: Path | str = _DEFAULT_STATE_DIR,
-        placements: list[PlacementConfig] | None = None,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         file_backed: bool = False,
         temp_dir: Path | str | None = None,
@@ -94,10 +90,6 @@ class D2TapeBackend:
         self._temp_dir = Path(temp_dir) if temp_dir is not None else None
         self._stinit_script = str(stinit_script) if stinit_script is not None else None
         self._volume_uuid = volume_uuid
-        self._placements = tuple(
-            _placement_from_config(name, placement)
-            for placement in (placements or [])
-        )
 
     @property
     def name(self) -> str:
@@ -122,9 +114,6 @@ class D2TapeBackend:
                 if artifact.get("verified") is False:
                     continue
                 yield _record_from_sidecar_artifact(artifact)
-
-    def list_tagged_placements(self) -> list[TaggedPlacement]:
-        return list(self._placements)
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         device = self._device_config()
@@ -522,39 +511,6 @@ def _sha256_file(path: Path) -> ContentHash:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return content_hash(digest.digest())
-
-
-def _placement_from_config(
-    backend_name: str,
-    placement: PlacementConfig,
-) -> TaggedPlacement:
-    if isinstance(placement, TaggedPlacement):
-        return TaggedPlacement(
-            placement.placement_id,
-            placement.content_class,
-            placement.copy_class,
-            backend_name,
-            placement.representation,
-            placement.key_epoch,
-        )
-    try:
-        return TaggedPlacement(
-            placement_id=str(placement["placement_id"]),
-            content_class=str(placement["content_class"]),
-            copy_class=str(placement["copy_class"]),
-            backend_name=backend_name,
-            representation=str(placement.get("representation", "raw-bytes")),
-            key_epoch=(
-                None
-                if placement.get("key_epoch") is None
-                else str(placement.get("key_epoch"))
-            ),
-        )
-    except KeyError as exc:
-        raise ValueError(
-            "d2tape backend placement config must include placement_id, "
-            "content_class, and copy_class"
-        ) from exc
 
 
 def _load_json_object(path: Path) -> dict[str, Any]:

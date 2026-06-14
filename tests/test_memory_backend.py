@@ -15,10 +15,8 @@ from sutradhara.backend.port import (
     BackendNotFoundError,
     ByteRange,
     StorageBackend,
-    TaggedPlacement,
 )
 from sutradhara.catalog.types import content_hash
-from sutradhara.sealing.port import Representation
 
 
 def test_memory_backend_satisfies_storagebackend_protocol() -> None:
@@ -119,46 +117,6 @@ def test_corrupt_unknown_hash_raises() -> None:
     bogus = content_hash(hashlib.sha256(b"never stored").digest())
     with pytest.raises(BackendNotFoundError):
         backend.corrupt(bogus)
-
-
-def test_memory_backend_lists_declared_tagged_placements() -> None:
-    backend = MemoryBackend(
-        "mem",
-        placements=[
-            {
-                "placement_id": "mem-fast",
-                "content_class": "video-priv",
-                "copy_class": "copy-1",
-                "representation": "rao-plain-v1",
-            },
-            TaggedPlacement(
-                placement_id="mem-cold",
-                content_class="video-priv",
-                copy_class="copy-2",
-                backend_name="ignored",
-                representation=Representation.RAO_AEAD_V1.value,
-                key_epoch="1" * 32,
-            ),
-        ],
-    )
-
-    assert backend.list_tagged_placements() == [
-        TaggedPlacement(
-            "mem-fast",
-            "video-priv",
-            "copy-1",
-            "mem",
-            Representation.RAO_PLAIN_V1.value,
-        ),
-        TaggedPlacement(
-            "mem-cold",
-            "video-priv",
-            "copy-2",
-            "mem",
-            Representation.RAO_AEAD_V1.value,
-            "1" * 32,
-        ),
-    ]
 
 
 def test_byte_range_validates_negative() -> None:

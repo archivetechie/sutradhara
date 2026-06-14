@@ -17,11 +17,10 @@ from sutradhara.backend.port import (
     BackendLocator,
     ByteRange,
     CopyRecord,
-    TaggedPlacement,
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_copy
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset
+from sutradhara.catalog.models import Backend, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import (
     BackendKind,
@@ -32,6 +31,7 @@ from sutradhara.catalog.types import (
     content_hash,
 )
 from sutradhara.scrub import scrub_backend
+from sutradhara.sealing.port import Representation
 
 
 @pytest.fixture
@@ -63,9 +63,6 @@ class _MismatchedIntegrityBackend:
             size_bytes=13,
         )
 
-    def list_tagged_placements(self) -> list[TaggedPlacement]:
-        return []
-
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         raise AssertionError("read_range is not used by scrub")
 
@@ -93,9 +90,6 @@ class _DuplicateLocatorBackend:
         )
         yield record
         yield record
-
-    def list_tagged_placements(self) -> list[TaggedPlacement]:
-        return []
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         raise AssertionError("read_range is not used by scrub")
@@ -170,9 +164,6 @@ def test_scrub_existing_rao_copy_does_not_create_stored_digest_asset(
                 size_bytes=99,
             )
 
-        def list_tagged_placements(self) -> list[TaggedPlacement]:
-            return []
-
         def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
             raise AssertionError("read_range is not used by scrub")
 
@@ -187,15 +178,24 @@ def test_scrub_existing_rao_copy_does_not_create_stored_digest_asset(
         )
         s.add(row)
         s.flush()
+        s.add(
+            Pool(
+                id="o-copy-1-pool",
+                backend_id=row.id,
+                representation=Representation.RAO_PLAIN_V1.value,
+            )
+        )
         s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=15))
         s.flush()
         add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=row.id,
+            pool_id="o-copy-1-pool",
             native_locator=locator,
             integrity_hash=stored_digest,
             source=CopySource.INGEST,
+            storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
         )
 
         report = scrub_backend(s, row, _ExistingRaoBackend(), now=now)

@@ -1,9 +1,4 @@
-"""Harness-facing fan-out wrapper for Sutradhara replication.
-
-The scenario harness imports this module as a stable seam. It keeps the default
-replication behavior raw-byte compatible for existing content types and applies
-the Scenario O representation/key policy only for `o-archive`.
-"""
+"""Harness-facing fan-out wrapper for Sutradhara replication."""
 
 from __future__ import annotations
 
@@ -24,7 +19,6 @@ from sutradhara.replication import (
     self_heal as replication_self_heal,
 )
 from sutradhara.sealing.rao import RaoCliOpener, RaoCliSealer
-from sutradhara.sealing.policy import DEFAULT_POLICY, n_archive_policy, o_archive_policy
 
 
 def fan_out(
@@ -35,7 +29,7 @@ def fan_out(
     *,
     backends: WritableBackendMap,
 ) -> list[Copy]:
-    """Replicate one asset through the harness-facing representation policy seam."""
+    """Replicate one asset through catalog pool membership policy."""
     if content_type not in {"o-archive", "n-archive"}:
         return replicate_asset(
             session,
@@ -43,12 +37,10 @@ def fan_out(
             source_path,
             content_type,
             backends=backends,
-            policy=DEFAULT_POLICY,
         )
 
     registry = KeyRegistry()
     epoch = registry.create_epoch()
-    policy = n_archive_policy() if content_type == "n-archive" else o_archive_policy()
     return replicate_asset(
         session,
         asset_hash,
@@ -56,7 +48,6 @@ def fan_out(
         content_type,
         backends=backends,
         sealer=RaoCliSealer(registry),
-        policy=policy,
         key_epoch=epoch.key_id,
     )
 
@@ -68,20 +59,8 @@ def status(
     *,
     backends: BackendMap,
 ) -> ReplicationStatus:
-    """Report replication status through the harness-facing policy seam."""
-    if content_type == "o-archive":
-        policy = o_archive_policy()
-    elif content_type == "n-archive":
-        policy = n_archive_policy()
-    else:
-        policy = DEFAULT_POLICY
-    return replication_status(
-        session,
-        asset_hash,
-        content_type,
-        backends,
-        policy=policy,
-    )
+    """Report replication status through catalog pool membership policy."""
+    return replication_status(session, asset_hash, content_type, backends)
 
 
 def self_heal(
@@ -91,19 +70,17 @@ def self_heal(
     *,
     backends: WritableBackendMap,
 ) -> list[Copy]:
-    """Rebuild missing copies through the harness-facing self-heal seam."""
+    """Rebuild missing copies through catalog pool membership policy."""
     if content_type not in {"o-archive", "n-archive"}:
         return replication_self_heal(
             session,
             asset_hash,
             content_type,
             backends=backends,
-            policy=DEFAULT_POLICY,
         )
 
     registry = KeyRegistry()
     epoch = registry.create_epoch()
-    policy = n_archive_policy() if content_type == "n-archive" else o_archive_policy()
     return replication_self_heal(
         session,
         asset_hash,
@@ -111,6 +88,5 @@ def self_heal(
         backends=backends,
         opener=RaoCliOpener(registry),
         sealer=RaoCliSealer(registry),
-        policy=policy,
         key_epoch=epoch.key_id,
     )

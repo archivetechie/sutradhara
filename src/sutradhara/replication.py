@@ -1,10 +1,13 @@
-"""Placement-tagged replication orchestration.
+"""Pool-backed replication orchestration.
 
-This module is the first-cut fan-out library the harness drives for rem_tape
-multi-pool replication. The policy layer speaks only in tagged placements:
-`content_class` selects an asset family and `copy_class` selects durable copy
-slots. Backend-native details such as rem_tape `pool_id` and `tape_uuid` remain
-inside `Copy.native_locator`.
+Replication policy is catalog data:
+
+* ``pool`` owns the backend-native destination id and byte representation.
+* ``artifactclass_pool`` declares the active pools for an artifactclass.
+* ``copy.pool_id`` records which pool produced each materialized copy.
+
+Backends still own physical write/read mechanics, but they no longer advertise
+scenario-era content/copy tags.
 """
 
 from __future__ import annotations
@@ -13,24 +16,22 @@ import contextlib
 import hashlib
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypedDict, TypeVar
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.backend.port import (
     ByteRange,
     CopyRecord,
     StorageBackend,
-    TaggedPlacement,
 )
 from sutradhara.catalog.copies import add_copy
-from sutradhara.catalog.models import Copy, PlacementTagPin
+from sutradhara.catalog.models import ArtifactClassPool, Copy, Pool
 from sutradhara.catalog.types import BackendKind, CopyHealth, CopySource
 from sutradhara.keys import KeyEpoch, KeyRegistry
-from sutradhara.sealing.policy import DEFAULT_POLICY, RepresentationPolicy
 from sutradhara.sealing.port import Opener, Representation, Sealer, SealResult
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliOpener, RaoCliSealer
 
@@ -39,16 +40,20 @@ class ReplicationError(Exception):
     """Base class for replication policy and completeness errors."""
 
 
-class DuplicatePlacementClass(ReplicationError):
-    """Two target placements claim the same content/copy tag pair."""
+class ReplicationPolicyMissing(ReplicationError):
+    """No active pool membership exists for an artifactclass."""
+
+
+class PoolBackendUnavailable(ReplicationError):
+    """A target pool's backend was not supplied to the operation."""
 
 
 class ReplicationInvariantError(ReplicationError):
     """A durability invariant was violated by existing catalog rows."""
 
 
-class PlacementTagDrift(ReplicationInvariantError):
-    """A discovered placement's routing tags no longer match its pin."""
+class PoolRepresentationError(ReplicationInvariantError):
+    """A copy's stored representation metadata disagrees with its pool."""
 
 
 class SelfHealUnavailable(ReplicationError):
@@ -56,57 +61,104 @@ class SelfHealUnavailable(ReplicationError):
 
 
 class WritableStorageBackend(StorageBackend, Protocol):
-    """Storage backend surface needed by the first fan-out writer."""
+    """Storage backend surface needed by the fan-out writer."""
 
     def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
-        """Write `source` to this backend's placement id and return a copy."""
+        """Write `source` to this backend's pool id and return a copy record."""
         ...
+
+
+@dataclass(frozen=True)
+class PoolTarget:
+    """One active replication destination for an artifactclass."""
+
+    pool_id: str
+    artifactclass: str
+    backend_id: int
+    backend_name: str
+    representation: str
+    key_epoch: str | None = None
+    location: str = ""
+    offsite_gate: bool = False
+    tier: str = ""
+    sort_order: int = 0
 
 
 class ReplicationStatus(TypedDict):
     complete: bool
-    have: set[TaggedPlacement]
-    want: set[TaggedPlacement]
-    missing: set[TaggedPlacement]
+    have: set[PoolTarget]
+    want: set[PoolTarget]
+    missing: set[PoolTarget]
 
 
 TBackend = TypeVar("TBackend", bound=StorageBackend)
 BackendMap = Mapping[int, StorageBackend]
 WritableBackendMap = Mapping[int, WritableStorageBackend]
-PlacementTarget = tuple[TBackend, TaggedPlacement]
+PoolTargetEntry = tuple[TBackend, PoolTarget]
 
 
-def target_placements(
-    content_type: str,
+def target_pools(
+    session: Session,
+    artifactclass: str,
     backends: Mapping[int, TBackend],
     *,
-    policy: RepresentationPolicy = DEFAULT_POLICY,
     key_epoch: str | None = None,
-) -> set[PlacementTarget[TBackend]]:
-    """Return every placement matching `content_type`, one per copy class.
+) -> list[PoolTargetEntry[TBackend]]:
+    """Return active pool targets for ``artifactclass`` in catalog order."""
+    memberships = list(
+        session.scalars(
+            select(ArtifactClassPool)
+            .options(joinedload(ArtifactClassPool.pool).joinedload(Pool.backend))
+            .where(
+                ArtifactClassPool.artifactclass == artifactclass,
+                ArtifactClassPool.active.is_(True),
+            )
+            .order_by(ArtifactClassPool.sort_order, ArtifactClassPool.pool_id)
+        )
+    )
+    if not memberships:
+        raise ReplicationPolicyMissing(
+            f"artifactclass {artifactclass!r} has no active pool memberships"
+        )
 
-    This is the swappable policy point. Today's fixed policy is "all placements
-    whose `content_class` matches the asset content type, with duplicate
-    `copy_class` values rejected instead of guessed."
-    """
-    targets: set[PlacementTarget[TBackend]] = set()
-    by_copy_class: dict[str, tuple[TBackend, TaggedPlacement]] = {}
-    for backend in backends.values():
-        for placement in backend.list_tagged_placements():
-            if placement.content_class != content_type:
-                continue
-            existing = by_copy_class.get(placement.copy_class)
-            if existing is not None:
-                _, other = existing
-                raise DuplicatePlacementClass(
-                    f"content_type {content_type!r} has duplicate copy_class "
-                    f"{placement.copy_class!r}: {other.backend_name}/"
-                    f"{other.placement_id} and {placement.backend_name}/"
-                    f"{placement.placement_id}"
-                )
-            target = (backend, _apply_representation_policy(placement, policy, key_epoch))
-            by_copy_class[placement.copy_class] = target
-            targets.add(target)
+    targets: list[PoolTargetEntry[TBackend]] = []
+    seen: set[str] = set()
+    for membership in memberships:
+        pool = membership.pool
+        if pool.id in seen:
+            raise ReplicationInvariantError(
+                f"artifactclass {artifactclass!r} has duplicate pool {pool.id!r}"
+            )
+        seen.add(pool.id)
+
+        Representation(pool.representation)
+        backend = backends.get(pool.backend_id)
+        if backend is None:
+            raise PoolBackendUnavailable(
+                f"pool {pool.id!r} targets backend_id={pool.backend_id}, "
+                "which was not supplied"
+            )
+        targets.append(
+            (
+                backend,
+                PoolTarget(
+                    pool_id=pool.id,
+                    artifactclass=artifactclass,
+                    backend_id=pool.backend_id,
+                    backend_name=pool.backend.name,
+                    representation=pool.representation,
+                    key_epoch=(
+                        key_epoch
+                        if pool.representation == Representation.RAO_AEAD_V1.value
+                        else None
+                    ),
+                    location=pool.location,
+                    offsite_gate=pool.offsite_gate,
+                    tier=pool.tier,
+                    sort_order=membership.sort_order,
+                ),
+            )
+        )
     return targets
 
 
@@ -114,63 +166,45 @@ def replicate_asset(
     session: Session,
     asset_hash: bytes,
     source_path: Path | str,
-    content_type: str,
+    artifactclass: str,
     *,
     backends: WritableBackendMap,
     sealer: Sealer | None = None,
-    policy: RepresentationPolicy = DEFAULT_POLICY,
     key_epoch: str | None = None,
 ) -> list[Copy]:
-    """Replicate one asset to every target placement and record Copy rows.
-
-    Existing healthy copies in target placements are reused, so a rerun does not
-    create extra physical writes. New copies are written via the backend's
-    existing `write_object_to_pool` method and recorded through `add_copy`.
-    """
-    validate_placement_tags(session, backends)
-    targets = _sorted_targets(
-        target_placements(
-            content_type,
-            backends,
-            policy=policy,
-            key_epoch=key_epoch,
-        )
-    )
-    existing = _healthy_copies_by_placement(session, asset_hash, targets)
-    backend_ids = {id(backend): backend_id for backend_id, backend in backends.items()}
+    """Replicate one asset to every active pool for an artifactclass."""
+    targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
+    existing = _healthy_copies_by_pool(session, asset_hash, targets)
     sealer = sealer or RaoCliSealer(KeyRegistry())
 
     copies: list[Copy] = []
-    for backend, placement in targets:
-        backend_id = backend_ids[id(backend)]
-        existing_copy = existing.get(placement)
+    for backend, target in targets:
+        existing_copy = existing.get(target)
         if existing_copy is not None:
-            _pin_or_validate_placement(session, backend_id, placement)
+            _assert_copy_matches_pool(existing_copy, target)
             copies.append(existing_copy)
             continue
 
-        representation = Representation(placement.representation)
+        representation = Representation(target.representation)
         with sealer.seal(
             source_path,
             representation,
-            key_epoch=_epoch_for(placement, representation),
+            key_epoch=_epoch_for(target, representation),
         ) as sealed:
-            record = backend.write_object_to_pool(
-                sealed.sealed_path,
-                placement.placement_id,
-            )
-            _assert_copy_integrity(asset_hash, record, sealed, placement)
+            record = backend.write_object_to_pool(sealed.sealed_path, target.pool_id)
+            _assert_copy_integrity(asset_hash, record, sealed, target)
         copy, _ = add_copy(
             session,
             logical_asset_hash=asset_hash,
-            backend_id=backend_id,
+            backend_id=target.backend_id,
+            pool_id=target.pool_id,
             native_locator=record.native_locator,
             integrity_hash=sealed.stored_digest,
             source=CopySource.INGEST,
             health=CopyHealth.OK,
             storage_metadata=_copy_storage_metadata(representation),
         )
-        _pin_or_validate_placement(session, backend_id, placement)
+        _assert_copy_matches_pool(copy, target)
         copies.append(copy)
     return copies
 
@@ -179,64 +213,51 @@ def repair(
     session: Session,
     asset_hash: bytes,
     source_path: Path | str,
-    content_type: str,
+    artifactclass: str,
     *,
     backends: WritableBackendMap,
     sealer: Sealer | None = None,
-    policy: RepresentationPolicy = DEFAULT_POLICY,
     key_epoch: str | None = None,
 ) -> list[Copy]:
-    """Write copies for placements currently missing from replication status."""
+    """Write copies for active pools currently missing from replication status."""
     status = replication_status(
         session,
         asset_hash,
-        content_type,
+        artifactclass,
         backends,
-        policy=policy,
         key_epoch=key_epoch,
     )
     if not status["missing"]:
         return []
 
-    targets = _sorted_targets(
-        target_placements(
-            content_type,
-            backends,
-            policy=policy,
-            key_epoch=key_epoch,
-        )
-    )
+    targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
     missing = status["missing"]
-    backend_ids = {id(backend): backend_id for backend_id, backend in backends.items()}
     sealer = sealer or RaoCliSealer(KeyRegistry())
 
     repaired: list[Copy] = []
-    for backend, placement in targets:
-        if placement not in missing:
+    for backend, target in targets:
+        if target not in missing:
             continue
-        backend_id = backend_ids[id(backend)]
-        representation = Representation(placement.representation)
+        representation = Representation(target.representation)
         with sealer.seal(
             source_path,
             representation,
-            key_epoch=_epoch_for(placement, representation),
+            key_epoch=_epoch_for(target, representation),
         ) as sealed:
-            record = backend.write_object_to_pool(
-                sealed.sealed_path,
-                placement.placement_id,
-            )
-            _assert_copy_integrity(asset_hash, record, sealed, placement)
+            record = backend.write_object_to_pool(sealed.sealed_path, target.pool_id)
+            _assert_copy_integrity(asset_hash, record, sealed, target)
         copy, _ = add_copy(
             session,
             logical_asset_hash=asset_hash,
-            backend_id=backend_id,
+            backend_id=target.backend_id,
+            pool_id=target.pool_id,
             native_locator=record.native_locator,
             integrity_hash=sealed.stored_digest,
             source=CopySource.INGEST,
             health=CopyHealth.OK,
             storage_metadata=_copy_storage_metadata(representation),
         )
-        _pin_or_validate_placement(session, backend_id, placement)
+        _assert_copy_matches_pool(copy, target)
         repaired.append(copy)
     return repaired
 
@@ -244,28 +265,20 @@ def repair(
 def self_heal(
     session: Session,
     asset_hash: bytes,
-    content_type: str,
+    artifactclass: str,
     *,
     backends: WritableBackendMap,
     opener: Opener | None = None,
     sealer: Sealer | None = None,
-    policy: RepresentationPolicy = DEFAULT_POLICY,
     key_epoch: str | None = None,
     chooser: Callable[[Sequence[Copy]], Copy] | None = None,
 ) -> list[Copy]:
-    """Rebuild missing target copies from a surviving healthy copy.
-
-    The source is read from an existing backend copy, opened to plaintext under
-    that copy's representation, checked against the logical asset hash, then
-    passed through `repair()` so the missing placement is sealed according to
-    its own representation policy.
-    """
+    """Rebuild missing pool copies from a surviving healthy copy."""
     status = replication_status(
         session,
         asset_hash,
-        content_type,
+        artifactclass,
         backends,
-        policy=policy,
         key_epoch=key_epoch,
     )
     if not status["missing"]:
@@ -284,25 +297,26 @@ def self_heal(
             f"uses backend_id={source.backend_id}, which is not available"
         )
 
-    source_placement = _placement_for_copy(
+    source_target = _pool_for_copy(
+        session,
         source,
-        content_type,
+        artifactclass,
         backends,
-        policy=policy,
         key_epoch=key_epoch,
     )
-    if source_placement is None:
+    if source_target is None:
         raise SelfHealUnavailable(
             f"cannot self-heal {asset_hash.hex()}: source copy id={source.id} "
-            "does not belong to a target placement"
+            "does not belong to an active target pool"
         )
 
     opener = opener or RaoCliOpener(KeyRegistry())
-    representation = Representation(source_placement.representation)
+    representation = Representation(source_target.representation)
+    _assert_copy_matches_pool(source, source_target)
     with _materialized_copy_path(source_backend, source) as stored_path, opener.open(
         stored_path,
         representation,
-        key_epoch=_epoch_for(source_placement, representation),
+        key_epoch=_epoch_for(source_target, representation),
     ) as plaintext_path:
         plaintext_digest = _sha256_file(plaintext_path)
         if plaintext_digest != asset_hash:
@@ -315,10 +329,9 @@ def self_heal(
             session,
             asset_hash,
             plaintext_path,
-            content_type,
+            artifactclass,
             backends=backends,
             sealer=sealer,
-            policy=policy,
             key_epoch=key_epoch,
         )
 
@@ -326,40 +339,32 @@ def self_heal(
 def replication_status(
     session: Session,
     asset_hash: bytes,
-    content_type: str,
+    artifactclass: str,
     backends: BackendMap,
     *,
-    policy: RepresentationPolicy = DEFAULT_POLICY,
     key_epoch: str | None = None,
 ) -> ReplicationStatus:
-    """Report whether an asset has healthy copies in all target placements."""
-    validate_placement_tags(session, backends)
-    targets = target_placements(
-        content_type,
-        backends,
-        policy=policy,
-        key_epoch=key_epoch,
-    )
-    target_placements_by_key = {
-        _placement_key(placement): placement for _, placement in targets
-    }
-    want = set(target_placements_by_key.values())
-    have: set[TaggedPlacement] = set()
-    media_id_by_placement: dict[TaggedPlacement, str] = {}
+    """Report whether an asset has healthy copies in all active pools."""
+    targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
+    targets_by_key = {_pool_key(target): target for _, target in targets}
+    want = set(targets_by_key.values())
+    have: set[PoolTarget] = set()
+    media_id_by_target: dict[PoolTarget, str] = {}
 
     for copy in _healthy_copies(session, asset_hash):
-        key = _copy_placement_key(copy)
+        key = _copy_pool_key(copy)
         if key is None:
             continue
-        placement = target_placements_by_key.get(key)
-        if placement is None:
+        target = targets_by_key.get(key)
+        if target is None:
             continue
-        have.add(placement)
+        _assert_copy_matches_pool(copy, target)
+        have.add(target)
         media_id = _copy_media_id(copy)
         if media_id:
-            media_id_by_placement[placement] = media_id
+            media_id_by_target[target] = media_id
 
-    _assert_distinct_media(have, media_id_by_placement)
+    _assert_distinct_media(have, media_id_by_target)
     missing = want - have
     return {
         "complete": not missing,
@@ -367,24 +372,6 @@ def replication_status(
         "want": want,
         "missing": missing,
     }
-
-
-def validate_placement_tags(
-    session: Session,
-    backends: BackendMap,
-) -> None:
-    """Compare discovered placement tags against any existing pins.
-
-    Missing pins are allowed during discovery. A mismatch is treated as a
-    reconciliation halt because silently acting on changed tags can mis-route
-    future copies.
-    """
-    for backend_id, backend in backends.items():
-        for placement in backend.list_tagged_placements():
-            pin = _get_placement_pin(session, backend_id, placement.placement_id)
-            if pin is None:
-                continue
-            _assert_pin_matches(pin, placement)
 
 
 def select_restore_source(
@@ -409,33 +396,21 @@ def select_restore_source(
     return selected
 
 
-def _sorted_targets(
-    targets: set[PlacementTarget[TBackend]],
-) -> list[PlacementTarget[TBackend]]:
-    return sorted(
-        targets,
-        key=lambda target: (
-            target[1].copy_class,
-            target[1].backend_name,
-            target[1].placement_id,
-        ),
-    )
-
-
-def _healthy_copies_by_placement(
+def _healthy_copies_by_pool(
     session: Session,
     asset_hash: bytes,
-    targets: list[PlacementTarget[WritableStorageBackend]],
-) -> dict[TaggedPlacement, Copy]:
-    by_key = {_placement_key(placement): placement for _, placement in targets}
-    result: dict[TaggedPlacement, Copy] = {}
+    targets: list[PoolTargetEntry[WritableStorageBackend]],
+) -> dict[PoolTarget, Copy]:
+    by_key = {_pool_key(target): target for _, target in targets}
+    result: dict[PoolTarget, Copy] = {}
     for copy in _healthy_copies(session, asset_hash):
-        key = _copy_placement_key(copy)
+        key = _copy_pool_key(copy)
         if key is None:
             continue
-        placement = by_key.get(key)
-        if placement is not None and placement not in result:
-            result[placement] = copy
+        target = by_key.get(key)
+        if target is not None and target not in result:
+            _assert_copy_matches_pool(copy, target)
+            result[target] = copy
     return result
 
 
@@ -452,103 +427,29 @@ def _healthy_copies(session: Session, asset_hash: bytes) -> list[Copy]:
     )
 
 
-def _placement_key(placement: TaggedPlacement) -> tuple[str, str]:
-    return (placement.backend_name, placement.placement_id)
+def _pool_key(target: PoolTarget) -> tuple[int, str]:
+    return (target.backend_id, target.pool_id)
 
 
-def _placement_for_copy(
+def _copy_pool_key(copy: Copy) -> tuple[int, str] | None:
+    if copy.pool_id is None:
+        return None
+    return (copy.backend_id, copy.pool_id)
+
+
+def _pool_for_copy(
+    session: Session,
     copy: Copy,
-    content_type: str,
+    artifactclass: str,
     backends: BackendMap,
     *,
-    policy: RepresentationPolicy,
     key_epoch: str | None,
-) -> TaggedPlacement | None:
-    key = _copy_placement_key(copy)
+) -> PoolTarget | None:
+    key = _copy_pool_key(copy)
     if key is None:
         return None
-    targets = target_placements(
-        content_type,
-        backends,
-        policy=policy,
-        key_epoch=key_epoch,
-    )
-    return {_placement_key(placement): placement for _, placement in targets}.get(key)
-
-
-def _apply_representation_policy(
-    placement: TaggedPlacement,
-    policy: RepresentationPolicy,
-    key_epoch: str | None,
-) -> TaggedPlacement:
-    representation = policy.get(
-        (placement.content_class, placement.copy_class),
-        placement.representation,
-    )
-    Representation(representation)
-    placement_key_epoch = (
-        key_epoch
-        if representation == Representation.RAO_AEAD_V1.value
-        else placement.key_epoch
-    )
-    return replace(
-        placement,
-        representation=representation,
-        key_epoch=placement_key_epoch,
-    )
-
-
-def _get_placement_pin(
-    session: Session,
-    backend_id: int,
-    placement_id: str,
-) -> PlacementTagPin | None:
-    return session.scalars(
-        select(PlacementTagPin).where(
-            PlacementTagPin.backend_id == backend_id,
-            PlacementTagPin.placement_id == placement_id,
-        )
-    ).one_or_none()
-
-
-def _pin_or_validate_placement(
-    session: Session,
-    backend_id: int,
-    placement: TaggedPlacement,
-) -> PlacementTagPin:
-    pin = _get_placement_pin(session, backend_id, placement.placement_id)
-    if pin is not None:
-        _assert_pin_matches(pin, placement)
-        return pin
-
-    pin = PlacementTagPin(
-        backend_id=backend_id,
-        placement_id=placement.placement_id,
-        content_class=placement.content_class,
-        copy_class=placement.copy_class,
-    )
-    session.add(pin)
-    session.flush()
-    return pin
-
-
-def _assert_pin_matches(pin: PlacementTagPin, placement: TaggedPlacement) -> None:
-    if pin.content_class == placement.content_class and pin.copy_class == placement.copy_class:
-        return
-    raise PlacementTagDrift(
-        "reconciliation halt: placement tag drift for "
-        f"{placement.backend_name}/{placement.placement_id}; pinned "
-        f"content_class={pin.content_class!r}, copy_class={pin.copy_class!r}; "
-        f"discovered content_class={placement.content_class!r}, "
-        f"copy_class={placement.copy_class!r}"
-    )
-
-
-def _copy_placement_key(copy: Copy) -> tuple[str, str] | None:
-    placement_id = copy.native_locator.get("pool_id")
-    if not isinstance(placement_id, str):
-        return None
-    return (copy.backend.name, placement_id)
+    targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
+    return {_pool_key(target): target for _, target in targets}.get(key)
 
 
 def _copy_media_id(copy: Copy) -> str | None:
@@ -577,52 +478,60 @@ def _materialized_copy_path(
 
 
 def _epoch_for(
-    placement: TaggedPlacement,
+    target: PoolTarget,
     representation: Representation,
 ) -> KeyEpoch | None:
     if representation is not Representation.RAO_AEAD_V1:
         return None
-    if placement.key_epoch is None:
+    if target.key_epoch is None:
         raise ReplicationInvariantError(
-            "encrypted placement requires key_epoch for "
-            f"{placement.backend_name}/{placement.placement_id}"
+            "encrypted pool requires key_epoch for "
+            f"{target.backend_name}/{target.pool_id}"
         )
-    return KeyEpoch(key_id=placement.key_epoch, created_at="", active=True)
+    return KeyEpoch(key_id=target.key_epoch, created_at="", active=True)
 
 
 def _copy_storage_metadata(representation: Representation) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"representation": representation.value}
     if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
-        return {
-            "representation": representation.value,
-            "chunk_size": RAO_CHUNK_SIZE,
-        }
-    return {}
+        metadata["chunk_size"] = RAO_CHUNK_SIZE
+    return metadata
+
+
+def _assert_copy_matches_pool(copy: Copy, target: PoolTarget) -> None:
+    copy_representation = copy.storage_metadata.get("representation")
+    if copy_representation == target.representation:
+        return
+    raise PoolRepresentationError(
+        f"copy id={copy.id} has representation {copy_representation!r}; "
+        f"pool {target.pool_id!r} requires {target.representation!r}"
+    )
 
 
 def _assert_copy_integrity(
     asset_hash: bytes,
     record: CopyRecord,
     seal_result: SealResult,
-    placement: TaggedPlacement,
+    target: PoolTarget,
 ) -> None:
     if seal_result.representation is Representation.RAW_BYTES:
         if record.logical_id == asset_hash and record.integrity_hash == asset_hash:
             return
         raise ReplicationInvariantError(
             "raw-bytes copy hash differs from asset for "
-            f"{placement.backend_name}/{placement.placement_id}"
+            f"{target.backend_name}/{target.pool_id}"
         )
 
     if seal_result.plaintext_digest != asset_hash:
         raise ReplicationInvariantError(
             "sealed plaintext_digest differs from requested asset for "
-            f"{placement.backend_name}/{placement.placement_id}"
+            f"{target.backend_name}/{target.pool_id}"
         )
     if record.integrity_hash == seal_result.stored_digest:
         return
     raise ReplicationInvariantError(
         "backend stored bytes differ from sealed representation for "
-        f"{placement.backend_name}/{placement.placement_id}"
+        f"{target.backend_name}/{target.pool_id}"
     )
 
 
@@ -635,38 +544,37 @@ def _sha256_file(path: Path) -> bytes:
 
 
 def _assert_distinct_media(
-    have: set[TaggedPlacement],
-    media_id_by_placement: dict[TaggedPlacement, str],
+    have: set[PoolTarget],
+    media_id_by_target: dict[PoolTarget, str],
 ) -> None:
-    missing_media_id = have - set(media_id_by_placement)
+    missing_media_id = have - set(media_id_by_target)
     if missing_media_id:
-        [placement] = _sorted_placements(missing_media_id)[:1]
+        [target] = _sorted_targets(missing_media_id)[:1]
         raise ReplicationInvariantError(
-            "target placement copies must include tape_uuid or volume_uuid to "
+            "target pool copies must include tape_uuid or volume_uuid to "
             "assert durability; "
-            f"{placement.backend_name}/{placement.placement_id} is missing tape_uuid"
+            f"{target.backend_name}/{target.pool_id} is missing tape_uuid"
         )
 
-    seen: dict[str, TaggedPlacement] = {}
-    for placement, media_id in media_id_by_placement.items():
+    seen: dict[str, PoolTarget] = {}
+    for target, media_id in media_id_by_target.items():
         other = seen.get(media_id)
         if other is not None:
             raise ReplicationInvariantError(
-                "target placements must resolve to distinct tape_uuid/media "
+                "target pools must resolve to distinct tape_uuid/media "
                 "identifiers; "
-                f"{other.backend_name}/{other.placement_id} and "
-                f"{placement.backend_name}/{placement.placement_id} both use "
-                f"{media_id}"
+                f"{other.backend_name}/{other.pool_id} and "
+                f"{target.backend_name}/{target.pool_id} both use {media_id}"
             )
-        seen[media_id] = placement
+        seen[media_id] = target
 
 
-def _sorted_placements(placements: set[TaggedPlacement]) -> list[TaggedPlacement]:
+def _sorted_targets(targets: set[PoolTarget]) -> list[PoolTarget]:
     return sorted(
-        placements,
-        key=lambda placement: (
-            placement.copy_class,
-            placement.backend_name,
-            placement.placement_id,
+        targets,
+        key=lambda target: (
+            target.sort_order,
+            target.backend_name,
+            target.pool_id,
         ),
     )

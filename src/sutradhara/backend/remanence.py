@@ -37,7 +37,6 @@ from sutradhara.backend.port import (
     BackendUnavailableError,
     ByteRange,
     CopyRecord,
-    TaggedPlacement,
     VerifyResult,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
@@ -270,11 +269,6 @@ class RemanenceBackend:
                     },
                 )
 
-    def list_tagged_placements(self) -> list[TaggedPlacement]:
-        if self._catalog is None:
-            return []
-        return self._list_tagged_placements_grpc()
-
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         if self._read_session is not None:
             return self._read_range_grpc(locator, byte_range)
@@ -388,35 +382,6 @@ class RemanenceBackend:
                 "live read_range/verify require a live daemon (from_grpc)"
             )
         return self._read_session
-
-    def _list_tagged_placements_grpc(self) -> list[TaggedPlacement]:
-        catalog = self._require_catalog()
-        placements: list[TaggedPlacement] = []
-        page_token = b""
-        try:
-            while True:
-                request = layer5_pb2.ListTapePoolsRequest()
-                if page_token:
-                    request.page_token.value = page_token
-                response = catalog.ListTapePools(request)
-                placements.extend(
-                    TaggedPlacement(
-                        placement_id=pool.pool_id,
-                        content_class=pool.content_class,
-                        copy_class=pool.copy_class,
-                        backend_name=self._name,
-                    )
-                    for pool in response.pools
-                )
-                page_token = response.next_page_token.value
-                if not page_token:
-                    break
-        except grpc.RpcError as e:
-            raise BackendUnavailableError(
-                f"Remanence Catalog.ListTapePools at {self._endpoint!r} failed: "
-                f"{_rpc_error_text(e)}"
-            ) from e
-        return placements
 
     def _read_range_grpc(
         self,

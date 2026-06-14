@@ -12,14 +12,11 @@ import hashlib
 import json
 import stat
 from pathlib import Path
-from typing import Any
-
 import pytest
 
 from sutradhara.backend.d2tape import D2TapeBackend
-from sutradhara.backend.port import ByteRange, StorageBackend, TaggedPlacement
+from sutradhara.backend.port import ByteRange, StorageBackend
 from sutradhara.catalog.types import content_hash
-from sutradhara.sealing.port import Representation
 
 
 def test_d2tape_backend_satisfies_storagebackend_protocol(
@@ -84,38 +81,9 @@ def test_write_read_verify_round_trip_and_sidecar_progression(
     ]
 
 
-def test_d2tape_backend_lists_declared_placements(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend, _ = _backend(
-        tmp_path,
-        monkeypatch,
-        placements=[
-            {
-                "placement_id": "n-copy-3",
-                "content_class": "n-archive",
-                "copy_class": "copy-3",
-                "representation": Representation.D2TAR_RAW.value,
-            }
-        ],
-    )
-
-    assert backend.list_tagged_placements() == [
-        TaggedPlacement(
-            "n-copy-3",
-            "n-archive",
-            "copy-3",
-            "d2-tape",
-            Representation.D2TAR_RAW.value,
-        )
-    ]
-
-
 def _backend(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    placements: list[TaggedPlacement | dict[str, Any]] | None = None,
 ) -> tuple[D2TapeBackend, Path]:
     java, jar, log_path = _fake_d2_cli(tmp_path, monkeypatch)
     device_env = tmp_path / "device.env"
@@ -138,7 +106,6 @@ def _backend(
             java_bin=java,
             device_env_path=device_env,
             state_dir=tmp_path / "state",
-            placements=placements,
             timeout_seconds=10,
         ),
         log_path,
