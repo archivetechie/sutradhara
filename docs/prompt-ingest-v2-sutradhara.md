@@ -9,6 +9,22 @@
 >
 > **PHASED — implement and commit per phase, in this order. Each phase is
 > independently shippable and verified by its harness scenario.**
+>
+> **RAO REFRESH / PARTIAL SUPERSESSION (2026-06-14).** amber was merged into
+> remanence as RAO (migration complete). Sealing/opening is now
+> `sutradhara/sealing/rao.py` (`RaoCliSealer`/`RaoCliOpener` over `rem-debug
+> archive build/inspect/extract`); representations `rao-plain-v1` / `rao-aead-v1`;
+> `AmberCliSealer`/`sealing/amber.py` are deleted. **Phase S's bundler
+> (`sutradhara/bundle.py` GNU-tar + `TarInfo.offset_data` PFR + the
+> `rem-tar-v1[AOF1[tar]]` nesting) is SUPERSEDED by
+> `~/remanence/docs/ingest-policy-design-v0.1.md` (approved 2026-06-12):** files
+> become first-class RAO entries (native manifest PFR); small/non-compliant
+> trees wrap as `.remwrap.tar` entries inside one RAO object via a ruleset
+> (`rem archive build --rules`, verbs `granular`/`blob`/`exclude`); ranged
+> single-file restore is RAO's native member range-extract (+ an optional
+> catalog blob inner-index). Phases R/T/U + the catalog/VS/lifecycle model stand
+> on RAO. **Re-cut Phase S against the ruleset design before implementing it** —
+> the Phase S section below is the obsolete GNU-tar-bundle plan.
 
 ## Phase S — Bundling + data-driven policies (storage-critical, do first)
 
@@ -70,8 +86,8 @@
    path (config). Register both as assets with **derivation edges**
    (`asset_derivation(derived, source, kind=mezz|preview)`).
    ffmpeg absent or per-file failure ⇒ flag `no-proxy`, never blocks archiving.
-4. **Cloud temp blob**: tar the whole intake dir (reuse the bundler) → amber
-   aead-stream-v1 seal (epoch key from the registry) → upload to the **S3
+4. **Cloud temp blob**: tar the whole intake dir → RAO `rao-aead-v1` seal
+   (`RaoCliSealer`, epoch key from the registry) → upload to the **S3
    backend** (new `backend/s3.py`, `BackendKind.S3`, boto3; config
    `{endpoint_url?, bucket, prefix, storage_class}` — `DEEP_ARCHIVE` in prod,
    omitted under dev MinIO) → one copy row, placement `cloud-temp`, keyed to the
@@ -125,16 +141,16 @@
 - **Artifactclass policy documents** — archival scope ONLY (placements,
   proxies, bundling), strict versioned validation (unknown keys = error), one
   accessor module. Governance policies (access, approval) key on TAGS, never on
-  classes. Test classes: `s-masters` → s-copy-1 (rem, aof-raw-v1, copy-1) +
-  s-copy-2 (rem, aof-aead-stream-v1, copy-2, offsite_gate=true) + s-copy-3
-  (d2-tape, d2tar-raw, copy-3); `s-proxy` → s-proxy pool (rem, aof-raw-v1,
+  classes. Test classes: `s-masters` → s-copy-1 (rem, rao-plain-v1, copy-1) +
+  s-copy-2 (rem, rao-aead-v1, copy-2, offsite_gate=true) + s-copy-3
+  (d2-tape, d2tar-raw, copy-3); `s-proxy` → s-proxy pool (rem, rao-plain-v1,
   copy-1; no offsite_gate). Production classes are config, not code.
 - **Bundle:** PAX tar, path-sorted, uncompressed; PFR = `(asset, bundle, offset,
   length)` from `TarInfo.offset_data`; bundle copies recorded like any object;
   copy-3 = d2tape-native tar of the same files (its per-file blocks are its PFR).
 - **Cloud:** backend name `cloud-temp`, kind s3; blob key
-  `intakes/<intake-id>.aof`; encrypted (aead) always; storage_class DEEP_ARCHIVE
-  in prod, plain under dev MinIO.
+  `intakes/<intake-id>.rao`; encrypted (rao-aead-v1) always; storage_class
+  DEEP_ARCHIVE in prod, plain under dev MinIO.
 - **Lifecycle gate (recipe-relative):** releasable(asset) = every copy_class in
   its class's recipe verified AND every `offsite_gate` placement
   `offsite_confirmed` (via `sutra offsite confirm`). Proxy-only assets (no
@@ -148,7 +164,8 @@
   (never as loose tiny artifacts — legacy shoeshine lesson).
 - **Key registry:** unchanged (`$SUTRADHARA_KEY_REGISTRY_DIR`).
 - **Verification chain:** card-stream sha256 (MHL) → intake re-hash → seal-time
-  `plaintext_digest` assert; send-matching by `(st_dev, st_ino)`+size with
+  RAO per-member `file_sha256` == registered (the asset hash — NOT RAO's
+  tar-body `plaintext_digest`); send-matching by `(st_dev, st_ino)`+size with
   hash-match fallback — no separate re-hash pass.
 
 ## Constraints

@@ -4,6 +4,23 @@
 > **Repo: `~/sutradhara/repo`.** Work order: `docs/prompt-ingest-v2-sutradhara.md`
 > (Phase S). Master design: `~/system/docs/design-ingest-flow.md`. Verified by
 > harness **scenario-S**. This doc is the *how*, grounded in the current code.
+>
+> **SUPERSEDED (2026-06-14) — DO NOT IMPLEMENT AS-IS.** This Phase S design is
+> built on amber as a *separate opaque sealer*: the §2 `rem-tar-v1[AOF1[bundle.tar]]`
+> nesting, the §3 `bundle`/`pfr` catalog tables keyed on harness-built
+> `TarInfo.offset_data`, the §5 GNU-tar bundler, the §6 `AmberCliSealer` fan-out.
+> Amber was merged into remanence as RAO (migration complete) and the bundling
+> model is replaced by `~/remanence/docs/ingest-policy-design-v0.1.md` (approved
+> 2026-06-12): media-sized files are first-class **RAO entries** with native
+> manifest PFR; small/non-compliant trees wrap as `.remwrap.tar` *inside one RAO
+> object* via a `granular`/`blob`/`exclude` ruleset (`rem archive build --rules`);
+> ranged single-file restore is RAO-native (+ an optional catalog blob
+> inner-index). **What survives — the intent:** single-class containers, no
+> shoeshine, two-integrity-layers/one-read, per-file asset identity via PFR,
+> oversize-split deferred, d2 shelf = commodity-tar-readable. §4 (policy
+> documents) and §7 (d2 bundle-level write) largely carry. **Re-cut against the
+> ruleset design: keep the intent, drop the GNU-tar-bundle + offset-PFR +
+> AOF-nesting mechanism.**
 
 ## 0. What Phase S adds
 Today `fan_out → replicate_asset` seals **one asset**; `Copy.logical_asset_hash`
