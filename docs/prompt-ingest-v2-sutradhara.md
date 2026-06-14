@@ -17,7 +17,7 @@
 > `AmberCliSealer`/`sealing/amber.py` are deleted. **Phase S's bundler
 > (`sutradhara/bundle.py` GNU-tar + `TarInfo.offset_data` PFR + the
 > `rem-tar-v1[AOF1[tar]]` nesting) is SUPERSEDED by
-> `~/remanence/docs/ingest-policy-design-v0.1.md` (approved 2026-06-12):** files
+> `~/system/docs/design-ingest-v2-rao-archive.md` (approved 2026-06-12):** files
 > become first-class RAO entries (native manifest PFR); small/non-compliant
 > trees wrap as `.remwrap.tar` entries inside one RAO object via a ruleset
 > (`rem archive build --rules`, verbs `granular`/`blob`/`exclude`); ranged

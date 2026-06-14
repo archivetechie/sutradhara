@@ -10,7 +10,7 @@
 > nesting, the §3 `bundle`/`pfr` catalog tables keyed on harness-built
 > `TarInfo.offset_data`, the §5 GNU-tar bundler, the §6 `AmberCliSealer` fan-out.
 > Amber was merged into remanence as RAO (migration complete) and the bundling
-> model is replaced by `~/remanence/docs/ingest-policy-design-v0.1.md` (approved
+> model is replaced by `~/system/docs/design-ingest-v2-rao-archive.md` (approved
 > 2026-06-12): media-sized files are first-class **RAO entries** with native
 > manifest PFR; small/non-compliant trees wrap as `.remwrap.tar` *inside one RAO
 > object* via a `granular`/`blob`/`exclude` ruleset (`rem archive build --rules`);
