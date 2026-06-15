@@ -18,6 +18,38 @@ def _tables(db_path: Path) -> set[str]:
         return {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
 
 
+def _unique_index_columns(db_path: Path, table: str) -> set[tuple[str, ...]]:
+    with sqlite3.connect(db_path) as conn:
+        result: set[tuple[str, ...]] = set()
+        for row in conn.execute(f"PRAGMA index_list({table})"):
+            index_name = row[1]
+            unique = bool(row[2])
+            if not unique:
+                continue
+            columns = tuple(col[2] for col in conn.execute(f"PRAGMA index_info({index_name})"))
+            result.add(columns)
+        return result
+
+
+def _table_sql(db_path: Path, table: str) -> str:
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "select sql from sqlite_master where type='table' and name=?",
+            (table,),
+        ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def _assert_archive_invariants(db_path: Path) -> None:
+    assert (
+        "copy_id",
+        "logical_asset_hash",
+        "member_path",
+    ) in _unique_index_columns(db_path, "asset_locator")
+    assert "ck_copy_asset_xor_bundle" in _table_sql(db_path, "copy")
+
+
 def test_create_all_creates_job_table_without_prior_job_import(tmp_path: Path) -> None:
     db_path = tmp_path / "create_all.db"
     code = f"""
@@ -41,6 +73,7 @@ engine.dispose()
     assert "exclusion_record" in tables
     assert "review_decision" in tables
     assert "placement_tag_pin" not in tables
+    _assert_archive_invariants(db_path)
 
 
 def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
@@ -68,3 +101,30 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     assert "exclusion_record" in tables
     assert "review_decision" in tables
     assert "placement_tag_pin" not in tables
+    _assert_archive_invariants(db_path)
+
+
+def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
+    db_path = tmp_path / "roundtrip.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+
+    for target in ("head", "base", "head"):
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "alembic",
+                "upgrade" if target == "head" else "downgrade",
+                target,
+            ],
+            cwd=repo_root,
+            env=env,
+            check=True,
+        )
+
+    tables = _tables(db_path)
+    assert "asset_locator" in tables
+    assert "copy" in tables
+    _assert_archive_invariants(db_path)

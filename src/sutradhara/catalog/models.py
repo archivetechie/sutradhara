@@ -314,6 +314,14 @@ class AssetLocator(Base):
     """A per-asset locator, including bundle-derived locations."""
 
     __tablename__ = "asset_locator"
+    __table_args__ = (
+        UniqueConstraint(
+            "copy_id",
+            "logical_asset_hash",
+            "member_path",
+            name="uq_asset_locator_copy_asset_member",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     logical_asset_hash: Mapped[bytes] = mapped_column(
@@ -341,6 +349,7 @@ class AssetLocator(Base):
         index=True,
     )
     native_locator: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    member_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     representation: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
@@ -471,8 +480,9 @@ class Copy(Base):
             name="uq_copy_backend_locator",
         ),
         CheckConstraint(
-            "logical_asset_hash IS NOT NULL OR bundle_id IS NOT NULL",
-            name="ck_copy_asset_or_bundle",
+            "(logical_asset_hash IS NOT NULL AND bundle_id IS NULL) OR "
+            "(logical_asset_hash IS NULL AND bundle_id IS NOT NULL)",
+            name="ck_copy_asset_xor_bundle",
         ),
     )
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterator
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -13,14 +15,19 @@ from sqlalchemy import Engine, select
 
 from sutradhara.archive_bundle import bundle_due, enqueue_artifact
 from sutradhara.archive_fanout import (
+    ArchiveFanoutError,
+    BuildArtifact,
     BundleHeld,
     BundleOversize,
     ConformanceScan,
     DeviationCluster,
+    HmacManifestSigner,
     LocalArchiveBuilder,
+    ManifestSigningError,
     flush_bundle,
 )
 from sutradhara.archive_restore import (
+    RemArchiveExtractor,
     RestoreIntegrityError,
     RestoreSourceUnavailable,
     restore_asset,
@@ -33,9 +40,10 @@ from sutradhara.artifactclass_policy import (
     get_artifactclass_policy,
 )
 from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, VerifyResult
+from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import AssetLocator, Backend, Bundle, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, make_engine, session_scope
-from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, content_hash
+from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
 from sutradhara.sealing.port import Representation
 
 
@@ -119,6 +127,31 @@ class _DeviationBuilder(LocalArchiveBuilder):
                 ),
             )
         )
+
+
+class _BadLocatorBuilder(LocalArchiveBuilder):
+    def build(self, **kwargs: Any) -> BuildArtifact:
+        artifact = super().build(**kwargs)
+        [first, *rest] = artifact.members
+        bad_first = replace(
+            first,
+            native_locator={
+                **first.native_locator,
+                "offset": int(first.native_locator["offset"]) + 1,
+            },
+        )
+        return replace(artifact, members=(bad_first, *rest))
+
+
+class _FakeKeyRegistry:
+    def __init__(self, key_path: Path) -> None:
+        self.key_path = key_path
+        self.seen: list[str] = []
+
+    @contextmanager
+    def materialized_root_key(self, key_id: str) -> Iterator[Path]:
+        self.seen.append(key_id)
+        yield self.key_path
 
 
 def _digest(data: bytes) -> bytes:
@@ -240,6 +273,7 @@ def test_enqueue_due_and_flush_fans_out_bundle_copies(
             },
             builder=LocalArchiveBuilder(),
             deliverables_dir=tmp_path / "manifests",
+            manifest_signer=HmacManifestSigner(b"receipt-secret", "test-key"),
         )
 
         sealed = s.get(Bundle, setup.bundle_id)
@@ -249,6 +283,10 @@ def test_enqueue_due_and_flush_fans_out_bundle_copies(
         assert result.manifest_path is not None
         assert Path(result.manifest_path).exists()
         assert sealed.customer_manifest_path == result.manifest_path
+        receipt = json.loads(Path(result.manifest_path).read_text())
+        assert receipt["signature"]["algorithm"] == "hmac-sha256"
+        assert receipt["signature"]["key_id"] == "test-key"
+        assert receipt["manifest"]["representation"] == Representation.RAO_PLAIN_V1.value
 
         copies = list(s.scalars(select(Copy).order_by(Copy.pool_id)))
         assert {copy.pool_id for copy in copies} == {
@@ -259,6 +297,25 @@ def test_enqueue_due_and_flush_fans_out_bundle_copies(
         assert len(list(s.scalars(select(AssetLocator)))) == 4
         assert rem_backend.writes == ["o-copy-1-pool"]
         assert d2_backend.writes == ["d2-shelf-pool"]
+
+
+def test_manifest_receipt_requires_keyed_signer(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_bundle(engine, tmp_path)
+
+    with session_scope(engine) as s, pytest.raises(ManifestSigningError):
+        flush_bundle(
+            s,
+            bundle_id=setup.bundle_id,
+            backends={
+                setup.rem_backend_id: _ArchiveWriteBackend("rem"),
+                setup.d2_backend_id: _ArchiveWriteBackend("d2"),
+            },
+            builder=LocalArchiveBuilder(),
+            deliverables_dir=tmp_path / "manifests",
+        )
 
 
 def test_compliant_expectation_holds_bundle_for_review(
@@ -319,6 +376,30 @@ def test_oversize_member_surfaces_before_writes(
     assert backend.writes == []
 
 
+def test_member_locator_verification_runs_before_bundle_seals(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_bundle(engine, tmp_path)
+
+    with pytest.raises(ArchiveFanoutError, match="member"), session_scope(engine) as s:
+        flush_bundle(
+            s,
+            bundle_id=setup.bundle_id,
+            backends={
+                setup.rem_backend_id: _ArchiveWriteBackend("rem"),
+                setup.d2_backend_id: _ArchiveWriteBackend("d2"),
+            },
+            builder=_BadLocatorBuilder(),
+        )
+
+    with session_scope(engine) as s:
+        bundle = s.get(Bundle, setup.bundle_id)
+        assert bundle is not None
+        assert bundle.status == "open"
+        assert list(s.scalars(select(Copy))) == []
+
+
 def test_restore_uses_policy_preference_and_falls_back_to_d2(
     engine: Engine,
     tmp_path: Path,
@@ -353,6 +434,7 @@ def test_restore_uses_policy_preference_and_falls_back_to_d2(
 
         rem_copy = s.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
         rem_copy.health = CopyHealth.MISSING
+        get_artifactclass_policy(s, "o-archive").restore_preference = ["o-copy-1-pool"]
         fallback = restore_asset(
             s,
             asset_hash=asset_hash,
@@ -397,6 +479,28 @@ def test_restore_surfaces_unavailable_and_integrity_failures(
 
         rem_copy = s.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
         rem_backend.corrupt(rem_copy.native_locator)
+        fallback = restore_asset(
+            s,
+            asset_hash=asset_hash,
+            artifactclass="o-archive",
+            destination=tmp_path / "corrupt-primary.bin",
+            backends={
+                setup.rem_backend_id: rem_backend,
+                setup.d2_backend_id: d2_backend,
+            },
+        )
+        assert fallback.pool_id == "d2-shelf-pool"
+
+        d2_locator = s.scalars(
+            select(AssetLocator).where(
+                AssetLocator.pool_id == "d2-shelf-pool",
+                AssetLocator.logical_asset_hash == asset_hash,
+            )
+        ).one()
+        d2_locator.native_locator = {
+            **d2_locator.native_locator,
+            "block_range": [0, int(d2_locator.native_locator["size_bytes"])],
+        }
         with pytest.raises(RestoreIntegrityError):
             restore_asset(
                 s,
@@ -408,3 +512,108 @@ def test_restore_surfaces_unavailable_and_integrity_failures(
                     setup.d2_backend_id: d2_backend,
                 },
             )
+
+
+def test_encrypted_restore_plumbing_uses_key_epoch_and_rao_range_args(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    restored = b"encrypted member"
+    asset_hash = _digest(restored)
+    key_epoch = "a" * 32
+    key_file = tmp_path / "root.key"
+    key_file.write_bytes(b"k" * 32)
+    rem_script = tmp_path / "fake-rem"
+    rem_script.write_text(
+        """#!/usr/bin/env python3
+import pathlib
+import sys
+args = sys.argv[1:]
+required = ["--path", "--first-chunk-lba", "--file-size-bytes", "--range", "--key-file"]
+missing = [flag for flag in required if flag not in args]
+if missing:
+    raise SystemExit("missing " + ",".join(missing))
+dest = pathlib.Path(args[args.index("--dest") + 1])
+member = args[args.index("--path") + 1]
+out = dest / member
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_bytes(b"encrypted member")
+""",
+        encoding="utf-8",
+    )
+    rem_script.chmod(0o755)
+    keys = _FakeKeyRegistry(key_file)
+    backend = _ArchiveWriteBackend("enc")
+    object_path = tmp_path / "encrypted.rao"
+    object_path.write_bytes(b"not a local archive")
+
+    with session_scope(engine) as s:
+        row = Backend(
+            name="rem",
+            kind=BackendKind.REM_TAPE,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        s.add(row)
+        s.flush()
+        s.add(
+            Pool(
+                id="encrypted-pool",
+                backend_id=row.id,
+                representation=Representation.RAO_AEAD_V1.value,
+            )
+        )
+        s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(restored)))
+        s.add(Bundle(id="bundle-enc", artifactclass="o-archive", status="sealed"))
+        s.flush()
+        apply_artifactclass_policy(
+            s,
+            "o-archive",
+            ArtifactClassPolicy(
+                ruleset="rao.o.v1",
+                placements=(PlacementPolicy("encrypted-pool"),),
+                bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
+                restore_preference=("encrypted-pool",),
+                expect="messy",
+            ),
+        )
+        record = backend.write_object_to_pool(object_path, "encrypted-pool")
+        copy, _ = add_bundle_copy(
+            s,
+            bundle_id="bundle-enc",
+            backend_id=row.id,
+            pool_id="encrypted-pool",
+            native_locator=record.native_locator,
+            integrity_hash=record.integrity_hash,
+            source=CopySource.INGEST,
+            storage_metadata={
+                "representation": Representation.RAO_AEAD_V1.value,
+                "key_epoch": key_epoch,
+                "stored_size_bytes": record.size_bytes,
+            },
+        )
+        s.add(
+            AssetLocator(
+                logical_asset_hash=asset_hash,
+                pool_id="encrypted-pool",
+                copy_id=copy.id,
+                bundle_id="bundle-enc",
+                member_path="nested/encrypted.bin",
+                native_locator={
+                    "member_path": "nested/encrypted.bin",
+                    "first_chunk_lba": 4,
+                    "size_bytes": len(restored),
+                },
+                representation=Representation.RAO_AEAD_V1.value,
+            )
+        )
+        result = restore_asset(
+            s,
+            asset_hash=asset_hash,
+            artifactclass="o-archive",
+            destination=tmp_path / "encrypted-restore.bin",
+            backends={row.id: backend},
+            extractor=RemArchiveExtractor(rem_script, keys=keys),  # type: ignore[arg-type]
+        )
+
+    assert result.output_path.read_bytes() == restored
+    assert keys.seen == [key_epoch]

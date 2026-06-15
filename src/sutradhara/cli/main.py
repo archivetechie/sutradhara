@@ -6,7 +6,7 @@ import click
 
 from sutradhara import __version__
 from sutradhara.cli.admin import admin_group
-from sutradhara.cli.archive import archive_group
+from sutradhara.cli.archive import archive_group, review_cmd
 from sutradhara.cli.assets import list_group
 from sutradhara.cli.backends import backends_group
 from sutradhara.cli.db import db_group
@@ -27,6 +27,7 @@ cli.add_command(scrub_cmd)
 cli.add_command(jobs_group)
 cli.add_command(admin_group)
 cli.add_command(archive_group)
+cli.add_command(review_cmd)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+from sutradhara.catalog.models import Bundle, ReviewDecision
+from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.cli.main import cli
 
 FIXTURE = Path(__file__).parent / "fixtures" / "remanence_objects.json"
@@ -60,7 +62,7 @@ def test_version(cli_env: dict[str, str]) -> None:
 
 def test_help_lists_subcommands(cli_env: dict[str, str]) -> None:
     result = _run(["--help"])
-    for cmd in ("db", "backends", "list", "scrub", "admin"):
+    for cmd in ("db", "backends", "list", "scrub", "admin", "archive", "review"):
         assert cmd in result.output
 
 
@@ -80,10 +82,15 @@ def test_backends_add_and_list(cli_env: dict[str, str]) -> None:
     _run(["db", "init"])
     _run(
         [
-            "backends", "add", "rem-primary",
-            "--kind", "rem_tape",
-            "--tier", "self_describing",
-            "--fixture", str(FIXTURE),
+            "backends",
+            "add",
+            "rem-primary",
+            "--kind",
+            "rem_tape",
+            "--tier",
+            "self_describing",
+            "--fixture",
+            str(FIXTURE),
         ]
     )
     result = _run(["backends", "list"])
@@ -102,10 +109,15 @@ def test_admin_reset_clears_catalog(cli_env: dict[str, str]) -> None:
     _run(["db", "init"])
     _run(
         [
-            "backends", "add", "rem-primary",
-            "--kind", "rem_tape",
-            "--tier", "self_describing",
-            "--fixture", str(FIXTURE),
+            "backends",
+            "add",
+            "rem-primary",
+            "--kind",
+            "rem_tape",
+            "--tier",
+            "self_describing",
+            "--fixture",
+            str(FIXTURE),
         ]
     )
 
@@ -118,6 +130,77 @@ def test_admin_reset_clears_catalog(cli_env: dict[str, str]) -> None:
 
 def test_admin_reset_requires_confirmation(cli_env: dict[str, str]) -> None:
     _run(["admin", "reset"], expect_exit=2)
+
+
+def test_top_level_review_shows_and_records_held_bundle(
+    cli_env: dict[str, str],
+) -> None:
+    _run(["db", "init"])
+    engine = make_engine()
+    with session_scope(engine) as session:
+        session.add(
+            Bundle(
+                id="bundle-held",
+                artifactclass="o-archive",
+                status="held",
+                review_summary={"clusters": [{"prefix": "tmp/", "count": 2}]},
+            )
+        )
+        session.add(
+            Bundle(
+                id="bundle-open",
+                artifactclass="o-archive",
+                status="open",
+            )
+        )
+
+    shown = _run(["review", "bundle-held"])
+    assert '"prefix": "tmp/"' in shown.output
+
+    missing_actor = _run(
+        ["review", "bundle-held", "--action", "exclude", "--why", "temporary files"],
+        expect_exit=1,
+    )
+    assert "--who is required" in missing_actor.output
+
+    not_held = _run(
+        [
+            "review",
+            "bundle-open",
+            "--action",
+            "exclude",
+            "--why",
+            "temporary files",
+            "--who",
+            "operator",
+        ],
+        expect_exit=1,
+    )
+    assert "only held bundles can be reviewed" in not_held.output
+
+    result = _run(
+        [
+            "review",
+            "bundle-held",
+            "--action",
+            "exclude",
+            "--scope",
+            "just-this-ingest",
+            "--subtree",
+            "tmp/",
+            "--why",
+            "temporary files",
+            "--who",
+            "operator",
+        ]
+    )
+    assert "recorded review decision" in result.output
+    with session_scope(engine) as session:
+        [decision] = session.query(ReviewDecision).all()
+        assert decision.bundle_id == "bundle-held"
+        assert decision.action == "exclude"
+        assert decision.reason == "temporary files"
+        assert decision.reviewer == "operator"
 
 
 def test_admin_doctor_reports_rem_debug_and_key_registry(
@@ -156,10 +239,15 @@ def test_scrub_against_empty_catalog_populates_everything(cli_env: dict[str, str
     _run(["db", "init"])
     _run(
         [
-            "backends", "add", "rem-primary",
-            "--kind", "rem_tape",
-            "--tier", "self_describing",
-            "--fixture", str(FIXTURE),
+            "backends",
+            "add",
+            "rem-primary",
+            "--kind",
+            "rem_tape",
+            "--tier",
+            "self_describing",
+            "--fixture",
+            str(FIXTURE),
         ]
     )
 
@@ -183,9 +271,13 @@ def test_second_scrub_is_idempotent(cli_env: dict[str, str]) -> None:
     _run(["db", "init"])
     _run(
         [
-            "backends", "add", "rem-primary",
-            "--kind", "rem_tape",
-            "--fixture", str(FIXTURE),
+            "backends",
+            "add",
+            "rem-primary",
+            "--kind",
+            "rem_tape",
+            "--fixture",
+            str(FIXTURE),
         ]
     )
     _run(["scrub", "--backend", "rem-primary"])  # first scrub
@@ -197,9 +289,7 @@ def test_second_scrub_is_idempotent(cli_env: dict[str, str]) -> None:
     assert "copies missing:    0" in result.output
 
 
-def test_dedup_across_two_backends_into_one_asset(
-    cli_env: dict[str, str], tmp_path: Path
-) -> None:
+def test_dedup_across_two_backends_into_one_asset(cli_env: dict[str, str], tmp_path: Path) -> None:
     """Same content on two backends → one logical asset, two copies.
 
     This is the spec's load-bearing dedup claim (spec-v0.1.md §2

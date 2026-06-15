@@ -9,7 +9,13 @@ import click
 from sqlalchemy import select
 
 from sutradhara.archive_bundle import enqueue_artifact, record_review_decision
-from sutradhara.archive_fanout import BundleHeld, RemArchiveBuilder, flush_bundle
+from sutradhara.archive_fanout import (
+    BundleHeld,
+    HmacManifestSigner,
+    ManifestSigningError,
+    RemArchiveBuilder,
+    flush_bundle,
+)
 from sutradhara.archive_restore import RemArchiveExtractor, restore_asset
 from sutradhara.artifactclass_policy import (
     apply_artifactclass_policy_file,
@@ -87,11 +93,18 @@ def bundle_enqueue(
 )
 @click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
 @click.option("--key-epoch", default=None, help="Key epoch for rao-aead-v1 pools.")
+@click.option(
+    "--manifest-signing-key-file",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Raw HMAC key file for customer manifest receipts.",
+)
 def bundle_flush(
     bundle_id: str,
     deliverables_dir: str | None,
     rem_bin: str,
     key_epoch: str | None,
+    manifest_signing_key_file: str | None,
 ) -> None:
     """Flush one open bundle to all active artifactclass pools."""
     engine = make_engine()
@@ -108,8 +121,9 @@ def bundle_flush(
                 builder=RemArchiveBuilder(rem_bin),
                 key_epoch=key_epoch,
                 deliverables_dir=None if deliverables_dir is None else Path(deliverables_dir),
+                manifest_signer=_manifest_signer(manifest_signing_key_file),
             )
-        except BundleHeld as exc:
+        except (BundleHeld, ManifestSigningError) as exc:
             raise click.ClickException(str(exc)) from exc
     click.echo(
         f"sealed {result.bundle_id}: copies={list(result.copy_ids)} "
@@ -151,6 +165,14 @@ def review_cmd(
         if action is None:
             click.echo(json.dumps(bundle.review_summary or {}, indent=2, sort_keys=True))
             return
+        if bundle.status != "held":
+            raise click.ClickException(
+                f"bundle {bundle_id!r} is {bundle.status!r}; only held bundles can be reviewed"
+            )
+        if not who:
+            raise click.ClickException("--who is required when recording a review decision")
+        if not why:
+            raise click.ClickException("--why is required when recording a review decision")
         decision = record_review_decision(
             session,
             bundle_id=bundle_id,
@@ -183,7 +205,7 @@ def restore_cmd(
     engine = make_engine()
     with session_scope(engine) as session:
         policy = get_artifactclass_policy(session, artifactclass)
-        backends = _preference_backends(session, policy.restore_preference)
+        backends = _restore_backends(session, artifactclass, policy.restore_preference)
         result = restore_asset(
             session,
             asset_hash=bytes.fromhex(asset_hash_hex),
@@ -213,6 +235,28 @@ def _target_backends(session, artifactclass: str):
     return {row.id: backend_from_row(row) for row in rows}
 
 
-def _preference_backends(session, pool_ids: list[str]):
-    rows = list(session.scalars(select(Backend).join(Backend.pools).where(Pool.id.in_(pool_ids))))
+def _restore_backends(session, artifactclass: str, pool_ids: list[str]):
+    active_pool_ids = [
+        row.pool_id
+        for row in session.scalars(
+            select(ArtifactClassPool)
+            .where(
+                ArtifactClassPool.artifactclass == artifactclass,
+                ArtifactClassPool.active.is_(True),
+            )
+            .order_by(ArtifactClassPool.sort_order, ArtifactClassPool.pool_id)
+        )
+    ]
+    wanted = [*pool_ids, *(pool_id for pool_id in active_pool_ids if pool_id not in pool_ids)]
+    rows = list(session.scalars(select(Backend).join(Backend.pools).where(Pool.id.in_(wanted))))
     return {row.id: backend_from_row(row) for row in rows}
+
+
+def _manifest_signer(path: str | None) -> HmacManifestSigner | None:
+    if path is None:
+        return None
+    key_path = Path(path)
+    return HmacManifestSigner(
+        key=key_path.read_bytes().rstrip(b"\r\n"),
+        key_id=key_path.name,
+    )

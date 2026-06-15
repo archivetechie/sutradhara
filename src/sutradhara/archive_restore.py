@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.artifactclass_policy import get_artifactclass_policy
 from sutradhara.backend.port import ByteRange, StorageBackend
-from sutradhara.catalog.models import AssetLocator, Copy
+from sutradhara.catalog.models import ArtifactClassPool, AssetLocator, Copy
 from sutradhara.catalog.types import CopyHealth, is_content_hash
 from sutradhara.keys import KeyRegistry
 from sutradhara.sealing.port import Representation
@@ -80,6 +80,14 @@ class LocalArchiveExtractor:
         representation = Representation(locator.representation)
         if representation is Representation.D2TAR_RAW:
             return _extract_d2(locator, copy, backend)
+        if (
+            representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}
+            and "offset" not in locator.native_locator
+        ):
+            raise ArchiveRestoreError(
+                f"copy id={copy.id} representation {representation.value!r} "
+                "requires a RAO restore adapter"
+            )
 
         container = _read_whole(backend, copy)
         if _is_local_archive(container):
@@ -140,7 +148,7 @@ class RemArchiveExtractor(LocalArchiveExtractor):
             object_path = temp_dir / "bundle.rao"
             dest_dir = temp_dir / "out"
             dest_dir.mkdir()
-            object_path.write_bytes(_read_whole(backend, copy))
+            _materialize_copy_to_path(backend, copy, object_path)
             cmd = [
                 self._rem_bin,
                 "archive",
@@ -149,9 +157,16 @@ class RemArchiveExtractor(LocalArchiveExtractor):
                 str(object_path),
                 "--dest",
                 str(dest_dir),
+                "--path",
+                member_path,
+                "--first-chunk-lba",
+                str(_first_chunk_lba(locator.native_locator)),
+                "--file-size-bytes",
+                str(_size_bytes(locator.native_locator)),
+                "--range",
+                f"0:{_size_bytes(locator.native_locator)}",
+                "--overwrite",
             ]
-            if member_path:
-                cmd.extend(["--member", member_path])
             if representation is Representation.RAO_PLAIN_V1:
                 cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
                 _run_rem(cmd)
@@ -177,6 +192,7 @@ def restore_asset(
         raise ValueError("asset_hash must be a 32-byte SHA-256 hash")
     archive_extractor = extractor or LocalArchiveExtractor()
     policy = get_artifactclass_policy(session, artifactclass)
+    pool_order = _restore_pool_order(session, artifactclass, policy.restore_preference)
     locators = list(
         session.scalars(
             select(AssetLocator)
@@ -184,12 +200,13 @@ def restore_asset(
             .where(AssetLocator.logical_asset_hash == asset_hash)
         )
     )
-    by_pool = {pool_id: [] for pool_id in policy.restore_preference}
+    by_pool = {pool_id: [] for pool_id in pool_order}
     for locator in locators:
         if locator.pool_id in by_pool:
             by_pool[locator.pool_id].append(locator)
 
-    for pool_id in policy.restore_preference:
+    integrity_errors: list[str] = []
+    for pool_id in pool_order:
         for locator in by_pool.get(pool_id, []):
             copy = locator.copy
             if copy is None or copy.health != CopyHealth.OK:
@@ -197,17 +214,21 @@ def restore_asset(
             backend = backends.get(copy.backend_id)
             if backend is None:
                 continue
-            data = archive_extractor.extract(
-                locator=locator,
-                copy=copy,
-                backend=backend,
-            )
+            try:
+                data = archive_extractor.extract(
+                    locator=locator,
+                    copy=copy,
+                    backend=backend,
+                )
+            except ArchiveRestoreError as exc:
+                integrity_errors.append(f"copy id={copy.id} pool={pool_id}: {exc}")
+                continue
             actual = hashlib.sha256(data).digest()
             if actual != asset_hash:
-                raise RestoreIntegrityError(
-                    f"restored bytes from copy id={copy.id} hash to "
-                    f"{actual.hex()}, expected {asset_hash.hex()}"
+                integrity_errors.append(
+                    f"copy id={copy.id} pool={pool_id}: {actual.hex()} != {asset_hash.hex()}"
                 )
+                continue
             output_path = Path(destination)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(data)
@@ -219,9 +240,42 @@ def restore_asset(
                 size_bytes=len(data),
             )
 
+    if integrity_errors:
+        raise RestoreIntegrityError(
+            f"all candidate restores for asset {asset_hash.hex()} failed integrity: "
+            + "; ".join(integrity_errors)
+        )
     raise RestoreSourceUnavailable(
         f"no healthy locator for asset {asset_hash.hex()} in artifactclass {artifactclass!r}"
     )
+
+
+def _restore_pool_order(
+    session: Session,
+    artifactclass: str,
+    restore_preference: list[str],
+) -> list[str]:
+    order: list[str] = []
+    seen: set[str] = set()
+    for pool_id in restore_preference:
+        if pool_id not in seen:
+            seen.add(pool_id)
+            order.append(pool_id)
+    memberships = list(
+        session.scalars(
+            select(ArtifactClassPool)
+            .where(
+                ArtifactClassPool.artifactclass == artifactclass,
+                ArtifactClassPool.active.is_(True),
+            )
+            .order_by(ArtifactClassPool.sort_order, ArtifactClassPool.pool_id)
+        )
+    )
+    for membership in memberships:
+        if membership.pool_id not in seen:
+            seen.add(membership.pool_id)
+            order.append(membership.pool_id)
+    return order
 
 
 def _extract_d2(
@@ -243,7 +297,7 @@ def _extract_d2(
                 ByteRange(data_start, data_start + size),
             )
     container = _read_whole(backend, copy)
-    return _extract_from_tar(container, _member_path(locator.native_locator))
+    return _extract_from_tar(container, locator.member_path)
 
 
 def _extract_from_tar(container: bytes, member_path: str) -> bytes:
@@ -280,11 +334,46 @@ def _read_whole(backend: StorageBackend, copy: Copy) -> bytes:
     return backend.read_range(copy.native_locator, ByteRange(0, 0))
 
 
+def _materialize_copy_to_path(
+    backend: StorageBackend,
+    copy: Copy,
+    destination: Path,
+) -> None:
+    size = copy.storage_metadata.get("stored_size_bytes")
+    if isinstance(size, int) and size >= 0:
+        with destination.open("wb") as handle:
+            for start in range(0, size, RAO_CHUNK_SIZE):
+                end = min(start + RAO_CHUNK_SIZE, size)
+                handle.write(backend.read_range(copy.native_locator, ByteRange(start, end)))
+        return
+    destination.write_bytes(_read_whole(backend, copy))
+
+
 def _member_path(locator: dict[str, Any]) -> str:
     value = locator.get("member_path")
     if not isinstance(value, str) or not value:
         raise ArchiveRestoreError("asset locator is missing member_path")
     return value
+
+
+def _first_chunk_lba(locator: dict[str, Any]) -> int:
+    value = locator.get("first_chunk_lba")
+    if value is None:
+        raise ArchiveRestoreError("RAO asset locator is missing first_chunk_lba")
+    result = int(value)
+    if result < 0:
+        raise ArchiveRestoreError(f"invalid first_chunk_lba {value!r}")
+    return result
+
+
+def _size_bytes(locator: dict[str, Any]) -> int:
+    value = locator.get("size_bytes")
+    if value is None:
+        raise ArchiveRestoreError("asset locator is missing size_bytes")
+    result = int(value)
+    if result < 0:
+        raise ArchiveRestoreError(f"invalid size_bytes {value!r}")
+    return result
 
 
 def _key_epoch(storage_metadata: dict[str, Any]) -> str:

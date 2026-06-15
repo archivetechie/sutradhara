@@ -110,7 +110,11 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
             s,
             logical_asset_hash=asset_hash,
             pool_id="archive-pool",
-            native_locator={"pool_id": "archive-pool", "object_id": "bundle-test"},
+            native_locator={
+                "pool_id": "archive-pool",
+                "object_id": "bundle-test",
+                "member_path": "member.bin",
+            },
             representation=Representation.RAO_PLAIN_V1.value,
             copy_id=copy.id,
             bundle_id=bundle.id,

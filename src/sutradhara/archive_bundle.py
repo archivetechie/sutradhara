@@ -48,6 +48,10 @@ class UnknownBundleCopy(ArchiveBundleError):
     """A locator operation referenced an unknown copy."""
 
 
+class AssetLocatorError(ArchiveBundleError):
+    """An asset locator is malformed."""
+
+
 class BundleStateError(ArchiveBundleError):
     """A bundle operation was requested in the wrong lifecycle state."""
 
@@ -213,6 +217,7 @@ def record_asset_locator(
     representation: str,
     copy_id: int,
     bundle_id: str,
+    member_path: str | None = None,
 ) -> AssetLocator:
     """Record a concrete per-copy locator for an asset in a bundle."""
     _require_asset(session, logical_asset_hash)
@@ -221,10 +226,14 @@ def record_asset_locator(
     copy = session.get(Copy, copy_id)
     if copy is None:
         raise UnknownBundleCopy(f"no Copy with id={copy_id}")
+    resolved_member_path = member_path or native_locator.get("member_path")
+    if not isinstance(resolved_member_path, str) or not resolved_member_path:
+        raise AssetLocatorError("asset locator requires a non-empty member_path")
     locator = AssetLocator(
         logical_asset_hash=logical_asset_hash,
         pool_id=pool_id,
         native_locator=native_locator,
+        member_path=resolved_member_path,
         representation=representation,
         copy_id=copy_id,
         bundle_id=bundle_id,

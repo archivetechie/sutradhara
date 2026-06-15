@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import hmac
 import json
 import subprocess
 import tarfile
@@ -30,9 +31,11 @@ from sutradhara.archive_bundle import (
     record_blob_root,
     record_exclusion,
 )
+from sutradhara.backend.port import ByteRange
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Bundle, BundleMember
 from sutradhara.catalog.types import CopyHealth, CopySource
+from sutradhara.keys import KeyRegistry
 from sutradhara.replication import (
     PoolTarget,
     WritableStorageBackend,
@@ -52,6 +55,10 @@ class BundleHeld(ArchiveFanoutError):
 
 class BundleOversize(ArchiveFanoutError):
     """A single artifact exceeds the configured tape capacity."""
+
+
+class ManifestSigningError(ArchiveFanoutError):
+    """A customer receipt could not be signed with a real keyed signature."""
 
 
 @dataclass(frozen=True)
@@ -162,6 +169,36 @@ class ArchiveBuilder(Protocol):
     ) -> BuildArtifact:
         """Build one archive object for a pool representation."""
         ...
+
+
+class ManifestSigner(Protocol):
+    """Keyed signer for customer-facing archive receipts."""
+
+    def sign(self, payload: Mapping[str, Any]) -> dict[str, str]:
+        """Return a detached signature over the canonical payload."""
+        ...
+
+
+@dataclass(frozen=True)
+class HmacManifestSigner:
+    """HMAC-SHA256 signer for customer manifest receipts."""
+
+    key: bytes
+    key_id: str
+
+    def __post_init__(self) -> None:
+        if not self.key:
+            raise ManifestSigningError("manifest signing key must not be empty")
+        if not self.key_id:
+            raise ManifestSigningError("manifest signing key_id must not be empty")
+
+    def sign(self, payload: Mapping[str, Any]) -> dict[str, str]:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return {
+            "algorithm": "hmac-sha256",
+            "key_id": self.key_id,
+            "digest": hmac.new(self.key, canonical, hashlib.sha256).hexdigest(),
+        }
 
 
 @dataclass(frozen=True)
@@ -279,7 +316,7 @@ class RemArchiveBuilder:
                 str(report_path),
                 *[str(member.source_path) for member in members],
             ]
-            subprocess.run(cmd, check=True)
+            _run_rem(cmd)
             if not report_path.exists():
                 return ConformanceScan()
             return _scan_from_json(_read_json(report_path))
@@ -312,7 +349,7 @@ class RemArchiveBuilder:
             if key_epoch:
                 cmd.extend(["--key-epoch", key_epoch])
         cmd.extend(str(member.source_path) for member in members)
-        subprocess.run(cmd, check=True)
+        _run_rem(cmd)
         manifest = _read_json(manifest_path)
         return BuildArtifact(
             artifact_path=output_path,
@@ -323,6 +360,56 @@ class RemArchiveBuilder:
             exclusions=tuple(_exclusions_from_manifest(manifest)),
         )
 
+    def verify_member_copy(
+        self,
+        *,
+        backend: WritableStorageBackend,
+        copy_locator: dict[str, Any],
+        member: BuiltMember,
+        representation: Representation,
+        storage_metadata: Mapping[str, Any],
+        work_dir: Path,
+    ) -> bytes:
+        """Extract one member from the stored copy through rem for verification."""
+        if representation not in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
+            raise ArchiveFanoutError(
+                f"RemArchiveBuilder cannot verify representation {representation.value!r}"
+            )
+        object_path = (
+            work_dir / f"verify-{hashlib.sha256(member.member_path.encode()).hexdigest()}.rao"
+        )
+        _materialize_copy_to_path(backend, copy_locator, storage_metadata, object_path)
+        verify_id = hashlib.sha256(member.member_path.encode() + b"\0" + member.file_sha256)
+        dest = work_dir / f"verify-out-{verify_id.hexdigest()}"
+        dest.mkdir()
+        cmd = [
+            self._rem_bin,
+            "archive",
+            "extract",
+            "--object",
+            str(object_path),
+            "--dest",
+            str(dest),
+            "--path",
+            member.member_path,
+            "--first-chunk-lba",
+            str(_first_chunk_lba(member.native_locator)),
+            "--file-size-bytes",
+            str(member.size_bytes),
+            "--range",
+            f"0:{member.size_bytes}",
+            "--overwrite",
+        ]
+        if representation is Representation.RAO_PLAIN_V1:
+            cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
+            _run_rem(cmd)
+        else:
+            key_epoch = _metadata_key_epoch(storage_metadata)
+            with KeyRegistry().materialized_root_key(key_epoch) as key_file:
+                cmd.extend(["--key-file", str(key_file)])
+                _run_rem(cmd)
+        return _single_restored_member(dest, member.member_path)
+
 
 def flush_bundle(
     session: Session,
@@ -332,9 +419,12 @@ def flush_bundle(
     builder: ArchiveBuilder,
     key_epoch: str | None = None,
     deliverables_dir: Path | str | None = None,
+    manifest_signer: ManifestSigner | None = None,
     tape_capacity_bytes: int | None = None,
 ) -> FanoutResult:
     """Flush one open bundle, build each pool copy, and record catalog state."""
+    if deliverables_dir is not None and manifest_signer is None:
+        raise ManifestSigningError("deliverables_dir requires a manifest_signer")
     bundle = (
         session.scalars(
             select(Bundle).options(joinedload(Bundle.members)).where(Bundle.id == bundle_id)
@@ -373,6 +463,9 @@ def flush_bundle(
     with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-{bundle.id}-") as raw:
         work_dir = Path(raw)
         for backend, target in targets:
+            # The DB transaction closes after all targets are written. A process
+            # crash here leaves physical orphan objects for scrub/reconcile,
+            # but not partial catalog rows.
             artifact = _build_for_target(
                 bundle=bundle,
                 members=members,
@@ -382,6 +475,11 @@ def flush_bundle(
                 work_dir=work_dir,
             )
             record = backend.write_object_to_pool(artifact.artifact_path, target.pool_id)
+            storage_metadata = _copy_storage_metadata(
+                target.representation,
+                key_epoch=target.key_epoch,
+                stored_size_bytes=record.size_bytes,
+            )
             copy, _ = add_bundle_copy(
                 session,
                 bundle_id=bundle.id,
@@ -391,10 +489,7 @@ def flush_bundle(
                 integrity_hash=artifact.stored_digest,
                 source=CopySource.INGEST,
                 health=CopyHealth.OK,
-                storage_metadata=_copy_storage_metadata(
-                    target.representation,
-                    key_epoch=target.key_epoch,
-                ),
+                storage_metadata=storage_metadata,
             )
             copy_ids.append(copy.id)
             _record_build_outputs(
@@ -404,17 +499,28 @@ def flush_bundle(
                 copy_id=copy.id,
                 artifact=artifact,
             )
-            _verify_members_from_copy(backend, copy.native_locator, artifact.members)
+            _verify_members_from_copy(
+                backend=backend,
+                copy_locator=copy.native_locator,
+                members=artifact.members,
+                representation=Representation(target.representation),
+                storage_metadata=storage_metadata,
+                builder=builder,
+                work_dir=work_dir,
+            )
             if (
                 deliverables_dir is not None
                 and artifact.manifest_path is not None
                 and manifest_receipt is None
+                and Representation(target.representation)
+                in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}
             ):
                 manifest_receipt = str(
                     emit_customer_manifest(
                         bundle=bundle,
                         manifest_path=artifact.manifest_path,
                         destination_dir=Path(deliverables_dir),
+                        signer=manifest_signer,
                     )
                 )
                 bundle.customer_manifest_path = manifest_receipt
@@ -428,8 +534,11 @@ def emit_customer_manifest(
     bundle: Bundle,
     manifest_path: Path,
     destination_dir: Path,
+    signer: ManifestSigner | None,
 ) -> Path:
-    """Wrap rem's manifest with an archive id, timestamp, and digest signature."""
+    """Wrap rem's manifest with an archive id, timestamp, and keyed signature."""
+    if signer is None:
+        raise ManifestSigningError("customer manifest requires a keyed signer")
     destination_dir.mkdir(parents=True, exist_ok=True)
     source = _read_json(manifest_path)
     archive_id = bundle.archive_id or f"archive-{bundle.id}"
@@ -444,11 +553,7 @@ def emit_customer_manifest(
         if bundle.scan_summary
         else [],
     }
-    signature_basis = json.dumps(payload, sort_keys=True).encode("utf-8")
-    payload["signature"] = {
-        "algorithm": "sha256",
-        "digest": hashlib.sha256(signature_basis).hexdigest(),
-    }
+    payload["signature"] = signer.sign(payload)
     destination = destination_dir / f"{archive_id}.manifest.json"
     destination.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
     bundle.archive_id = archive_id
@@ -489,8 +594,12 @@ def _copy_storage_metadata(
     representation: str,
     *,
     key_epoch: str | None,
+    stored_size_bytes: int,
 ) -> dict[str, Any]:
-    metadata: dict[str, Any] = {"representation": representation}
+    metadata: dict[str, Any] = {
+        "representation": representation,
+        "stored_size_bytes": stored_size_bytes,
+    }
     if representation in {
         Representation.RAO_PLAIN_V1.value,
         Representation.RAO_AEAD_V1.value,
@@ -572,6 +681,7 @@ def _record_build_outputs(
             representation=target.representation,
             copy_id=copy_id,
             bundle_id=bundle.id,
+            member_path=member.member_path,
         )
     for root in artifact.blob_roots:
         record_blob_root(
@@ -598,16 +708,76 @@ def _record_build_outputs(
 
 
 def _verify_members_from_copy(
+    *,
     backend: WritableStorageBackend,
     copy_locator: dict[str, Any],
     members: Sequence[BuiltMember],
+    representation: Representation,
+    storage_metadata: Mapping[str, Any],
+    builder: ArchiveBuilder,
+    work_dir: Path,
 ) -> None:
-    # The backend-level verify hook is retained for production adapters. Member
-    # byte verification happens in restore tests through asset_locator; this
-    # hook catches a failed write before staging cleanup.
     result = backend.verify(copy_locator)
     if not result.ok:
         raise ArchiveFanoutError(f"backend verify failed: {result.detail}")
+    cached_container: bytes | None = None
+    for member in members:
+        data, cached_container = _verified_member_bytes(
+            backend=backend,
+            copy_locator=copy_locator,
+            member=member,
+            representation=representation,
+            storage_metadata=storage_metadata,
+            builder=builder,
+            work_dir=work_dir,
+            cached_container=cached_container,
+        )
+        digest = hashlib.sha256(data).digest()
+        if digest != member.file_sha256:
+            raise ArchiveFanoutError(
+                f"member verification failed for {member.member_path!r}: "
+                f"{digest.hex()} != {member.file_sha256.hex()}"
+            )
+
+
+def _verified_member_bytes(
+    *,
+    backend: WritableStorageBackend,
+    copy_locator: dict[str, Any],
+    member: BuiltMember,
+    representation: Representation,
+    storage_metadata: Mapping[str, Any],
+    builder: ArchiveBuilder,
+    work_dir: Path,
+    cached_container: bytes | None,
+) -> tuple[bytes, bytes | None]:
+    if representation is Representation.D2TAR_RAW and "block_range" in member.native_locator:
+        start, end = _block_range(member.native_locator)
+        return backend.read_range(copy_locator, ByteRange(start, end)), cached_container
+    if "offset" in member.native_locator:
+        container = cached_container
+        if container is None:
+            container = backend.read_range(copy_locator, ByteRange(0, 0))
+        return _extract_local_archive_member(container, member.native_locator), container
+    if representation is Representation.RAO_PLAIN_V1:
+        start = _first_chunk_lba(member.native_locator) * RAO_CHUNK_SIZE
+        end = start + member.size_bytes
+        return backend.read_range(copy_locator, ByteRange(start, end)), cached_container
+
+    verifier = getattr(builder, "verify_member_copy", None)
+    if verifier is None:
+        raise ArchiveFanoutError(
+            f"member verification for {representation.value!r} requires builder support"
+        )
+    data = verifier(
+        backend=backend,
+        copy_locator=copy_locator,
+        member=member,
+        representation=representation,
+        storage_metadata=storage_metadata,
+        work_dir=work_dir,
+    )
+    return data, cached_container
 
 
 def _member_input(member: BundleMember) -> MemberInput:
@@ -664,25 +834,14 @@ def _members_from_manifest(
     by_path = {member.member_path: member for member in inputs}
     raw_members = manifest.get("members", [])
     if not raw_members:
-        return [
-            BuiltMember(
-                logical_asset_hash=member.logical_asset_hash,
-                member_path=member.member_path,
-                size_bytes=member.size_bytes,
-                file_sha256=member.file_sha256,
-                native_locator={
-                    "member_path": member.member_path,
-                    "first_chunk_lba": 0,
-                    "size_bytes": member.size_bytes,
-                },
-            )
-            for member in inputs
-        ]
+        raise ArchiveFanoutError("rem manifest did not include member locators")
     built: list[BuiltMember] = []
     for item in raw_members:
         if not isinstance(item, dict):
             continue
         path = str(item.get("path") or item.get("member_path"))
+        if path not in by_path:
+            raise ArchiveFanoutError(f"rem manifest returned unknown member path {path!r}")
         source = by_path[path]
         built.append(
             BuiltMember(
@@ -734,6 +893,90 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ArchiveFanoutError(f"{path} JSON root is not an object")
     return data
+
+
+def _block_range(locator: Mapping[str, Any]) -> tuple[int, int]:
+    raw = locator.get("block_range")
+    if not isinstance(raw, list) or len(raw) != 2:
+        raise ArchiveFanoutError("block locator requires block_range=[start,end]")
+    start = int(raw[0])
+    end = int(raw[1])
+    if start < 0 or end < start:
+        raise ArchiveFanoutError(f"invalid block_range {raw!r}")
+    return start, end
+
+
+def _first_chunk_lba(locator: Mapping[str, Any]) -> int:
+    value = locator.get("first_chunk_lba")
+    if value is None:
+        raise ArchiveFanoutError("RAO locator requires first_chunk_lba")
+    result = int(value)
+    if result < 0:
+        raise ArchiveFanoutError(f"invalid first_chunk_lba {value!r}")
+    return result
+
+
+def _metadata_key_epoch(storage_metadata: Mapping[str, Any]) -> str:
+    value = storage_metadata.get("key_epoch")
+    if not isinstance(value, str) or not value:
+        raise ArchiveFanoutError("encrypted copy metadata is missing key_epoch")
+    return value
+
+
+def _extract_local_archive_member(container: bytes, locator: Mapping[str, Any]) -> bytes:
+    if len(container) < 8:
+        raise ArchiveFanoutError("local archive is too short")
+    header_len = int.from_bytes(container[:8], "big")
+    payload_start = 8 + header_len
+    if header_len <= 0 or payload_start > len(container):
+        raise ArchiveFanoutError("local archive header length is invalid")
+    try:
+        header = json.loads(container[8:payload_start].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArchiveFanoutError("local archive header is not valid JSON") from exc
+    if not isinstance(header, dict) or header.get("format") != "sutradhara-local-archive-v1":
+        raise ArchiveFanoutError("copy is not a sutradhara local archive")
+    offset = int(locator["offset"])
+    size = int(locator["size_bytes"])
+    return container[payload_start + offset : payload_start + offset + size]
+
+
+def _materialize_copy_to_path(
+    backend: WritableStorageBackend,
+    copy_locator: Mapping[str, Any],
+    storage_metadata: Mapping[str, Any],
+    destination: Path,
+) -> None:
+    size = storage_metadata.get("stored_size_bytes")
+    if isinstance(size, int) and size >= 0:
+        with destination.open("wb") as handle:
+            for start in range(0, size, RAO_CHUNK_SIZE):
+                end = min(start + RAO_CHUNK_SIZE, size)
+                handle.write(backend.read_range(dict(copy_locator), ByteRange(start, end)))
+        return
+    destination.write_bytes(backend.read_range(dict(copy_locator), ByteRange(0, 0)))
+
+
+def _single_restored_member(dest_dir: Path, member_path: str) -> bytes:
+    candidate = dest_dir / member_path
+    if candidate.is_file():
+        return candidate.read_bytes()
+    files = [path for path in dest_dir.rglob("*") if path.is_file()]
+    if len(files) != 1:
+        raise ArchiveFanoutError(
+            f"rem member verification expected one file for {member_path!r}, found {len(files)}"
+        )
+    return files[0].read_bytes()
+
+
+def _run_rem(cmd: Sequence[str]) -> None:
+    result = subprocess.run(list(cmd), capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise ArchiveFanoutError(
+            f"rem command failed (exit {result.returncode}): "
+            f"stdout={result.stdout.strip()[:500]!r} "
+            f"stderr={result.stderr.strip()[:500]!r}"
+        )
 
 
 def _sha256_file(path: Path) -> bytes:
