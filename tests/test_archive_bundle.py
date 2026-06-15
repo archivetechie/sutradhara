@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from sqlalchemy import Engine, select
@@ -11,6 +13,7 @@ from sqlalchemy import Engine, select
 from sutradhara.archive_bundle import (
     UnknownBundlePool,
     add_bundle_member,
+    enqueue_artifact,
     get_or_create_open_bundle,
     record_asset_locator,
     record_blob_root,
@@ -167,3 +170,41 @@ def test_record_asset_locator_rejects_unknown_pool(engine: Engine) -> None:
                 copy_id=0,
                 bundle_id="bundle-missing",
             )
+
+
+def test_enqueue_artifact_escapes_default_member_path_from_raw_filename(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    raw_name = b"legacy-\xff\\name.bin"
+    raw_path = os.fsencode(tmp_path) + b"/" + raw_name
+    fd = os.open(raw_path, os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, b"payload")
+    finally:
+        os.close(fd)
+    source = Path(os.fsdecode(raw_path))
+    asset_hash = _hash(b"payload")
+
+    with session_scope(engine) as s:
+        policy = ArtifactClassPolicyRecord(
+            artifactclass="o-archive",
+            ruleset="rao.o.v1",
+            expect="messy",
+            target_bytes=1024,
+            max_age_seconds=3600,
+            restore_preference=[],
+        )
+        s.add_all([policy, LogicalAsset(content_sha256=asset_hash, size_bytes=7)])
+        s.flush()
+
+        _, member, _ = enqueue_artifact(
+            s,
+            artifactclass="o-archive",
+            policy=policy,
+            logical_asset_hash=asset_hash,
+            source_path=source,
+            bundle_id="bundle-escape",
+        )
+
+        assert member.member_path == r"legacy-\xff\\name.bin"

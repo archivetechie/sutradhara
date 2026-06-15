@@ -23,11 +23,20 @@ from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.artifactclass_policy import get_artifactclass_policy
 from sutradhara.backend.port import ByteRange, StorageBackend
-from sutradhara.catalog.models import ArtifactClassPool, AssetLocator, Copy
+from sutradhara.catalog.models import (
+    ArtifactClassPool,
+    AssetLocator,
+    Bundle,
+    BundleMember,
+    Copy,
+    StagingTransform,
+)
 from sutradhara.catalog.types import CopyHealth, is_content_hash
 from sutradhara.keys import KeyRegistry
+from sutradhara.member_name import MemberNameError, escape_member_name, unescape_member_name
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.staging import StagingError, reverse_transforms
 
 
 class ArchiveRestoreError(Exception):
@@ -40,6 +49,10 @@ class RestoreSourceUnavailable(ArchiveRestoreError):
 
 class RestoreIntegrityError(ArchiveRestoreError):
     """Restored bytes do not match the logical asset hash."""
+
+
+class RestoreNameError(ArchiveRestoreError):
+    """A customer member-name restore request could not be resolved."""
 
 
 @dataclass(frozen=True)
@@ -167,6 +180,9 @@ class RemArchiveExtractor(LocalArchiveExtractor):
                 f"0:{_size_bytes(locator.native_locator)}",
                 "--overwrite",
             ]
+            format_plugin = _format_plugin(copy.storage_metadata)
+            if format_plugin is not None:
+                cmd.extend(["--format", format_plugin])
             if representation is Representation.RAO_PLAIN_V1:
                 cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
                 _run_rem(cmd)
@@ -215,12 +231,16 @@ def restore_asset(
             if backend is None:
                 continue
             try:
-                data = archive_extractor.extract(
+                extracted = archive_extractor.extract(
                     locator=locator,
                     copy=copy,
                     backend=backend,
                 )
+                data = _reverse_locator_transforms(session, locator, extracted)
             except ArchiveRestoreError as exc:
+                integrity_errors.append(f"copy id={copy.id} pool={pool_id}: {exc}")
+                continue
+            except StagingError as exc:
                 integrity_errors.append(f"copy id={copy.id} pool={pool_id}: {exc}")
                 continue
             actual = hashlib.sha256(data).digest()
@@ -248,6 +268,73 @@ def restore_asset(
     raise RestoreSourceUnavailable(
         f"no healthy locator for asset {asset_hash.hex()} in artifactclass {artifactclass!r}"
     )
+
+
+def resolve_member_asset_hash(
+    session: Session,
+    *,
+    artifactclass: str,
+    member_name: str,
+) -> bytes:
+    """Resolve a customer escaped member name to a logical asset hash."""
+    try:
+        canonical = escape_member_name(unescape_member_name(member_name))
+    except MemberNameError as exc:
+        raise RestoreNameError(f"invalid escaped member name {member_name!r}: {exc}") from exc
+
+    hashes: set[bytes] = set(
+        session.scalars(
+            select(StagingTransform.logical_asset_hash).where(
+                StagingTransform.artifactclass == artifactclass,
+                (
+                    (StagingTransform.original_member_path == canonical)
+                    | (StagingTransform.stored_member_path == canonical)
+                ),
+            )
+        )
+    )
+    hashes.update(
+        session.scalars(
+            select(BundleMember.logical_asset_hash)
+            .join(Bundle, Bundle.id == BundleMember.bundle_id)
+            .where(
+                Bundle.artifactclass == artifactclass,
+                BundleMember.member_path == canonical,
+            )
+        )
+    )
+    if not hashes:
+        raise RestoreNameError(
+            f"no catalog member {member_name!r} in artifactclass {artifactclass!r}"
+        )
+    if len(hashes) > 1:
+        raise RestoreNameError(
+            f"member name {member_name!r} is ambiguous in artifactclass {artifactclass!r}"
+        )
+    return next(iter(hashes))
+
+
+def _reverse_locator_transforms(
+    session: Session,
+    locator: AssetLocator,
+    data: bytes,
+) -> bytes:
+    if locator.bundle_id is None:
+        return data
+    transforms = list(
+        session.scalars(
+            select(StagingTransform)
+            .where(
+                StagingTransform.bundle_id == locator.bundle_id,
+                StagingTransform.logical_asset_hash == locator.logical_asset_hash,
+                StagingTransform.stored_member_path == locator.member_path,
+            )
+            .order_by(StagingTransform.step_order)
+        )
+    )
+    if not transforms:
+        return data
+    return reverse_transforms(data, transforms)
 
 
 def _restore_pool_order(
@@ -380,6 +467,15 @@ def _key_epoch(storage_metadata: dict[str, Any]) -> str:
     value = storage_metadata.get("key_epoch")
     if not isinstance(value, str) or not value:
         raise ArchiveRestoreError("encrypted archive copy is missing key_epoch")
+    return value
+
+
+def _format_plugin(storage_metadata: dict[str, Any]) -> str | None:
+    value = storage_metadata.get("format_plugin")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ArchiveRestoreError("copy format_plugin metadata must be a non-empty string")
     return value
 
 

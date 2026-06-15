@@ -50,6 +50,25 @@ preference = ["o-copy-1-pool", "o-copy-2-pool"]
 """
 
 
+def _staging_policy_text() -> str:
+    return (
+        _policy_text()
+        + """
+[staging.appledouble]
+action = "merge-to-xattrs"
+tool = "sutradhara-parser"
+on_error = "hold"
+record = true
+
+[staging.compression]
+codec = "zstd"
+level = 10
+globs = ["**/*.img"]
+min_bytes = 1024
+"""
+    )
+
+
 def test_parse_artifactclass_policy_accepts_strict_document() -> None:
     policy = parse_artifactclass_policy(_policy_text())
 
@@ -62,12 +81,58 @@ def test_parse_artifactclass_policy_accepts_strict_document() -> None:
     assert policy.bundling.target_gb == 32
     assert policy.bundling.max_age_seconds == 48 * 3600
     assert policy.restore_preference == ("o-copy-1-pool", "o-copy-2-pool")
+    assert policy.staging.appledouble.action == "off"
+    assert policy.staging.compression.codec == "off"
+
+
+def test_parse_artifactclass_policy_accepts_strict_staging_config() -> None:
+    policy = parse_artifactclass_policy(_staging_policy_text())
+
+    assert policy.staging.appledouble.action == "merge-to-xattrs"
+    assert policy.staging.appledouble.tool == "sutradhara-parser"
+    assert policy.staging.appledouble.on_error == "hold"
+    assert policy.staging.compression.codec == "zstd"
+    assert policy.staging.compression.level == 10
+    assert policy.staging.compression.globs == ("**/*.img",)
+    assert policy.staging.compression.min_bytes == 1024
 
 
 def test_parse_artifactclass_policy_rejects_unknown_keys() -> None:
     text = _policy_text() + "\nextra = true\n"
 
     with pytest.raises(ArtifactClassPolicyError, match="unknown key"):
+        parse_artifactclass_policy(text)
+
+
+def test_parse_artifactclass_policy_rejects_unknown_staging_keys() -> None:
+    text = _policy_text() + "\n[staging.compression]\ncodec = \"zstd\"\nlevel = 3\nsuffix = \".zst\"\n"
+
+    with pytest.raises(ArtifactClassPolicyError, match="unknown key"):
+        parse_artifactclass_policy(text)
+
+
+def test_parse_artifactclass_policy_rejects_restore_dispatch_policy_block() -> None:
+    text = _policy_text() + "\n[restore_dispatch]\nforeign_format = \"bru-v1\"\n"
+
+    with pytest.raises(ArtifactClassPolicyError, match="unknown key"):
+        parse_artifactclass_policy(text)
+
+
+def test_parse_artifactclass_policy_requires_zstd_level() -> None:
+    text = _policy_text() + "\n[staging.compression]\ncodec = \"zstd\"\n"
+
+    with pytest.raises(ArtifactClassPolicyError, match="level"):
+        parse_artifactclass_policy(text)
+
+
+def test_parse_artifactclass_policy_requires_recorded_appledouble_merge() -> None:
+    text = _policy_text() + """
+[staging.appledouble]
+action = "merge-to-xattrs"
+record = false
+"""
+
+    with pytest.raises(ArtifactClassPolicyError, match="record"):
         parse_artifactclass_policy(text)
 
 
@@ -86,7 +151,7 @@ def test_parse_artifactclass_policy_rejects_duplicate_pools() -> None:
 
 
 def test_apply_artifactclass_policy_upserts_memberships(engine: Engine) -> None:
-    policy = parse_artifactclass_policy(_policy_text())
+    policy = parse_artifactclass_policy(_staging_policy_text())
     with session_scope(engine) as s:
         backend = Backend(
             name="rem",
@@ -142,6 +207,7 @@ def test_apply_artifactclass_policy_upserts_memberships(engine: Engine) -> None:
         assert record.target_bytes == 32 * 1024**3
         assert record.max_age_seconds == 48 * 3600
         assert record.restore_preference == ["o-copy-1-pool", "o-copy-2-pool"]
+        assert record.staging_config == policy.staging.to_json()
 
 
 def test_apply_artifactclass_policy_rejects_unknown_pool(engine: Engine) -> None:

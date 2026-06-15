@@ -29,22 +29,35 @@ from sutradhara.archive_fanout import (
 from sutradhara.archive_restore import (
     RemArchiveExtractor,
     RestoreIntegrityError,
+    RestoreNameError,
     RestoreSourceUnavailable,
+    resolve_member_asset_hash,
     restore_asset,
 )
 from sutradhara.artifactclass_policy import (
     ArtifactClassPolicy,
     BundlingPolicy,
+    CompressionStagingPolicy,
     PlacementPolicy,
+    StagingPolicy,
     apply_artifactclass_policy,
     get_artifactclass_policy,
 )
 from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, VerifyResult
 from sutradhara.catalog.copies import add_bundle_copy
-from sutradhara.catalog.models import AssetLocator, Backend, Bundle, Copy, LogicalAsset, Pool
+from sutradhara.catalog.models import (
+    AssetLocator,
+    Backend,
+    Bundle,
+    Copy,
+    LogicalAsset,
+    Pool,
+    StagingTransform,
+)
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
 from sutradhara.sealing.port import Representation
+from sutradhara.staging import stage_and_enqueue_artifact
 
 
 @pytest.fixture
@@ -163,6 +176,7 @@ def _install_policy(
     *,
     expect: str = "messy",
     target_gb: float = 0.000001,
+    staging: StagingPolicy = StagingPolicy(),
 ) -> tuple[int, int]:
     with session_scope(engine) as s:
         rem = Backend(
@@ -207,6 +221,7 @@ def _install_policy(
                 ),
                 restore_preference=("o-copy-1-pool", "d2-shelf-pool"),
                 expect=expect,
+                staging=staging,
             ),
         )
         return rem.id, d2.id
@@ -447,6 +462,104 @@ def test_restore_uses_policy_preference_and_falls_back_to_d2(
         )
         assert fallback.pool_id == "d2-shelf-pool"
         assert fallback.output_path.read_bytes() == setup.assets[asset_hash]
+
+
+def test_zstd_staged_member_fans_out_manifests_and_restores_original(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    original = (b"virtual disk block\n" * 256) + b"tail"
+    source = tmp_path / "disk.img"
+    source.write_bytes(original)
+    rem_id, d2_id = _install_policy(
+        engine,
+        staging=StagingPolicy(
+            compression=CompressionStagingPolicy(
+                codec="zstd",
+                level=3,
+                globs=("**/*.img",),
+            )
+        ),
+    )
+    rem_backend = _ArchiveWriteBackend("rem")
+    d2_backend = _ArchiveWriteBackend("d2")
+
+    with session_scope(engine) as s:
+        policy = get_artifactclass_policy(s, "o-archive")
+        staged = stage_and_enqueue_artifact(
+            s,
+            artifactclass="o-archive",
+            policy=policy,
+            source_path=source,
+            staging_root=tmp_path / "stage",
+            member_path="images/disk.img",
+            bundle_id="bundle-zstd",
+        )
+
+        assert staged.logical_sha256 == _digest(original)
+        assert staged.stored_member_path == "images/disk.img.zst"
+        assert staged.staged_path.read_bytes() != original
+
+        result = flush_bundle(
+            s,
+            bundle_id="bundle-zstd",
+            backends={rem_id: rem_backend, d2_id: d2_backend},
+            builder=LocalArchiveBuilder(),
+            deliverables_dir=tmp_path / "manifests",
+            manifest_signer=HmacManifestSigner(b"receipt-secret", "test-key"),
+        )
+
+        transforms = list(s.scalars(select(StagingTransform)))
+        assert [transform.kind for transform in transforms] == ["zstd-file-v1"]
+        assert transforms[0].original_member_path == "images/disk.img"
+        assert transforms[0].stored_member_path == "images/disk.img.zst"
+        assert transforms[0].original_sha256 == _digest(original)
+        assert transforms[0].stored_sha256 == staged.staged_sha256
+
+        assert result.manifest_path is not None
+        receipt = json.loads(Path(result.manifest_path).read_text())
+        assert receipt["members"] == [
+            {
+                "member_name": "images/disk.img",
+                "stored_member_name": "images/disk.img.zst",
+                "logical_sha256": _digest(original).hex(),
+                "stored_sha256": staged.staged_sha256.hex(),
+                "transforms": ["zstd-file-v1"],
+                "pfr_original": False,
+            }
+        ]
+        assert (
+            resolve_member_asset_hash(
+                s,
+                artifactclass="o-archive",
+                member_name="images/disk.img",
+            )
+            == _digest(original)
+        )
+        assert (
+            resolve_member_asset_hash(
+                s,
+                artifactclass="o-archive",
+                member_name="images/disk.img.zst",
+            )
+            == _digest(original)
+        )
+        with pytest.raises(RestoreNameError):
+            resolve_member_asset_hash(
+                s,
+                artifactclass="o-archive",
+                member_name=r"bad\xFF",
+            )
+
+        restored = restore_asset(
+            s,
+            asset_hash=_digest(original),
+            artifactclass="o-archive",
+            destination=tmp_path / "restored.img",
+            backends={rem_id: rem_backend, d2_id: d2_backend},
+        )
+
+    assert restored.output_path.read_bytes() == original
 
 
 def test_restore_surfaces_unavailable_and_integrity_failures(

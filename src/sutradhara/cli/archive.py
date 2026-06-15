@@ -8,7 +8,7 @@ from pathlib import Path
 import click
 from sqlalchemy import select
 
-from sutradhara.archive_bundle import enqueue_artifact, record_review_decision
+from sutradhara.archive_bundle import record_review_decision
 from sutradhara.archive_fanout import (
     BundleHeld,
     HmacManifestSigner,
@@ -16,7 +16,12 @@ from sutradhara.archive_fanout import (
     RemArchiveBuilder,
     flush_bundle,
 )
-from sutradhara.archive_restore import RemArchiveExtractor, restore_asset
+from sutradhara.archive_restore import (
+    RemArchiveExtractor,
+    RestoreNameError,
+    resolve_member_asset_hash,
+    restore_asset,
+)
 from sutradhara.artifactclass_policy import (
     apply_artifactclass_policy_file,
     get_artifactclass_policy,
@@ -24,6 +29,7 @@ from sutradhara.artifactclass_policy import (
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool
 from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.staging import StagingHeld, stage_and_enqueue_artifact
 
 
 @click.group("archive")
@@ -59,27 +65,49 @@ def bundle_group() -> None:
 @click.argument("asset_hash_hex")
 @click.argument("source_path", type=click.Path(exists=True, dir_okay=False))
 @click.option("--member-path", default=None, help="Path stored inside the archive.")
+@click.option(
+    "--staging-dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Directory for copy-on-write staging transforms.",
+)
 def bundle_enqueue(
     artifactclass: str,
     asset_hash_hex: str,
     source_path: str,
     member_path: str | None,
+    staging_dir: str | None,
 ) -> None:
-    """Add an existing logical asset to an artifactclass open bundle."""
+    """Stage and add an existing logical asset to an artifactclass open bundle."""
+    expected_hash = bytes.fromhex(asset_hash_hex)
     engine = make_engine()
     with session_scope(engine) as session:
         policy = get_artifactclass_policy(session, artifactclass)
-        bundle, member, created = enqueue_artifact(
-            session,
-            artifactclass=artifactclass,
-            policy=policy,
-            logical_asset_hash=bytes.fromhex(asset_hash_hex),
-            source_path=source_path,
-            member_path=member_path,
-        )
+        try:
+            staged = stage_and_enqueue_artifact(
+                session,
+                artifactclass=artifactclass,
+                policy=policy,
+                source_path=source_path,
+                staging_root=_staging_root(source_path, staging_dir),
+                member_path=member_path,
+            )
+        except StagingHeld as exc:
+            raise click.ClickException(json.dumps(exc.summary, indent=2, sort_keys=True)) from exc
+        if staged.logical_sha256 != expected_hash:
+            raise click.ClickException(
+                f"source hash {staged.logical_sha256.hex()} does not match {asset_hash_hex}"
+            )
+        bundle = session.scalars(
+            select(Bundle).where(
+                Bundle.artifactclass == artifactclass,
+                Bundle.status == "open",
+            )
+        ).first()
+        if bundle is None:
+            raise click.ClickException("staging did not create an open bundle")
         click.echo(
-            f"{'enqueued' if created else 'already present'} "
-            f"{member.member_path!r} in bundle {bundle.id}"
+            f"enqueued {staged.stored_member_path!r} in bundle {bundle.id}"
         )
 
 
@@ -191,31 +219,44 @@ def review_cmd(
 
 
 @archive_group.command("restore")
-@click.argument("asset_hash_hex")
+@click.argument("asset_hash_hex", required=False)
 @click.option("--artifactclass", required=True, help="Artifactclass restore policy.")
 @click.option("--dest", "destination", required=True, type=click.Path(dir_okay=False))
 @click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
+@click.option("--member-name", default=None, help="Escaped customer manifest member name.")
 def restore_cmd(
-    asset_hash_hex: str,
+    asset_hash_hex: str | None,
     artifactclass: str,
     destination: str,
     rem_bin: str,
+    member_name: str | None,
 ) -> None:
     """Restore one asset using artifactclass pool preference."""
     engine = make_engine()
     with session_scope(engine) as session:
+        if (asset_hash_hex is None) == (member_name is None):
+            raise click.ClickException("provide exactly one of ASSET_HASH_HEX or --member-name")
+        asset_hash = (
+            bytes.fromhex(asset_hash_hex)
+            if asset_hash_hex is not None
+            else _resolve_member_hash(
+                session=session,
+                artifactclass=artifactclass,
+                member_name=member_name,
+            )
+        )
         policy = get_artifactclass_policy(session, artifactclass)
         backends = _restore_backends(session, artifactclass, policy.restore_preference)
         result = restore_asset(
             session,
-            asset_hash=bytes.fromhex(asset_hash_hex),
+            asset_hash=asset_hash,
             artifactclass=artifactclass,
             destination=destination,
             backends=backends,
             extractor=RemArchiveExtractor(rem_bin),
         )
     click.echo(
-        f"restored {asset_hash_hex} from pool {result.pool_id} copy {result.copy_id} "
+        f"restored {result.asset_hash.hex()} from pool {result.pool_id} copy {result.copy_id} "
         f"to {result.output_path}"
     )
 
@@ -233,6 +274,23 @@ def _target_backends(session, artifactclass: str):
         )
     )
     return {row.id: backend_from_row(row) for row in rows}
+
+
+def _resolve_member_hash(session, artifactclass: str, member_name: str | None) -> bytes:
+    try:
+        return resolve_member_asset_hash(
+            session,
+            artifactclass=artifactclass,
+            member_name=member_name or "",
+        )
+    except RestoreNameError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _staging_root(source_path: str, staging_dir: str | None) -> Path:
+    if staging_dir is not None:
+        return Path(staging_dir)
+    return Path(source_path).resolve().parent / ".sutradhara-stage"
 
 
 def _restore_backends(session, artifactclass: str, pool_ids: list[str]):

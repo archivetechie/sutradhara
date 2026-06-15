@@ -47,12 +47,60 @@ class BundlingPolicy:
 
 
 @dataclass(frozen=True)
+class AppleDoubleStagingPolicy:
+    action: str = "off"
+    tool: str = "sutradhara-parser"
+    on_error: str = "hold"
+    record: bool = True
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "action": self.action,
+            "tool": self.tool,
+            "on_error": self.on_error,
+            "record": self.record,
+        }
+
+
+@dataclass(frozen=True)
+class CompressionStagingPolicy:
+    codec: str = "off"
+    level: int | None = None
+    globs: tuple[str, ...] = ()
+    min_bytes: int | None = None
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "codec": self.codec,
+            "globs": list(self.globs),
+        }
+        if self.level is not None:
+            payload["level"] = self.level
+        if self.min_bytes is not None:
+            payload["min_bytes"] = self.min_bytes
+        return payload
+
+
+@dataclass(frozen=True)
+class StagingPolicy:
+    appledouble: AppleDoubleStagingPolicy = AppleDoubleStagingPolicy()
+    compression: CompressionStagingPolicy = CompressionStagingPolicy()
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "appledouble": self.appledouble.to_json(),
+            "compression": self.compression.to_json(),
+        }
+
+
+@dataclass(frozen=True)
 class ArtifactClassPolicy:
     ruleset: str
     placements: tuple[PlacementPolicy, ...]
     bundling: BundlingPolicy
     restore_preference: tuple[str, ...]
     expect: str
+    staging: StagingPolicy = StagingPolicy()
 
 
 _DURATION_RE = re.compile(r"^(?P<value>[1-9][0-9]*)(?P<unit>s|m|h|d)$")
@@ -79,6 +127,11 @@ def get_artifactclass_policy(
     return policy
 
 
+def staging_policy_from_json(raw: object) -> StagingPolicy:
+    """Hydrate a persisted normalized staging policy JSON document."""
+    return _parse_staging(raw, "staging_config")
+
+
 def parse_artifactclass_policy(
     text: str,
     *,
@@ -97,7 +150,7 @@ def parse_artifactclass_policy(
     )
     _reject_keys(
         raw,
-        {"ruleset", "placements", "bundling", "restore", "expect"},
+        {"ruleset", "placements", "bundling", "restore", "expect", "staging"},
         source,
     )
 
@@ -139,12 +192,15 @@ def parse_artifactclass_policy(
     if not restore_preference:
         raise ArtifactClassPolicyError(f"{source}: restore.preference must not be empty")
 
+    staging = _parse_staging(raw.get("staging"), f"{source}: staging")
+
     return ArtifactClassPolicy(
         ruleset=ruleset,
         placements=placements,
         bundling=bundling,
         restore_preference=restore_preference,
         expect=expect,
+        staging=staging,
     )
 
 
@@ -202,6 +258,7 @@ def apply_artifactclass_policy(
     record.target_bytes = policy.bundling.target_bytes
     record.max_age_seconds = policy.bundling.max_age_seconds
     record.restore_preference = list(policy.restore_preference)
+    record.staging_config = policy.staging.to_json()
     record.policy_source = source
     record.policy_sha256 = (
         hashlib.sha256(source_text.encode("utf-8")).hexdigest() if source_text is not None else None
@@ -243,6 +300,71 @@ def _parse_placement(raw: object, label: str) -> PlacementPolicy:
     )
 
 
+def _parse_staging(raw: object, label: str) -> StagingPolicy:
+    if raw is None:
+        return StagingPolicy()
+    table = _required_table(raw, label)
+    _reject_keys(table, {"appledouble", "compression"}, label)
+    return StagingPolicy(
+        appledouble=_parse_appledouble(table.get("appledouble"), f"{label}.appledouble"),
+        compression=_parse_compression(table.get("compression"), f"{label}.compression"),
+    )
+
+
+def _parse_appledouble(raw: object, label: str) -> AppleDoubleStagingPolicy:
+    if raw is None:
+        return AppleDoubleStagingPolicy()
+    table = _required_table(raw, label)
+    _reject_keys(table, {"action", "tool", "on_error", "record"}, label)
+    action = _optional_str(table.get("action"), f"{label}.action", default="off")
+    if action not in {"off", "merge-to-xattrs"}:
+        raise ArtifactClassPolicyError(f"{label}.action must be 'off' or 'merge-to-xattrs'")
+    tool = _optional_str(table.get("tool"), f"{label}.tool", default="sutradhara-parser")
+    if tool not in {"netatalk-ad", "sutradhara-parser"}:
+        raise ArtifactClassPolicyError(
+            f"{label}.tool must be 'netatalk-ad' or 'sutradhara-parser'"
+        )
+    on_error = _optional_str(table.get("on_error"), f"{label}.on_error", default="hold")
+    if on_error not in {"hold", "fail"}:
+        raise ArtifactClassPolicyError(f"{label}.on_error must be 'hold' or 'fail'")
+    record = table.get("record", True)
+    if not isinstance(record, bool):
+        raise ArtifactClassPolicyError(f"{label}.record must be a boolean")
+    if action == "merge-to-xattrs" and not record:
+        raise ArtifactClassPolicyError(f"{label}.record must be true when merging AppleDouble")
+    return AppleDoubleStagingPolicy(
+        action=action,
+        tool=tool,
+        on_error=on_error,
+        record=record,
+    )
+
+
+def _parse_compression(raw: object, label: str) -> CompressionStagingPolicy:
+    if raw is None:
+        return CompressionStagingPolicy()
+    table = _required_table(raw, label)
+    _reject_keys(table, {"codec", "level", "globs", "min_bytes"}, label)
+    codec = _optional_str(table.get("codec"), f"{label}.codec", default="off")
+    if codec not in {"off", "zstd"}:
+        raise ArtifactClassPolicyError(f"{label}.codec must be 'off' or 'zstd'")
+    level = _optional_int(table.get("level"), f"{label}.level")
+    if codec == "zstd" and level is None:
+        raise ArtifactClassPolicyError(f"{label}.level is required when codec='zstd'")
+    if level is not None and not 1 <= level <= 22:
+        raise ArtifactClassPolicyError(f"{label}.level must be between 1 and 22")
+    globs = _str_tuple(table.get("globs", []), f"{label}.globs")
+    min_bytes = _optional_int(table.get("min_bytes"), f"{label}.min_bytes")
+    if min_bytes is not None and min_bytes < 0:
+        raise ArtifactClassPolicyError(f"{label}.min_bytes must be non-negative")
+    return CompressionStagingPolicy(
+        codec=codec,
+        level=level,
+        globs=globs,
+        min_bytes=min_bytes,
+    )
+
+
 def _require_keys(raw: dict[str, object], required: set[str], label: str) -> None:
     missing = sorted(required - set(raw))
     if missing:
@@ -264,6 +386,20 @@ def _required_table(raw: object, label: str) -> dict[str, object]:
 def _required_str(raw: object, label: str) -> str:
     if not isinstance(raw, str) or not raw:
         raise ArtifactClassPolicyError(f"{label} must be a non-empty string")
+    return raw
+
+
+def _optional_str(raw: object, label: str, *, default: str) -> str:
+    if raw is None:
+        return default
+    return _required_str(raw, label)
+
+
+def _optional_int(raw: object, label: str) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ArtifactClassPolicyError(f"{label} must be an integer")
     return raw
 
 

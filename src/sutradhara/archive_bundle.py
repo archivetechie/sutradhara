@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -28,8 +29,10 @@ from sutradhara.catalog.models import (
     LogicalAsset,
     Pool,
     ReviewDecision,
+    StagingTransform,
 )
 from sutradhara.catalog.types import is_content_hash
+from sutradhara.member_name import escape_path_name, escape_path_text
 
 
 class ArchiveBundleError(Exception):
@@ -54,6 +57,10 @@ class AssetLocatorError(ArchiveBundleError):
 
 class BundleStateError(ArchiveBundleError):
     """A bundle operation was requested in the wrong lifecycle state."""
+
+
+class StagingTransformError(ArchiveBundleError):
+    """A staging transform record is inconsistent with its bundle member."""
 
 
 def get_or_create_open_bundle(
@@ -96,6 +103,7 @@ def enqueue_artifact(
     logical_asset_hash: bytes,
     source_path: Path | str,
     member_path: str | None = None,
+    member_path_is_escaped: bool = False,
     bundle_id: str | None = None,
     now: dt.datetime | None = None,
     source_metadata: dict[str, Any] | None = None,
@@ -104,7 +112,19 @@ def enqueue_artifact(
     _require_asset(session, logical_asset_hash)
     source = Path(source_path)
     size_bytes = source.stat().st_size
-    path_in_bundle = member_path or source.name
+    if member_path is None:
+        path_in_bundle = escape_path_name(source)
+    elif member_path_is_escaped:
+        path_in_bundle = member_path
+    else:
+        path_in_bundle = escape_path_text(member_path)
+    stored_source_path = str(source)
+    metadata = dict(source_metadata or {})
+    try:
+        stored_source_path.encode("utf-8")
+    except UnicodeEncodeError:
+        metadata["source_path_bytes_hex"] = os.fsencode(source).hex()
+        stored_source_path = None
     bundle, _ = get_or_create_open_bundle(
         session,
         artifactclass=artifactclass,
@@ -117,10 +137,10 @@ def enqueue_artifact(
         bundle=bundle,
         logical_asset_hash=logical_asset_hash,
         member_path=path_in_bundle,
-        source_path=str(source),
+        source_path=stored_source_path,
         size_bytes=size_bytes,
         file_sha256=_sha256_file(source),
-        source_metadata=source_metadata,
+        source_metadata=metadata or None,
     )
     return bundle, member, created
 
@@ -271,6 +291,61 @@ def record_blob_root(
     session.add(root)
     session.flush()
     return root
+
+
+def record_staging_transform(
+    session: Session,
+    *,
+    member: BundleMember,
+    artifactclass: str,
+    step_order: int,
+    kind: str,
+    reversible: bool,
+    original_member_path: str,
+    stored_member_path: str,
+    original_size_bytes: int,
+    stored_size_bytes: int,
+    original_sha256: bytes,
+    stored_sha256: bytes,
+    parameters: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    is_final: bool = True,
+) -> StagingTransform:
+    """Record one ordered staging transform for a bundle member."""
+    if is_final and stored_member_path != member.member_path:
+        raise StagingTransformError(
+            f"transform stored path {stored_member_path!r} does not match "
+            f"bundle member {member.member_path!r}"
+        )
+    if original_sha256 != member.logical_asset_hash:
+        raise StagingTransformError(
+            "transform original_sha256 must match the member logical asset hash"
+        )
+    if is_final and stored_sha256 != member.file_sha256:
+        raise StagingTransformError(
+            f"transform stored sha256 for {stored_member_path!r} does not match "
+            "bundle member file_sha256"
+        )
+    transform = StagingTransform(
+        bundle_member_id=member.id,
+        bundle_id=member.bundle_id,
+        logical_asset_hash=member.logical_asset_hash,
+        artifactclass=artifactclass,
+        step_order=step_order,
+        kind=kind,
+        reversible=reversible,
+        original_member_path=original_member_path,
+        stored_member_path=stored_member_path,
+        original_size_bytes=original_size_bytes,
+        stored_size_bytes=stored_size_bytes,
+        original_sha256=original_sha256,
+        stored_sha256=stored_sha256,
+        parameters=parameters or {},
+        result=result or {},
+    )
+    session.add(transform)
+    session.flush()
+    return transform
 
 
 def record_exclusion(

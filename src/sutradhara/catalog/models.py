@@ -209,6 +209,7 @@ class ArtifactClassPolicyRecord(Base):
     target_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     max_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     restore_preference: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    staging_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     policy_source: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     policy_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(
@@ -308,6 +309,76 @@ class BundleMember(Base):
 
     bundle: Mapped[Bundle] = relationship(back_populates="members")
     logical_asset: Mapped[LogicalAsset] = relationship()
+    transforms: Mapped[list[StagingTransform]] = relationship(
+        back_populates="bundle_member",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="StagingTransform.step_order",
+    )
+
+
+class StagingTransform(Base):
+    """One recorded staging transform applied before bundle fan-out.
+
+    Transform rows are copy-independent. They describe how one bundle member's
+    archived bytes differ from the original logical asset and, for reversible
+    transforms such as zstd compression, how restore must recover the original
+    bytes before verifying the logical asset hash.
+    """
+
+    __tablename__ = "staging_transform"
+    __table_args__ = (
+        UniqueConstraint(
+            "bundle_member_id",
+            "step_order",
+            name="uq_staging_transform_member_step",
+        ),
+        UniqueConstraint(
+            "bundle_id",
+            "stored_member_path",
+            "step_order",
+            name="uq_staging_transform_bundle_stored_step",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bundle_member_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("bundle_member.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    bundle_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("bundle.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    logical_asset_hash: Mapped[bytes] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    step_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    reversible: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    original_member_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    stored_member_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    original_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    stored_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    original_sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    stored_sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    parameters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    bundle_member: Mapped[BundleMember] = relationship(back_populates="transforms")
+    logical_asset: Mapped[LogicalAsset] = relationship()
+    bundle: Mapped[Bundle] = relationship()
 
 
 class AssetLocator(Base):

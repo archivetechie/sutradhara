@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import os
 import subprocess
 import tarfile
 import tempfile
@@ -549,6 +550,7 @@ def emit_customer_manifest(
         "ruleset": bundle.ruleset,
         "issued_at": dt.datetime.now(dt.UTC).isoformat(),
         "manifest": source,
+        "members": _customer_manifest_members(bundle),
         "exclusion_summary": bundle.scan_summary.get("exclusions", [])
         if bundle.scan_summary
         else [],
@@ -558,6 +560,27 @@ def emit_customer_manifest(
     destination.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
     bundle.archive_id = archive_id
     return destination
+
+
+def _customer_manifest_members(bundle: Bundle) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for member in sorted(bundle.members, key=lambda item: item.member_path):
+        metadata = member.source_metadata or {}
+        logical_name = metadata.get("logical_path")
+        if not isinstance(logical_name, str) or not logical_name:
+            logical_name = member.member_path
+        transforms = sorted(member.transforms, key=lambda item: item.step_order)
+        entries.append(
+            {
+                "member_name": logical_name,
+                "stored_member_name": member.member_path,
+                "logical_sha256": member.logical_asset_hash.hex(),
+                "stored_sha256": member.file_sha256.hex(),
+                "transforms": [transform.kind for transform in transforms],
+                "pfr_original": not any(transform.kind == "zstd-file-v1" for transform in transforms),
+            }
+        )
+    return entries
 
 
 def _build_for_target(
@@ -781,17 +804,33 @@ def _verified_member_bytes(
 
 
 def _member_input(member: BundleMember) -> MemberInput:
-    if member.source_path is None:
+    source_path = _member_source_path(member)
+    if source_path is None:
         raise ArchiveFanoutError(
             f"bundle member {member.id} has no source_path; cannot materialize"
         )
     return MemberInput(
         logical_asset_hash=member.logical_asset_hash,
         member_path=member.member_path,
-        source_path=Path(member.source_path),
+        source_path=source_path,
         size_bytes=member.size_bytes,
         file_sha256=member.file_sha256,
     )
+
+
+def _member_source_path(member: BundleMember) -> Path | None:
+    if member.source_path is not None:
+        return Path(member.source_path)
+    metadata = member.source_metadata or {}
+    raw_hex = metadata.get("source_path_bytes_hex")
+    if isinstance(raw_hex, str) and raw_hex:
+        try:
+            return Path(os.fsdecode(bytes.fromhex(raw_hex)))
+        except ValueError as exc:
+            raise ArchiveFanoutError(
+                f"bundle member {member.id} has invalid source_path_bytes_hex"
+            ) from exc
+    return None
 
 
 def _scan_from_json(raw: dict[str, Any]) -> ConformanceScan:

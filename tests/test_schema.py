@@ -48,6 +48,16 @@ def _assert_archive_invariants(db_path: Path) -> None:
         "member_path",
     ) in _unique_index_columns(db_path, "asset_locator")
     assert "ck_copy_asset_xor_bundle" in _table_sql(db_path, "copy")
+    assert (
+        "bundle_member_id",
+        "step_order",
+    ) in _unique_index_columns(db_path, "staging_transform")
+    assert (
+        "bundle_id",
+        "stored_member_path",
+        "step_order",
+    ) in _unique_index_columns(db_path, "staging_transform")
+    assert "staging_config" in _table_sql(db_path, "artifactclass_policy")
 
 
 def test_create_all_creates_job_table_without_prior_job_import(tmp_path: Path) -> None:
@@ -72,6 +82,7 @@ engine.dispose()
     assert "blob_root" in tables
     assert "exclusion_record" in tables
     assert "review_decision" in tables
+    assert "staging_transform" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
 
@@ -100,6 +111,7 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     assert "blob_root" in tables
     assert "exclusion_record" in tables
     assert "review_decision" in tables
+    assert "staging_transform" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
 
