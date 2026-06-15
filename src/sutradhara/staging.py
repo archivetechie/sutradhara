@@ -9,10 +9,10 @@ steps for reversible transforms.
 from __future__ import annotations
 
 import hashlib
-import io
 import os
 import shutil
 import struct
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -44,6 +44,11 @@ _APPLEDOUBLE_MAGIC = 0x00051607
 _APPLEDOUBLE_VERSION = 0x00020000
 _APPLEDOUBLE_RESOURCE_FORK = 2
 _APPLEDOUBLE_FINDER_INFO = 9
+_APPLEDOUBLE_FINDER_INFO_BYTES = 32
+_APPLEDOUBLE_ATTR_MAGIC = 0x41545452
+_APPLEDOUBLE_ATTR_MAGIC_BYTES = b"ATTR"
+_APPLEDOUBLE_ATTR_HEADER_BYTES = 36
+_APPLEDOUBLE_ATTR_ENTRY_FIXED_BYTES = 11
 _ZSTD_SUFFIX = ".zst"
 
 
@@ -89,6 +94,20 @@ class StagedArtifact:
     staged_size_bytes: int
     transforms: tuple[TransformSpec, ...]
     pfr_original: bool
+
+
+@dataclass(frozen=True)
+class RestoredFile:
+    """A streamed restore transform result."""
+
+    sha256: bytes
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class _AppleDoubleEntry:
+    offset: int
+    data: bytes
 
 
 def stage_and_enqueue_artifact(
@@ -190,6 +209,8 @@ def stage_artifact(
     source = Path(source_path)
     if not source.is_file():
         raise StagingError(f"staging currently requires a regular file: {source}")
+    if policy.appledouble.action == "merge-to-xattrs" and _is_appledouble_sidecar(source):
+        _handle_appledouble_sidecar_source(policy.appledouble, source)
     logical_member_path = (
         escape_path_name(source) if member_path is None else escape_path_text(member_path)
     )
@@ -238,11 +259,11 @@ def stage_artifact(
             TransformSpec(
                 kind=ZSTD_FILE_KIND,
                 reversible=True,
-                original_member_path=logical_member_path,
+                original_member_path=current_member_path,
                 stored_member_path=compressed_member_path,
-                original_size_bytes=original_size,
+                original_size_bytes=current_size,
                 stored_size_bytes=compressed_size,
-                original_sha256=original_hash,
+                original_sha256=current_hash,
                 stored_sha256=compressed_hash,
                 parameters={
                     "codec": "zstd",
@@ -274,20 +295,45 @@ def stage_artifact(
     )
 
 
-def reverse_transforms(data: bytes, transforms: Iterable[StagingTransform]) -> bytes:
-    """Apply reversible transform inverses in restore order."""
-    restored = data
-    for transform in sorted(transforms, key=lambda item: item.step_order, reverse=True):
-        if not transform.reversible:
-            continue
-        if transform.kind == ZSTD_FILE_KIND:
-            try:
-                restored = _decompress_zstd(restored)
-            except zstd.ZstdError as exc:
-                raise StagingError("zstd decompression failed during restore") from exc
-            continue
-        raise StagingError(f"unsupported reversible transform {transform.kind!r}")
-    return restored
+def reverse_transforms_to_path(
+    source: Path,
+    destination: Path,
+    transforms: Iterable[StagingTransform],
+) -> RestoredFile:
+    """Apply reversible transform inverses from one file path to another."""
+    reversible = [
+        transform
+        for transform in sorted(transforms, key=lambda item: item.step_order, reverse=True)
+        if transform.reversible
+    ]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not reversible:
+        _copy_file(source, destination)
+        return RestoredFile(
+            sha256=_sha256_file(destination),
+            size_bytes=destination.stat().st_size,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix=".sutradhara-transform-",
+        dir=destination.parent,
+    ) as raw_tmp:
+        temp_dir = Path(raw_tmp)
+        current = source
+        for index, transform in enumerate(reversible):
+            target = destination if index == len(reversible) - 1 else temp_dir / f"step-{index}"
+            if transform.kind == ZSTD_FILE_KIND:
+                try:
+                    _decompress_zstd_to_path(current, target)
+                except zstd.ZstdError as exc:
+                    raise StagingError("zstd decompression failed during restore") from exc
+                current = target
+                continue
+            raise StagingError(f"unsupported reversible transform {transform.kind!r}")
+    return RestoredFile(
+        sha256=_sha256_file(destination),
+        size_bytes=destination.stat().st_size,
+    )
 
 
 def _merge_appledouble(
@@ -319,13 +365,14 @@ def _merge_appledouble(
     raw = sidecar.read_bytes()
     try:
         entries = _parse_appledouble(raw)
-        xattrs = _apply_appledouble_entries(staged, entries)
+        xattrs = _apply_appledouble_entries(staged, raw, entries)
     except Exception as exc:
         _handle_appledouble_error(policy, f"AppleDouble merge failed for {sidecar}: {exc}")
     staged_sidecar = staged.with_name(f"._{staged.name}")
     if staged_sidecar.exists():
         staged_sidecar.unlink()
-    resource_fork_bytes = len(entries.get(_APPLEDOUBLE_RESOURCE_FORK, b""))
+    resource_fork = entries.get(_APPLEDOUBLE_RESOURCE_FORK)
+    resource_fork_bytes = len(resource_fork.data) if resource_fork is not None else 0
     return TransformSpec(
         kind=APPLEDOUBLE_MERGE_KIND,
         reversible=False,
@@ -343,18 +390,43 @@ def _merge_appledouble(
         },
         result={
             "merged": True,
+            "consumed_sidecar": True,
+            "sidecar_path": str(sidecar),
             "xattrs": xattrs,
             "resource_fork_bytes": resource_fork_bytes,
         },
     )
 
 
-def _handle_appledouble_error(policy: AppleDoubleStagingPolicy, message: str) -> None:
+def _is_appledouble_sidecar(source: Path) -> bool:
+    return source.name.startswith("._") and len(source.name) > 2
+
+
+def _handle_appledouble_sidecar_source(policy: AppleDoubleStagingPolicy, source: Path) -> None:
+    sibling = source.with_name(source.name[2:])
+    reason = (
+        "appledouble-sidecar-consumed"
+        if sibling.exists()
+        else "appledouble-sidecar-without-data-fork"
+    )
+    _handle_appledouble_error(
+        policy,
+        f"AppleDouble sidecar {source} is metadata for {sibling}, not an archive member",
+        reason=reason,
+    )
+
+
+def _handle_appledouble_error(
+    policy: AppleDoubleStagingPolicy,
+    message: str,
+    *,
+    reason: str = "appledouble-merge-failed",
+) -> None:
     summary = {
         "clusters": [
             {
                 "prefix": "",
-                "reason": "appledouble-merge-failed",
+                "reason": reason,
                 "count": 1,
                 "bytes_total": 0,
                 "samples": [message],
@@ -368,7 +440,7 @@ def _handle_appledouble_error(policy: AppleDoubleStagingPolicy, message: str) ->
     raise StagingError(message)
 
 
-def _parse_appledouble(raw: bytes) -> dict[int, bytes]:
+def _parse_appledouble(raw: bytes) -> dict[int, _AppleDoubleEntry]:
     if len(raw) < 26:
         raise StagingError("AppleDouble sidecar is too short")
     magic, version = struct.unpack_from(">II", raw, 0)
@@ -378,29 +450,125 @@ def _parse_appledouble(raw: bytes) -> dict[int, bytes]:
     table_end = 26 + entry_count * 12
     if table_end > len(raw):
         raise StagingError("AppleDouble entry table is truncated")
-    entries: dict[int, bytes] = {}
+    entries: dict[int, _AppleDoubleEntry] = {}
     for index in range(entry_count):
         entry_id, offset, length = struct.unpack_from(">III", raw, 26 + index * 12)
         end = offset + length
         if offset > len(raw) or end > len(raw) or end < offset:
             raise StagingError(f"AppleDouble entry {entry_id} points outside the sidecar")
-        entries[entry_id] = raw[offset:end]
+        entries[entry_id] = _AppleDoubleEntry(offset=offset, data=raw[offset:end])
     if not any(entry in entries for entry in {_APPLEDOUBLE_RESOURCE_FORK, _APPLEDOUBLE_FINDER_INFO}):
         raise StagingError("AppleDouble sidecar has no supported metadata entries")
     return entries
 
 
-def _apply_appledouble_entries(path: Path, entries: dict[int, bytes]) -> list[str]:
+def _apply_appledouble_entries(
+    path: Path,
+    raw: bytes,
+    entries: dict[int, _AppleDoubleEntry],
+) -> list[str]:
     applied: list[str] = []
     if _APPLEDOUBLE_RESOURCE_FORK in entries:
         name = "user.com.apple.ResourceFork"
-        os.setxattr(path, name, entries[_APPLEDOUBLE_RESOURCE_FORK])
+        os.setxattr(path, name, entries[_APPLEDOUBLE_RESOURCE_FORK].data)
         applied.append(name)
     if _APPLEDOUBLE_FINDER_INFO in entries:
         name = "user.com.apple.FinderInfo"
-        os.setxattr(path, name, entries[_APPLEDOUBLE_FINDER_INFO])
+        finder_entry = entries[_APPLEDOUBLE_FINDER_INFO]
+        if len(finder_entry.data) < _APPLEDOUBLE_FINDER_INFO_BYTES:
+            raise StagingError("AppleDouble FinderInfo entry is shorter than 32 bytes")
+        os.setxattr(path, name, finder_entry.data[:_APPLEDOUBLE_FINDER_INFO_BYTES])
         applied.append(name)
+        for attr_name, value in _parse_appledouble_finder_xattrs(raw, finder_entry):
+            os.setxattr(path, attr_name, value)
+            applied.append(attr_name)
     return applied
+
+
+def _parse_appledouble_finder_xattrs(
+    raw: bytes,
+    finder_entry: _AppleDoubleEntry,
+) -> list[tuple[str, bytes]]:
+    trailer_start = finder_entry.offset + _APPLEDOUBLE_FINDER_INFO_BYTES
+    trailer_end = finder_entry.offset + len(finder_entry.data)
+    trailer = raw[trailer_start:trailer_end]
+    if not trailer or not trailer.strip(b"\0"):
+        return []
+
+    attr_start = trailer_start
+    if not trailer.startswith(_APPLEDOUBLE_ATTR_MAGIC_BYTES):
+        if trailer.startswith(b"\0\0" + _APPLEDOUBLE_ATTR_MAGIC_BYTES):
+            attr_start += 2
+        else:
+            raise StagingError("AppleDouble FinderInfo ATTR trailer has invalid magic")
+    return _parse_appledouble_attrs(raw, attr_start)
+
+
+def _parse_appledouble_attrs(raw: bytes, attr_start: int) -> list[tuple[str, bytes]]:
+    header_end = attr_start + _APPLEDOUBLE_ATTR_HEADER_BYTES
+    if header_end > len(raw):
+        raise StagingError("AppleDouble ATTR header is truncated")
+    (
+        magic,
+        _debug_tag,
+        _total_size,
+        data_start,
+        data_length,
+        _reserved0,
+        _reserved1,
+        _reserved2,
+        _flags,
+        attr_count,
+    ) = struct.unpack_from(">IIIII3IHH", raw, attr_start)
+    if magic != _APPLEDOUBLE_ATTR_MAGIC:
+        raise StagingError("AppleDouble ATTR header has invalid magic")
+    if data_start > len(raw) or data_start + data_length > len(raw):
+        raise StagingError("AppleDouble ATTR data points outside the sidecar")
+
+    attrs: list[tuple[str, bytes]] = []
+    entry_offset = header_end
+    for _index in range(attr_count):
+        fixed_end = entry_offset + _APPLEDOUBLE_ATTR_ENTRY_FIXED_BYTES
+        if fixed_end > len(raw):
+            raise StagingError("AppleDouble ATTR entry is truncated")
+        value_offset, value_length, _entry_flags, name_length = struct.unpack_from(
+            ">IIHB",
+            raw,
+            entry_offset,
+        )
+        if name_length < 2 or name_length > 129:
+            raise StagingError("AppleDouble ATTR entry has invalid name length")
+        name_start = fixed_end
+        name_end = name_start + name_length
+        if name_end > len(raw):
+            raise StagingError("AppleDouble ATTR entry name is truncated")
+        raw_name = raw[name_start:name_end]
+        if raw_name[-1] != 0:
+            raise StagingError("AppleDouble ATTR entry name is not NUL-terminated")
+        try:
+            name = raw_name[:-1].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise StagingError("AppleDouble ATTR entry name is not UTF-8") from exc
+        value_start = value_offset
+        value_end = value_start + value_length
+        if value_start > len(raw) or value_end > len(raw) or value_end < value_start:
+            value_start = attr_start + value_offset
+            value_end = value_start + value_length
+        if value_start > len(raw) or value_end > len(raw) or value_end < value_start:
+            raise StagingError("AppleDouble ATTR entry data points outside the sidecar")
+        attrs.append((_linux_xattr_name(name), raw[value_start:value_end]))
+        entry_offset += _align4(_APPLEDOUBLE_ATTR_ENTRY_FIXED_BYTES + name_length)
+    return attrs
+
+
+def _linux_xattr_name(name: str) -> str:
+    if name.startswith(("user.", "system.", "security.", "trusted.")):
+        return name
+    return f"user.{name}"
+
+
+def _align4(value: int) -> int:
+    return (value + 3) & ~3
 
 
 def _should_compress(
@@ -445,11 +613,16 @@ def _compress_zstd(source: Path, destination: Path, *, level: int) -> None:
         compressor.copy_stream(raw_in, raw_out)
 
 
-def _decompress_zstd(data: bytes) -> bytes:
-    raw_in = io.BytesIO(data)
-    raw_out = io.BytesIO()
-    zstd.ZstdDecompressor().copy_stream(raw_in, raw_out)
-    return raw_out.getvalue()
+def _decompress_zstd_to_path(source: Path, destination: Path) -> None:
+    with source.open("rb") as raw_in, destination.open("wb") as raw_out:
+        zstd.ZstdDecompressor().copy_stream(raw_in, raw_out)
+
+
+def _copy_file(source: Path, destination: Path) -> None:
+    if source == destination:
+        return
+    with source.open("rb") as raw_in, destination.open("wb") as raw_out:
+        shutil.copyfileobj(raw_in, raw_out, length=1024 * 1024)
 
 
 def _safe_staging_path(root: Path, member_path: str) -> Path:

@@ -8,9 +8,8 @@ asset identity.
 
 from __future__ import annotations
 
-import hashlib
-import io
 import json
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -36,7 +35,9 @@ from sutradhara.keys import KeyRegistry
 from sutradhara.member_name import MemberNameError, escape_member_name, unescape_member_name
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
-from sutradhara.staging import StagingError, reverse_transforms
+from sutradhara.staging import StagingError, reverse_transforms_to_path
+
+_MAX_LOCAL_ARCHIVE_HEADER_BYTES = 16 * 1024 * 1024
 
 
 class ArchiveRestoreError(Exception):
@@ -69,30 +70,33 @@ class RestoreResult:
 class ArchiveExtractor(Protocol):
     """Per-copy archive extraction boundary."""
 
-    def extract(
+    def extract_to_path(
         self,
         *,
         locator: AssetLocator,
         copy: Copy,
         backend: StorageBackend,
-    ) -> bytes:
-        """Return plaintext bytes for one locator from one stored copy."""
+        destination: Path,
+    ) -> None:
+        """Write the stored member bytes for one locator from one stored copy."""
         ...
 
 
 class LocalArchiveExtractor:
     """Extractor for d2 tar copies, local test archives, and offset locators."""
 
-    def extract(
+    def extract_to_path(
         self,
         *,
         locator: AssetLocator,
         copy: Copy,
         backend: StorageBackend,
-    ) -> bytes:
+        destination: Path,
+    ) -> None:
         representation = Representation(locator.representation)
         if representation is Representation.D2TAR_RAW:
-            return _extract_d2(locator, copy, backend)
+            _extract_d2_to_path(locator, copy, backend, destination)
+            return
         if (
             representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}
             and "offset" not in locator.native_locator
@@ -102,16 +106,19 @@ class LocalArchiveExtractor:
                 "requires a RAO restore adapter"
             )
 
-        container = _read_whole(backend, copy)
-        if _is_local_archive(container):
-            return _extract_from_local_archive(container, locator.native_locator)
+        if _try_extract_from_local_archive_to_path(backend, copy, locator, destination):
+            return
         if "offset" in locator.native_locator:
             offset = int(locator.native_locator["offset"])
             size = int(locator.native_locator["size_bytes"])
-            return backend.read_range(
+            _copy_backend_range_to_path(
+                backend,
                 copy.native_locator,
-                ByteRange(offset, offset + size),
+                offset,
+                offset + size,
+                destination,
             )
+            return
         raise ArchiveRestoreError(
             f"copy id={copy.id} representation {representation.value!r} requires "
             "a RAO restore adapter; no local locator offset was available"
@@ -130,15 +137,22 @@ class RemArchiveExtractor(LocalArchiveExtractor):
         self._rem_bin = str(rem_bin)
         self._keys = keys or KeyRegistry()
 
-    def extract(
+    def extract_to_path(
         self,
         *,
         locator: AssetLocator,
         copy: Copy,
         backend: StorageBackend,
-    ) -> bytes:
+        destination: Path,
+    ) -> None:
         try:
-            return super().extract(locator=locator, copy=copy, backend=backend)
+            super().extract_to_path(
+                locator=locator,
+                copy=copy,
+                backend=backend,
+                destination=destination,
+            )
+            return
         except ArchiveRestoreError:
             representation = Representation(locator.representation)
             if representation not in {
@@ -146,15 +160,16 @@ class RemArchiveExtractor(LocalArchiveExtractor):
                 Representation.RAO_AEAD_V1,
             }:
                 raise
-            return self._extract_with_rem(locator, copy, backend, representation)
+            self._extract_with_rem_to_path(locator, copy, backend, representation, destination)
 
-    def _extract_with_rem(
+    def _extract_with_rem_to_path(
         self,
         locator: AssetLocator,
         copy: Copy,
         backend: StorageBackend,
         representation: Representation,
-    ) -> bytes:
+        destination: Path,
+    ) -> None:
         member_path = _member_path(locator.native_locator)
         with tempfile.TemporaryDirectory(prefix="sutradhara-restore-") as raw:
             temp_dir = Path(raw)
@@ -191,7 +206,7 @@ class RemArchiveExtractor(LocalArchiveExtractor):
                 with self._keys.materialized_root_key(key_epoch) as key_file:
                     cmd.extend(["--key-file", str(key_file)])
                     _run_rem(cmd)
-            return _read_restored_member(dest_dir, member_path)
+            _copy_restored_member(dest_dir, member_path, destination)
 
 
 def restore_asset(
@@ -230,35 +245,47 @@ def restore_asset(
             backend = backends.get(copy.backend_id)
             if backend is None:
                 continue
+            output_path = Path(destination)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                extracted = archive_extractor.extract(
-                    locator=locator,
-                    copy=copy,
-                    backend=backend,
-                )
-                data = _reverse_locator_transforms(session, locator, extracted)
+                with tempfile.TemporaryDirectory(
+                    prefix=".sutradhara-restore-",
+                    dir=output_path.parent,
+                ) as raw_tmp:
+                    temp_dir = Path(raw_tmp)
+                    stored_path = temp_dir / "stored-member"
+                    restored_path = temp_dir / "restored-member"
+                    archive_extractor.extract_to_path(
+                        locator=locator,
+                        copy=copy,
+                        backend=backend,
+                        destination=stored_path,
+                    )
+                    restored = reverse_transforms_to_path(
+                        stored_path,
+                        restored_path,
+                        _locator_transforms(session, locator),
+                    )
+                    if restored.sha256 != asset_hash:
+                        integrity_errors.append(
+                            f"copy id={copy.id} pool={pool_id}: "
+                            f"{restored.sha256.hex()} != {asset_hash.hex()}"
+                        )
+                        continue
+                    restored_path.replace(output_path)
+                    return RestoreResult(
+                        asset_hash=asset_hash,
+                        pool_id=pool_id,
+                        copy_id=copy.id,
+                        output_path=output_path,
+                        size_bytes=restored.size_bytes,
+                    )
             except ArchiveRestoreError as exc:
                 integrity_errors.append(f"copy id={copy.id} pool={pool_id}: {exc}")
                 continue
             except StagingError as exc:
                 integrity_errors.append(f"copy id={copy.id} pool={pool_id}: {exc}")
                 continue
-            actual = hashlib.sha256(data).digest()
-            if actual != asset_hash:
-                integrity_errors.append(
-                    f"copy id={copy.id} pool={pool_id}: {actual.hex()} != {asset_hash.hex()}"
-                )
-                continue
-            output_path = Path(destination)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_bytes(data)
-            return RestoreResult(
-                asset_hash=asset_hash,
-                pool_id=pool_id,
-                copy_id=copy.id,
-                output_path=output_path,
-                size_bytes=len(data),
-            )
 
     if integrity_errors:
         raise RestoreIntegrityError(
@@ -314,27 +341,33 @@ def resolve_member_asset_hash(
     return next(iter(hashes))
 
 
-def _reverse_locator_transforms(
+def _locator_transforms(
     session: Session,
     locator: AssetLocator,
-    data: bytes,
-) -> bytes:
+) -> list[StagingTransform]:
     if locator.bundle_id is None:
-        return data
-    transforms = list(
+        return []
+    member_id = session.scalar(
+        select(StagingTransform.bundle_member_id)
+        .where(
+            StagingTransform.bundle_id == locator.bundle_id,
+            StagingTransform.logical_asset_hash == locator.logical_asset_hash,
+            StagingTransform.stored_member_path == locator.member_path,
+        )
+        .order_by(StagingTransform.step_order.desc())
+        .limit(1)
+    )
+    if member_id is None:
+        return []
+    return list(
         session.scalars(
             select(StagingTransform)
             .where(
-                StagingTransform.bundle_id == locator.bundle_id,
-                StagingTransform.logical_asset_hash == locator.logical_asset_hash,
-                StagingTransform.stored_member_path == locator.member_path,
+                StagingTransform.bundle_member_id == member_id,
             )
             .order_by(StagingTransform.step_order)
         )
     )
-    if not transforms:
-        return data
-    return reverse_transforms(data, transforms)
 
 
 def _restore_pool_order(
@@ -365,11 +398,12 @@ def _restore_pool_order(
     return order
 
 
-def _extract_d2(
+def _extract_d2_to_path(
     locator: AssetLocator,
     copy: Copy,
     backend: StorageBackend,
-) -> bytes:
+    destination: Path,
+) -> None:
     if "block_range" in locator.native_locator:
         raw_range = locator.native_locator["block_range"]
         if (
@@ -379,42 +413,91 @@ def _extract_d2(
         ):
             data_start = int(raw_range[0])
             size = int(locator.native_locator["size_bytes"])
-            return backend.read_range(
+            _copy_backend_range_to_path(
+                backend,
                 copy.native_locator,
-                ByteRange(data_start, data_start + size),
+                data_start,
+                data_start + size,
+                destination,
             )
-    container = _read_whole(backend, copy)
-    return _extract_from_tar(container, locator.member_path)
+            return
+    with tempfile.TemporaryDirectory(prefix="sutradhara-d2-restore-") as raw_tmp:
+        object_path = Path(raw_tmp) / "copy.tar"
+        _materialize_copy_to_path(backend, copy, object_path)
+        _extract_tar_member_to_path(object_path, locator.member_path, destination)
 
 
-def _extract_from_tar(container: bytes, member_path: str) -> bytes:
-    with tarfile.open(fileobj=io.BytesIO(container), mode="r:*") as tar:
+def _extract_tar_member_to_path(
+    tar_path: Path,
+    member_path: str,
+    destination: Path,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tar_path, mode="r:*") as tar:
         handle = tar.extractfile(member_path)
         if handle is None:
             raise ArchiveRestoreError(f"tar member {member_path!r} is not a file")
-        return handle.read()
+        with destination.open("wb") as raw_out:
+            shutil.copyfileobj(handle, raw_out, length=1024 * 1024)
 
 
-def _extract_from_local_archive(container: bytes, locator: dict[str, object]) -> bytes:
-    header_len = int.from_bytes(container[:8], "big")
-    payload_start = 8 + header_len
-    json.loads(container[8:payload_start].decode("utf-8"))
-    offset = int(locator["offset"])
-    size = int(locator["size_bytes"])
-    return container[payload_start + offset : payload_start + offset + size]
-
-
-def _is_local_archive(container: bytes) -> bool:
-    if len(container) < 8:
+def _try_extract_from_local_archive_to_path(
+    backend: StorageBackend,
+    copy: Copy,
+    locator: AssetLocator,
+    destination: Path,
+) -> bool:
+    header_len_raw = backend.read_range(copy.native_locator, ByteRange(0, 8))
+    if len(header_len_raw) != 8:
         return False
-    header_len = int.from_bytes(container[:8], "big")
-    if header_len <= 0 or 8 + header_len > len(container):
+    header_len = int.from_bytes(header_len_raw, "big")
+    if header_len <= 0 or header_len > _MAX_LOCAL_ARCHIVE_HEADER_BYTES:
         return False
     try:
-        header = json.loads(container[8 : 8 + header_len].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        header_bytes = backend.read_range(copy.native_locator, ByteRange(8, 8 + header_len))
+        header = json.loads(header_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return False
-    return isinstance(header, dict) and header.get("format") == "sutradhara-local-archive-v1"
+    if not isinstance(header, dict) or header.get("format") != "sutradhara-local-archive-v1":
+        return False
+    if "offset" not in locator.native_locator or "size_bytes" not in locator.native_locator:
+        raise ArchiveRestoreError("local archive locator is missing offset/size_bytes")
+    offset = int(locator.native_locator["offset"])
+    size = int(locator.native_locator["size_bytes"])
+    if offset < 0 or size < 0:
+        raise ArchiveRestoreError("local archive locator has negative offset/size_bytes")
+    payload_start = 8 + header_len
+    _copy_backend_range_to_path(
+        backend,
+        copy.native_locator,
+        payload_start + offset,
+        payload_start + offset + size,
+        destination,
+    )
+    return True
+
+
+def _copy_backend_range_to_path(
+    backend: StorageBackend,
+    locator: dict[str, Any],
+    start: int,
+    end: int,
+    destination: Path,
+) -> None:
+    if start < 0 or end < start:
+        raise ArchiveRestoreError(f"invalid backend byte range [{start}, {end})")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as handle:
+        for cursor in range(start, end, RAO_CHUNK_SIZE):
+            chunk_end = min(cursor + RAO_CHUNK_SIZE, end)
+            chunk = backend.read_range(locator, ByteRange(cursor, chunk_end))
+            expected = chunk_end - cursor
+            if len(chunk) != expected:
+                raise ArchiveRestoreError(
+                    f"backend returned {len(chunk)} bytes for range "
+                    f"[{cursor}, {chunk_end}), expected {expected}"
+                )
+            handle.write(chunk)
 
 
 def _read_whole(backend: StorageBackend, copy: Copy) -> bytes:
@@ -428,10 +511,7 @@ def _materialize_copy_to_path(
 ) -> None:
     size = copy.storage_metadata.get("stored_size_bytes")
     if isinstance(size, int) and size >= 0:
-        with destination.open("wb") as handle:
-            for start in range(0, size, RAO_CHUNK_SIZE):
-                end = min(start + RAO_CHUNK_SIZE, size)
-                handle.write(backend.read_range(copy.native_locator, ByteRange(start, end)))
+        _copy_backend_range_to_path(backend, copy.native_locator, 0, size, destination)
         return
     destination.write_bytes(_read_whole(backend, copy))
 
@@ -489,13 +569,17 @@ def _run_rem(cmd: list[str]) -> None:
         )
 
 
-def _read_restored_member(dest_dir: Path, member_path: str) -> bytes:
+def _copy_restored_member(dest_dir: Path, member_path: str, destination: Path) -> None:
     candidate = dest_dir / member_path if member_path else None
     if candidate is not None and candidate.is_file():
-        return candidate.read_bytes()
-    files = [path for path in dest_dir.rglob("*") if path.is_file()]
-    if len(files) != 1:
-        raise ArchiveRestoreError(
-            f"rem restore expected one file for member {member_path!r}, found {len(files)}"
-        )
-    return files[0].read_bytes()
+        source = candidate
+    else:
+        files = [path for path in dest_dir.rglob("*") if path.is_file()]
+        if len(files) != 1:
+            raise ArchiveRestoreError(
+                f"rem restore expected one file for member {member_path!r}, found {len(files)}"
+            )
+        source = files[0]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as raw_in, destination.open("wb") as raw_out:
+        shutil.copyfileobj(raw_in, raw_out, length=1024 * 1024)

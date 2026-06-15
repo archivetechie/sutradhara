@@ -8,6 +8,7 @@ designed to prove.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -17,7 +18,8 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from sutradhara.catalog.models import Bundle, ReviewDecision
+from sutradhara.artifactclass_policy import AppleDoubleStagingPolicy, StagingPolicy
+from sutradhara.catalog.models import ArtifactClassPolicyRecord, Bundle, ReviewDecision
 from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.cli.main import cli
 
@@ -201,6 +203,50 @@ def test_top_level_review_shows_and_records_held_bundle(
         assert decision.action == "exclude"
         assert decision.reason == "temporary files"
         assert decision.reviewer == "operator"
+
+
+def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    _run(["db", "init"])
+    source = tmp_path / "photo.tif"
+    source.write_bytes(b"image-data")
+    source.with_name("._photo.tif").write_bytes(b"not-appledouble")
+    engine = make_engine()
+    with session_scope(engine) as session:
+        session.add(
+            ArtifactClassPolicyRecord(
+                artifactclass="photo",
+                ruleset="rao.photo.v1",
+                expect="messy",
+                target_bytes=1024,
+                max_age_seconds=60,
+                restore_preference=[],
+                staging_config=StagingPolicy(
+                    appledouble=AppleDoubleStagingPolicy(action="merge-to-xattrs")
+                ).to_json(),
+            )
+        )
+
+    result = _run(
+        [
+            "archive",
+            "bundle",
+            "enqueue",
+            "photo",
+            hashlib.sha256(b"image-data").hexdigest(),
+            str(source),
+        ],
+        expect_exit=1,
+    )
+
+    assert "appledouble-merge-failed" in result.output
+    with session_scope(engine) as session:
+        [bundle] = session.query(Bundle).all()
+        assert bundle.artifactclass == "photo"
+        assert bundle.status == "held"
+        assert bundle.review_summary["clusters"][0]["reason"] == "appledouble-merge-failed"
 
 
 def test_admin_doctor_reports_rem_debug_and_key_registry(

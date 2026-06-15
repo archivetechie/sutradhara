@@ -81,6 +81,8 @@ def bundle_enqueue(
     """Stage and add an existing logical asset to an artifactclass open bundle."""
     expected_hash = bytes.fromhex(asset_hash_hex)
     engine = make_engine()
+    held_summary: dict[str, object] | None = None
+    message: str | None = None
     with session_scope(engine) as session:
         policy = get_artifactclass_policy(session, artifactclass)
         try:
@@ -93,22 +95,26 @@ def bundle_enqueue(
                 member_path=member_path,
             )
         except StagingHeld as exc:
-            raise click.ClickException(json.dumps(exc.summary, indent=2, sort_keys=True)) from exc
-        if staged.logical_sha256 != expected_hash:
-            raise click.ClickException(
-                f"source hash {staged.logical_sha256.hex()} does not match {asset_hash_hex}"
-            )
-        bundle = session.scalars(
-            select(Bundle).where(
-                Bundle.artifactclass == artifactclass,
-                Bundle.status == "open",
-            )
-        ).first()
-        if bundle is None:
-            raise click.ClickException("staging did not create an open bundle")
-        click.echo(
-            f"enqueued {staged.stored_member_path!r} in bundle {bundle.id}"
-        )
+            held_summary = exc.summary
+            staged = None
+        if staged is not None:
+            if staged.logical_sha256 != expected_hash:
+                raise click.ClickException(
+                    f"source hash {staged.logical_sha256.hex()} does not match {asset_hash_hex}"
+                )
+            bundle = session.scalars(
+                select(Bundle).where(
+                    Bundle.artifactclass == artifactclass,
+                    Bundle.status == "open",
+                )
+            ).first()
+            if bundle is None:
+                raise click.ClickException("staging did not create an open bundle")
+            message = f"enqueued {staged.stored_member_path!r} in bundle {bundle.id}"
+    if held_summary is not None:
+        raise click.ClickException(json.dumps(held_summary, indent=2, sort_keys=True))
+    if message is not None:
+        click.echo(message)
 
 
 @bundle_group.command("flush")

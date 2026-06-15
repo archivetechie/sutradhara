@@ -82,6 +82,7 @@ class _ArchiveWriteBackend:
         self._objects: dict[str, bytes] = {}
         self._counter = 0
         self.writes: list[str] = []
+        self.reads: list[ByteRange] = []
 
     @property
     def name(self) -> str:
@@ -111,6 +112,7 @@ class _ArchiveWriteBackend:
         return iter(())
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+        self.reads.append(byte_range)
         data = self._objects[str(locator["object_id"])]
         if byte_range.is_whole_object:
             return data
@@ -551,6 +553,7 @@ def test_zstd_staged_member_fans_out_manifests_and_restores_original(
                 member_name=r"bad\xFF",
             )
 
+        rem_backend.reads.clear()
         restored = restore_asset(
             s,
             asset_hash=_digest(original),
@@ -560,6 +563,8 @@ def test_zstd_staged_member_fans_out_manifests_and_restores_original(
         )
 
     assert restored.output_path.read_bytes() == original
+    assert rem_backend.reads
+    assert all(not byte_range.is_whole_object for byte_range in rem_backend.reads)
 
 
 def test_restore_surfaces_unavailable_and_integrity_failures(

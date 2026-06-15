@@ -317,9 +317,9 @@ def record_staging_transform(
             f"transform stored path {stored_member_path!r} does not match "
             f"bundle member {member.member_path!r}"
         )
-    if original_sha256 != member.logical_asset_hash:
+    if step_order == 0 and original_sha256 != member.logical_asset_hash:
         raise StagingTransformError(
-            "transform original_sha256 must match the member logical asset hash"
+            "first transform original_sha256 must match the member logical asset hash"
         )
     if is_final and stored_sha256 != member.file_sha256:
         raise StagingTransformError(

@@ -9,6 +9,7 @@ from sqlalchemy import Engine, select
 
 from sutradhara.artifactclass_policy import (
     ArtifactClassPolicyError,
+    ArtifactClassPolicyWarning,
     UnknownPolicyPool,
     apply_artifactclass_policy,
     get_artifactclass_policy,
@@ -186,7 +187,8 @@ def test_apply_artifactclass_policy_upserts_memberships(engine: Engine) -> None:
         )
         s.flush()
 
-        apply_artifactclass_policy(s, "o-archive", policy)
+        with pytest.warns(ArtifactClassPolicyWarning, match="AppleDouble merge"):
+            apply_artifactclass_policy(s, "o-archive", policy)
 
         memberships = list(
             s.scalars(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 import tomllib
+import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,10 @@ class ArtifactClassPolicyError(ValueError):
 
 class UnknownPolicyPool(ArtifactClassPolicyError):
     """A policy references a pool that is not declared in the catalog."""
+
+
+class ArtifactClassPolicyWarning(UserWarning):
+    """A policy is valid but needs operator attention."""
 
 
 @dataclass(frozen=True)
@@ -225,6 +230,7 @@ def apply_artifactclass_policy(
         raise UnknownPolicyPool(
             f"artifactclass {artifactclass!r} references unknown pools: " + ", ".join(missing)
         )
+    _warn_if_appledouble_ruleset_preservation_is_unproven(policy)
 
     existing = {
         membership.pool_id: membership
@@ -264,6 +270,19 @@ def apply_artifactclass_policy(
         hashlib.sha256(source_text.encode("utf-8")).hexdigest() if source_text is not None else None
     )
     session.flush()
+
+
+def _warn_if_appledouble_ruleset_preservation_is_unproven(
+    policy: ArtifactClassPolicy,
+) -> None:
+    if policy.staging.appledouble.action != "merge-to-xattrs":
+        return
+    warnings.warn(
+        "AppleDouble merge writes user.com.apple.* xattrs before rem ruleset "
+        f"{policy.ruleset!r}; verify that the ruleset preserves com.apple.* metadata",
+        ArtifactClassPolicyWarning,
+        stacklevel=3,
+    )
 
 
 def apply_artifactclass_policy_file(
