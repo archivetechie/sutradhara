@@ -10,8 +10,14 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine, select
 
-from sutradhara.catalog.copies import UnknownLogicalAsset, add_copy, lookup_by_hash
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset
+from sutradhara.catalog.copies import (
+    UnknownBundle,
+    UnknownLogicalAsset,
+    add_bundle_copy,
+    add_copy,
+    lookup_by_hash,
+)
+from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
 
@@ -161,6 +167,66 @@ def test_add_copy_is_idempotent_and_does_not_mutate_existing(engine: Engine) -> 
         copies = list(s.scalars(select(Copy)))
         assert len(copies) == 1
         assert copies[0].integrity_hash == original_integrity
+
+
+def test_add_bundle_copy_records_bundle_without_logical_asset(engine: Engine) -> None:
+    backend_id = _add_backend(engine)
+    locator = {
+        "pool_id": "archive-pool",
+        "object_id": "bundle-001",
+        "content_sha256": _hash("bundle").hex(),
+    }
+
+    with session_scope(engine) as s:
+        s.add(Bundle(id="bundle-001", artifactclass="o-archive"))
+        s.add(
+            Pool(
+                id="archive-pool",
+                backend_id=backend_id,
+                representation="rao-plain-v1",
+            )
+        )
+        s.flush()
+        first, created = add_bundle_copy(
+            s,
+            bundle_id="bundle-001",
+            backend_id=backend_id,
+            pool_id="archive-pool",
+            native_locator=locator,
+            integrity_hash=_hash("bundle"),
+            source=CopySource.INGEST,
+            storage_metadata={"representation": "rao-plain-v1"},
+        )
+        second, second_created = add_bundle_copy(
+            s,
+            bundle_id="bundle-001",
+            backend_id=backend_id,
+            pool_id="archive-pool",
+            native_locator=locator,
+            integrity_hash=_hash("ignored"),
+            source=CopySource.SCRUB,
+            storage_metadata={"representation": "ignored"},
+        )
+        assert created is True
+        assert second_created is False
+        assert second.id == first.id
+        assert first.logical_asset_hash is None
+        assert first.bundle_id == "bundle-001"
+
+
+def test_add_bundle_copy_rejects_unknown_bundle(engine: Engine) -> None:
+    backend_id = _add_backend(engine)
+
+    with session_scope(engine) as s, pytest.raises(UnknownBundle, match="no Bundle"):
+        add_bundle_copy(
+            s,
+            bundle_id="missing",
+            backend_id=backend_id,
+            pool_id="archive-pool",
+            native_locator={"object_id": "bundle-001"},
+            integrity_hash=_hash("bundle"),
+            source=CopySource.INGEST,
+        )
 
 
 def test_add_copy_same_locator_different_backend_is_separate_copy(

@@ -15,9 +15,10 @@ import datetime as dt
 from typing import Any
 
 from sqlalchemy import (
-    Boolean,
     JSON,
     BigInteger,
+    Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Integer,
@@ -67,9 +68,7 @@ class LogicalAsset(Base):
 
     # Non-authoritative ergonomic metadata.
     human_label: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    media_kind: Mapped[MediaKind | None] = mapped_column(
-        String(32), nullable=True
-    )
+    media_kind: Mapped[MediaKind | None] = mapped_column(String(32), nullable=True)
     media_info: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     copies: Mapped[list[Copy]] = relationship(
@@ -199,6 +198,30 @@ class ArtifactClassPool(Base):
         )
 
 
+class ArtifactClassPolicyRecord(Base):
+    """The active strict policy document bound to an artifactclass."""
+
+    __tablename__ = "artifactclass_policy"
+
+    artifactclass: Mapped[str] = mapped_column(String(128), primary_key=True)
+    ruleset: Mapped[str] = mapped_column(String(256), nullable=False)
+    expect: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    max_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    restore_preference: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    policy_source: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    policy_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ArtifactClassPolicy artifactclass={self.artifactclass!r} "
+            f"ruleset={self.ruleset!r} expect={self.expect!r}>"
+        )
+
+
 class Bundle(Base):
     """A synthetic archive object containing one or more logical assets."""
 
@@ -206,15 +229,23 @@ class Bundle(Base):
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    representation: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    created_at: Mapped[dt.datetime] = mapped_column(
+    member_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    target_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    max_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ruleset: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    expect: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    archive_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scan_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    review_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    customer_manifest_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    opened_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
-    closed_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    flushed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sealed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    held_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     members: Mapped[list[BundleMember]] = relationship(
         back_populates="bundle",
@@ -225,11 +256,19 @@ class Bundle(Base):
         back_populates="bundle",
         lazy="selectin",
     )
+    copies: Mapped[list[Copy]] = relationship(
+        back_populates="bundle",
+        lazy="selectin",
+    )
+    review_decisions: Mapped[list[ReviewDecision]] = relationship(
+        back_populates="bundle",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
 
     def __repr__(self) -> str:
         return (
-            f"<Bundle id={self.id!r} artifactclass={self.artifactclass!r} "
-            f"status={self.status!r}>"
+            f"<Bundle id={self.id!r} artifactclass={self.artifactclass!r} status={self.status!r}>"
         )
 
 
@@ -240,8 +279,8 @@ class BundleMember(Base):
     __table_args__ = (
         UniqueConstraint(
             "bundle_id",
-            "logical_asset_hash",
-            name="uq_bundle_member_bundle_asset",
+            "member_path",
+            name="uq_bundle_member_bundle_path",
         ),
     )
 
@@ -259,8 +298,10 @@ class BundleMember(Base):
         index=True,
     )
     member_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    source_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     file_sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    source_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     added_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -312,31 +353,46 @@ class AssetLocator(Base):
 
 
 class BlobRoot(Base):
-    """Content root for a generated blob or bundle manifest."""
+    """A coarse pointer to a blob entry inside one archive copy."""
 
     __tablename__ = "blob_root"
     __table_args__ = (
         UniqueConstraint(
-            "logical_asset_hash",
-            "algorithm",
-            name="uq_blob_root_asset_algorithm",
+            "copy_id",
+            "root_path",
+            name="uq_blob_root_copy_root",
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    logical_asset_hash: Mapped[bytes] = mapped_column(
-        LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+    bundle_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("bundle.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
-    algorithm: Mapped[str] = mapped_column(String(64), nullable=False)
-    root_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    copy_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("copy.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    pool_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("pool.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    root_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    native_locator: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    archive_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
-    logical_asset: Mapped[LogicalAsset] = relationship()
+    bundle: Mapped[Bundle] = relationship()
+    copy: Mapped[Copy] = relationship()
+    pool: Mapped[Pool] = relationship()
 
 
 class ExclusionRecord(Base):
@@ -345,6 +401,12 @@ class ExclusionRecord(Base):
     __tablename__ = "exclusion_record"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bundle_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("bundle.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     logical_asset_hash: Mapped[bytes | None] = mapped_column(
         LargeBinary(32),
@@ -354,16 +416,46 @@ class ExclusionRecord(Base):
     )
     path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    bytes_total: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    ruleset_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    ruleset_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
     logical_asset: Mapped[LogicalAsset | None] = relationship()
+    bundle: Mapped[Bundle | None] = relationship()
+
+
+class ReviewDecision(Base):
+    """A recorded held-bundle review decision."""
+
+    __tablename__ = "review_decision"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bundle_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("bundle.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    subtree: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    reviewer: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    persisted_rule: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    decided_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    bundle: Mapped[Bundle] = relationship(back_populates="review_decisions")
 
 
 class Copy(Base):
-    """One realization of a logical asset on one backend.
+    """One realization of a logical asset or bundle on one backend.
 
     Many copies per asset (per docs/spec-v0.1.md §4.2). UNIQUE on
     (backend_id, native_locator_key) so a backend cannot register the
@@ -378,14 +470,24 @@ class Copy(Base):
             "native_locator_key",
             name="uq_copy_backend_locator",
         ),
+        CheckConstraint(
+            "logical_asset_hash IS NOT NULL OR bundle_id IS NOT NULL",
+            name="ck_copy_asset_or_bundle",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    logical_asset_hash: Mapped[bytes] = mapped_column(
+    logical_asset_hash: Mapped[bytes | None] = mapped_column(
         LargeBinary(32),
         ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
+        index=True,
+    )
+    bundle_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("bundle.id", ondelete="CASCADE"),
+        nullable=True,
         index=True,
     )
     backend_id: Mapped[int] = mapped_column(
@@ -407,14 +509,10 @@ class Copy(Base):
     # and ordering of dict keys in JSON storage is implementation-defined).
     native_locator: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     native_locator_key: Mapped[str] = mapped_column(String(512), nullable=False)
-    storage_metadata: Mapped[dict[str, Any]] = mapped_column(
-        JSON, nullable=False, default=dict
-    )
+    storage_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
     integrity_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
-    health: Mapped[CopyHealth] = mapped_column(
-        String(16), nullable=False, default=CopyHealth.OK
-    )
+    health: Mapped[CopyHealth] = mapped_column(String(16), nullable=False, default=CopyHealth.OK)
     last_verified_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -423,13 +521,14 @@ class Copy(Base):
     )
     source: Mapped[CopySource] = mapped_column(String(32), nullable=False)
 
-    logical_asset: Mapped[LogicalAsset] = relationship(back_populates="copies")
+    logical_asset: Mapped[LogicalAsset | None] = relationship(back_populates="copies")
+    bundle: Mapped[Bundle | None] = relationship(back_populates="copies")
     backend: Mapped[Backend] = relationship(back_populates="copies")
     pool: Mapped[Pool | None] = relationship(back_populates="copies")
 
     def __repr__(self) -> str:
         return (
             f"<Copy id={self.id} "
-            f"hash={self.logical_asset_hash.hex()[:12]}… "
+            f"hash={self.logical_asset_hash.hex()[:12] if self.logical_asset_hash else None}… "
             f"backend={self.backend_id} health={self.health}>"
         )

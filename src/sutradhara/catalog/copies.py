@@ -18,7 +18,7 @@ from typing import Any, TypedDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.catalog.models import Copy, LogicalAsset
+from sutradhara.catalog.models import Bundle, Copy, LogicalAsset
 from sutradhara.catalog.session import locator_key
 from sutradhara.catalog.types import CopyHealth, CopySource, is_content_hash
 
@@ -29,6 +29,10 @@ class CatalogError(Exception):
 
 class UnknownLogicalAsset(CatalogError):
     """The given content hash does not name a registered LogicalAsset."""
+
+
+class UnknownBundle(CatalogError):
+    """The given bundle id does not name a registered Bundle."""
 
 
 class CopyPoolMismatch(CatalogError):
@@ -96,6 +100,70 @@ def add_copy(
 
     copy = Copy(
         logical_asset_hash=logical_asset_hash,
+        backend_id=backend_id,
+        pool_id=pool_id,
+        native_locator=native_locator,
+        native_locator_key=key,
+        storage_metadata=storage_metadata or {},
+        integrity_hash=integrity_hash,
+        source=source,
+        health=health,
+    )
+    if last_verified_at is not None:
+        copy.last_verified_at = last_verified_at
+    if first_observed_at is not None:
+        copy.first_observed_at = first_observed_at
+
+    session.add(copy)
+    session.flush()
+    return copy, True
+
+
+def add_bundle_copy(
+    session: Session,
+    *,
+    bundle_id: str,
+    backend_id: int,
+    pool_id: str,
+    native_locator: dict[str, Any],
+    integrity_hash: bytes,
+    source: CopySource,
+    health: CopyHealth = CopyHealth.OK,
+    storage_metadata: dict[str, Any] | None = None,
+    last_verified_at: dt.datetime | None = None,
+    first_observed_at: dt.datetime | None = None,
+) -> tuple[Copy, bool]:
+    """Record one materialized bundle copy on a backend pool.
+
+    Bundle copies deliberately use ``Copy.bundle_id`` instead of
+    ``Copy.logical_asset_hash``. Per-asset restore goes through ``asset_locator``
+    rows that point at this copy.
+    """
+    if session.get(Bundle, bundle_id) is None:
+        raise UnknownBundle(f"no Bundle with id {bundle_id!r}")
+
+    key = locator_key(native_locator)
+    existing = session.scalars(
+        select(Copy).where(
+            Copy.backend_id == backend_id,
+            Copy.native_locator_key == key,
+        )
+    ).one_or_none()
+    if existing is not None:
+        if existing.bundle_id != bundle_id:
+            raise CopyPoolMismatch(
+                f"copy id={existing.id} locator already belongs to bundle "
+                f"{existing.bundle_id!r}, not {bundle_id!r}"
+            )
+        if existing.pool_id != pool_id:
+            raise CopyPoolMismatch(
+                f"copy id={existing.id} locator already belongs to pool "
+                f"{existing.pool_id!r}, not {pool_id!r}"
+            )
+        return existing, False
+
+    copy = Copy(
+        bundle_id=bundle_id,
         backend_id=backend_id,
         pool_id=pool_id,
         native_locator=native_locator,

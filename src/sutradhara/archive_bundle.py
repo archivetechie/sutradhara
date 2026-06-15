@@ -1,22 +1,35 @@
-"""Catalog helpers for durable archive bundle bookkeeping."""
+"""Durable RAO archive bundle bookkeeping.
+
+This module owns the sutradhara-side accumulator state: an open bundle per
+artifactclass, its pending member set, flush thresholds copied from the applied
+artifactclass policy, per-copy asset locators, blob-root pointers, exclusion
+records, and held-bundle review decisions.
+"""
 
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import uuid
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
     AssetLocator,
     BlobRoot,
     Bundle,
     BundleMember,
+    Copy,
     ExclusionRecord,
     LogicalAsset,
     Pool,
+    ReviewDecision,
 )
+from sutradhara.catalog.types import is_content_hash
 
 
 class ArchiveBundleError(Exception):
@@ -31,26 +44,27 @@ class UnknownBundlePool(ArchiveBundleError):
     """A locator operation referenced an unknown pool."""
 
 
+class UnknownBundleCopy(ArchiveBundleError):
+    """A locator operation referenced an unknown copy."""
+
+
+class BundleStateError(ArchiveBundleError):
+    """A bundle operation was requested in the wrong lifecycle state."""
+
+
 def get_or_create_open_bundle(
     session: Session,
     *,
     artifactclass: str,
-    representation: str,
+    policy: ArtifactClassPolicyRecord,
     bundle_id: str | None = None,
+    now: dt.datetime | None = None,
 ) -> tuple[Bundle, bool]:
-    """Return the open bundle for an artifactclass/representation pair.
-
-    If ``bundle_id`` is supplied it is used for a newly-created bundle. Without
-    it, a synthetic id is generated.
-    """
+    """Return the durable open accumulator for an artifactclass."""
     existing = session.scalars(
         select(Bundle)
-        .where(
-            Bundle.artifactclass == artifactclass,
-            Bundle.representation == representation,
-            Bundle.status == "open",
-        )
-        .order_by(Bundle.created_at, Bundle.id)
+        .where(Bundle.artifactclass == artifactclass, Bundle.status == "open")
+        .order_by(Bundle.opened_at, Bundle.id)
     ).first()
     if existing is not None:
         return existing, False
@@ -58,16 +72,94 @@ def get_or_create_open_bundle(
     bundle = Bundle(
         id=bundle_id or f"bundle-{uuid.uuid4().hex}",
         artifactclass=artifactclass,
-        representation=representation,
+        status="open",
+        target_bytes=policy.target_bytes,
+        max_age_seconds=policy.max_age_seconds,
+        ruleset=policy.ruleset,
+        expect=policy.expect,
+        opened_at=now or dt.datetime.now(dt.UTC),
     )
     session.add(bundle)
     session.flush()
     return bundle, True
 
 
+def enqueue_artifact(
+    session: Session,
+    *,
+    artifactclass: str,
+    policy: ArtifactClassPolicyRecord,
+    logical_asset_hash: bytes,
+    source_path: Path | str,
+    member_path: str | None = None,
+    bundle_id: str | None = None,
+    now: dt.datetime | None = None,
+    source_metadata: dict[str, Any] | None = None,
+) -> tuple[Bundle, BundleMember, bool]:
+    """Add one asset to the open accumulator for ``artifactclass``."""
+    _require_asset(session, logical_asset_hash)
+    source = Path(source_path)
+    size_bytes = source.stat().st_size
+    path_in_bundle = member_path or source.name
+    bundle, _ = get_or_create_open_bundle(
+        session,
+        artifactclass=artifactclass,
+        policy=policy,
+        bundle_id=bundle_id,
+        now=now,
+    )
+    member, created = add_bundle_member(
+        session,
+        bundle=bundle,
+        logical_asset_hash=logical_asset_hash,
+        member_path=path_in_bundle,
+        source_path=str(source),
+        size_bytes=size_bytes,
+        file_sha256=_sha256_file(source),
+        source_metadata=source_metadata,
+    )
+    return bundle, member, created
+
+
+def bundle_due(
+    bundle: Bundle,
+    *,
+    now: dt.datetime | None = None,
+    force: bool = False,
+) -> bool:
+    """Return whether an open bundle should be flushed."""
+    if bundle.status != "open":
+        return False
+    if force:
+        return bundle.member_count > 0
+    if bundle.member_count == 0:
+        return False
+    if bundle.target_bytes and bundle.total_bytes >= bundle.target_bytes:
+        return True
+    if not bundle.max_age_seconds:
+        return False
+    reference = now or dt.datetime.now(dt.UTC)
+    return (reference - bundle.opened_at).total_seconds() >= bundle.max_age_seconds
+
+
 def close_bundle(session: Session, bundle: Bundle) -> Bundle:
-    """Mark an open bundle as closed."""
-    bundle.status = "closed"
+    """Mark a bundle as sealed after all copy materialisations are verified."""
+    bundle.status = "sealed"
+    bundle.sealed_at = dt.datetime.now(dt.UTC)
+    session.flush()
+    return bundle
+
+
+def hold_bundle(
+    session: Session,
+    bundle: Bundle,
+    *,
+    summary: dict[str, Any],
+) -> Bundle:
+    """Mark a bundle as held for human review."""
+    bundle.status = "held"
+    bundle.held_at = dt.datetime.now(dt.UTC)
+    bundle.review_summary = summary
     session.flush()
     return bundle
 
@@ -80,16 +172,17 @@ def add_bundle_member(
     member_path: str,
     size_bytes: int,
     file_sha256: bytes,
+    source_path: str | None = None,
+    source_metadata: dict[str, Any] | None = None,
 ) -> tuple[BundleMember, bool]:
-    """Add a logical asset to a bundle and update bundle byte totals."""
-    if session.get(LogicalAsset, logical_asset_hash) is None:
-        raise UnknownBundleAsset(
-            f"no LogicalAsset with content hash {logical_asset_hash.hex()}"
-        )
+    """Add a logical asset to a bundle and update accumulator totals."""
+    if bundle.status != "open":
+        raise BundleStateError(f"bundle {bundle.id!r} is not open")
+    _require_asset(session, logical_asset_hash)
     existing = session.scalars(
         select(BundleMember).where(
             BundleMember.bundle_id == bundle.id,
-            BundleMember.logical_asset_hash == logical_asset_hash,
+            BundleMember.member_path == member_path,
         )
     ).one_or_none()
     if existing is not None:
@@ -99,10 +192,13 @@ def add_bundle_member(
         bundle_id=bundle.id,
         logical_asset_hash=logical_asset_hash,
         member_path=member_path,
+        source_path=source_path,
         size_bytes=size_bytes,
         file_sha256=file_sha256,
+        source_metadata=source_metadata,
     )
     bundle.total_bytes += size_bytes
+    bundle.member_count += 1
     session.add(member)
     session.flush()
     return member, True
@@ -115,16 +211,16 @@ def record_asset_locator(
     pool_id: str,
     native_locator: dict[str, Any],
     representation: str,
-    copy_id: int | None = None,
-    bundle_id: str | None = None,
+    copy_id: int,
+    bundle_id: str,
 ) -> AssetLocator:
-    """Record a concrete locator for an asset, including bundle locators."""
-    if session.get(LogicalAsset, logical_asset_hash) is None:
-        raise UnknownBundleAsset(
-            f"no LogicalAsset with content hash {logical_asset_hash.hex()}"
-        )
+    """Record a concrete per-copy locator for an asset in a bundle."""
+    _require_asset(session, logical_asset_hash)
     if session.get(Pool, pool_id) is None:
         raise UnknownBundlePool(f"no Pool with id {pool_id!r}")
+    copy = session.get(Copy, copy_id)
+    if copy is None:
+        raise UnknownBundleCopy(f"no Copy with id={copy_id}")
     locator = AssetLocator(
         logical_asset_hash=logical_asset_hash,
         pool_id=pool_id,
@@ -141,19 +237,27 @@ def record_asset_locator(
 def record_blob_root(
     session: Session,
     *,
-    logical_asset_hash: bytes,
-    algorithm: str,
-    root_hash: bytes,
+    bundle_id: str,
+    copy_id: int,
+    pool_id: str,
+    root_path: str,
+    native_locator: dict[str, Any],
+    archive_id: str | None = None,
 ) -> BlobRoot:
-    """Record a blob root for an asset and algorithm."""
-    if session.get(LogicalAsset, logical_asset_hash) is None:
-        raise UnknownBundleAsset(
-            f"no LogicalAsset with content hash {logical_asset_hash.hex()}"
-        )
+    """Record a coarse blob-root pointer for single-file restore from blobs."""
+    if session.get(Bundle, bundle_id) is None:
+        raise BundleStateError(f"no Bundle with id {bundle_id!r}")
+    if session.get(Copy, copy_id) is None:
+        raise UnknownBundleCopy(f"no Copy with id={copy_id}")
+    if session.get(Pool, pool_id) is None:
+        raise UnknownBundlePool(f"no Pool with id {pool_id!r}")
     root = BlobRoot(
-        logical_asset_hash=logical_asset_hash,
-        algorithm=algorithm,
-        root_hash=root_hash,
+        bundle_id=bundle_id,
+        copy_id=copy_id,
+        pool_id=pool_id,
+        root_path=root_path,
+        native_locator=native_locator,
+        archive_id=archive_id,
     )
     session.add(root)
     session.flush()
@@ -165,18 +269,76 @@ def record_exclusion(
     *,
     artifactclass: str,
     reason: str,
+    bundle_id: str | None = None,
     logical_asset_hash: bytes | None = None,
     path: str | None = None,
+    count: int = 1,
+    bytes_total: int = 0,
+    ruleset_name: str | None = None,
+    ruleset_hash: str | None = None,
     detail: dict[str, Any] | None = None,
 ) -> ExclusionRecord:
     """Record why a candidate was excluded from archive bundling."""
+    if logical_asset_hash is not None:
+        _require_asset(session, logical_asset_hash)
     exclusion = ExclusionRecord(
+        bundle_id=bundle_id,
         artifactclass=artifactclass,
         reason=reason,
         logical_asset_hash=logical_asset_hash,
         path=path,
+        count=count,
+        bytes_total=bytes_total,
+        ruleset_name=ruleset_name,
+        ruleset_hash=ruleset_hash,
         detail=detail,
     )
     session.add(exclusion)
     session.flush()
     return exclusion
+
+
+def record_review_decision(
+    session: Session,
+    *,
+    bundle_id: str,
+    action: str,
+    scope: str,
+    subtree: str | None = None,
+    reason: str | None = None,
+    reviewer: str | None = None,
+    persisted_rule: dict[str, Any] | None = None,
+) -> ReviewDecision:
+    """Record a held-bundle human review decision."""
+    bundle = session.get(Bundle, bundle_id)
+    if bundle is None:
+        raise BundleStateError(f"no Bundle with id {bundle_id!r}")
+    decision = ReviewDecision(
+        bundle_id=bundle_id,
+        action=action,
+        scope=scope,
+        subtree=subtree,
+        reason=reason,
+        reviewer=reviewer,
+        persisted_rule=persisted_rule,
+    )
+    session.add(decision)
+    session.flush()
+    return decision
+
+
+def _require_asset(session: Session, logical_asset_hash: bytes) -> LogicalAsset:
+    if not is_content_hash(logical_asset_hash):
+        raise ValueError("logical_asset_hash must be a 32-byte SHA-256 hash")
+    asset = session.get(LogicalAsset, logical_asset_hash)
+    if asset is None:
+        raise UnknownBundleAsset(f"no LogicalAsset with content hash {logical_asset_hash.hex()}")
+    return asset
+
+
+def _sha256_file(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()

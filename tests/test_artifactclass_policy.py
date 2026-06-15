@@ -11,9 +11,10 @@ from sutradhara.artifactclass_policy import (
     ArtifactClassPolicyError,
     UnknownPolicyPool,
     apply_artifactclass_policy,
+    get_artifactclass_policy,
     parse_artifactclass_policy,
 )
-from sutradhara.catalog.models import ArtifactClassPool, Backend, Pool
+from sutradhara.catalog.models import ArtifactClassPolicyRecord, ArtifactClassPool, Backend, Pool
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier
 from sutradhara.sealing.port import Representation
@@ -134,6 +135,13 @@ def test_apply_artifactclass_policy_upserts_memberships(engine: Engine) -> None:
             ("stale-pool", False, None),
             ("o-copy-2-pool", True, "encrypted"),
         ]
+        record = get_artifactclass_policy(s, "o-archive")
+        assert isinstance(record, ArtifactClassPolicyRecord)
+        assert record.ruleset == "rao.o.v1"
+        assert record.expect == "messy"
+        assert record.target_bytes == 32 * 1024**3
+        assert record.max_age_seconds == 48 * 3600
+        assert record.restore_preference == ["o-copy-1-pool", "o-copy-2-pool"]
 
 
 def test_apply_artifactclass_policy_rejects_unknown_pool(engine: Engine) -> None:

@@ -7,17 +7,17 @@ whether incoming material is expected to be compliant or messy.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.catalog.models import ArtifactClassPool, Pool
+from sutradhara.catalog.models import ArtifactClassPolicyRecord, ArtifactClassPool, Pool
 
 
 class ArtifactClassPolicyError(ValueError):
@@ -40,6 +40,11 @@ class BundlingPolicy:
     target_gb: float
     max_age_seconds: int
 
+    @property
+    def target_bytes(self) -> int:
+        """Bundling target rounded to bytes."""
+        return int(self.target_gb * 1024**3)
+
 
 @dataclass(frozen=True)
 class ArtifactClassPolicy:
@@ -61,6 +66,17 @@ def load_artifactclass_policy(path: Path | str) -> ArtifactClassPolicy:
         policy_path.read_text(encoding="utf-8"),
         source=str(policy_path),
     )
+
+
+def get_artifactclass_policy(
+    session: Session,
+    artifactclass: str,
+) -> ArtifactClassPolicyRecord:
+    """Return the active persisted policy for an artifactclass."""
+    policy = session.get(ArtifactClassPolicyRecord, artifactclass)
+    if policy is None:
+        raise ArtifactClassPolicyError(f"artifactclass {artifactclass!r} has no applied policy")
+    return policy
 
 
 def parse_artifactclass_policy(
@@ -88,9 +104,7 @@ def parse_artifactclass_policy(
     ruleset = _required_str(raw["ruleset"], f"{source}: ruleset")
     expect = _required_str(raw["expect"], f"{source}: expect")
     if expect not in {"compliant", "messy"}:
-        raise ArtifactClassPolicyError(
-            f"{source}: expect must be 'compliant' or 'messy'"
-        )
+        raise ArtifactClassPolicyError(f"{source}: expect must be 'compliant' or 'messy'")
 
     placements_raw = raw["placements"]
     if not isinstance(placements_raw, list) or not placements_raw:
@@ -123,9 +137,7 @@ def parse_artifactclass_policy(
         f"{source}: restore.preference",
     )
     if not restore_preference:
-        raise ArtifactClassPolicyError(
-            f"{source}: restore.preference must not be empty"
-        )
+        raise ArtifactClassPolicyError(f"{source}: restore.preference must not be empty")
 
     return ArtifactClassPolicy(
         ruleset=ruleset,
@@ -140,6 +152,9 @@ def apply_artifactclass_policy(
     session: Session,
     artifactclass: str,
     policy: ArtifactClassPolicy,
+    *,
+    source: str | None = None,
+    source_text: str | None = None,
 ) -> None:
     """Apply placement membership from a validated policy document.
 
@@ -148,23 +163,17 @@ def apply_artifactclass_policy(
     from the document are marked inactive.
     """
     pool_ids = [placement.pool for placement in policy.placements]
-    pools = {
-        pool.id: pool
-        for pool in session.scalars(select(Pool).where(Pool.id.in_(pool_ids)))
-    }
+    pools = {pool.id: pool for pool in session.scalars(select(Pool).where(Pool.id.in_(pool_ids)))}
     missing = sorted(set(pool_ids) - set(pools))
     if missing:
         raise UnknownPolicyPool(
-            f"artifactclass {artifactclass!r} references unknown pools: "
-            + ", ".join(missing)
+            f"artifactclass {artifactclass!r} references unknown pools: " + ", ".join(missing)
         )
 
     existing = {
         membership.pool_id: membership
         for membership in session.scalars(
-            select(ArtifactClassPool).where(
-                ArtifactClassPool.artifactclass == artifactclass
-            )
+            select(ArtifactClassPool).where(ArtifactClassPool.artifactclass == artifactclass)
         )
     }
     active_pool_ids = set(pool_ids)
@@ -183,7 +192,40 @@ def apply_artifactclass_policy(
     for pool_id, membership in existing.items():
         if pool_id not in active_pool_ids:
             membership.active = False
+
+    record = session.get(ArtifactClassPolicyRecord, artifactclass)
+    if record is None:
+        record = ArtifactClassPolicyRecord(artifactclass=artifactclass)
+        session.add(record)
+    record.ruleset = policy.ruleset
+    record.expect = policy.expect
+    record.target_bytes = policy.bundling.target_bytes
+    record.max_age_seconds = policy.bundling.max_age_seconds
+    record.restore_preference = list(policy.restore_preference)
+    record.policy_source = source
+    record.policy_sha256 = (
+        hashlib.sha256(source_text.encode("utf-8")).hexdigest() if source_text is not None else None
+    )
     session.flush()
+
+
+def apply_artifactclass_policy_file(
+    session: Session,
+    artifactclass: str,
+    path: Path | str,
+) -> ArtifactClassPolicy:
+    """Load, validate, and persist an artifactclass policy file."""
+    policy_path = Path(path)
+    text = policy_path.read_text(encoding="utf-8")
+    policy = parse_artifactclass_policy(text, source=str(policy_path))
+    apply_artifactclass_policy(
+        session,
+        artifactclass,
+        policy,
+        source=str(policy_path),
+        source_text=text,
+    )
+    return policy
 
 
 def _parse_placement(raw: object, label: str) -> PlacementPolicy:
@@ -204,17 +246,13 @@ def _parse_placement(raw: object, label: str) -> PlacementPolicy:
 def _require_keys(raw: dict[str, object], required: set[str], label: str) -> None:
     missing = sorted(required - set(raw))
     if missing:
-        raise ArtifactClassPolicyError(
-            f"{label}: missing required key(s): {', '.join(missing)}"
-        )
+        raise ArtifactClassPolicyError(f"{label}: missing required key(s): {', '.join(missing)}")
 
 
 def _reject_keys(raw: dict[str, object], allowed: set[str], label: str) -> None:
     extra = sorted(set(raw) - allowed)
     if extra:
-        raise ArtifactClassPolicyError(
-            f"{label}: unknown key(s): {', '.join(extra)}"
-        )
+        raise ArtifactClassPolicyError(f"{label}: unknown key(s): {', '.join(extra)}")
 
 
 def _required_table(raw: object, label: str) -> dict[str, object]:
@@ -244,9 +282,7 @@ def _duration_seconds(raw: object, label: str) -> int:
             raise ArtifactClassPolicyError(f"{label} must be positive")
         return raw
     if not isinstance(raw, str):
-        raise ArtifactClassPolicyError(
-            f"{label} must be a duration like '48h' or integer seconds"
-        )
+        raise ArtifactClassPolicyError(f"{label} must be a duration like '48h' or integer seconds")
     match = _DURATION_RE.match(raw)
     if match is None:
         raise ArtifactClassPolicyError(

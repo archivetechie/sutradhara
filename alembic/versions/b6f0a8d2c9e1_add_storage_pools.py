@@ -1,4 +1,4 @@
-"""Add storage pools and artifactclass memberships.
+"""Add storage pools and RAO archive catalog tables.
 
 Revision ID: b6f0a8d2c9e1
 Revises: 9b2af1cc0e6a
@@ -65,32 +65,39 @@ def upgrade() -> None:
         unique=False,
     )
 
-    with op.batch_alter_table("copy") as batch_op:
-        batch_op.add_column(
-            sa.Column(
-                "pool_id",
-                sa.String(length=128),
-                nullable=True,
-            )
-        )
-        batch_op.create_foreign_key(
-            "fk_copy_pool_id_pool",
-            "pool",
-            ["pool_id"],
-            ["id"],
-            ondelete="SET NULL",
-        )
-        batch_op.create_index(op.f("ix_copy_pool_id"), ["pool_id"], unique=False)
+    op.create_table(
+        "artifactclass_policy",
+        sa.Column("artifactclass", sa.String(length=128), nullable=False),
+        sa.Column("ruleset", sa.String(length=256), nullable=False),
+        sa.Column("expect", sa.String(length=32), nullable=False),
+        sa.Column("target_bytes", sa.BigInteger(), nullable=False),
+        sa.Column("max_age_seconds", sa.Integer(), nullable=False),
+        sa.Column("restore_preference", sa.JSON(), nullable=False),
+        sa.Column("policy_source", sa.String(length=1024), nullable=True),
+        sa.Column("policy_sha256", sa.String(length=64), nullable=True),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.PrimaryKeyConstraint("artifactclass"),
+    )
 
     op.create_table(
         "bundle",
         sa.Column("id", sa.String(length=128), nullable=False),
         sa.Column("artifactclass", sa.String(length=128), nullable=False),
-        sa.Column("representation", sa.String(length=64), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("total_bytes", sa.BigInteger(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("closed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("member_count", sa.Integer(), nullable=False),
+        sa.Column("target_bytes", sa.BigInteger(), nullable=False),
+        sa.Column("max_age_seconds", sa.Integer(), nullable=False),
+        sa.Column("ruleset", sa.String(length=256), nullable=True),
+        sa.Column("expect", sa.String(length=32), nullable=True),
+        sa.Column("archive_id", sa.String(length=128), nullable=True),
+        sa.Column("scan_summary", sa.JSON(), nullable=True),
+        sa.Column("review_summary", sa.JSON(), nullable=True),
+        sa.Column("customer_manifest_path", sa.String(length=2048), nullable=True),
+        sa.Column("opened_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("flushed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("sealed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("held_at", sa.DateTime(timezone=True), nullable=True),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
@@ -100,14 +107,47 @@ def upgrade() -> None:
         unique=False,
     )
 
+    with op.batch_alter_table("copy") as batch_op:
+        batch_op.add_column(sa.Column("pool_id", sa.String(length=128), nullable=True))
+        batch_op.add_column(
+            sa.Column("bundle_id", sa.String(length=128), nullable=True)
+        )
+        batch_op.alter_column(
+            "logical_asset_hash",
+            existing_type=sa.LargeBinary(length=32),
+            nullable=True,
+        )
+        batch_op.create_foreign_key(
+            "fk_copy_pool_id_pool",
+            "pool",
+            ["pool_id"],
+            ["id"],
+            ondelete="SET NULL",
+        )
+        batch_op.create_foreign_key(
+            "fk_copy_bundle_id_bundle",
+            "bundle",
+            ["bundle_id"],
+            ["id"],
+            ondelete="CASCADE",
+        )
+        batch_op.create_check_constraint(
+            "ck_copy_asset_or_bundle",
+            "logical_asset_hash IS NOT NULL OR bundle_id IS NOT NULL",
+        )
+        batch_op.create_index(op.f("ix_copy_pool_id"), ["pool_id"], unique=False)
+        batch_op.create_index(op.f("ix_copy_bundle_id"), ["bundle_id"], unique=False)
+
     op.create_table(
         "bundle_member",
         sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("bundle_id", sa.String(length=128), nullable=False),
         sa.Column("logical_asset_hash", sa.LargeBinary(length=32), nullable=False),
         sa.Column("member_path", sa.String(length=1024), nullable=False),
+        sa.Column("source_path", sa.String(length=2048), nullable=True),
         sa.Column("size_bytes", sa.BigInteger(), nullable=False),
         sa.Column("file_sha256", sa.LargeBinary(length=32), nullable=False),
+        sa.Column("source_metadata", sa.JSON(), nullable=True),
         sa.Column("added_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(["bundle_id"], ["bundle.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(
@@ -118,8 +158,8 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
             "bundle_id",
-            "logical_asset_hash",
-            name="uq_bundle_member_bundle_asset",
+            "member_path",
+            name="uq_bundle_member_bundle_path",
         ),
     )
     op.create_index(
@@ -145,11 +185,7 @@ def upgrade() -> None:
         sa.Column("native_locator", sa.JSON(), nullable=False),
         sa.Column("representation", sa.String(length=64), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["bundle_id"],
-            ["bundle.id"],
-            ondelete="SET NULL",
-        ),
+        sa.ForeignKeyConstraint(["bundle_id"], ["bundle.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["copy_id"], ["copy.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(
             ["logical_asset_hash"],
@@ -187,38 +223,38 @@ def upgrade() -> None:
     op.create_table(
         "blob_root",
         sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("logical_asset_hash", sa.LargeBinary(length=32), nullable=False),
-        sa.Column("algorithm", sa.String(length=64), nullable=False),
-        sa.Column("root_hash", sa.LargeBinary(length=32), nullable=False),
+        sa.Column("bundle_id", sa.String(length=128), nullable=False),
+        sa.Column("copy_id", sa.Integer(), nullable=False),
+        sa.Column("pool_id", sa.String(length=128), nullable=False),
+        sa.Column("root_path", sa.String(length=1024), nullable=False),
+        sa.Column("native_locator", sa.JSON(), nullable=False),
+        sa.Column("archive_id", sa.String(length=128), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["logical_asset_hash"],
-            ["logical_asset.content_sha256"],
-            ondelete="CASCADE",
-        ),
+        sa.ForeignKeyConstraint(["bundle_id"], ["bundle.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["copy_id"], ["copy.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["pool_id"], ["pool.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "logical_asset_hash",
-            "algorithm",
-            name="uq_blob_root_asset_algorithm",
-        ),
+        sa.UniqueConstraint("copy_id", "root_path", name="uq_blob_root_copy_root"),
     )
-    op.create_index(
-        op.f("ix_blob_root_logical_asset_hash"),
-        "blob_root",
-        ["logical_asset_hash"],
-        unique=False,
-    )
+    op.create_index(op.f("ix_blob_root_bundle_id"), "blob_root", ["bundle_id"])
+    op.create_index(op.f("ix_blob_root_copy_id"), "blob_root", ["copy_id"])
+    op.create_index(op.f("ix_blob_root_pool_id"), "blob_root", ["pool_id"])
 
     op.create_table(
         "exclusion_record",
         sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("bundle_id", sa.String(length=128), nullable=True),
         sa.Column("artifactclass", sa.String(length=128), nullable=False),
         sa.Column("logical_asset_hash", sa.LargeBinary(length=32), nullable=True),
         sa.Column("path", sa.String(length=1024), nullable=True),
         sa.Column("reason", sa.String(length=128), nullable=False),
+        sa.Column("count", sa.Integer(), nullable=False),
+        sa.Column("bytes_total", sa.BigInteger(), nullable=False),
+        sa.Column("ruleset_name", sa.String(length=256), nullable=True),
+        sa.Column("ruleset_hash", sa.String(length=64), nullable=True),
         sa.Column("detail", sa.JSON(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["bundle_id"], ["bundle.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(
             ["logical_asset_hash"],
             ["logical_asset.content_sha256"],
@@ -230,13 +266,36 @@ def upgrade() -> None:
         op.f("ix_exclusion_record_artifactclass"),
         "exclusion_record",
         ["artifactclass"],
-        unique=False,
+    )
+    op.create_index(
+        op.f("ix_exclusion_record_bundle_id"),
+        "exclusion_record",
+        ["bundle_id"],
     )
     op.create_index(
         op.f("ix_exclusion_record_logical_asset_hash"),
         "exclusion_record",
         ["logical_asset_hash"],
-        unique=False,
+    )
+
+    op.create_table(
+        "review_decision",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("bundle_id", sa.String(length=128), nullable=False),
+        sa.Column("action", sa.String(length=64), nullable=False),
+        sa.Column("scope", sa.String(length=64), nullable=False),
+        sa.Column("subtree", sa.String(length=1024), nullable=True),
+        sa.Column("reason", sa.String(length=2048), nullable=True),
+        sa.Column("reviewer", sa.String(length=256), nullable=True),
+        sa.Column("persisted_rule", sa.JSON(), nullable=True),
+        sa.Column("decided_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["bundle_id"], ["bundle.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        op.f("ix_review_decision_bundle_id"),
+        "review_decision",
+        ["bundle_id"],
     )
 
     op.drop_index(
@@ -270,13 +329,15 @@ def downgrade() -> None:
         unique=False,
     )
 
-    with op.batch_alter_table("copy") as batch_op:
-        batch_op.drop_constraint("fk_copy_pool_id_pool", type_="foreignkey")
-        batch_op.drop_index(op.f("ix_copy_pool_id"))
-        batch_op.drop_column("pool_id")
+    op.drop_index(op.f("ix_review_decision_bundle_id"), table_name="review_decision")
+    op.drop_table("review_decision")
 
     op.drop_index(
         op.f("ix_exclusion_record_logical_asset_hash"),
+        table_name="exclusion_record",
+    )
+    op.drop_index(
+        op.f("ix_exclusion_record_bundle_id"),
         table_name="exclusion_record",
     )
     op.drop_index(
@@ -285,7 +346,9 @@ def downgrade() -> None:
     )
     op.drop_table("exclusion_record")
 
-    op.drop_index(op.f("ix_blob_root_logical_asset_hash"), table_name="blob_root")
+    op.drop_index(op.f("ix_blob_root_pool_id"), table_name="blob_root")
+    op.drop_index(op.f("ix_blob_root_copy_id"), table_name="blob_root")
+    op.drop_index(op.f("ix_blob_root_bundle_id"), table_name="blob_root")
     op.drop_table("blob_root")
 
     op.drop_index(op.f("ix_asset_locator_pool_id"), table_name="asset_locator")
@@ -304,8 +367,23 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_bundle_member_bundle_id"), table_name="bundle_member")
     op.drop_table("bundle_member")
 
+    with op.batch_alter_table("copy") as batch_op:
+        batch_op.drop_index(op.f("ix_copy_bundle_id"))
+        batch_op.drop_index(op.f("ix_copy_pool_id"))
+        batch_op.drop_constraint("ck_copy_asset_or_bundle", type_="check")
+        batch_op.drop_constraint("fk_copy_bundle_id_bundle", type_="foreignkey")
+        batch_op.drop_constraint("fk_copy_pool_id_pool", type_="foreignkey")
+        batch_op.alter_column(
+            "logical_asset_hash",
+            existing_type=sa.LargeBinary(length=32),
+            nullable=False,
+        )
+        batch_op.drop_column("bundle_id")
+        batch_op.drop_column("pool_id")
+
     op.drop_index(op.f("ix_bundle_artifactclass"), table_name="bundle")
     op.drop_table("bundle")
+    op.drop_table("artifactclass_policy")
 
     op.drop_index(op.f("ix_artifactclass_pool_pool_id"), table_name="artifactclass_pool")
     op.drop_index(
