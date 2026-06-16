@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from sutradhara.catalog.session import (
     session_scope,
 )
 from sutradhara.catalog.types import (
+    AssetValidity,
     BackendKind,
     BackendTier,
     CopyHealth,
@@ -30,7 +33,15 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.cli.main import cli
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
-from sutradhara.jobs.engine import claim_pending, run_one, run_pending, submit
+from sutradhara.jobs.config import RetryPolicy, WorkerConfig
+from sutradhara.jobs.engine import (
+    claim_job_by_id,
+    claim_pending,
+    reset_orphaned_running_jobs,
+    run_one,
+    run_pending,
+    submit,
+)
 from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.registry import (
     JobContext,
@@ -38,6 +49,7 @@ from sutradhara.jobs.registry import (
     register_handler,
     registered_kinds,
 )
+from sutradhara.jobs.worker import JobWorker
 
 
 @pytest.fixture
@@ -46,6 +58,12 @@ def engine() -> Iterator[Engine]:
     create_all(eng)
     yield eng
     eng.dispose()
+
+
+def _aware_utc(value: dt.datetime) -> dt.datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
 
 
 # -------------------------------------------------------------------------
@@ -61,6 +79,8 @@ def test_submit_creates_pending_job(engine: Engine) -> None:
         assert job.kind == "verify"
         assert job.params == {"copy_id": 1}
         assert job.attempts == 0
+        assert job.not_before == job.created_at
+        assert job.priority == 0
 
 
 def test_claim_pending_returns_oldest_first(engine: Engine) -> None:
@@ -81,6 +101,39 @@ def test_claim_pending_returns_oldest_first(engine: Engine) -> None:
 def test_claim_pending_returns_none_when_empty(engine: Engine) -> None:
     with session_scope(engine) as s:
         assert claim_pending(s) is None
+
+
+def test_atomic_claim_flips_running_and_second_claim_cannot_regrab(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        job = submit(s, "verify", {"copy_id": 1})
+        claimed = claim_job_by_id(s, job.id)
+        assert claimed is not None
+        assert claimed.status == JobStatus.RUNNING
+        assert claimed.attempts == 1
+        assert claim_job_by_id(s, job.id) is None
+
+
+def test_prerequisites_gate_pending_jobs(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        prereq = submit(s, "verify", {"copy_id": 1})
+        child = submit(s, "verify", {"copy_id": 2}, prerequisites=[prereq.id])
+
+        assert claim_pending(s) is not None
+        assert claim_pending(s) is None
+        prereq.status = JobStatus.SUCCEEDED
+        s.flush()
+
+        claimed = claim_pending(s)
+        assert claimed is not None
+        assert claimed.id == child.id
+
+
+def test_submit_is_idempotent_for_dedupe_key(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        first = submit(s, "verify", {"copy_id": 1}, dedupe_key="verify:1")
+        second = submit(s, "verify", {"copy_id": 2}, dedupe_key="verify:1")
+        assert second.id == first.id
+        assert second.params == {"copy_id": 1}
 
 
 def test_run_unknown_kind_marks_failed(engine: Engine) -> None:
@@ -200,6 +253,264 @@ def test_run_pending_drains_queue(engine: Engine) -> None:
         from sutradhara.jobs import registry as _r
 
         _r._HANDLERS.pop("_test_counter", None)
+
+
+def _worker_engine(tmp_path: Path) -> Engine:
+    db_path = tmp_path / f"worker-{time.time_ns()}.db"
+    eng = make_engine(f"sqlite:///{db_path}")
+    create_all(eng)
+    return eng
+
+
+def test_worker_enforces_cpu_and_io_lease_caps(tmp_path: Path) -> None:
+    state = {"active": 0, "max_active": 0}
+    lock = threading.Lock()
+
+    @register_handler("_test_lease_sleep")
+    def _lease_sleep(ctx: JobContext) -> JobResult:
+        assert ctx.granted_leases
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        time.sleep(0.05)
+        with lock:
+            state["active"] -= 1
+        return JobResult(ok=True)
+
+    try:
+        eng = _worker_engine(tmp_path)
+        with session_scope(eng) as s:
+            for _index in range(4):
+                submit(
+                    s,
+                    "_test_lease_sleep",
+                    {},
+                    required_resources=[{"pool": "cpu", "count": 8}],
+                )
+        worker = JobWorker(
+            eng,
+            config=WorkerConfig.defaults().with_pool_overrides(
+                {"cpu": 24, "io": 2, "tape_drive": 0, "gpu": 0}
+            ),
+        )
+        worker.drain()
+        assert state["max_active"] == 3
+        eng.dispose()
+
+        state.update({"active": 0, "max_active": 0})
+        eng = _worker_engine(tmp_path)
+        with session_scope(eng) as s:
+            for _index in range(3):
+                submit(
+                    s,
+                    "_test_lease_sleep",
+                    {},
+                    required_resources=[{"pool": "cpu", "count": 8}],
+                )
+        worker = JobWorker(
+            eng,
+            config=WorkerConfig.defaults().with_pool_overrides(
+                {"cpu": 16, "io": 2, "tape_drive": 0, "gpu": 0}
+            ),
+        )
+        worker.drain()
+        assert state["max_active"] == 2
+        eng.dispose()
+
+        state.update({"active": 0, "max_active": 0})
+        eng = _worker_engine(tmp_path)
+        with session_scope(eng) as s:
+            for _index in range(3):
+                submit(
+                    s,
+                    "_test_lease_sleep",
+                    {},
+                    required_resources=[{"pool": "io", "count": 1}],
+                )
+        worker = JobWorker(
+            eng,
+            config=WorkerConfig.defaults().with_pool_overrides(
+                {"cpu": 24, "io": 1, "tape_drive": 0, "gpu": 0}
+            ),
+        )
+        worker.drain()
+        assert state["max_active"] == 1
+        eng.dispose()
+    finally:
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_lease_sleep", None)
+
+
+def test_worker_is_work_conserving_but_aging_blocks_starvation(tmp_path: Path) -> None:
+    order: list[str] = []
+    lock = threading.Lock()
+
+    @register_handler("_test_aging")
+    def _aging(ctx: JobContext) -> JobResult:
+        name = str(ctx.job.params["name"])
+        with lock:
+            order.append(name)
+        time.sleep(float(ctx.job.params.get("sleep", 0.01)))
+        return JobResult(ok=True)
+
+    try:
+        eng = _worker_engine(tmp_path)
+        with session_scope(eng) as s:
+            submit(
+                s,
+                "_test_aging",
+                {"name": "holder", "sleep": 0.2},
+                required_resources=[{"pool": "cpu", "count": 4}],
+            )
+            submit(
+                s,
+                "_test_aging",
+                {"name": "big"},
+                required_resources=[{"pool": "cpu", "count": 8}],
+            )
+            submit(
+                s,
+                "_test_aging",
+                {"name": "small-1"},
+                required_resources=[{"pool": "cpu", "count": 1}],
+            )
+            submit(
+                s,
+                "_test_aging",
+                {"name": "small-2"},
+                required_resources=[{"pool": "cpu", "count": 1}],
+            )
+
+        config = WorkerConfig.defaults().with_pool_overrides(
+            {"cpu": 8, "io": 2, "tape_drive": 0, "gpu": 0}
+        )
+        config = WorkerConfig(
+            capacities=config.capacities,
+            retry=config.retry,
+            per_kind_retry=config.per_kind_retry,
+            aging_threshold_scans=2,
+            executor_workers=8,
+        )
+        JobWorker(eng, config=config).drain()
+
+        assert order.index("small-1") < order.index("big")
+        assert order.index("big") < order.index("small-2")
+    finally:
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_aging", None)
+
+
+def test_worker_retries_with_backoff_then_fails(tmp_path: Path) -> None:
+    @register_handler("_test_retry_fails")
+    def _retry_fails(_ctx: JobContext) -> JobResult:
+        return JobResult(ok=False, detail="try again")
+
+    try:
+        eng = _worker_engine(tmp_path)
+        with session_scope(eng) as s:
+            job = submit(s, "_test_retry_fails", {})
+        config = WorkerConfig(
+            capacities={"cpu": 4, "io": 2, "tape_drive": 0, "gpu": 0},
+            retry=RetryPolicy(max_attempts=2, backoff_seconds=60),
+            executor_workers=4,
+        )
+        JobWorker(eng, config=config).drain()
+        with session_scope(eng) as s:
+            row = s.get(Job, job.id)
+            assert row is not None
+            assert row.status == JobStatus.PENDING
+            assert row.attempts == 1
+            assert _aware_utc(row.not_before) > dt.datetime.now(dt.UTC)
+            row.not_before = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
+
+        JobWorker(eng, config=config).drain(recover_orphans=False)
+        with session_scope(eng) as s:
+            row = s.get(Job, job.id)
+            assert row is not None
+            assert row.status == JobStatus.FAILED
+            assert row.attempts == 2
+    finally:
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_retry_fails", None)
+
+
+def test_worker_startup_resets_orphaned_running_jobs(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        job = submit(s, "verify", {"copy_id": 1})
+        job.status = JobStatus.RUNNING
+        job.started_at = dt.datetime.now(dt.UTC)
+
+    with session_scope(engine) as s:
+        assert reset_orphaned_running_jobs(s) == 1
+        row = s.get(Job, job.id)
+        assert row is not None
+        assert row.status == JobStatus.PENDING
+        assert row.started_at is None
+
+
+def test_validate_handler_marks_clean_and_decode_invalid_assets(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    clean = tmp_path / "clean.txt"
+    clean.write_text("valid text", encoding="utf-8")
+    invalid = tmp_path / "invalid.bin"
+    invalid.write_bytes(b"\xff\xfe\xfa")
+    clean_hash = _register_asset(engine, clean.read_bytes())
+    invalid_hash = _register_asset(engine, invalid.read_bytes())
+
+    with session_scope(engine) as s:
+        clean_job = submit(
+            s,
+            "validate",
+            {"asset_hash": clean_hash.hex(), "path": str(clean), "validator": "utf-8"},
+        )
+        invalid_job = submit(
+            s,
+            "validate",
+            {
+                "asset_hash": invalid_hash.hex(),
+                "path": str(invalid),
+                "validator": "utf-8",
+            },
+        )
+        clean_result = run_one(s, clean_job.id)
+        invalid_result = run_one(s, invalid_job.id)
+
+        assert clean_result.ok
+        assert invalid_result.ok
+        clean_asset = s.get(LogicalAsset, clean_hash)
+        invalid_asset = s.get(LogicalAsset, invalid_hash)
+        assert clean_asset is not None
+        assert invalid_asset is not None
+        assert clean_asset.validity == AssetValidity.OK
+        assert invalid_asset.validity == AssetValidity.SUSPECT
+        assert invalid_asset.validity_note is not None
+        assert "decode error" in invalid_asset.validity_note
+
+
+def test_validate_handler_read_error_does_not_mark_suspect(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing.txt"
+    asset_hash = _register_asset(engine, b"not read")
+
+    with session_scope(engine) as s:
+        job = submit(
+            s,
+            "validate",
+            {"asset_hash": asset_hash.hex(), "path": str(missing), "validator": "utf-8"},
+        )
+        result = run_one(s, job.id)
+        asset = s.get(LogicalAsset, asset_hash)
+        assert not result.ok
+        assert "read error" in result.detail
+        assert asset is not None
+        assert asset.validity == AssetValidity.UNVALIDATED
 
 
 # -------------------------------------------------------------------------
@@ -579,13 +890,21 @@ def test_backends_add_merges_config_and_library_uuid(cli_env: dict[str, str]) ->
     _run_cli(["db", "init"])
     _run_cli(
         [
-            "backends", "add", "rem-specific",
-            "--kind", "rem_tape",
-            "--fixture", str(FIXTURE),
-            "--config", "priority=7",
-            "--config", "enabled=true",
-            "--config", "label=archive",
-            "--library-uuid", "library-123",
+            "backends",
+            "add",
+            "rem-specific",
+            "--kind",
+            "rem_tape",
+            "--fixture",
+            str(FIXTURE),
+            "--config",
+            "priority=7",
+            "--config",
+            "enabled=true",
+            "--config",
+            "label=archive",
+            "--library-uuid",
+            "library-123",
         ]
     )
 
@@ -606,10 +925,15 @@ def test_backends_add_rejects_colliding_config_keys(cli_env: dict[str, str]) -> 
 
     fixture_collision = _run_cli(
         [
-            "backends", "add", "rem-fixture-collision",
-            "--kind", "rem_tape",
-            "--config", "fixture_path=elsewhere.json",
-            "--fixture", str(FIXTURE),
+            "backends",
+            "add",
+            "rem-fixture-collision",
+            "--kind",
+            "rem_tape",
+            "--config",
+            "fixture_path=elsewhere.json",
+            "--fixture",
+            str(FIXTURE),
         ],
         expect_exit=2,
     )
@@ -618,10 +942,15 @@ def test_backends_add_rejects_colliding_config_keys(cli_env: dict[str, str]) -> 
 
     library_collision = _run_cli(
         [
-            "backends", "add", "rem-library-collision",
-            "--kind", "rem_tape",
-            "--config", "library_uuid=from-config",
-            "--library-uuid", "from-flag",
+            "backends",
+            "add",
+            "rem-library-collision",
+            "--kind",
+            "rem_tape",
+            "--config",
+            "library_uuid=from-config",
+            "--library-uuid",
+            "from-flag",
         ],
         expect_exit=2,
     )
@@ -630,10 +959,15 @@ def test_backends_add_rejects_colliding_config_keys(cli_env: dict[str, str]) -> 
 
     config_collision = _run_cli(
         [
-            "backends", "add", "rem-config-collision",
-            "--kind", "rem_tape",
-            "--config", "priority=1",
-            "--config", "priority=2",
+            "backends",
+            "add",
+            "rem-config-collision",
+            "--kind",
+            "rem_tape",
+            "--config",
+            "priority=1",
+            "--config",
+            "priority=2",
         ],
         expect_exit=2,
     )
@@ -651,6 +985,54 @@ def test_jobs_submit_unknown_kind_exits_nonzero(cli_env: dict[str, str]) -> None
     _run_cli(["db", "init"])
     result = _run_cli(["jobs", "submit", "nonexistent_kind"], expect_exit=2)
     assert "no handler registered" in result.output
+
+
+def test_jobs_submit_accepts_scheduler_fields_and_dedupe_key(
+    cli_env: dict[str, str],
+) -> None:
+    _run_cli(["db", "init"])
+    first = _run_cli(
+        [
+            "jobs",
+            "submit",
+            "verify",
+            "--param",
+            "copy_id=1",
+            "--resource",
+            "cpu=2",
+            "--prereq",
+            "42",
+            "--not-before",
+            "2030-01-02T03:04:05Z",
+            "--priority",
+            "7",
+            "--dedupe-key",
+            "verify:copy:1",
+        ]
+    )
+    second = _run_cli(
+        [
+            "jobs",
+            "submit",
+            "verify",
+            "--param",
+            "copy_id=2",
+            "--dedupe-key",
+            "verify:copy:1",
+        ]
+    )
+
+    assert "id=1" in first.output
+    assert "id=1" in second.output
+    eng = make_engine()
+    with session_scope(eng) as s:
+        [job] = list(s.scalars(select(Job)))
+        assert job.params == {"copy_id": 1}
+        assert job.required_resources == [{"pool": "cpu", "count": 2}]
+        assert job.prerequisites == [42]
+        assert job.priority == 7
+        assert job.dedupe_key == "verify:copy:1"
+        assert _aware_utc(job.not_before) == dt.datetime(2030, 1, 2, 3, 4, 5, tzinfo=dt.UTC)
 
 
 def test_jobs_run_missing_id_exits_nonzero_without_traceback(
@@ -680,10 +1062,15 @@ def test_jobs_round_trip(cli_env: dict[str, str]) -> None:
     _run_cli(["db", "init"])
     _run_cli(
         [
-            "backends", "add", "tape-primary",
-            "--kind", "rem_tape",
-            "--tier", "self_describing",
-            "--fixture", str(FIXTURE),
+            "backends",
+            "add",
+            "tape-primary",
+            "--kind",
+            "rem_tape",
+            "--tier",
+            "self_describing",
+            "--fixture",
+            str(FIXTURE),
         ]
     )
     _run_cli(["scrub", "--backend", "tape-primary"])
@@ -723,9 +1110,13 @@ def test_jobs_run_drains_queue_with_limit_zero(cli_env: dict[str, str]) -> None:
     _run_cli(["db", "init"])
     _run_cli(
         [
-            "backends", "add", "tape-primary",
-            "--kind", "rem_tape",
-            "--fixture", str(FIXTURE),
+            "backends",
+            "add",
+            "tape-primary",
+            "--kind",
+            "rem_tape",
+            "--fixture",
+            str(FIXTURE),
         ]
     )
     _run_cli(["scrub", "--backend", "tape-primary"])
@@ -761,9 +1152,7 @@ def test_jobs_submit_with_string_param(cli_env: dict[str, str]) -> None:
 
     try:
         _run_cli(["db", "init"])
-        result = _run_cli(
-            ["jobs", "submit", "_test_string_param", "-p", "label=hello-world"]
-        )
+        result = _run_cli(["jobs", "submit", "_test_string_param", "-p", "label=hello-world"])
         assert "submitted job" in result.output
         run_result = _run_cli(["jobs", "run"])
         assert "hello-world" in run_result.output

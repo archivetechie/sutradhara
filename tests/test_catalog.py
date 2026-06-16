@@ -103,8 +103,8 @@ def test_copy_requires_existing_asset_and_backend(engine: Engine) -> None:
     with pytest.raises(IntegrityError), session_scope(engine) as s:
         s.add(
             Copy(
-                logical_asset_hash=h,        # no LogicalAsset with this PK
-                backend_id=999,              # no Backend with this PK
+                logical_asset_hash=h,  # no LogicalAsset with this PK
+                backend_id=999,  # no Backend with this PK
                 native_locator=locator,
                 native_locator_key=locator_key(locator),
                 integrity_hash=h,

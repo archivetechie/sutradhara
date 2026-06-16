@@ -118,9 +118,9 @@ discovered after sealing is a preserved-but-broken master.
 **still archived** (its bytes may be recoverable later with expert tooling; refusing
 to preserve it is culling). It is **flagged** in the catalog and **gated out of
 normal restore**. Concretely:
-- `LogicalAsset` gains a `validity` field (`ok` | `suspect` | `unvalidated`) + a
-  condition note. (Validity is a property of the *content*, so it lives on the
-  content-addressed asset, not per-occurrence.)
+- `LogicalAsset` gains a `validity` field (`ok` | `suspect` | `unvalidated`,
+  default `unvalidated`) + a condition note. (Validity is a property of the
+  *content*, so it lives on the content-addressed asset, not per-occurrence.)
 - The `transcode`/`validate` handler classifies failure **two ways**:
   - **decode/corruption error** → set `validity=suspect` + record the **hash×decode
     diagnostic** (hash-matched-but-undecodable ⇒ source-corrupt; hash-mismatch ⇒

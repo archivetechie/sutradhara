@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from sutradhara.keys import KeyRegistry
+from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import (
     RAO_CHUNK_SIZE,
     RaoCliOpener,
@@ -25,7 +26,6 @@ from sutradhara.sealing.rao import (
     inspect_rao,
     resolve_rem_bin,
 )
-from sutradhara.sealing.port import Representation
 
 
 def _rem_bin_or_skip() -> str:

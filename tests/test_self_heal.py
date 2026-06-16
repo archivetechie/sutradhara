@@ -43,8 +43,8 @@ from sutradhara.replication import (
     replication_status,
     self_heal,
 )
-from sutradhara.sealing.rao import RaoCliOpener, RaoCliSealer, resolve_rem_bin
 from sutradhara.sealing.port import Representation, SealResult
+from sutradhara.sealing.rao import RaoCliOpener, RaoCliSealer, resolve_rem_bin
 
 
 @pytest.fixture

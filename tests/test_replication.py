@@ -476,9 +476,7 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
         rows = list(s.scalars(select(Copy).order_by(Copy.id)))
         assert {row.backend.name for row in rows} == {"mem-rem", "d2-tape"}
         [d2_copy] = [row for row in rows if row.backend.name == "d2-tape"]
-        assert d2_copy.storage_metadata == {
-            "representation": Representation.D2TAR_RAW.value
-        }
+        assert d2_copy.storage_metadata == {"representation": Representation.D2TAR_RAW.value}
         assert d2_copy.integrity_hash == asset_hash
 
 
@@ -504,9 +502,12 @@ def test_replicate_asset_rejects_rao_plaintext_digest_mismatch(
         plaintext_digest_override=hashlib.sha256(b"different").digest(),
     )
 
-    with session_scope(engine) as s, pytest.raises(
-        ReplicationInvariantError,
-        match="plaintext_digest",
+    with (
+        session_scope(engine) as s,
+        pytest.raises(
+            ReplicationInvariantError,
+            match="plaintext_digest",
+        ),
     ):
         replicate_asset(
             s,
@@ -540,9 +541,12 @@ def test_replicate_asset_rejects_rao_stored_digest_mismatch(
         stored_digest_override=hashlib.sha256(b"different").digest(),
     )
 
-    with session_scope(engine) as s, pytest.raises(
-        ReplicationInvariantError,
-        match="stored bytes",
+    with (
+        session_scope(engine) as s,
+        pytest.raises(
+            ReplicationInvariantError,
+            match="stored bytes",
+        ),
     ):
         replicate_asset(
             s,
@@ -615,9 +619,7 @@ def test_replicate_asset_rejects_backend_hash_mismatch(
     )
     backend = _WrongHashBackend("rem")
 
-    with session_scope(engine) as s, pytest.raises(
-        ReplicationInvariantError, match="differs"
-    ):
+    with session_scope(engine) as s, pytest.raises(ReplicationInvariantError, match="differs"):
         replicate_asset(
             s,
             asset_hash,

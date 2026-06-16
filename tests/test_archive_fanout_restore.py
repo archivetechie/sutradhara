@@ -31,6 +31,7 @@ from sutradhara.archive_restore import (
     RestoreIntegrityError,
     RestoreNameError,
     RestoreSourceUnavailable,
+    RestoreSuspectAsset,
     resolve_member_asset_hash,
     restore_asset,
 )
@@ -55,7 +56,14 @@ from sutradhara.catalog.models import (
     StagingTransform,
 )
 from sutradhara.catalog.session import create_all, make_engine, session_scope
-from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
+from sutradhara.catalog.types import (
+    AssetValidity,
+    BackendKind,
+    BackendTier,
+    CopyHealth,
+    CopySource,
+    content_hash,
+)
 from sutradhara.sealing.port import Representation
 from sutradhara.staging import stage_and_enqueue_artifact
 
@@ -466,6 +474,54 @@ def test_restore_uses_policy_preference_and_falls_back_to_d2(
         assert fallback.output_path.read_bytes() == setup.assets[asset_hash]
 
 
+def test_restore_refuses_suspect_asset_without_force(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_bundle(engine, tmp_path)
+    rem_backend = _ArchiveWriteBackend("rem")
+    d2_backend = _ArchiveWriteBackend("d2")
+    [asset_hash] = list(setup.assets)[:1]
+
+    with session_scope(engine) as s:
+        flush_bundle(
+            s,
+            bundle_id=setup.bundle_id,
+            backends={
+                setup.rem_backend_id: rem_backend,
+                setup.d2_backend_id: d2_backend,
+            },
+            builder=LocalArchiveBuilder(),
+        )
+        asset = s.get(LogicalAsset, asset_hash)
+        assert asset is not None
+        asset.validity = AssetValidity.SUSPECT
+        asset.validity_note = "decode error via validate"
+        with pytest.raises(RestoreSuspectAsset, match="decode error"):
+            restore_asset(
+                s,
+                asset_hash=asset_hash,
+                artifactclass="o-archive",
+                destination=tmp_path / "blocked.bin",
+                backends={
+                    setup.rem_backend_id: rem_backend,
+                    setup.d2_backend_id: d2_backend,
+                },
+            )
+        forced = restore_asset(
+            s,
+            asset_hash=asset_hash,
+            artifactclass="o-archive",
+            destination=tmp_path / "forced.bin",
+            backends={
+                setup.rem_backend_id: rem_backend,
+                setup.d2_backend_id: d2_backend,
+            },
+            force_suspect=True,
+        )
+        assert forced.output_path.read_bytes() == setup.assets[asset_hash]
+
+
 def test_zstd_staged_member_fans_out_manifests_and_restores_original(
     engine: Engine,
     tmp_path: Path,
@@ -530,22 +586,16 @@ def test_zstd_staged_member_fans_out_manifests_and_restores_original(
                 "pfr_original": False,
             }
         ]
-        assert (
-            resolve_member_asset_hash(
-                s,
-                artifactclass="o-archive",
-                member_name="images/disk.img",
-            )
-            == _digest(original)
-        )
-        assert (
-            resolve_member_asset_hash(
-                s,
-                artifactclass="o-archive",
-                member_name="images/disk.img.zst",
-            )
-            == _digest(original)
-        )
+        assert resolve_member_asset_hash(
+            s,
+            artifactclass="o-archive",
+            member_name="images/disk.img",
+        ) == _digest(original)
+        assert resolve_member_asset_hash(
+            s,
+            artifactclass="o-archive",
+            member_name="images/disk.img.zst",
+        ) == _digest(original)
         with pytest.raises(RestoreNameError):
             resolve_member_asset_hash(
                 s,

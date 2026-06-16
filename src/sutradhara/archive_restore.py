@@ -28,9 +28,10 @@ from sutradhara.catalog.models import (
     Bundle,
     BundleMember,
     Copy,
+    LogicalAsset,
     StagingTransform,
 )
-from sutradhara.catalog.types import CopyHealth, is_content_hash
+from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
 from sutradhara.keys import KeyRegistry
 from sutradhara.member_name import MemberNameError, escape_member_name, unescape_member_name
 from sutradhara.sealing.port import Representation
@@ -54,6 +55,10 @@ class RestoreIntegrityError(ArchiveRestoreError):
 
 class RestoreNameError(ArchiveRestoreError):
     """A customer member-name restore request could not be resolved."""
+
+
+class RestoreSuspectAsset(ArchiveRestoreError):
+    """A normal restore was refused because the asset is flagged suspect."""
 
 
 @dataclass(frozen=True)
@@ -217,10 +222,12 @@ def restore_asset(
     destination: Path | str,
     backends: dict[int, StorageBackend],
     extractor: ArchiveExtractor | None = None,
+    force_suspect: bool = False,
 ) -> RestoreResult:
     """Restore one asset using the artifactclass ordered pool preference."""
     if not is_content_hash(asset_hash):
         raise ValueError("asset_hash must be a 32-byte SHA-256 hash")
+    _check_asset_restore_allowed(session, asset_hash, force_suspect=force_suspect)
     archive_extractor = extractor or LocalArchiveExtractor()
     policy = get_artifactclass_policy(session, artifactclass)
     pool_order = _restore_pool_order(session, artifactclass, policy.restore_preference)
@@ -231,7 +238,7 @@ def restore_asset(
             .where(AssetLocator.logical_asset_hash == asset_hash)
         )
     )
-    by_pool = {pool_id: [] for pool_id in pool_order}
+    by_pool: dict[str, list[AssetLocator]] = {pool_id: [] for pool_id in pool_order}
     for locator in locators:
         if locator.pool_id in by_pool:
             by_pool[locator.pool_id].append(locator)
@@ -294,6 +301,23 @@ def restore_asset(
         )
     raise RestoreSourceUnavailable(
         f"no healthy locator for asset {asset_hash.hex()} in artifactclass {artifactclass!r}"
+    )
+
+
+def _check_asset_restore_allowed(
+    session: Session,
+    asset_hash: bytes,
+    *,
+    force_suspect: bool,
+) -> None:
+    asset = session.get(LogicalAsset, asset_hash)
+    if asset is None:
+        return
+    if asset.validity != AssetValidity.SUSPECT or force_suspect:
+        return
+    note = f": {asset.validity_note}" if asset.validity_note else ""
+    raise RestoreSuspectAsset(
+        f"asset {asset_hash.hex()} is flagged suspect{note}; use --force to restore anyway"
     )
 
 

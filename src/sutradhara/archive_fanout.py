@@ -577,7 +577,9 @@ def _customer_manifest_members(bundle: Bundle) -> list[dict[str, Any]]:
                 "logical_sha256": member.logical_asset_hash.hex(),
                 "stored_sha256": member.file_sha256.hex(),
                 "transforms": [transform.kind for transform in transforms],
-                "pfr_original": not any(transform.kind == "zstd-file-v1" for transform in transforms),
+                "pfr_original": not any(
+                    transform.kind == "zstd-file-v1" for transform in transforms
+                ),
             }
         )
     return entries

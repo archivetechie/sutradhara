@@ -35,9 +35,7 @@ def handle_verify(ctx: JobContext) -> JobResult:
     params = ctx.job.params
     raw_copy_id = params.get("copy_id")
     if not isinstance(raw_copy_id, int):
-        raise ValueError(
-            f"verify job requires params.copy_id (int); got {raw_copy_id!r}"
-        )
+        raise ValueError(f"verify job requires params.copy_id (int); got {raw_copy_id!r}")
 
     copy = ctx.session.get(Copy, raw_copy_id)
     if copy is None:

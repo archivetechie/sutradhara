@@ -33,13 +33,9 @@ class ByteRange:
         if self.start < 0 or self.end < 0:
             raise ValueError(f"byte range must be non-negative: [{self.start}, {self.end})")
         if self.end == 0 and self.start != 0:
-            raise ValueError(
-                "byte range end=0 is reserved for whole-object reads; use [0, 0)"
-            )
+            raise ValueError("byte range end=0 is reserved for whole-object reads; use [0, 0)")
         if self.end != 0 and self.end < self.start:
-            raise ValueError(
-                f"byte range end must be >= start: [{self.start}, {self.end})"
-            )
+            raise ValueError(f"byte range end must be >= start: [{self.start}, {self.end})")
 
     @property
     def is_whole_object(self) -> bool:

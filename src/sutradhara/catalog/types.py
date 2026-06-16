@@ -20,9 +20,7 @@ def is_content_hash(value: bytes) -> bool:
 def content_hash(value: bytes) -> ContentHash:
     """Construct a `ContentHash`, validating length."""
     if not is_content_hash(value):
-        raise ValueError(
-            f"content_sha256 must be {CONTENT_HASH_LEN} bytes; got {len(value)}"
-        )
+        raise ValueError(f"content_sha256 must be {CONTENT_HASH_LEN} bytes; got {len(value)}")
     return ContentHash(value)
 
 
@@ -67,11 +65,19 @@ class CopyHealth(StrEnum):
     MISSING = "missing"
 
 
+class AssetValidity(StrEnum):
+    """Decode/parse validity of the content-addressed asset bytes."""
+
+    OK = "ok"
+    SUSPECT = "suspect"
+    UNVALIDATED = "unvalidated"
+
+
 class CopySource(StrEnum):
     """How this copy first came to be known to the catalog."""
 
-    INGEST = "ingest"            # first-write path
-    SCRUB = "scrub"              # discovered by a scrub re-enumeration
+    INGEST = "ingest"  # first-write path
+    SCRUB = "scrub"  # discovered by a scrub re-enumeration
     MANUAL_IMPORT = "manual_import"
 
 

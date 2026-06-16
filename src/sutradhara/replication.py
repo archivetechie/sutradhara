@@ -135,8 +135,7 @@ def target_pools(
         backend = backends.get(pool.backend_id)
         if backend is None:
             raise PoolBackendUnavailable(
-                f"pool {pool.id!r} targets backend_id={pool.backend_id}, "
-                "which was not supplied"
+                f"pool {pool.id!r} targets backend_id={pool.backend_id}, which was not supplied"
             )
         targets.append(
             (
@@ -286,9 +285,7 @@ def self_heal(
 
     source = select_restore_source(session, asset_hash, chooser=chooser)
     if source is None:
-        raise SelfHealUnavailable(
-            f"cannot self-heal {asset_hash.hex()}: no healthy source copy"
-        )
+        raise SelfHealUnavailable(f"cannot self-heal {asset_hash.hex()}: no healthy source copy")
 
     source_backend = backends.get(source.backend_id)
     if source_backend is None:
@@ -313,11 +310,14 @@ def self_heal(
     opener = opener or RaoCliOpener(KeyRegistry())
     representation = Representation(source_target.representation)
     _assert_copy_matches_pool(source, source_target)
-    with _materialized_copy_path(source_backend, source) as stored_path, opener.open(
-        stored_path,
-        representation,
-        key_epoch=_epoch_for(source_target, representation),
-    ) as plaintext_path:
+    with (
+        _materialized_copy_path(source_backend, source) as stored_path,
+        opener.open(
+            stored_path,
+            representation,
+            key_epoch=_epoch_for(source_target, representation),
+        ) as plaintext_path,
+    ):
         plaintext_digest = _sha256_file(plaintext_path)
         if plaintext_digest != asset_hash:
             raise ReplicationInvariantError(
@@ -485,8 +485,7 @@ def _epoch_for(
         return None
     if target.key_epoch is None:
         raise ReplicationInvariantError(
-            "encrypted pool requires key_epoch for "
-            f"{target.backend_name}/{target.pool_id}"
+            f"encrypted pool requires key_epoch for {target.backend_name}/{target.pool_id}"
         )
     return KeyEpoch(key_id=target.key_epoch, created_at="", active=True)
 
@@ -518,8 +517,7 @@ def _assert_copy_integrity(
         if record.logical_id == asset_hash and record.integrity_hash == asset_hash:
             return
         raise ReplicationInvariantError(
-            "raw-bytes copy hash differs from asset for "
-            f"{target.backend_name}/{target.pool_id}"
+            f"raw-bytes copy hash differs from asset for {target.backend_name}/{target.pool_id}"
         )
 
     if seal_result.plaintext_digest != asset_hash:

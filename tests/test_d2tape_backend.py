@@ -12,6 +12,8 @@ import hashlib
 import json
 import stat
 from pathlib import Path
+from typing import Any
+
 import pytest
 
 from sutradhara.backend.d2tape import D2TapeBackend

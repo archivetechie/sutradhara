@@ -67,9 +67,7 @@ def test_obsolete_placements_config_is_rejected() -> None:
 
 
 def test_daemon_endpoint_builds_live_adapter() -> None:
-    backend = backend_from_row(
-        _rem_tape_row({"daemon_endpoint": "http://localhost:50051"})
-    )
+    backend = backend_from_row(_rem_tape_row({"daemon_endpoint": "http://localhost:50051"}))
     assert isinstance(backend, RemanenceBackend)
     assert backend.name == "primary-tape"
 
@@ -83,9 +81,7 @@ def test_fixture_path_builds_fixture_adapter(tmp_path: Path) -> None:
 
 
 def test_both_keys_raises_not_configured() -> None:
-    row = _rem_tape_row(
-        {"daemon_endpoint": "http://x", "fixture_path": "/tmp/f.json"}
-    )
+    row = _rem_tape_row({"daemon_endpoint": "http://x", "fixture_path": "/tmp/f.json"})
     with pytest.raises(BackendNotConfigured, match="both"):
         backend_from_row(row)
 

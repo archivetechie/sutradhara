@@ -32,9 +32,7 @@ def scrub_cmd(backend_name: str) -> None:
     """
     engine = make_engine()
     with session_scope(engine) as s:
-        row = s.scalars(
-            select(Backend).where(Backend.name == backend_name)
-        ).one_or_none()
+        row = s.scalars(select(Backend).where(Backend.name == backend_name)).one_or_none()
         if row is None:
             click.echo(f"error: no backend named {backend_name!r}", err=True)
             sys.exit(2)

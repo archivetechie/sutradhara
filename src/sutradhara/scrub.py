@@ -77,9 +77,7 @@ def scrub_backend(
     # the missing-on-backend set by removing the seen ones.
     catalog_copies: dict[str, Copy] = {
         c.native_locator_key: c
-        for c in session.scalars(
-            select(Copy).where(Copy.backend_id == backend_row.id)
-        )
+        for c in session.scalars(select(Copy).where(Copy.backend_id == backend_row.id))
     }
 
     for record in backend.enumerate():
@@ -193,9 +191,7 @@ def _update_existing_copy(
     report.copies_updated += 1
 
 
-def _health_for_record(
-    record: CopyRecord, backend_row: Backend, report: ScrubReport
-) -> CopyHealth:
+def _health_for_record(record: CopyRecord, backend_row: Backend, report: ScrubReport) -> CopyHealth:
     if record.logical_id == record.integrity_hash:
         return CopyHealth.OK
 

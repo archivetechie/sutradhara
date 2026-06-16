@@ -106,32 +106,35 @@ def test_parse_artifactclass_policy_rejects_unknown_keys() -> None:
 
 
 def test_parse_artifactclass_policy_rejects_unknown_staging_keys() -> None:
-    text = _policy_text() + "\n[staging.compression]\ncodec = \"zstd\"\nlevel = 3\nsuffix = \".zst\"\n"
+    text = _policy_text() + '\n[staging.compression]\ncodec = "zstd"\nlevel = 3\nsuffix = ".zst"\n'
 
     with pytest.raises(ArtifactClassPolicyError, match="unknown key"):
         parse_artifactclass_policy(text)
 
 
 def test_parse_artifactclass_policy_rejects_restore_dispatch_policy_block() -> None:
-    text = _policy_text() + "\n[restore_dispatch]\nforeign_format = \"bru-v1\"\n"
+    text = _policy_text() + '\n[restore_dispatch]\nforeign_format = "bru-v1"\n'
 
     with pytest.raises(ArtifactClassPolicyError, match="unknown key"):
         parse_artifactclass_policy(text)
 
 
 def test_parse_artifactclass_policy_requires_zstd_level() -> None:
-    text = _policy_text() + "\n[staging.compression]\ncodec = \"zstd\"\n"
+    text = _policy_text() + '\n[staging.compression]\ncodec = "zstd"\n'
 
     with pytest.raises(ArtifactClassPolicyError, match="level"):
         parse_artifactclass_policy(text)
 
 
 def test_parse_artifactclass_policy_requires_recorded_appledouble_merge() -> None:
-    text = _policy_text() + """
+    text = (
+        _policy_text()
+        + """
 [staging.appledouble]
 action = "merge-to-xattrs"
 record = false
 """
+    )
 
     with pytest.raises(ArtifactClassPolicyError, match="record"):
         parse_artifactclass_policy(text)

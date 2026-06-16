@@ -24,6 +24,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import (
@@ -34,6 +35,7 @@ from sqlalchemy.orm import (
 )
 
 from sutradhara.catalog.types import (
+    AssetValidity,
     BackendKind,
     BackendTier,
     CopyHealth,
@@ -59,6 +61,12 @@ class LogicalAsset(Base):
     """
 
     __tablename__ = "logical_asset"
+    __table_args__ = (
+        CheckConstraint(
+            "validity IN ('ok', 'suspect', 'unvalidated')",
+            name="ck_logical_asset_validity",
+        ),
+    )
 
     content_sha256: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -70,6 +78,10 @@ class LogicalAsset(Base):
     human_label: Mapped[str | None] = mapped_column(String(512), nullable=True)
     media_kind: Mapped[MediaKind | None] = mapped_column(String(32), nullable=True)
     media_info: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    validity: Mapped[AssetValidity] = mapped_column(
+        String(32), nullable=False, default=AssetValidity.UNVALIDATED
+    )
+    validity_note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     copies: Mapped[list[Copy]] = relationship(
         back_populates="logical_asset",

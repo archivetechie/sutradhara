@@ -1,5 +1,6 @@
 """Per-copy sealing interfaces and implementations."""
 
+from sutradhara.sealing.port import Opener, Representation, Sealer, SealResult
 from sutradhara.sealing.rao import (
     RAO_CHUNK_SIZE,
     RaoCliOpener,
@@ -8,11 +9,10 @@ from sutradhara.sealing.rao import (
     inspect_rao,
     resolve_rem_bin,
 )
-from sutradhara.sealing.port import Opener, Representation, Sealer, SealResult
 
 __all__ = [
-    "Opener",
     "RAO_CHUNK_SIZE",
+    "Opener",
     "RaoCliOpener",
     "RaoCliSealer",
     "RaoInspection",

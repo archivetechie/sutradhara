@@ -19,9 +19,17 @@ import pytest
 from click.testing import CliRunner
 
 from sutradhara.artifactclass_policy import AppleDoubleStagingPolicy, StagingPolicy
-from sutradhara.catalog.models import ArtifactClassPolicyRecord, Bundle, ReviewDecision
+from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
+    Bundle,
+    LogicalAsset,
+    ReviewDecision,
+)
 from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.catalog.types import AssetValidity
 from sutradhara.cli.main import cli
+from sutradhara.jobs.engine import submit
+from sutradhara.jobs.models import Job, JobStatus
 
 FIXTURE = Path(__file__).parent / "fixtures" / "remanence_objects.json"
 
@@ -64,7 +72,7 @@ def test_version(cli_env: dict[str, str]) -> None:
 
 def test_help_lists_subcommands(cli_env: dict[str, str]) -> None:
     result = _run(["--help"])
-    for cmd in ("db", "backends", "list", "scrub", "admin", "archive", "review"):
+    for cmd in ("db", "backends", "list", "scrub", "admin", "archive", "review", "worker"):
         assert cmd in result.output
 
 
@@ -72,6 +80,42 @@ def test_db_init_creates_schema(cli_env: dict[str, str]) -> None:
     result = _run(["db", "init"])
     assert "OK" in result.output
     assert os.path.exists(cli_env["db"])
+
+
+def test_worker_once_cli_drains_validate_job(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    _run(["db", "init"])
+    source = tmp_path / "payload.txt"
+    source.write_text("valid text", encoding="utf-8")
+    payload = source.read_bytes()
+    digest = hashlib.sha256(payload).digest()
+
+    engine = make_engine()
+    with session_scope(engine) as session:
+        session.add(LogicalAsset(content_sha256=digest, size_bytes=len(payload)))
+        job = submit(
+            session,
+            "validate",
+            {
+                "asset_hash": digest.hex(),
+                "path": str(source),
+                "validator": "utf-8",
+            },
+        )
+        job_id = job.id
+
+    result = _run(["worker", "--once", "--pools", "cpu=2"])
+
+    assert "worker drained 1 job(s)" in result.output
+    with session_scope(engine) as session:
+        row = session.get(Job, job_id)
+        asset = session.get(LogicalAsset, digest)
+        assert row is not None
+        assert row.status == JobStatus.SUCCEEDED
+        assert asset is not None
+        assert asset.validity == AssetValidity.OK
 
 
 def test_backends_list_empty(cli_env: dict[str, str]) -> None:
@@ -246,6 +290,7 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
         [bundle] = session.query(Bundle).all()
         assert bundle.artifactclass == "photo"
         assert bundle.status == "held"
+        assert bundle.review_summary is not None
         assert bundle.review_summary["clusters"][0]["reason"] == "appledouble-merge-failed"
 
 

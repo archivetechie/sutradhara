@@ -145,7 +145,9 @@ def stage_and_enqueue_artifact(
 
     asset = session.get(LogicalAsset, staged.logical_sha256)
     if asset is None:
-        session.add(LogicalAsset(content_sha256=staged.logical_sha256, size_bytes=staged.logical_size_bytes))
+        session.add(
+            LogicalAsset(content_sha256=staged.logical_sha256, size_bytes=staged.logical_size_bytes)
+        )
         session.flush()
 
     source_metadata = {
@@ -218,9 +220,8 @@ def stage_artifact(
     original_hash = _sha256_file(source)
     transforms: list[TransformSpec] = []
 
-    needs_copy = (
-        policy.appledouble.action == "merge-to-xattrs"
-        or _should_compress(policy.compression, logical_member_path, original_size)
+    needs_copy = policy.appledouble.action == "merge-to-xattrs" or _should_compress(
+        policy.compression, logical_member_path, original_size
     )
     current_path = source
     current_member_path = logical_member_path
@@ -457,7 +458,9 @@ def _parse_appledouble(raw: bytes) -> dict[int, _AppleDoubleEntry]:
         if offset > len(raw) or end > len(raw) or end < offset:
             raise StagingError(f"AppleDouble entry {entry_id} points outside the sidecar")
         entries[entry_id] = _AppleDoubleEntry(offset=offset, data=raw[offset:end])
-    if not any(entry in entries for entry in {_APPLEDOUBLE_RESOURCE_FORK, _APPLEDOUBLE_FINDER_INFO}):
+    if not any(
+        entry in entries for entry in {_APPLEDOUBLE_RESOURCE_FORK, _APPLEDOUBLE_FINDER_INFO}
+    ):
         raise StagingError("AppleDouble sidecar has no supported metadata entries")
     return entries
 

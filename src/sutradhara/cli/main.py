@@ -12,6 +12,7 @@ from sutradhara.cli.backends import backends_group
 from sutradhara.cli.db import db_group
 from sutradhara.cli.jobs import jobs_group
 from sutradhara.cli.scrub import scrub_cmd
+from sutradhara.cli.worker import worker_cmd
 
 
 @click.group()
@@ -25,6 +26,7 @@ cli.add_command(backends_group)
 cli.add_command(list_group)
 cli.add_command(scrub_cmd)
 cli.add_command(jobs_group)
+cli.add_command(worker_cmd)
 cli.add_command(admin_group)
 cli.add_command(archive_group)
 cli.add_command(review_cmd)

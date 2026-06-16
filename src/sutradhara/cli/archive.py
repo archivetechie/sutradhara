@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import click
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from sutradhara.archive_bundle import record_review_decision
 from sutradhara.archive_fanout import (
@@ -19,6 +21,7 @@ from sutradhara.archive_fanout import (
 from sutradhara.archive_restore import (
     RemArchiveExtractor,
     RestoreNameError,
+    RestoreSuspectAsset,
     resolve_member_asset_hash,
     restore_asset,
 )
@@ -27,8 +30,10 @@ from sutradhara.artifactclass_policy import (
     get_artifactclass_policy,
 )
 from sutradhara.backend.factory import backend_from_row
+from sutradhara.backend.port import StorageBackend
 from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool
 from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.replication import WritableStorageBackend
 from sutradhara.staging import StagingHeld, stage_and_enqueue_artifact
 
 
@@ -230,12 +235,19 @@ def review_cmd(
 @click.option("--dest", "destination", required=True, type=click.Path(dir_okay=False))
 @click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
 @click.option("--member-name", default=None, help="Escaped customer manifest member name.")
+@click.option(
+    "--force",
+    "force_suspect",
+    is_flag=True,
+    help="Restore even when the logical asset is flagged suspect.",
+)
 def restore_cmd(
     asset_hash_hex: str | None,
     artifactclass: str,
     destination: str,
     rem_bin: str,
     member_name: str | None,
+    force_suspect: bool,
 ) -> None:
     """Restore one asset using artifactclass pool preference."""
     engine = make_engine()
@@ -253,21 +265,25 @@ def restore_cmd(
         )
         policy = get_artifactclass_policy(session, artifactclass)
         backends = _restore_backends(session, artifactclass, policy.restore_preference)
-        result = restore_asset(
-            session,
-            asset_hash=asset_hash,
-            artifactclass=artifactclass,
-            destination=destination,
-            backends=backends,
-            extractor=RemArchiveExtractor(rem_bin),
-        )
+        try:
+            result = restore_asset(
+                session,
+                asset_hash=asset_hash,
+                artifactclass=artifactclass,
+                destination=destination,
+                backends=backends,
+                extractor=RemArchiveExtractor(rem_bin),
+                force_suspect=force_suspect,
+            )
+        except RestoreSuspectAsset as exc:
+            raise click.ClickException(str(exc)) from exc
     click.echo(
         f"restored {result.asset_hash.hex()} from pool {result.pool_id} copy {result.copy_id} "
         f"to {result.output_path}"
     )
 
 
-def _target_backends(session, artifactclass: str):
+def _target_backends(session: Session, artifactclass: str) -> dict[int, WritableStorageBackend]:
     rows = list(
         session.scalars(
             select(Backend)
@@ -279,10 +295,10 @@ def _target_backends(session, artifactclass: str):
             )
         )
     )
-    return {row.id: backend_from_row(row) for row in rows}
+    return {row.id: cast(WritableStorageBackend, backend_from_row(row)) for row in rows}
 
 
-def _resolve_member_hash(session, artifactclass: str, member_name: str | None) -> bytes:
+def _resolve_member_hash(session: Session, artifactclass: str, member_name: str | None) -> bytes:
     try:
         return resolve_member_asset_hash(
             session,
@@ -299,7 +315,9 @@ def _staging_root(source_path: str, staging_dir: str | None) -> Path:
     return Path(source_path).resolve().parent / ".sutradhara-stage"
 
 
-def _restore_backends(session, artifactclass: str, pool_ids: list[str]):
+def _restore_backends(
+    session: Session, artifactclass: str, pool_ids: list[str]
+) -> dict[int, StorageBackend]:
     active_pool_ids = [
         row.pool_id
         for row in session.scalars(

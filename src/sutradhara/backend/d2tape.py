@@ -40,11 +40,7 @@ from sutradhara.sealing.port import Representation
 _DEFAULT_DEVICE_ENV = Path("/var/lib/replica/d2tape/device.env")
 _DEFAULT_STATE_DIR = Path("/var/lib/replica/d2tape/volumes")
 _DEFAULT_JAR_GLOB = (
-    Path.home()
-    / "d2tape"
-    / "d2tape-cli"
-    / "target"
-    / "d2tape-cli-*-jar-with-dependencies.jar"
+    Path.home() / "d2tape" / "d2tape-cli" / "target" / "d2tape-cli-*-jar-with-dependencies.jar"
 )
 _DEFAULT_TIMEOUT_SECONDS = 300.0
 _PAYLOAD_NAME = "payload.bin"
@@ -156,9 +152,7 @@ class D2TapeBackend:
         if byte_range.is_whole_object:
             return data
         if byte_range.end > len(data):
-            raise ValueError(
-                f"byte range end {byte_range.end} exceeds object size {len(data)}"
-            )
+            raise ValueError(f"byte range end {byte_range.end} exceeds object size {len(data)}")
         return data[byte_range.start : byte_range.end]
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
@@ -363,14 +357,11 @@ class D2TapeBackend:
         device = os.environ.get("D2TAPE_DEVICE") or values.get("D2TAPE_DEVICE")
         if not device:
             raise BackendUnavailableError(
-                "d2tape device state not found; set D2TAPE_DEVICE or write "
-                f"{self._device_env_path}"
+                f"d2tape device state not found; set D2TAPE_DEVICE or write {self._device_env_path}"
             )
         barcode = os.environ.get("D2TAPE_BARCODE") or values.get("D2TAPE_BARCODE", "")
         if not barcode:
-            raise BackendUnavailableError(
-                "d2tape device state is missing D2TAPE_BARCODE"
-            )
+            raise BackendUnavailableError("d2tape device state is missing D2TAPE_BARCODE")
         return _DeviceConfig(
             device=device,
             barcode=barcode,
@@ -388,8 +379,7 @@ class D2TapeBackend:
                 or values.get("D2TAPE_VOLUME_UUID")
             ),
             stinit_script=(
-                os.environ.get("D2TAPE_STINIT_SCRIPT")
-                or values.get("D2TAPE_STINIT_SCRIPT")
+                os.environ.get("D2TAPE_STINIT_SCRIPT") or values.get("D2TAPE_STINIT_SCRIPT")
             ),
         )
 
@@ -462,8 +452,7 @@ def _resolve_jar_path() -> Path:
     if candidates:
         return candidates[-1]
     raise FileNotFoundError(
-        "d2tape CLI fat jar not found. Expected $D2TAPE_JAR or "
-        f"{_DEFAULT_JAR_GLOB}"
+        f"d2tape CLI fat jar not found. Expected $D2TAPE_JAR or {_DEFAULT_JAR_GLOB}"
     )
 
 

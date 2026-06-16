@@ -146,9 +146,7 @@ def _resolve_tape_backend(session: Session, target_backend: str | None) -> Backe
 
     candidates = list(
         session.scalars(
-            select(Backend)
-            .where(Backend.kind == BackendKind.REM_TAPE)
-            .order_by(Backend.name)
+            select(Backend).where(Backend.kind == BackendKind.REM_TAPE).order_by(Backend.name)
         )
     )
     if not candidates:
@@ -159,7 +157,6 @@ def _resolve_tape_backend(session: Session, target_backend: str | None) -> Backe
     if len(candidates) > 1:
         names = ", ".join(repr(backend.name) for backend in candidates)
         raise AmbiguousBackend(
-            f"multiple rem_tape backends registered: {names}; "
-            "pass target_backend explicitly"
+            f"multiple rem_tape backends registered: {names}; pass target_backend explicitly"
         )
     return candidates[0]

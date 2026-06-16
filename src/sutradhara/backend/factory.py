@@ -62,12 +62,8 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
             jar_path=_optional_str(cfg, "jar_path"),
             java_home=_optional_str(cfg, "java_home"),
             java_bin=_optional_str(cfg, "java_bin"),
-            device_env_path=str(
-                cfg.get("device_env_path", "/var/lib/replica/d2tape/device.env")
-            ),
-            state_dir=str(
-                cfg.get("state_dir", "/var/lib/replica/d2tape/volumes")
-            ),
+            device_env_path=str(cfg.get("device_env_path", "/var/lib/replica/d2tape/device.env")),
+            state_dir=str(cfg.get("state_dir", "/var/lib/replica/d2tape/volumes")),
             timeout_seconds=_optional_float(cfg, "timeout_seconds", 300.0),
             file_backed=bool(cfg.get("file_backed", False)),
             temp_dir=_optional_str(cfg, "temp_dir"),
@@ -75,9 +71,7 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
             volume_uuid=_optional_str(cfg, "volume_uuid"),
         )
 
-    raise UnsupportedBackendKind(
-        f"backend {row.name!r}: kind={row.kind} has no factory yet"
-    )
+    raise UnsupportedBackendKind(f"backend {row.name!r}: kind={row.kind} has no factory yet")
 
 
 def _optional_str(cfg: dict[str, object], key: str) -> str | None:

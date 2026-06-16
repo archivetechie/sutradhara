@@ -340,9 +340,7 @@ def _parse_appledouble(raw: object, label: str) -> AppleDoubleStagingPolicy:
         raise ArtifactClassPolicyError(f"{label}.action must be 'off' or 'merge-to-xattrs'")
     tool = _optional_str(table.get("tool"), f"{label}.tool", default="sutradhara-parser")
     if tool not in {"netatalk-ad", "sutradhara-parser"}:
-        raise ArtifactClassPolicyError(
-            f"{label}.tool must be 'netatalk-ad' or 'sutradhara-parser'"
-        )
+        raise ArtifactClassPolicyError(f"{label}.tool must be 'netatalk-ad' or 'sutradhara-parser'")
     on_error = _optional_str(table.get("on_error"), f"{label}.on_error", default="hold")
     if on_error not in {"hold", "fail"}:
         raise ArtifactClassPolicyError(f"{label}.on_error must be 'hold' or 'fail'")

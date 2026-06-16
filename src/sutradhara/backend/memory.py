@@ -72,9 +72,7 @@ class MemoryBackend:
             return data
 
         if byte_range.end > len(data):
-            raise ValueError(
-                f"byte range end {byte_range.end} exceeds object size {len(data)}"
-            )
+            raise ValueError(f"byte range end {byte_range.end} exceeds object size {len(data)}")
         return data[byte_range.start : byte_range.end]
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
@@ -100,9 +98,7 @@ class MemoryBackend:
         try:
             h = content_hash(bytes.fromhex(hex_value))
         except ValueError as e:
-            raise BackendNotFoundError(
-                f"invalid hash_hex {hex_value!r}: {e}"
-            ) from e
+            raise BackendNotFoundError(f"invalid hash_hex {hex_value!r}: {e}") from e
         if h not in self._objects:
             raise BackendNotFoundError(f"no object with hash {hex_value[:12]}…")
         return h

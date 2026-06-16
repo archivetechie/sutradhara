@@ -76,10 +76,7 @@ def test_appledouble_merge_records_transform_and_consumes_sidecar(
     assert not staged.staged_path.with_name("._photo.tif").exists()
     assert os.getxattr(staged.staged_path, "user.com.apple.ResourceFork") == resource
     assert os.getxattr(staged.staged_path, "user.com.apple.FinderInfo") == finder_info
-    assert (
-        os.getxattr(staged.staged_path, "user.com.apple.metadata:_kMDItemUserTags")
-        == tags
-    )
+    assert os.getxattr(staged.staged_path, "user.com.apple.metadata:_kMDItemUserTags") == tags
     assert [member.member_path for member in members] == ["photo.tif"]
     assert [transform.kind for transform in transforms] == ["appledouble-merge-v1"]
     assert transforms[0].reversible is False
@@ -202,8 +199,8 @@ def _appledouble_attr_blob(finder_info_end: int, attrs: dict[str, bytes] | None)
     entries = bytearray()
     data = bytearray()
     names_and_values = [(name.encode("utf-8") + b"\0", value) for name, value in attrs.items()]
-    data_start = attr_start + header_size + sum(
-        _align4(11 + len(name)) for name, _value in names_and_values
+    data_start = (
+        attr_start + header_size + sum(_align4(11 + len(name)) for name, _value in names_and_values)
     )
     for name, value in names_and_values:
         value_offset = data_start + len(data)

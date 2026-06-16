@@ -81,9 +81,7 @@ class _CatalogClient(Protocol):
         self, request: layer5_pb2.EnumerateObjectsRequest
     ) -> Iterator[layer5_pb2.ObjectRecord]: ...
 
-    def GetObject(
-        self, request: layer5_pb2.GetObjectRequest
-    ) -> layer5_pb2.ObjectRecord: ...
+    def GetObject(self, request: layer5_pb2.GetObjectRequest) -> layer5_pb2.ObjectRecord: ...
 
     def ListTapePools(
         self, request: layer5_pb2.ListTapePoolsRequest
@@ -174,22 +172,16 @@ class RemanenceBackend:
         return cls.from_object_dicts(name, raw)
 
     @classmethod
-    def from_object_dicts(
-        cls, name: str, dicts: list[dict[str, Any]]
-    ) -> RemanenceBackend:
+    def from_object_dicts(cls, name: str, dicts: list[dict[str, Any]]) -> RemanenceBackend:
         """Construct from in-memory dicts. Convenient for tests."""
         return cls(name, [_object_from_dict(d) for d in dicts])
 
     @classmethod
-    def from_objects(
-        cls, name: str, objects: list[_RemanenceObject]
-    ) -> RemanenceBackend:
+    def from_objects(cls, name: str, objects: list[_RemanenceObject]) -> RemanenceBackend:
         return cls(name, list(objects))
 
     @classmethod
-    def from_grpc(
-        cls, name: str, endpoint: str | None = None
-    ) -> RemanenceBackend:
+    def from_grpc(cls, name: str, endpoint: str | None = None) -> RemanenceBackend:
         """Construct a live adapter targeting a Remanence daemon Catalog.
 
         Prefer `from_grpc(name, endpoint)`. `from_grpc(endpoint)` is accepted for
@@ -282,8 +274,7 @@ class RemanenceBackend:
             return obj.content
         if byte_range.end > len(obj.content):
             raise ValueError(
-                f"byte range end {byte_range.end} exceeds object size "
-                f"{len(obj.content)}"
+                f"byte range end {byte_range.end} exceeds object size {len(obj.content)}"
             )
         return obj.content[byte_range.start : byte_range.end]
 
@@ -313,8 +304,7 @@ class RemanenceBackend:
         return VerifyResult(
             ok=False,
             actual_hash=actual,
-            detail=f"expected {obj.content_sha256.hex()[:12]}…, "
-            f"got {actual.hex()[:12]}…",
+            detail=f"expected {obj.content_sha256.hex()[:12]}…, got {actual.hex()[:12]}…",
         )
 
     def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
@@ -337,8 +327,7 @@ class RemanenceBackend:
             )
         except grpc.RpcError as e:
             raise BackendUnavailableError(
-                f"Remanence OpenWriteSession at {self._endpoint!r} failed: "
-                f"{_rpc_error_text(e)}"
+                f"Remanence OpenWriteSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
             ) from e
 
         try:
@@ -349,8 +338,7 @@ class RemanenceBackend:
         except grpc.RpcError as e:
             self._safe_abort(client, session.session_id, _rpc_error_text(e))
             raise BackendUnavailableError(
-                f"Remanence write session at {self._endpoint!r} failed: "
-                f"{_rpc_error_text(e)}"
+                f"Remanence write session at {self._endpoint!r} failed: {_rpc_error_text(e)}"
             ) from e
         except Exception as e:
             self._safe_abort(client, session.session_id, str(e))
@@ -402,8 +390,7 @@ class RemanenceBackend:
             )
         except grpc.RpcError as e:
             raise BackendUnavailableError(
-                f"Remanence OpenReadSession at {self._endpoint!r} failed: "
-                f"{_rpc_error_text(e)}"
+                f"Remanence OpenReadSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
             ) from e
 
         try:
@@ -422,8 +409,7 @@ class RemanenceBackend:
         except grpc.RpcError as e:
             self._safe_close_read(client, session.session_id)
             raise BackendUnavailableError(
-                f"Remanence ReadObjectRange at {self._endpoint!r} failed: "
-                f"{_rpc_error_text(e)}"
+                f"Remanence ReadObjectRange at {self._endpoint!r} failed: {_rpc_error_text(e)}"
             ) from e
         return data
 
@@ -433,9 +419,7 @@ class RemanenceBackend:
         session_id: bytes,
     ) -> None:
         try:
-            client.CloseReadSession(
-                layer5_pb2.CloseReadSessionRequest(session_id=session_id)
-            )
+            client.CloseReadSession(layer5_pb2.CloseReadSessionRequest(session_id=session_id))
         except grpc.RpcError:
             return
 
@@ -500,8 +484,7 @@ class RemanenceBackend:
             return self._by_locator[(tape_uuid, tape_file_number)]
         except KeyError as e:
             raise BackendNotFoundError(
-                f"no object at tape {tape_uuid.hex()[:12]}…, "
-                f"file {tape_file_number}"
+                f"no object at tape {tape_uuid.hex()[:12]}…, file {tape_file_number}"
             ) from e
 
 
@@ -570,9 +553,7 @@ def _decode_content(d: dict[str, Any]) -> bytes | None:
 # --- live proto decoding -------------------------------------------------
 
 
-def _copy_record_from_proto(
-    obj: layer5_pb2.ObjectRecord, cp: layer5_pb2.ObjectCopy
-) -> CopyRecord:
+def _copy_record_from_proto(obj: layer5_pb2.ObjectRecord, cp: layer5_pb2.ObjectCopy) -> CopyRecord:
     digest = content_hash(obj.content_sha256)
     return CopyRecord(
         logical_id=digest,
@@ -691,8 +672,7 @@ def _uuid_bytes_from_locator(locator: BackendLocator, key: str) -> bytes:
 def _hex_bytes(value: bytes, field: str, *, length: int) -> str:
     if len(value) != length:
         raise BackendUnavailableError(
-            f"Remanence Catalog returned {field} with {len(value)} bytes; "
-            f"expected {length}"
+            f"Remanence Catalog returned {field} with {len(value)} bytes; expected {length}"
         )
     return value.hex()
 

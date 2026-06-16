@@ -26,6 +26,7 @@ class JobContext:
 
     session: Session
     job: Job
+    granted_leases: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,8 +71,7 @@ def get_handler(kind: str) -> JobHandler:
         return _HANDLERS[kind]
     except KeyError as e:
         raise HandlerNotRegistered(
-            f"no handler registered for kind {kind!r}; known kinds: "
-            f"{sorted(_HANDLERS)}"
+            f"no handler registered for kind {kind!r}; known kinds: {sorted(_HANDLERS)}"
         ) from e
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sys
 from typing import Any
@@ -11,6 +12,7 @@ from sqlalchemy import select
 
 from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
+from sutradhara.jobs.config import parse_pool_overrides
 from sutradhara.jobs.engine import run_one, run_pending, submit
 from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.registry import (
@@ -33,20 +35,47 @@ def jobs_group() -> None:
     multiple=True,
     help="key=value (repeatable). Values are JSON-decoded if possible, else strings.",
 )
-def jobs_submit(kind: str, param: tuple[str, ...]) -> None:
+@click.option(
+    "--resource",
+    multiple=True,
+    help="Required counted resource, pool=count. Repeatable.",
+)
+@click.option("--prereq", "prerequisites", multiple=True, type=int, help="Prerequisite job id.")
+@click.option("--not-before", default=None, help="ISO-8601 UTC timestamp before dispatch.")
+@click.option("--priority", type=int, default=0, show_default=True, help="Lower runs earlier.")
+@click.option("--dedupe-key", default=None, help="Idempotency key for submit retries.")
+def jobs_submit(
+    kind: str,
+    param: tuple[str, ...],
+    resource: tuple[str, ...],
+    prerequisites: tuple[int, ...],
+    not_before: str | None,
+    priority: int,
+    dedupe_key: str | None,
+) -> None:
     """Submit a new job of KIND with --param key=value pairs."""
     if kind not in registered_kinds():
         click.echo(
-            f"error: no handler registered for kind {kind!r}; "
-            f"known: {sorted(registered_kinds())}",
+            f"error: no handler registered for kind {kind!r}; known: {sorted(registered_kinds())}",
             err=True,
         )
         sys.exit(2)
 
     params = _parse_params(param)
+    required_resources = _parse_resources(resource)
+    not_before_dt = _parse_not_before(not_before)
     engine = make_engine()
     with session_scope(engine) as s:
-        job = submit(s, kind, params)
+        job = submit(
+            s,
+            kind,
+            params,
+            required_resources=required_resources,
+            prerequisites=list(prerequisites),
+            not_before=not_before_dt,
+            priority=priority,
+            dedupe_key=dedupe_key,
+        )
         click.echo(f"submitted job id={job.id} kind={job.kind!r} status={job.status}")
 
 
@@ -92,10 +121,7 @@ def jobs_list(status_filter: str | None, limit: int, as_json: bool) -> None:
                 click.echo(json.dumps(_job_to_dict(r)))
             return
 
-        click.echo(
-            f"{'ID':>5}  {'KIND'.ljust(12)}  {'STATUS'.ljust(10)}  "
-            f"{'ATT':>3}  CREATED"
-        )
+        click.echo(f"{'ID':>5}  {'KIND'.ljust(12)}  {'STATUS'.ljust(10)}  {'ATT':>3}  CREATED")
         click.echo("-----  ------------  ----------  ---  ----------------------------")
         for r in rows:
             click.echo(
@@ -170,6 +196,9 @@ def _job_to_dict(job: Job) -> dict[str, Any]:
         "params": job.params,
         "required_resources": job.required_resources,
         "prerequisites": job.prerequisites,
+        "not_before": job.not_before.isoformat(),
+        "priority": job.priority,
+        "dedupe_key": job.dedupe_key,
         "step_state": job.step_state,
         "attempts": job.attempts,
         "last_error": job.last_error,
@@ -190,3 +219,23 @@ def _parse_params(pairs: tuple[str, ...]) -> dict[str, Any]:
         except json.JSONDecodeError:
             out[k] = v
     return out
+
+
+def _parse_resources(items: tuple[str, ...]) -> list[dict[str, Any]]:
+    try:
+        resources = parse_pool_overrides(items)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    return [{"pool": pool, "count": count} for pool, count in resources.items()]
+
+
+def _parse_not_before(raw: str | None) -> dt.datetime | None:
+    if raw is None:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise click.UsageError("--not-before must be an ISO-8601 datetime") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed

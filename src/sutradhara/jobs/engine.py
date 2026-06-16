@@ -1,19 +1,22 @@
-"""Job submission and synchronous in-process runner.
+"""Job submission, atomic claim, and synchronous in-process execution.
 
-Day-1 engine: take the oldest PENDING job, mark RUNNING, dispatch to
-handler, record outcome. No queue substrate (Redis / Postgres
-LISTEN/NOTIFY), no worker fleets — those land in later slices.
+The worker stores jobs in the Sutradhara catalog DB. SQLite is still the queue
+substrate, but claims now use a guarded ``PENDING -> RUNNING`` update so the
+future Postgres ``SKIP LOCKED`` implementation can be swapped in one place.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import traceback
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
+from sutradhara.jobs.config import WorkerConfig
+from sutradhara.jobs.leases import LeaseManager, normalize_required_resources
 from sutradhara.jobs.models import TERMINAL_STATUSES, Job, JobStatus
 from sutradhara.jobs.registry import (
     HandlerNotRegistered,
@@ -34,24 +37,43 @@ def submit(
     *,
     required_resources: list[dict[str, Any]] | None = None,
     prerequisites: list[int] | None = None,
+    not_before: dt.datetime | None = None,
+    priority: int = 0,
+    dedupe_key: str | None = None,
 ) -> Job:
     """Create a PENDING job in the catalog. Returns the persisted Job.
 
     Caller is responsible for `session.commit()`.
     """
+    if dedupe_key is not None:
+        existing = session.scalars(
+            select(Job).where(Job.dedupe_key == dedupe_key).order_by(Job.id).limit(1)
+        ).one_or_none()
+        if existing is not None:
+            return existing
+    now = _utcnow()
     job = Job(
         kind=kind,
         params=params or {},
         required_resources=required_resources or [],
         prerequisites=prerequisites or [],
         status=JobStatus.PENDING,
+        created_at=now,
+        not_before=not_before or now,
+        priority=priority,
+        dedupe_key=dedupe_key,
     )
     session.add(job)
     session.flush()  # so caller can read job.id
     return job
 
 
-def run_one(session: Session, job_id: int) -> JobResult:
+def run_one(
+    session: Session,
+    job_id: int,
+    *,
+    granted_leases: dict[str, int] | None = None,
+) -> JobResult:
     """Run a specific job by id. Marks status, records outcome.
 
     Returns the `JobResult` from the handler (or a synthesized failure
@@ -61,14 +83,13 @@ def run_one(session: Session, job_id: int) -> JobResult:
     if job is None:
         raise ValueError(f"no job with id={job_id}")
     if job.status in TERMINAL_STATUSES:
-        raise ValueError(
-            f"job id={job_id} is in terminal status {job.status}; cannot re-run"
-        )
-
-    job.status = JobStatus.RUNNING
-    job.started_at = _utcnow()
-    job.attempts += 1
-    session.flush()
+        raise ValueError(f"job id={job_id} is in terminal status {job.status}; cannot re-run")
+    if job.status == JobStatus.PENDING:
+        job = _claim_job_by_id(session, job.id, now=_utcnow())
+        if job is None:
+            raise ValueError(f"job id={job_id} could not be claimed")
+    elif job.status != JobStatus.RUNNING:
+        raise ValueError(f"job id={job_id} is {job.status}; cannot run")
 
     try:
         handler = get_handler(job.kind)
@@ -79,7 +100,7 @@ def run_one(session: Session, job_id: int) -> JobResult:
         return JobResult(ok=False, detail=str(e))
 
     try:
-        result = handler(JobContext(session=session, job=job))
+        result = handler(JobContext(session=session, job=job, granted_leases=granted_leases or {}))
     except Exception as e:
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
@@ -96,19 +117,23 @@ def run_one(session: Session, job_id: int) -> JobResult:
     return result
 
 
-def claim_pending(session: Session) -> Job | None:
-    """Return the oldest PENDING job, or None.
-
-    Day-1 has no concurrency; "claim" is just "fetch oldest pending."
-    A real scheduler with multiple workers will need SKIP LOCKED or an
-    equivalent.
-    """
-    return session.scalars(
-        select(Job)
-        .where(Job.status == JobStatus.PENDING)
-        .order_by(Job.created_at, Job.id)
-        .limit(1)
-    ).one_or_none()
+def claim_pending(
+    session: Session,
+    *,
+    leases: LeaseManager | None = None,
+    now: dt.datetime | None = None,
+) -> Job | None:
+    """Atomically claim the first eligible pending job that fits leases."""
+    claim_time = now or _utcnow()
+    manager = leases or LeaseManager(WorkerConfig.defaults().capacities)
+    for job in _pending_candidates(session, now=claim_time):
+        required = normalize_required_resources(job.required_resources)
+        if not manager.fits(required):
+            continue
+        claimed = _claim_job_by_id(session, job.id, now=claim_time)
+        if claimed is not None:
+            return claimed
+    return None
 
 
 def run_pending(session: Session, *, limit: int = 1) -> list[tuple[int, JobResult]]:
@@ -129,3 +154,97 @@ def run_pending(session: Session, *, limit: int = 1) -> list[tuple[int, JobResul
         if remaining is not None:
             remaining -= 1
     return results
+
+
+def pending_candidates(session: Session, *, now: dt.datetime | None = None) -> list[Job]:
+    """Return pending jobs whose delay and prerequisites allow dispatch."""
+    return _pending_candidates(session, now=now or _utcnow())
+
+
+def claim_job_by_id(
+    session: Session,
+    job_id: int,
+    *,
+    now: dt.datetime | None = None,
+) -> Job | None:
+    """Guarded ``PENDING -> RUNNING`` claim for a scheduler-selected job."""
+    return _claim_job_by_id(session, job_id, now=now or _utcnow())
+
+
+def reset_orphaned_running_jobs(session: Session) -> int:
+    """Reset RUNNING jobs to PENDING on single-worker startup."""
+    result = cast(
+        CursorResult[Any],
+        session.execute(
+            update(Job)
+            .where(Job.status == JobStatus.RUNNING)
+            .values(status=JobStatus.PENDING, started_at=None, not_before=_utcnow())
+        ),
+    )
+    return int(result.rowcount or 0)
+
+
+def apply_retry_policy(
+    session: Session,
+    job: Job,
+    *,
+    config: WorkerConfig,
+    now: dt.datetime | None = None,
+) -> None:
+    """Re-enqueue a failed job when its retry policy has attempts remaining."""
+    if job.status != JobStatus.FAILED:
+        return
+    retry = config.retry_for_kind(job.kind)
+    if job.attempts >= retry.max_attempts:
+        return
+    base = now or _utcnow()
+    job.status = JobStatus.PENDING
+    job.not_before = base + dt.timedelta(seconds=retry.delay_seconds(job.attempts))
+    job.started_at = None
+    job.finished_at = None
+    session.flush()
+
+
+def _pending_candidates(session: Session, *, now: dt.datetime) -> list[Job]:
+    rows = list(
+        session.scalars(
+            select(Job)
+            .where(
+                Job.status == JobStatus.PENDING,
+                Job.not_before <= now,
+            )
+            .order_by(Job.priority, Job.created_at, Job.id)
+        )
+    )
+    return [job for job in rows if _prerequisites_succeeded(session, job)]
+
+
+def _prerequisites_succeeded(session: Session, job: Job) -> bool:
+    for prereq_id in job.prerequisites or []:
+        prereq = session.get(Job, prereq_id)
+        if prereq is None or prereq.status != JobStatus.SUCCEEDED:
+            return False
+    return True
+
+
+def _claim_job_by_id(session: Session, job_id: int, *, now: dt.datetime) -> Job | None:
+    result = cast(
+        CursorResult[Any],
+        session.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status == JobStatus.PENDING)
+            .values(
+                status=JobStatus.RUNNING,
+                started_at=now,
+                finished_at=None,
+                attempts=Job.attempts + 1,
+            )
+        ),
+    )
+    if result.rowcount != 1:
+        return None
+    session.flush()
+    claimed = session.get(Job, job_id)
+    if claimed is not None:
+        session.refresh(claimed)
+    return claimed

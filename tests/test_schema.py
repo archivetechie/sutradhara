@@ -60,6 +60,16 @@ def _assert_archive_invariants(db_path: Path) -> None:
     assert "staging_config" in _table_sql(db_path, "artifactclass_policy")
 
 
+def _assert_worker_lease_invariants(db_path: Path) -> None:
+    assert "not_before" in _table_sql(db_path, "job")
+    assert "priority" in _table_sql(db_path, "job")
+    assert "dedupe_key" in _table_sql(db_path, "job")
+    assert ("dedupe_key",) in _unique_index_columns(db_path, "job")
+    assert "validity" in _table_sql(db_path, "logical_asset")
+    assert "validity_note" in _table_sql(db_path, "logical_asset")
+    assert "ck_logical_asset_validity" in _table_sql(db_path, "logical_asset")
+
+
 def test_create_all_creates_job_table_without_prior_job_import(tmp_path: Path) -> None:
     db_path = tmp_path / "create_all.db"
     code = f"""
@@ -85,6 +95,7 @@ engine.dispose()
     assert "staging_transform" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
+    _assert_worker_lease_invariants(db_path)
 
 
 def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
@@ -114,6 +125,7 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     assert "staging_transform" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
+    _assert_worker_lease_invariants(db_path)
 
 
 def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
@@ -140,3 +152,4 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     assert "asset_locator" in tables
     assert "copy" in tables
     _assert_archive_invariants(db_path)
+    _assert_worker_lease_invariants(db_path)

@@ -62,9 +62,7 @@ def list_assets(limit: int, as_json: bool) -> None:
                 click.echo(json.dumps(payload))
             return
 
-        click.echo(
-            f"{'HASH'.ljust(16)}  {'SIZE'.rjust(12)}  {'COPIES'.rjust(6)}  BACKENDS"
-        )
+        click.echo(f"{'HASH'.ljust(16)}  {'SIZE'.rjust(12)}  {'COPIES'.rjust(6)}  BACKENDS")
         click.echo(f"{'-' * 16}  {'-' * 12}  {'-' * 6}  --------")
         for r in rows:
             available_copies = [c for c in r.copies if c.health != CopyHealth.MISSING]

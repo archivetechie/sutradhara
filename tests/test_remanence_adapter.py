@@ -265,7 +265,7 @@ def catalog_server(
 ) -> Iterator[tuple[str, _Catalog]]:
     servicer = _Catalog(proto_object)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
-    layer5_pb2_grpc.add_CatalogServicer_to_server(servicer, server)
+    layer5_pb2_grpc.add_CatalogServicer_to_server(servicer, server)  # type: ignore[no-untyped-call]
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     try:
@@ -403,7 +403,7 @@ class _ReadSession(layer5_pb2_grpc.ReadSessionServiceServicer):
 @contextmanager
 def _serve_read(servicer: _ReadSession) -> Iterator[str]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
-    layer5_pb2_grpc.add_ReadSessionServiceServicer_to_server(servicer, server)
+    layer5_pb2_grpc.add_ReadSessionServiceServicer_to_server(servicer, server)  # type: ignore[no-untyped-call]
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     try:
@@ -576,7 +576,7 @@ class _WriteSession(layer5_pb2_grpc.WriteSessionServiceServicer):
 @contextmanager
 def _serve_write(servicer: _WriteSession) -> Iterator[str]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
-    layer5_pb2_grpc.add_WriteSessionServiceServicer_to_server(servicer, server)
+    layer5_pb2_grpc.add_WriteSessionServiceServicer_to_server(servicer, server)  # type: ignore[no-untyped-call]
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     try:
@@ -630,9 +630,7 @@ def test_write_streams_start_chunks_finish(
     src = tmp_path / "big.bin"
     src.write_bytes(data)
 
-    RemanenceBackend.from_grpc("primary-tape", endpoint).write_object_to_pool(
-        src, "scenario-a"
-    )
+    RemanenceBackend.from_grpc("primary-tape", endpoint).write_object_to_pool(src, "scenario-a")
 
     msgs = servicer.appended
     assert msgs[0].HasField("start")
@@ -672,12 +670,10 @@ def test_write_object_locator_parity_with_enumerate(
     src = tmp_path / "obj.bin"
     src.write_bytes(b"x" * 10)
 
-    written = RemanenceBackend.from_grpc(
-        "primary-tape", write_endpoint
-    ).write_object_to_pool(src, "scenario-a")
-    [enumerated] = list(
-        RemanenceBackend.from_grpc("primary-tape", catalog_endpoint).enumerate()
+    written = RemanenceBackend.from_grpc("primary-tape", write_endpoint).write_object_to_pool(
+        src, "scenario-a"
     )
+    [enumerated] = list(RemanenceBackend.from_grpc("primary-tape", catalog_endpoint).enumerate())
 
     assert written.native_locator == enumerated.native_locator
     assert locator_key(written.native_locator) == locator_key(enumerated.native_locator)
@@ -799,8 +795,8 @@ class _RTRead(layer5_pb2_grpc.ReadSessionServiceServicer):
 @contextmanager
 def _serve_roundtrip(store: _RoundTripStore) -> Iterator[str]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
-    layer5_pb2_grpc.add_WriteSessionServiceServicer_to_server(_RTWrite(store), server)
-    layer5_pb2_grpc.add_ReadSessionServiceServicer_to_server(_RTRead(store), server)
+    layer5_pb2_grpc.add_WriteSessionServiceServicer_to_server(_RTWrite(store), server)  # type: ignore[no-untyped-call]
+    layer5_pb2_grpc.add_ReadSessionServiceServicer_to_server(_RTRead(store), server)  # type: ignore[no-untyped-call]
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     try:

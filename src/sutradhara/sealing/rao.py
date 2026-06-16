@@ -184,9 +184,7 @@ def inspect_rao(path: Path | str) -> RaoInspection:
     try:
         representation = _REM_REPRESENTATIONS[rem_representation]
     except KeyError as exc:
-        raise RuntimeError(
-            f"unknown RAO representation {rem_representation!r}"
-        ) from exc
+        raise RuntimeError(f"unknown RAO representation {rem_representation!r}") from exc
     key_id = report.get("key_id")
     if representation is Representation.RAO_AEAD_V1:
         if not isinstance(key_id, str) or not key_id:
@@ -201,10 +199,7 @@ def resolve_rem_bin() -> str:
         return rem_bin
     if _REM_BIN_DEFAULT.exists():
         return str(_REM_BIN_DEFAULT)
-    raise FileNotFoundError(
-        "rem-debug binary not found. Expected $REM_BIN or "
-        f"{_REM_BIN_DEFAULT}."
-    )
+    raise FileNotFoundError(f"rem-debug binary not found. Expected $REM_BIN or {_REM_BIN_DEFAULT}.")
 
 
 def _build_rao(
@@ -327,19 +322,17 @@ def _assert_report_representation(
     expected: Representation,
 ) -> None:
     rem_value = report.get("representation")
+    if not isinstance(rem_value, str):
+        raise RuntimeError(f"RAO build reported unexpected representation: {report!r}")
     try:
         actual = _REM_REPRESENTATIONS[rem_value]
     except KeyError as exc:
         raise RuntimeError(f"RAO build reported unexpected representation: {report!r}") from exc
     if actual is not expected:
-        raise RuntimeError(
-            f"RAO build representation drift: {actual.value} != {expected.value}"
-        )
+        raise RuntimeError(f"RAO build representation drift: {actual.value} != {expected.value}")
     chunk_size = report.get("chunk_size")
     if chunk_size != RAO_CHUNK_SIZE:
-        raise RuntimeError(
-            f"RAO build chunk_size drift: {chunk_size!r} != {RAO_CHUNK_SIZE}"
-        )
+        raise RuntimeError(f"RAO build chunk_size drift: {chunk_size!r} != {RAO_CHUNK_SIZE}")
 
 
 def _single_member_digest_from_build_report(report: dict[str, Any], basename: str) -> bytes:
@@ -366,9 +359,7 @@ def _single_member_digest_from_build_report(report: dict[str, Any], basename: st
 def _single_restored_member(dest: Path) -> Path:
     files = [path for path in dest.rglob("*") if path.is_file()]
     if len(files) != 1:
-        raise RuntimeError(
-            f"RAO extract expected one regular file, got {len(files)} under {dest}"
-        )
+        raise RuntimeError(f"RAO extract expected one regular file, got {len(files)} under {dest}")
     return files[0]
 
 
@@ -415,9 +406,7 @@ def _digest_from_hex(value: str, *, field: str) -> bytes:
     except ValueError as exc:
         raise RuntimeError(f"RAO report {field!r} is not hex: {value!r}") from exc
     if len(digest) != _DIGEST_SIZE:
-        raise RuntimeError(
-            f"RAO report {field!r} must be {_DIGEST_SIZE} bytes, got {len(digest)}"
-        )
+        raise RuntimeError(f"RAO report {field!r} must be {_DIGEST_SIZE} bytes, got {len(digest)}")
     return digest
 
 

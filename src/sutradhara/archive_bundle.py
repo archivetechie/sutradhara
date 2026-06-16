@@ -118,10 +118,11 @@ def enqueue_artifact(
         path_in_bundle = member_path
     else:
         path_in_bundle = escape_path_text(member_path)
-    stored_source_path = str(source)
+    source_path_text = str(source)
+    stored_source_path: str | None = source_path_text
     metadata = dict(source_metadata or {})
     try:
-        stored_source_path.encode("utf-8")
+        source_path_text.encode("utf-8")
     except UnicodeEncodeError:
         metadata["source_path_bytes_hex"] = os.fsencode(source).hex()
         stored_source_path = None
