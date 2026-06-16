@@ -27,6 +27,18 @@ The archive/storage spine is live and green (scenarios RAP/RAB/RAS):
   archive build/inspect/extract`; representations `rao-plain-v1` / `rao-aead-v1`.
 - **Backends** (`backend/`): `remanence.py`, `d2tape.py`, `memory.py`, `factory.py`,
   `port.py` (the `StorageBackend` Protocol R's S3 adapter must satisfy).
+- **Job framework** (`jobs/`): a general, typed job system — DO NOT reinvent it.
+  `Job` table with a `kind` dispatch string (designed to grow:
+  `"verify, ingest, copy, transcode, …"`), a `register_handler(kind)` registry
+  (`registry.py`), and an engine (`engine.py`: `submit(session, kind, params, *,
+  prerequisites, required_resources)` → PENDING job; `run_pending` / `run_one`
+  claim + dispatch; `JobStatus` lifecycle; `step_state` for resumable/idempotent
+  handlers). A handler is `handle_x(ctx: JobContext) -> JobResult`, registered by
+  importing its module under `jobs/handlers/`. Existing handlers: `verify`, `copy`,
+  `restore`. **R's proxy + cloud-blob work are NEW HANDLERS here, not bespoke
+  modules** — and that is exactly how audio-extract / transcription / thumbnail /
+  scene-detect jobs get added later (a new `kind` + handler, reusing this
+  plumbing; no rules engine, per the house style).
 
 ## The model refinement R introduces (read this first)
 The design says "asset += `virtual_path`, `intake_id`, `(st_dev,st_ino)`". That
@@ -97,29 +109,44 @@ tables were added). No change to `LogicalAsset`/`Copy`/`Bundle` schemas.
      `intake.verified.json`. **Only when `source_kind=card`** does this double as the
      "removable media may be released" signal (a custody hook the offload client
      polls); other sources have no card to hold.
-2. **Proxy job** (`src/sutradhara/proxy.py`): per **video** master item, ONE
-   ffmpeg invocation producing TWO outputs — mezz (1080p h264 ~50 Mbps) + preview
-   (~360p h264 ~1.5 Mbps) — to the cache-shard path (config). Register each output
-   as a `LogicalAsset` + `ingest_item(role=proxy)` + `asset_derivation` edge to the
-   master. **ffmpeg absent or a per-file decode failure ⇒ flag the master
-   `no-proxy` and continue — proxies NEVER block intake/registration.** Add an
-   ffmpeg-presence check the harness can preflight (don't inline-assert in the job).
+   - On success, **enqueue the downstream work as jobs** via
+     `jobs.engine.submit(session, kind, params=…)`: one `transcode` job per video
+     master and one `cloud-blob` job for the intake. Registration is synchronous
+     (the authoritative record), the derived/cloud work is async through the engine
+     (`run_pending`) — so a slow ffmpeg or S3 never blocks registration.
+2. **`transcode` job handler** (`jobs/handlers/transcode.py`, `@register_handler
+   ("transcode")`): per **video** master item, ONE ffmpeg invocation producing TWO
+   outputs — mezz (1080p h264 ~50 Mbps) + preview (~360p h264 ~1.5 Mbps) — to the
+   cache-shard path (config). Register each output as a `LogicalAsset` + an
+   `ingest_item` (its `artifactclass` = the policy-derived proxy class) + an
+   `asset_derivation` edge to the master (`kind=mezz|preview`). **ffmpeg absent or a
+   per-file decode failure ⇒ `JobResult(ok=True)` with the master flagged `no-proxy`
+   in `step_state` — a missing proxy is a non-failure; proxies NEVER block
+   intake/registration.** Add an ffmpeg-presence check the harness can preflight
+   (don't inline-assert in the handler). This handler is the template for future
+   derivation jobs (audio-extract, transcription, …): same shape, different `kind`.
 3. **S3 backend adapter** (`src/sutradhara/backend/s3.py`, `BackendKind.S3`):
    implement the `StorageBackend` port over boto3. Config
    `{endpoint_url?, bucket, prefix, storage_class?}` — `DEEP_ARCHIVE` in prod,
    omitted/standard under dev MinIO. Multipart upload; object get for verify;
    record `stored_digest`. Register it in `backend/factory.py`.
-4. **Cloud-temp blob** (`src/sutradhara/cloud_blob.py`): for a registered intake,
-   build **one** RAO object over the whole intake dir — `rem archive build` with a
-   whole-tree `blob **` ruleset → `rao-aead-v1` sealed under the epoch key
-   (`RaoCliSealer`, key registry unchanged) → S3 put at `intakes/<intake-id>.rao`
-   → record **one `Copy` row**, placement `cloud-temp`, keyed to the intake.
-   (Reuse the proven RAO archive machinery; do not hand-roll a separate tar.) One
-   object per intake — Deep Archive per-object overhead is the reason.
-5. **Tests** (DoD gate): MHL parse/verify good + corrupted (byte-flip after MHL ⇒
-   quarantine, zero registration); registration idempotency (re-scan = no dup);
-   **dedup** (identical bytes in two intakes ⇒ one `LogicalAsset`, two
-   `ingest_item`s); derivation edges; S3 adapter against MinIO (skip cleanly if
+4. **`cloud-blob` job handler** (`jobs/handlers/cloud_blob.py`, `@register_handler
+   ("cloud-blob")`): for a registered intake, build **one** RAO object over the
+   whole intake dir — `rem archive build` with a whole-tree `blob **` ruleset →
+   `rao-aead-v1` sealed under the epoch key (`RaoCliSealer`, key registry unchanged)
+   → S3 put at `intakes/<intake-id>.rao` → record **one `Copy` row**, placement
+   `cloud-temp`, keyed to the intake. (Reuse the proven RAO archive machinery + the
+   step-3 S3 adapter; do not hand-roll a separate tar.) One object per intake —
+   Deep Archive per-object overhead is the reason. Idempotent re-run (use
+   `step_state`); `JobResult(ok=True)` once the Copy row exists.
+5. **Tests** (DoD gate): cross-check good + corrupted (byte-flip after a prior
+   manifest ⇒ quarantine, zero registration); **baseline** (no prior manifest ⇒
+   registered, intake's hashes authoritative); registration idempotency (re-scan =
+   no dup); **dedup** (identical bytes in two intakes ⇒ one `LogicalAsset`, two
+   `ingest_item`s); **job dispatch** (`run_pending` runs the enqueued `transcode` +
+   `cloud-blob` jobs → proxies with `asset_derivation` edges, and the cloud Copy
+   row); **ffmpeg-absent** (`transcode` returns `ok=True`, master flagged
+   `no-proxy`, registration intact); S3 adapter against MinIO (skip cleanly if
    absent); cloud-blob round-trip (build → put → get → `rem archive extract` →
    per-member `file_sha256` == registered). `pytest`, `ruff`/format, type-check —
    paste output.
