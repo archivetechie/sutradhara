@@ -110,46 +110,81 @@ tables were added). No change to `LogicalAsset`/`Copy`/`Bundle` schemas.
      "removable media may be released" signal (a custody hook the offload client
      polls); other sources have no card to hold.
    - On success, **enqueue the downstream work as jobs** via
-     `jobs.engine.submit(session, kind, params=…)`: one `transcode` job per video
-     master and one `cloud-blob` job for the intake. Registration is synchronous
-     (the authoritative record), the derived/cloud work is async through the engine
-     (`run_pending`) — so a slow ffmpeg or S3 never blocks registration.
+     `jobs.engine.submit(session, kind, params=…, dedupe_key=…)`: one `transcode`
+     job per video master, one `pfr-index` job per **high-bitrate** video master,
+     and one `cloud-blob` job for the intake. Registration is synchronous (the
+     authoritative record); the derived/cloud work is async through the worker — so
+     a slow ffmpeg or S3 never blocks registration. These jobs run under the
+     **resource-lease worker** (`prompt-job-worker-leases.md` / `design-worker-lease-
+     scheduler.md`) and declare resources: `transcode → [{cpu,8}]`,
+     `pfr-index → [{io,1},{cpu,1}]`, `cloud-blob → [{io,1}]`. Each is a per-file/
+     per-intake atomic job (Pattern B / Pattern A); dedupe on `(kind, ingest_item_id)`
+     so re-scan never double-enqueues.
 2. **`transcode` job handler** (`jobs/handlers/transcode.py`, `@register_handler
-   ("transcode")`): per **video** master item, ONE ffmpeg invocation producing TWO
-   outputs — mezz (1080p h264 ~50 Mbps) + preview (~360p h264 ~1.5 Mbps) — to the
-   cache-shard path (config). Register each output as a `LogicalAsset` + an
-   `ingest_item` (its `artifactclass` = the policy-derived proxy class) + an
-   `asset_derivation` edge to the master (`kind=mezz|preview`). **ffmpeg absent or a
-   per-file decode failure ⇒ `JobResult(ok=True)` with the master flagged `no-proxy`
-   in `step_state` — a missing proxy is a non-failure; proxies NEVER block
-   intake/registration.** Add an ffmpeg-presence check the harness can preflight
-   (don't inline-assert in the handler). This handler is the template for future
-   derivation jobs (audio-extract, transcription, …): same shape, different `kind`.
-3. **S3 backend adapter** (`src/sutradhara/backend/s3.py`, `BackendKind.S3`):
+   ("transcode")`, `[{cpu,8}]`): per **video** master item, ONE ffmpeg invocation
+   producing TWO outputs — mezz (1080p h264 ~50 Mbps) + preview (~360p h264 ~1.5
+   Mbps) — to the cache-shard path (config), with ffmpeg `-threads` **pinned to the
+   leased cpu count** from `JobContext`. Register each output as a `LogicalAsset` +
+   an `ingest_item` (its `artifactclass` = the policy-derived proxy class) + an
+   `asset_derivation` edge to the master (`kind=mezz|preview`). **Two-mode failure**
+   (since a decode failure is also a corruption signal — see
+   `design-worker-lease-scheduler.md §6`):
+   - **decode / corruption error** ⇒ set the master `LogicalAsset.validity=suspect`
+     + record the **hash×decode diagnostic** (hash-matched-but-undecodable ⇒
+     source-corrupt; hash-mismatch ⇒ transfer-corrupt) in `validity_note`; make no
+     proxy; `JobResult(ok=True)`. **The asset is still archived** (archive-everything)
+     — the `validity` flag gates *restore*, not preservation.
+   - **benign / operational** (ffmpeg absent, unsupported codec, OOM, timeout) ⇒
+     `JobResult(ok=True)`, master flagged `no-proxy` in `step_state`, `validity`
+     unchanged.
+   Distinguish a **read error** (unreadable file) from a **decode error** — only the
+   latter sets `suspect`. Proxies NEVER block intake/registration. ffmpeg-presence is
+   a harness preflight, not an inline assert. This is the template for future
+   derivation jobs (audio-extract, transcription, …): new `kind`, same shape.
+3. **`pfr-index` job handler** (`jobs/handlers/pfr_index.py`, `@register_handler
+   ("pfr-index")`, `[{io,1},{cpu,1}]`): per **high-bitrate** video master, **parse
+   only — ffprobe, NO decode** (I/O-bound); extract the container header/footer/index
+   (ISO-BMFF `moov`/sample-tables; MXF Header/Footer partitions + Index Table
+   Segments) + the keyframe/GOP map into a small **sidecar** stored beside the asset
+   for later partial-file restore (memory `pfr-pre-ingest-high-bitrate`; build order
+   MP4 H.264 long-GOP first, then MXF All-Intra). Reads the **original**; sibling of
+   `transcode`, no dependency on it. A container-parse failure (truncated/bad index)
+   is also a validity signal ⇒ may set `validity=suspect` like §2.
+4. **S3 backend adapter** (`src/sutradhara/backend/s3.py`, `BackendKind.S3`):
    implement the `StorageBackend` port over boto3. Config
    `{endpoint_url?, bucket, prefix, storage_class?}` — `DEEP_ARCHIVE` in prod,
    omitted/standard under dev MinIO. Multipart upload; object get for verify;
    record `stored_digest`. Register it in `backend/factory.py`.
-4. **`cloud-blob` job handler** (`jobs/handlers/cloud_blob.py`, `@register_handler
-   ("cloud-blob")`): for a registered intake, build **one** RAO object over the
-   whole intake dir — `rem archive build` with a whole-tree `blob **` ruleset →
+5. **`cloud-blob` job handler** (`jobs/handlers/cloud_blob.py`, `@register_handler
+   ("cloud-blob")`, `[{io,1}]`, Pattern A — atomic over the whole intake): build
+   **one** RAO object over the whole intake dir — `rem archive build` with a
+   whole-tree `blob **` ruleset →
    `rao-aead-v1` sealed under the epoch key (`RaoCliSealer`, key registry unchanged)
    → S3 put at `intakes/<intake-id>.rao` → record **one `Copy` row**, placement
    `cloud-temp`, keyed to the intake. (Reuse the proven RAO archive machinery + the
-   step-3 S3 adapter; do not hand-roll a separate tar.) One object per intake —
+   step-4 S3 adapter; do not hand-roll a separate tar.) One object per intake —
    Deep Archive per-object overhead is the reason. Idempotent re-run (use
    `step_state`); `JobResult(ok=True)` once the Copy row exists.
-5. **Tests** (DoD gate): cross-check good + corrupted (byte-flip after a prior
+
+> **Depends on the worker:** the `transcode`/`pfr-index`/`cloud-blob` handlers run
+> under the resource-lease worker (`prompt-job-worker-leases.md`). Land that first;
+> this prompt's handlers declare resources, pin ffmpeg `-threads` to the lease, and
+> set `LogicalAsset.validity`. The intake-scan + register half (step 1, minus the
+> enqueue) does **not** depend on the worker and may proceed in parallel.
+
+6. **Tests** (DoD gate): cross-check good + corrupted (byte-flip after a prior
    manifest ⇒ quarantine, zero registration); **baseline** (no prior manifest ⇒
    registered, intake's hashes authoritative); registration idempotency (re-scan =
-   no dup); **dedup** (identical bytes in two intakes ⇒ one `LogicalAsset`, two
-   `ingest_item`s); **job dispatch** (`run_pending` runs the enqueued `transcode` +
-   `cloud-blob` jobs → proxies with `asset_derivation` edges, and the cloud Copy
-   row); **ffmpeg-absent** (`transcode` returns `ok=True`, master flagged
-   `no-proxy`, registration intact); S3 adapter against MinIO (skip cleanly if
-   absent); cloud-blob round-trip (build → put → get → `rem archive extract` →
-   per-member `file_sha256` == registered). `pytest`, `ruff`/format, type-check —
-   paste output.
+   no dup, dedupe_key holds); **dedup** (identical bytes in two intakes ⇒ one
+   `LogicalAsset`, two `ingest_item`s); **job dispatch** (the worker runs enqueued
+   `transcode` + `pfr-index` + `cloud-blob` jobs → proxies with `asset_derivation`
+   edges, a PFR sidecar, the cloud Copy row); **two-mode transcode** — a
+   decode-invalid fixture ⇒ `validity=suspect`, no proxy, **still archived**, and a
+   normal restore of it is **refused** (gate); a benign/ffmpeg-absent case ⇒
+   `no-proxy`, `validity` unchanged, archived + restorable; a read-error fixture ⇒
+   read error, **not** suspect; S3 adapter against MinIO (skip cleanly if absent);
+   cloud-blob round-trip (build → put → get → `rem archive extract` → per-member
+   `file_sha256` == registered). `pytest`, `ruff`/format, type-check — paste output.
 
 ## Shared contract (IDENTICAL in the harness prompt)
 - **Landing layout:** `/landing/<intake-id>/` containing `payload/…` (the received
