@@ -169,7 +169,7 @@ def _build_cloud_blob(
         destination.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         return _sha256_file(destination)
 
-    rem_bin = os.environ.get("REM_BIN") or shutil.which("rem") or "rem"
+    rem_bin = _resolve_rem_bin()
     with tempfile.TemporaryDirectory(prefix="sutradhara-cloud-blob-") as raw:
         work_dir = Path(raw)
         rules_path = work_dir / "rules.rem"
@@ -307,6 +307,36 @@ def _is_under(path: Path, parent: Path) -> bool:
 
 def _bundle_id(intake_id: str) -> str:
     return f"cloud-blob:{intake_id}"
+
+
+def _resolve_rem_bin() -> str:
+    """Resolve the Remanence CLI used to build cloud RAO objects."""
+
+    env_value = os.environ.get("REM_BIN")
+    if env_value:
+        env_path = Path(env_value).expanduser()
+        if env_path.is_file() and os.access(env_path, os.X_OK):
+            return str(env_path)
+        env_command = shutil.which(env_value)
+        if env_command:
+            return env_command
+        raise FileNotFoundError(
+            f"REM_BIN points to a non-executable Remanence CLI: {env_value!r}. "
+            "Set REM_BIN to the rem binary path."
+        )
+
+    path_match = shutil.which("rem")
+    if path_match:
+        return path_match
+
+    fallback = Path.home() / "remanence" / "target" / "release" / "rem"
+    if fallback.is_file() and os.access(fallback, os.X_OK):
+        return str(fallback)
+
+    raise FileNotFoundError(
+        "Remanence CLI not found. Set REM_BIN to the rem binary path, or install "
+        "rem on PATH, or build ~/remanence/target/release/rem."
+    )
 
 
 def _optional_str(value: Any) -> str | None:

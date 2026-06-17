@@ -31,6 +31,7 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.intake import scan_landing_root
 from sutradhara.jobs.engine import run_one, submit
+from sutradhara.jobs.handlers.cloud_blob import _resolve_rem_bin
 from sutradhara.jobs.models import Job, JobStatus
 
 
@@ -159,6 +160,54 @@ def test_transcode_read_error_fails_without_suspect(
         assert job_row.status == JobStatus.FAILED
 
 
+def test_cloud_blob_rem_bin_resolver_uses_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rem = _write_executable(tmp_path / "custom-rem")
+    monkeypatch.setenv("REM_BIN", str(rem))
+    monkeypatch.setenv("PATH", "")
+
+    assert _resolve_rem_bin() == str(rem)
+
+
+def test_cloud_blob_rem_bin_resolver_uses_path_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rem = _write_executable(tmp_path / "rem")
+    monkeypatch.delenv("REM_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    assert _resolve_rem_bin() == str(rem)
+
+
+def test_cloud_blob_rem_bin_resolver_uses_home_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    rem = _write_executable(home / "remanence" / "target" / "release" / "rem")
+    monkeypatch.delenv("REM_BIN", raising=False)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("HOME", str(home))
+
+    assert _resolve_rem_bin() == str(rem)
+
+
+def test_cloud_blob_rem_bin_resolver_missing_binary_is_actionable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("REM_BIN", raising=False)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    with pytest.raises(FileNotFoundError, match="Set REM_BIN"):
+        _resolve_rem_bin()
+
+
 def _write_intake(landing: Path, intake_id: str, files: dict[str, bytes]) -> Path:
     root = landing / intake_id
     payload = root / "payload"
@@ -182,6 +231,13 @@ def _write_intake(landing: Path, intake_id: str, files: dict[str, bytes]) -> Pat
     )
     assert first_path is not None
     return first_path
+
+
+def _write_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
 
 
 def _add_cloud_backend(session: Any) -> None:
