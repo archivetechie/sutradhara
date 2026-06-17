@@ -40,6 +40,8 @@ from sutradhara.catalog.types import (
     BackendTier,
     CopyHealth,
     CopySource,
+    IntakeSourceKind,
+    IntakeStatus,
     MediaKind,
 )
 
@@ -88,11 +90,182 @@ class LogicalAsset(Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+    ingest_items: Mapped[list[IngestItem]] = relationship(
+        back_populates="logical_asset",
+        lazy="selectin",
+    )
 
     def __repr__(self) -> str:
         return (
             f"<LogicalAsset hash={self.content_sha256.hex()[:12]}… "
             f"size={self.size_bytes} copies={len(self.copies)}>"
+        )
+
+
+class Intake(Base):
+    """A completed landing batch admitted by the intake scanner.
+
+    The scanner treats an `intake.json` sentinel as the boundary between
+    receiving and verifying. A quarantined intake records the failed batch but
+    does not register any `ingest_item` rows.
+    """
+
+    __tablename__ = "intake"
+    __table_args__ = (
+        CheckConstraint(
+            "source_kind IN ('card', 'drive', 'upload', 'handoff', 'download', 'other')",
+            name="ck_intake_source_kind",
+        ),
+        CheckConstraint(
+            "status IN ('receiving', 'verifying', 'quarantined', 'registered')",
+            name="ck_intake_status",
+        ),
+    )
+
+    intake_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    operator: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_kind: Mapped[IntakeSourceKind] = mapped_column(String(32), nullable=False)
+    source_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    label: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    manifest_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    status: Mapped[IntakeStatus] = mapped_column(
+        String(32), nullable=False, default=IntakeStatus.RECEIVING
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    registered_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    quarantined_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    items: Mapped[list[IngestItem]] = relationship(
+        back_populates="intake",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Intake id={self.intake_id!r} source_kind={self.source_kind!r} "
+            f"status={self.status!r}>"
+        )
+
+
+class IngestItem(Base):
+    """One occurrence of a logical asset within an intake.
+
+    Occurrence identity stays separate from content identity: two card intakes
+    may carry the same bytes and still deserve separate provenance rows.
+    """
+
+    __tablename__ = "ingest_item"
+    __table_args__ = (
+        UniqueConstraint(
+            "intake_id",
+            "as_received_path",
+            name="uq_ingest_item_intake_as_received_path",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    intake_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("intake.intake_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    logical_asset_hash: Mapped[bytes] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    as_received_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    virtual_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    st_dev: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    st_ino: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    item_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSON,
+        nullable=False,
+        default=dict,
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    intake: Mapped[Intake] = relationship(back_populates="items")
+    logical_asset: Mapped[LogicalAsset] = relationship(back_populates="ingest_items")
+    derived_from_edges: Mapped[list[AssetDerivation]] = relationship(
+        back_populates="derived_item",
+        cascade="all, delete-orphan",
+        foreign_keys="AssetDerivation.derived_item_id",
+        lazy="selectin",
+    )
+    source_for_edges: Mapped[list[AssetDerivation]] = relationship(
+        back_populates="source_item",
+        cascade="all, delete-orphan",
+        foreign_keys="AssetDerivation.source_item_id",
+        lazy="selectin",
+    )
+
+    def __repr__(self) -> str:
+        return f"<IngestItem id={self.id} intake={self.intake_id!r} path={self.as_received_path!r}>"
+
+
+class AssetDerivation(Base):
+    """A provenance edge from one ingested occurrence to a derived occurrence."""
+
+    __tablename__ = "asset_derivation"
+    __table_args__ = (
+        UniqueConstraint(
+            "derived_item_id",
+            "source_item_id",
+            "kind",
+            name="uq_asset_derivation_derived_source_kind",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    derived_item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("ingest_item.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source_item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("ingest_item.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    derived_item: Mapped[IngestItem] = relationship(
+        back_populates="derived_from_edges",
+        foreign_keys=[derived_item_id],
+    )
+    source_item: Mapped[IngestItem] = relationship(
+        back_populates="source_for_edges",
+        foreign_keys=[source_item_id],
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AssetDerivation source_item={self.source_item_id} "
+            f"derived_item={self.derived_item_id} kind={self.kind!r}>"
         )
 
 

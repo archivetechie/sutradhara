@@ -84,6 +84,21 @@ def _assert_worker_lease_invariants(db_path: Path) -> None:
     assert "ck_logical_asset_validity" in _table_sql(db_path, "logical_asset")
 
 
+def _assert_intake_invariants(db_path: Path) -> None:
+    assert "ck_intake_source_kind" in _table_sql(db_path, "intake")
+    assert "ck_intake_status" in _table_sql(db_path, "intake")
+    assert (
+        "intake_id",
+        "as_received_path",
+    ) in _unique_index_columns(db_path, "ingest_item")
+    assert (
+        "derived_item_id",
+        "source_item_id",
+        "kind",
+    ) in _unique_index_columns(db_path, "asset_derivation")
+    assert "metadata" in _table_sql(db_path, "ingest_item")
+
+
 def test_create_all_creates_job_table_without_prior_job_import(tmp_path: Path) -> None:
     db_path = tmp_path / "create_all.db"
     code = f"""
@@ -107,9 +122,13 @@ engine.dispose()
     assert "exclusion_record" in tables
     assert "review_decision" in tables
     assert "staging_transform" in tables
+    assert "intake" in tables
+    assert "ingest_item" in tables
+    assert "asset_derivation" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
+    _assert_intake_invariants(db_path)
 
 
 def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
@@ -137,9 +156,13 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     assert "exclusion_record" in tables
     assert "review_decision" in tables
     assert "staging_transform" in tables
+    assert "intake" in tables
+    assert "ingest_item" in tables
+    assert "asset_derivation" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
+    _assert_intake_invariants(db_path)
 
 
 def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
@@ -165,5 +188,9 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     tables = _tables(db_path)
     assert "asset_locator" in tables
     assert "copy" in tables
+    assert "intake" in tables
+    assert "ingest_item" in tables
+    assert "asset_derivation" in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
+    _assert_intake_invariants(db_path)

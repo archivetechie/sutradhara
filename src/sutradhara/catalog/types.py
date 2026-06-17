@@ -89,3 +89,23 @@ class MediaKind(StrEnum):
     IMAGE = "image"
     DOCUMENT = "document"
     OTHER = "other"
+
+
+class IntakeSourceKind(StrEnum):
+    """Where an intake arrived from before catalog registration."""
+
+    CARD = "card"
+    DRIVE = "drive"
+    UPLOAD = "upload"
+    HANDOFF = "handoff"
+    DOWNLOAD = "download"
+    OTHER = "other"
+
+
+class IntakeStatus(StrEnum):
+    """Registration state for a landing intake."""
+
+    RECEIVING = "receiving"
+    VERIFYING = "verifying"
+    QUARANTINED = "quarantined"
+    REGISTERED = "registered"

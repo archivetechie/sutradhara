@@ -72,7 +72,17 @@ def test_version(cli_env: dict[str, str]) -> None:
 
 def test_help_lists_subcommands(cli_env: dict[str, str]) -> None:
     result = _run(["--help"])
-    for cmd in ("db", "backends", "list", "scrub", "admin", "archive", "review", "worker"):
+    for cmd in (
+        "db",
+        "backends",
+        "list",
+        "scrub",
+        "intake",
+        "admin",
+        "archive",
+        "review",
+        "worker",
+    ):
         assert cmd in result.output
 
 

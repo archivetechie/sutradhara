@@ -71,6 +71,20 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
             volume_uuid=_optional_str(cfg, "volume_uuid"),
         )
 
+    if row.kind == BackendKind.S3:
+        from sutradhara.backend.s3 import S3Backend
+
+        bucket = _optional_str(cfg, "bucket")
+        if bucket is None:
+            raise BackendNotConfigured(f"backend {row.name!r} (kind=s3) needs config.bucket")
+        return S3Backend(
+            row.name,
+            bucket=bucket,
+            prefix=_optional_str(cfg, "prefix") or "",
+            endpoint_url=_optional_str(cfg, "endpoint_url"),
+            storage_class=_optional_str(cfg, "storage_class"),
+        )
+
     raise UnsupportedBackendKind(f"backend {row.name!r}: kind={row.kind} has no factory yet")
 
 
