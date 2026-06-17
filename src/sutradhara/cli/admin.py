@@ -73,16 +73,16 @@ def _rem_diagnostic() -> _Diagnostic:
         resolved = resolve_rem_bin()
     except FileNotFoundError as exc:
         return _Diagnostic(
-            "rem-debug",
+            "rem",
             False,
-            f"{exc} Set REM_BIN or install rem-debug in the default location.",
+            f"{exc} Set REM_BIN or install rem in the default location.",
         )
 
     path = Path(resolved)
     if path.exists() and os.access(path, os.X_OK):
-        return _Diagnostic("rem-debug", True, f"using {resolved}")
+        return _Diagnostic("rem", True, f"using {resolved}")
     return _Diagnostic(
-        "rem-debug",
+        "rem",
         False,
         f"resolved to {resolved}, but it is not an executable file",
     )

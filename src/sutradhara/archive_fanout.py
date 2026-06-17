@@ -19,7 +19,7 @@ import tarfile
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from sqlalchemy import select
@@ -37,6 +37,11 @@ from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Bundle, BundleMember
 from sutradhara.catalog.types import CopyHealth, CopySource
 from sutradhara.keys import KeyRegistry
+from sutradhara.rem_archive_cli import (
+    resolve_rem_bin,
+    run_rem_archive_build,
+    run_rem_archive_scan,
+)
 from sutradhara.replication import (
     PoolTarget,
     WritableStorageBackend,
@@ -294,8 +299,8 @@ class RemArchiveBuilder:
     side without depending on rem internals.
     """
 
-    def __init__(self, rem_bin: str | Path = "rem") -> None:
-        self._rem_bin = str(rem_bin)
+    def __init__(self, rem_bin: str | Path | None = None) -> None:
+        self._rem_bin = None if rem_bin is None else str(rem_bin)
 
     def scan(
         self,
@@ -304,23 +309,13 @@ class RemArchiveBuilder:
         members: Sequence[MemberInput],
         ruleset: str,
     ) -> ConformanceScan:
-        with tempfile.TemporaryDirectory(prefix="sutradhara-rem-scan-") as raw:
-            report_path = Path(raw) / "scan.json"
-            cmd = [
-                self._rem_bin,
-                "archive",
-                "build",
-                "--scan-only",
-                "--rules",
-                ruleset,
-                "--scan-out",
-                str(report_path),
-                *[str(member.source_path) for member in members],
-            ]
-            _run_rem(cmd)
-            if not report_path.exists():
-                return ConformanceScan()
-            return _scan_from_json(_read_json(report_path))
+        report = run_rem_archive_scan(
+            inputs=_rem_input_paths(members),
+            ruleset=ruleset or None,
+            rem_bin=self._rem_bin,
+            failure_label="rem archive scan",
+        )
+        return _scan_from_json(_normalized_rem_scan_report(report))
 
     def build(
         self,
@@ -334,27 +329,35 @@ class RemArchiveBuilder:
     ) -> BuildArtifact:
         output_path = work_dir / f"{bundle.id}-{representation.value}.rao"
         manifest_path = work_dir / f"{bundle.id}-{representation.value}.manifest.json"
-        cmd = [
-            self._rem_bin,
-            "archive",
-            "build",
-            "--rules",
-            ruleset,
-            "--output",
-            str(output_path),
-            "--manifest-out",
-            str(manifest_path),
-        ]
+        rem_ruleset: str | None = ruleset or None
         if representation is Representation.RAO_AEAD_V1:
-            cmd.append("--encrypt")
-            if key_epoch:
-                cmd.extend(["--key-epoch", key_epoch])
-        cmd.extend(str(member.source_path) for member in members)
-        _run_rem(cmd)
-        manifest = _read_json(manifest_path)
+            if key_epoch is None:
+                raise ArchiveFanoutError("encrypted RAO archive build requires key_epoch")
+            with KeyRegistry().materialized_root_key(key_epoch) as key_file:
+                result = run_rem_archive_build(
+                    inputs=_rem_input_paths(members),
+                    ruleset=rem_ruleset,
+                    output_path=output_path,
+                    manifest_path=manifest_path,
+                    rem_bin=self._rem_bin,
+                    encrypt=True,
+                    key_id=key_epoch,
+                    key_file=key_file,
+                    failure_label="rem archive build",
+                )
+        else:
+            result = run_rem_archive_build(
+                inputs=_rem_input_paths(members),
+                ruleset=rem_ruleset,
+                output_path=output_path,
+                manifest_path=manifest_path,
+                rem_bin=self._rem_bin,
+                failure_label="rem archive build",
+            )
+        manifest = _normalized_rem_build_report(result.stdout_report)
         return BuildArtifact(
             artifact_path=output_path,
-            stored_digest=_sha256_file(output_path),
+            stored_digest=result.stored_digest,
             members=tuple(_members_from_manifest(manifest, members)),
             manifest_path=manifest_path,
             blob_roots=tuple(_blob_roots_from_manifest(manifest)),
@@ -384,7 +387,7 @@ class RemArchiveBuilder:
         dest = work_dir / f"verify-out-{verify_id.hexdigest()}"
         dest.mkdir()
         cmd = [
-            self._rem_bin,
+            resolve_rem_bin(self._rem_bin),
             "archive",
             "extract",
             "--object",
@@ -835,21 +838,51 @@ def _member_source_path(member: BundleMember) -> Path | None:
     return None
 
 
+def _rem_input_paths(members: Sequence[MemberInput]) -> list[Path]:
+    """Return build roots that make rem member paths match the catalog paths."""
+
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for member in members:
+        source = Path(member.source_path)
+        parts = PurePosixPath(member.member_path).parts
+        root = source
+        if parts and len(source.parents) >= len(parts):
+            root = source.parents[len(parts) - 1]
+        if root not in seen:
+            roots.append(root)
+            seen.add(root)
+    return roots
+
+
 def _scan_from_json(raw: dict[str, Any]) -> ConformanceScan:
     clusters = tuple(_cluster_from_json(item) for item in raw.get("clusters", []))
     exclusions = tuple(_cluster_from_json(item) for item in raw.get("exclusions", []))
     return ConformanceScan(clusters=clusters, exclusions=exclusions)
 
 
+def _normalized_rem_scan_report(report: dict[str, Any]) -> dict[str, Any]:
+    scan = report.get("scan")
+    if not isinstance(scan, dict):
+        return report
+    normalized = dict(report)
+    normalized["clusters"] = scan.get("clusters", normalized.get("clusters", []))
+    normalized["exclusions"] = scan.get("exclusions", normalized.get("exclusions", []))
+    return normalized
+
+
 def _cluster_from_json(raw: object) -> DeviationCluster:
     if not isinstance(raw, dict):
         raise ArchiveFanoutError("scan cluster must be an object")
     samples = raw.get("samples", [])
+    bytes_value = raw.get("bytes_total")
+    if bytes_value is None:
+        bytes_value = raw.get("bytes", 0)
     return DeviationCluster(
         prefix=str(raw.get("prefix", "")),
         reason=str(raw.get("reason", "unknown")),
         count=int(raw.get("count", 0)),
-        bytes_total=int(raw.get("bytes_total", 0)),
+        bytes_total=int(str(bytes_value)),
         samples=tuple(str(sample) for sample in samples if isinstance(sample, str)),
         proposed_default=(
             None if raw.get("proposed_default") is None else str(raw.get("proposed_default"))
@@ -866,6 +899,31 @@ def _cluster_json(cluster: DeviationCluster) -> dict[str, Any]:
         "samples": list(cluster.samples),
         "proposed_default": cluster.proposed_default,
     }
+
+
+def _normalized_rem_build_report(report: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(report)
+    if normalized.get("members"):
+        return normalized
+    files = normalized.get("files")
+    if isinstance(files, list):
+        members: list[dict[str, Any]] = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            if not isinstance(path, str):
+                continue
+            members.append(
+                {
+                    "path": path,
+                    "size_bytes": item.get("size_bytes"),
+                    "sha256": item.get("file_sha256") or item.get("sha256"),
+                    "first_chunk_lba": item.get("first_chunk_lba"),
+                }
+            )
+        normalized["members"] = members
+    return normalized
 
 
 def _members_from_manifest(

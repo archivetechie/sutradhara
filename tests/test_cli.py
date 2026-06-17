@@ -304,34 +304,34 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
         assert bundle.review_summary["clusters"][0]["reason"] == "appledouble-merge-failed"
 
 
-def test_admin_doctor_reports_rem_debug_and_key_registry(
+def test_admin_doctor_reports_rem_and_key_registry(
     cli_env: dict[str, str],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rem_debug = tmp_path / "rem-debug"
-    rem_debug.write_text("#!/bin/sh\nexit 0\n")
-    rem_debug.chmod(rem_debug.stat().st_mode | stat.S_IXUSR)
-    monkeypatch.setenv("REM_BIN", str(rem_debug))
+    rem = tmp_path / "rem"
+    rem.write_text("#!/bin/sh\nexit 0\n")
+    rem.chmod(rem.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("REM_BIN", str(rem))
     monkeypatch.setenv("SUTRADHARA_KEY_REGISTRY_DIR", str(tmp_path / "keys"))
 
     result = _run(["admin", "doctor"])
 
-    assert f"rem-debug: OK - using {rem_debug}" in result.output
+    assert f"rem: OK - using {rem}" in result.output
     assert "key-registry: OK" in result.output
 
 
-def test_admin_doctor_strict_fails_on_missing_rem_debug(
+def test_admin_doctor_strict_fails_on_missing_rem(
     cli_env: dict[str, str],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("REM_BIN", str(tmp_path / "missing-rem-debug"))
+    monkeypatch.setenv("REM_BIN", str(tmp_path / "missing-rem"))
     monkeypatch.setenv("SUTRADHARA_KEY_REGISTRY_DIR", str(tmp_path / "keys"))
 
     result = _run(["admin", "doctor", "--strict"], expect_exit=1)
 
-    assert "rem-debug: WARN" in result.output
+    assert "rem: WARN" in result.output
     assert "one or more diagnostics" in result.output
 
 

@@ -1,6 +1,6 @@
 """Remanence RAO CLI sealing tests.
 
-The unit tests drive a fake `rem-debug` binary so the sealing port's command
+The unit tests drive a fake `rem` binary so the sealing port's command
 construction, digest mapping, inspection, cleanup, and pass-through behavior
 stay hermetic. The integration test uses the real binary when available to
 prove plaintext/encrypted round trips, missing-key failure, and byte-stable
@@ -34,12 +34,12 @@ def _rem_bin_or_skip() -> str:
     except FileNotFoundError as exc:
         pytest.skip(str(exc))
     if not os.access(resolved, os.X_OK):
-        pytest.skip(f"rem-debug is not executable: {resolved}")
+        pytest.skip(f"rem is not executable: {resolved}")
     return resolved
 
 
 def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    script = tmp_path / "rem-debug"
+    script = tmp_path / "rem"
     script.write_text(
         textwrap.dedent(
             """\

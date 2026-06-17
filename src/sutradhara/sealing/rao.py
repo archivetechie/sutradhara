@@ -1,6 +1,6 @@
 """Remanence RAO CLI implementation of the Sutradhara sealing port.
 
-This module wraps `rem-debug archive build/inspect/extract` as Sutradhara's
+This module wraps `rem archive build/inspect/extract` as Sutradhara's
 stateless file codec. It seals one local plaintext file into deterministic RAO
 objects for backend storage, opens stored RAO objects back to plaintext for
 self-heal, and maps Remanence's JSON reports into the catalog representation
@@ -21,12 +21,17 @@ from pathlib import Path
 from typing import Any
 
 from sutradhara.keys import KeyEpoch, KeyRegistry
+from sutradhara.rem_archive_cli import (
+    resolve_rem_bin as _resolve_rem_bin,
+)
+from sutradhara.rem_archive_cli import (
+    run_rem_archive_build,
+)
 from sutradhara.sealing.port import Representation, SealResult
 
 RAO_CHUNK_SIZE = 262144
 RAO_TIMESTAMP = "2026-01-01T00:00:00Z"
 
-_REM_BIN_DEFAULT = Path.home() / "remanence" / "target" / "release" / "rem-debug"
 _DIGEST_SIZE = 32
 _REM_REPRESENTATIONS = {
     "plaintext": Representation.RAO_PLAIN_V1,
@@ -195,11 +200,7 @@ def inspect_rao(path: Path | str) -> RaoInspection:
 
 def resolve_rem_bin() -> str:
     """Resolve the Remanence CLI path used by Sutradhara."""
-    if rem_bin := os.environ.get("REM_BIN"):
-        return rem_bin
-    if _REM_BIN_DEFAULT.exists():
-        return str(_REM_BIN_DEFAULT)
-    raise FileNotFoundError(f"rem-debug binary not found. Expected $REM_BIN or {_REM_BIN_DEFAULT}.")
+    return _resolve_rem_bin()
 
 
 def _build_rao(
@@ -217,35 +218,26 @@ def _build_rao(
         representation=representation,
         key_id=key_id,
     )
-    args = [
-        "archive",
-        "build",
-        "--inputs",
-        str(source),
-        "--out",
-        str(sealed_path),
-        "--chunk-size",
-        str(RAO_CHUNK_SIZE),
-    ]
     if representation is Representation.RAO_AEAD_V1:
         if key_file is None or key_id is None:
             raise ValueError("encrypted RAO build requires key_file and key_id")
-        args.extend(["--encrypt", "--key-file", str(key_file), "--key-id", key_id])
     elif key_file is not None or key_id is not None:
         raise ValueError("key_file/key_id are only valid for encrypted RAO builds")
-    args.extend(
-        [
-            "--object-id",
-            ids["object_id"],
-            "--caller-object-id",
-            ids["caller_object_id"],
-            "--manifest-file-id",
-            ids["manifest_file_id"],
-            "--timestamp",
-            RAO_TIMESTAMP,
-        ]
+    result = run_rem_archive_build(
+        inputs=[source],
+        ruleset=None,
+        output_path=sealed_path,
+        chunk_size=RAO_CHUNK_SIZE,
+        object_id=ids["object_id"],
+        caller_object_id=ids["caller_object_id"],
+        manifest_file_id=ids["manifest_file_id"],
+        timestamp=RAO_TIMESTAMP,
+        encrypt=representation is Representation.RAO_AEAD_V1,
+        key_id=key_id,
+        key_file=key_file,
+        failure_label="rem archive build",
     )
-    return _json_report(_run_rem(args))
+    return result.stdout_report
 
 
 def _extract_rao(
@@ -373,7 +365,7 @@ def _run_rem(args: list[str], *, check: bool = True) -> subprocess.CompletedProc
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if check and result.returncode != 0:
         raise RuntimeError(
-            f"rem-debug {' '.join(args[:2])} failed (exit {result.returncode}): "
+            f"rem {' '.join(args[:2])} failed (exit {result.returncode}): "
             f"stdout={result.stdout.strip()[:500]!r} "
             f"stderr={result.stderr.strip()[:500]!r}"
         )

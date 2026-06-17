@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
 import os
-import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -21,6 +18,8 @@ from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Backend, Bundle, Copy, IngestItem, Intake, Pool
 from sutradhara.catalog.types import CopyHealth, CopySource
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
+from sutradhara.keys import KeyRegistry
+from sutradhara.rem_archive_cli import run_rem_archive_build, sha256_file
 from sutradhara.sealing.port import Representation
 
 
@@ -77,9 +76,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
     blob_dir = cache_root / "intakes" / intake.intake_id / "cloud"
     blob_dir.mkdir(parents=True, exist_ok=True)
     blob_path = blob_dir / f"{intake.intake_id}.rao"
-    key_epoch = _optional_str(params.get("key_epoch")) or os.environ.get(
-        "SUTRADHARA_CLOUD_KEY_EPOCH"
-    )
+    key_epoch = _cloud_key_epoch(params.get("key_epoch"))
 
     members = _member_inputs_for_intake(ctx, intake, intake_root, payload_root)
     bundle = _upsert_cloud_bundle(
@@ -92,6 +89,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
     stored_digest = _build_cloud_blob(
         bundle=bundle,
         members=members,
+        intake_root=intake_root,
         payload_root=payload_root,
         destination=blob_path,
         key_epoch=key_epoch,
@@ -147,9 +145,10 @@ def _build_cloud_blob(
     *,
     bundle: Bundle,
     members: list[MemberInput],
+    intake_root: Path,
     payload_root: Path,
     destination: Path,
-    key_epoch: str | None,
+    key_epoch: str,
 ) -> bytes:
     if os.environ.get("SUTRADHARA_FAKE_CLOUD_BLOB") == "1":
         payload = {
@@ -167,44 +166,32 @@ def _build_cloud_blob(
             ],
         }
         destination.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        return _sha256_file(destination)
+        return sha256_file(destination)
 
-    rem_bin = _resolve_rem_bin()
     with tempfile.TemporaryDirectory(prefix="sutradhara-cloud-blob-") as raw:
         work_dir = Path(raw)
         rules_path = work_dir / "rules.rem"
         manifest_path = work_dir / "manifest.json"
-        rules_path.write_text("blob **\n", encoding="utf-8")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            rem_bin,
-            "archive",
-            "build",
-            "--rules",
-            str(rules_path),
-            "--output",
-            str(destination),
-            "--manifest-out",
-            str(manifest_path),
-            "--encrypt",
-        ]
-        if key_epoch:
-            cmd.extend(["--key-epoch", key_epoch])
-        cmd.extend(str(member.source_path) for member in members)
-        completed = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                "rem archive build failed for cloud blob: "
-                f"{completed.stderr.strip() or completed.stdout.strip()}"
+        rules_path.write_text("blob **/\n", encoding="utf-8")
+        with KeyRegistry().materialized_root_key(key_epoch) as key_file:
+            result = run_rem_archive_build(
+                inputs=[intake_root],
+                ruleset=rules_path,
+                output_path=destination,
+                manifest_path=manifest_path,
+                encrypt=True,
+                key_id=key_epoch,
+                key_file=key_file,
+                failure_label="rem archive build for cloud blob",
             )
-        if not destination.exists():
-            raise RuntimeError("rem archive build did not produce the cloud blob object")
-        return _sha256_file(destination)
+        return result.stored_digest
+
+
+def _cloud_key_epoch(value: Any) -> str:
+    raw = _optional_str(value) or _optional_str(os.environ.get("SUTRADHARA_CLOUD_KEY_EPOCH"))
+    if raw is not None:
+        return raw
+    return KeyRegistry().create_epoch().key_id
 
 
 def _member_inputs_for_intake(
@@ -223,7 +210,7 @@ def _member_inputs_for_intake(
             continue
         if not source_path.exists() or not source_path.is_file():
             raise ValueError(f"payload source path is unavailable: {source_path}")
-        digest = item_hashes.get(source_path) or _sha256_file(source_path)
+        digest = item_hashes.get(source_path) or sha256_file(source_path)
         stat = source_path.stat()
         members.append(
             MemberInput(
@@ -276,7 +263,7 @@ def _upsert_cloud_bundle(
             member_count=member_count,
             target_bytes=total_bytes,
             max_age_seconds=0,
-            ruleset="blob **",
+            ruleset="blob **/",
             expect="compliant",
             archive_id=bundle_id,
         )
@@ -286,7 +273,7 @@ def _upsert_cloud_bundle(
         bundle.total_bytes = total_bytes
         bundle.member_count = member_count
         bundle.target_bytes = total_bytes
-        bundle.ruleset = "blob **"
+        bundle.ruleset = "blob **/"
         bundle.expect = "compliant"
     ctx.session.flush()
     return bundle
@@ -309,46 +296,8 @@ def _bundle_id(intake_id: str) -> str:
     return f"cloud-blob:{intake_id}"
 
 
-def _resolve_rem_bin() -> str:
-    """Resolve the Remanence CLI used to build cloud RAO objects."""
-
-    env_value = os.environ.get("REM_BIN")
-    if env_value:
-        env_path = Path(env_value).expanduser()
-        if env_path.is_file() and os.access(env_path, os.X_OK):
-            return str(env_path)
-        env_command = shutil.which(env_value)
-        if env_command:
-            return env_command
-        raise FileNotFoundError(
-            f"REM_BIN points to a non-executable Remanence CLI: {env_value!r}. "
-            "Set REM_BIN to the rem binary path."
-        )
-
-    path_match = shutil.which("rem")
-    if path_match:
-        return path_match
-
-    fallback = Path.home() / "remanence" / "target" / "release" / "rem"
-    if fallback.is_file() and os.access(fallback, os.X_OK):
-        return str(fallback)
-
-    raise FileNotFoundError(
-        "Remanence CLI not found. Set REM_BIN to the rem binary path, or install "
-        "rem on PATH, or build ~/remanence/target/release/rem."
-    )
-
-
 def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value)
     return text if text else None
-
-
-def _sha256_file(path: Path) -> bytes:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.digest()
