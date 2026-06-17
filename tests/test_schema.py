@@ -31,6 +31,16 @@ def _unique_index_columns(db_path: Path, table: str) -> set[tuple[str, ...]]:
         return result
 
 
+def _index_sql(db_path: Path, index_name: str) -> str:
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "select sql from sqlite_master where type='index' and name=?",
+            (index_name,),
+        ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
 def _table_sql(db_path: Path, table: str) -> str:
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
@@ -65,6 +75,10 @@ def _assert_worker_lease_invariants(db_path: Path) -> None:
     assert "priority" in _table_sql(db_path, "job")
     assert "dedupe_key" in _table_sql(db_path, "job")
     assert ("dedupe_key",) in _unique_index_columns(db_path, "job")
+    index_sql = _index_sql(db_path, "uq_job_dedupe_key_live")
+    assert "UNIQUE INDEX" in index_sql
+    assert "WHERE status IN ('pending', 'running', 'queued')" in index_sql
+    assert "uq_job_dedupe_key" not in _table_sql(db_path, "job")
     assert "validity" in _table_sql(db_path, "logical_asset")
     assert "validity_note" in _table_sql(db_path, "logical_asset")
     assert "ck_logical_asset_validity" in _table_sql(db_path, "logical_asset")

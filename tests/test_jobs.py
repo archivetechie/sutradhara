@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner, Result
 from sqlalchemy import Engine, select
+from sqlalchemy.exc import IntegrityError
 
 from sutradhara.backend import factory as backend_factory
 from sutradhara.backend.memory import MemoryBackend
@@ -128,12 +129,72 @@ def test_prerequisites_gate_pending_jobs(engine: Engine) -> None:
         assert claimed.id == child.id
 
 
-def test_submit_is_idempotent_for_dedupe_key(engine: Engine) -> None:
+@pytest.mark.parametrize(
+    "live_status",
+    [JobStatus.PENDING, JobStatus.RUNNING, JobStatus.QUEUED],
+)
+def test_submit_is_idempotent_for_live_dedupe_key(
+    engine: Engine,
+    live_status: JobStatus,
+) -> None:
     with session_scope(engine) as s:
-        first = submit(s, "verify", {"copy_id": 1}, dedupe_key="verify:1")
-        second = submit(s, "verify", {"copy_id": 2}, dedupe_key="verify:1")
+        dedupe_key = f"verify:{live_status.value}"
+        first = submit(s, "verify", {"copy_id": 1}, dedupe_key=dedupe_key)
+        first.status = live_status
+        s.flush()
+
+        second = submit(s, "verify", {"copy_id": 2}, dedupe_key=dedupe_key)
+
         assert second.id == first.id
         assert second.params == {"copy_id": 1}
+
+
+@pytest.mark.parametrize("terminal_status", [JobStatus.FAILED, JobStatus.SUCCEEDED])
+def test_submit_ignores_terminal_jobs_for_dedupe_key(
+    engine: Engine,
+    terminal_status: JobStatus,
+) -> None:
+    with session_scope(engine) as s:
+        first = submit(s, "verify", {"copy_id": 1}, dedupe_key="verify:terminal")
+        first.status = terminal_status
+        first.finished_at = dt.datetime.now(dt.UTC)
+        s.flush()
+
+        second = submit(s, "verify", {"copy_id": 2}, dedupe_key="verify:terminal")
+
+        assert second.id != first.id
+        assert second.status == JobStatus.PENDING
+        assert second.params == {"copy_id": 2}
+        rows = list(
+            s.scalars(select(Job).where(Job.dedupe_key == "verify:terminal").order_by(Job.id))
+        )
+        assert [row.id for row in rows] == [first.id, second.id]
+
+
+@pytest.mark.parametrize(
+    "live_status",
+    [JobStatus.PENDING, JobStatus.RUNNING, JobStatus.QUEUED],
+)
+def test_live_dedupe_key_unique_index_blocks_direct_duplicate_insert(
+    engine: Engine,
+    live_status: JobStatus,
+) -> None:
+    def insert_duplicate_live_job() -> None:
+        with session_scope(engine) as s:
+            dedupe_key = f"verify:race:{live_status.value}"
+            submit(s, "verify", {"copy_id": 1}, dedupe_key=dedupe_key)
+            s.add(
+                Job(
+                    kind="verify",
+                    params={"copy_id": 2},
+                    status=live_status,
+                    dedupe_key=dedupe_key,
+                )
+            )
+            s.flush()
+
+    with pytest.raises(IntegrityError):
+        insert_duplicate_live_job()
 
 
 def test_run_unknown_kind_marks_failed(engine: Engine) -> None:

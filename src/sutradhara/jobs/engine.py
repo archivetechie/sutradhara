@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.leases import LeaseManager, normalize_required_resources
-from sutradhara.jobs.models import TERMINAL_STATUSES, Job, JobStatus
+from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, TERMINAL_STATUSES, Job, JobStatus
 from sutradhara.jobs.registry import (
     HandlerNotRegistered,
     JobContext,
@@ -47,7 +47,13 @@ def submit(
     """
     if dedupe_key is not None:
         existing = session.scalars(
-            select(Job).where(Job.dedupe_key == dedupe_key).order_by(Job.id).limit(1)
+            select(Job)
+            .where(
+                Job.dedupe_key == dedupe_key,
+                Job.status.in_(LIVE_JOB_STATUS_VALUES),
+            )
+            .order_by(Job.id)
+            .limit(1)
         ).one_or_none()
         if existing is not None:
             return existing

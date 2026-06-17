@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     DateTime,
+    Index,
     Integer,
     String,
     Text,
@@ -38,6 +39,8 @@ class JobStatus(StrEnum):
 
 # Terminal states — no further status transitions allowed.
 TERMINAL_STATUSES = frozenset({JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED})
+LIVE_JOB_STATUSES = (JobStatus.PENDING, JobStatus.RUNNING, JobStatus.QUEUED)
+LIVE_JOB_STATUS_VALUES = tuple(status.value for status in LIVE_JOB_STATUSES)
 
 
 class Job(Base):
@@ -75,7 +78,7 @@ class Job(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow, index=True
     )
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    dedupe_key: Mapped[str | None] = mapped_column(String(256), nullable=True, unique=True)
+    dedupe_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # Free-form on failure. Structured detail belongs in step_state /
     # the audit log (which doesn't exist yet — TODO once Sutradhara audit
@@ -90,3 +93,12 @@ class Job(Base):
 
     def __repr__(self) -> str:
         return f"<Job id={self.id} kind={self.kind!r} status={self.status}>"
+
+
+Index(
+    "uq_job_dedupe_key_live",
+    Job.dedupe_key,
+    unique=True,
+    sqlite_where=Job.status.in_(LIVE_JOB_STATUS_VALUES),
+    postgresql_where=Job.status.in_(LIVE_JOB_STATUS_VALUES),
+)
