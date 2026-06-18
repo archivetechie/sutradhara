@@ -81,6 +81,7 @@ def test_help_lists_subcommands(cli_env: dict[str, str]) -> None:
         "admin",
         "archive",
         "review",
+        "receive",
         "worker",
     ):
         assert cmd in result.output

@@ -9,13 +9,11 @@ a bad manifest quarantines the intake and leaves zero `ingest_item` rows.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
-from xml.etree import ElementTree as ET
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -35,6 +33,13 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job
+from sutradhara.receive import (
+    FileReceipt,
+    hash_payload_tree,
+    manifest_mismatch,
+    read_manifest_sha256,
+    sha256_file,
+)
 
 VIDEO_EXTENSIONS = {
     ".3gp",
@@ -67,18 +72,7 @@ IMAGE_EXTENSIONS = {
 DOCUMENT_EXTENSIONS = {".csv", ".doc", ".docx", ".json", ".pdf", ".txt", ".xml"}
 
 
-@dataclass(frozen=True)
-class PayloadRecord:
-    path: Path
-    relpath: str
-    sha256_hex: str
-    size_bytes: int
-    st_dev: int | None
-    st_ino: int | None
-
-    @property
-    def sha256_bytes(self) -> bytes:
-        return bytes.fromhex(self.sha256_hex)
+PayloadRecord = FileReceipt
 
 
 @dataclass
@@ -200,6 +194,29 @@ def scan_intake(
     records = _hash_payload(payload_root)
     actual = {record.relpath: record.sha256_hex for record in records}
     if manifest_path is not None:
+        manifest_file_mismatch = _manifest_file_mismatch(sentinel, manifest_path)
+        if manifest_file_mismatch:
+            intake = _upsert_intake(
+                session,
+                intake_id=intake_id,
+                sentinel=sentinel,
+                manifest_path=manifest_path,
+                status=IntakeStatus.QUARANTINED,
+            )
+            _write_quarantine_receipt(
+                root,
+                intake,
+                manifest_file_mismatch,
+                reason="manifest-sha256-mismatch",
+            )
+            return IntakeScanOutcome(
+                intake_id=intake_id,
+                path=root,
+                status=IntakeStatus.QUARANTINED.value,
+                reason="manifest-sha256-mismatch",
+                manifest_path=manifest_path,
+                details=manifest_file_mismatch,
+            )
         expected = read_manifest_sha256(manifest_path)
         mismatch = _manifest_mismatch(actual, expected)
         if mismatch:
@@ -257,23 +274,6 @@ def scan_intake(
         jobs_submitted=submitted,
         manifest_path=manifest_path,
     )
-
-
-def read_manifest_sha256(path: str | Path) -> dict[str, str]:
-    """Read a manifest and return POSIX relative path -> SHA-256 hex.
-
-    Supports a strict JSON shape for tests and a permissive ASC MHL XML reader
-    that only accepts entries carrying a SHA-256 value. Other hashes never
-    substitute for SHA-256.
-    """
-
-    manifest = Path(path)
-    if manifest.suffix.lower() == ".json":
-        return _read_json_manifest(manifest)
-    try:
-        return _read_xml_manifest(manifest)
-    except ET.ParseError as exc:
-        raise ValueError(f"manifest {manifest} is not valid XML") from exc
 
 
 def _enqueue_missing_jobs(
@@ -446,7 +446,7 @@ def _register_payload_record(
         )
     ).one_or_none()
     metadata = {
-        "source_path": str(record.path),
+        "source_path": str(record.source_path),
         "payload_root": str(payload_root),
         "sha256": record.sha256_hex,
     }
@@ -475,29 +475,7 @@ def _register_payload_record(
 
 
 def _hash_payload(payload_root: Path) -> list[PayloadRecord]:
-    records: list[PayloadRecord] = []
-    for path in sorted(p for p in payload_root.rglob("*") if p.is_file()):
-        relpath = path.relative_to(payload_root).as_posix()
-        stat = path.stat()
-        records.append(
-            PayloadRecord(
-                path=path,
-                relpath=relpath,
-                sha256_hex=_sha256_file(path),
-                size_bytes=stat.st_size,
-                st_dev=getattr(stat, "st_dev", None),
-                st_ino=getattr(stat, "st_ino", None),
-            )
-        )
-    return records
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return hash_payload_tree(payload_root)
 
 
 def _find_manifest(intake_dir: Path) -> Path | None:
@@ -514,120 +492,19 @@ def _find_manifest(intake_dir: Path) -> Path | None:
 
 
 def _manifest_mismatch(actual: dict[str, str], expected: dict[str, str]) -> dict[str, Any]:
-    missing = sorted(path for path in actual if path not in expected)
-    extra = sorted(path for path in expected if path not in actual)
-    mismatched = [
-        {
-            "path": path,
-            "expected": expected[path],
-            "actual": actual[path],
-        }
-        for path in sorted(actual.keys() & expected.keys())
-        if actual[path].lower() != expected[path].lower()
-    ]
-    if not missing and not extra and not mismatched and expected:
+    return manifest_mismatch(actual, expected)
+
+
+def _manifest_file_mismatch(sentinel: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
+    expected = sentinel.get("manifest_sha256")
+    if expected is None:
         return {}
-    if not expected:
-        return {
-            "reason": "manifest-has-no-sha256",
-            "missing": sorted(actual),
-            "extra": [],
-            "mismatched": [],
-        }
-    return {"missing": missing, "extra": extra, "mismatched": mismatched}
-
-
-def _read_json_manifest(path: Path) -> dict[str, str]:
-    data = _read_json(path)
-    records: dict[str, str] = {}
-    if isinstance(data.get("files"), dict):
-        for relpath, digest in data["files"].items():
-            _add_manifest_record(records, str(relpath), str(digest))
-    elif isinstance(data.get("files"), list):
-        for entry in data["files"]:
-            if not isinstance(entry, dict):
-                continue
-            relpath = entry.get("path") or entry.get("file") or entry.get("relative_path")
-            digest = entry.get("sha256") or entry.get("sha256_hex")
-            if relpath is not None and digest is not None:
-                _add_manifest_record(records, str(relpath), str(digest))
-    else:
-        for relpath, digest in data.items():
-            if isinstance(digest, str):
-                _add_manifest_record(records, str(relpath), digest)
-    return records
-
-
-def _read_xml_manifest(path: Path) -> dict[str, str]:
-    root = ET.parse(path).getroot()
-    records: dict[str, str] = {}
-    for element in root.iter():
-        children = list(element)
-        if not children:
-            continue
-        paths = [
-            _normalize_manifest_path(child.text or "") for child in children if _is_path_tag(child)
-        ]
-        shas = [_manifest_sha_from_element(child) for child in children]
-        sha_values = [sha for sha in shas if sha is not None]
-        if paths and sha_values:
-            _add_manifest_record(records, paths[0], sha_values[0])
-    return records
-
-
-def _is_path_tag(element: ET.Element[str]) -> bool:
-    name = _local_name(element.tag)
-    return name in {"file", "filename", "path", "relativepath", "relative_path"}
-
-
-def _manifest_sha_from_element(element: ET.Element[str]) -> str | None:
-    name = _local_name(element.tag)
-    text = (element.text or "").strip()
-    attr_text = " ".join(str(v).lower() for v in element.attrib.values())
-    if name in {"sha256", "sha-256"} and _is_sha256_hex(text):
-        return text.lower()
-    if name == "hash" and "sha256" in attr_text and _is_sha256_hex(text):
-        return text.lower()
-    for key in ("sha256", "sha-256"):
-        value = element.attrib.get(key)
-        if value and _is_sha256_hex(value):
-            return value.lower()
-    if "sha256" in attr_text:
-        for value in element.attrib.values():
-            if _is_sha256_hex(str(value)):
-                return str(value).lower()
-    return None
-
-
-def _add_manifest_record(records: dict[str, str], raw_path: str, digest: str) -> None:
-    relpath = _normalize_manifest_path(raw_path)
-    if not relpath or not _is_sha256_hex(digest):
-        return
-    records[relpath] = digest.lower()
-
-
-def _normalize_manifest_path(raw: str) -> str:
-    value = raw.strip().replace("\\", "/")
-    while value.startswith("./"):
-        value = value[2:]
-    value = value.lstrip("/")
-    if value.startswith("payload/"):
-        value = value[len("payload/") :]
-    return PurePosixPath(value).as_posix() if value else ""
-
-
-def _is_sha256_hex(value: str) -> bool:
-    if len(value) != 64:
-        return False
-    try:
-        bytes.fromhex(value)
-    except ValueError:
-        return False
-    return True
-
-
-def _local_name(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1].lower().replace("-", "_")
+    if not isinstance(expected, str) or len(expected) != 64:
+        return {"expected": expected, "actual": None}
+    actual = sha256_file(manifest_path)
+    if actual.lower() == expected.lower():
+        return {}
+    return {"expected": expected.lower(), "actual": actual}
 
 
 def _media_kind_for_path(path: str) -> MediaKind:
@@ -694,13 +571,15 @@ def _write_quarantine_receipt(
     intake_dir: Path,
     intake: Intake,
     mismatch: dict[str, Any],
+    *,
+    reason: str = "manifest-mismatch",
 ) -> None:
     payload = {
         "intake_id": intake.intake_id,
         "status": IntakeStatus.QUARANTINED.value,
         "quarantined_at": intake.quarantined_at.isoformat() if intake.quarantined_at else None,
         "manifest_path": intake.manifest_path,
-        "reason": "manifest-mismatch",
+        "reason": reason,
         "details": mismatch,
     }
     _write_json(intake_dir / "intake.quarantined.json", payload)

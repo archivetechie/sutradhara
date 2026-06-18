@@ -1,0 +1,66 @@
+"""Dependency-light front-door receive core.
+
+The receive package owns the filesystem contract for Sutradhara's first-contact
+intake path: canonical member names, ASC-MHL manifests, atomic landing writes,
+resume state, and server marker polling. It deliberately has no catalog,
+backend, Remanence, or database dependencies so the same code can run on edge
+clients and inside the server-side intake verifier.
+"""
+
+from sutradhara.receive.core import (
+    CANONICALIZATION_VERSION,
+    RECEIVE_VERSION,
+    AtomicWriteObserver,
+    CollisionError,
+    ConfirmationResult,
+    DestinationVerificationError,
+    FileReceipt,
+    OrphanSweepResult,
+    ReceiveError,
+    ReceiveResult,
+    RejectedEntry,
+    SourceMutationError,
+    SourceScanError,
+    canonicalize_filesystem_path,
+    canonicalize_manifest_path,
+    hash_payload_tree,
+    manifest_mismatch,
+    manifest_text,
+    read_manifest_sha256,
+    receive_source,
+    safe_payload_path,
+    sha256_file,
+    slug_operator,
+    sweep_orphans,
+    wait_for_server_confirmation,
+    write_mhl_manifest,
+)
+
+__all__ = [
+    "CANONICALIZATION_VERSION",
+    "RECEIVE_VERSION",
+    "AtomicWriteObserver",
+    "CollisionError",
+    "ConfirmationResult",
+    "DestinationVerificationError",
+    "FileReceipt",
+    "OrphanSweepResult",
+    "ReceiveError",
+    "ReceiveResult",
+    "RejectedEntry",
+    "SourceMutationError",
+    "SourceScanError",
+    "canonicalize_filesystem_path",
+    "canonicalize_manifest_path",
+    "hash_payload_tree",
+    "manifest_mismatch",
+    "manifest_text",
+    "read_manifest_sha256",
+    "receive_source",
+    "safe_payload_path",
+    "sha256_file",
+    "slug_operator",
+    "sweep_orphans",
+    "wait_for_server_confirmation",
+    "write_mhl_manifest",
+]
