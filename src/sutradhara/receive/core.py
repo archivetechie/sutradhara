@@ -2,7 +2,7 @@
 
 This module is shared by edge-side `sutra receive` and server-side `intake scan`.
 It keeps the contract-critical parts in one dependency-light place: canonical
-member paths, ASC-MHL manifests, safe payload paths, atomic writes, resumable
+member paths, BagIt manifests, safe payload paths, atomic writes, resumable
 landing directories, source quiescence checks, and server release markers.
 """
 
@@ -23,12 +23,19 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
-from xml.etree import ElementTree as ET
 
 from sutradhara.member_name import MemberNameError, escape_member_name, unescape_member_name
 
-RECEIVE_VERSION = "receive-v1"
-CANONICALIZATION_VERSION = "receive-path-v1"
+RECEIVE_VERSION = "receive-v2"
+CANONICALIZATION_VERSION = "receive-bagit-path-v2"
+BAG_PROFILE = "bagit-1.0"
+BAGIT_TEXT = "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n"
+DATA_DIR_NAME = "data"
+MANIFEST_NAME = "manifest-sha256.txt"
+BAG_INFO_NAME = "bag-info.txt"
+BAGIT_NAME = "bagit.txt"
+TAGMANIFEST_NAME = "tagmanifest-sha256.txt"
+_BAG_TAG_FILES = (BAGIT_NAME, BAG_INFO_NAME, MANIFEST_NAME)
 _COPY_BUFFER_BYTES = 1024 * 1024
 _DEFAULT_ORPHAN_AGE = dt.timedelta(hours=24)
 
@@ -96,11 +103,67 @@ class ReceiveResult:
     intake_id: str
     intake_dir: Path
     manifest_path: Path
+    bag_info_path: Path
+    tagmanifest_path: Path
     sentinel_path: Path
     file_count: int
     total_bytes: int
     skipped_count: int
-    manifest_sha256: str
+    bag_profile: str
+
+
+@dataclass(frozen=True)
+class BagWriteResult:
+    """BagIt tag files written for a completed receive."""
+
+    manifest_path: Path
+    bag_info_path: Path
+    tagmanifest_path: Path
+
+
+@dataclass(frozen=True)
+class BagValidationResult:
+    """Completeness and validity evidence for an intake BagIt bag."""
+
+    bag_root: Path
+    data_root: Path
+    metadata: dict[str, str]
+    manifest: dict[str, str]
+    actual: dict[str, str]
+    actual_records: tuple[FileReceipt, ...]
+    missing: list[str]
+    extra: list[str]
+    mismatched: list[dict[str, str]]
+    tag_mismatched: list[dict[str, str | None]]
+    errors: list[str]
+
+    @property
+    def complete(self) -> bool:
+        """True when manifest and payload inventory agree exactly."""
+
+        return (
+            not self.missing
+            and not self.extra
+            and not any(error.startswith("complete:") for error in self.errors)
+        )
+
+    @property
+    def valid(self) -> bool:
+        """True when the bag is complete and all payload/tag checksums verify."""
+
+        return self.complete and not self.mismatched and not self.tag_mismatched and not self.errors
+
+    def details(self) -> dict[str, Any]:
+        """Return a quarantine-ready detail dictionary."""
+
+        payload: dict[str, Any] = {
+            "missing": self.missing,
+            "extra": self.extra,
+            "mismatched": self.mismatched,
+            "tag_mismatched": self.tag_mismatched,
+            "errors": self.errors,
+        }
+        return {key: value for key, value in payload.items() if value}
 
 
 @dataclass(frozen=True)
@@ -201,20 +264,26 @@ def receive_source(
         label = _optional_str(receiving.get("label"))
         events.append(f"resumed intake {intake_id} from {source_root}")
 
-    payload_root = intake_dir / "payload"
+    data_root = intake_dir / DATA_DIR_NAME
     try:
         regulars, rejected = _scan_source(source_root)
         _check_collisions(regulars)
-        payload_root.mkdir(parents=True, exist_ok=True)
-        _fsync_dir(payload_root)
+        data_root.mkdir(parents=True, exist_ok=True)
+        _fsync_dir(data_root)
+        if resume is not None:
+            _prune_stale_payload_files(
+                data_root,
+                desired_relpaths={entry.relpath for entry in regulars},
+                events=events,
+            )
         receipts = _copy_or_verify_entries(
             regulars,
-            payload_root=payload_root,
+            payload_root=data_root,
             observer=atomic_observer,
             events=events,
         )
         if after_copy_hook is not None:
-            after_copy_hook(payload_root, receipts)
+            after_copy_hook(data_root, receipts)
         _verify_destination_files(receipts)
         entries = {receipt.relpath: receipt.sha256_hex for receipt in receipts}
         total_bytes = sum(receipt.size_bytes for receipt in receipts)
@@ -225,27 +294,28 @@ def receive_source(
         )
         _write_receive_log(intake_dir / "receive.log", events, observer=atomic_observer)
 
-        manifest_path = intake_dir / "manifest.mhl"
-        _atomic_write_text(
-            manifest_path,
-            manifest_text(entries),
+        bag_files = write_bagit_files(
+            intake_dir,
+            entries=entries,
+            metadata=bag_info_metadata(
+                intake_id=intake_id,
+                source_kind=source_kind,
+                operator=operator,
+                source_ref=source_ref,
+                artifactclass=artifactclass,
+                label=label,
+                started_at=started_at,
+                file_count=len(receipts),
+                total_bytes=total_bytes,
+                skipped_count=len(rejected),
+            ),
             observer=atomic_observer,
         )
-        manifest_digest = sha256_file(manifest_path)
         sentinel = {
             "intake_id": intake_id,
-            "operator": operator,
-            "source_kind": source_kind,
-            "source_ref": source_ref,
-            "artifactclass": artifactclass,
-            "label": label,
+            "status": "complete",
+            "bag_profile": BAG_PROFILE,
             "created_at": started_at.isoformat(),
-            "receive_version": RECEIVE_VERSION,
-            "canonicalization_version": CANONICALIZATION_VERSION,
-            "manifest_sha256": manifest_digest,
-            "file_count": len(receipts),
-            "total_bytes": total_bytes,
-            "skipped_count": len(rejected),
         }
         _atomic_write_json(intake_dir / "intake.json", sentinel, observer=atomic_observer)
         _fsync_dir(intake_dir)
@@ -255,12 +325,14 @@ def receive_source(
         return ReceiveResult(
             intake_id=intake_id,
             intake_dir=intake_dir,
-            manifest_path=manifest_path,
+            manifest_path=bag_files.manifest_path,
+            bag_info_path=bag_files.bag_info_path,
+            tagmanifest_path=bag_files.tagmanifest_path,
             sentinel_path=intake_dir / "intake.json",
             file_count=len(receipts),
             total_bytes=total_bytes,
             skipped_count=len(rejected),
-            manifest_sha256=manifest_digest,
+            bag_profile=BAG_PROFILE,
         )
     except ReceiveError as exc:
         events.append(f"failed: {exc}")
@@ -335,9 +407,21 @@ def hash_payload_tree(payload_root: Path | str) -> list[FileReceipt]:
 
     root = Path(payload_root)
     receipts: list[FileReceipt] = []
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+    for path in sorted(root.rglob("*")):
         relpath = canonicalize_filesystem_path(path, root)
-        stat_result = path.stat()
+        try:
+            stat_result = path.lstat()
+        except FileNotFoundError as exc:
+            raise SourceScanError(f"payload entry disappeared during hash: {path}") from exc
+        if stat.S_ISDIR(stat_result.st_mode):
+            continue
+        if stat.S_ISLNK(stat_result.st_mode):
+            raise ReceiveError(f"payload contains unsupported symlink: {relpath}")
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ReceiveError(
+                f"payload contains unsupported {_special_file_reason(stat_result.st_mode)}: "
+                f"{relpath}"
+            )
         receipts.append(
             FileReceipt(
                 source_path=path,
@@ -354,38 +438,206 @@ def hash_payload_tree(payload_root: Path | str) -> list[FileReceipt]:
 
 
 def read_manifest_sha256(path: str | Path) -> dict[str, str]:
-    """Read JSON or ASC-MHL and return canonical POSIX relpath -> SHA-256 hex."""
+    """Read BagIt `manifest-sha256.txt` as canonical relpath -> SHA-256 hex.
 
-    manifest = Path(path)
-    if manifest.suffix.lower() == ".json":
-        return _read_json_manifest(manifest)
-    try:
-        return _read_xml_manifest(manifest)
-    except ET.ParseError as exc:
-        raise ValueError(f"manifest {manifest} is not valid XML") from exc
+    Paths are serialized as BagIt bag-relative POSIX paths under `data/`. The
+    BagIt RFC 8493 percent layer is reversed first (`%25`, `%0D`, `%0A`), then the
+    receive member-name canonicalization is applied.
+    """
 
-
-def write_mhl_manifest(path: str | Path, entries: Mapping[str, str]) -> str:
-    """Write an ASC-MHL XML manifest and return its SHA-256 digest."""
-
-    destination = Path(path)
-    _atomic_write_text(destination, manifest_text(entries))
-    return sha256_file(destination)
+    return _read_checksum_manifest(Path(path), payload_manifest=True)
 
 
-def manifest_text(entries: Mapping[str, str]) -> str:
-    """Return deterministic ASC-MHL XML text for canonical relpath digests."""
+def read_bag_info(path: str | Path) -> dict[str, str]:
+    """Read a BagIt `bag-info.txt` file into a label dictionary."""
 
-    root = ET.Element("hashlist")
+    result: dict[str, str] = {}
+    current_key: str | None = None
+    for line_number, raw_line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        if not raw_line:
+            continue
+        if raw_line[0].isspace() and current_key is not None:
+            result[current_key] = f"{result[current_key]}\n{raw_line.strip()}"
+            continue
+        if ":" not in raw_line:
+            raise ReceiveError(f"invalid bag-info line {line_number}: {raw_line!r}")
+        key, value = raw_line.split(":", 1)
+        key = key.strip()
+        if not key:
+            raise ReceiveError(f"invalid empty bag-info label at line {line_number}")
+        result[key] = value.strip()
+        current_key = key
+    return result
+
+
+def bag_info_metadata(
+    *,
+    intake_id: str,
+    source_kind: str,
+    operator: str,
+    source_ref: str | None,
+    artifactclass: str,
+    label: str | None,
+    started_at: dt.datetime,
+    file_count: int,
+    total_bytes: int,
+    skipped_count: int,
+) -> dict[str, str]:
+    """Return the BagIt metadata labels that are authoritative for intake."""
+
+    return {
+        "Bagging-Date": started_at.date().isoformat(),
+        "Payload-Oxum": f"{total_bytes}.{file_count}",
+        "Bag-Software-Agent": f"sutradhara-receive/{RECEIVE_VERSION}",
+        "Intake-Id": intake_id,
+        "Operator": operator,
+        "Source-Kind": source_kind,
+        "Source-Ref": source_ref or "",
+        "Artifactclass": artifactclass,
+        "Label": label or "",
+        "Canonicalization-Version": CANONICALIZATION_VERSION,
+        "Skipped-Count": str(skipped_count),
+    }
+
+
+def write_bagit_files(
+    bag_root: Path | str,
+    *,
+    entries: Mapping[str, str],
+    metadata: Mapping[str, str],
+    observer: AtomicWriteObserver | None = None,
+) -> BagWriteResult:
+    """Write BagIt tag files for a completed receive and return their paths."""
+
+    root = Path(bag_root)
+    manifest_path = root / MANIFEST_NAME
+    bag_info_path = root / BAG_INFO_NAME
+    bagit_path = root / BAGIT_NAME
+    tagmanifest_path = root / TAGMANIFEST_NAME
+    _atomic_write_text(bagit_path, BAGIT_TEXT, observer=observer)
+    _atomic_write_text(bag_info_path, bag_info_text(metadata), observer=observer)
+    _atomic_write_text(manifest_path, bagit_manifest_text(entries), observer=observer)
+    _atomic_write_text(
+        tagmanifest_path,
+        tagmanifest_text(root, _BAG_TAG_FILES),
+        observer=observer,
+    )
+    return BagWriteResult(
+        manifest_path=manifest_path,
+        bag_info_path=bag_info_path,
+        tagmanifest_path=tagmanifest_path,
+    )
+
+
+def bagit_manifest_text(entries: Mapping[str, str]) -> str:
+    """Return deterministic BagIt `manifest-sha256.txt` text."""
+
+    lines = []
     for relpath in sorted(entries):
         digest = entries[relpath].lower()
-        item = ET.SubElement(root, "hash")
-        file_el = ET.SubElement(item, "file")
-        file_el.text = f"payload/{canonicalize_manifest_path(relpath)}"
-        sha_el = ET.SubElement(item, "sha256")
-        sha_el.text = digest
-    _indent_xml(root)
-    return ET.tostring(root, encoding="unicode") + "\n"
+        if not _is_sha256_hex(digest):
+            raise ReceiveError(f"invalid sha256 for {relpath!r}: {entries[relpath]!r}")
+        canonical = canonicalize_manifest_path(relpath)
+        lines.append(f"{digest}  {_encode_bagit_path(f'{DATA_DIR_NAME}/{canonical}')}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def bag_info_text(metadata: Mapping[str, str]) -> str:
+    """Return deterministic BagIt `bag-info.txt` text for intake metadata."""
+
+    order = [
+        "Bagging-Date",
+        "Payload-Oxum",
+        "Bag-Software-Agent",
+        "Intake-Id",
+        "Operator",
+        "Source-Kind",
+        "Source-Ref",
+        "Artifactclass",
+        "Label",
+        "Canonicalization-Version",
+        "Skipped-Count",
+    ]
+    lines: list[str] = []
+    for key in order:
+        if key in metadata:
+            lines.append(f"{key}: {_bag_info_value(metadata[key])}")
+    for key in sorted(set(metadata) - set(order)):
+        lines.append(f"{key}: {_bag_info_value(metadata[key])}")
+    return "\n".join(lines) + "\n"
+
+
+def tagmanifest_text(bag_root: Path | str, tag_files: Iterable[str]) -> str:
+    """Return deterministic BagIt `tagmanifest-sha256.txt` text."""
+
+    root = Path(bag_root)
+    lines = []
+    for relpath in sorted(tag_files):
+        path = root / relpath
+        lines.append(f"{sha256_file(path)}  {_encode_bagit_path(relpath)}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def validate_bag(bag_root: Path | str) -> BagValidationResult:
+    """Validate BagIt completeness and checksum validity for an intake bag."""
+
+    root = Path(bag_root)
+    data_root = root / DATA_DIR_NAME
+    errors: list[str] = []
+    metadata: dict[str, str] = {}
+    manifest: dict[str, str] = {}
+    actual_records: tuple[FileReceipt, ...] = ()
+    if not data_root.is_dir():
+        errors.append(f"complete: missing {DATA_DIR_NAME}/ directory")
+    else:
+        try:
+            actual_records = tuple(hash_payload_tree(data_root))
+        except ReceiveError as exc:
+            errors.append(f"complete: cannot hash {DATA_DIR_NAME}/: {exc}")
+    actual = {record.relpath: record.sha256_hex for record in actual_records}
+
+    try:
+        manifest = read_manifest_sha256(root / MANIFEST_NAME)
+    except (OSError, ReceiveError, ValueError) as exc:
+        errors.append(f"complete: cannot read {MANIFEST_NAME}: {exc}")
+
+    try:
+        metadata = read_bag_info(root / BAG_INFO_NAME)
+    except (OSError, ReceiveError, ValueError) as exc:
+        errors.append(f"cannot read {BAG_INFO_NAME}: {exc}")
+
+    mismatch = manifest_mismatch(actual, manifest)
+    missing = list(mismatch.get("missing", []))
+    extra = list(mismatch.get("extra", []))
+    mismatched = list(mismatch.get("mismatched", []))
+    if metadata:
+        oxum = metadata.get("Payload-Oxum")
+        expected_oxum = (
+            f"{sum(record.size_bytes for record in actual_records)}.{len(actual_records)}"
+        )
+        if oxum != expected_oxum:
+            errors.append(f"Payload-Oxum mismatch: expected {expected_oxum}, actual {oxum!r}")
+        if metadata.get("Canonicalization-Version") != CANONICALIZATION_VERSION:
+            errors.append(
+                "Canonicalization-Version mismatch: "
+                f"expected {CANONICALIZATION_VERSION}, "
+                f"actual {metadata.get('Canonicalization-Version')!r}"
+            )
+
+    tag_mismatched = _verify_tagmanifest(root)
+    return BagValidationResult(
+        bag_root=root,
+        data_root=data_root,
+        metadata=metadata,
+        manifest=manifest,
+        actual=actual,
+        actual_records=actual_records,
+        missing=missing,
+        extra=extra,
+        mismatched=mismatched,
+        tag_mismatched=tag_mismatched,
+        errors=errors,
+    )
 
 
 def manifest_mismatch(actual: Mapping[str, str], expected: Mapping[str, str]) -> dict[str, Any]:
@@ -397,8 +649,8 @@ def manifest_mismatch(actual: Mapping[str, str], expected: Mapping[str, str]) ->
     expected_canonical = {
         canonicalize_manifest_path(path): digest.lower() for path, digest in expected.items()
     }
-    missing = sorted(path for path in actual_canonical if path not in expected_canonical)
-    extra = sorted(path for path in expected_canonical if path not in actual_canonical)
+    missing = sorted(path for path in expected_canonical if path not in actual_canonical)
+    extra = sorted(path for path in actual_canonical if path not in expected_canonical)
     mismatched = [
         {
             "path": path,
@@ -413,8 +665,8 @@ def manifest_mismatch(actual: Mapping[str, str], expected: Mapping[str, str]) ->
     if not expected_canonical:
         return {
             "reason": "manifest-has-no-sha256",
-            "missing": sorted(actual_canonical),
-            "extra": [],
+            "missing": [],
+            "extra": sorted(actual_canonical),
             "mismatched": [],
         }
     return {"missing": missing, "extra": extra, "mismatched": mismatched}
@@ -435,14 +687,124 @@ def canonicalize_filesystem_path(path: Path | str, root: Path | str) -> str:
 def canonicalize_manifest_path(raw: str) -> str:
     """Canonicalize a manifest path into the shared receive member-name form."""
 
-    value = raw.strip()
+    value = raw
     while value.startswith("./"):
         value = value[2:]
     value = value.lstrip("/")
-    if value.startswith("payload/"):
-        value = value[len("payload/") :]
+    if value.startswith(f"{DATA_DIR_NAME}/"):
+        value = value[len(f"{DATA_DIR_NAME}/") :]
     pure = PurePosixPath(value)
     return _canonicalize_parts(pure.parts, from_filesystem=False)
+
+
+def _read_checksum_manifest(path: Path, *, payload_manifest: bool) -> dict[str, str]:
+    records: dict[str, str] = {}
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not raw_line:
+            continue
+        if len(raw_line) < 66:
+            raise ReceiveError(f"invalid checksum line {line_number} in {path}")
+        digest = raw_line[:64].lower()
+        index = 64
+        if raw_line[index] not in {" ", "\t"}:
+            raise ReceiveError(f"invalid checksum separator at line {line_number} in {path}")
+        while index < len(raw_line) and raw_line[index] in {" ", "\t"}:
+            index += 1
+        encoded_path = raw_line[index:]
+        if not encoded_path:
+            raise ReceiveError(f"missing checksum path at line {line_number} in {path}")
+        if not _is_sha256_hex(digest):
+            raise ReceiveError(f"invalid sha256 at line {line_number} in {path}")
+        decoded_path = _decode_bagit_path(encoded_path)
+        if payload_manifest:
+            relpath = _canonicalize_payload_manifest_path(decoded_path)
+            records[relpath] = digest
+        else:
+            records[PurePosixPath(decoded_path).as_posix()] = digest
+    return records
+
+
+def _canonicalize_payload_manifest_path(decoded_path: str) -> str:
+    value = decoded_path
+    while value.startswith("./"):
+        value = value[2:]
+    if PurePosixPath(value).is_absolute():
+        raise ReceiveError(f"payload manifest path must be relative: {decoded_path!r}")
+    if not value.startswith(f"{DATA_DIR_NAME}/"):
+        raise ReceiveError(
+            f"payload manifest path must start with {DATA_DIR_NAME}/: {decoded_path!r}"
+        )
+    return canonicalize_manifest_path(value)
+
+
+def _verify_tagmanifest(root: Path) -> list[dict[str, str | None]]:
+    path = root / TAGMANIFEST_NAME
+    mismatched: list[dict[str, str | None]] = []
+    try:
+        expected = _read_checksum_manifest(path, payload_manifest=False)
+    except (OSError, ReceiveError, ValueError) as exc:
+        return [{"path": TAGMANIFEST_NAME, "expected": "readable", "actual": str(exc)}]
+
+    for relpath in _BAG_TAG_FILES:
+        if relpath not in expected:
+            mismatched.append({"path": relpath, "expected": "listed", "actual": None})
+
+    for relpath, expected_digest in sorted(expected.items()):
+        target = root / relpath
+        if not _is_safe_bag_relative_path(relpath):
+            mismatched.append(
+                {"path": relpath, "expected": expected_digest, "actual": "unsafe path"}
+            )
+            continue
+        if not target.is_file():
+            mismatched.append({"path": relpath, "expected": expected_digest, "actual": None})
+            continue
+        actual = sha256_file(target)
+        if actual != expected_digest:
+            mismatched.append({"path": relpath, "expected": expected_digest, "actual": actual})
+    return mismatched
+
+
+def _encode_bagit_path(path: str) -> str:
+    return path.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _decode_bagit_path(path: str) -> str:
+    output: list[str] = []
+    index = 0
+    while index < len(path):
+        char = path[index]
+        if char != "%":
+            output.append(char)
+            index += 1
+            continue
+        token = path[index + 1 : index + 3]
+        if len(token) != 2:
+            raise ReceiveError(f"invalid BagIt percent escape in path: {path!r}")
+        normalized = token.upper()
+        if normalized == "25":
+            output.append("%")
+        elif normalized == "0D":
+            output.append("\r")
+        elif normalized == "0A":
+            output.append("\n")
+        else:
+            raise ReceiveError(f"unsupported BagIt percent escape %{token} in path: {path!r}")
+        index += 3
+    return "".join(output)
+
+
+def _bag_info_value(value: object) -> str:
+    return str(value).replace("\r", " ").replace("\n", " ")
+
+
+def _is_safe_bag_relative_path(relpath: str) -> bool:
+    pure = PurePosixPath(relpath)
+    return (
+        bool(pure.parts)
+        and not pure.is_absolute()
+        and all(part not in {"", ".", ".."} for part in pure.parts)
+    )
 
 
 def slug_operator(operator: str) -> str:
@@ -539,7 +901,15 @@ def _copy_or_verify_entries(
         destination = safe_payload_path(payload_root, entry.relpath)
         source_digest, snapshot = _hash_source_with_stat_guard(entry.source_path)
         copied = True
-        if destination.exists():
+        existing_mode = _existing_destination_mode(destination)
+        if existing_mode is not None:
+            if stat.S_ISLNK(existing_mode):
+                raise ReceiveError(f"payload destination is a symlink: {destination}")
+            if not stat.S_ISREG(existing_mode):
+                raise ReceiveError(
+                    f"payload destination is unsupported "
+                    f"{_special_file_reason(existing_mode)}: {destination}"
+                )
             destination_digest = sha256_file(destination)
             if destination_digest == source_digest:
                 copied = False
@@ -568,6 +938,51 @@ def _copy_or_verify_entries(
             )
         )
     return tuple(receipts)
+
+
+def _existing_destination_mode(path: Path) -> int | None:
+    try:
+        return path.lstat().st_mode
+    except FileNotFoundError:
+        return None
+
+
+def _prune_stale_payload_files(
+    payload_root: Path,
+    *,
+    desired_relpaths: set[str],
+    events: list[str],
+) -> None:
+    for path in _payload_paths_deepest_first(payload_root):
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(mode):
+            continue
+        relpath = canonicalize_filesystem_path(path, payload_root)
+        if relpath in desired_relpaths:
+            continue
+        path.unlink()
+        events.append(f"resume pruned stale {relpath}")
+    for path in _payload_paths_deepest_first(payload_root):
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(mode):
+            continue
+        with suppress(OSError):
+            path.rmdir()
+    _fsync_dir(payload_root)
+
+
+def _payload_paths_deepest_first(payload_root: Path) -> list[Path]:
+    return sorted(
+        payload_root.rglob("*"),
+        key=lambda item: len(item.relative_to(payload_root).parts),
+        reverse=True,
+    )
 
 
 def _copy_source_to_destination(
@@ -642,80 +1057,6 @@ def _raise_if_mutated(path: Path, before: _StatSnapshot, after: _StatSnapshot) -
         raise SourceMutationError(f"source changed during receive: {path}")
 
 
-def _read_json_manifest(path: Path) -> dict[str, str]:
-    data = _read_json(path)
-    records: dict[str, str] = {}
-    if isinstance(data.get("files"), dict):
-        for relpath, digest in data["files"].items():
-            _add_manifest_record(records, str(relpath), str(digest))
-    elif isinstance(data.get("files"), list):
-        for entry in data["files"]:
-            if not isinstance(entry, dict):
-                continue
-            relpath = entry.get("path") or entry.get("file") or entry.get("relative_path")
-            digest = entry.get("sha256") or entry.get("sha256_hex")
-            if relpath is not None and digest is not None:
-                _add_manifest_record(records, str(relpath), str(digest))
-    else:
-        for relpath, digest in data.items():
-            if isinstance(digest, str):
-                _add_manifest_record(records, str(relpath), digest)
-    return records
-
-
-def _read_xml_manifest(path: Path) -> dict[str, str]:
-    root = ET.parse(path).getroot()
-    records: dict[str, str] = {}
-    for element in root.iter():
-        children = list(element)
-        if not children:
-            continue
-        paths = [
-            canonicalize_manifest_path(child.text or "")
-            for child in children
-            if _is_path_tag(child)
-        ]
-        shas = [_manifest_sha_from_element(child) for child in children]
-        sha_values = [sha for sha in shas if sha is not None]
-        if paths and sha_values:
-            _add_manifest_record(records, paths[0], sha_values[0])
-    return records
-
-
-def _is_path_tag(element: ET.Element[str]) -> bool:
-    name = _local_name(element.tag)
-    return name in {"file", "filename", "path", "relativepath", "relative_path"}
-
-
-def _manifest_sha_from_element(element: ET.Element[str]) -> str | None:
-    name = _local_name(element.tag)
-    text = (element.text or "").strip()
-    attr_text = " ".join(str(v).lower() for v in element.attrib.values())
-    if name in {"sha256", "sha-256"} and _is_sha256_hex(text):
-        return text.lower()
-    if name == "hash" and "sha256" in attr_text and _is_sha256_hex(text):
-        return text.lower()
-    for key in ("sha256", "sha-256"):
-        value = element.attrib.get(key)
-        if value and _is_sha256_hex(value):
-            return value.lower()
-    if "sha256" in attr_text:
-        for value in element.attrib.values():
-            if _is_sha256_hex(str(value)):
-                return str(value).lower()
-    return None
-
-
-def _add_manifest_record(records: dict[str, str], raw_path: str, digest: str) -> None:
-    try:
-        relpath = canonicalize_manifest_path(raw_path)
-    except ReceiveError:
-        return
-    if not relpath or not _is_sha256_hex(digest):
-        return
-    records[relpath] = digest.lower()
-
-
 def _is_sha256_hex(value: str) -> bool:
     if len(value) != 64:
         return False
@@ -724,12 +1065,6 @@ def _is_sha256_hex(value: str) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _local_name(tag: str) -> str:
-    if "}" in tag:
-        tag = tag.rsplit("}", 1)[1]
-    return tag.lower().replace("-", "").replace("_", "")
 
 
 def _canonicalize_parts(parts: Iterable[str], *, from_filesystem: bool) -> str:
@@ -827,7 +1162,7 @@ def _validate_landing_relationship(source: Path, landing: Path) -> None:
 def _is_inside_existing_payload(path: Path) -> bool:
     candidates = (path, *path.parents)
     for candidate in candidates:
-        if candidate.name != "payload":
+        if candidate.name not in {DATA_DIR_NAME, "payload"}:
             continue
         parent = candidate.parent
         if (parent / "intake.json").exists() or (parent / ".receiving.json").exists():
@@ -933,16 +1268,3 @@ def _optional_str(value: object) -> str | None:
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
-
-
-def _indent_xml(element: ET.Element[str], level: int = 0) -> None:
-    indent = "\n" + level * "  "
-    if len(element):
-        if not element.text or not element.text.strip():
-            element.text = indent + "  "
-        for child in element:
-            _indent_xml(child, level + 1)
-        if not child.tail or not child.tail.strip():
-            child.tail = indent
-    if level and (not element.tail or not element.tail.strip()):
-        element.tail = indent

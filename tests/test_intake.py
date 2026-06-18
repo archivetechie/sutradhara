@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 from collections.abc import Iterator
@@ -15,6 +16,7 @@ from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.intake import scan_landing_root
 from sutradhara.jobs.models import Job
+from sutradhara.receive import BAG_PROFILE, bag_info_metadata, write_bagit_files
 
 
 @pytest.fixture
@@ -81,7 +83,7 @@ def test_scan_bad_manifest_quarantines_without_registration(
         outcomes = scan_landing_root(session, landing)
 
     assert outcomes[0].status == IntakeStatus.QUARANTINED.value
-    assert outcomes[0].reason == "manifest-mismatch"
+    assert outcomes[0].reason == "bag-invalid"
     assert (landing / "card-002" / "intake.quarantined.json").exists()
     with session_scope(engine) as session:
         intake = session.get(Intake, "card-002")
@@ -182,6 +184,8 @@ def _write_intake(
 ) -> Path:
     root = landing / intake_id
     payload = root / "payload"
+    if manifest:
+        payload = root / "data"
     payload.mkdir(parents=True)
     first_path: Path | None = None
     entries: dict[str, str] = {}
@@ -193,22 +197,35 @@ def _write_intake(
         entries[relpath] = hashlib.sha256(content).hexdigest()
 
     if manifest:
-        manifest_entries = entries.copy()
+        write_bagit_files(
+            root,
+            entries=entries,
+            metadata=bag_info_metadata(
+                intake_id=intake_id,
+                source_kind=source_kind,
+                operator="tester",
+                source_ref=None,
+                artifactclass="video-master",
+                label=intake_id,
+                started_at=dt.datetime(2026, 6, 18, tzinfo=dt.UTC),
+                file_count=len(entries),
+                total_bytes=sum(len(content) for content in files.values()),
+                skipped_count=0,
+            ),
+        )
         if corrupt_manifest:
-            first = next(iter(manifest_entries))
-            manifest_entries[first] = "0" * 64
-        _write_mhl(root / "manifest.mhl", manifest_entries)
+            first = next(iter(files))
+            (payload / first).write_bytes(b"corrupt payload")
 
     (root / "intake.json").write_text(
         json.dumps(
-            {
-                "intake_id": intake_id,
-                "operator": "tester",
-                "source_kind": source_kind,
-                "artifactclass": "video-master",
-                "label": intake_id,
-            },
+            _sentinel_payload(
+                intake_id,
+                source_kind=source_kind,
+                manifest=manifest,
+            ),
             indent=2,
+            sort_keys=True,
         ),
         encoding="utf-8",
     )
@@ -216,9 +233,18 @@ def _write_intake(
     return first_path
 
 
-def _write_mhl(path: Path, entries: dict[str, str]) -> None:
-    body = "\n".join(
-        f"  <hash><file>payload/{relpath}</file><sha256>{digest}</sha256></hash>"
-        for relpath, digest in entries.items()
-    )
-    path.write_text(f"<hashlist>\n{body}\n</hashlist>\n", encoding="utf-8")
+def _sentinel_payload(intake_id: str, *, source_kind: str, manifest: bool) -> dict[str, str]:
+    if manifest:
+        return {
+            "bag_profile": BAG_PROFILE,
+            "created_at": "2026-06-18T00:00:00+00:00",
+            "intake_id": intake_id,
+            "status": "complete",
+        }
+    return {
+        "intake_id": intake_id,
+        "operator": "tester",
+        "source_kind": source_kind,
+        "artifactclass": "video-master",
+        "label": intake_id,
+    }

@@ -1,4 +1,4 @@
-"""Front-door receive filesystem contract tests."""
+"""Front-door receive BagIt filesystem contract tests."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, func, select
 
 from sutradhara.catalog.models import IngestItem
 from sutradhara.catalog.session import create_all, make_engine, session_scope
@@ -22,6 +22,7 @@ from sutradhara.catalog.types import IntakeStatus
 from sutradhara.cli.main import cli
 from sutradhara.intake import scan_landing_root
 from sutradhara.receive import (
+    BAG_PROFILE,
     CANONICALIZATION_VERSION,
     RECEIVE_VERSION,
     AtomicWriteObserver,
@@ -29,14 +30,15 @@ from sutradhara.receive import (
     DestinationVerificationError,
     ReceiveError,
     SourceMutationError,
-    manifest_mismatch,
+    bag_info_metadata,
+    read_bag_info,
     read_manifest_sha256,
     receive_source,
     safe_payload_path,
-    sha256_file,
     sweep_orphans,
+    validate_bag,
     wait_for_server_confirmation,
-    write_mhl_manifest,
+    write_bagit_files,
 )
 from sutradhara.receive import core as receive_core
 
@@ -49,25 +51,76 @@ def engine() -> Iterator[Engine]:
     eng.dispose()
 
 
-def test_mhl_writer_round_trips_to_shared_reader(tmp_path: Path) -> None:
-    digest = hashlib.sha256(b"hello").hexdigest()
-    manifest = tmp_path / "manifest.mhl"
+def test_bagit_writer_round_trips_to_shared_reader_and_payload_oxum(tmp_path: Path) -> None:
+    bag = tmp_path / "bag"
+    data = bag / "data"
+    data.mkdir(parents=True)
+    payload = b"hello"
+    (data / "clip%.mov").write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
 
-    manifest_digest = write_mhl_manifest(manifest, {"clip.mov": digest})
-
-    assert manifest.read_text(encoding="utf-8") == (
-        "<hashlist>\n"
-        "  <hash>\n"
-        "    <file>payload/clip.mov</file>\n"
-        f"    <sha256>{digest}</sha256>\n"
-        "  </hash>\n"
-        "</hashlist>\n"
+    result = write_bagit_files(
+        bag,
+        entries={"clip%.mov": digest},
+        metadata=bag_info_metadata(
+            intake_id="bag-001",
+            source_kind="card",
+            operator="op",
+            source_ref="A001",
+            artifactclass="camera-original",
+            label="shoot",
+            started_at=dt.datetime(2026, 6, 18, tzinfo=dt.UTC),
+            file_count=1,
+            total_bytes=len(payload),
+            skipped_count=0,
+        ),
     )
-    assert sha256_file(manifest) == manifest_digest
-    assert read_manifest_sha256(manifest) == {"clip.mov": digest}
+
+    assert (bag / "bagit.txt").read_text(encoding="utf-8") == (
+        "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n"
+    )
+    assert result.manifest_path.read_text(encoding="utf-8") == (f"{digest}  data/clip%25.mov\n")
+    assert read_manifest_sha256(result.manifest_path) == {"clip%.mov": digest}
+    bag_info = read_bag_info(result.bag_info_path)
+    assert bag_info["Payload-Oxum"] == f"{len(payload)}.1"
+    validation = validate_bag(bag)
+    assert validation.complete is True
+    assert validation.valid is True
 
 
-def test_receive_writes_sentinel_last_and_manifest_digest(tmp_path: Path) -> None:
+def test_receive_output_passes_reference_bagit_validator_when_installed(tmp_path: Path) -> None:
+    bagit = pytest.importorskip("bagit")
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+
+    result = receive_source(source, landing=landing, source_kind="card", operator="op")
+
+    bagit.Bag(str(result.intake_dir)).validate()
+
+
+def test_validate_bag_rejects_payload_manifest_path_outside_data(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+    result = receive_source(source, landing=landing, source_kind="card", operator="op")
+    result.manifest_path.write_text(
+        result.manifest_path.read_text(encoding="utf-8").replace(
+            "data/clip.mov",
+            "clip.mov",
+        ),
+        encoding="utf-8",
+    )
+
+    validation = validate_bag(result.intake_dir)
+
+    assert validation.complete is False
+    assert any("must start with data/" in item for item in validation.errors)
+
+
+def test_receive_writes_slim_sentinel_last_and_bag_tags(tmp_path: Path) -> None:
     source = tmp_path / "source"
     landing = tmp_path / "landing"
     source.mkdir()
@@ -85,14 +138,20 @@ def test_receive_writes_sentinel_last_and_manifest_digest(tmp_path: Path) -> Non
     )
 
     sentinel = json.loads(result.sentinel_path.read_text(encoding="utf-8"))
-    assert sentinel["receive_version"] == RECEIVE_VERSION
-    assert sentinel["canonicalization_version"] == CANONICALIZATION_VERSION
-    assert sentinel["manifest_sha256"] == sha256_file(result.manifest_path)
-    assert sentinel["file_count"] == 1
-    assert sentinel["total_bytes"] == len(b"video")
+    assert sentinel == {
+        "bag_profile": BAG_PROFILE,
+        "created_at": sentinel["created_at"],
+        "intake_id": result.intake_id,
+        "status": "complete",
+    }
+    assert "manifest_sha256" not in sentinel
     assert not (result.intake_dir / ".receiving.json").exists()
     assert observer.intake_checked is True
     assert observer.destinations[-1].name == "intake.json"
+    bag_info = read_bag_info(result.bag_info_path)
+    assert bag_info["Bag-Software-Agent"] == f"sutradhara-receive/{RECEIVE_VERSION}"
+    assert bag_info["Canonicalization-Version"] == CANONICALIZATION_VERSION
+    assert bag_info["Payload-Oxum"] == f"{len(b'video')}.1"
     assert read_manifest_sha256(result.manifest_path) == {
         "clip.mov": hashlib.sha256(b"video").hexdigest()
     }
@@ -109,7 +168,7 @@ def test_receive_rejects_nfc_and_case_collisions_before_payload_copy(tmp_path: P
         with pytest.raises(CollisionError):
             receive_source(source, landing=landing, source_kind="card", operator="op")
 
-    assert not list(landing.glob("*/payload"))
+    assert not list(landing.glob("*/data"))
     assert not list(landing.glob("*/intake.json"))
 
 
@@ -127,7 +186,7 @@ def test_receive_escapes_invalid_source_bytes(tmp_path: Path) -> None:
     result = receive_source(source, landing=landing, source_kind="drive", operator="op")
 
     escaped = "bad_\\xff.bin"
-    assert (result.intake_dir / "payload" / escaped).read_bytes() == b"legacy"
+    assert (result.intake_dir / "data" / escaped).read_bytes() == b"legacy"
     assert read_manifest_sha256(result.manifest_path) == {
         escaped: hashlib.sha256(b"legacy").hexdigest()
     }
@@ -192,18 +251,18 @@ def test_receive_records_skipped_symlink_and_fifo(tmp_path: Path) -> None:
 
     result = receive_source(source, landing=landing, source_kind="card", operator="op")
 
-    sentinel = json.loads(result.sentinel_path.read_text(encoding="utf-8"))
+    bag_info = read_bag_info(result.bag_info_path)
     log = (result.intake_dir / "receive.log").read_text(encoding="utf-8")
-    assert sentinel["skipped_count"] == 2
+    assert bag_info["Skipped-Count"] == "2"
     assert "link.mov: symlink" in log
     assert "pipe: fifo" in log
 
 
 def test_payload_path_and_source_relationship_guards(tmp_path: Path) -> None:
     with pytest.raises(ReceiveError):
-        safe_payload_path(tmp_path / "payload", "../escape.mov")
+        safe_payload_path(tmp_path / "data", "../escape.mov")
     with pytest.raises(ReceiveError):
-        safe_payload_path(tmp_path / "payload", "/absolute.mov")
+        safe_payload_path(tmp_path / "data", "/absolute.mov")
 
     source = tmp_path / "source"
     source.mkdir()
@@ -212,11 +271,11 @@ def test_payload_path_and_source_relationship_guards(tmp_path: Path) -> None:
         receive_source(source, landing=source / "landing", source_kind="card", operator="op")
 
     existing = tmp_path / "landing" / "done"
-    payload = existing / "payload"
-    payload.mkdir(parents=True)
+    data = existing / "data"
+    data.mkdir(parents=True)
     (existing / "intake.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ReceiveError):
-        receive_source(payload, landing=tmp_path / "landing", source_kind="card", operator="op")
+        receive_source(data, landing=tmp_path / "landing", source_kind="card", operator="op")
 
 
 def test_explicit_resume_rehashes_present_files_and_bare_rerun_mints_new_id(
@@ -241,8 +300,8 @@ def test_explicit_resume_rehashes_present_files_and_bare_rerun_mints_new_id(
         )
 
     failed_id = next(path.name for path in landing.iterdir() if path.is_dir())
-    failed_payload = landing / failed_id / "payload"
-    (failed_payload / "a.mov").write_bytes(b"bad")
+    failed_data = landing / failed_id / "data"
+    (failed_data / "a.mov").write_bytes(b"bad")
 
     rerun = receive_source(source, landing=landing, source_kind="card", operator="op")
     assert rerun.intake_id != failed_id
@@ -255,9 +314,78 @@ def test_explicit_resume_rehashes_present_files_and_bare_rerun_mints_new_id(
         resume=failed_id,
     )
     assert resumed.intake_id == failed_id
-    assert (failed_payload / "a.mov").read_bytes() == b"a"
+    assert (failed_data / "a.mov").read_bytes() == b"a"
     assert not (landing / failed_id / ".receiving.json").exists()
     assert (landing / failed_id / "intake.json").exists()
+
+
+def test_resume_prunes_stale_data_files(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "keep.mov").write_bytes(b"keep")
+    (source / "drop.mov").write_bytes(b"drop")
+
+    def crash_after_copy(_payload: Path, _receipts: tuple[Any, ...]) -> None:
+        raise ReceiveError("simulated crash")
+
+    with pytest.raises(ReceiveError):
+        receive_source(
+            source,
+            landing=landing,
+            source_kind="card",
+            operator="op",
+            after_copy_hook=crash_after_copy,
+        )
+
+    intake_id = next(path.name for path in landing.iterdir() if path.is_dir())
+    (source / "drop.mov").unlink()
+
+    result = receive_source(
+        None,
+        landing=landing,
+        source_kind="card",
+        operator="ignored",
+        resume=intake_id,
+    )
+
+    assert not (result.intake_dir / "data" / "drop.mov").exists()
+    assert validate_bag(result.intake_dir).valid is True
+
+
+def test_resume_rejects_existing_special_destination(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+
+    def crash_after_copy(_payload: Path, _receipts: tuple[Any, ...]) -> None:
+        raise ReceiveError("simulated crash")
+
+    with pytest.raises(ReceiveError):
+        receive_source(
+            source,
+            landing=landing,
+            source_kind="card",
+            operator="op",
+            after_copy_hook=crash_after_copy,
+        )
+
+    intake_id = next(path.name for path in landing.iterdir() if path.is_dir())
+    destination = landing / intake_id / "data" / "clip.mov"
+    destination.unlink()
+    os.mkfifo(destination)
+
+    with pytest.raises(ReceiveError, match="unsupported fifo"):
+        receive_source(
+            None,
+            landing=landing,
+            source_kind="card",
+            operator="ignored",
+            resume=intake_id,
+        )
+
+    assert not (landing / intake_id / "intake.json").exists()
 
 
 def test_sweep_orphans_removes_only_stale_receiving_dirs(tmp_path: Path) -> None:
@@ -321,7 +449,10 @@ def test_receive_then_intake_scan_accepts_nfd_source_name(engine: Engine, tmp_pa
         assert item.as_received_path == "Café.mov"
 
 
-def test_intake_quarantines_if_manifest_digest_changes(engine: Engine, tmp_path: Path) -> None:
+def test_intake_quarantines_if_tagmanifest_catches_manifest_tamper(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source"
     landing = tmp_path / "landing"
     source.mkdir()
@@ -339,7 +470,96 @@ def test_intake_quarantines_if_manifest_digest_changes(engine: Engine, tmp_path:
         outcomes = scan_landing_root(session, landing)
 
     assert outcomes[0].status == IntakeStatus.QUARANTINED.value
-    assert outcomes[0].reason == "manifest-sha256-mismatch"
+    assert outcomes[0].reason == "bag-invalid"
+    assert outcomes[0].details["tag_mismatched"][0]["path"] == "manifest-sha256.txt"
+
+
+def test_validate_bag_rejects_unsafe_tagmanifest_path(tmp_path: Path) -> None:
+    bag = tmp_path / "bag"
+    data = bag / "data"
+    data.mkdir(parents=True)
+    (data / "clip.mov").write_bytes(b"video")
+    digest = hashlib.sha256(b"video").hexdigest()
+    write_bagit_files(
+        bag,
+        entries={"clip.mov": digest},
+        metadata=bag_info_metadata(
+            intake_id="bad-tag-path",
+            source_kind="card",
+            operator="op",
+            source_ref=None,
+            artifactclass="camera-original",
+            label=None,
+            started_at=dt.datetime(2026, 6, 18, tzinfo=dt.UTC),
+            file_count=1,
+            total_bytes=len(b"video"),
+            skipped_count=0,
+        ),
+    )
+    (bag / "tagmanifest-sha256.txt").write_text(f"{'0' * 64}  .\n", encoding="utf-8")
+
+    validation = validate_bag(bag)
+
+    assert validation.complete is True
+    assert validation.valid is False
+    assert validation.tag_mismatched == [
+        {"path": "bagit.txt", "expected": "listed", "actual": None},
+        {"path": "bag-info.txt", "expected": "listed", "actual": None},
+        {"path": "manifest-sha256.txt", "expected": "listed", "actual": None},
+        {"path": ".", "expected": "0" * 64, "actual": "unsafe path"},
+    ]
+
+
+def test_intake_quarantines_bag_payload_symlink_without_following(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    outside = tmp_path / "outside.txt"
+    source.mkdir()
+    outside.write_text("outside", encoding="utf-8")
+    (source / "clip.mov").write_bytes(b"video")
+    result = receive_source(source, landing=landing, source_kind="card", operator="op")
+    try:
+        (result.intake_dir / "data" / "link.txt").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with session_scope(engine) as session:
+        outcomes = scan_landing_root(session, landing)
+
+    assert outcomes[0].status == IntakeStatus.QUARANTINED.value
+    assert outcomes[0].reason == "bag-incomplete"
+    assert any("unsupported symlink" in item for item in outcomes[0].details["errors"])
+    with session_scope(engine) as session:
+        assert session.scalar(select(func.count()).select_from(IngestItem)) == 0
+
+
+def test_intake_distinguishes_incomplete_missing_extra_and_invalid_payload(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    landing = tmp_path / "landing"
+    missing = _received_fixture(tmp_path, landing, "missing")
+    (missing / "data" / "clip.mov").unlink()
+    extra = _received_fixture(tmp_path, landing, "extra")
+    (extra / "data" / "extra.mov").write_bytes(b"extra")
+    invalid = _received_fixture(tmp_path, landing, "invalid")
+    (invalid / "data" / "clip.mov").write_bytes(b"corrupt")
+
+    with session_scope(engine) as session:
+        outcomes = scan_landing_root(session, landing)
+
+    by_id = {row.intake_id: row for row in outcomes}
+    assert by_id[missing.name].reason == "bag-incomplete"
+    assert by_id[missing.name].details["missing"] == ["clip.mov"]
+    assert by_id[extra.name].reason == "bag-incomplete"
+    assert by_id[extra.name].details["extra"] == ["extra.mov"]
+    assert by_id[invalid.name].reason == "bag-invalid"
+    assert by_id[invalid.name].details["mismatched"][0]["path"] == "clip.mov"
+    with session_scope(engine) as session:
+        assert session.scalar(select(func.count()).select_from(IngestItem)) == 0
 
 
 def test_cli_receive_fake_source_and_confirm_timeout(tmp_path: Path) -> None:
@@ -368,13 +588,14 @@ def test_cli_receive_fake_source_and_confirm_timeout(tmp_path: Path) -> None:
 
     assert result.exit_code == 3
     payload = json.loads(result.output)
+    assert payload["bag_profile"] == BAG_PROFILE
     assert payload["file_count"] == 1
     assert payload["confirmation"]["status"] == "timeout"
     assert payload["confirmation"]["release_ok"] is False
 
 
 @pytest.mark.parametrize("source_kind", ["card", "drive", "upload"])
-def test_receive_source_kind_is_carried_to_sentinel(source_kind: str, tmp_path: Path) -> None:
+def test_receive_source_kind_is_carried_to_bag_info(source_kind: str, tmp_path: Path) -> None:
     source = tmp_path / source_kind
     landing = tmp_path / "landing"
     source.mkdir()
@@ -382,14 +603,52 @@ def test_receive_source_kind_is_carried_to_sentinel(source_kind: str, tmp_path: 
 
     result = receive_source(source, landing=landing, source_kind=source_kind, operator="op")
 
-    sentinel = json.loads(result.sentinel_path.read_text(encoding="utf-8"))
-    assert sentinel["source_kind"] == source_kind
+    assert read_bag_info(result.bag_info_path)["Source-Kind"] == source_kind
 
 
-def test_manifest_mismatch_normalizes_both_sides() -> None:
+def test_manifest_mismatch_uses_bagit_missing_extra_labels() -> None:
     digest = hashlib.sha256(b"video").hexdigest()
 
-    assert manifest_mismatch({"Café.mov": digest}, {"Cafe\u0301.mov": digest}) == {}
+    assert receive_core.manifest_mismatch({"Café.mov": digest}, {"Cafe\u0301.mov": digest}) == {}
+    assert receive_core.manifest_mismatch({"extra.mov": digest}, {})["extra"] == ["extra.mov"]
+    assert receive_core.manifest_mismatch({}, {"missing.mov": digest})["missing"] == ["missing.mov"]
+
+
+def _received_fixture(tmp_path: Path, landing: Path, name: str) -> Path:
+    source = tmp_path / f"source-{name}"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+    result = receive_source(
+        source,
+        landing=landing,
+        source_kind="card",
+        operator="op",
+        now=dt.datetime(2026, 6, 18, tzinfo=dt.UTC),
+    )
+    fixed = landing / name
+    result.intake_dir.rename(fixed)
+    bag_info = read_bag_info(fixed / "bag-info.txt")
+    bag_info["Intake-Id"] = name
+    write_bagit_files(
+        fixed,
+        entries=read_manifest_sha256(fixed / "manifest-sha256.txt"),
+        metadata=bag_info,
+    )
+    (fixed / "intake.json").write_text(
+        json.dumps(
+            {
+                "bag_profile": BAG_PROFILE,
+                "created_at": "2026-06-18T00:00:00+00:00",
+                "intake_id": name,
+                "status": "complete",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return fixed
 
 
 class _RecordingObserver(AtomicWriteObserver):
@@ -401,6 +660,6 @@ class _RecordingObserver(AtomicWriteObserver):
         assert temp_path.exists()
         assert not final_path.exists()
         if final_path.name == "intake.json":
-            assert (final_path.parent / "manifest.mhl").exists()
+            assert (final_path.parent / "tagmanifest-sha256.txt").exists()
             self.intake_checked = True
         self.destinations.append(final_path)

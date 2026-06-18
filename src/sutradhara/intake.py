@@ -1,9 +1,9 @@
 """Landing-root intake scanner for Phase R.
 
 The scanner is level-triggered over completed intake directories. A completed
-intake is a directory containing an `intake.json` sentinel and a `payload/`
-subtree. Optional manifests are cross-checked before any catalog registration;
-a bad manifest quarantines the intake and leaves zero `ingest_item` rows.
+front-door receive is a BagIt bag with an `intake.json` sentinel and a `data/`
+subtree. Baseline legacy intakes without BagIt tags still register from
+`payload/` with no manifest.
 """
 
 from __future__ import annotations
@@ -34,11 +34,14 @@ from sutradhara.catalog.types import (
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job
 from sutradhara.receive import (
+    BAG_INFO_NAME,
+    DATA_DIR_NAME,
+    MANIFEST_NAME,
     FileReceipt,
+    ReceiveError,
     hash_payload_tree,
-    manifest_mismatch,
-    read_manifest_sha256,
-    sha256_file,
+    read_bag_info,
+    validate_bag,
 )
 
 VIDEO_EXTENSIONS = {
@@ -144,13 +147,21 @@ def scan_intake(
     sentinel_path = root / "intake.json"
     if not sentinel_path.exists():
         raise FileNotFoundError(sentinel_path)
-    payload_root = root / "payload"
-    if not payload_root.is_dir():
-        raise FileNotFoundError(payload_root)
 
     sentinel = _read_json(sentinel_path)
-    intake_id = str(sentinel.get("intake_id") or root.name)
-    manifest_path = _find_manifest(root)
+    is_bag = _is_bag_intake(root)
+    if is_bag:
+        payload_root = root / DATA_DIR_NAME
+        manifest_path = root / MANIFEST_NAME
+        metadata = _intake_metadata_from_bag(root, sentinel)
+    else:
+        payload_root = root / "payload"
+        manifest_path = None
+        metadata = _intake_metadata_from_mapping(sentinel, root)
+    if not is_bag and not payload_root.is_dir():
+        raise FileNotFoundError(payload_root)
+
+    intake_id = str(metadata.get("intake_id") or root.name)
     existing = session.get(Intake, intake_id)
     if existing is not None and existing.status == IntakeStatus.QUARANTINED:
         return IntakeScanOutcome(
@@ -191,56 +202,37 @@ def scan_intake(
             manifest_path=Path(existing.manifest_path) if existing.manifest_path else manifest_path,
         )
 
-    records = _hash_payload(payload_root)
-    actual = {record.relpath: record.sha256_hex for record in records}
-    if manifest_path is not None:
-        manifest_file_mismatch = _manifest_file_mismatch(sentinel, manifest_path)
-        if manifest_file_mismatch:
+    if is_bag:
+        validation = validate_bag(root)
+        metadata = _intake_metadata_from_labels(validation.metadata, sentinel, root)
+        intake_id = str(metadata.get("intake_id") or intake_id)
+        if not validation.valid:
+            reason = "bag-incomplete" if not validation.complete else "bag-invalid"
             intake = _upsert_intake(
                 session,
                 intake_id=intake_id,
-                sentinel=sentinel,
+                metadata=metadata,
                 manifest_path=manifest_path,
                 status=IntakeStatus.QUARANTINED,
             )
-            _write_quarantine_receipt(
-                root,
-                intake,
-                manifest_file_mismatch,
-                reason="manifest-sha256-mismatch",
-            )
+            details = validation.details()
+            _write_quarantine_receipt(root, intake, details, reason=reason)
             return IntakeScanOutcome(
                 intake_id=intake_id,
                 path=root,
                 status=IntakeStatus.QUARANTINED.value,
-                reason="manifest-sha256-mismatch",
+                reason=reason,
                 manifest_path=manifest_path,
-                details=manifest_file_mismatch,
+                details=details,
             )
-        expected = read_manifest_sha256(manifest_path)
-        mismatch = _manifest_mismatch(actual, expected)
-        if mismatch:
-            intake = _upsert_intake(
-                session,
-                intake_id=intake_id,
-                sentinel=sentinel,
-                manifest_path=manifest_path,
-                status=IntakeStatus.QUARANTINED,
-            )
-            _write_quarantine_receipt(root, intake, mismatch)
-            return IntakeScanOutcome(
-                intake_id=intake_id,
-                path=root,
-                status=IntakeStatus.QUARANTINED.value,
-                reason="manifest-mismatch",
-                manifest_path=manifest_path,
-                details=mismatch,
-            )
+        records = list(validation.actual_records)
+    else:
+        records = _hash_payload(payload_root)
 
     intake = _upsert_intake(
         session,
         intake_id=intake_id,
-        sentinel=sentinel,
+        metadata=metadata,
         manifest_path=manifest_path,
         status=IntakeStatus.VERIFYING,
     )
@@ -380,25 +372,63 @@ def _cloud_bundle_has_copy(session: Session, intake_id: str) -> bool:
     )
 
 
+def _is_bag_intake(root: Path) -> bool:
+    return any((root / name).exists() for name in ("bagit.txt", BAG_INFO_NAME, MANIFEST_NAME))
+
+
+def _intake_metadata_from_bag(root: Path, sentinel: dict[str, Any]) -> dict[str, Any]:
+    try:
+        labels = read_bag_info(root / BAG_INFO_NAME)
+    except (OSError, ReceiveError, ValueError):
+        labels = {}
+    return _intake_metadata_from_labels(labels, sentinel, root)
+
+
+def _intake_metadata_from_labels(
+    labels: dict[str, str],
+    sentinel: dict[str, Any],
+    root: Path,
+) -> dict[str, Any]:
+    return {
+        "intake_id": labels.get("Intake-Id") or sentinel.get("intake_id") or root.name,
+        "operator": labels.get("Operator") or sentinel.get("operator"),
+        "source_kind": labels.get("Source-Kind") or sentinel.get("source_kind"),
+        "source_ref": labels.get("Source-Ref") or sentinel.get("source_ref"),
+        "artifactclass": labels.get("Artifactclass") or sentinel.get("artifactclass"),
+        "label": labels.get("Label") or sentinel.get("label"),
+    }
+
+
+def _intake_metadata_from_mapping(source: dict[str, Any], root: Path) -> dict[str, Any]:
+    return {
+        "intake_id": source.get("intake_id") or root.name,
+        "operator": source.get("operator"),
+        "source_kind": source.get("source_kind"),
+        "source_ref": source.get("source_ref"),
+        "artifactclass": source.get("artifactclass"),
+        "label": source.get("label"),
+    }
+
+
 def _upsert_intake(
     session: Session,
     *,
     intake_id: str,
-    sentinel: dict[str, Any],
+    metadata: dict[str, Any],
     manifest_path: Path | None,
     status: IntakeStatus,
 ) -> Intake:
-    source_kind = _source_kind(str(sentinel.get("source_kind") or IntakeSourceKind.OTHER.value))
+    source_kind = _source_kind(str(metadata.get("source_kind") or IntakeSourceKind.OTHER.value))
     now = _utcnow()
     intake = session.get(Intake, intake_id)
     if intake is None:
         intake = Intake(
             intake_id=intake_id,
-            operator=str(sentinel.get("operator") or os.environ.get("USER") or "unknown"),
+            operator=str(metadata.get("operator") or os.environ.get("USER") or "unknown"),
             source_kind=source_kind,
-            source_ref=_optional_str(sentinel.get("source_ref")),
-            artifactclass=str(sentinel.get("artifactclass") or "default"),
-            label=_optional_str(sentinel.get("label")),
+            source_ref=_optional_str(metadata.get("source_ref")),
+            artifactclass=str(metadata.get("artifactclass") or "default"),
+            label=_optional_str(metadata.get("label")),
             manifest_path=str(manifest_path) if manifest_path else None,
             status=status,
             created_at=now,
@@ -406,11 +436,11 @@ def _upsert_intake(
         )
         session.add(intake)
     else:
-        intake.operator = str(sentinel.get("operator") or intake.operator)
+        intake.operator = str(metadata.get("operator") or intake.operator)
         intake.source_kind = source_kind
-        intake.source_ref = _optional_str(sentinel.get("source_ref"))
-        intake.artifactclass = str(sentinel.get("artifactclass") or intake.artifactclass)
-        intake.label = _optional_str(sentinel.get("label"))
+        intake.source_ref = _optional_str(metadata.get("source_ref"))
+        intake.artifactclass = str(metadata.get("artifactclass") or intake.artifactclass)
+        intake.label = _optional_str(metadata.get("label"))
         intake.manifest_path = str(manifest_path) if manifest_path else None
         intake.status = status
         intake.updated_at = now
@@ -476,35 +506,6 @@ def _register_payload_record(
 
 def _hash_payload(payload_root: Path) -> list[PayloadRecord]:
     return hash_payload_tree(payload_root)
-
-
-def _find_manifest(intake_dir: Path) -> Path | None:
-    candidates: list[Path] = []
-    for path in intake_dir.iterdir():
-        if not path.is_file():
-            continue
-        lower = path.name.lower()
-        if lower == "intake.json" or lower.startswith("intake."):
-            continue
-        if lower.startswith("manifest.") or lower.endswith(".mhl") or lower.endswith(".mhl.xml"):
-            candidates.append(path)
-    return sorted(candidates)[0] if candidates else None
-
-
-def _manifest_mismatch(actual: dict[str, str], expected: dict[str, str]) -> dict[str, Any]:
-    return manifest_mismatch(actual, expected)
-
-
-def _manifest_file_mismatch(sentinel: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
-    expected = sentinel.get("manifest_sha256")
-    if expected is None:
-        return {}
-    if not isinstance(expected, str) or len(expected) != 64:
-        return {"expected": expected, "actual": None}
-    actual = sha256_file(manifest_path)
-    if actual.lower() == expected.lower():
-        return {}
-    return {"expected": expected.lower(), "actual": actual}
 
 
 def _media_kind_for_path(path: str) -> MediaKind:

@@ -179,12 +179,14 @@ def _result_payload(
     payload: dict[str, Any] = {
         "intake_id": result.intake_id,
         "intake_dir": str(result.intake_dir),
+        "bag_profile": result.bag_profile,
         "manifest_path": str(result.manifest_path),
+        "bag_info_path": str(result.bag_info_path),
+        "tagmanifest_path": str(result.tagmanifest_path),
         "sentinel_path": str(result.sentinel_path),
         "file_count": result.file_count,
         "total_bytes": result.total_bytes,
         "skipped_count": result.skipped_count,
-        "manifest_sha256": result.manifest_sha256,
     }
     if confirmation is not None:
         payload["confirmation"] = {
@@ -202,7 +204,9 @@ def _echo_result(result: ReceiveResult, confirmation: ConfirmationResult | None)
         f"{result.total_bytes} byte(s), skipped={result.skipped_count}"
     )
     click.echo(f"sentinel: {result.sentinel_path}")
+    click.echo(f"bag profile: {result.bag_profile}")
     click.echo(f"manifest: {result.manifest_path}")
+    click.echo(f"tagmanifest: {result.tagmanifest_path}")
     if confirmation is None:
         return
     if confirmation.release_ok:
