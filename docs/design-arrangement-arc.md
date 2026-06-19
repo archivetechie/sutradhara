@@ -106,7 +106,7 @@ begin archive preparation. Operators need names and side effects they can trust.
 |---|---:|---|
 | **inspect** | none, except optional inspection records/logs | Validate BagIt and report readiness/quarantine. |
 | **register** | catalog mutation | Accept a valid intake into authoritative catalog truth. |
-| **prepare** | job requests | One generic verb over the profile's job set (derivatives/indexes/enrichments); new kinds = config, not a new verb. cloud-temp (temporary DR) is automatic at register + gate-expired, not a prepare step. |
+| **prepare** | desired profile + reconciliation wake-ups | One generic verb over the profile's job set (derivatives/indexes/enrichments); new kinds = config, not a new verb. cloud-temp (temporary DR) is automatic at register + gate-expired, not a prepare step. |
 | **arrange** | arrangement rows + projection tree | Let humans sort registered assets before archive. |
 | **submit** | frozen submission rows/source-map | Freeze arrangement as archive input. |
 | **archive** | durable copy creation | Stream original bytes into RAO/d2 under submitted names. |
@@ -148,8 +148,9 @@ A prepare profile maps `(artifactclass | media_kind, profile) -> [ {job_kind, pa
 `prepare` ensures only the missing work (idempotent); a new kind is **config + a
 handler**, never a new CLI verb. It is the generic surface over the existing job
 framework, and the profile is desired-state the way copies are (the reconciliation
-model): "this class should have these derivatives." Automation can still fire it,
-emitting the same explicit per-kind domain events (`DerivativesRequested(...)`).
+model): "this class should have these derivations." Automation can still fire it; the
+work is reconciled (§2.6) and audited in the job/attempt log, not announced as a
+per-kind lifecycle event.
 
 **cloud-temp is not one of these.** The encrypted cloud DR blob is a *temporary,
 lifecycle-bounded* `Copy` - created automatically at register/prepare, and **expired
@@ -246,11 +247,12 @@ file-manager-browsable native package *contents* in the bag are a hard external
 requirement - not the case for `.fcpbundle`/`.photoslibrary`/`.app`, which Apple itself
 models as single-file library packages with application-managed internal media.
 
-### 2.6 Reconcilers enqueue work; events are audit + nudges, never the trigger
+### 2.6 Reconcilers enqueue work; wake-ups are event-driven, not full-table polling
 
 The lifecycle stages should be **decoupled** from the jobs they cause - a new job
 kind must not mean editing a stage. The durable way to get that decoupling is
-**desired-state reconciliation, not an event bus**. Concretely:
+**desired-state reconciliation**, but the reconciler must be awakened by an
+**event/worklist plane**, not by repeatedly scanning every asset. Concretely:
 
 - **A stage mutates catalog state and emits a domain event.** It does **not** itself
   decide which jobs to run. `register` *creates the asset*; it does not enqueue
@@ -261,23 +263,78 @@ kind must not mean editing a stage. The durable way to get that decoupling is
   never had to know `transcode` exists; a new kind is **profile + handler** (§2.3,
   `prepare_requirement`). This is the same decoupling an event bus would give, but it
   **self-heals** and survives a missed moment.
-- **Events are for audit + speed, never authorization.** Keep a **domain-event log**
-  (`IntakeRegistered`, `Sent`, `Archived`, `OffsiteConfirmed`) for provenance and
-  observability, and use events as **edge-trigger nudges** ("register just happened -
-  kick this asset's reconciler now") to cut latency. But a job is **never pinned to an
-  event as its trigger**.
+- **Events are first-class wake-ups, never authorization.** Keep a **domain-event
+  log** (`IntakeRegistered`, `PrepareRequested`, `Archived`, `OffsiteConfirmed`,
+  `ToolVersionChanged`) for provenance and observability. In the same durable path,
+  project those events into a small **reconciliation worklist**: "these targets may now
+  have an open gap." The reconciler claims worklist rows, reloads the current catalog
+  state for that target, and only then decides whether a job is wanted.
+
+This distinction matters at scale. "Level-triggered" means **the decision is made from
+current catalog facts**, not from the event payload. It does **not** mean "wake every
+loop and ask the database which of 50 million assets are missing proxies." Pure
+full-table polling becomes the bottleneck long before the storage layer does.
+
+The production shape is therefore:
+
+1. A catalog mutation commits the authoritative fact and appends a domain-event row.
+2. A transactional outbox/worker projects the event into a domain worklist, e.g.
+   `(domain='derivation', target=ingest_item_id, condition_key='hd-review:preview',
+   reason='registered', due_at=now)`.
+3. The reconciler reads **due worklist rows**, batches by domain/profile/condition,
+   and performs the desired-state check only for those targets.
+4. If the gap is real and no live attempt already exists, it enqueues a job attempt.
+   If the gap is already closed, it marks the worklist row consumed.
+5. Job completion updates the produced fact (`asset_derivation`, `Copy`, index row,
+   verification timestamp) and may create follow-on wake-ups for dependent targets.
+6. A scheduled **sweep** periodically rebuilds or audits the worklist from indexed
+   catalog facts. Sweeps are safety nets for missed events, code bugs, and new profile
+   rules; they are not the hot path.
 
 **Why (the d3 lesson, per `design-reconciliation-model.md`).** Event-pinned work is
-edge-triggered: a missed event (dispatcher crash, a job added after the event fired, a
-repair/replay) means the work **silently never happens**. Level-triggered
-reconciliation converges regardless. Pinning jobs to events would reintroduce d3's
-"missed the event, the work never happened" plus a control-plane / rules engine the
-house style avoids.
+unsafe: a missed event (dispatcher crash, a job added after the event fired, a
+repair/replay) means the work **silently never happens**. Desired-state reconciliation
+converges because the catalog remains the source of truth. But desired-state
+reconciliation must be **worklist-driven** in normal operation, with coarse sweeps as
+backstop, or it becomes a database polling engine at archive scale.
 
-**This is also a YAGNI line.** Do not build an event-binding engine now - it is a
-second triggering mechanism before the first (reconciliation) is even built out. Build
-the reconcilers (the trigger), emit the event log (audit), and add nudges only where
-latency demands. Events accelerate; they do not authorize.
+**Design line:** events and worklists wake reconcilers; catalog facts authorize jobs.
+Do not bind "event X creates job Y." Do not poll all assets every cycle. Build
+per-domain reconcilers that can be fed by events, manual requests, job completions,
+profile changes, and scheduled sweep findings through the same rebuildable worklist.
+
+### 2.7 First-class fact-types vs generic job kinds (where the built-in line sits)
+
+To stay flexible without becoming a soup of opaque jobs, the system is **first-class
+on the nouns, generic on the verbs.**
+
+- **Fact-types** are the small, fixed vocabulary the rest of the system *reasons
+  about*: a **derivation** (the `asset_derivation` edge: master -> derived, `kind`), a
+  **copy**, an **index** (PFR sidecar), **validity**. They earn first-class status
+  because real features depend on knowing what they are - the projection layer finds a
+  master's review proxy, restore distinguishes master vs derived, the restore-gate
+  reads validity, search badges proxies.
+- **Job kinds** are open-ended and *produce* facts: `transcode`, `pfr-index`,
+  `thumbnail`, `transcription`, `scene-detect`, ... Each handler yields facts of a
+  fact-type (transcode -> two derivation edges; pfr-index -> an index; cloud-temp -> a
+  copy).
+
+So there is **no "create derivatives" stage** - *derivation* is a built-in **noun**,
+and the jobs that produce it are generic. The built-in/custom line is drawn at the
+**fact-type** level, not the job level:
+
+| layer | open or fixed? | example |
+|---|---|---|
+| fact-types (catalog vocabulary) | small, fixed, deliberate to add | derivation, copy, index, validity |
+| job kinds (produce facts) | open: config + handler | transcode, pfr-index, thumbnail, transcription |
+| prepare profile (class -> wanted facts, via which kind) | pure config | `s-masters -> mezz+preview derivations (transcode) + index (pfr-index)` |
+
+**Consequence:** a new job kind that produces an *existing* fact-type (audio-extract,
+transcription, scene-detect -> all derivations) is **config + a handler, no schema
+change**. A genuinely novel output (e.g. embeddings -> a vector store) needs a **new
+fact-type** - the rare, deliberate, first-class decision (drawn maybe once a year).
+`transcode`/`pfr-index`/`cloud-temp` are "built-in" only in that they ship in the
+default profile + a default handler; the engine has no built-in/custom tier.
 
 ---
 
@@ -367,18 +424,25 @@ job kind (§2.3):
 sutra prepare <intake-id> --profile hd-review
 ```
 
-This queues only the missing jobs in the profile (idempotent). An operator
-convenience composes register + prepare:
+This records the requested profile and wakes the relevant reconcilers. The observed
+effect is still idempotent - only missing jobs in the profile are queued after the
+reconciler re-checks catalog state. An operator convenience composes register +
+prepare:
 
 ```bash
 sutra intake accept <intake-id> --artifactclass s-masters --prepare hd-review
 ```
 
-Internally it still emits explicit per-kind events:
+Internally, `register` emits the coarse lifecycle milestone; `prepare` records the
+requested profile and emits a profile-level wake-up (`PrepareRequested`). The
+derivation reconciler then evaluates the current catalog state and enqueues only the
+jobs still needed (§2.6, §2.7). There is no per-kind `…Requested` lifecycle event:
 
 ```text
-IntakeRegistered
-DerivativesRequested(profile=hd-review)
+IntakeRegistered            # lifecycle milestone (audit)
+PrepareRequested(hd-review)  # wake-up for the derivation/index reconcilers
+# reconciler -> enqueue transcode/pfr-index only if the gap is still open;
+#               each run is a job_attempt, not a lifecycle event
 ```
 
 The `hd-review` profile for video produces:
@@ -640,7 +704,265 @@ asset_derivation
   metadata_json
 ```
 
-### 4.4 Arrangement
+### 4.4 Reconciliation wake-ups and worklists
+
+Reconcilers are desired-state controllers, but their hot path is a **derived
+worklist**, not an unbounded catalog scan. The worklist may be implemented per-domain
+for performance, but the logical shape is:
+
+```text
+domain_event
+  id
+  kind                         # IntakeRegistered, PrepareRequested, JobSucceeded, ...
+  aggregate_type
+  aggregate_id
+  payload_json
+  created_at
+  projected_at                 # set after wake-ups are materialized
+
+reconciliation_wakeup
+  id
+  domain                       # derivation, copy, verification, arrangement_projection
+  target_type                  # ingest_item, logical_asset, copy, workspace, ...
+  target_id
+  condition_key                # preview, mezz, pfr-index, tape-copy:d2, verify:180d, ...
+  desired_generation
+  reason                       # registered, profile_changed, job_finished, sweep, manual
+  due_at
+  priority
+  status                       # pending, claimed, consumed, suppressed
+  claimed_by
+  claimed_at
+  last_error
+  created_at
+  updated_at
+```
+
+Rules:
+
+- `domain_event` is append-only audit/provenance.
+- `reconciliation_wakeup` is a **derived acceleration structure**. It is durable enough
+  for worker claims, but not authoritative intent. If it is lost, a sweep can rebuild
+  it from catalog state.
+- Use a live-row uniqueness guard such as
+  `(domain, target_type, target_id, condition_key) WHERE status IN ('pending','claimed')`
+  so duplicate events and double-clicked operator actions coalesce without merging
+  unrelated requirements for the same target.
+- The reconciler reads only due wake-ups, then reloads the authoritative catalog rows
+  and evaluates desired vs observed state. If the desired state is already satisfied,
+  the wake-up is consumed without a job.
+- Backoff/blocking state belongs with the domain condition the reconciler reads
+  (`asset_derivation.status`, copy verification freshness, arrangement dirty state,
+  and the condition summary in §4.5), not in the event log. The worklist answers
+  "what should I check now?", not "what is true?"
+- Scheduled sweeps insert `reason='sweep'` wake-ups for targets whose indexed condition
+  says they may be open or stale. Sweeps must be bounded and indexed (by profile hash,
+  status, `next_eligible_at`, `last_verified_at`, updated-at watermarks), not full
+  rescans on every controller loop.
+
+This keeps the d3 safety property (replay/rebuild can converge after missed events)
+without turning Sutradhara into a database poller at tens-of-millions scale.
+
+### 4.5 Reconciliation condition model
+
+The worklist tells a reconciler **what to check next**. It does not answer **whether
+work should run**. That decision comes from a compact, queryable **condition model**
+maintained per domain. The model has four layers:
+
+1. **Desired state** - durable intent, usually scoped by policy or operator request.
+2. **Observed state** - facts already in the catalog (`asset_derivation`, `Copy`,
+   index sidecar rows, verification timestamps, arrangement projection state).
+3. **Condition summary** - the current per-target/per-requirement decision state used
+   by reconcilers and dashboards.
+4. **Attempt log** - append-only history of every job try and its outcome.
+
+Keep these separate. Desired state is authoritative. Observed state proves whether the
+desired fact exists. Condition summary is a maintained projection for hot-path queries.
+Attempt history is audit/provenance and must not be scanned on every reconcile cycle.
+
+#### Desired state
+
+Desired state should be domain-owned, not hidden in job rows. For derivations and
+indexes, `prepare` creates a profile assignment:
+
+```text
+prepare_assignment
+  id
+  scope_type                   # intake, workspace, query, explicit_items
+  scope_id
+  profile                      # hd-review
+  status                       # active, suppressed, retired
+  profile_generation
+  requested_by
+  requested_at
+  metadata_json
+```
+
+The profile expands into per-target requirements. Broad assignments must be expanded
+asynchronously and in shards; do not synchronously insert 20 million rows in the
+operator request. The authoritative desired state is the assignment + profile
+generation. Materialized per-target rows are acceleration/provenance:
+
+```text
+asset_requirement
+  id
+  assignment_id
+  ingest_item_id
+  fact_type                    # derivation, index
+  condition_key                # preview, mezz, pfr-index
+  prepare_requirement_id
+  desired_generation           # profile/params generation this row represents
+  params_hash
+  status                       # active, suppressed, retired
+  created_at
+  updated_at
+```
+
+Other domains use the same pattern with their own nouns: placement policy creates copy
+requirements; verification policy creates freshness requirements; arrangement
+projection creates workspace projection requirements. Do **not** build one generic
+"desired job" table. Share the condition contract, not the domain model.
+
+#### Condition summary
+
+Each domain keeps a compact condition row keyed by the target and requirement:
+
+```text
+reconciliation_condition
+  id
+  domain                       # derivation, copy, verification, arrangement_projection
+  target_type
+  target_id
+  condition_key
+  desired_generation
+  observed_generation
+  status                       # see table below
+  reason_code
+  reason_detail
+  attempt_count
+  last_attempt_id
+  live_job_id
+  next_eligible_at
+  blocked_until_kind           # none, tool_version, source_generation, policy_generation, manual
+  blocked_until_value
+  suppressed_by
+  suppressed_at
+  updated_at
+```
+
+The status vocabulary is shared:
+
+| status | Meaning | Reconciler action |
+|---|---|---|
+| `satisfied` | Desired fact exists and matches the desired generation/params. | Consume wake-up. |
+| `open` | Desired fact is missing and no live attempt is running. | Eligible if due. |
+| `stale` | Fact exists but profile, params, tool, or freshness generation changed. | Eligible if due. |
+| `in_flight` | A pending/running attempt already owns this requirement. | Do not enqueue. |
+| `failed_transient` | Last attempt failed, but retry is allowed after backoff. | Retry only after `next_eligible_at`. |
+| `blocked` | Repeating now is pointless until an external generation changes. | Do not retry until unblock condition is met. |
+| `suppressed` | Operator/policy deliberately paused this requirement. | Do not retry until unsuppressed. |
+| `not_applicable` | The selector no longer applies or desired state was retired. | Consume wake-up and keep for audit/diagnosis if useful. |
+
+The canonical enqueue predicate is:
+
+```text
+desired state is active
+AND condition.status IN ('open', 'stale', 'failed_transient')
+AND now >= condition.next_eligible_at
+AND no live attempt exists for (domain, target_type, target_id, condition_key)
+AND condition is not suppressed
+AND condition is not blocked
+```
+
+Blocked conditions reopen by generation changes, not by time alone. Examples:
+
+- corrupt source fixed by re-ingest -> `source_generation` changes;
+- handler bug fixed -> `tool_version` changes;
+- profile params changed -> `policy_generation` changes;
+- operator override -> manual unblock changes status to `open`.
+
+When one of those facts changes, the event projector or sweep inserts a wake-up for
+the blocked condition. The reconciler then recomputes the condition from current
+catalog state and may move it back to `open` or `stale`.
+
+#### Attempt log
+
+Every actual run appends an attempt record. This is the provenance trail, not the
+reconciler hot path:
+
+```text
+job_attempt
+  id
+  domain
+  target_type
+  target_id
+  condition_key
+  job_kind
+  params_hash
+  status                       # queued, running, succeeded, failed, canceled
+  worker_id
+  tool_name
+  tool_version
+  source_generation
+  desired_generation
+  started_at
+  finished_at
+  error_code
+  error_message
+  metadata_json
+```
+
+Attempt completion updates observed facts and the condition summary in the same
+transaction as the attempt result where possible. If a worker crashes between job
+output and condition update, the next wake-up/sweep recomputes the condition from
+observed facts.
+
+#### Backoff and sweeps
+
+Backoff is stored on the condition row (`next_eligible_at`, `attempt_count`,
+`reason_code`), not derived by scanning attempts. Sweeps read indexed condition rows:
+
+```text
+WHERE status IN ('open', 'stale', 'failed_transient')
+  AND next_eligible_at <= now
+```
+
+For recurrence, verification uses the observed freshness fact:
+
+```text
+WHERE domain = 'verification'
+  AND last_verified_at < now - policy.interval
+```
+
+For broad profile changes, do not wake every affected asset synchronously. Store the
+new profile generation, then run a sharded expander/sweep that materializes or updates
+conditions in bounded batches. Until expansion finishes, the assignment generation is
+the source of truth; missing condition rows are a backlog, not absence of desired
+state.
+
+#### Domain examples
+
+```text
+derivation condition:
+  target = ingest_item:123
+  condition_key = hd-review:preview
+  desired_generation = profile hd-review v7
+  observed_generation = preview params_hash abc if present
+
+copy condition:
+  target = logical_asset:sha256...
+  condition_key = placement:d2:tape-primary
+  desired_generation = artifactclass policy v4
+  observed_generation = latest verified copy policy generation
+
+verification condition:
+  target = copy:456
+  condition_key = verify:180d
+  desired_generation = verification policy v2
+  observed_generation = last_verified_at bucket / copy digest generation
+```
+
+### 4.6 Arrangement
 
 ```text
 arrangement_workspace
@@ -675,7 +997,7 @@ arrangement_event
   at
 ```
 
-### 4.5 Submission
+### 4.7 Submission
 
 ```text
 archive_submission
@@ -698,7 +1020,7 @@ archive_submission_member
   size_snapshot
 ```
 
-### 4.6 Virtual namespace and tags
+### 4.8 Virtual namespace and tags
 
 ```text
 virtual_path
@@ -758,9 +1080,10 @@ sutra prepare <intake-id> --profile hd-review
 sutra prepare <intake-id> --profile hd-review --retry-failed
 ```
 
-`prepare` runs the profile's job set, idempotently; the **profile** (not the CLI)
-defines which kinds, so new kinds need no new verb. cloud-temp is created at register
-and gate-expired (§3.4), not here.
+`prepare` records a desired profile and inserts reconciliation wake-ups; the
+reconciler queues the missing jobs idempotently. The **profile** (not the CLI) defines
+which kinds, so new kinds need no new verb. cloud-temp is created at register and
+gate-expired (§3.4), not here.
 
 ### 5.3 Arrangement
 
@@ -807,6 +1130,32 @@ sutra tag ls  <src>
 ```
 
 `<src>` may resolve by ingest item id, exact virtual path, or subtree prefix.
+
+### 5.6 Reconciliation operations
+
+Normal reconciliation is event/worklist driven and runs continuously on the server.
+Operator/admin commands are for diagnosis, manual wake-ups, and safety sweeps:
+
+```bash
+sutra reconcile status [--domain derivation|copy|verification|arrangement]
+sutra reconcile wake --domain derivation --target ingest_item:<id> \
+  --condition hd-review:preview --reason manual
+sutra reconcile sweep --domain derivation --profile hd-review
+sutra reconcile sweep --domain verification --older-than 180d
+```
+
+REST shape:
+
+```text
+GET  /api/reconciliation/status
+POST /api/reconciliation/wake
+POST /api/reconciliation/sweep
+```
+
+`wake` inserts worklist rows for a target/condition; it does not enqueue jobs
+directly. `sweep` performs a bounded indexed audit and inserts wake-ups for targets
+whose condition may be open or stale. Neither command bypasses the reconciler's
+desired-state check.
 
 ---
 
@@ -887,8 +1236,9 @@ failed
 
 ### 7.3 Prepare
 
-- Queue only missing derivative requirements.
-- Record requested profile and parameters.
+- Record the requested prepare profile and emit reconciliation wake-ups.
+- Reconciler queues only missing derivative requirements after reloading current
+  catalog state.
 - Preserve retry/regenerate as explicit operator choices.
 
 ### 7.4 Arrangement
@@ -912,6 +1262,27 @@ failed
 - Reject/hidden states change discovery defaults only; durable copies remain.
 - Restore by virtual path resolves through catalog identity, not staging paths.
 
+### 7.7 Reconciliation
+
+- Hot-path reconcilers consume due `reconciliation_wakeup` rows; they do not scan all
+  assets every loop.
+- A wake-up is only a hint. The reconciler must re-read catalog desired/observed state
+  before enqueueing any job.
+- Duplicate wake-ups for the same live target and `condition_key` coalesce; different
+  requirements for the same target do not.
+- A durable desired-state record exists for every operator/policy request that must
+  survive queue loss.
+- Condition summaries are updated from observed facts and attempt outcomes; reconcilers
+  do not scan the attempt log in the hot path.
+- The enqueue predicate is explicit: active desired state, eligible condition,
+  `next_eligible_at <= now`, no live attempt, not suppressed, not blocked.
+- Blocked conditions reopen only when their unblock generation changes
+  (`tool_version`, `source_generation`, `policy_generation`, or manual unblock).
+- Missed event recovery is proven by scheduled sweeps that can rebuild wake-ups from
+  indexed catalog state.
+- Sweeps are bounded by domain indexes and watermarks (`status`, `next_eligible_at`,
+  `last_verified_at`, profile hash, updated-at), not unconstrained table scans.
+
 ---
 
 ## 8. Scenario Plan
@@ -926,6 +1297,20 @@ ensure hd-review -> transcode jobs queued
 run jobs -> derivatives ready
 negative: corrupt BagIt inspect -> quarantined, no registration
 negative: repeated register -> idempotent
+```
+
+### R3 - event/worklist reconciliation at scale
+
+```text
+register intake -> domain_event + reconciliation_wakeup rows written
+run derivation reconciler on due wake-ups -> only those targets are evaluated
+duplicate register/prepare wake-up -> coalesced, no duplicate live attempt
+preview and pfr-index for same item -> separate condition_key rows, not merged
+transcode fails transiently -> condition.failed_transient + next_eligible_at backoff
+corrupt source blocks transcode -> condition.blocked until source_generation changes
+drop/projector-miss a domain_event -> scheduled sweep recreates wake-up from catalog state
+profile change -> generation advances; sharded sweep/expander creates affected wake-ups
+verification sweep -> wake copies with last_verified_at older than threshold
 ```
 
 ### S0 - arrangement workspace
@@ -974,9 +1359,22 @@ coverage abruptly. Migrate in phases:
    - `register_intake`
    - `ensure_derivatives`
    - `ensure_cloud_temp`
-2. Keep `scan` as a compatibility wrapper or policy-controlled automation path.
-3. Change harness scenarios to prove explicit lifecycle semantics.
-4. Reclassify automation as policy:
+2. Add the reconciliation outbox/worklist spine:
+   - append `domain_event` rows for lifecycle/profile/job-completion facts;
+   - project events into per-domain `reconciliation_wakeup` rows;
+   - make reconcilers consume due wake-ups and re-check catalog truth before enqueueing
+     jobs;
+   - add bounded scheduled sweeps as missed-event recovery.
+3. Add the reconciliation condition model before broad automation:
+   - persist desired-state assignments (`prepare_assignment`, placement/freshness
+     policy assignments);
+   - maintain per-target/per-`condition_key` condition summaries;
+   - append job attempts separately from condition state;
+   - implement backoff, suppressed, blocked, and generation-based unblock semantics.
+4. Keep `scan` as a compatibility wrapper or policy-controlled automation path.
+5. Change harness scenarios to prove explicit lifecycle semantics and missed-event
+   sweep recovery.
+6. Reclassify automation as policy:
 
 ```text
 intake.registration_mode = manual | auto_on_valid_inspect
