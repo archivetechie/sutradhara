@@ -58,6 +58,10 @@ The important storage properties are:
 the as-received payload and must remain immutable evidence. Operator sorting
 must not rename, move, or delete files inside this tree.
 
+macOS **packages** (`.fcpbundle`, `.photoslibrary`, `.app`, ...) are normalized to a
+single tar payload at receive (see §2.5), so `data/` holds one entry per package,
+never its internal files.
+
 ### 0.3 Catalog split
 
 Two concepts matter throughout:
@@ -157,6 +161,73 @@ resolution. They differ in storage effect.
 | **Arrangement** | Archive entry names for a not-yet-archived submission. | Frozen into source-map; archive writes originals under these names. |
 | **Virtual segregation** | Browse/search/restore namespace after archive. | Catalog metadata only; sealed storage objects do not move. |
 
+### 2.5 Package normalization at receive (macOS bundles)
+
+Some "files" are macOS **packages** - directories the OS and operator treat as one
+opaque item but which hold thousands-to-millions of internal files (`.fcpbundle`,
+`.photoslibrary`, `.imovielibrary`, `.app`). They must be **one object end to end** -
+one payload entry, one `LogicalAsset`, one `IngestItem`, one arrangement node, one
+archived blob - never millions of each. We already draw this boundary at the archive
+layer (blob config); we draw the **same boundary, from the same config, at receive**.
+
+**Decision (A-prime): receive-time package wrapping as first-contact normalization.**
+When `sutra receive`'s walk meets a directory matching a configured **package
+boundary**, it does not recurse. It **defines** the package's canonical byte object by
+streaming the subtree through a **pinned deterministic tar** into one SHA-256, landed
+as a single payload:
+
+- physical `data/A001.fcpbundle.tar` -> one `manifest-sha256.txt` entry (the bag stays
+  RFC-8493-valid: one file, not millions);
+- logical name `A001.fcpbundle`, recorded as `logical_member_path` alongside
+  `stored_member_path` (`....tar`) - exactly as compression records `.zst` members;
+- an **inner index** (`member -> offset/len + sha256`) as a tag file, so deep fixity
+  and single-internal-file restore remain possible (the same inner index the archive
+  blob keeps - produced here, once, at first contact);
+- `register` creates **one master `IngestItem`** per package; `archive` streams the
+  `.tar` as-is (already blobbed - no re-tar at seal).
+
+This **reuses the existing logical/stored member-name + staging-transform machinery**
+(the compression design); no new table is required.
+
+**It is normalization, not a reversal-transform.** The archive-side staging transforms
+(AppleDouble merge, `.zst`) preserve a pre-existing single-file `LogicalAsset` and
+reverse on restore. A package has **no single byte stream until receive defines one** -
+its archival identity *is* the pinned tar; there is no "original" to reverse to. It is
+recorded as a first-contact package-normalization in the bag's tag files.
+
+**It does not eliminate the first-contact walk.** Receive still opens/stats every
+internal file once to stream it into the tar (reading the bytes is unavoidable). What
+A-prime removes is everything *downstream and repeated*: a copied landing tree of
+millions of entries, a giant manifest, the catalog explosion at register, an
+arrangement projection of a million render files, and a re-walk at every later stage.
+**Walk once, then one object forever.**
+
+**The tar profile must be pinned and versioned.** "One hash" is durable evidence only
+if the tar is byte-reproducible across versions and platforms. Pin and version the full
+profile: tar format (ustar/pax), member **path ordering** (deterministic sort), uid/gid
+normalization, mtime policy, mode bits, symlink / xattr / resource-fork / AppleDouble /
+sparse-file handling, and error policy. Use the **same pinned dialect as the archive
+`.remwrap.tar`**, so the hash is stable *and* matches the blob the archive would have
+produced.
+
+**The boundary config is shared and versioned.** Receive runs at the edge with no DB,
+so the package-boundary list is a **synced receive policy/profile** whose hash is
+written into **`bag-info.txt`** (next to `canonicalization_version`), so the server
+knows which boundary set the edge applied and the two never disagree.
+
+**Detection is glob-driven, not the macOS package bit.** On the Linux staging host a
+`.fcpbundle` is just a directory with no Finder package flag, so the portable signal is
+the shared **package-glob list** (`*.fcpbundle`, `*.photoslibrary`, ...); the macOS
+package bit is a secondary hint only when receive runs on a Mac. A boundary **stops
+everything inside it** (no recursion, no per-file transform within) and matches at the
+**outermost** package edge.
+
+**Scope.** A-prime is the default for opaque packages. The native-directory alternative
+(per-file manifest, collapse only at register) is **reserved** for any class where
+file-manager-browsable native package *contents* in the bag are a hard external
+requirement - not the case for `.fcpbundle`/`.photoslibrary`/`.app`, which Apple itself
+models as single-file library packages with application-managed internal media.
+
 ---
 
 ## 3. End-to-end Flow
@@ -215,7 +286,8 @@ sutra intake register <intake-id> --artifactclass s-masters
 Effects:
 
 - Create/update the authoritative `Intake` row.
-- Create one master `IngestItem` per BagIt payload file.
+- Create one master `IngestItem` per BagIt payload **object** (a normalized
+  package, §2.5, is one object; its internal files are not individual items).
 - Create/link content-addressed `LogicalAsset` rows.
 - Record provenance:
   - bag root;
@@ -885,6 +957,10 @@ Even with automation enabled, the domain events remain explicit and auditable.
    first present a virtual tree adapter to existing RAO code.
 6. Proxy readiness policy: whether arrangement creation blocks until `hd-review`
    is ready or creates a workspace in `pending_derivatives`.
+7. Package-boundary profile distribution (§2.5): how the edge gets the synced
+   package-glob list (bundled with the `receive` build vs a fetched/pinned profile),
+   and the exact `bag-info.txt` key + hash recording it. Plus where the pinned tar
+   profile is defined so receive and the archive `.remwrap.tar` share one dialect.
 
 ---
 
