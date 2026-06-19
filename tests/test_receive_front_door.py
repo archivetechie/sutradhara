@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import tarfile
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +26,9 @@ from sutradhara.intake import scan_landing_root
 from sutradhara.receive import (
     BAG_PROFILE,
     CANONICALIZATION_VERSION,
+    PACKAGE_INDEX_NAME,
+    PACKAGE_PROFILE_HASH,
+    PACKAGE_PROFILE_VERSION,
     RECEIVE_VERSION,
     AtomicWriteObserver,
     CollisionError,
@@ -33,6 +38,7 @@ from sutradhara.receive import (
     bag_info_metadata,
     read_bag_info,
     read_manifest_sha256,
+    read_package_index,
     receive_source,
     safe_payload_path,
     sweep_orphans,
@@ -256,6 +262,179 @@ def test_receive_records_skipped_symlink_and_fifo(tmp_path: Path) -> None:
     assert bag_info["Skipped-Count"] == "2"
     assert "link.mov: symlink" in log
     assert "pipe: fifo" in log
+
+
+def test_receive_wraps_package_dir_as_single_tar_with_inner_index(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    bundle = source / "A001.fcpbundle"
+    nested = bundle / "Event"
+    nested.mkdir(parents=True)
+    (nested / "clip.mov").write_bytes(b"video")
+    (nested / "._clip.mov").write_bytes(b"appledouble")
+    try:
+        (bundle / "clip-link.mov").symlink_to("Event/clip.mov")
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    result = receive_source(source, landing=landing, source_kind="card", operator="op")
+
+    data_root = result.intake_dir / "data"
+    package_tar = data_root / "A001.fcpbundle.tar"
+    assert package_tar.is_file()
+    assert not (data_root / "A001.fcpbundle").exists()
+    assert read_manifest_sha256(result.manifest_path) == {
+        "A001.fcpbundle.tar": hashlib.sha256(package_tar.read_bytes()).hexdigest()
+    }
+    bag_info = read_bag_info(result.bag_info_path)
+    assert bag_info["Package-Profile-Version"] == PACKAGE_PROFILE_VERSION
+    assert bag_info["Package-Profile-Hash"] == PACKAGE_PROFILE_HASH
+
+    package_index = read_package_index(result.intake_dir / PACKAGE_INDEX_NAME)
+    package = package_index["packages"][0]
+    assert package["logical_member_path"] == "A001.fcpbundle"
+    assert package["stored_member_path"] == "A001.fcpbundle.tar"
+    assert package["profile"] == PACKAGE_PROFILE_VERSION
+    assert package["sha256"] == hashlib.sha256(package_tar.read_bytes()).hexdigest()
+
+    by_member = {member["member"]: member for member in package["members"]}
+    assert by_member["A001.fcpbundle/Event/clip.mov"]["type"] == "file"
+    assert by_member["A001.fcpbundle/Event/._clip.mov"]["type"] == "file"
+    assert by_member["A001.fcpbundle/clip-link.mov"]["type"] == "symlink"
+    assert by_member["A001.fcpbundle/clip-link.mov"]["linkname"] == "Event/clip.mov"
+    assert by_member["A001.fcpbundle/clip-link.mov"]["data_offset"] is None
+    clip = by_member["A001.fcpbundle/Event/clip.mov"]
+    with package_tar.open("rb") as handle:
+        handle.seek(clip["data_offset"])
+        extracted = handle.read(clip["length"])
+    assert extracted == b"video"
+    assert hashlib.sha256(extracted).hexdigest() == clip["sha256"]
+
+    with tarfile.open(package_tar, mode="r:") as tar:
+        assert tar.getmember("A001.fcpbundle").isdir()
+        assert tar.getmember("A001.fcpbundle/clip-link.mov").issym()
+        assert tar.extractfile("A001.fcpbundle/Event/clip.mov").read() == b"video"
+
+    validation = validate_bag(result.intake_dir)
+    assert validation.valid is True
+    assert validation.actual_records[0].relpath == "A001.fcpbundle.tar"
+    assert validation.actual_records[0].as_received_relpath == "A001.fcpbundle"
+
+
+def test_package_tar_profile_is_stable_across_receive_runs(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    bundle = source / "A001.fcpbundle"
+    (bundle / "Event").mkdir(parents=True)
+    (bundle / "Event" / "clip.mov").write_bytes(b"video")
+    (bundle / "Event" / "notes.txt").write_bytes(b"notes")
+
+    first = receive_source(
+        source, landing=tmp_path / "landing-a", source_kind="card", operator="op"
+    )
+    second = receive_source(
+        source, landing=tmp_path / "landing-b", source_kind="card", operator="op"
+    )
+
+    first_tar = first.intake_dir / "data" / "A001.fcpbundle.tar"
+    second_tar = second.intake_dir / "data" / "A001.fcpbundle.tar"
+    assert first_tar.read_bytes() == second_tar.read_bytes()
+    assert read_manifest_sha256(first.manifest_path) == read_manifest_sha256(second.manifest_path)
+
+
+# A fixed package fixture must hash to this exact value. If a tarfile/Python change
+# alters the bytes, this fails on purpose: the package tar's sha256 is the asset's
+# durable identity, so a format change must be a conscious `package-tar-v2` bump and
+# re-pin, never a silent re-identification of every package across an upgrade.
+PACKAGE_TAR_GOLDEN_SHA256 = "621c2c7fc235a8243034b209d9f46bfcd3a2a505a853d6d643746ef80a20b0cc"
+
+
+def _write_golden_package(source: Path) -> None:
+    bundle = source / "GOLDEN.fcpbundle"
+    (bundle / "Render").mkdir(parents=True)
+    (bundle / "Render" / "clip01.mov").write_bytes(b"clip-one")
+    (bundle / "Render" / "clip02.mov").write_bytes(b"clip-two")
+    (bundle / "._meta").write_bytes(b"appledouble")
+    (bundle / "library.plist").write_bytes(b"plist")
+
+
+def test_package_tar_matches_pinned_golden_vector(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_golden_package(source)
+
+    result = receive_source(source, landing=tmp_path / "landing", source_kind="card", operator="op")
+
+    package_tar = result.intake_dir / "data" / "GOLDEN.fcpbundle.tar"
+    actual = hashlib.sha256(package_tar.read_bytes()).hexdigest()
+    assert actual == PACKAGE_TAR_GOLDEN_SHA256, (
+        "package-tar-v1 bytes changed: if intentional, bump the profile version and "
+        f"re-pin this golden; otherwise a tarfile/Python change is silently "
+        f"re-identifying every package (got {actual})"
+    )
+
+
+def test_package_bag_passes_reference_bagit_validator(tmp_path: Path) -> None:
+    bagit = pytest.importorskip("bagit")
+    source = tmp_path / "source"
+    _write_golden_package(source)
+
+    result = receive_source(source, landing=tmp_path / "landing", source_kind="card", operator="op")
+
+    # RFC 8493 conformance with a package `.tar` payload + the package-index tag file.
+    bagit.Bag(str(result.intake_dir)).validate()
+
+
+def test_receive_rejects_package_stored_member_collision(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    bundle = source / "A001.fcpbundle"
+    bundle.mkdir(parents=True)
+    (bundle / "clip.mov").write_bytes(b"video")
+    (source / "A001.fcpbundle.tar").write_bytes(b"existing tar")
+
+    with pytest.raises(CollisionError, match="A001\\.fcpbundle\\.tar"):
+        receive_source(source, landing=landing, source_kind="card", operator="op")
+
+
+def test_resume_removes_stale_package_index_when_package_disappears(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    bundle = source / "A001.fcpbundle"
+    bundle.mkdir(parents=True)
+    (bundle / "clip.mov").write_bytes(b"video")
+
+    class FailOnManifest(AtomicWriteObserver):
+        def before_rename(self, temp_path: Path, final_path: Path) -> None:
+            if final_path.name == "manifest-sha256.txt":
+                raise ReceiveError("simulated crash after package index")
+
+    with pytest.raises(ReceiveError, match="simulated crash"):
+        receive_source(
+            source,
+            landing=landing,
+            source_kind="card",
+            operator="op",
+            atomic_observer=FailOnManifest(),
+        )
+
+    intake_id = next(path.name for path in landing.iterdir() if path.is_dir())
+    failed = landing / intake_id
+    assert (failed / PACKAGE_INDEX_NAME).exists()
+    shutil.rmtree(bundle)
+    (source / "notes.txt").write_bytes(b"notes")
+
+    resumed = receive_source(
+        None,
+        landing=landing,
+        source_kind="card",
+        operator="ignored",
+        resume=intake_id,
+    )
+
+    assert not (resumed.intake_dir / PACKAGE_INDEX_NAME).exists()
+    assert read_manifest_sha256(resumed.manifest_path) == {
+        "notes.txt": hashlib.sha256(b"notes").hexdigest()
+    }
+    assert validate_bag(resumed.intake_dir).valid is True
 
 
 def test_payload_path_and_source_relationship_guards(tmp_path: Path) -> None:

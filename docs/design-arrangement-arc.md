@@ -106,7 +106,7 @@ begin archive preparation. Operators need names and side effects they can trust.
 |---|---:|---|
 | **inspect** | none, except optional inspection records/logs | Validate BagIt and report readiness/quarantine. |
 | **register** | catalog mutation | Accept a valid intake into authoritative catalog truth. |
-| **prepare** | job requests | Explicitly request derivatives and temporary durability work. |
+| **prepare** | job requests | One generic verb over the profile's job set (derivatives/indexes/enrichments); new kinds = config, not a new verb. cloud-temp (temporary DR) is automatic at register + gate-expired, not a prepare step. |
 | **arrange** | arrangement rows + projection tree | Let humans sort registered assets before archive. |
 | **submit** | frozen submission rows/source-map | Freeze arrangement as archive input. |
 | **archive** | durable copy creation | Stream original bytes into RAO/d2 under submitted names. |
@@ -131,24 +131,31 @@ and later frozen as:
 archive_path -> source_path -> sha256
 ```
 
-### 2.3 Proxy generation is explicit
+### 2.3 Preparation is explicit and config-driven (one verb, not a verb per job)
 
-Proxy/mezz generation should not be a surprise side effect of read-only
-inspection.
-
-Use:
+Post-register work (review derivatives, indexes, future enrichments) should not be a
+surprise side effect of read-only inspection. But the *set* of that work must not be
+hard-coded into the CLI - new kinds (audio-extract, transcription, thumbnail, OCR,
+scene-detect, ...) appear over time. So there is **one generic verb** driven by a
+configurable **prepare profile**, not a verb per job kind:
 
 ```bash
-sutra derivatives ensure --intake <intake-id> --profile hd-review
+sutra prepare <intake-id> --profile hd-review
 ```
 
-This queues only missing work. Retry/regenerate modes are explicit.
+A prepare profile maps `(artifactclass | media_kind, profile) -> [ {job_kind, params},
+... ]` (e.g. `s-masters + hd-review -> [transcode(mezz,preview), pfr-index]`).
+`prepare` ensures only the missing work (idempotent); a new kind is **config + a
+handler**, never a new CLI verb. It is the generic surface over the existing job
+framework, and the profile is desired-state the way copies are (the reconciliation
+model): "this class should have these derivatives." Automation can still fire it,
+emitting the same explicit per-kind domain events (`DerivativesRequested(...)`).
 
-Automation can still exist, but it should fire the same explicit domain event:
-
-```text
-DerivativesRequested(profile=hd-review, intake_id=...)
-```
+**cloud-temp is not one of these.** The encrypted cloud DR blob is a *temporary,
+lifecycle-bounded* `Copy` - created automatically at register/prepare, and **expired
+by the deletion-gate (Phase U)** once tape copies are verified + offsite-confirmed. It
+is neither a CLI verb nor a permanent placement (a placement reconciler would fight the
+expiry); its desired end-state is deletion.
 
 ### 2.4 Arrangement and VS are one namespace family
 
@@ -189,6 +196,17 @@ as a single payload:
 This **reuses the existing logical/stored member-name + staging-transform machinery**
 (the compression design); no new table is required.
 
+**Wrap once; the archive stores it dense.** The package tar is produced exactly once,
+at receive (its hash is the package's identity); the archive stores it as an opaque
+**dense** member and never re-tars it. So there is one tar implementation to pin
+(receive), **rem needs no package awareness** (dense object + ranged read), and
+**package-blobbing moves from archive-time to receive-time** - the archive layer stops
+adding package globs to the blob ruleset (they arrive pre-wrapped; the blob config now
+covers only archive-time operator blobs). The package's **inner index** is a set of PFR
+locators one level down, so single-internal-file restore reuses the existing
+partial-restore path. Receive-layer mechanism + the pinned `package-tar-v1` profile +
+golden-vector test: `design-receive-front-door.md` §12.
+
 **It is normalization, not a reversal-transform.** The archive-side staging transforms
 (AppleDouble merge, `.zst`) preserve a pre-existing single-file `LogicalAsset` and
 reverse on restore. A package has **no single byte stream until receive defines one** -
@@ -227,6 +245,39 @@ everything inside it** (no recursion, no per-file transform within) and matches 
 file-manager-browsable native package *contents* in the bag are a hard external
 requirement - not the case for `.fcpbundle`/`.photoslibrary`/`.app`, which Apple itself
 models as single-file library packages with application-managed internal media.
+
+### 2.6 Reconcilers enqueue work; events are audit + nudges, never the trigger
+
+The lifecycle stages should be **decoupled** from the jobs they cause - a new job
+kind must not mean editing a stage. The durable way to get that decoupling is
+**desired-state reconciliation, not an event bus**. Concretely:
+
+- **A stage mutates catalog state and emits a domain event.** It does **not** itself
+  decide which jobs to run. `register` *creates the asset*; it does not enqueue
+  `transcode`.
+- **Reconcilers own "what should exist" and enqueue jobs to close the gap.** "Prepare
+  runs transcode" is really *"the derivation reconciler sees an asset that, per its
+  class profile, should have a proxy and doesn't -> enqueue transcode."* The stage
+  never had to know `transcode` exists; a new kind is **profile + handler** (§2.3,
+  `prepare_requirement`). This is the same decoupling an event bus would give, but it
+  **self-heals** and survives a missed moment.
+- **Events are for audit + speed, never authorization.** Keep a **domain-event log**
+  (`IntakeRegistered`, `Sent`, `Archived`, `OffsiteConfirmed`) for provenance and
+  observability, and use events as **edge-trigger nudges** ("register just happened -
+  kick this asset's reconciler now") to cut latency. But a job is **never pinned to an
+  event as its trigger**.
+
+**Why (the d3 lesson, per `design-reconciliation-model.md`).** Event-pinned work is
+edge-triggered: a missed event (dispatcher crash, a job added after the event fired, a
+repair/replay) means the work **silently never happens**. Level-triggered
+reconciliation converges regardless. Pinning jobs to events would reintroduce d3's
+"missed the event, the work never happened" plus a control-plane / rules engine the
+house style avoids.
+
+**This is also a YAGNI line.** Do not build an event-binding engine now - it is a
+second triggering mechanism before the first (reconciliation) is even built out. Build
+the reconcilers (the trigger), emit the event log (audit), and add nudges only where
+latency demands. Events accelerate; they do not authorize.
 
 ---
 
@@ -306,43 +357,45 @@ Registration idempotency:
 - Duplicate content across intakes: one `LogicalAsset`, separate `IngestItem`
   provenance.
 
-### 3.4 Prepare derivatives and cloud-temp
+### 3.4 Prepare (derivatives, indexes, enrichments)
 
-Preparation explicitly requests work needed for review, arrangement, VS, and
-temporary disaster recovery.
-
-```bash
-sutra derivatives ensure --intake <intake-id> --profile hd-review
-sutra cloud-temp ensure --intake <intake-id>
-```
-
-An operator convenience command can compose the steps:
+Preparation explicitly requests the post-register work needed for review,
+arrangement, and VS - driven by the artifactclass/media **profile**, not a verb per
+job kind (§2.3):
 
 ```bash
-sutra intake accept <intake-id> \
-  --artifactclass s-masters \
-  --prepare hd-review \
-  --cloud-temp
+sutra prepare <intake-id> --profile hd-review
 ```
 
-Internally this still emits separate events:
+This queues only the missing jobs in the profile (idempotent). An operator
+convenience composes register + prepare:
+
+```bash
+sutra intake accept <intake-id> --artifactclass s-masters --prepare hd-review
+```
+
+Internally it still emits explicit per-kind events:
 
 ```text
 IntakeRegistered
 DerivativesRequested(profile=hd-review)
-CloudTempRequested
 ```
 
-For video, `hd-review` should produce:
+The `hd-review` profile for video produces:
 
 - preview proxy for quick browse/scrub;
-- HD mezz/proxy for human segregation on cheaper clients;
+- HD mezz/proxy for human arrangement on cheaper clients;
 - derivation edges back to the original master;
 - locators readable by the projection layer.
 
-For non-video assets, the same profile may mean thumbnail, PDF preview, OCR/text,
-audio waveform, or no derivative. Arrangement is generic; video is only one
-derivative policy.
+For non-video assets the same profile may mean thumbnail, PDF preview, OCR/text,
+audio waveform, or no derivative - it is just a different **profile entry**. The CLI
+verb never changes; the profile does.
+
+**cloud-temp (temporary DR) is not part of `prepare`.** The encrypted cloud blob is a
+temporary `Copy` created automatically at register (the DR copy is wanted ASAP,
+independent of any review profile) and **expired by the deletion-gate (Phase U)** once
+durable tape copies are confirmed - not a CLI verb, not a permanent placement (§2.3).
 
 ### 3.5 Create arrangement workspace
 
@@ -562,14 +615,19 @@ logical_asset
   created_at
 ```
 
-### 4.3 Derivatives
+### 4.3 Prepare profile and derivations
+
+The **prepare profile** is the desired-state config that drives `sutra prepare`
+(§2.3): one row per (selector, profile) -> job kind + params. `kind` is **any
+registered job kind** (transcode, pfr-index, thumbnail, transcription, ...), so new
+prep work is a row + a handler, never a new CLI verb.
 
 ```text
-derivative_requirement
+prepare_requirement            # the prepare profile
   id
-  profile
-  media_type
-  kind
+  profile                      # e.g. hd-review
+  selector                     # artifactclass or media_type this entry applies to
+  kind                         # any registered job kind
   params_json
 
 asset_derivation
@@ -681,7 +739,7 @@ waits for the identity model.
 ```bash
 sutra intake inspect /replica/landing/<intake-id>
 sutra intake register <intake-id> --artifactclass s-masters
-sutra intake accept <intake-id> --artifactclass s-masters --prepare hd-review --cloud-temp
+sutra intake accept <intake-id> --artifactclass s-masters --prepare hd-review
 ```
 
 REST shape:
@@ -692,13 +750,17 @@ POST /api/intakes/{id}/register
 POST /api/intakes/{id}/accept
 ```
 
-### 5.2 Derivatives
+### 5.2 Prepare
 
 ```bash
-sutra derivatives status --intake <intake-id> --profile hd-review
-sutra derivatives ensure --intake <intake-id> --profile hd-review
-sutra derivatives retry --intake <intake-id> --profile hd-review --failed-only
+sutra prepare status <intake-id> [--profile hd-review]
+sutra prepare <intake-id> --profile hd-review
+sutra prepare <intake-id> --profile hd-review --retry-failed
 ```
+
+`prepare` runs the profile's job set, idempotently; the **profile** (not the CLI)
+defines which kinds, so new kinds need no new verb. cloud-temp is created at register
+and gate-expired (§3.4), not here.
 
 ### 5.3 Arrangement
 
@@ -945,8 +1007,9 @@ Even with automation enabled, the domain events remain explicit and auditable.
 
 1. Compatibility naming: keep `scan`, introduce `inspect`, or support both while
    scenarios migrate.
-2. Operator default: should `intake accept --prepare hd-review --cloud-temp` be
-   the standard command, with lower-level commands for admin/debug?
+2. Operator default: should `intake accept --prepare hd-review` be the standard
+   command, with lower-level commands for admin/debug? (cloud-temp is automatic at
+   register, not a flag - §3.4.)
 3. Projection v1 mechanics:
    - materialized proxy files over SMB;
    - server-side watcher/reconciler;
@@ -957,10 +1020,13 @@ Even with automation enabled, the domain events remain explicit and auditable.
    first present a virtual tree adapter to existing RAO code.
 6. Proxy readiness policy: whether arrangement creation blocks until `hd-review`
    is ready or creates a workspace in `pending_derivatives`.
-7. Package-boundary profile distribution (§2.5): how the edge gets the synced
-   package-glob list (bundled with the `receive` build vs a fetched/pinned profile),
-   and the exact `bag-info.txt` key + hash recording it. Plus where the pinned tar
-   profile is defined so receive and the archive `.remwrap.tar` share one dialect.
+7. Package normalization (§2.5) — **resolved.** Wrap-once at receive; the archive
+   stores the package tar **dense** (rem unchanged; package-blobbing moves from
+   archive to receive). `package_globs` + the pinned **`package-tar-v1`** profile live
+   in the shared `receive` core, **bundled with the `receive` build** (offline edge),
+   with `Package-Profile-Version` + hash in `bag-info.txt`. There is **one** tar
+   dialect (receive's) because the archive never re-tars — no shared-dialect problem.
+   Receive-layer spec: `design-receive-front-door.md` §12.
 
 ---
 

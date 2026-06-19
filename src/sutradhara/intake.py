@@ -456,36 +456,45 @@ def _register_payload_record(
     payload_root: Path,
     record: PayloadRecord,
 ) -> IngestItem:
+    as_received_path = record.as_received_relpath
+    stored_member_path = record.stored_relpath or record.relpath
     asset = session.get(LogicalAsset, record.sha256_bytes)
     if asset is None:
         asset = LogicalAsset(
             content_sha256=record.sha256_bytes,
             size_bytes=record.size_bytes,
-            media_kind=_media_kind_for_path(record.relpath),
-            media_info={"path": record.relpath},
+            media_kind=_media_kind_for_path(as_received_path),
+            media_info={"path": as_received_path, "stored_member_path": stored_member_path},
             validity=AssetValidity.UNVALIDATED,
         )
         session.add(asset)
     elif asset.media_kind is None:
-        asset.media_kind = _media_kind_for_path(record.relpath)
+        asset.media_kind = _media_kind_for_path(as_received_path)
 
     item = session.scalars(
         select(IngestItem).where(
             IngestItem.intake_id == intake.intake_id,
-            IngestItem.as_received_path == record.relpath,
+            IngestItem.as_received_path == as_received_path,
         )
     ).one_or_none()
     metadata = {
         "source_path": str(record.source_path),
         "payload_root": str(payload_root),
         "sha256": record.sha256_hex,
+        "stored_member_path": stored_member_path,
     }
+    if record.logical_relpath is not None:
+        metadata["logical_member_path"] = record.logical_relpath
+    if record.package_profile is not None:
+        metadata["package_profile"] = record.package_profile
+    if record.package_index is not None:
+        metadata["package_index_path"] = str(payload_root.parent / record.package_index)
     if item is None:
         item = IngestItem(
             intake=intake,
             logical_asset=asset,
-            as_received_path=record.relpath,
-            virtual_path=record.relpath,
+            as_received_path=as_received_path,
+            virtual_path=as_received_path,
             st_dev=record.st_dev,
             st_ino=record.st_ino,
             size_bytes=record.size_bytes,
@@ -495,7 +504,7 @@ def _register_payload_record(
         session.add(item)
     else:
         item.logical_asset = asset
-        item.virtual_path = item.virtual_path or record.relpath
+        item.virtual_path = item.virtual_path or as_received_path
         item.st_dev = record.st_dev
         item.st_ino = record.st_ino
         item.size_bytes = record.size_bytes

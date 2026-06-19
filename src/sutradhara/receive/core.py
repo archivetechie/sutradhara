@@ -9,12 +9,14 @@ landing directories, source quiescence checks, and server release markers.
 from __future__ import annotations
 
 import datetime as dt
+import fnmatch
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import tarfile
 import time
 import unicodedata
 import uuid
@@ -22,12 +24,14 @@ from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 from sutradhara.member_name import MemberNameError, escape_member_name, unescape_member_name
 
 RECEIVE_VERSION = "receive-v2"
 CANONICALIZATION_VERSION = "receive-bagit-path-v2"
+PACKAGE_PROFILE_VERSION = "package-tar-v1"
+PACKAGE_GLOBS = ("*.fcpbundle", "*.photoslibrary", "*.imovielibrary", "*.app")
 BAG_PROFILE = "bagit-1.0"
 BAGIT_TEXT = "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n"
 DATA_DIR_NAME = "data"
@@ -35,9 +39,29 @@ MANIFEST_NAME = "manifest-sha256.txt"
 BAG_INFO_NAME = "bag-info.txt"
 BAGIT_NAME = "bagit.txt"
 TAGMANIFEST_NAME = "tagmanifest-sha256.txt"
+PACKAGE_INDEX_NAME = "package-index.json"
 _BAG_TAG_FILES = (BAGIT_NAME, BAG_INFO_NAME, MANIFEST_NAME)
 _COPY_BUFFER_BYTES = 1024 * 1024
 _DEFAULT_ORPHAN_AGE = dt.timedelta(hours=24)
+_PACKAGE_FILE_MODE = 0o644
+_PACKAGE_DIR_MODE = 0o755
+_PACKAGE_SYMLINK_MODE = 0o777
+_PACKAGE_MTIME = 0
+PACKAGE_PROFILE_HASH = hashlib.sha256(
+    json.dumps(
+        {
+            "format": "tar-pax",
+            "globs": PACKAGE_GLOBS,
+            "mtime": _PACKAGE_MTIME,
+            "profile": PACKAGE_PROFILE_VERSION,
+            "regular_file_mode": _PACKAGE_FILE_MODE,
+            "directory_mode": _PACKAGE_DIR_MODE,
+            "symlink_mode": _PACKAGE_SYMLINK_MODE,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 
 
 class ReceiveError(Exception):
@@ -69,7 +93,7 @@ class AtomicWriteObserver:
 
 @dataclass(frozen=True)
 class FileReceipt:
-    """One regular file copied or verified in an intake payload."""
+    """One payload object copied or verified in an intake payload."""
 
     source_path: Path
     relpath: str
@@ -79,12 +103,23 @@ class FileReceipt:
     st_dev: int | None
     st_ino: int | None
     copied: bool
+    logical_relpath: str | None = None
+    stored_relpath: str | None = None
+    package_profile: str | None = None
+    package_index: str | None = None
+    package_members: tuple[dict[str, Any], ...] = ()
 
     @property
     def sha256_bytes(self) -> bytes:
         """Return the file digest as raw SHA-256 bytes."""
 
         return bytes.fromhex(self.sha256_hex)
+
+    @property
+    def as_received_relpath(self) -> str:
+        """Return the operator-facing relpath for this payload object."""
+
+        return self.logical_relpath or self.relpath
 
 
 @dataclass(frozen=True)
@@ -187,6 +222,8 @@ class ConfirmationResult:
 class _SourceEntry:
     source_path: Path
     relpath: str
+    entry_type: str = "file"
+    logical_relpath: str | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +232,23 @@ class _StatSnapshot:
     mtime_ns: int
     inode: int | None
     device: int | None
+
+
+@dataclass(frozen=True)
+class _PackageMember:
+    source_path: Path
+    member_name: str
+    mode: int
+    size: int
+    type_name: str
+    linkname: str | None = None
+
+
+@dataclass(frozen=True)
+class _PackageTarResult:
+    digest: str
+    size_bytes: int
+    members: tuple[dict[str, Any], ...]
 
 
 def receive_source(
@@ -286,6 +340,19 @@ def receive_source(
             after_copy_hook(data_root, receipts)
         _verify_destination_files(receipts)
         entries = {receipt.relpath: receipt.sha256_hex for receipt in receipts}
+        package_index = _package_index_payload(receipts)
+        extra_tag_files: tuple[str, ...] = ()
+        if package_index is not None:
+            _atomic_write_json(
+                intake_dir / PACKAGE_INDEX_NAME,
+                package_index,
+                observer=atomic_observer,
+            )
+            extra_tag_files = (PACKAGE_INDEX_NAME,)
+        else:
+            with suppress(FileNotFoundError):
+                (intake_dir / PACKAGE_INDEX_NAME).unlink()
+                _fsync_dir(intake_dir)
         total_bytes = sum(receipt.size_bytes for receipt in receipts)
         for item in rejected:
             events.append(f"skipped {item.relpath}: {item.reason}")
@@ -309,6 +376,7 @@ def receive_source(
                 total_bytes=total_bytes,
                 skipped_count=len(rejected),
             ),
+            extra_tag_files=extra_tag_files,
             observer=atomic_observer,
         )
         sentinel = {
@@ -402,7 +470,11 @@ def wait_for_server_confirmation(
         time.sleep(poll_interval_seconds)
 
 
-def hash_payload_tree(payload_root: Path | str) -> list[FileReceipt]:
+def hash_payload_tree(
+    payload_root: Path | str,
+    *,
+    reject_native_packages: bool = False,
+) -> list[FileReceipt]:
     """Hash a payload tree using the same canonical relpaths as receive."""
 
     root = Path(payload_root)
@@ -414,6 +486,12 @@ def hash_payload_tree(payload_root: Path | str) -> list[FileReceipt]:
         except FileNotFoundError as exc:
             raise SourceScanError(f"payload entry disappeared during hash: {path}") from exc
         if stat.S_ISDIR(stat_result.st_mode):
+            if reject_native_packages and _is_package_boundary(relpath):
+                raise ReceiveError(
+                    "payload contains un-normalized package directory "
+                    f"{relpath!r}; re-run sutra receive so it is stored as a "
+                    f"{PACKAGE_PROFILE_VERSION} tar"
+                )
             continue
         if stat.S_ISLNK(stat_result.st_mode):
             raise ReceiveError(f"payload contains unsupported symlink: {relpath}")
@@ -435,6 +513,38 @@ def hash_payload_tree(payload_root: Path | str) -> list[FileReceipt]:
             )
         )
     return receipts
+
+
+def read_package_index(path: str | Path) -> dict[str, Any]:
+    """Read and lightly validate a receive package index tag file."""
+
+    payload = _read_json(Path(path))
+    if payload.get("profile") != PACKAGE_PROFILE_VERSION:
+        raise ReceiveError(
+            "Package-Profile-Version mismatch: "
+            f"expected {PACKAGE_PROFILE_VERSION}, actual {payload.get('profile')!r}"
+        )
+    if payload.get("profile_hash") != PACKAGE_PROFILE_HASH:
+        raise ReceiveError(
+            "Package-Profile-Hash mismatch: "
+            f"expected {PACKAGE_PROFILE_HASH}, actual {payload.get('profile_hash')!r}"
+        )
+    packages = payload.get("packages")
+    if not isinstance(packages, list):
+        raise ReceiveError(f"{PACKAGE_INDEX_NAME} packages must be a list")
+    for package in packages:
+        if not isinstance(package, dict):
+            raise ReceiveError(f"{PACKAGE_INDEX_NAME} package entries must be objects")
+        for key in ("logical_member_path", "stored_member_path", "sha256", "members"):
+            if key not in package:
+                raise ReceiveError(f"{PACKAGE_INDEX_NAME} package missing {key}")
+        canonicalize_manifest_path(str(package["logical_member_path"]))
+        canonicalize_manifest_path(str(package["stored_member_path"]))
+        if not _is_sha256_hex(str(package["sha256"])):
+            raise ReceiveError(f"{PACKAGE_INDEX_NAME} package has invalid sha256")
+        if not isinstance(package["members"], list):
+            raise ReceiveError(f"{PACKAGE_INDEX_NAME} package members must be a list")
+    return payload
 
 
 def read_manifest_sha256(path: str | Path) -> dict[str, str]:
@@ -496,6 +606,8 @@ def bag_info_metadata(
         "Artifactclass": artifactclass,
         "Label": label or "",
         "Canonicalization-Version": CANONICALIZATION_VERSION,
+        "Package-Profile-Version": PACKAGE_PROFILE_VERSION,
+        "Package-Profile-Hash": PACKAGE_PROFILE_HASH,
         "Skipped-Count": str(skipped_count),
     }
 
@@ -505,6 +617,7 @@ def write_bagit_files(
     *,
     entries: Mapping[str, str],
     metadata: Mapping[str, str],
+    extra_tag_files: Iterable[str] = (),
     observer: AtomicWriteObserver | None = None,
 ) -> BagWriteResult:
     """Write BagIt tag files for a completed receive and return their paths."""
@@ -517,9 +630,10 @@ def write_bagit_files(
     _atomic_write_text(bagit_path, BAGIT_TEXT, observer=observer)
     _atomic_write_text(bag_info_path, bag_info_text(metadata), observer=observer)
     _atomic_write_text(manifest_path, bagit_manifest_text(entries), observer=observer)
+    tag_files = (*_BAG_TAG_FILES, *tuple(extra_tag_files))
     _atomic_write_text(
         tagmanifest_path,
-        tagmanifest_text(root, _BAG_TAG_FILES),
+        tagmanifest_text(root, tag_files),
         observer=observer,
     )
     return BagWriteResult(
@@ -556,6 +670,8 @@ def bag_info_text(metadata: Mapping[str, str]) -> str:
         "Artifactclass",
         "Label",
         "Canonicalization-Version",
+        "Package-Profile-Version",
+        "Package-Profile-Hash",
         "Skipped-Count",
     ]
     lines: list[str] = []
@@ -591,7 +707,7 @@ def validate_bag(bag_root: Path | str) -> BagValidationResult:
         errors.append(f"complete: missing {DATA_DIR_NAME}/ directory")
     else:
         try:
-            actual_records = tuple(hash_payload_tree(data_root))
+            actual_records = tuple(hash_payload_tree(data_root, reject_native_packages=True))
         except ReceiveError as exc:
             errors.append(f"complete: cannot hash {DATA_DIR_NAME}/: {exc}")
     actual = {record.relpath: record.sha256_hex for record in actual_records}
@@ -606,6 +722,16 @@ def validate_bag(bag_root: Path | str) -> BagValidationResult:
     except (OSError, ReceiveError, ValueError) as exc:
         errors.append(f"cannot read {BAG_INFO_NAME}: {exc}")
 
+    package_index_path = root / PACKAGE_INDEX_NAME
+    package_index: dict[str, Any] | None = None
+    if package_index_path.exists():
+        try:
+            package_index = read_package_index(package_index_path)
+            actual_records = _annotate_package_records(actual_records, package_index)
+        except (OSError, ReceiveError, ValueError) as exc:
+            errors.append(f"cannot read {PACKAGE_INDEX_NAME}: {exc}")
+
+    actual = {record.relpath: record.sha256_hex for record in actual_records}
     mismatch = manifest_mismatch(actual, manifest)
     missing = list(mismatch.get("missing", []))
     extra = list(mismatch.get("extra", []))
@@ -623,8 +749,29 @@ def validate_bag(bag_root: Path | str) -> BagValidationResult:
                 f"expected {CANONICALIZATION_VERSION}, "
                 f"actual {metadata.get('Canonicalization-Version')!r}"
             )
+        allowed_package_versions = (
+            {PACKAGE_PROFILE_VERSION}
+            if package_index_path.exists()
+            else {None, PACKAGE_PROFILE_VERSION}
+        )
+        if metadata.get("Package-Profile-Version") not in allowed_package_versions:
+            errors.append(
+                "Package-Profile-Version mismatch: "
+                f"expected {PACKAGE_PROFILE_VERSION}, "
+                f"actual {metadata.get('Package-Profile-Version')!r}"
+            )
+        allowed_package_hashes = (
+            {PACKAGE_PROFILE_HASH} if package_index_path.exists() else {None, PACKAGE_PROFILE_HASH}
+        )
+        if metadata.get("Package-Profile-Hash") not in allowed_package_hashes:
+            errors.append(
+                "Package-Profile-Hash mismatch: "
+                f"expected {PACKAGE_PROFILE_HASH}, "
+                f"actual {metadata.get('Package-Profile-Hash')!r}"
+            )
 
-    tag_mismatched = _verify_tagmanifest(root)
+    extra_required_tags = (PACKAGE_INDEX_NAME,) if package_index_path.exists() else ()
+    tag_mismatched = _verify_tagmanifest(root, required_tag_files=extra_required_tags)
     return BagValidationResult(
         bag_root=root,
         data_root=data_root,
@@ -737,7 +884,11 @@ def _canonicalize_payload_manifest_path(decoded_path: str) -> str:
     return canonicalize_manifest_path(value)
 
 
-def _verify_tagmanifest(root: Path) -> list[dict[str, str | None]]:
+def _verify_tagmanifest(
+    root: Path,
+    *,
+    required_tag_files: Iterable[str] = (),
+) -> list[dict[str, str | None]]:
     path = root / TAGMANIFEST_NAME
     mismatched: list[dict[str, str | None]] = []
     try:
@@ -745,7 +896,7 @@ def _verify_tagmanifest(root: Path) -> list[dict[str, str | None]]:
     except (OSError, ReceiveError, ValueError) as exc:
         return [{"path": TAGMANIFEST_NAME, "expected": "readable", "actual": str(exc)}]
 
-    for relpath in _BAG_TAG_FILES:
+    for relpath in (*_BAG_TAG_FILES, *tuple(required_tag_files)):
         if relpath not in expected:
             mismatched.append({"path": relpath, "expected": "listed", "actual": None})
 
@@ -849,6 +1000,101 @@ def safe_payload_path(payload_root: Path | str, relpath: str) -> Path:
     return final
 
 
+def _is_package_boundary(relpath: str) -> bool:
+    path = PurePosixPath(relpath)
+    name = path.name.casefold()
+    whole = path.as_posix().casefold()
+    return any(
+        fnmatch.fnmatchcase(name, pattern.casefold())
+        or fnmatch.fnmatchcase(whole, pattern.casefold())
+        for pattern in PACKAGE_GLOBS
+    )
+
+
+def _package_index_payload(receipts: Iterable[FileReceipt]) -> dict[str, Any] | None:
+    packages: list[dict[str, Any]] = []
+    for receipt in receipts:
+        if receipt.package_profile != PACKAGE_PROFILE_VERSION:
+            continue
+        if receipt.logical_relpath is None or receipt.stored_relpath is None:
+            raise ReceiveError(f"package receipt missing logical/stored relpath: {receipt.relpath}")
+        if not receipt.package_members:
+            raise ReceiveError(f"package receipt missing inner index: {receipt.relpath}")
+        packages.append(
+            {
+                "logical_member_path": receipt.logical_relpath,
+                "stored_member_path": receipt.stored_relpath,
+                "profile": PACKAGE_PROFILE_VERSION,
+                "sha256": receipt.sha256_hex,
+                "size_bytes": receipt.size_bytes,
+                "members": list(receipt.package_members),
+            }
+        )
+    if not packages:
+        return None
+    return {
+        "profile": PACKAGE_PROFILE_VERSION,
+        "profile_hash": PACKAGE_PROFILE_HASH,
+        "package_globs": list(PACKAGE_GLOBS),
+        "packages": sorted(packages, key=lambda item: item["stored_member_path"]),
+    }
+
+
+def _annotate_package_records(
+    records: tuple[FileReceipt, ...],
+    package_index: Mapping[str, Any],
+) -> tuple[FileReceipt, ...]:
+    by_stored: dict[str, dict[str, Any]] = {}
+    for raw_package in package_index.get("packages", []):
+        package_entry = dict(raw_package)
+        stored = canonicalize_manifest_path(str(package_entry["stored_member_path"]))
+        if stored in by_stored:
+            raise ReceiveError(f"{PACKAGE_INDEX_NAME} duplicates stored member {stored!r}")
+        by_stored[stored] = package_entry
+
+    annotated: list[FileReceipt] = []
+    seen_stored: set[str] = set()
+    for record in records:
+        indexed_package = by_stored.get(record.relpath)
+        if indexed_package is None:
+            annotated.append(record)
+            continue
+        if str(indexed_package.get("sha256")) != record.sha256_hex:
+            raise ReceiveError(
+                f"{PACKAGE_INDEX_NAME} sha256 mismatch for {record.relpath}: "
+                f"expected {record.sha256_hex}, actual {indexed_package.get('sha256')!r}"
+            )
+        if indexed_package.get("profile") != PACKAGE_PROFILE_VERSION:
+            raise ReceiveError(
+                f"{PACKAGE_INDEX_NAME} profile mismatch for {record.relpath}: "
+                f"{indexed_package.get('profile')!r}"
+            )
+        annotated.append(
+            FileReceipt(
+                source_path=record.source_path,
+                relpath=record.relpath,
+                destination_path=record.destination_path,
+                sha256_hex=record.sha256_hex,
+                size_bytes=record.size_bytes,
+                st_dev=record.st_dev,
+                st_ino=record.st_ino,
+                copied=record.copied,
+                logical_relpath=canonicalize_manifest_path(
+                    str(indexed_package["logical_member_path"])
+                ),
+                stored_relpath=record.relpath,
+                package_profile=PACKAGE_PROFILE_VERSION,
+                package_index=PACKAGE_INDEX_NAME,
+            )
+        )
+        seen_stored.add(record.relpath)
+
+    missing = sorted(set(by_stored) - seen_stored)
+    if missing:
+        raise ReceiveError(f"{PACKAGE_INDEX_NAME} references missing payloads: {missing}")
+    return tuple(annotated)
+
+
 def _scan_source(source_root: Path) -> tuple[tuple[_SourceEntry, ...], tuple[RejectedEntry, ...]]:
     regulars: list[_SourceEntry] = []
     rejected: list[RejectedEntry] = []
@@ -856,9 +1102,20 @@ def _scan_source(source_root: Path) -> tuple[tuple[_SourceEntry, ...], tuple[Rej
         root = Path(root_raw)
         for dirname in list(dirs):
             path = root / dirname
+            relpath = canonicalize_filesystem_path(path, source_root)
             if path.is_symlink():
-                relpath = canonicalize_filesystem_path(path, source_root)
                 rejected.append(RejectedEntry(relpath, path, "symlink-directory"))
+                dirs.remove(dirname)
+                continue
+            if _is_package_boundary(relpath):
+                regulars.append(
+                    _SourceEntry(
+                        path,
+                        f"{relpath}.tar",
+                        entry_type="package",
+                        logical_relpath=relpath,
+                    )
+                )
                 dirs.remove(dirname)
         for filename in files:
             path = root / filename
@@ -898,8 +1155,92 @@ def _copy_or_verify_entries(
 ) -> tuple[FileReceipt, ...]:
     receipts: list[FileReceipt] = []
     for entry in entries:
-        destination = safe_payload_path(payload_root, entry.relpath)
-        source_digest, snapshot = _hash_source_with_stat_guard(entry.source_path)
+        if entry.entry_type == "package":
+            receipts.append(
+                _copy_or_verify_package_entry(
+                    entry,
+                    payload_root=payload_root,
+                    observer=observer,
+                    events=events,
+                )
+            )
+        else:
+            receipts.append(
+                _copy_or_verify_file_entry(
+                    entry,
+                    payload_root=payload_root,
+                    observer=observer,
+                    events=events,
+                )
+            )
+    return tuple(receipts)
+
+
+def _copy_or_verify_file_entry(
+    entry: _SourceEntry,
+    *,
+    payload_root: Path,
+    observer: AtomicWriteObserver | None,
+    events: list[str],
+) -> FileReceipt:
+    destination = safe_payload_path(payload_root, entry.relpath)
+    source_digest, snapshot = _hash_source_with_stat_guard(entry.source_path)
+    copied = True
+    existing_mode = _existing_destination_mode(destination)
+    if existing_mode is not None:
+        if stat.S_ISLNK(existing_mode):
+            raise ReceiveError(f"payload destination is a symlink: {destination}")
+        if not stat.S_ISREG(existing_mode):
+            raise ReceiveError(
+                f"payload destination is unsupported "
+                f"{_special_file_reason(existing_mode)}: {destination}"
+            )
+        destination_digest = sha256_file(destination)
+        if destination_digest == source_digest:
+            copied = False
+            events.append(f"resume kept verified {entry.relpath}")
+        else:
+            events.append(f"resume replacing mismatched {entry.relpath}")
+            _copy_source_to_destination(entry.source_path, destination, observer=observer)
+            source_digest, snapshot = _hash_source_with_stat_guard(entry.source_path)
+    else:
+        digest_from_copy, snapshot = _copy_source_to_destination(
+            entry.source_path,
+            destination,
+            observer=observer,
+        )
+        source_digest = digest_from_copy
+    return FileReceipt(
+        source_path=entry.source_path,
+        relpath=entry.relpath,
+        destination_path=destination,
+        sha256_hex=source_digest,
+        size_bytes=snapshot.size,
+        st_dev=snapshot.device,
+        st_ino=snapshot.inode,
+        copied=copied,
+    )
+
+
+def _copy_or_verify_package_entry(
+    entry: _SourceEntry,
+    *,
+    payload_root: Path,
+    observer: AtomicWriteObserver | None,
+    events: list[str],
+) -> FileReceipt:
+    logical_relpath = entry.logical_relpath
+    if logical_relpath is None:
+        raise ReceiveError(f"package entry missing logical relpath: {entry.source_path}")
+    destination = safe_payload_path(payload_root, entry.relpath)
+    source_stat = _stat_snapshot(entry.source_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _fsync_dir(destination.parent)
+    temp_path = _temp_path_for(destination)
+    try:
+        package = _build_package_tar(entry.source_path, temp_path, logical_relpath=logical_relpath)
+        after_source_stat = _stat_snapshot(entry.source_path)
+        _raise_if_mutated(entry.source_path, source_stat, after_source_stat)
         copied = True
         existing_mode = _existing_destination_mode(destination)
         if existing_mode is not None:
@@ -911,33 +1252,39 @@ def _copy_or_verify_entries(
                     f"{_special_file_reason(existing_mode)}: {destination}"
                 )
             destination_digest = sha256_file(destination)
-            if destination_digest == source_digest:
+            if destination_digest == package.digest:
+                temp_path.unlink()
                 copied = False
-                events.append(f"resume kept verified {entry.relpath}")
+                events.append(f"resume kept verified package {logical_relpath}")
             else:
-                events.append(f"resume replacing mismatched {entry.relpath}")
-                _copy_source_to_destination(entry.source_path, destination, observer=observer)
-                source_digest, snapshot = _hash_source_with_stat_guard(entry.source_path)
+                events.append(f"resume replacing mismatched package {logical_relpath}")
         else:
-            digest_from_copy, snapshot = _copy_source_to_destination(
-                entry.source_path,
-                destination,
-                observer=observer,
-            )
-            source_digest = digest_from_copy
-        receipts.append(
-            FileReceipt(
-                source_path=entry.source_path,
-                relpath=entry.relpath,
-                destination_path=destination,
-                sha256_hex=source_digest,
-                size_bytes=snapshot.size,
-                st_dev=snapshot.device,
-                st_ino=snapshot.inode,
-                copied=copied,
-            )
+            events.append(f"packaged {logical_relpath} -> {entry.relpath}")
+
+        if copied:
+            if observer is not None:
+                observer.before_rename(temp_path, destination)
+            temp_path.replace(destination)
+            _fsync_dir(destination.parent)
+        return FileReceipt(
+            source_path=entry.source_path,
+            relpath=entry.relpath,
+            destination_path=destination,
+            sha256_hex=package.digest,
+            size_bytes=package.size_bytes,
+            st_dev=after_source_stat.device,
+            st_ino=after_source_stat.inode,
+            copied=copied,
+            logical_relpath=logical_relpath,
+            stored_relpath=entry.relpath,
+            package_profile=PACKAGE_PROFILE_VERSION,
+            package_index=PACKAGE_INDEX_NAME,
+            package_members=package.members,
         )
-    return tuple(receipts)
+    except Exception:
+        with suppress(FileNotFoundError):
+            temp_path.unlink()
+        raise
 
 
 def _existing_destination_mode(path: Path) -> int | None:
@@ -1014,6 +1361,218 @@ def _copy_source_to_destination(
         with suppress(FileNotFoundError):
             temp_path.unlink()
         raise
+
+
+def _build_package_tar(
+    package_root: Path,
+    destination: Path,
+    *,
+    logical_relpath: str,
+) -> _PackageTarResult:
+    """Write a deterministic receive package tar and return its index evidence."""
+
+    try:
+        root_mode = package_root.lstat().st_mode
+    except FileNotFoundError as exc:
+        raise SourceScanError(f"package disappeared during receive: {package_root}") from exc
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        raise ReceiveError(f"package boundary is not a directory: {package_root}")
+
+    members = _package_members(package_root, logical_relpath=logical_relpath)
+    member_records: dict[str, dict[str, Any]] = {}
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("xb") as raw_out:
+        hashing_out = _HashingWriter(raw_out)
+        with tarfile.open(
+            fileobj=cast(Any, hashing_out),
+            mode="w",
+            format=tarfile.PAX_FORMAT,
+        ) as tar:
+            for member in members:
+                info = _tar_info_for_package_member(member)
+                if member.type_name == "file":
+                    before = _stat_snapshot(member.source_path)
+                    with member.source_path.open("rb") as raw_in:
+                        hashing_in = _HashingReader(raw_in)
+                        tar.addfile(info, hashing_in)
+                    after = _stat_snapshot(member.source_path)
+                    _raise_if_mutated(member.source_path, before, after)
+                    member_records[member.member_name] = {
+                        "member": member.member_name,
+                        "type": "file",
+                        "length": member.size,
+                        "sha256": hashing_in.hexdigest(),
+                    }
+                else:
+                    tar.addfile(info)
+                    record: dict[str, Any] = {
+                        "member": member.member_name,
+                        "type": member.type_name,
+                        "length": 0,
+                        "sha256": None,
+                    }
+                    if member.linkname is not None:
+                        record["linkname"] = member.linkname
+                    member_records[member.member_name] = record
+        raw_out.flush()
+        os.fsync(raw_out.fileno())
+        digest = hashing_out.hexdigest()
+
+    offsets = _package_tar_offsets(destination)
+    for member_name, record in member_records.items():
+        record["data_offset"] = offsets.get(member_name) if record["type"] == "file" else None
+    return _PackageTarResult(
+        digest=digest,
+        size_bytes=destination.stat().st_size,
+        members=tuple(member_records[name] for name in sorted(member_records)),
+    )
+
+
+def _package_members(package_root: Path, *, logical_relpath: str) -> tuple[_PackageMember, ...]:
+    members = [
+        _PackageMember(
+            source_path=package_root,
+            member_name=logical_relpath,
+            mode=_PACKAGE_DIR_MODE,
+            size=0,
+            type_name="directory",
+        )
+    ]
+    for root_raw, dirs, files in os.walk(package_root, topdown=True, followlinks=False):
+        root = Path(root_raw)
+        dirs.sort(key=lambda name: canonicalize_filesystem_path(root / name, package_root))
+        for dirname in list(dirs):
+            path = root / dirname
+            member = _package_member_from_path(
+                package_root,
+                path,
+                logical_relpath=logical_relpath,
+            )
+            if member.type_name == "symlink":
+                dirs.remove(dirname)
+            members.append(member)
+        for filename in sorted(
+            files,
+            key=lambda name: canonicalize_filesystem_path(root / name, package_root),
+        ):
+            members.append(
+                _package_member_from_path(
+                    package_root,
+                    root / filename,
+                    logical_relpath=logical_relpath,
+                )
+            )
+    return tuple(sorted(members, key=lambda item: item.member_name))
+
+
+def _package_member_from_path(
+    package_root: Path,
+    path: Path,
+    *,
+    logical_relpath: str,
+) -> _PackageMember:
+    relpath = canonicalize_filesystem_path(path, package_root)
+    member_name = PurePosixPath(logical_relpath, relpath).as_posix()
+    try:
+        stat_result = path.lstat()
+    except FileNotFoundError as exc:
+        raise SourceScanError(f"package entry disappeared during receive: {path}") from exc
+    mode = stat_result.st_mode
+    if stat.S_ISLNK(mode):
+        return _PackageMember(
+            source_path=path,
+            member_name=member_name,
+            mode=_PACKAGE_SYMLINK_MODE,
+            size=0,
+            type_name="symlink",
+            linkname=os.readlink(path),
+        )
+    if stat.S_ISDIR(mode):
+        return _PackageMember(
+            source_path=path,
+            member_name=member_name,
+            mode=_PACKAGE_DIR_MODE,
+            size=0,
+            type_name="directory",
+        )
+    if stat.S_ISREG(mode):
+        return _PackageMember(
+            source_path=path,
+            member_name=member_name,
+            mode=_PACKAGE_FILE_MODE,
+            size=stat_result.st_size,
+            type_name="file",
+        )
+    raise ReceiveError(f"package contains unsupported {_special_file_reason(mode)}: {member_name}")
+
+
+def _tar_info_for_package_member(member: _PackageMember) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(member.member_name)
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = _PACKAGE_MTIME
+    info.mode = member.mode
+    info.pax_headers = {}
+    if member.type_name == "file":
+        info.type = tarfile.REGTYPE
+        info.size = member.size
+    elif member.type_name == "directory":
+        info.type = tarfile.DIRTYPE
+        info.size = 0
+    elif member.type_name == "symlink":
+        info.type = tarfile.SYMTYPE
+        info.linkname = member.linkname or ""
+        info.size = 0
+    else:
+        raise ReceiveError(f"unsupported package member type: {member.type_name}")
+    return info
+
+
+def _package_tar_offsets(path: Path) -> dict[str, int | None]:
+    offsets: dict[str, int | None] = {}
+    with tarfile.open(path, mode="r:") as tar:
+        for info in tar:
+            offsets[info.name] = getattr(info, "offset_data", None)
+    return offsets
+
+
+class _HashingWriter:
+    """Binary file wrapper that records the SHA-256 of bytes written through it."""
+
+    def __init__(self, handle: BinaryIO) -> None:
+        self._handle = handle
+        self._digest = hashlib.sha256()
+
+    def write(self, data: bytes) -> int:
+        self._digest.update(data)
+        return self._handle.write(data)
+
+    def tell(self) -> int:
+        return self._handle.tell()
+
+    def flush(self) -> None:
+        self._handle.flush()
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
+class _HashingReader:
+    """Binary file wrapper that records the SHA-256 of bytes read through it."""
+
+    def __init__(self, handle: BinaryIO) -> None:
+        self._handle = handle
+        self._digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._handle.read(size)
+        self._digest.update(data)
+        return data
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
 
 
 def _hash_source_with_stat_guard(source: Path) -> tuple[str, _StatSnapshot]:

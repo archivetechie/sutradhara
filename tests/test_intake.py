@@ -16,7 +16,13 @@ from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.intake import scan_landing_root
 from sutradhara.jobs.models import Job
-from sutradhara.receive import BAG_PROFILE, bag_info_metadata, write_bagit_files
+from sutradhara.receive import (
+    BAG_PROFILE,
+    PACKAGE_INDEX_NAME,
+    bag_info_metadata,
+    receive_source,
+    write_bagit_files,
+)
 
 
 @pytest.fixture
@@ -65,6 +71,49 @@ def test_scan_good_manifest_registers_items_and_jobs(engine: Engine, tmp_path: P
     assert clip.exists()
 
 
+def test_scan_receive_package_registers_one_logical_item(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    bundle = source / "A001.fcpbundle"
+    (bundle / "Event").mkdir(parents=True)
+    (bundle / "Event" / "clip.mov").write_bytes(b"video bytes")
+
+    result = receive_source(
+        source,
+        landing=landing,
+        source_kind="card",
+        operator="tester",
+        artifactclass="camera-original",
+    )
+
+    with session_scope(engine) as session:
+        outcomes = scan_landing_root(session, landing, cache_root=tmp_path / "cache")
+
+    assert outcomes[0].status == IntakeStatus.REGISTERED.value
+    assert outcomes[0].item_count == 1
+    assert outcomes[0].jobs_submitted == 1
+    with session_scope(engine) as session:
+        item = session.scalars(select(IngestItem)).one()
+        asset = session.scalars(select(LogicalAsset)).one()
+        assert item.as_received_path == "A001.fcpbundle"
+        assert item.virtual_path == "A001.fcpbundle"
+        assert item.item_metadata["stored_member_path"] == "A001.fcpbundle.tar"
+        assert item.item_metadata["logical_member_path"] == "A001.fcpbundle"
+        assert item.item_metadata["package_index_path"] == str(
+            result.intake_dir / PACKAGE_INDEX_NAME
+        )
+        assert item.item_metadata["source_path"] == str(
+            result.intake_dir / "data" / "A001.fcpbundle.tar"
+        )
+        assert asset.media_info["path"] == "A001.fcpbundle"
+        assert asset.media_info["stored_member_path"] == "A001.fcpbundle.tar"
+        jobs = list(session.scalars(select(Job)))
+        assert [job.kind for job in jobs] == ["cloud-blob"]
+
+
 def test_scan_bad_manifest_quarantines_without_registration(
     engine: Engine,
     tmp_path: Path,
@@ -89,6 +138,31 @@ def test_scan_bad_manifest_quarantines_without_registration(
         intake = session.get(Intake, "card-002")
         assert intake is not None
         assert intake.status == IntakeStatus.QUARANTINED
+        assert session.scalar(select(func.count()).select_from(IngestItem)) == 0
+        assert session.scalar(select(func.count()).select_from(LogicalAsset)) == 0
+        assert session.scalar(select(func.count()).select_from(Job)) == 0
+
+
+def test_scan_quarantines_unnormalized_native_package_directory(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    landing = tmp_path / "landing"
+    _write_intake(
+        landing,
+        "card-native-package",
+        source_kind="card",
+        files={"A001.fcpbundle/Event/clip.mov": b"video bytes"},
+        manifest=True,
+    )
+
+    with session_scope(engine) as session:
+        outcomes = scan_landing_root(session, landing, cache_root=tmp_path / "cache")
+
+    assert outcomes[0].status == IntakeStatus.QUARANTINED.value
+    assert outcomes[0].reason == "bag-incomplete"
+    assert any("un-normalized package directory" in item for item in outcomes[0].details["errors"])
+    with session_scope(engine) as session:
         assert session.scalar(select(func.count()).select_from(IngestItem)) == 0
         assert session.scalar(select(func.count()).select_from(LogicalAsset)) == 0
         assert session.scalar(select(func.count()).select_from(Job)) == 0
