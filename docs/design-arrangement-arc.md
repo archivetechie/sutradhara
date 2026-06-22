@@ -8,7 +8,7 @@
 > ```text
 > inspect   = read-only validation/discovery
 > register  = explicit catalog acceptance
-> prepare   = explicit derivative/cloud job request
+> prepare   = explicit derivative/index/enrichment profile request
 > arrange   = pre-archive human layout over cataloged assets
 > submit    = frozen archive namespace/source-map
 > archive   = stream original bytes under submitted names
