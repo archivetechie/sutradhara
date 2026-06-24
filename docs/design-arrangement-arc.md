@@ -143,14 +143,30 @@ configurable **prepare profile**, not a verb per job kind:
 sutra prepare <intake-id> --profile hd-review
 ```
 
-A prepare profile maps `(artifactclass | media_kind, profile) -> [ {job_kind, params},
-... ]` (e.g. `s-masters + hd-review -> [transcode(mezz,preview), pfr-index]`).
+A prepare profile maps `(artifactclass | media_kind, profile) -> [ {job_kind, params,
+output_class}, ... ]` (e.g. `s-masters + hd-review -> [transcode(mezz,preview) → class
+s-proxy, pfr-index → sidecar]`).
 `prepare` ensures only the missing work (idempotent); a new kind is **config + a
 handler**, never a new CLI verb. It is the generic surface over the existing job
 framework, and the profile is desired-state the way copies are (the reconciliation
 model): "this class should have these derivations." Automation can still fire it; the
 work is reconciled (§2.6) and audited in the job/attempt log, not announced as a
 per-kind lifecycle event.
+
+**Each derivative output gets its own artifactclass — `output_class` — never the
+source's.** The produced item (a proxy, an extracted audio stem) is just another
+`IngestItem` with its own class, so it gets *its* copies by the normal `artifactclass
+-> pools` rule — and the model **recurses** (a derivative's class may itself declare a
+prepare profile). The class comes from the profile entry, so a proxy is always
+`s-proxy` (1 copy) — **never inherited from `s-masters` (3 expensive copies)**. Today
+`transcode` falls back to the source class when no class is passed
+(`handlers/transcode.py:85`: `params.get("proxy_artifactclass") or item.artifactclass`)
+— a footgun that would cut a proxy master-tier copies; **remove that fallback once the
+profile carries `output_class`.** A `sidecar = true` derivative (e.g. pfr-index)
+attaches to the source object and takes no copies of its own. This — copies driven by
+class, derivatives driven by the profile, both reconciled `policy × asset` — is the
+two-dimension desired-state model that `design-reconciliation-model.md §3.7` states
+generically; the concrete derivative model lives here.
 
 **cloud-temp is not one of these.** The encrypted cloud DR blob is a *temporary,
 lifecycle-bounded* `Copy` - created automatically at register/prepare, and **expired
