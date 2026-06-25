@@ -31,6 +31,16 @@ def _unique_index_columns(db_path: Path, table: str) -> set[tuple[str, ...]]:
         return result
 
 
+def _index_columns(db_path: Path, table: str) -> set[tuple[str, ...]]:
+    with sqlite3.connect(db_path) as conn:
+        result: set[tuple[str, ...]] = set()
+        for row in conn.execute(f"PRAGMA index_list({table})"):
+            index_name = row[1]
+            columns = tuple(col[2] for col in conn.execute(f"PRAGMA index_info({index_name})"))
+            result.add(columns)
+        return result
+
+
 def _index_sql(db_path: Path, index_name: str) -> str:
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
@@ -82,6 +92,18 @@ def _assert_worker_lease_invariants(db_path: Path) -> None:
     assert "validity" in _table_sql(db_path, "logical_asset")
     assert "validity_note" in _table_sql(db_path, "logical_asset")
     assert "ck_logical_asset_validity" in _table_sql(db_path, "logical_asset")
+    assert "job_attempt" in _tables(db_path)
+    attempt_sql = _table_sql(db_path, "job_attempt")
+    assert "job_kind" in attempt_sql
+    assert "attempt_number" in attempt_sql
+    assert "outcome" in attempt_sql
+    assert "granted_leases" in attempt_sql
+    assert "code_version" in attempt_sql
+    assert "DEFAULT '{}'" in attempt_sql
+    assert "ON DELETE SET NULL" in attempt_sql
+    attempt_indexes = _index_columns(db_path, "job_attempt")
+    assert ("job_id",) in attempt_indexes
+    assert ("job_kind",) in attempt_indexes
 
 
 def _assert_intake_invariants(db_path: Path) -> None:

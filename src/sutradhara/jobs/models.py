@@ -14,10 +14,12 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -80,9 +82,8 @@ class Job(Base):
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     dedupe_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
-    # Free-form on failure. Structured detail belongs in step_state /
-    # the audit log (which doesn't exist yet — TODO once Sutradhara audit
-    # surface lands).
+    # Free-form current failure reason. Structured per-run detail belongs in
+    # step_state and the append-only JobAttempt audit log.
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[dt.datetime] = mapped_column(
@@ -93,6 +94,48 @@ class Job(Base):
 
     def __repr__(self) -> str:
         return f"<Job id={self.id} kind={self.kind!r} status={self.status}>"
+
+
+class JobAttempt(Base):
+    """Append-only audit transcript for one completed run of a job.
+
+    The live ``job`` row remains the queue/current-state record. ``job_attempt``
+    keeps the durable execution history that later condition projections can
+    summarize, even after terminal job rows are pruned.
+    """
+
+    __tablename__ = "job_attempt"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("job.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    job_kind: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    outcome: Mapped[JobStatus] = mapped_column(String(16), nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    granted_leases: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default=text("'{}'")
+    )
+    worker_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    code_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    detail: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default=text("'{}'")
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<JobAttempt id={self.id} job_id={self.job_id} "
+            f"kind={self.job_kind!r} outcome={self.outcome}>"
+        )
 
 
 Index(

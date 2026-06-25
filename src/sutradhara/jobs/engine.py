@@ -15,6 +15,7 @@ from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
+from sutradhara.jobs.attempts import record_attempt
 from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.leases import LeaseManager, normalize_required_resources
 from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, TERMINAL_STATUSES, Job, JobStatus
@@ -103,6 +104,7 @@ def run_one(
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
         job.last_error = str(e)
+        record_attempt(session, job, granted_leases=granted_leases)
         return JobResult(ok=False, detail=str(e))
 
     try:
@@ -111,6 +113,7 @@ def run_one(
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
         job.last_error = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+        record_attempt(session, job, granted_leases=granted_leases)
         return JobResult(ok=False, detail=str(e))
 
     job.status = JobStatus.SUCCEEDED if result.ok else JobStatus.FAILED
@@ -120,6 +123,7 @@ def run_one(
         # Merge over existing step_state so handlers can build up state
         # incrementally without clobbering.
         job.step_state = {**job.step_state, **result.step_state}
+    record_attempt(session, job, granted_leases=granted_leases)
     return result
 
 
