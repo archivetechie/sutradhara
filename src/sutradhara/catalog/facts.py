@@ -115,7 +115,12 @@ def record_index(
     sidecar_path: Path,
     metadata_key: str = "pfr_sidecar_path",
 ) -> None:
-    """Record a sidecar index pointer for an ingest item without creating a Copy."""
+    """Record a sidecar index pointer for an ingest item without creating a Copy.
+
+    ``index_kind`` is part of the domain fact contract. P0.1 preserves the
+    existing v1 metadata shape, so the kind is validated here but not yet
+    persisted; P4.1's typed sidecar/index representation should record it.
+    """
 
     if not index_kind:
         raise ValueError("index_kind must be non-empty")
@@ -129,7 +134,10 @@ def record_validity(
     validity: AssetValidity,
     note: str | None = None,
 ) -> None:
-    """Record the latest decode/parse validity fact for an asset."""
+    """Record the latest decode/parse validity fact for an asset.
+
+    Passing ``note=None`` intentionally clears any previous validity note.
+    """
 
     asset.validity = validity
     asset.validity_note = note
