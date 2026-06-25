@@ -313,7 +313,9 @@ def test_receive_wraps_package_dir_as_single_tar_with_inner_index(tmp_path: Path
     with tarfile.open(package_tar, mode="r:") as tar:
         assert tar.getmember("A001.fcpbundle").isdir()
         assert tar.getmember("A001.fcpbundle/clip-link.mov").issym()
-        assert tar.extractfile("A001.fcpbundle/Event/clip.mov").read() == b"video"
+        extracted_member = tar.extractfile("A001.fcpbundle/Event/clip.mov")
+        assert extracted_member is not None
+        assert extracted_member.read() == b"video"
 
     validation = validate_bag(result.intake_dir)
     assert validation.valid is True

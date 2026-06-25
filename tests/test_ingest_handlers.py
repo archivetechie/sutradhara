@@ -40,6 +40,8 @@ from sutradhara.catalog.types import (
 from sutradhara.intake import prepare_intake, register_landing_root
 from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.models import Job, JobStatus
+from sutradhara.jobs.reconcilers import derivation as _derivation_reconciler  # noqa: F401
+from sutradhara.jobs.reconcilers.spine import reconcile
 
 
 @pytest.fixture
@@ -69,7 +71,7 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
         outcomes = register_landing_root(
             session,
             landing,
-            artifactclass="video-master",
+            artifactclass="s-masters",
             cache_root=tmp_path / "cache",
         )
         for outcome in outcomes:
@@ -77,8 +79,8 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
                 session,
                 outcome.intake_id,
                 profile="hd-review",
-                cache_root=tmp_path / "cache",
             )
+        reconcile(session, "derivation")
         jobs = list(session.scalars(select(Job).order_by(Job.kind)))
         assert [job.kind for job in jobs] == ["cloud-blob", "pfr-index", "transcode"]
         for job in jobs:
@@ -139,7 +141,7 @@ def test_transcode_derivation_facts_are_idempotent(
         )
         assert [item.id for item in derived] == [first_ids["mezz"], first_ids["preview"]]
         assert {item.item_metadata["kind"] for item in derived} == {"mezz", "preview"}
-        assert {item.artifactclass for item in derived} == {"proxy"}
+        assert {item.artifactclass for item in derived} == {"s-proxy"}
         assert session.scalar(select(func.count()).select_from(IngestItem)) == 3
         assert session.scalar(select(func.count()).select_from(AssetDerivation)) == 2
         assert session.scalar(select(func.count()).select_from(LogicalAsset)) == 3
@@ -202,7 +204,7 @@ def test_transcode_decode_error_marks_master_suspect(
             {
                 "ingest_item_id": item.id,
                 "cache_root": str(tmp_path / "cache"),
-                "proxy_artifactclass": "proxy",
+                "output_class": "s-proxy",
             },
             required_resources=[{"pool": "cpu", "count": 8}],
         )
@@ -245,7 +247,7 @@ def test_transcode_read_error_fails_without_suspect(
             {
                 "ingest_item_id": item.id,
                 "cache_root": str(tmp_path / "cache"),
-                "proxy_artifactclass": "proxy",
+                "output_class": "s-proxy",
             },
         )
         result = run_one(session, job.id)
@@ -343,7 +345,7 @@ def _run_transcode_job(engine: Engine, item_id: int, tmp_path: Path) -> dict[str
             {
                 "ingest_item_id": item_id,
                 "cache_root": str(tmp_path / "cache"),
-                "proxy_artifactclass": "proxy",
+                "output_class": "s-proxy",
             },
             required_resources=[{"pool": "cpu", "count": 8}],
         )

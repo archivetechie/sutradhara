@@ -122,13 +122,7 @@ def intake_register(
     "--cache-root",
     type=click.Path(path_type=Path, file_okay=False),
     default=None,
-    help="Directory for register/prepare work.",
-)
-@click.option(
-    "--proxy-artifactclass",
-    default="proxy",
-    show_default=True,
-    help="Artifactclass assigned to transcode outputs.",
+    help="Directory for register cloud-temp work.",
 )
 @click.option(
     "--cloud-backend",
@@ -149,7 +143,6 @@ def intake_accept(
     artifactclass: str | None,
     prepare_profile: str | None,
     cache_root: Path | None,
-    proxy_artifactclass: str,
     cloud_backend: str,
     cloud_pool: str,
     as_json: bool,
@@ -166,7 +159,6 @@ def intake_accept(
                 artifactclass=artifactclass,
                 prepare_profile=prepare_profile,
                 cache_root=cache_root,
-                proxy_artifactclass=proxy_artifactclass,
                 cloud_backend_name=cloud_backend,
                 cloud_pool_id=cloud_pool,
             )
@@ -181,27 +173,13 @@ def intake_accept(
 @click.command("prepare")
 @click.argument("intake_id")
 @click.option("--profile", required=True, help="Prepare profile to record.")
-@click.option(
-    "--cache-root",
-    type=click.Path(path_type=Path, file_okay=False),
-    required=True,
-    help="Directory for generated derivatives and sidecars.",
-)
-@click.option(
-    "--proxy-artifactclass",
-    default="proxy",
-    show_default=True,
-    help="Artifactclass assigned to transcode outputs.",
-)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON summary.")
 def prepare_cmd(
     intake_id: str,
     profile: str,
-    cache_root: Path,
-    proxy_artifactclass: str,
     as_json: bool,
 ) -> None:
-    """Record a prepare profile and enqueue missing derivative work."""
+    """Record a prepare profile for the derivation reconciler."""
 
     engine = make_engine()
     try:
@@ -210,8 +188,6 @@ def prepare_cmd(
                 session,
                 intake_id,
                 profile=profile,
-                cache_root=cache_root,
-                proxy_artifactclass=proxy_artifactclass,
             )
     except ValueError as exc:
         click.echo(f"error: {exc}", err=True)

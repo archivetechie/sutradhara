@@ -150,6 +150,7 @@ def test_register_receive_package_registers_one_logical_item(
         assert item.item_metadata["source_path"] == str(
             result.intake_dir / "data" / "A001.fcpbundle.tar"
         )
+        assert asset.media_info is not None
         assert asset.media_info["path"] == "A001.fcpbundle"
         assert asset.media_info["stored_member_path"] == "A001.fcpbundle.tar"
         jobs = list(session.scalars(select(Job)))
@@ -360,17 +361,16 @@ def test_register_then_prepare_splits_cloud_from_derivatives(
             session,
             "card-prepare",
             profile="hd-review",
-            cache_root=tmp_path / "cache",
         )
 
     assert registered.jobs_submitted == 1
-    assert prepared.jobs_submitted == 2
+    assert prepared.jobs_submitted == 0
     with session_scope(engine) as session:
         intake = session.get(Intake, "card-prepare")
         assert intake is not None
         assert intake.requested_profile == "hd-review"
         jobs = list(session.scalars(select(Job).order_by(Job.kind)))
-        assert [job.kind for job in jobs] == ["cloud-blob", "pfr-index", "transcode"]
+        assert [job.kind for job in jobs] == ["cloud-blob"]
 
 
 def test_prepare_requires_registered_and_known_profile(
@@ -394,7 +394,6 @@ def test_prepare_requires_registered_and_known_profile(
             session,
             "missing",
             profile="hd-review",
-            cache_root=tmp_path / "cache",
         )
     with (
         pytest.raises(ValueError, match="prepare requires registered"),
@@ -404,7 +403,6 @@ def test_prepare_requires_registered_and_known_profile(
             session,
             "card-bad",
             profile="hd-review",
-            cache_root=tmp_path / "cache",
         )
     with (
         pytest.raises(ValueError, match="unknown prepare profile"),
@@ -414,7 +412,6 @@ def test_prepare_requires_registered_and_known_profile(
             session,
             "card-bad",
             profile="typo",
-            cache_root=tmp_path / "cache",
         )
 
 
@@ -437,31 +434,28 @@ def test_prepare_idempotent_and_profile_overwrite(
             session,
             "card-overwrite",
             profile="hd-review",
-            cache_root=tmp_path / "cache",
         )
     with session_scope(engine) as session:
         second = prepare_intake(
             session,
             "card-overwrite",
             profile="hd-review",
-            cache_root=tmp_path / "cache",
         )
     with session_scope(engine) as session:
         third = prepare_intake(
             session,
             "card-overwrite",
             profile="proxy-review",
-            cache_root=tmp_path / "cache",
         )
 
-    assert first.jobs_submitted == 2
+    assert first.jobs_submitted == 0
     assert second.jobs_submitted == 0
     assert third.jobs_submitted == 0
     with session_scope(engine) as session:
         intake = session.get(Intake, "card-overwrite")
         assert intake is not None
         assert intake.requested_profile == "proxy-review"
-        assert session.scalar(select(func.count()).select_from(Job)) == 3
+        assert session.scalar(select(func.count()).select_from(Job)) == 1
 
 
 def test_accept_equals_register_plus_prepare(engine: Engine, tmp_path: Path) -> None:
@@ -483,13 +477,13 @@ def test_accept_equals_register_plus_prepare(engine: Engine, tmp_path: Path) -> 
         )
 
     assert outcome.status == IntakeStatus.REGISTERED.value
-    assert outcome.jobs_submitted == 3
+    assert outcome.jobs_submitted == 1
     with session_scope(engine) as session:
         intake = session.get(Intake, "card-accept")
         assert intake is not None
         assert intake.requested_profile == "hd-review"
         assert session.scalar(select(func.count()).select_from(IngestItem)) == 1
-        assert session.scalar(select(func.count()).select_from(Job)) == 3
+        assert session.scalar(select(func.count()).select_from(Job)) == 1
 
 
 def test_identical_bytes_dedup_to_one_logical_asset(

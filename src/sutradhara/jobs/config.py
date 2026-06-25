@@ -8,10 +8,19 @@ the actual granted leases through ``JobContext``.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 DEFAULT_IO_CAPACITY = 2
+DEFAULT_DERIVATION_CACHE_ROOT = Path("/var/lib/replica/cache")
+_DERIVATION_CACHE_ROOT_OVERRIDE: ContextVar[Path | None] = ContextVar(
+    "derivation_cache_root_override",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -113,3 +122,29 @@ def config_from_json(raw: dict[str, Any] | None = None) -> WorkerConfig:
             executor_workers=config.executor_workers,
         )
     return config
+
+
+def derivation_cache_root() -> Path:
+    """Return the cache root used by derivation reconcilers and handlers."""
+
+    override = _DERIVATION_CACHE_ROOT_OVERRIDE.get()
+    if override is not None:
+        return override
+    raw = os.environ.get("SUTRADHARA_CACHE_ROOT")
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return DEFAULT_DERIVATION_CACHE_ROOT
+
+
+@contextmanager
+def override_derivation_cache_root(path: str | Path | None) -> Iterator[None]:
+    """Temporarily override ``derivation_cache_root`` for one reconcile run."""
+
+    if path is None:
+        yield
+        return
+    token = _DERIVATION_CACHE_ROOT_OVERRIDE.set(Path(path).expanduser().resolve())
+    try:
+        yield
+    finally:
+        _DERIVATION_CACHE_ROOT_OVERRIDE.reset(token)

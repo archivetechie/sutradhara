@@ -11,7 +11,8 @@ from typing import Any
 from sutradhara.catalog.facts import record_derivation, record_validity
 from sutradhara.catalog.models import IngestItem, LogicalAsset
 from sutradhara.catalog.types import AssetValidity, MediaKind
-from sutradhara.jobs.registry import JobContext, JobResult, register_handler
+from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
+from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
 from sutradhara.rem_archive_cli import sha256_file
 
 
@@ -44,6 +45,10 @@ def handle_transcode(ctx: JobContext) -> JobResult:
             step_state={"transcode": {"kind": "read_error", "path": str(source_path)}},
         )
 
+    output_class = params.get("output_class")
+    if not isinstance(output_class, str) or not output_class:
+        raise ValueError("transcode job requires params.output_class (non-empty str)")
+
     cache_root = Path(str(params.get("cache_root") or ".sutradhara-cache")).resolve()
     output_dir = cache_root / "intakes" / item.intake_id / "derivatives" / str(item.id)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -71,10 +76,16 @@ def handle_transcode(ctx: JobContext) -> JobResult:
             ok=True,
             detail=str(result["detail"]),
             step_state={"transcode": result},
+            condition=ConditionProjection(
+                condition=CONDITION_BLOCKED,
+                reason="unsupported-source",
+                message=str(result["detail"]),
+                blocked_tool=("ffmpeg", _tool_version("ffmpeg")),
+            ),
         )
     if result["kind"] == "no_proxy":
         return JobResult(
-            ok=True,
+            ok=False,
             detail=str(result["detail"]),
             step_state={"transcode": result},
         )
@@ -85,14 +96,13 @@ def handle_transcode(ctx: JobContext) -> JobResult:
             step_state={"transcode": result},
         )
 
-    proxy_artifactclass = str(params.get("proxy_artifactclass") or item.artifactclass)
     mezz = record_derivation(
         ctx.session,
         source_item=item,
         output_path=mezz_path,
         relpath=f"derived/{item.id}/mezz.mp4",
         kind="mezz",
-        artifactclass=proxy_artifactclass,
+        artifactclass=output_class,
         media_kind=MediaKind.VIDEO,
         generated_by="transcode",
     )
@@ -102,7 +112,7 @@ def handle_transcode(ctx: JobContext) -> JobResult:
         output_path=preview_path,
         relpath=f"derived/{item.id}/preview.mp4",
         kind="preview",
-        artifactclass=proxy_artifactclass,
+        artifactclass=output_class,
         media_kind=MediaKind.VIDEO,
         generated_by="transcode",
     )
@@ -254,6 +264,24 @@ def _granted_cpu_threads(ctx: JobContext) -> int:
         return max(1, int(raw or 1))
     except (TypeError, ValueError):
         return 1
+
+
+def _tool_version(tool: str) -> str:
+    path = shutil.which(tool)
+    if path is None:
+        return "unknown"
+    try:
+        completed = subprocess.run(
+            [path, "-version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    lines = (completed.stdout or completed.stderr or "").splitlines()
+    return lines[0][:128] if lines else "unknown"
 
 
 def _read_prefix(path: Path, size: int) -> bytes:

@@ -3,7 +3,7 @@
 P1.1 splits the old combined landing-root pass into three verbs:
 `inspect_intake` validates without writing rows, `register_intake` admits
 catalog truth and ensures the cloud-temp stopgap, and `prepare_intake` records a
-profile and enqueues the temporary derivative jobs. Callers own transactions.
+profile for the derivation reconciler. Callers own transactions.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from sutradhara.catalog.models import (
-    AssetDerivation,
     Copy,
     IngestItem,
     Intake,
@@ -34,6 +33,7 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job
+from sutradhara.jobs.reconcilers.profiles import known_profile_names
 from sutradhara.receive import (
     BAG_INFO_NAME,
     DATA_DIR_NAME,
@@ -75,7 +75,6 @@ IMAGE_EXTENSIONS = {
 }
 DOCUMENT_EXTENSIONS = {".csv", ".doc", ".docx", ".json", ".pdf", ".txt", ".xml"}
 
-PREPARE_PROFILE_ALLOWLIST = frozenset({"hd-review", "proxy-review"})
 PayloadRecord = FileReceipt
 
 
@@ -320,13 +319,12 @@ def prepare_intake(
     intake_id: str,
     *,
     profile: str,
-    cache_root: str | Path,
-    proxy_artifactclass: str = "proxy",
 ) -> PrepareOutcome:
-    """Record a prepare profile and ensure the P1.1 derivative stopgap jobs."""
+    """Record a prepare profile for the derivation reconciler."""
 
-    if profile not in PREPARE_PROFILE_ALLOWLIST:
-        allowed = ", ".join(sorted(PREPARE_PROFILE_ALLOWLIST))
+    profile_names = known_profile_names()
+    if profile not in profile_names:
+        allowed = ", ".join(sorted(profile_names))
         raise ValueError(f"unknown prepare profile {profile!r}; expected one of: {allowed}")
     intake = session.get(Intake, intake_id)
     if intake is None:
@@ -336,19 +334,13 @@ def prepare_intake(
     previous = intake.requested_profile
     intake.requested_profile = profile
     intake.updated_at = _utcnow()
-    submitted = _enqueue_missing_derivative_jobs(
-        session,
-        intake,
-        cache_root=Path(cache_root),
-        proxy_artifactclass=proxy_artifactclass,
-    )
     session.flush()
     reason = "already-prepared" if previous == profile else "profile-recorded"
     return PrepareOutcome(
         intake_id=intake.intake_id,
         status=IntakeStatus.REGISTERED.value,
         profile=profile,
-        jobs_submitted=submitted,
+        jobs_submitted=0,
         reason=reason,
     )
 
@@ -360,7 +352,6 @@ def accept_landing_root(
     artifactclass: str | None = None,
     prepare_profile: str | None = None,
     cache_root: str | Path | None = None,
-    proxy_artifactclass: str = "proxy",
     cloud_backend_name: str = "cloud-temp",
     cloud_pool_id: str = "cloud-temp",
 ) -> list[IntakeRegisterOutcome]:
@@ -383,8 +374,6 @@ def accept_landing_root(
                 session,
                 outcome.intake_id,
                 profile=prepare_profile,
-                cache_root=final_cache_root,
-                proxy_artifactclass=proxy_artifactclass,
             )
             outcome = IntakeRegisterOutcome(
                 intake_id=outcome.intake_id,
@@ -409,7 +398,6 @@ def accept_intake(
     artifactclass: str | None = None,
     prepare_profile: str | None = None,
     cache_root: str | Path | None = None,
-    proxy_artifactclass: str = "proxy",
     cloud_backend_name: str = "cloud-temp",
     cloud_pool_id: str = "cloud-temp",
 ) -> IntakeRegisterOutcome:
@@ -425,16 +413,10 @@ def accept_intake(
     )
     if prepare_profile is None or outcome.status != IntakeStatus.REGISTERED.value:
         return outcome
-    ctx = _read_intake_context(intake_dir)
-    final_cache_root = (
-        Path(cache_root).resolve() if cache_root else ctx.root.parent / ".sutradhara-cache"
-    )
     prepared = prepare_intake(
         session,
         outcome.intake_id,
         profile=prepare_profile,
-        cache_root=final_cache_root,
-        proxy_artifactclass=proxy_artifactclass,
     )
     return IntakeRegisterOutcome(
         intake_id=outcome.intake_id,
@@ -552,44 +534,6 @@ def _enqueue_missing_cloud_job(
     )
 
 
-def _enqueue_missing_derivative_jobs(
-    session: Session,
-    intake: Intake,
-    *,
-    cache_root: Path,
-    proxy_artifactclass: str,
-) -> int:
-    submitted = 0
-    cache_root = cache_root.resolve()
-    for item in sorted(intake.items, key=lambda r: r.as_received_path):
-        if not _is_video_path(item.as_received_path):
-            continue
-        if not _source_has_derivations(session, item.id, {"mezz", "preview"}) and _submit_once(
-            session,
-            "transcode",
-            {
-                "ingest_item_id": item.id,
-                "cache_root": str(cache_root),
-                "proxy_artifactclass": proxy_artifactclass,
-            },
-            dedupe_key=f"transcode:{item.id}",
-            resources=[{"pool": "cpu", "count": 8}],
-        ):
-            submitted += 1
-        if not _has_pfr_sidecar(item) and _submit_once(
-            session,
-            "pfr-index",
-            {
-                "ingest_item_id": item.id,
-                "cache_root": str(cache_root),
-            },
-            dedupe_key=f"pfr-index:{item.id}",
-            resources=[{"pool": "io", "count": 1}, {"pool": "cpu", "count": 1}],
-        ):
-            submitted += 1
-    return submitted
-
-
 def _submit_once(
     session: Session,
     kind: str,
@@ -613,21 +557,6 @@ def _submit_once(
         dedupe_key=dedupe_key,
     )
     return job is not existing
-
-
-def _source_has_derivations(session: Session, item_id: int, kinds: set[str]) -> bool:
-    rows = session.scalars(
-        select(AssetDerivation.kind).where(
-            AssetDerivation.source_item_id == item_id,
-            AssetDerivation.kind.in_(kinds),
-        )
-    ).all()
-    return kinds.issubset(set(rows))
-
-
-def _has_pfr_sidecar(item: IngestItem) -> bool:
-    path = item.item_metadata.get("pfr_sidecar_path") if item.item_metadata else None
-    return isinstance(path, str) and Path(path).exists()
 
 
 def _cloud_bundle_has_copy(session: Session, intake_id: str) -> bool:
@@ -820,13 +749,13 @@ def _register_payload_record(
         asset = LogicalAsset(
             content_sha256=record.sha256_bytes,
             size_bytes=record.size_bytes,
-            media_kind=_media_kind_for_path(as_received_path),
+            media_kind=media_kind_for_path(as_received_path),
             media_info={"path": as_received_path, "stored_member_path": stored_member_path},
             validity=AssetValidity.UNVALIDATED,
         )
         session.add(asset)
     elif asset.media_kind is None:
-        asset.media_kind = _media_kind_for_path(as_received_path)
+        asset.media_kind = media_kind_for_path(as_received_path)
 
     item = session.scalars(
         select(IngestItem).where(
@@ -890,7 +819,9 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _media_kind_for_path(path: str) -> MediaKind:
+def media_kind_for_path(path: str) -> MediaKind:
+    """Classify an intake occurrence by its as-received path suffix."""
+
     suffix = Path(path).suffix.lower()
     if suffix in VIDEO_EXTENSIONS:
         return MediaKind.VIDEO
@@ -901,6 +832,9 @@ def _media_kind_for_path(path: str) -> MediaKind:
     if suffix in DOCUMENT_EXTENSIONS:
         return MediaKind.DOCUMENT
     return MediaKind.OTHER
+
+
+_media_kind_for_path = media_kind_for_path
 
 
 def _is_video_path(path: str) -> bool:
