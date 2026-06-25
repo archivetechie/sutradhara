@@ -37,9 +37,10 @@ reserves on dispatch, releases on terminal.
   `gpu` (0/omitted now).
 - Declaration: `required_resources: [{pool, count}]` — e.g. `transcode → [{cpu,8}]`,
   `pfr-index → [{io,1},{cpu,1}]`, `cloud-blob → [{io,1}]`.
-- Invariant `Σ leased[pool] ≤ capacity[pool]`. ffmpeg `-threads` is **pinned to the
-  leased `cpu` count** (fixes d2's uncapped-ffmpeg fire). Lease accounting is
-  in-memory in the single worker process (authoritative — one worker).
+- Invariant `Σ leased[pool] ≤ capacity[pool]`. Lease accounting is in-memory in the
+  single worker process (authoritative — one worker). **The lease bounds *admission*
+  (how many heavy jobs run at once) and the scarce non-CPU resources (`drive`/`gpu`/
+  `io`); actual CPU is bounded by a cgroup, NOT by ffmpeg `-threads` — see §4a.**
 
 ## 4. Worker + scheduler (single-node)
 **One worker process = one claimer/scheduler thread + a bounded execution pool.**
@@ -68,6 +69,54 @@ reserves on dispatch, releases on terminal.
 - **Crash recovery:** on worker startup any job left `RUNNING` is orphaned (single
   worker ⇒ nobody else owns it) → reset to PENDING; in-memory leases vanish with the
   process, so budget is reclaimed. Fixes d2's "job holding a tape indefinitely".
+
+## 4a. Elastic enforcement & priority (cgroups v2, not `-threads`)
+The lease budget decides *admission*; the **kernel** decides moment-to-moment CPU
+sharing. This split is deliberate (decisions 2026-06-25).
+
+**`-threads` is a hint, not a bound.** ffmpeg's real thread count is codec-dependent
+— libx265 (`pools`), hardware encoders, and decoder/filter/lookahead threads all
+ignore or exceed `-threads`. So we **never** rely on it to cap CPU. We may pass a
+`-threads` hint ≈ the lease (to avoid pathological intra-cgroup thread thrashing),
+but the **guarantee** is the cgroup.
+
+**CPU is enforced and shared by a cgroup (kernel-level) — which gives elasticity for
+free.** Each job runs in its own **cgroup v2** with:
+- **`CPUWeight`** (proportional share) — a job alone on an idle box expands to fill
+  spare cores; under contention the kernel shares by weight and it scales back
+  automatically ("use more when free, yield when busy");
+- optionally **`CPUQuota` / `cpu.max`** (a hard ceiling ≈ the leased cores) when a
+  hard cap is wanted;
+- **`IOWeight`** + `nice`/`ionice` for I/O-heavy and best-effort work.
+
+This bounds the **entire process tree** no matter how many threads the codec spawns —
+fixing d2's uncapped-ffmpeg fire *and* allowing elastic expansion, which static
+`-threads` pinning could not.
+
+**Ubuntu / systemd.** Modern Ubuntu LTS (22.04, 24.04) defaults to **cgroup v2**; go
+*through systemd*, never raw `/sys/fs/cgroup`. Either wrap each subprocess in a
+transient scope — `systemd-run --scope -p CPUWeight=N -p CPUQuota=M% -p IOWeight=K
+-- nice -n X <cmd>` — or run the worker as a `Delegate=yes` service that owns a
+cgroup subtree and sets `cpu.weight`/`cpu.max` per job. Do **not** use cgroup v1.
+
+**Priority** has two layers, both from a per-kind default + per-job override:
+- *Dispatch* priority — the `priority` field decides who gets a lease first
+  (work-conserving + aging, §4).
+- *Execution* priority — the same priority maps to `CPUWeight`/`nice`/`ionice` so the
+  running set shares the box by priority.
+Set it by **role**: urgent/operator-facing (restore, release-verify) = high;
+fresh-intake pipeline (transcode/pfr-index/cloud-blob) = medium; background/
+maintenance (verify-freshness, re-derive, bulk migration) = low/best-effort (soaks
+idle capacity, yields to everything).
+
+**Large campaigns don't blow up.** A bulk job (e.g. an LTO-7 → LTO-9 migration) is a
+**compact desired-state change** — one assignment + a generation bump, *not* millions
+of rows. Per-target work is **expanded in bounded shards** (reconciliation-model
+§4.4–4.5); the queue lives in the DB (cheap rows); the worker holds only the
+**in-flight** set in memory, bounded by leases (for tape, by the `drive` pool ≈ a
+handful at once). At best-effort priority it drains as a controlled background flow
+that yields to operator work. The anti-pattern — a synchronous million-row insert, or
+waking every asset each loop — is explicitly forbidden.
 
 ## 5. Job granularity & multi-file units
 **Rule: a job is the smallest unit of atomic, independently-retryable work. Choose

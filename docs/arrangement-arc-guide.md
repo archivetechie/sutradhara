@@ -103,7 +103,7 @@ The tempting mistake is to hard-code "make a proxy" into the pipeline. Then ever
 
 Adding a brand-new kind of derived work next year — say, transcription — is **a line of configuration plus a small handler**, not a new command and not a change to the pipeline. The operator's request never changes ("prepare, hd-review"); the *recipe* changes. This is a recurring theme: **the system is fixed about its core nouns and open-ended about the work that produces them.**
 
-One subtle but important detail: **each derived thing is a first-class item with its own filing class.** A proxy isn't "a cheap shadow of the master" — it's its own catalogued item that belongs to a *proxy* class, which says "keep 1 copy." The master belongs to a *masters* class, which says "keep 3 copies, one offsite, one encrypted." So a proxy is preserved like anything else — just to its own, cheaper, durability rule. (And the system must never accidentally let a proxy inherit the *master's* expensive 3-copy rule; the proxy's class comes from the recipe, deliberately.) The model even recurses: a derivative could itself have derivatives. Everything is "an item with a class," and the class decides how many copies it gets.
+One subtle but important detail: **each derived thing is a first-class item with its own filing class.** A proxy isn't "a cheap shadow of the master" — it's its own catalogued item that belongs to a *proxy* class, which says "keep 1 copy." The master belongs to a *masters* class, which says "keep 3 copies, one offsite, one encrypted." So a proxy is preserved like anything else — just to its own, cheaper, durability rule. (And the system must never accidentally let a proxy inherit the *master's* expensive 3-copy rule; the proxy's class comes from the recipe, deliberately.) The model even recurses: a derivative could itself have derivatives. Everything is "an item with a class," and the class decides how many copies it gets — **including zero.** Not every derived thing is preserved with its own copies: a partial-restore index just *rides along* on its source; the disaster-recovery cloud copy is deliberately *temporary* (kept until the tape copies are confirmed, then deleted); a cheap thumbnail might be kept only while convenient and simply *regenerated* from the master if it's ever lost. "Don't really preserve this" is just a class with no permanent copies — said in the same vocabulary as everything else. (And one more quiet benefit of this design: the small bit of code that *makes* a new kind of derivative — a transcription job, say — only has to speak in plain terms, "I produced a transcript from this master." It never needs to know how the catalogue stores things. That keeps adding new kinds of work genuinely easy.)
 
 ### 5. Arrange over copies, freeze a map, archive without wasteful copies
 
@@ -129,7 +129,19 @@ After material is on tape, organization doesn't stop — but it changes characte
 
 When someone restores a file — by its current virtual name, an old name, or a tag — the catalogue resolves that name through the item's identity down to the physical location on tape. Names are a flexible surface; the bytes underneath are fixed.
 
-### 7. The tireless librarian: how work actually gets decided
+### 7. Getting it back out — and a clever shortcut for giant files
+
+Storing is only half the job; eventually someone wants material *back*. Restore is where the catalogue earns its keep: you ask for something by its current name (or an old name, or a tag), the catalogue resolves that down to the exact spot on tape, and the bytes come back — verified against their fingerprint on the way out.
+
+Most of the time this is simple: pull one file out of an archived bundle. The bundle carries a little table of "this file lives at these bytes," so the drive seeks straight to it and reads just that file — no need to read the whole bundle.
+
+The interesting case is **pulling a short clip out of an enormous master** — say 30 seconds out of a 2-hour 4K file that's a quarter of a *terabyte*. Restoring the whole 250 GB just to grab 30 seconds is wasteful: on tape that's ~11 minutes of reading to use 0.1% of it. So for these giants we can be cleverer — but only because of a quirk of how tape works.
+
+On tape, **moving to a position ("seeking") and reading data are completely different speeds.** Seeking shuttles the tape at high speed, reading nothing — crossing the *entire* tape takes about a minute. Actually *reading* the entire tape would take about twelve *hours*. So seeking past data is hundreds of times faster than reading it. And here's the key: restoring the whole file and restoring just the clip pay the **same** seek to reach that part of the tape; the only difference is how much they then *read*. Whole-file reads 250 GB (~11 minutes); the clip reads ~1 GB (a few seconds). Same seek, vastly less reading — about a **13× faster** restore, and the drive is freed up 13× sooner for the next request.
+
+The catch is that this only pays off for the *giants*. Every restore has a fixed overhead of about a minute (mounting and seeking) that the shortcut can't beat — so it's only worth it when the reading you avoid is much bigger than that minute: files of roughly a hundred gigabytes and up. For an ordinary few-GB file, just restore the whole thing and trim the clip; the shortcut would save seconds and isn't worth the extra machinery. So the rule is simple: **whole-file for everything normal; the byte-range shortcut only for the handful of enormous high-bitrate masters** — which, conveniently, is exactly where most of the archive's bytes live. (And even on the shortcut, the actual video-cutting is handed to the standard tool, ffmpeg; we never reinvent that part.)
+
+### 8. The tireless librarian: how work actually gets decided
 
 So far we've described *what* should happen. The interesting question is *how the system makes sure it happens* — reliably, at the scale of tens of millions of files, for decades.
 
@@ -145,7 +157,7 @@ There's one practical wrinkle worth understanding, because it's the difference b
 
 This same librarian handles *every* kind of "should exist" the same way: copies, proxies, indexes, freshness re-checks ("this copy hasn't been verified in 180 days — re-verify it"). And it composes with the recipes from idea #4: a new kind of derived work is a new recipe entry, and the librarian starts ensuring it exists — no new machinery. (One more nuance: when work genuinely *can't* succeed right now — a corrupt source, a tool that needs upgrading — the librarian marks it "blocked" and stops banging on it, until the thing that would fix it actually changes. It retries when there's a reason to, not on a timer.)
 
-### 8. The sealed crate: when a "file" is really a folder of a million files
+### 9. The sealed crate: when a "file" is really a folder of a million files
 
 A last wrinkle that matters in real media work. Some things that *look* like a single file are actually folders containing thousands-to-millions of internal pieces — a Final Cut Pro library (`.fcpbundle`), a Photos library, an app bundle. The operator thinks of it as one item; the operating system treats it as one item; but on disk it's an explosion of tiny files.
 
@@ -166,7 +178,7 @@ If you remember nothing else, remember these:
 3. **The catalogue is the single source of truth, and it's editable; the tape is sealed.** Names and structure live in the catalogue; bytes live, unmovably, on tape.
 4. **Archive-everything; flag, never cull.** Nothing is silently deleted. "Rejected" is a label, not an erasure.
 5. **Steps are small, named, and predictable.** You always know what a command will and won't do. Custody begins at exactly one place.
-6. **Configuration over code.** New kinds of derived work, new policies, new recipes are configuration plus a small handler — not surgery on the pipeline.
+6. **Configuration over code.** New kinds of derived work, new policies, new recipes are configuration plus a small handler — not surgery on the pipeline. And that handler speaks in plain domain terms ("I made a transcript from this master"); it never needs to know the database's internals.
 7. **Desired-state, not triggers.** The system continuously closes the gap between what should exist and what does, so it self-heals and never silently loses work.
 8. **Arrange with pointers; copy nothing extra.** Human layout is a map; archiving follows the map and reads each original exactly once.
 

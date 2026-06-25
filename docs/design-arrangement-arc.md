@@ -352,6 +352,33 @@ fact-type** - the rare, deliberate, first-class decision (drawn maybe once a yea
 `transcode`/`pfr-index`/`cloud-temp` are "built-in" only in that they ship in the
 default profile + a default handler; the engine has no built-in/custom tier.
 
+**Handler contract: handlers record *facts*, not rows (decision 2026-06-25).** A
+handler must **not** write catalog tables directly — that would couple every handler
+to the schema and make a schema change ripple through all of them, and it would
+demand database knowledge to add a job. Instead a handler calls a thin
+**fact-recording API**, one call per fact-type: `record_derivation(source, output,
+kind, output_class)`, `record_index(...)`, `record_copy(...)`, `record_validity(...)`.
+That API is the *only* code that knows the `LogicalAsset`/`IngestItem`/
+`AssetDerivation`/`Copy` schema. So a new handler needs **domain** knowledge ("I
+produced a derivative of kind transcript"), not **database** knowledge; the schema can
+evolve behind the API; and the hard shared logic (dedup-by-hash, edges, idempotency)
+lives in one audited place. This is what actually makes "new job = config + a handler"
+true. (Today `transcode` constructs rows directly — migrate it onto this API.)
+
+**Not every produced item is archived — the class decides.** A derivative is always
+first-class in the *catalog* (recorded, identified, with a derivation edge), but
+whether it gets durable copies is driven entirely by its `output_class` — the same
+knob that says "3 copies" can say "0". Four cases, all expressed in the existing
+class vocabulary, no special mechanism:
+- **sidecar** (e.g. `pfr-index`): a fact that **rides on the source object**, with no
+  copies of its own (`sidecar = true`);
+- **temporary / lifecycle-bounded** (e.g. `cloud-temp`): a `Copy` whose desired
+  end-state is **deletion** (gate-expired) — preserved briefly by design;
+- **regenerable / cache**: a class with **no pools** — catalogued but never archived,
+  remade on demand from the preserved source (a cheap thumbnail, a scrub cache);
+- **pure scratch**: not catalogued at all — the handler discards its intermediates,
+  records only what it chooses to keep.
+
 ---
 
 ## 3. End-to-end Flow
@@ -1430,8 +1457,17 @@ Even with automation enabled, the domain events remain explicit and auditable.
    - no client-side FUSE in the first slice.
 4. Delete semantics in arrangement: safer default is `excluded` with explicit
    remove-from-workspace, not silent deletion.
-5. Source-map archive adapter: land direct source-map support in archive code, or
-   first present a virtual tree adapter to existing RAO code.
+5. Source-map archive adapter — **resolved (2026-06-25): a `--map` input to `rem
+   archive build`.** rem's build core already separates name from source
+   (`ArchiveBuildInputFile { source, archive_path }`, with archive-path uniqueness
+   enforced), so this is a CLI map-parser over existing machinery — it also verifies
+   the map's sha256 at build time and writes members **in map order** (so the arranged
+   structure is contiguous on tape). A symlink-tree adapter (arranged names as links
+   pointing at the masters) is acceptable only as a **temporary bridge**: it
+   re-materializes a possibly-million-entry tree and encodes the map in filesystem
+   paths, so it is not the target. Calling rem's Rust core directly is just `--map`
+   via a heavier Python↔Rust binding; the CLI `--map` keeps the existing shell-out
+   boundary. No file `mv`, no copied staging tree either way.
 6. Proxy readiness policy: whether arrangement creation blocks until `hd-review`
    is ready or creates a workspace in `pending_derivatives`.
 7. Package normalization (§2.5) — **resolved.** Wrap-once at receive; the archive
