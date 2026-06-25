@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from sutradhara.catalog.facts import record_validity
 from sutradhara.catalog.models import LogicalAsset
 from sutradhara.catalog.types import AssetValidity, is_content_hash
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
@@ -55,8 +56,7 @@ def handle_validate(ctx: JobContext) -> JobResult:
             json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         note = f"decode error via {validator}: {exc}"
-        asset.validity = AssetValidity.SUSPECT
-        asset.validity_note = note
+        record_validity(ctx.session, asset=asset, validity=AssetValidity.SUSPECT, note=note)
         return JobResult(
             ok=True,
             detail=note,
@@ -69,8 +69,9 @@ def handle_validate(ctx: JobContext) -> JobResult:
             },
         )
 
-    asset.validity = AssetValidity.OK
-    asset.validity_note = f"validated via {validator}"
+    record_validity(
+        ctx.session, asset=asset, validity=AssetValidity.OK, note=f"validated via {validator}"
+    )
     return JobResult(
         ok=True,
         detail="validated ok",

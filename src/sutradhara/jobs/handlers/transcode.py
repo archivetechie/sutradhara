@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
-
-from sutradhara.catalog.models import AssetDerivation, IngestItem, LogicalAsset
+from sutradhara.catalog.facts import record_derivation, record_validity
+from sutradhara.catalog.models import IngestItem, LogicalAsset
 from sutradhara.catalog.types import AssetValidity, MediaKind
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
+from sutradhara.rem_archive_cli import sha256_file
 
 
 @register_handler("transcode")
@@ -62,8 +61,12 @@ def handle_transcode(ctx: JobContext) -> JobResult:
         )
 
     if result["kind"] == "decode_error":
-        source_asset.validity = AssetValidity.SUSPECT
-        source_asset.validity_note = str(result["detail"])
+        record_validity(
+            ctx.session,
+            asset=source_asset,
+            validity=AssetValidity.SUSPECT,
+            note=str(result["detail"]),
+        )
         return JobResult(
             ok=True,
             detail=str(result["detail"]),
@@ -83,26 +86,32 @@ def handle_transcode(ctx: JobContext) -> JobResult:
         )
 
     proxy_artifactclass = str(params.get("proxy_artifactclass") or item.artifactclass)
-    mezz = _register_derived_item(
-        ctx,
+    mezz = record_derivation(
+        ctx.session,
         source_item=item,
         output_path=mezz_path,
         relpath=f"derived/{item.id}/mezz.mp4",
         kind="mezz",
         artifactclass=proxy_artifactclass,
         media_kind=MediaKind.VIDEO,
+        generated_by="transcode",
     )
-    preview = _register_derived_item(
-        ctx,
+    preview = record_derivation(
+        ctx.session,
         source_item=item,
         output_path=preview_path,
         relpath=f"derived/{item.id}/preview.mp4",
         kind="preview",
         artifactclass=proxy_artifactclass,
         media_kind=MediaKind.VIDEO,
+        generated_by="transcode",
     )
-    source_asset.validity = AssetValidity.OK
-    source_asset.validity_note = "transcode completed"
+    record_validity(
+        ctx.session,
+        asset=source_asset,
+        validity=AssetValidity.OK,
+        note="transcode completed",
+    )
     return JobResult(
         ok=True,
         detail="transcode outputs registered",
@@ -133,7 +142,7 @@ def _fake_transcode(source: Path, mezz: Path, preview: Path) -> dict[str, Any]:
             "kind": "decode_error",
             "detail": "decode error via fake transcode marker",
         }
-    source_digest = _sha256_file(source).hex()
+    source_digest = sha256_file(source).hex()
     mezz.write_bytes(f"fake mezzanine for {source_digest}\n".encode())
     preview.write_bytes(f"fake preview for {source_digest}\n".encode())
     return {"kind": "ok", "detail": "fake transcode completed"}
@@ -234,83 +243,6 @@ def _stderr_is_decode_error(stderr: str) -> bool:
     return any(needle in lowered for needle in needles)
 
 
-def _register_derived_item(
-    ctx: JobContext,
-    *,
-    source_item: IngestItem,
-    output_path: Path,
-    relpath: str,
-    kind: str,
-    artifactclass: str,
-    media_kind: MediaKind,
-) -> IngestItem:
-    if not output_path.exists() or output_path.stat().st_size <= 0:
-        raise ValueError(f"transcode output missing or empty: {output_path}")
-    digest = _sha256_file(output_path)
-    asset = ctx.session.get(LogicalAsset, digest)
-    if asset is None:
-        asset = LogicalAsset(
-            content_sha256=digest,
-            size_bytes=output_path.stat().st_size,
-            media_kind=media_kind,
-            media_info={"derived_from_item_id": source_item.id, "kind": kind},
-            validity=AssetValidity.UNVALIDATED,
-        )
-        ctx.session.add(asset)
-
-    item = ctx.session.scalars(
-        select(IngestItem).where(
-            IngestItem.intake_id == source_item.intake_id,
-            IngestItem.as_received_path == relpath,
-        )
-    ).one_or_none()
-    stat = output_path.stat()
-    metadata = {
-        "source_path": str(output_path),
-        "generated_by": "transcode",
-        "source_item_id": source_item.id,
-        "kind": kind,
-    }
-    if item is None:
-        item = IngestItem(
-            intake_id=source_item.intake_id,
-            logical_asset_hash=digest,
-            as_received_path=relpath,
-            virtual_path=relpath,
-            st_dev=getattr(stat, "st_dev", None),
-            st_ino=getattr(stat, "st_ino", None),
-            size_bytes=stat.st_size,
-            artifactclass=artifactclass,
-            item_metadata=metadata,
-        )
-        ctx.session.add(item)
-        ctx.session.flush()
-    else:
-        item.logical_asset_hash = digest
-        item.st_dev = getattr(stat, "st_dev", None)
-        item.st_ino = getattr(stat, "st_ino", None)
-        item.size_bytes = stat.st_size
-        item.artifactclass = artifactclass
-        item.item_metadata = {**(item.item_metadata or {}), **metadata}
-
-    edge = ctx.session.scalars(
-        select(AssetDerivation).where(
-            AssetDerivation.derived_item_id == item.id,
-            AssetDerivation.source_item_id == source_item.id,
-            AssetDerivation.kind == kind,
-        )
-    ).one_or_none()
-    if edge is None:
-        ctx.session.add(
-            AssetDerivation(
-                derived_item_id=item.id,
-                source_item_id=source_item.id,
-                kind=kind,
-            )
-        )
-    return item
-
-
 def _granted_cpu_threads(ctx: JobContext) -> int:
     raw = ctx.granted_leases.get("cpu")
     if raw is None:
@@ -327,11 +259,3 @@ def _granted_cpu_threads(ctx: JobContext) -> int:
 def _read_prefix(path: Path, size: int) -> bytes:
     with path.open("rb") as fh:
         return fh.read(size)
-
-
-def _sha256_file(path: Path) -> bytes:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.digest()

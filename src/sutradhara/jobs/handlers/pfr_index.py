@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from sutradhara.catalog.facts import record_index, record_validity
 from sutradhara.catalog.models import IngestItem, LogicalAsset
 from sutradhara.catalog.types import AssetValidity
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
@@ -43,8 +44,12 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
         if probe_result["kind"] == "container_parse_error":
             asset = ctx.session.get(LogicalAsset, item.logical_asset_hash)
             if asset is not None:
-                asset.validity = AssetValidity.SUSPECT
-                asset.validity_note = str(probe_result["detail"])
+                record_validity(
+                    ctx.session,
+                    asset=asset,
+                    validity=AssetValidity.SUSPECT,
+                    note=str(probe_result["detail"]),
+                )
             return JobResult(
                 ok=True,
                 detail=str(probe_result["detail"]),
@@ -66,7 +71,12 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
         "probe": probe,
     }
     sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    item.item_metadata = {**(item.item_metadata or {}), "pfr_sidecar_path": str(sidecar_path)}
+    record_index(
+        ctx.session,
+        item=item,
+        index_kind="pfr-index-v1",
+        sidecar_path=sidecar_path,
+    )
     return JobResult(
         ok=True,
         detail="pfr sidecar written",
