@@ -11,6 +11,7 @@ handlers are available after `import sutradhara.jobs.handlers`.
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,6 +30,21 @@ class JobContext:
     granted_leases: dict[str, int] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ConditionProjection:
+    """Axis-B condition projection returned by reconciler-aware handlers.
+
+    The projection intentionally contains no observed-state field: observed
+    reality is owned by reconciler observation, not by job handlers.
+    """
+
+    condition: str
+    reason: str | None = None
+    message: str | None = None
+    next_eligible_at: dt.datetime | None = None
+    blocked_tool: tuple[str, str] | None = None
+
+
 @dataclass
 class JobResult:
     """What a handler returns.
@@ -42,6 +58,7 @@ class JobResult:
     ok: bool
     detail: str = ""
     step_state: dict[str, Any] = field(default_factory=dict)
+    condition: ConditionProjection | None = None
 
 
 JobHandler = Callable[[JobContext], JobResult]

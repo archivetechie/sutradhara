@@ -127,7 +127,7 @@ def _execute_job(
     with session_scope(engine) as session:
         result = run_one(session, job_id, granted_leases=granted)
         job = session.get(Job, job_id)
-        if job is not None:
+        if job is not None and job.recon_domain is None:
             apply_retry_policy(session, job, config=config)
         return WorkerJobOutcome(
             job_id=job_id,

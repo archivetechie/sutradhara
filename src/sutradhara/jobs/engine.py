@@ -18,8 +18,20 @@ from sqlalchemy.orm import Session
 from sutradhara.jobs.attempts import record_attempt
 from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.leases import LeaseManager, normalize_required_resources
-from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, TERMINAL_STATUSES, Job, JobStatus
+from sutradhara.jobs.models import (
+    LIVE_JOB_STATUS_VALUES,
+    TERMINAL_STATUSES,
+    Job,
+    JobAttempt,
+    JobStatus,
+)
+from sutradhara.jobs.reconcilers.conditions import (
+    CONDITION_BACKOFF,
+    CONDITION_BLOCKED,
+    record_condition,
+)
 from sutradhara.jobs.registry import (
+    ConditionProjection,
     HandlerNotRegistered,
     JobContext,
     JobResult,
@@ -41,6 +53,8 @@ def submit(
     not_before: dt.datetime | None = None,
     priority: int = 0,
     dedupe_key: str | None = None,
+    recon_domain: str | None = None,
+    recon_target_key: str | None = None,
 ) -> Job:
     """Create a PENDING job in the catalog. Returns the persisted Job.
 
@@ -69,6 +83,8 @@ def submit(
         not_before=not_before or now,
         priority=priority,
         dedupe_key=dedupe_key,
+        recon_domain=recon_domain,
+        recon_target_key=recon_target_key,
     )
     session.add(job)
     session.flush()  # so caller can read job.id
@@ -104,16 +120,46 @@ def run_one(
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
         job.last_error = str(e)
-        record_attempt(session, job, granted_leases=granted_leases)
+        attempt = record_attempt(session, job, granted_leases=granted_leases)
+        _record_reconciler_condition(
+            session,
+            job,
+            attempt,
+            condition=CONDITION_BACKOFF,
+            reason="handler-not-registered",
+            message=str(e),
+        )
         return JobResult(ok=False, detail=str(e))
 
     try:
         result = handler(JobContext(session=session, job=job, granted_leases=granted_leases or {}))
+    except NotImplementedError as e:
+        job.status = JobStatus.FAILED
+        job.finished_at = _utcnow()
+        job.last_error = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+        attempt = record_attempt(session, job, granted_leases=granted_leases)
+        _record_reconciler_condition(
+            session,
+            job,
+            attempt,
+            condition=CONDITION_BLOCKED,
+            reason="not-implemented",
+            message=str(e),
+        )
+        return JobResult(ok=False, detail=str(e))
     except Exception as e:
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
         job.last_error = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
-        record_attempt(session, job, granted_leases=granted_leases)
+        attempt = record_attempt(session, job, granted_leases=granted_leases)
+        _record_reconciler_condition(
+            session,
+            job,
+            attempt,
+            condition=CONDITION_BACKOFF,
+            reason="handler-exception",
+            message=str(e),
+        )
         return JobResult(ok=False, detail=str(e))
 
     job.status = JobStatus.SUCCEEDED if result.ok else JobStatus.FAILED
@@ -123,8 +169,67 @@ def run_one(
         # Merge over existing step_state so handlers can build up state
         # incrementally without clobbering.
         job.step_state = {**job.step_state, **result.step_state}
-    record_attempt(session, job, granted_leases=granted_leases)
+    attempt = record_attempt(session, job, granted_leases=granted_leases)
+    if result.condition is not None:
+        _record_projection_condition(session, job, attempt, result.condition)
+    elif result.ok:
+        _record_reconciler_condition(session, job, attempt, condition=None)
+    else:
+        _record_reconciler_condition(
+            session,
+            job,
+            attempt,
+            condition=CONDITION_BACKOFF,
+            reason="unclassified",
+            message=result.detail,
+        )
     return result
+
+
+def _record_projection_condition(
+    session: Session,
+    job: Job,
+    attempt: JobAttempt,
+    projection: ConditionProjection,
+) -> None:
+    _record_reconciler_condition(
+        session,
+        job,
+        attempt,
+        condition=projection.condition,
+        reason=projection.reason,
+        message=projection.message,
+        next_eligible_at=projection.next_eligible_at,
+        blocked_tool=projection.blocked_tool,
+    )
+
+
+def _record_reconciler_condition(
+    session: Session,
+    job: Job,
+    attempt: JobAttempt,
+    *,
+    condition: str | None,
+    reason: str | None = None,
+    message: str | None = None,
+    next_eligible_at: dt.datetime | None = None,
+    blocked_tool: tuple[str, str] | None = None,
+) -> None:
+    if job.recon_domain is None:
+        return
+    if job.recon_target_key is None:
+        raise ValueError(f"reconciler job id={job.id} has recon_domain but no target key")
+    record_condition(
+        session,
+        domain=job.recon_domain,
+        target_key=job.recon_target_key,
+        condition=condition,
+        reason=reason,
+        message=message,
+        attempt=attempt,
+        next_eligible_at=next_eligible_at,
+        blocked_tool=blocked_tool,
+    )
 
 
 def claim_pending(

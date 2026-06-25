@@ -19,6 +19,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -81,6 +82,8 @@ class Job(Base):
     )
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     dedupe_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    recon_domain: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    recon_target_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # Free-form current failure reason. Structured per-run detail belongs in
     # step_state and the append-only JobAttempt audit log.
@@ -138,10 +141,73 @@ class JobAttempt(Base):
         )
 
 
+class ReconciliationCondition(Base):
+    """Durable per-target reconciliation projection.
+
+    Rows are keyed by ``(domain, target_key)`` and summarize observed reality plus
+    the latest attempt outcome so reconcilers can use a small indexed worklist
+    instead of scanning job attempts.
+    """
+
+    __tablename__ = "reconciliation_condition"
+    __table_args__ = (
+        UniqueConstraint("domain", "target_key", name="uq_recon_condition_domain_target"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    domain: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    observed_state: Mapped[str] = mapped_column(String(64), nullable=False)
+    condition: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_eligible_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    blocked_tool_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    blocked_tool_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_attempt_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("job_attempt.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    last_attempt_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_success_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ReconciliationCondition domain={self.domain!r} "
+            f"target={self.target_key!r} condition={self.condition!r}>"
+        )
+
+
 Index(
     "uq_job_dedupe_key_live",
     Job.dedupe_key,
     unique=True,
     sqlite_where=Job.status.in_(LIVE_JOB_STATUS_VALUES),
     postgresql_where=Job.status.in_(LIVE_JOB_STATUS_VALUES),
+)
+
+Index(
+    "ix_job_recon_live",
+    Job.recon_domain,
+    Job.recon_target_key,
+    sqlite_where=Job.status.in_(LIVE_JOB_STATUS_VALUES),
+    postgresql_where=Job.status.in_(LIVE_JOB_STATUS_VALUES),
+)
+
+Index(
+    "ix_condition_work",
+    ReconciliationCondition.domain,
+    ReconciliationCondition.condition,
+    ReconciliationCondition.next_eligible_at,
 )
