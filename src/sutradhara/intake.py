@@ -1,14 +1,15 @@
-"""Landing-root intake scanner for Phase R.
+"""Explicit intake lifecycle for landing-root acceptance.
 
-The scanner is level-triggered over completed intake directories. A completed
-front-door receive is a BagIt bag with an `intake.json` sentinel and a `data/`
-subtree. Baseline legacy intakes without BagIt tags still register from
-`payload/` with no manifest.
+P1.1 splits the old combined landing-root pass into three verbs:
+`inspect_intake` validates without writing rows, `register_intake` admits
+catalog truth and ensures the cloud-temp stopgap, and `prepare_intake` records a
+profile and enqueues the temporary derivative jobs. Callers own transactions.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -74,12 +75,29 @@ IMAGE_EXTENSIONS = {
 }
 DOCUMENT_EXTENSIONS = {".csv", ".doc", ".docx", ".json", ".pdf", ".txt", ".xml"}
 
-
+PREPARE_PROFILE_ALLOWLIST = frozenset({"hd-review", "proxy-review"})
 PayloadRecord = FileReceipt
 
 
-@dataclass
-class IntakeScanOutcome:
+@dataclass(frozen=True)
+class InspectReport:
+    """Read-only validation report for a completed intake directory."""
+
+    intake_id: str
+    path: Path
+    status: str
+    item_count: int = 0
+    reason: str | None = None
+    manifest_path: Path | None = None
+    manifest_digest: str | None = None
+    artifactclass: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class IntakeRegisterOutcome:
+    """Result of explicit catalog acceptance for one intake."""
+
     intake_id: str
     path: Path
     status: str
@@ -87,240 +105,488 @@ class IntakeScanOutcome:
     jobs_submitted: int = 0
     reason: str | None = None
     manifest_path: Path | None = None
+    manifest_digest: str | None = None
+    artifactclass: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
 
-def scan_landing_root(
+@dataclass(frozen=True)
+class PrepareOutcome:
+    """Result of recording and ensuring derivative work for a prepare profile."""
+
+    intake_id: str
+    status: str
+    profile: str
+    jobs_submitted: int = 0
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _IntakeContext:
+    root: Path
+    sentinel: dict[str, Any]
+    is_bag: bool
+    payload_root: Path
+    manifest_path: Path | None
+    metadata: dict[str, Any]
+    intake_id: str
+
+
+@dataclass(frozen=True)
+class _ValidatedPayload:
+    intake_id: str
+    metadata: dict[str, Any]
+    records: list[PayloadRecord]
+    valid: bool
+    complete: bool
+    manifest_digest: str | None
+    details: dict[str, Any]
+
+
+def inspect_landing_root(
+    session: Session,
+    landing_root: str | Path,
+) -> list[InspectReport]:
+    """Inspect every completed intake below a landing root without DB writes."""
+
+    return [inspect_intake(session, path) for path in _iter_intake_dirs(landing_root)]
+
+
+def inspect_intake(session: Session, intake_dir: str | Path) -> InspectReport:
+    """Validate one intake directory and report readiness without mutating catalog rows."""
+
+    ctx = _read_intake_context(intake_dir)
+    validated = _validate_payload(ctx)
+    existing = session.get(Intake, validated.intake_id)
+    artifactclass = _optional_str(validated.metadata.get("artifactclass"))
+    if existing is not None and existing.status == IntakeStatus.REGISTERED:
+        status = "already-registered"
+        reason = status
+        item_count = len(existing.items)
+    elif existing is not None and existing.status == IntakeStatus.QUARANTINED:
+        status = "quarantined"
+        reason = status
+        item_count = 0
+    elif validated.valid:
+        status = "ready"
+        reason = None
+        item_count = len(validated.records)
+    elif not validated.complete:
+        status = "incomplete"
+        reason = "bag-incomplete"
+        item_count = 0
+    else:
+        status = "invalid"
+        reason = "bag-invalid"
+        item_count = 0
+    return InspectReport(
+        intake_id=validated.intake_id,
+        path=ctx.root,
+        status=status,
+        item_count=item_count,
+        reason=reason,
+        manifest_path=ctx.manifest_path,
+        manifest_digest=validated.manifest_digest,
+        artifactclass=artifactclass,
+        details=validated.details,
+    )
+
+
+def register_landing_root(
     session: Session,
     landing_root: str | Path,
     *,
-    enqueue_jobs: bool = True,
+    artifactclass: str | None = None,
     cache_root: str | Path | None = None,
-    proxy_artifactclass: str = "proxy",
     cloud_backend_name: str = "cloud-temp",
     cloud_pool_id: str = "cloud-temp",
-) -> list[IntakeScanOutcome]:
-    """Scan completed intakes below `landing_root`.
-
-    Caller owns the transaction. This function is idempotent against registered
-    intakes and live jobs; terminal job history is not treated as durable
-    desired state.
-    """
+) -> list[IntakeRegisterOutcome]:
+    """Register every completed intake below a landing root."""
 
     root = Path(landing_root).resolve()
-    outcomes: list[IntakeScanOutcome] = []
-    if not root.exists():
-        raise FileNotFoundError(root)
-
     final_cache_root = Path(cache_root).resolve() if cache_root else root / ".sutradhara-cache"
-    for intake_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        sentinel = intake_dir / "intake.json"
-        if not sentinel.exists():
-            continue
-        outcomes.append(
-            scan_intake(
-                session,
-                intake_dir,
-                enqueue_jobs=enqueue_jobs,
-                cache_root=final_cache_root,
-                proxy_artifactclass=proxy_artifactclass,
-                cloud_backend_name=cloud_backend_name,
-                cloud_pool_id=cloud_pool_id,
-            )
+    return [
+        register_intake(
+            session,
+            path,
+            artifactclass=artifactclass,
+            cache_root=final_cache_root,
+            cloud_backend_name=cloud_backend_name,
+            cloud_pool_id=cloud_pool_id,
         )
-    return outcomes
+        for path in _iter_intake_dirs(root)
+    ]
 
 
-def scan_intake(
+def register_intake(
     session: Session,
     intake_dir: str | Path,
     *,
-    enqueue_jobs: bool = True,
-    cache_root: str | Path,
-    proxy_artifactclass: str = "proxy",
+    artifactclass: str | None = None,
+    cache_root: str | Path | None = None,
     cloud_backend_name: str = "cloud-temp",
     cloud_pool_id: str = "cloud-temp",
-) -> IntakeScanOutcome:
-    """Verify and register a single completed intake directory."""
+) -> IntakeRegisterOutcome:
+    """Validate and explicitly admit one intake into the catalog."""
 
-    root = Path(intake_dir).resolve()
-    sentinel_path = root / "intake.json"
-    if not sentinel_path.exists():
-        raise FileNotFoundError(sentinel_path)
-
-    sentinel = _read_json(sentinel_path)
-    is_bag = _is_bag_intake(root)
-    if is_bag:
-        payload_root = root / DATA_DIR_NAME
-        manifest_path = root / MANIFEST_NAME
-        metadata = _intake_metadata_from_bag(root, sentinel)
-    else:
-        payload_root = root / "payload"
-        manifest_path = None
-        metadata = _intake_metadata_from_mapping(sentinel, root)
-    if not is_bag and not payload_root.is_dir():
-        raise FileNotFoundError(payload_root)
-
-    intake_id = str(metadata.get("intake_id") or root.name)
-    existing = session.get(Intake, intake_id)
-    if existing is not None and existing.status == IntakeStatus.QUARANTINED:
-        return IntakeScanOutcome(
-            intake_id=intake_id,
-            path=root,
-            status=IntakeStatus.QUARANTINED.value,
-            reason="already-quarantined",
-            manifest_path=Path(existing.manifest_path) if existing.manifest_path else manifest_path,
-        )
+    ctx = _read_intake_context(intake_dir)
+    validated = _validate_payload(ctx)
+    resolved_class = _resolve_artifactclass(ctx, validated.metadata, artifactclass)
+    metadata = {**validated.metadata, "artifactclass": resolved_class}
+    existing = session.get(Intake, validated.intake_id)
+    final_cache_root = (
+        Path(cache_root).resolve() if cache_root else ctx.root.parent / ".sutradhara-cache"
+    )
 
     if existing is not None and existing.status == IntakeStatus.REGISTERED:
-        submitted = (
-            _enqueue_missing_jobs(
-                session,
-                existing,
-                payload_root=payload_root,
-                cache_root=Path(cache_root),
-                proxy_artifactclass=proxy_artifactclass,
-                cloud_backend_name=cloud_backend_name,
-                cloud_pool_id=cloud_pool_id,
-            )
-            if enqueue_jobs
-            else 0
-        )
-        _write_verified_receipt(
-            root,
+        return _handle_registered_intake(
+            session,
+            ctx,
+            validated,
             existing,
-            item_count=len(existing.items),
-            jobs_submitted=submitted,
-        )
-        return IntakeScanOutcome(
-            intake_id=intake_id,
-            path=root,
-            status=IntakeStatus.REGISTERED.value,
-            item_count=len(existing.items),
-            jobs_submitted=submitted,
-            reason="already-registered",
-            manifest_path=Path(existing.manifest_path) if existing.manifest_path else manifest_path,
+            resolved_class=resolved_class,
+            cache_root=final_cache_root,
+            cloud_backend_name=cloud_backend_name,
+            cloud_pool_id=cloud_pool_id,
         )
 
-    if is_bag:
-        validation = validate_bag(root)
-        metadata = _intake_metadata_from_labels(validation.metadata, sentinel, root)
-        intake_id = str(metadata.get("intake_id") or intake_id)
-        if not validation.valid:
-            reason = "bag-incomplete" if not validation.complete else "bag-invalid"
-            intake = _upsert_intake(
-                session,
-                intake_id=intake_id,
-                metadata=metadata,
-                manifest_path=manifest_path,
-                status=IntakeStatus.QUARANTINED,
-            )
-            details = validation.details()
-            _write_quarantine_receipt(root, intake, details, reason=reason)
-            return IntakeScanOutcome(
-                intake_id=intake_id,
-                path=root,
-                status=IntakeStatus.QUARANTINED.value,
-                reason=reason,
-                manifest_path=manifest_path,
-                details=details,
-            )
-        records = list(validation.actual_records)
-    else:
-        records = _hash_payload(payload_root)
+    if not validated.valid:
+        reason = "bag-incomplete" if not validated.complete else "bag-invalid"
+        intake = _upsert_intake(
+            session,
+            intake_id=validated.intake_id,
+            metadata=metadata,
+            manifest_path=ctx.manifest_path,
+            status=IntakeStatus.QUARANTINED,
+        )
+        intake.manifest_digest = validated.manifest_digest
+        session.flush()
+        _write_quarantine_receipt(ctx.root, intake, validated.details, reason=reason)
+        return IntakeRegisterOutcome(
+            intake_id=validated.intake_id,
+            path=ctx.root,
+            status=IntakeStatus.QUARANTINED.value,
+            reason=reason,
+            manifest_path=ctx.manifest_path,
+            manifest_digest=validated.manifest_digest,
+            artifactclass=resolved_class,
+            details=validated.details,
+        )
 
     intake = _upsert_intake(
         session,
-        intake_id=intake_id,
+        intake_id=validated.intake_id,
         metadata=metadata,
-        manifest_path=manifest_path,
+        manifest_path=ctx.manifest_path,
         status=IntakeStatus.VERIFYING,
     )
-    for record in records:
-        _register_payload_record(session, intake, payload_root, record)
+    for record in validated.records:
+        _register_payload_record(session, intake, ctx.payload_root, record)
+    intake.manifest_digest = validated.manifest_digest
     intake.status = IntakeStatus.REGISTERED
     intake.registered_at = _utcnow()
     intake.quarantined_at = None
     intake.updated_at = intake.registered_at
     session.flush()
 
-    submitted = (
-        _enqueue_missing_jobs(
+    submitted = _enqueue_missing_cloud_job(
+        session,
+        intake,
+        payload_root=ctx.payload_root,
+        cache_root=final_cache_root,
+        cloud_backend_name=cloud_backend_name,
+        cloud_pool_id=cloud_pool_id,
+    )
+    _write_verified_receipt(
+        ctx.root,
+        intake,
+        item_count=len(validated.records),
+        jobs_submitted=submitted,
+    )
+    return IntakeRegisterOutcome(
+        intake_id=validated.intake_id,
+        path=ctx.root,
+        status=IntakeStatus.REGISTERED.value,
+        item_count=len(validated.records),
+        jobs_submitted=submitted,
+        manifest_path=ctx.manifest_path,
+        manifest_digest=validated.manifest_digest,
+        artifactclass=resolved_class,
+    )
+
+
+def prepare_intake(
+    session: Session,
+    intake_id: str,
+    *,
+    profile: str,
+    cache_root: str | Path,
+    proxy_artifactclass: str = "proxy",
+) -> PrepareOutcome:
+    """Record a prepare profile and ensure the P1.1 derivative stopgap jobs."""
+
+    if profile not in PREPARE_PROFILE_ALLOWLIST:
+        allowed = ", ".join(sorted(PREPARE_PROFILE_ALLOWLIST))
+        raise ValueError(f"unknown prepare profile {profile!r}; expected one of: {allowed}")
+    intake = session.get(Intake, intake_id)
+    if intake is None:
+        raise ValueError(f"intake {intake_id!r} is not registered; register first")
+    if intake.status != IntakeStatus.REGISTERED:
+        raise ValueError(f"intake {intake_id!r} is {intake.status}; prepare requires registered")
+    previous = intake.requested_profile
+    intake.requested_profile = profile
+    intake.updated_at = _utcnow()
+    submitted = _enqueue_missing_derivative_jobs(
+        session,
+        intake,
+        cache_root=Path(cache_root),
+        proxy_artifactclass=proxy_artifactclass,
+    )
+    session.flush()
+    reason = "already-prepared" if previous == profile else "profile-recorded"
+    return PrepareOutcome(
+        intake_id=intake.intake_id,
+        status=IntakeStatus.REGISTERED.value,
+        profile=profile,
+        jobs_submitted=submitted,
+        reason=reason,
+    )
+
+
+def accept_landing_root(
+    session: Session,
+    landing_root: str | Path,
+    *,
+    artifactclass: str | None = None,
+    prepare_profile: str | None = None,
+    cache_root: str | Path | None = None,
+    proxy_artifactclass: str = "proxy",
+    cloud_backend_name: str = "cloud-temp",
+    cloud_pool_id: str = "cloud-temp",
+) -> list[IntakeRegisterOutcome]:
+    """Register every completed intake and optionally prepare registered ones."""
+
+    root = Path(landing_root).resolve()
+    final_cache_root = Path(cache_root).resolve() if cache_root else root / ".sutradhara-cache"
+    outcomes: list[IntakeRegisterOutcome] = []
+    for path in _iter_intake_dirs(root):
+        outcome = register_intake(
             session,
-            intake,
-            payload_root=payload_root,
-            cache_root=Path(cache_root),
-            proxy_artifactclass=proxy_artifactclass,
+            path,
+            artifactclass=artifactclass,
+            cache_root=final_cache_root,
             cloud_backend_name=cloud_backend_name,
             cloud_pool_id=cloud_pool_id,
         )
-        if enqueue_jobs
-        else 0
+        if prepare_profile is not None and outcome.status == IntakeStatus.REGISTERED.value:
+            prepared = prepare_intake(
+                session,
+                outcome.intake_id,
+                profile=prepare_profile,
+                cache_root=final_cache_root,
+                proxy_artifactclass=proxy_artifactclass,
+            )
+            outcome = IntakeRegisterOutcome(
+                intake_id=outcome.intake_id,
+                path=outcome.path,
+                status=outcome.status,
+                item_count=outcome.item_count,
+                jobs_submitted=outcome.jobs_submitted + prepared.jobs_submitted,
+                reason=outcome.reason,
+                manifest_path=outcome.manifest_path,
+                manifest_digest=outcome.manifest_digest,
+                artifactclass=outcome.artifactclass,
+                details=outcome.details,
+            )
+        outcomes.append(outcome)
+    return outcomes
+
+
+def accept_intake(
+    session: Session,
+    intake_dir: str | Path,
+    *,
+    artifactclass: str | None = None,
+    prepare_profile: str | None = None,
+    cache_root: str | Path | None = None,
+    proxy_artifactclass: str = "proxy",
+    cloud_backend_name: str = "cloud-temp",
+    cloud_pool_id: str = "cloud-temp",
+) -> IntakeRegisterOutcome:
+    """Register one intake and optionally prepare it in the caller's transaction."""
+
+    outcome = register_intake(
+        session,
+        intake_dir,
+        artifactclass=artifactclass,
+        cache_root=cache_root,
+        cloud_backend_name=cloud_backend_name,
+        cloud_pool_id=cloud_pool_id,
     )
-    _write_verified_receipt(root, intake, item_count=len(records), jobs_submitted=submitted)
-    return IntakeScanOutcome(
-        intake_id=intake_id,
-        path=root,
-        status=IntakeStatus.REGISTERED.value,
-        item_count=len(records),
+    if prepare_profile is None or outcome.status != IntakeStatus.REGISTERED.value:
+        return outcome
+    ctx = _read_intake_context(intake_dir)
+    final_cache_root = (
+        Path(cache_root).resolve() if cache_root else ctx.root.parent / ".sutradhara-cache"
+    )
+    prepared = prepare_intake(
+        session,
+        outcome.intake_id,
+        profile=prepare_profile,
+        cache_root=final_cache_root,
+        proxy_artifactclass=proxy_artifactclass,
+    )
+    return IntakeRegisterOutcome(
+        intake_id=outcome.intake_id,
+        path=outcome.path,
+        status=outcome.status,
+        item_count=outcome.item_count,
+        jobs_submitted=outcome.jobs_submitted + prepared.jobs_submitted,
+        reason=outcome.reason,
+        manifest_path=outcome.manifest_path,
+        manifest_digest=outcome.manifest_digest,
+        artifactclass=outcome.artifactclass,
+        details=outcome.details,
+    )
+
+
+def _handle_registered_intake(
+    session: Session,
+    ctx: _IntakeContext,
+    validated: _ValidatedPayload,
+    existing: Intake,
+    *,
+    resolved_class: str,
+    cache_root: Path,
+    cloud_backend_name: str,
+    cloud_pool_id: str,
+) -> IntakeRegisterOutcome:
+    if not validated.valid:
+        details = {
+            "reason": "registered-intake-invalid",
+            "validation": validated.details,
+            "expected": {
+                "manifest_digest": existing.manifest_digest,
+                "artifactclass": existing.artifactclass,
+            },
+            "actual": {
+                "manifest_digest": validated.manifest_digest,
+                "artifactclass": resolved_class,
+            },
+        }
+        _write_discrepancy_receipt(ctx.root, existing, details)
+        raise ValueError(f"registered intake {existing.intake_id!r} no longer validates")
+
+    same_fingerprint = (
+        existing.manifest_digest == validated.manifest_digest
+        and existing.artifactclass == resolved_class
+    )
+    if not same_fingerprint:
+        details = {
+            "reason": "fingerprint-mismatch",
+            "expected": {
+                "manifest_digest": existing.manifest_digest,
+                "artifactclass": existing.artifactclass,
+            },
+            "actual": {
+                "manifest_digest": validated.manifest_digest,
+                "artifactclass": resolved_class,
+            },
+        }
+        _write_discrepancy_receipt(ctx.root, existing, details)
+        raise ValueError(f"registered intake {existing.intake_id!r} fingerprint changed")
+
+    submitted = _enqueue_missing_cloud_job(
+        session,
+        existing,
+        payload_root=ctx.payload_root,
+        cache_root=cache_root,
+        cloud_backend_name=cloud_backend_name,
+        cloud_pool_id=cloud_pool_id,
+    )
+    _write_verified_receipt(
+        ctx.root,
+        existing,
+        item_count=len(existing.items),
         jobs_submitted=submitted,
-        manifest_path=manifest_path,
+    )
+    return IntakeRegisterOutcome(
+        intake_id=existing.intake_id,
+        path=ctx.root,
+        status=IntakeStatus.REGISTERED.value,
+        item_count=len(existing.items),
+        jobs_submitted=submitted,
+        reason="already-registered",
+        manifest_path=Path(existing.manifest_path) if existing.manifest_path else ctx.manifest_path,
+        manifest_digest=existing.manifest_digest,
+        artifactclass=existing.artifactclass,
     )
 
 
-def _enqueue_missing_jobs(
+def _enqueue_missing_cloud_job(
     session: Session,
     intake: Intake,
     *,
     payload_root: Path,
     cache_root: Path,
-    proxy_artifactclass: str,
     cloud_backend_name: str,
     cloud_pool_id: str,
+) -> int:
+    if _cloud_bundle_has_copy(session, intake.intake_id):
+        return 0
+    return int(
+        _submit_once(
+            session,
+            "cloud-blob",
+            {
+                "intake_id": intake.intake_id,
+                "intake_root": str(payload_root.parent.resolve()),
+                "payload_root": str(payload_root.resolve()),
+                "cache_root": str(cache_root.resolve()),
+                "backend_name": cloud_backend_name,
+                "pool_id": cloud_pool_id,
+            },
+            dedupe_key=f"cloud-blob:{intake.intake_id}",
+            resources=[{"pool": "io", "count": 1}],
+        )
+    )
+
+
+def _enqueue_missing_derivative_jobs(
+    session: Session,
+    intake: Intake,
+    *,
+    cache_root: Path,
+    proxy_artifactclass: str,
 ) -> int:
     submitted = 0
     cache_root = cache_root.resolve()
     for item in sorted(intake.items, key=lambda r: r.as_received_path):
-        if _is_video_path(item.as_received_path):
-            if not _source_has_derivations(session, item.id, {"mezz", "preview"}) and _submit_once(
-                session,
-                "transcode",
-                {
-                    "ingest_item_id": item.id,
-                    "cache_root": str(cache_root),
-                    "proxy_artifactclass": proxy_artifactclass,
-                },
-                dedupe_key=f"transcode:{item.id}",
-                resources=[{"pool": "cpu", "count": 8}],
-            ):
-                submitted += 1
-            if not _has_pfr_sidecar(item) and _submit_once(
-                session,
-                "pfr-index",
-                {
-                    "ingest_item_id": item.id,
-                    "cache_root": str(cache_root),
-                },
-                dedupe_key=f"pfr-index:{item.id}",
-                resources=[{"pool": "io", "count": 1}, {"pool": "cpu", "count": 1}],
-            ):
-                submitted += 1
-    cloud_needed = not _cloud_bundle_has_copy(session, intake.intake_id)
-    if cloud_needed and _submit_once(
-        session,
-        "cloud-blob",
-        {
-            "intake_id": intake.intake_id,
-            "intake_root": str(payload_root.parent.resolve()),
-            "payload_root": str(payload_root.resolve()),
-            "cache_root": str(cache_root),
-            "backend_name": cloud_backend_name,
-            "pool_id": cloud_pool_id,
-        },
-        dedupe_key=f"cloud-blob:{intake.intake_id}",
-        resources=[{"pool": "io", "count": 1}],
-    ):
-        submitted += 1
+        if not _is_video_path(item.as_received_path):
+            continue
+        if not _source_has_derivations(session, item.id, {"mezz", "preview"}) and _submit_once(
+            session,
+            "transcode",
+            {
+                "ingest_item_id": item.id,
+                "cache_root": str(cache_root),
+                "proxy_artifactclass": proxy_artifactclass,
+            },
+            dedupe_key=f"transcode:{item.id}",
+            resources=[{"pool": "cpu", "count": 8}],
+        ):
+            submitted += 1
+        if not _has_pfr_sidecar(item) and _submit_once(
+            session,
+            "pfr-index",
+            {
+                "ingest_item_id": item.id,
+                "cache_root": str(cache_root),
+            },
+            dedupe_key=f"pfr-index:{item.id}",
+            resources=[{"pool": "io", "count": 1}, {"pool": "cpu", "count": 1}],
+        ):
+            submitted += 1
     return submitted
 
 
@@ -372,6 +638,94 @@ def _cloud_bundle_has_copy(session: Session, intake_id: str) -> bool:
     )
 
 
+def _iter_intake_dirs(landing_root: str | Path) -> list[Path]:
+    root = Path(landing_root).resolve()
+    if not root.exists():
+        raise FileNotFoundError(root)
+    if (root / "intake.json").exists():
+        return [root]
+    return sorted(
+        path for path in root.iterdir() if path.is_dir() and (path / "intake.json").exists()
+    )
+
+
+def _read_intake_context(intake_dir: str | Path) -> _IntakeContext:
+    root = Path(intake_dir).resolve()
+    sentinel_path = root / "intake.json"
+    if not sentinel_path.exists():
+        raise FileNotFoundError(sentinel_path)
+
+    sentinel = _read_json(sentinel_path)
+    is_bag = _is_bag_intake(root)
+    if is_bag:
+        payload_root = root / DATA_DIR_NAME
+        manifest_path = root / MANIFEST_NAME
+        metadata = _intake_metadata_from_bag(root, sentinel)
+    else:
+        payload_root = root / "payload"
+        manifest_path = None
+        metadata = _intake_metadata_from_mapping(sentinel, root)
+        if not payload_root.is_dir():
+            raise FileNotFoundError(payload_root)
+    intake_id = str(metadata.get("intake_id") or root.name)
+    return _IntakeContext(
+        root=root,
+        sentinel=sentinel,
+        is_bag=is_bag,
+        payload_root=payload_root,
+        manifest_path=manifest_path,
+        metadata=metadata,
+        intake_id=intake_id,
+    )
+
+
+def _validate_payload(ctx: _IntakeContext) -> _ValidatedPayload:
+    if ctx.is_bag:
+        validation = validate_bag(ctx.root)
+        metadata = _intake_metadata_from_labels(validation.metadata, ctx.sentinel, ctx.root)
+        digest = (
+            _sha256_file(ctx.manifest_path)
+            if ctx.manifest_path and ctx.manifest_path.exists()
+            else None
+        )
+        return _ValidatedPayload(
+            intake_id=str(metadata.get("intake_id") or ctx.intake_id),
+            metadata=metadata,
+            records=list(validation.actual_records) if validation.valid else [],
+            valid=validation.valid,
+            complete=validation.complete,
+            manifest_digest=digest,
+            details=validation.details(),
+        )
+    records = _hash_payload(ctx.payload_root)
+    return _ValidatedPayload(
+        intake_id=ctx.intake_id,
+        metadata=ctx.metadata,
+        records=records,
+        valid=True,
+        complete=True,
+        manifest_digest=_legacy_manifest_digest(records),
+        details={},
+    )
+
+
+def _resolve_artifactclass(
+    ctx: _IntakeContext,
+    metadata: dict[str, Any],
+    requested_artifactclass: str | None,
+) -> str:
+    cli_class = _optional_str(requested_artifactclass)
+    bag_class = _optional_str(metadata.get("artifactclass")) if ctx.is_bag else None
+    if bag_class and cli_class and bag_class != cli_class:
+        raise ValueError(
+            f"artifactclass mismatch: bag has {bag_class!r}, register was given {cli_class!r}"
+        )
+    resolved = bag_class or cli_class
+    if resolved is None:
+        raise ValueError("artifactclass is required for intake registration")
+    return resolved
+
+
 def _is_bag_intake(root: Path) -> bool:
     return any((root / name).exists() for name in ("bagit.txt", BAG_INFO_NAME, MANIFEST_NAME))
 
@@ -419,6 +773,9 @@ def _upsert_intake(
     status: IntakeStatus,
 ) -> Intake:
     source_kind = _source_kind(str(metadata.get("source_kind") or IntakeSourceKind.OTHER.value))
+    artifactclass = _optional_str(metadata.get("artifactclass"))
+    if artifactclass is None:
+        raise ValueError("artifactclass is required for intake registration")
     now = _utcnow()
     intake = session.get(Intake, intake_id)
     if intake is None:
@@ -427,7 +784,7 @@ def _upsert_intake(
             operator=str(metadata.get("operator") or os.environ.get("USER") or "unknown"),
             source_kind=source_kind,
             source_ref=_optional_str(metadata.get("source_ref")),
-            artifactclass=str(metadata.get("artifactclass") or "default"),
+            artifactclass=artifactclass,
             label=_optional_str(metadata.get("label")),
             manifest_path=str(manifest_path) if manifest_path else None,
             status=status,
@@ -439,7 +796,7 @@ def _upsert_intake(
         intake.operator = str(metadata.get("operator") or intake.operator)
         intake.source_kind = source_kind
         intake.source_ref = _optional_str(metadata.get("source_ref"))
-        intake.artifactclass = str(metadata.get("artifactclass") or intake.artifactclass)
+        intake.artifactclass = artifactclass
         intake.label = _optional_str(metadata.get("label"))
         intake.manifest_path = str(manifest_path) if manifest_path else None
         intake.status = status
@@ -517,6 +874,22 @@ def _hash_payload(payload_root: Path) -> list[PayloadRecord]:
     return hash_payload_tree(payload_root)
 
 
+def _legacy_manifest_digest(records: list[PayloadRecord]) -> str:
+    payload = [
+        (record.relpath, record.sha256_hex) for record in sorted(records, key=lambda r: r.relpath)
+    ]
+    encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _media_kind_for_path(path: str) -> MediaKind:
     suffix = Path(path).suffix.lower()
     if suffix in VIDEO_EXTENSIONS:
@@ -570,6 +943,8 @@ def _write_verified_receipt(
         "artifactclass": intake.artifactclass,
         "source_kind": intake.source_kind,
         "manifest_path": intake.manifest_path,
+        "manifest_digest": intake.manifest_digest,
+        "requested_profile": intake.requested_profile,
         "item_count": item_count,
         "jobs_submitted": jobs_submitted,
         "release_signal": intake.source_kind == IntakeSourceKind.CARD,
@@ -589,10 +964,26 @@ def _write_quarantine_receipt(
         "status": IntakeStatus.QUARANTINED.value,
         "quarantined_at": intake.quarantined_at.isoformat() if intake.quarantined_at else None,
         "manifest_path": intake.manifest_path,
+        "manifest_digest": intake.manifest_digest,
         "reason": reason,
         "details": mismatch,
     }
     _write_json(intake_dir / "intake.quarantined.json", payload)
+
+
+def _write_discrepancy_receipt(
+    intake_dir: Path,
+    intake: Intake,
+    details: dict[str, Any],
+) -> None:
+    payload = {
+        "intake_id": intake.intake_id,
+        "status": IntakeStatus.REGISTERED.value,
+        "registered_at": intake.registered_at.isoformat() if intake.registered_at else None,
+        "reason": "registered-intake-discrepancy",
+        "details": details,
+    }
+    _write_json(intake_dir / "intake.discrepancy.json", payload)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

@@ -107,8 +107,11 @@ def _assert_worker_lease_invariants(db_path: Path) -> None:
 
 
 def _assert_intake_invariants(db_path: Path) -> None:
-    assert "ck_intake_source_kind" in _table_sql(db_path, "intake")
-    assert "ck_intake_status" in _table_sql(db_path, "intake")
+    intake_sql = _table_sql(db_path, "intake")
+    assert "ck_intake_source_kind" in intake_sql
+    assert "ck_intake_status" in intake_sql
+    assert "manifest_digest" in intake_sql
+    assert "requested_profile" in intake_sql
     assert (
         "intake_id",
         "as_received_path",

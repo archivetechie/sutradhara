@@ -1,6 +1,6 @@
 """Filesystem receive core for Sutradhara's source-agnostic intake front door.
 
-This module is shared by edge-side `sutra receive` and server-side `intake scan`.
+This module is shared by edge-side `sutra receive` and server-side intake registration.
 It keeps the contract-critical parts in one dependency-light place: canonical
 member paths, BagIt manifests, safe payload paths, atomic writes, resumable
 landing directories, source quiescence checks, and server release markers.

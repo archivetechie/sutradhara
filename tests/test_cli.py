@@ -82,9 +82,18 @@ def test_help_lists_subcommands(cli_env: dict[str, str]) -> None:
         "archive",
         "review",
         "receive",
+        "prepare",
         "worker",
     ):
         assert cmd in result.output
+
+
+def test_intake_help_replaces_scan_with_explicit_verbs(cli_env: dict[str, str]) -> None:
+    result = _run(["intake", "--help"])
+    assert "inspect" in result.output
+    assert "register" in result.output
+    assert "accept" in result.output
+    assert "scan" not in result.output
 
 
 def test_db_init_creates_schema(cli_env: dict[str, str]) -> None:

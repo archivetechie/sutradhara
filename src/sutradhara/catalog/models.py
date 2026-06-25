@@ -103,9 +103,9 @@ class LogicalAsset(Base):
 
 
 class Intake(Base):
-    """A completed landing batch admitted by the intake scanner.
+    """A completed landing batch admitted through explicit intake registration.
 
-    The scanner treats an `intake.json` sentinel as the boundary between
+    Intake treats an `intake.json` sentinel as the boundary between
     receiving and verifying. A quarantined intake records the failed batch but
     does not register any `ingest_item` rows.
     """
@@ -129,6 +129,8 @@ class Intake(Base):
     artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     label: Mapped[str | None] = mapped_column(String(512), nullable=True)
     manifest_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    manifest_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    requested_profile: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[IntakeStatus] = mapped_column(
         String(32), nullable=False, default=IntakeStatus.RECEIVING
     )

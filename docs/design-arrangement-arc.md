@@ -1400,28 +1400,25 @@ reject marker hides from default listing but does not delete copies
 
 ## 9. Migration from Current Implementation
 
-The current implementation may still expose `sutra intake scan` as a combined
-verify/register/enqueue compatibility command. Do not break existing harness
-coverage abruptly. Migrate in phases:
+P1.1 cuts the old combined `sutra intake scan` entry point and exposes the
+explicit intake lifecycle directly. Keep harness coverage by migrating callers
+to the split verbs:
 
 1. Introduce explicit service functions:
    - `inspect_intake`
    - `register_intake`
-   - `ensure_derivatives`
-   - `ensure_cloud_temp`
-2. Add the reconciliation outbox/worklist spine:
-   - append `domain_event` rows for lifecycle/profile/job-completion facts;
-   - project events into per-domain `reconciliation_wakeup` rows;
-   - make reconcilers consume due wake-ups and re-check catalog truth before enqueueing
-     jobs;
-   - add bounded scheduled sweeps as missed-event recovery.
-3. Add the reconciliation condition model before broad automation:
-   - persist desired-state assignments (`prepare_assignment`, placement/freshness
-     policy assignments);
-   - maintain per-target/per-`condition_key` condition summaries;
-   - append job attempts separately from condition state;
-   - implement backoff, suppressed, blocked, and generation-based unblock semantics.
-4. Keep `scan` as a compatibility wrapper or policy-controlled automation path.
+   - `prepare_intake`
+   - `accept_intake`
+2. Keep P1.1 on the P0.3 single-table catalog reality:
+   - `register_intake` accepts the landing payload and submits the cloud-temp
+     stopgap job;
+   - `prepare_intake` records `Intake.requested_profile` and submits the
+     transcode/PFR stopgap jobs;
+   - no `domain_event`/`reconciliation_wakeup` tables land in this phase.
+3. Delete `scan` instead of keeping a compatibility wrapper; the project is still
+   pre-production, so stale automation should fail loudly.
+4. P1.2/P1.3 replace the stopgap job submissions with level-triggered
+   reconcilers and add the condition/wakeup model before broad automation.
 5. Change harness scenarios to prove explicit lifecycle semantics and missed-event
    sweep recovery.
 6. Reclassify automation as policy:

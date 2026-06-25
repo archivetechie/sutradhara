@@ -22,7 +22,7 @@ from sutradhara.catalog.models import IngestItem
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.cli.main import cli
-from sutradhara.intake import scan_landing_root
+from sutradhara.intake import register_landing_root
 from sutradhara.receive import (
     BAG_PROFILE,
     CANONICALIZATION_VERSION,
@@ -609,7 +609,10 @@ def test_confirmation_is_fail_safe_for_verified_quarantine_and_timeout(tmp_path:
     assert deadline.status == "timeout"
 
 
-def test_receive_then_intake_scan_accepts_nfd_source_name(engine: Engine, tmp_path: Path) -> None:
+def test_receive_then_intake_register_accepts_nfd_source_name(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source"
     landing = tmp_path / "landing"
     source.mkdir()
@@ -618,7 +621,7 @@ def test_receive_then_intake_scan_accepts_nfd_source_name(engine: Engine, tmp_pa
     result = receive_source(source, landing=landing, source_kind="card", operator="Op/../Name")
 
     with session_scope(engine) as session:
-        outcomes = scan_landing_root(session, landing, cache_root=tmp_path / "cache")
+        outcomes = register_landing_root(session, landing, cache_root=tmp_path / "cache")
 
     assert outcomes[0].status == IntakeStatus.REGISTERED.value
     assert re.fullmatch(r"\d{8}-op-name-[0-9a-f]{32}", result.intake_id)
@@ -646,7 +649,7 @@ def test_intake_quarantines_if_tagmanifest_catches_manifest_tamper(
     )
 
     with session_scope(engine) as session:
-        outcomes = scan_landing_root(session, landing)
+        outcomes = register_landing_root(session, landing)
 
     assert outcomes[0].status == IntakeStatus.QUARANTINED.value
     assert outcomes[0].reason == "bag-invalid"
@@ -706,7 +709,7 @@ def test_intake_quarantines_bag_payload_symlink_without_following(
         pytest.skip(f"symlink creation unavailable: {exc}")
 
     with session_scope(engine) as session:
-        outcomes = scan_landing_root(session, landing)
+        outcomes = register_landing_root(session, landing)
 
     assert outcomes[0].status == IntakeStatus.QUARANTINED.value
     assert outcomes[0].reason == "bag-incomplete"
@@ -728,7 +731,7 @@ def test_intake_distinguishes_incomplete_missing_extra_and_invalid_payload(
     (invalid / "data" / "clip.mov").write_bytes(b"corrupt")
 
     with session_scope(engine) as session:
-        outcomes = scan_landing_root(session, landing)
+        outcomes = register_landing_root(session, landing)
 
     by_id = {row.intake_id: row for row in outcomes}
     assert by_id[missing.name].reason == "bag-incomplete"

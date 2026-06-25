@@ -71,7 +71,8 @@
 
 1. **Intake model** (`intake` table: intake_id, operator, card_id, artifactclass,
    shoot_label, mhl_path, status receiving|verifying|quarantined|registered).
-2. **Watcher/CLI** (`sutra intake scan <landing-root>` runnable by cron/harness):
+2. **Watcher/CLI** (superseded for Phase R by P1.1's explicit
+   `sutra intake inspect` / `register` / `accept` lifecycle):
    detect completed intakes (sentinel `intake.json` present, per Shared contract)
    → parse **ASC MHL** manifest (sha256 entries REQUIRED; use the `ascmhl` package
    if it fits, else a minimal compliant reader) → re-hash all files → mismatch ⇒

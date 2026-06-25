@@ -37,7 +37,7 @@ from sutradhara.catalog.types import (
     MediaKind,
     content_hash,
 )
-from sutradhara.intake import scan_landing_root
+from sutradhara.intake import prepare_intake, register_landing_root
 from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.models import Job, JobStatus
 
@@ -66,7 +66,19 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
 
     with session_scope(engine) as session:
         _add_cloud_backend(session)
-        scan_landing_root(session, landing, cache_root=tmp_path / "cache")
+        outcomes = register_landing_root(
+            session,
+            landing,
+            artifactclass="video-master",
+            cache_root=tmp_path / "cache",
+        )
+        for outcome in outcomes:
+            prepare_intake(
+                session,
+                outcome.intake_id,
+                profile="hd-review",
+                cache_root=tmp_path / "cache",
+            )
         jobs = list(session.scalars(select(Job).order_by(Job.kind)))
         assert [job.kind for job in jobs] == ["cloud-blob", "pfr-index", "transcode"]
         for job in jobs:
@@ -105,7 +117,12 @@ def test_transcode_derivation_facts_are_idempotent(
     _write_intake(landing, "card-110", {"clip.mov": b"valid video payload"})
 
     with session_scope(engine) as session:
-        scan_landing_root(session, landing, enqueue_jobs=False, cache_root=tmp_path / "cache")
+        register_landing_root(
+            session,
+            landing,
+            artifactclass="video-master",
+            cache_root=tmp_path / "cache",
+        )
         item_id = session.scalars(select(IngestItem.id)).one()
 
     first_ids = _run_transcode_job(engine, item_id, tmp_path)
@@ -140,7 +157,12 @@ def test_pfr_index_fact_is_idempotent_and_preserves_metadata(
     _write_intake(landing, "card-111", {"clip.mov": b"valid video payload"})
 
     with session_scope(engine) as session:
-        scan_landing_root(session, landing, enqueue_jobs=False, cache_root=tmp_path / "cache")
+        register_landing_root(
+            session,
+            landing,
+            artifactclass="video-master",
+            cache_root=tmp_path / "cache",
+        )
         item = session.scalars(select(IngestItem)).one()
         item.item_metadata = {**(item.item_metadata or {}), "operator_note": "keep me"}
         item_id = item.id
@@ -167,7 +189,12 @@ def test_transcode_decode_error_marks_master_suspect(
     _write_intake(landing, "card-101", {"clip.mov": b"DECODE_FAIL damaged"})
 
     with session_scope(engine) as session:
-        scan_landing_root(session, landing, enqueue_jobs=False, cache_root=tmp_path / "cache")
+        register_landing_root(
+            session,
+            landing,
+            artifactclass="video-master",
+            cache_root=tmp_path / "cache",
+        )
         item = session.scalars(select(IngestItem)).one()
         job = submit(
             session,
@@ -204,7 +231,12 @@ def test_transcode_read_error_fails_without_suspect(
     source = _write_intake(landing, "card-102", {"clip.mov": b"valid video payload"})
 
     with session_scope(engine) as session:
-        scan_landing_root(session, landing, enqueue_jobs=False, cache_root=tmp_path / "cache")
+        register_landing_root(
+            session,
+            landing,
+            artifactclass="video-master",
+            cache_root=tmp_path / "cache",
+        )
         item = session.scalars(select(IngestItem)).one()
         source.unlink()
         job = submit(
@@ -237,7 +269,12 @@ def test_fact_recording_api_does_not_commit(engine: Engine, tmp_path: Path) -> N
 
     with session_scope(engine) as session:
         _add_cloud_backend(session)
-        scan_landing_root(session, landing, enqueue_jobs=False, cache_root=tmp_path / "cache")
+        register_landing_root(
+            session,
+            landing,
+            artifactclass="video-master",
+            cache_root=tmp_path / "cache",
+        )
         item = session.scalars(select(IngestItem)).one()
         item_id = item.id
         asset_hash = item.logical_asset_hash
