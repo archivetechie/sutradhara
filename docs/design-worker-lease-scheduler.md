@@ -39,7 +39,7 @@ reserves on dispatch, releases on terminal.
   `pfr-index → [{io,1},{cpu,1}]`, `cloud-blob → [{io,1}]`.
 - Invariant `Σ leased[pool] ≤ capacity[pool]`. Lease accounting is in-memory in the
   single worker process (authoritative — one worker). **The lease bounds *admission*
-  (how many heavy jobs run at once) and the scarce non-CPU resources (`drive`/`gpu`/
+  (how many heavy jobs run at once) and the scarce non-CPU resources (`tape_drive`/`gpu`/
   `io`); actual CPU is bounded by a cgroup, NOT by ffmpeg `-threads` — see §4a.**
 
 ## 4. Worker + scheduler (single-node)
@@ -113,7 +113,7 @@ idle capacity, yields to everything).
 **compact desired-state change** — one assignment + a generation bump, *not* millions
 of rows. Per-target work is **expanded in bounded shards** (reconciliation-model
 §4.4–4.5); the queue lives in the DB (cheap rows); the worker holds only the
-**in-flight** set in memory, bounded by leases (for tape, by the `drive` pool ≈ a
+**in-flight** set in memory, bounded by leases (for tape, by the `tape_drive` pool ≈ a
 handful at once). At best-effort priority it drains as a controlled background flow
 that yields to operator work. The anti-pattern — a synchronous million-row insert, or
 waking every asset each loop — is explicitly forbidden.
@@ -211,7 +211,7 @@ half is synchronous and independent of the worker, so it can proceed in parallel
 ## 8. Config
 One source (no drift — d3's lesson): pool capacities (`cpu`/`io`/`tape_drive`/`gpu`),
 per-kind default `required_resources`, per-kind `max_attempts`/backoff, execution-
-pool size. `cpu` defaults to `os.cpu_count()`; drive capacity from the tape layer.
+pool size. `cpu` defaults to `os.cpu_count()`; `tape_drive` capacity from the tape layer.
 
 ## 9. Storage substrate
 **SQLite now** (WAL) — one worker process = one writer, no cross-process claim

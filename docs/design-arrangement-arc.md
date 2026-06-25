@@ -363,7 +363,14 @@ That API is the *only* code that knows the `LogicalAsset`/`IngestItem`/
 produced a derivative of kind transcript"), not **database** knowledge; the schema can
 evolve behind the API; and the hard shared logic (dedup-by-hash, edges, idempotency)
 lives in one audited place. This is what actually makes "new job = config + a handler"
-true. (Today `transcode` constructs rows directly — migrate it onto this API.)
+true. (Today `transcode` constructs rows directly, and `pfr-index` writes an
+ffprobe-only sidecar — migrate both onto this API.) **The API's own contract must be
+pinned before the first migration** (it's the natural first implementation slice): an
+**idempotency key** per fact (a re-run of a completed handler is a no-op, not a
+duplicate); fact-recording in the **same transaction as the job's terminal result**
+(a crash can't leave a fact without its job outcome, or vice-versa); and an explicit
+representation for **sidecar / no-copy outputs** (a derivation or index that takes no
+`Copy`).
 
 **Not every produced item is archived — the class decides.** A derivative is always
 first-class in the *catalog* (recorded, identified, with a derivation edge), but
@@ -1468,6 +1475,11 @@ Even with automation enabled, the domain events remain explicit and auditable.
    paths, so it is not the target. Calling rem's Rust core directly is just `--map`
    via a heavier Python↔Rust binding; the CLI `--map` keeps the existing shell-out
    boundary. No file `mv`, no copied staging tree either way.
+   **Direction is settled; a short cross-repo `--map` wire-spec is the next step
+   before coding** — it must pin: field/escaping rules for tab/newline/non-UTF-8 in
+   paths; path normalization + security (source paths anchored to the intake's
+   registered BagIt payload root, no traversal); a per-entry size check; duplicate
+   `archive_path` handling; and a deterministic map-manifest hash.
 6. Proxy readiness policy: whether arrangement creation blocks until `hd-review`
    is ready or creates a workspace in `pending_derivatives`.
 7. Package normalization (§2.5) — **resolved.** Wrap-once at receive; the archive
