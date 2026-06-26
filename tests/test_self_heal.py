@@ -228,8 +228,15 @@ def _add_o_archive_pools(engine: Engine, backend_id: int) -> None:
         )
 
 
-def _metadata(representation: Representation) -> dict[str, object]:
-    return {"representation": representation.value}
+def _metadata(
+    representation: Representation,
+    *,
+    key_epoch: str | None = None,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {"representation": representation.value}
+    if representation is Representation.RAO_AEAD_V1 and key_epoch is not None:
+        metadata["key_epoch"] = key_epoch
+    return metadata
 
 
 def _backend() -> _ReadableTaggedWriteBackend:
@@ -360,6 +367,64 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
     assert backend.writes == ["o-copy-2-pool"]
     assert opener.calls == [(Representation.RAO_PLAIN_V1, None)]
     assert sealer.calls == [(Representation.RAO_AEAD_V1, key_id)]
+
+
+def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
+    engine: Engine,
+) -> None:
+    data = b"heal from old encrypted copy"
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
+    backend = _backend()
+    opener = _FakeOpener()
+    sealer = _FakeSealer()
+    old_key_id = "a" * 32
+    current_key_id = "b" * 32
+
+    missing_record = backend.put_object("o-copy-1-pool", b"lost old copy")
+    source_record = backend.put_object(
+        "o-copy-2-pool",
+        b"rao-aead-v1:" + old_key_id.encode("ascii") + b":" + data,
+    )
+
+    with session_scope(engine) as s:
+        add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=missing_record.native_locator,
+            integrity_hash=missing_record.integrity_hash,
+            source=CopySource.INGEST,
+            health=CopyHealth.MISSING,
+            pool_id="o-copy-1-pool",
+            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+        )
+        add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=source_record.native_locator,
+            integrity_hash=source_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-2-pool",
+            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=old_key_id),
+        )
+
+        repaired = self_heal(
+            s,
+            asset_hash,
+            "o-archive",
+            backends={backend_id: backend},
+            key_epoch=current_key_id,
+            opener=opener,
+            sealer=sealer,
+        )
+
+    assert len(repaired) == 1
+    assert repaired[0].native_locator["pool_id"] == "o-copy-1-pool"
+    assert opener.calls == [(Representation.RAO_AEAD_V1, old_key_id)]
+    assert sealer.calls == [(Representation.RAO_PLAIN_V1, None)]
 
 
 def test_self_heal_rejects_source_that_opens_to_wrong_plaintext(

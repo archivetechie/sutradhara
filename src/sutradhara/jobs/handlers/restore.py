@@ -1,38 +1,85 @@
-"""`restore` job: read a logical asset's bytes back from one copy.
+"""`restore` job: read verified whole-asset bytes back from one copy.
 
-Params:
-    copy_id (int) - the catalog `copy.id` to read from.
-
-Status (day-1):
-    EXECUTION IS NOT IMPLEMENTED. Dispatching a restore job records *intent*
-    (a PENDING row created by `sutradhara.jobs.dispatch.dispatch_restore`);
-    actually reading bytes back needs the backend read path
-    (`backend.read_range`, whole-object day-1) plus an output/destination
-    interface, neither of which exists yet.
-
-    The handler is registered anyway - on purpose. An unregistered kind crashes
-    `run_one` with a generic HandlerNotRegistered; a registered handler that
-    raises `NotImplementedError` lets the engine record a clean, intentional
-    FAILED job whose `last_error` states the roadmap. It must NOT fake success:
-    a restore that produced no bytes is not SUCCEEDED.
-
-    Partial / byte-range restore is deferred (spec roadmap item 10). Choosing
-    WHICH copy to restore from is a separate policy layer; this handler is told
-    the copy via `params.copy_id`.
+The handler is the imperative P2.1 restore mechanism: it restores the caller's
+chosen asset-scoped ``copy_id`` to a validated absolute ``dest_path``. Copy
+selection, path resolution, member extraction, and corruption response remain
+outside this job; this handler only reads, opens, verifies, and atomically
+places one whole object.
 """
 
 from __future__ import annotations
 
+from sutradhara.backend.factory import backend_from_row
+from sutradhara.backend.port import BackendError, StorageBackend
+from sutradhara.catalog.models import Copy
+from sutradhara.catalog.types import CopyHealth
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
+from sutradhara.keys import KeyRegistry
+from sutradhara.restore import (
+    RestoreError,
+    atomic_write_verified_file,
+    restore_copy,
+    validate_restore_destination,
+)
+from sutradhara.sealing.rao import RaoCliOpener
+
+
+def resolve_restore_backend(copy: Copy) -> StorageBackend:
+    """Return the backend instance used to read this restore copy."""
+    return backend_from_row(copy.backend)
 
 
 @register_handler("restore")
 def handle_restore(ctx: JobContext) -> JobResult:
     params = ctx.job.params
-    raise NotImplementedError(
-        "restore execution is not implemented yet: reading bytes back from a "
-        "backend requires the backend read path (backend.read_range, whole-object) "
-        "plus an output/destination interface, which do not exist. dispatch_restore "
-        "records restore intent only (day-1). "
-        f"requested: copy_id={params.get('copy_id')!r}"
+    copy_id = params.get("copy_id")
+    if not isinstance(copy_id, int):
+        return _failure("bad-params", "restore job requires params.copy_id (int)")
+    try:
+        destination = validate_restore_destination(params.get("dest_path"))
+    except ValueError as exc:
+        return _failure("bad-destination", str(exc))
+
+    copy = ctx.session.get(Copy, copy_id)
+    if copy is None:
+        return _failure("unknown-copy", f"no Copy with id={copy_id}; nothing to restore")
+    if copy.health == CopyHealth.MISSING:
+        return _failure(
+            "missing-copy",
+            f"copy id={copy_id} has health=missing; there are no bytes to restore",
+        )
+    if copy.bundle_id is not None or copy.logical_asset_hash is None:
+        return _failure("bundle-unsupported", "bundle restore is not supported by P2.1")
+
+    try:
+        backend = resolve_restore_backend(copy)
+        opener = RaoCliOpener(KeyRegistry())
+        with restore_copy(ctx.session, copy, backend=backend, opener=opener) as result:
+            atomic_write_verified_file(result.path, destination)
+    except RestoreError as exc:
+        return _failure("restore-failed", str(exc))
+    except (BackendError, OSError, RuntimeError, ValueError, KeyError) as exc:
+        return _failure("restore-failed", f"{type(exc).__name__}: {exc}")
+
+    return JobResult(
+        ok=True,
+        detail=f"restored copy id={copy_id} to {destination}",
+        step_state={
+            "restore": {
+                "kind": "ok",
+                "copy_id": copy_id,
+                "path": str(destination),
+                "sha256": result.sha256.hex(),
+                "bytes": result.size_bytes,
+                "representation": result.representation.value,
+            }
+        },
+    )
+
+
+def _failure(reason: str, detail: str) -> JobResult:
+    return JobResult(
+        ok=False,
+        detail=detail,
+        step_state={"restore": {"kind": reason, "detail": detail}},
     )

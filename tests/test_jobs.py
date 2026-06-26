@@ -1259,6 +1259,7 @@ def _register_restorable_copy(
             native_locator=locator,
             native_locator_key=locator_key(locator),
             integrity_hash=asset_hash,
+            storage_metadata={"representation": "raw-bytes"},
             source=CopySource.SCRUB,
             health=health,
         )
@@ -1267,68 +1268,81 @@ def _register_restorable_copy(
         return copy.id
 
 
-def test_dispatch_restore_creates_pending_restore_job(engine: Engine) -> None:
+def test_dispatch_restore_creates_pending_restore_job(engine: Engine, tmp_path: Path) -> None:
     from sutradhara.jobs.dispatch import dispatch_restore
 
     copy_id = _register_restorable_copy(engine, backend_name="tape-1")
+    dest_path = tmp_path / "restored.bin"
 
     with session_scope(engine) as s:
-        handle = dispatch_restore(s, copy_id)
+        handle = dispatch_restore(s, copy_id, dest_path)
 
     assert handle["kind"] == "restore"
     assert handle["copy_id"] == copy_id
     assert handle["source_backend"] == "tape-1"
-    assert handle["params"] == {"copy_id": copy_id}
+    assert handle["dest_path"] == str(dest_path)
+    assert handle["params"] == {"copy_id": copy_id, "dest_path": str(dest_path)}
 
     with session_scope(engine) as s:
         job = s.get(Job, handle["job_id"])
         assert job is not None
         assert job.status == JobStatus.PENDING
         assert job.kind == "restore"
-        assert job.params == {"copy_id": copy_id}
+        assert job.params == {"copy_id": copy_id, "dest_path": str(dest_path)}
 
 
 def test_dispatch_restore_raises_for_unknown_copy(engine: Engine) -> None:
     from sutradhara.jobs.dispatch import UnknownCopy, dispatch_restore
 
     with session_scope(engine) as s, pytest.raises(UnknownCopy, match="no Copy with id"):
-        dispatch_restore(s, 999)
+        dispatch_restore(s, 999, Path.cwd() / "restore.bin")
 
 
-def test_dispatch_restore_rejects_missing_copy(engine: Engine) -> None:
+def test_dispatch_restore_rejects_missing_copy(engine: Engine, tmp_path: Path) -> None:
     from sutradhara.jobs.dispatch import CopyNotRestorable, dispatch_restore
 
     copy_id = _register_restorable_copy(engine, health=CopyHealth.MISSING)
 
     with session_scope(engine) as s, pytest.raises(CopyNotRestorable, match="missing"):
-        dispatch_restore(s, copy_id)
+        dispatch_restore(s, copy_id, tmp_path / "restore.bin")
 
 
-def test_dispatch_restore_allows_suspect_copy(engine: Engine) -> None:
+def test_dispatch_restore_allows_suspect_copy(engine: Engine, tmp_path: Path) -> None:
     from sutradhara.jobs.dispatch import dispatch_restore
 
     copy_id = _register_restorable_copy(engine, health=CopyHealth.SUSPECT)
 
     with session_scope(engine) as s:
-        handle = dispatch_restore(s, copy_id)
+        handle = dispatch_restore(s, copy_id, tmp_path / "restore.bin")
 
     assert handle["kind"] == "restore"
     assert handle["copy_id"] == copy_id
+
+
+def test_dispatch_restore_rejects_invalid_destination(engine: Engine, tmp_path: Path) -> None:
+    from sutradhara.jobs.dispatch import InvalidRestoreDestination, dispatch_restore
+
+    copy_id = _register_restorable_copy(engine)
+
+    with session_scope(engine) as s, pytest.raises(InvalidRestoreDestination, match="absolute"):
+        dispatch_restore(s, copy_id, "relative.bin")
+
+    with session_scope(engine) as s, pytest.raises(InvalidRestoreDestination, match="parent"):
+        dispatch_restore(s, copy_id, tmp_path / "missing" / "restore.bin")
 
 
 def test_restore_kind_is_registered() -> None:
     assert "restore" in registered_kinds()
 
 
-def test_restore_handler_fails_loudly_does_not_fake_success(
+def test_restore_handler_fails_cleanly_does_not_fake_success(
     engine: Engine,
 ) -> None:
-    """A restore job must FAIL (not SUCCEED) - no bytes are actually read yet."""
+    """A restore job must FAIL (not SUCCEED) if required params are absent."""
     with session_scope(engine) as s:
         job = submit(s, "restore", {"copy_id": 1})
         result = run_one(s, job.id)
         assert not result.ok
         assert job.status == JobStatus.FAILED
         assert job.last_error is not None
-        assert "not implemented" in job.last_error
-        assert "NotImplementedError" in job.last_error
+        assert "destination" in job.last_error

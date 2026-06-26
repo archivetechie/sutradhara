@@ -12,10 +12,7 @@ scenario-era content/copy tags.
 
 from __future__ import annotations
 
-import contextlib
-import hashlib
-import tempfile
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypedDict, TypeVar
@@ -23,15 +20,12 @@ from typing import Any, Protocol, TypedDict, TypeVar
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from sutradhara.backend.port import (
-    ByteRange,
-    CopyRecord,
-    StorageBackend,
-)
+from sutradhara.backend.port import CopyRecord, StorageBackend
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import ArtifactClassPool, Copy, Pool
 from sutradhara.catalog.types import BackendKind, CopyHealth, CopySource
 from sutradhara.keys import KeyEpoch, KeyRegistry
+from sutradhara.restore import RestoreError, restore_copy
 from sutradhara.sealing.port import Opener, Representation, Sealer, SealResult
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliOpener, RaoCliSealer
 
@@ -185,10 +179,11 @@ def replicate_asset(
             continue
 
         representation = Representation(target.representation)
+        seal_epoch = _epoch_for(target, representation)
         with sealer.seal(
             source_path,
             representation,
-            key_epoch=_epoch_for(target, representation),
+            key_epoch=seal_epoch,
         ) as sealed:
             record = backend.write_object_to_pool(sealed.sealed_path, target.pool_id)
             _assert_copy_integrity(asset_hash, record, sealed, target)
@@ -201,7 +196,10 @@ def replicate_asset(
             integrity_hash=sealed.stored_digest,
             source=CopySource.INGEST,
             health=CopyHealth.OK,
-            storage_metadata=_copy_storage_metadata(representation),
+            storage_metadata=_copy_storage_metadata(
+                representation,
+                key_epoch=seal_epoch.key_id if seal_epoch is not None else None,
+            ),
         )
         _assert_copy_matches_pool(copy, target)
         copies.append(copy)
@@ -238,10 +236,11 @@ def repair(
         if target not in missing:
             continue
         representation = Representation(target.representation)
+        seal_epoch = _epoch_for(target, representation)
         with sealer.seal(
             source_path,
             representation,
-            key_epoch=_epoch_for(target, representation),
+            key_epoch=seal_epoch,
         ) as sealed:
             record = backend.write_object_to_pool(sealed.sealed_path, target.pool_id)
             _assert_copy_integrity(asset_hash, record, sealed, target)
@@ -254,7 +253,10 @@ def repair(
             integrity_hash=sealed.stored_digest,
             source=CopySource.INGEST,
             health=CopyHealth.OK,
-            storage_metadata=_copy_storage_metadata(representation),
+            storage_metadata=_copy_storage_metadata(
+                representation,
+                key_epoch=seal_epoch.key_id if seal_epoch is not None else None,
+            ),
         )
         _assert_copy_matches_pool(copy, target)
         repaired.append(copy)
@@ -308,32 +310,29 @@ def self_heal(
         )
 
     opener = opener or RaoCliOpener(KeyRegistry())
-    representation = Representation(source_target.representation)
     _assert_copy_matches_pool(source, source_target)
-    with (
-        _materialized_copy_path(source_backend, source) as stored_path,
-        opener.open(
-            stored_path,
-            representation,
-            key_epoch=_epoch_for(source_target, representation),
-        ) as plaintext_path,
-    ):
-        plaintext_digest = _sha256_file(plaintext_path)
-        if plaintext_digest != asset_hash:
-            raise ReplicationInvariantError(
-                "self-heal source plaintext hash differs from requested asset "
-                f"for copy id={source.id}: {plaintext_digest.hex()} != "
-                f"{asset_hash.hex()}"
+    try:
+        restored = restore_copy(session, source, backend=source_backend, opener=opener)
+        with restored as result:
+            if result.sha256 != asset_hash:
+                raise ReplicationInvariantError(
+                    "self-heal source plaintext hash differs from requested asset "
+                    f"for copy id={source.id}: {result.sha256.hex()} != "
+                    f"{asset_hash.hex()}"
+                )
+            return repair(
+                session,
+                asset_hash,
+                result.path,
+                artifactclass,
+                backends=backends,
+                sealer=sealer,
+                key_epoch=key_epoch,
             )
-        return repair(
-            session,
-            asset_hash,
-            plaintext_path,
-            artifactclass,
-            backends=backends,
-            sealer=sealer,
-            key_epoch=key_epoch,
-        )
+    except RestoreError as exc:
+        raise ReplicationInvariantError(
+            f"self-heal source plaintext hash/integrity failure for copy id={source.id}: {exc}"
+        ) from exc
 
 
 def replication_status(
@@ -466,17 +465,6 @@ def _copy_media_id(copy: Copy) -> str | None:
     return None
 
 
-@contextlib.contextmanager
-def _materialized_copy_path(
-    backend: StorageBackend,
-    copy: Copy,
-) -> Iterator[Path]:
-    with tempfile.TemporaryDirectory(prefix="sutradhara-self-heal-") as temp_dir_raw:
-        path = Path(temp_dir_raw) / "stored-copy.bin"
-        path.write_bytes(backend.read_range(copy.native_locator, ByteRange(0, 0)))
-        yield path
-
-
 def _epoch_for(
     target: PoolTarget,
     representation: Representation,
@@ -490,10 +478,16 @@ def _epoch_for(
     return KeyEpoch(key_id=target.key_epoch, created_at="", active=True)
 
 
-def _copy_storage_metadata(representation: Representation) -> dict[str, Any]:
+def _copy_storage_metadata(
+    representation: Representation,
+    *,
+    key_epoch: str | None = None,
+) -> dict[str, Any]:
     metadata: dict[str, Any] = {"representation": representation.value}
     if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
         metadata["chunk_size"] = RAO_CHUNK_SIZE
+    if representation is Representation.RAO_AEAD_V1 and key_epoch is not None:
+        metadata["key_epoch"] = key_epoch
     return metadata
 
 
@@ -531,14 +525,6 @@ def _assert_copy_integrity(
         "backend stored bytes differ from sealed representation for "
         f"{target.backend_name}/{target.pool_id}"
     )
-
-
-def _sha256_file(path: Path) -> bytes:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.digest()
 
 
 def _assert_distinct_media(

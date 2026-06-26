@@ -395,6 +395,7 @@ def test_replicate_asset_records_stored_digest_for_rao_pool_copies(
         assert rows["o-copy-2-pool"].storage_metadata == {
             "representation": Representation.RAO_AEAD_V1.value,
             "chunk_size": RAO_CHUNK_SIZE,
+            "key_epoch": "1" * 32,
         }
 
 

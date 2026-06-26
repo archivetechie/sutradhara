@@ -13,6 +13,7 @@ The caller owns the transaction (`session.commit()`), matching the
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from sqlalchemy import select
@@ -22,6 +23,7 @@ from sutradhara.catalog.models import Backend, Copy, LogicalAsset
 from sutradhara.catalog.types import BackendKind, CopyHealth, is_content_hash
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job
+from sutradhara.restore import validate_restore_destination
 
 
 class DispatchError(Exception):
@@ -46,6 +48,10 @@ class UnknownCopy(DispatchError):
 
 class CopyNotRestorable(DispatchError):
     """The copy cannot be restored from (e.g. health == MISSING)."""
+
+
+class InvalidRestoreDestination(DispatchError):
+    """The requested restore destination cannot be written safely."""
 
 
 def dispatch_write_to_tape(
@@ -94,7 +100,11 @@ def dispatch_write_to_tape(
     }
 
 
-def dispatch_restore(session: Session, copy_id: int) -> dict[str, Any]:
+def dispatch_restore(
+    session: Session,
+    copy_id: int,
+    dest_path: str | os.PathLike[str],
+) -> dict[str, Any]:
     """Dispatch a read-only `restore` job for one existing copy.
 
     Pure dispatch: validate the copy, submit a PENDING `restore` job, and return
@@ -104,8 +114,9 @@ def dispatch_restore(session: Session, copy_id: int) -> dict[str, Any]:
     Returns a handle: `{"job_id", "kind", "params", "copy_id", "source_backend"}`.
 
     Raises:
-        UnknownCopy        — no Copy with that id.
-        CopyNotRestorable  — the copy's health is MISSING (no bytes to read).
+        UnknownCopy                — no Copy with that id.
+        CopyNotRestorable          — the copy's health is MISSING (no bytes to read).
+        InvalidRestoreDestination  — dest_path is not absolute or its parent is absent.
     """
     copy = session.get(Copy, copy_id)
     if copy is None:
@@ -117,13 +128,24 @@ def dispatch_restore(session: Session, copy_id: int) -> dict[str, Any]:
             "there are no bytes to restore from it"
         )
 
-    job: Job = submit(session, "restore", {"copy_id": copy_id})
+    try:
+        dest_text = os.fspath(dest_path)
+        destination = validate_restore_destination(dest_text)
+    except (TypeError, ValueError) as exc:
+        raise InvalidRestoreDestination(str(exc)) from exc
+
+    job: Job = submit(
+        session,
+        "restore",
+        {"copy_id": copy_id, "dest_path": str(destination)},
+    )
     return {
         "job_id": job.id,
         "kind": job.kind,
         "params": job.params,
         "copy_id": copy_id,
         "source_backend": copy.backend.name,
+        "dest_path": str(destination),
     }
 
 
