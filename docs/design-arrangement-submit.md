@@ -1,6 +1,6 @@
 # Design — P2.3a: arrangement model + submit + the frozen source-map
 
-> Status: **design, for review** (the owner + Claude, 2026-06-26). Implementation item **P2.3a** — the
+> Status: **implemented design** (the owner + Claude, 2026-06-26). Implementation item **P2.3a** — the
 > first slice of plan item **P2.3** (decomposed: P2.3a model+submit+source-map / P2.3b projection /
 > P2.3c watcher). Sources: `design-arrangement-arc.md` §2.4, §3.5–3.9. Depends: P1.1 (registered
 > masters), P1.2 (proxies exist — for the *later* projection slice, not this one).
@@ -208,7 +208,7 @@ then DB** order with the P2.1 durable-write helper:
    `UPDATE arrangement SET status='submitted' WHERE id=:aid AND status <> 'submitted'` —
    **rowcount 0 ⇒ a concurrent submit already won ⇒ abort**; (b) insert the immutable `submission` +
    `submission_member` rows (`manifest_digest` = the TSV digest, `status='pending_archive'`); (c)
-   `UPDATE arrangement SET submission_id=:id, submitted_at=…`. The flip is **first** so the concurrent
+   `UPDATE arrangement SET submission_id=:id`. The flip is **first** so the concurrent
    loser is rejected before inserting rows; `submission_id` is set **last** because its FK requires the
    `submission` row to exist. The **caller commits** (no-commit discipline).
 The only failure residue is an **orphan submission dir** (files written in step 2, then the DB rolled
