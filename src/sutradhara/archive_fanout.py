@@ -32,6 +32,7 @@ from sutradhara.archive_bundle import (
     record_blob_root,
     record_exclusion,
 )
+from sutradhara.archive_restore import ArchiveRestoreError, read_member_bytes
 from sutradhara.backend.port import ByteRange
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Bundle, BundleMember
@@ -117,6 +118,24 @@ class BuiltMember:
     size_bytes: int
     file_sha256: bytes
     native_locator: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ReadCopyView:
+    """Copy-shaped view used before fan-out rows are committed."""
+
+    native_locator: dict[str, Any]
+    storage_metadata: dict[str, Any]
+    id: int | None = None
+
+
+@dataclass(frozen=True)
+class _ReadAssetLocatorView:
+    """AssetLocator-shaped view over a built member locator."""
+
+    representation: str
+    native_locator: dict[str, Any]
+    member_path: str
 
 
 @dataclass(frozen=True)
@@ -779,23 +798,32 @@ def _verified_member_bytes(
     work_dir: Path,
     cached_container: bytes | None,
 ) -> tuple[bytes, bytes | None]:
-    if representation is Representation.D2TAR_RAW and "block_range" in member.native_locator:
-        start, end = _block_range(member.native_locator)
-        return backend.read_range(copy_locator, ByteRange(start, end)), cached_container
-    if "offset" in member.native_locator:
-        container = cached_container
-        if container is None:
-            container = backend.read_range(copy_locator, ByteRange(0, 0))
-        return _extract_local_archive_member(container, member.native_locator), container
-    if representation is Representation.RAO_PLAIN_V1:
-        start = _first_chunk_lba(member.native_locator) * RAO_CHUNK_SIZE
-        end = start + member.size_bytes
-        return backend.read_range(copy_locator, ByteRange(start, end)), cached_container
+    try:
+        data = read_member_bytes(
+            backend,
+            _ReadCopyView(
+                native_locator=dict(copy_locator),
+                storage_metadata=dict(storage_metadata),
+            ),
+            _ReadAssetLocatorView(
+                representation=representation.value,
+                native_locator=dict(member.native_locator),
+                member_path=member.member_path,
+            ),
+            work_dir=work_dir,
+        )
+    except ArchiveRestoreError as exc:
+        if representation is not Representation.RAO_AEAD_V1:
+            raise ArchiveFanoutError(str(exc)) from exc
+        fallback_error = exc
+    else:
+        return data, cached_container
 
     verifier = getattr(builder, "verify_member_copy", None)
     if verifier is None:
         raise ArchiveFanoutError(
-            f"member verification for {representation.value!r} requires builder support"
+            f"member verification for {representation.value!r} requires builder support: "
+            f"{fallback_error}"
         )
     data = verifier(
         backend=backend,
@@ -994,17 +1022,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def _block_range(locator: Mapping[str, Any]) -> tuple[int, int]:
-    raw = locator.get("block_range")
-    if not isinstance(raw, list) or len(raw) != 2:
-        raise ArchiveFanoutError("block locator requires block_range=[start,end]")
-    start = int(raw[0])
-    end = int(raw[1])
-    if start < 0 or end < start:
-        raise ArchiveFanoutError(f"invalid block_range {raw!r}")
-    return start, end
-
-
 def _first_chunk_lba(locator: Mapping[str, Any]) -> int:
     value = locator.get("first_chunk_lba")
     if value is None:
@@ -1020,24 +1037,6 @@ def _metadata_key_epoch(storage_metadata: Mapping[str, Any]) -> str:
     if not isinstance(value, str) or not value:
         raise ArchiveFanoutError("encrypted copy metadata is missing key_epoch")
     return value
-
-
-def _extract_local_archive_member(container: bytes, locator: Mapping[str, Any]) -> bytes:
-    if len(container) < 8:
-        raise ArchiveFanoutError("local archive is too short")
-    header_len = int.from_bytes(container[:8], "big")
-    payload_start = 8 + header_len
-    if header_len <= 0 or payload_start > len(container):
-        raise ArchiveFanoutError("local archive header length is invalid")
-    try:
-        header = json.loads(container[8:payload_start].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ArchiveFanoutError("local archive header is not valid JSON") from exc
-    if not isinstance(header, dict) or header.get("format") != "sutradhara-local-archive-v1":
-        raise ArchiveFanoutError("copy is not a sutradhara local archive")
-    offset = int(locator["offset"])
-    size = int(locator["size_bytes"])
-    return container[payload_start + offset : payload_start + offset + size]
 
 
 def _materialize_copy_to_path(

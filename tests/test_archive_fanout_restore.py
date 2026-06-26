@@ -32,6 +32,8 @@ from sutradhara.archive_restore import (
     RestoreNameError,
     RestoreSourceUnavailable,
     RestoreSuspectAsset,
+    read_member_bytes,
+    read_member_to_path,
     resolve_member_asset_hash,
     restore_asset,
 )
@@ -65,6 +67,7 @@ from sutradhara.catalog.types import (
     content_hash,
 )
 from sutradhara.sealing.port import Representation
+from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 from sutradhara.staging import stage_and_enqueue_artifact
 
 
@@ -277,6 +280,71 @@ def _create_bundle(
         return _ArchiveSetup(bundle_id, rem_id, d2_id, assets)
 
 
+def _create_rao_plain_copy(
+    engine: Engine,
+    tmp_path: Path,
+    backend: _ArchiveWriteBackend,
+    members: list[tuple[str, bytes, int | None]],
+) -> tuple[int, dict[bytes, bytes]]:
+    rem_id, _ = _install_policy(engine)
+    object_size = 0
+    for _, data, first_lba in members:
+        if first_lba is None:
+            continue
+        object_size = max(object_size, first_lba * RAO_CHUNK_SIZE + len(data))
+    payload = bytearray(b"\0" * object_size)
+    for _, data, first_lba in members:
+        if first_lba is None:
+            continue
+        start = first_lba * RAO_CHUNK_SIZE
+        payload[start : start + len(data)] = data
+
+    object_path = tmp_path / "manual-plain.rao"
+    object_path.write_bytes(payload)
+    assets = {_digest(data): data for _, data, _ in members}
+
+    with session_scope(engine) as s:
+        s.add(Bundle(id="bundle-plain", artifactclass="o-archive", status="sealed"))
+        for asset_hash, data in assets.items():
+            s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(data)))
+        s.flush()
+        record = backend.write_object_to_pool(object_path, "o-copy-1-pool")
+        copy, _ = add_bundle_copy(
+            s,
+            bundle_id="bundle-plain",
+            backend_id=rem_id,
+            pool_id="o-copy-1-pool",
+            native_locator=record.native_locator,
+            integrity_hash=record.integrity_hash,
+            source=CopySource.INGEST,
+            health=CopyHealth.OK,
+            storage_metadata={
+                "representation": Representation.RAO_PLAIN_V1.value,
+                "chunk_size": RAO_CHUNK_SIZE,
+                "stored_size_bytes": record.size_bytes,
+            },
+        )
+        for member_path, data, first_lba in members:
+            native_locator: dict[str, object] = {
+                "member_path": member_path,
+                "size_bytes": len(data),
+            }
+            if first_lba is not None:
+                native_locator["first_chunk_lba"] = first_lba
+            s.add(
+                AssetLocator(
+                    logical_asset_hash=_digest(data),
+                    pool_id="o-copy-1-pool",
+                    copy_id=copy.id,
+                    bundle_id="bundle-plain",
+                    member_path=member_path,
+                    native_locator=native_locator,
+                    representation=Representation.RAO_PLAIN_V1.value,
+                )
+            )
+    return rem_id, assets
+
+
 def test_enqueue_due_and_flush_fans_out_bundle_copies(
     engine: Engine,
     tmp_path: Path,
@@ -322,6 +390,63 @@ def test_enqueue_due_and_flush_fans_out_bundle_copies(
         assert len(list(s.scalars(select(AssetLocator)))) == 4
         assert rem_backend.writes == ["o-copy-1-pool"]
         assert d2_backend.writes == ["d2-shelf-pool"]
+
+
+def test_local_archive_builder_aead_offsets_verify_without_builder_fallback(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    backend = _ArchiveWriteBackend("aead")
+    data = b"encrypted-test-builder-payload"
+    source = tmp_path / "asset.bin"
+    source.write_bytes(data)
+
+    with session_scope(engine) as s:
+        row = Backend(
+            name="aead",
+            kind=BackendKind.REM_TAPE,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        s.add(row)
+        s.flush()
+        s.add(
+            Pool(
+                id="aead-pool",
+                backend_id=row.id,
+                representation=Representation.RAO_AEAD_V1.value,
+            )
+        )
+        s.add(LogicalAsset(content_sha256=_digest(data), size_bytes=len(data)))
+        s.flush()
+        apply_artifactclass_policy(
+            s,
+            "aead-archive",
+            ArtifactClassPolicy(
+                ruleset="rao.aead.test",
+                placements=(PlacementPolicy("aead-pool", role="offsite"),),
+                bundling=BundlingPolicy(target_gb=0.000000001, max_age_seconds=60),
+                restore_preference=("aead-pool",),
+                expect="messy",
+            ),
+        )
+        policy = get_artifactclass_policy(s, "aead-archive")
+        bundle, _, _ = enqueue_artifact(
+            s,
+            artifactclass="aead-archive",
+            policy=policy,
+            logical_asset_hash=_digest(data),
+            source_path=source,
+            member_path="asset.bin",
+        )
+        flush_bundle(
+            s,
+            bundle_id=bundle.id,
+            backends={row.id: backend},
+            builder=LocalArchiveBuilder(),
+            key_epoch="1" * 32,
+        )
+
+    assert backend.writes == ["aead-pool"]
 
 
 def test_manifest_receipt_requires_keyed_signer(
@@ -460,6 +585,7 @@ def test_restore_uses_policy_preference_and_falls_back_to_d2(
         rem_copy = s.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
         rem_copy.health = CopyHealth.MISSING
         get_artifactclass_policy(s, "o-archive").restore_preference = ["o-copy-1-pool"]
+        d2_backend.reads.clear()
         fallback = restore_asset(
             s,
             asset_hash=asset_hash,
@@ -472,6 +598,155 @@ def test_restore_uses_policy_preference_and_falls_back_to_d2(
         )
         assert fallback.pool_id == "d2-shelf-pool"
         assert fallback.output_path.read_bytes() == setup.assets[asset_hash]
+        assert d2_backend.reads
+        assert all(not byte_range.is_whole_object for byte_range in d2_backend.reads)
+
+
+def test_rao_plain_restore_reads_only_member_range(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    backend = _ArchiveWriteBackend("rem")
+    target = b"beta body" * 7
+    first_lba = 2
+    rem_id, assets = _create_rao_plain_copy(
+        engine,
+        tmp_path,
+        backend,
+        [
+            ("a.bin", b"alpha body", 1),
+            ("nested/b.bin", target, first_lba),
+        ],
+    )
+    asset_hash = _digest(target)
+
+    with session_scope(engine) as s:
+        backend.reads.clear()
+        restored = restore_asset(
+            s,
+            asset_hash=asset_hash,
+            artifactclass="o-archive",
+            destination=tmp_path / "restore-beta.bin",
+            backends={rem_id: backend},
+        )
+
+    start = first_lba * RAO_CHUNK_SIZE
+    assert restored.output_path.read_bytes() == assets[asset_hash]
+    assert backend.reads == [ByteRange(start, start + len(target))]
+
+
+def test_zero_byte_rao_plain_member_restores_without_backend_read(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    backend = _ArchiveWriteBackend("rem")
+    rem_id, _ = _create_rao_plain_copy(
+        engine,
+        tmp_path,
+        backend,
+        [("empty.bin", b"", None)],
+    )
+
+    with session_scope(engine) as s:
+        backend.reads.clear()
+        restored = restore_asset(
+            s,
+            asset_hash=hashlib.sha256(b"").digest(),
+            artifactclass="o-archive",
+            destination=tmp_path / "empty.bin",
+            backends={rem_id: backend},
+        )
+
+    assert restored.output_path.read_bytes() == b""
+    assert backend.reads == []
+
+
+def test_restore_resolves_relative_nested_destination_and_keeps_existing_on_failure(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _ArchiveWriteBackend("rem")
+    payload = b"durable restore payload"
+    rem_id, _ = _create_rao_plain_copy(
+        engine,
+        tmp_path,
+        backend,
+        [("payload.bin", payload, 1)],
+    )
+    asset_hash = _digest(payload)
+    monkeypatch.chdir(tmp_path)
+
+    with session_scope(engine) as s:
+        restored = restore_asset(
+            s,
+            asset_hash=asset_hash,
+            artifactclass="o-archive",
+            destination=Path("new/rel/dir/payload.bin"),
+            backends={rem_id: backend},
+        )
+
+    expected = (tmp_path / "new/rel/dir/payload.bin").resolve()
+    assert restored.output_path == expected
+    assert expected.read_bytes() == payload
+
+    existing = tmp_path / "new/rel/dir/existing.bin"
+    existing.write_bytes(b"old bytes")
+    with session_scope(engine) as s:
+        copy = s.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
+        backend.corrupt(copy.native_locator)
+        with pytest.raises(RestoreIntegrityError):
+            restore_asset(
+                s,
+                asset_hash=asset_hash,
+                artifactclass="o-archive",
+                destination=Path("new/rel/dir/existing.bin"),
+                backends={rem_id: backend},
+            )
+
+    assert existing.read_bytes() == b"old bytes"
+    assert list(existing.parent.glob(f".{existing.name}.*.tmp")) == []
+
+
+def test_read_member_primitive_matches_bytes_wrapper_and_streams_large_member(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    backend = _ArchiveWriteBackend("rem")
+    payload = (b"large member\n" * ((RAO_CHUNK_SIZE // len(b"large member\n")) + 2)) + b"tail"
+    first_lba = 1
+    _rem_id, _ = _create_rao_plain_copy(
+        engine,
+        tmp_path,
+        backend,
+        [("large.bin", payload, first_lba)],
+    )
+
+    with session_scope(engine) as s:
+        locator = s.scalars(
+            select(AssetLocator).where(AssetLocator.logical_asset_hash == _digest(payload))
+        ).one()
+        copy = locator.copy
+        assert copy is not None
+        output_path = tmp_path / "primitive-large.bin"
+        backend.reads.clear()
+        written = read_member_to_path(backend, copy, locator, output_path)
+        path_ranges = list(backend.reads)
+        backend.reads.clear()
+        wrapper_bytes = read_member_bytes(backend, copy, locator, work_dir=tmp_path)
+        wrapper_ranges = list(backend.reads)
+
+    start = first_lba * RAO_CHUNK_SIZE
+    end = start + len(payload)
+    assert written == len(payload)
+    assert output_path.read_bytes() == payload
+    assert wrapper_bytes == payload
+    assert len(path_ranges) > 1
+    assert path_ranges == wrapper_ranges
+    assert all(not byte_range.is_whole_object for byte_range in path_ranges)
+    assert path_ranges[0].start == start
+    assert path_ranges[-1].end == end
+    assert sum(byte_range.length for byte_range in path_ranges) == len(payload)
 
 
 def test_restore_refuses_suspect_asset_without_force(

@@ -34,6 +34,7 @@ from sutradhara.catalog.models import (
 from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
 from sutradhara.keys import KeyRegistry
 from sutradhara.member_name import MemberNameError, escape_member_name, unescape_member_name
+from sutradhara.restore import atomic_write_verified_file
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 from sutradhara.staging import StagingError, reverse_transforms_to_path
@@ -98,35 +99,11 @@ class LocalArchiveExtractor:
         backend: StorageBackend,
         destination: Path,
     ) -> None:
-        representation = Representation(locator.representation)
-        if representation is Representation.D2TAR_RAW:
-            _extract_d2_to_path(locator, copy, backend, destination)
-            return
-        if (
-            representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}
-            and "offset" not in locator.native_locator
-        ):
-            raise ArchiveRestoreError(
-                f"copy id={copy.id} representation {representation.value!r} "
-                "requires a RAO restore adapter"
-            )
-
-        if _try_extract_from_local_archive_to_path(backend, copy, locator, destination):
-            return
-        if "offset" in locator.native_locator:
-            offset = int(locator.native_locator["offset"])
-            size = int(locator.native_locator["size_bytes"])
-            _copy_backend_range_to_path(
-                backend,
-                copy.native_locator,
-                offset,
-                offset + size,
-                destination,
-            )
-            return
-        raise ArchiveRestoreError(
-            f"copy id={copy.id} representation {representation.value!r} requires "
-            "a RAO restore adapter; no local locator offset was available"
+        read_member_to_path(
+            backend=backend,
+            copy=copy,
+            asset_locator=locator,
+            dest=destination,
         )
 
 
@@ -150,68 +127,113 @@ class RemArchiveExtractor(LocalArchiveExtractor):
         backend: StorageBackend,
         destination: Path,
     ) -> None:
-        try:
-            super().extract_to_path(
-                locator=locator,
-                copy=copy,
-                backend=backend,
-                destination=destination,
-            )
-            return
-        except ArchiveRestoreError:
-            representation = Representation(locator.representation)
-            if representation not in {
-                Representation.RAO_PLAIN_V1,
-                Representation.RAO_AEAD_V1,
-            }:
-                raise
-            self._extract_with_rem_to_path(locator, copy, backend, representation, destination)
+        read_member_to_path(
+            backend=backend,
+            copy=copy,
+            asset_locator=locator,
+            dest=destination,
+            rem_bin=self._rem_bin,
+            keys=self._keys,
+        )
 
-    def _extract_with_rem_to_path(
-        self,
-        locator: AssetLocator,
-        copy: Copy,
-        backend: StorageBackend,
-        representation: Representation,
-        destination: Path,
-    ) -> None:
-        member_path = _member_path(locator.native_locator)
-        with tempfile.TemporaryDirectory(prefix="sutradhara-restore-") as raw:
-            temp_dir = Path(raw)
-            object_path = temp_dir / "bundle.rao"
-            dest_dir = temp_dir / "out"
-            dest_dir.mkdir()
-            _materialize_copy_to_path(backend, copy, object_path)
-            cmd = [
-                self._rem_bin,
-                "archive",
-                "extract",
-                "--object",
-                str(object_path),
-                "--dest",
-                str(dest_dir),
-                "--path",
-                member_path,
-                "--first-chunk-lba",
-                str(_first_chunk_lba(locator.native_locator)),
-                "--file-size-bytes",
-                str(_size_bytes(locator.native_locator)),
-                "--range",
-                f"0:{_size_bytes(locator.native_locator)}",
-                "--overwrite",
-            ]
-            format_plugin = _format_plugin(copy.storage_metadata)
-            if format_plugin is not None:
-                cmd.extend(["--format", format_plugin])
-            if representation is Representation.RAO_PLAIN_V1:
-                cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
-                _run_rem(cmd)
-            else:
-                key_epoch = _key_epoch(copy.storage_metadata)
-                with self._keys.materialized_root_key(key_epoch) as key_file:
-                    cmd.extend(["--key-file", str(key_file)])
-                    _run_rem(cmd)
-            _copy_restored_member(dest_dir, member_path, destination)
+
+def read_member_to_path(
+    backend: StorageBackend,
+    copy: Any,
+    asset_locator: Any,
+    dest: Path,
+    *,
+    rem_bin: str | Path | None = None,
+    keys: KeyRegistry | None = None,
+) -> int:
+    """Write one archive member's stored bytes to ``dest``.
+
+    This is the shared member-read primitive for restore and build-time
+    verification. It streams through a destination path so large members do not
+    have to be held in memory; the bytes wrapper below is only for callers that
+    already need an in-memory verification value.
+    """
+    native_locator = dict(asset_locator.native_locator)
+    size = _size_bytes(native_locator)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if size == 0:
+        dest.write_bytes(b"")
+        return 0
+
+    representation = Representation(asset_locator.representation)
+    if representation is Representation.D2TAR_RAW:
+        _extract_d2_to_path(asset_locator, copy, backend, dest)
+        return size
+
+    if "offset" in native_locator:
+        if _try_extract_from_local_archive_to_path(backend, copy, asset_locator, dest):
+            return size
+        offset = int(native_locator["offset"])
+        _copy_backend_range_to_path(
+            backend,
+            dict(copy.native_locator),
+            offset,
+            offset + size,
+            dest,
+        )
+        return size
+
+    if representation is Representation.RAO_PLAIN_V1:
+        start = _first_chunk_lba(native_locator) * RAO_CHUNK_SIZE
+        _copy_backend_range_to_path(
+            backend,
+            dict(copy.native_locator),
+            start,
+            start + size,
+            dest,
+        )
+        return size
+
+    if representation is Representation.RAO_AEAD_V1:
+        if rem_bin is None:
+            copy_id = getattr(copy, "id", None)
+            label = f"copy id={copy_id}" if copy_id is not None else "copy"
+            raise ArchiveRestoreError(
+                f"{label} representation {representation.value!r} requires a RAO restore adapter"
+            )
+        _extract_rao_with_rem_to_path(
+            backend=backend,
+            copy=copy,
+            locator=asset_locator,
+            representation=representation,
+            destination=dest,
+            rem_bin=rem_bin,
+            keys=keys or KeyRegistry(),
+        )
+        return size
+
+    raise ArchiveRestoreError(f"unsupported archive representation {representation.value!r}")
+
+
+def read_member_bytes(
+    backend: StorageBackend,
+    copy: Any,
+    asset_locator: Any,
+    *,
+    work_dir: Path | None = None,
+    rem_bin: str | Path | None = None,
+    keys: KeyRegistry | None = None,
+) -> bytes:
+    """Return member bytes via ``read_member_to_path`` for verification tests."""
+    with tempfile.TemporaryDirectory(
+        prefix="sutradhara-member-read-",
+        dir=work_dir,
+    ) as raw_tmp:
+        member_path = Path(raw_tmp) / "member"
+        read_member_to_path(
+            backend=backend,
+            copy=copy,
+            asset_locator=asset_locator,
+            dest=member_path,
+            rem_bin=rem_bin,
+            keys=keys,
+        )
+        return member_path.read_bytes()
 
 
 def restore_asset(
@@ -229,6 +251,7 @@ def restore_asset(
         raise ValueError("asset_hash must be a 32-byte SHA-256 hash")
     _check_asset_restore_allowed(session, asset_hash, force_suspect=force_suspect)
     archive_extractor = extractor or LocalArchiveExtractor()
+    output_path = Path(destination).resolve()
     policy = get_artifactclass_policy(session, artifactclass)
     pool_order = _restore_pool_order(session, artifactclass, policy.restore_preference)
     locators = list(
@@ -252,7 +275,6 @@ def restore_asset(
             backend = backends.get(copy.backend_id)
             if backend is None:
                 continue
-            output_path = Path(destination)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with tempfile.TemporaryDirectory(
@@ -279,7 +301,7 @@ def restore_asset(
                             f"{restored.sha256.hex()} != {asset_hash.hex()}"
                         )
                         continue
-                    restored_path.replace(output_path)
+                    atomic_write_verified_file(restored_path, output_path)
                     return RestoreResult(
                         asset_hash=asset_hash,
                         pool_id=pool_id,
@@ -524,13 +546,13 @@ def _copy_backend_range_to_path(
             handle.write(chunk)
 
 
-def _read_whole(backend: StorageBackend, copy: Copy) -> bytes:
+def _read_whole(backend: StorageBackend, copy: Any) -> bytes:
     return backend.read_range(copy.native_locator, ByteRange(0, 0))
 
 
 def _materialize_copy_to_path(
     backend: StorageBackend,
-    copy: Copy,
+    copy: Any,
     destination: Path,
 ) -> None:
     size = copy.storage_metadata.get("stored_size_bytes")
@@ -538,6 +560,56 @@ def _materialize_copy_to_path(
         _copy_backend_range_to_path(backend, copy.native_locator, 0, size, destination)
         return
     destination.write_bytes(_read_whole(backend, copy))
+
+
+def _extract_rao_with_rem_to_path(
+    *,
+    backend: StorageBackend,
+    copy: Any,
+    locator: Any,
+    representation: Representation,
+    destination: Path,
+    rem_bin: str | Path,
+    keys: KeyRegistry,
+) -> None:
+    member_path = _member_path(locator.native_locator)
+    size = _size_bytes(locator.native_locator)
+    with tempfile.TemporaryDirectory(prefix="sutradhara-restore-") as raw:
+        temp_dir = Path(raw)
+        object_path = temp_dir / "bundle.rao"
+        dest_dir = temp_dir / "out"
+        dest_dir.mkdir()
+        _materialize_copy_to_path(backend, copy, object_path)
+        cmd = [
+            str(rem_bin),
+            "archive",
+            "extract",
+            "--object",
+            str(object_path),
+            "--dest",
+            str(dest_dir),
+            "--path",
+            member_path,
+            "--first-chunk-lba",
+            str(_first_chunk_lba(locator.native_locator)),
+            "--file-size-bytes",
+            str(size),
+            "--range",
+            f"0:{size}",
+            "--overwrite",
+        ]
+        format_plugin = _format_plugin(copy.storage_metadata)
+        if format_plugin is not None:
+            cmd.extend(["--format", format_plugin])
+        if representation is Representation.RAO_PLAIN_V1:
+            cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
+            _run_rem(cmd)
+        else:
+            key_epoch = _key_epoch(copy.storage_metadata)
+            with keys.materialized_root_key(key_epoch) as key_file:
+                cmd.extend(["--key-file", str(key_file)])
+                _run_rem(cmd)
+        _copy_restored_member(dest_dir, member_path, destination)
 
 
 def _member_path(locator: dict[str, Any]) -> str:
