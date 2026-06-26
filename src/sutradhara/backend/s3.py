@@ -155,7 +155,7 @@ class S3Backend:
 
 def _make_boto3_client(*, endpoint_url: str | None) -> Any:
     try:
-        import boto3  # type: ignore[import-not-found]
+        import boto3  # type: ignore[import-untyped]
     except ImportError as exc:  # pragma: no cover - depends on local env
         raise RuntimeError("boto3 is required for S3 backends") from exc
     return boto3.client("s3", endpoint_url=endpoint_url)
