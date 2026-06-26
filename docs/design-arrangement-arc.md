@@ -538,6 +538,13 @@ abandoned
 
 ### 3.6 Project workspace for ordinary file managers
 
+> **Carve-out (2026-06-26): §3.6–3.7 are NOT sutradhara.** The projection tree, `members.json`, and the
+> file-op→row watcher are a presentation/gateway concern, not storage-orchestration, and must not share
+> the durability (P0.3) loop. They moved to the **arrangement gateway** project
+> (`/home/user/arrangement-gateway/`, charter doc there). sutradhara owns only the arrangement *model*
+> + submission/source-map (§3.5, §3.8) and the API/restore the gateway consumes. The text below is
+> retained as the gateway's source intent. See the plan's P2.3 note.
+
 Sutradhara materializes a server-side projection:
 
 ```text
