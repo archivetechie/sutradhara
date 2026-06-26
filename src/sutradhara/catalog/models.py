@@ -314,9 +314,7 @@ class Arrangement(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
-    submitted_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    submitted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     intake: Mapped[Intake] = relationship()
     members: Mapped[list[ArrangementMember]] = relationship(
@@ -409,8 +407,7 @@ class Submission(Base):
 
     def __repr__(self) -> str:
         return (
-            f"<Submission id={self.id!r} arrangement={self.arrangement_id} "
-            f"status={self.status!r}>"
+            f"<Submission id={self.id!r} arrangement={self.arrangement_id} status={self.status!r}>"
         )
 
 
@@ -673,7 +670,7 @@ class BundleMember(Base):
         nullable=False,
         index=True,
     )
-    member_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    member_path: Mapped[str] = mapped_column(String(2048), nullable=False)
     source_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     file_sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
@@ -795,7 +792,7 @@ class AssetLocator(Base):
         index=True,
     )
     native_locator: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    member_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    member_path: Mapped[str] = mapped_column(String(2048), nullable=False)
     representation: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow

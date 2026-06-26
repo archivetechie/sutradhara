@@ -105,7 +105,9 @@ def create_from_intake(session: Session, intake_id: str, *, label: str) -> Arran
     if intake is None:
         raise ArrangementError(f"intake {intake_id!r} does not exist")
     if intake.status != IntakeStatus.REGISTERED:
-        raise ArrangementError(f"intake {intake_id!r} is {intake.status}; arrangement requires registered")
+        raise ArrangementError(
+            f"intake {intake_id!r} is {intake.status}; arrangement requires registered"
+        )
 
     arrangement = Arrangement(
         label=label,
@@ -157,7 +159,9 @@ def create_from_arrangement(session: Session, arrangement_id: int, *, label: str
     return clone
 
 
-def move_member(session: Session, arrangement_id: int, from_path: str, to_path: str) -> ArrangementMember:
+def move_member(
+    session: Session, arrangement_id: int, from_path: str, to_path: str
+) -> ArrangementMember:
     """Move one active arrangement member to a new archive path."""
 
     arrangement = _get_mutable_arrangement(session, arrangement_id)
@@ -197,9 +201,7 @@ def list_arrangements(session: Session) -> list[ArrangementSummary]:
 
     rows = list(
         session.scalars(
-            select(Arrangement)
-            .options(selectinload(Arrangement.members))
-            .order_by(Arrangement.id)
+            select(Arrangement).options(selectinload(Arrangement.members)).order_by(Arrangement.id)
         )
     )
     return [summarize_arrangement(row) for row in rows]
@@ -242,7 +244,9 @@ def submit_arrangement(
     if arrangement.status == ArrangementStatus.SUBMITTED:
         raise ArrangementFrozen(f"arrangement {arrangement_id} is already submitted")
     if arrangement.status not in MUTABLE_ARRANGEMENT_STATUSES:
-        raise ArrangementFrozen(f"arrangement {arrangement_id} is {arrangement.status}; cannot submit")
+        raise ArrangementFrozen(
+            f"arrangement {arrangement_id} is {arrangement.status}; cannot submit"
+        )
 
     entries = _build_source_map_entries(session, arrangement)
     if not entries:
@@ -287,7 +291,7 @@ def submit_arrangement(
                 submitted_at=submitted_at,
                 updated_at=submitted_at,
             )
-        )
+        ),
     )
     if result.rowcount != 1:
         raise ArrangementSubmitRace(f"arrangement {arrangement.id} was submitted concurrently")
@@ -389,7 +393,9 @@ def _build_source_map_entries(session: Session, arrangement: Arrangement) -> lis
         seen_paths.add(archive_path)
         item = session.get(IngestItem, member.ingest_item_id)
         if item is None:
-            raise ArrangementError(f"arrangement member {member.id} references a missing ingest item")
+            raise ArrangementError(
+                f"arrangement member {member.id} references a missing ingest item"
+            )
         _validate_live_master(session, item)
         if item.artifactclass != arrangement.artifactclass:
             raise ArrangementError(
@@ -400,7 +406,9 @@ def _build_source_map_entries(session: Session, arrangement: Arrangement) -> lis
         _reject_control_chars(source_path, "source_path")
         path = Path(source_path)
         if not path.is_file():
-            raise ArrangementError(f"source_path for item {item.id} is missing or not a file: {path}")
+            raise ArrangementError(
+                f"source_path for item {item.id} is missing or not a file: {path}"
+            )
         digest = sha256_file(path)
         if digest != item.logical_asset_hash:
             raise ArrangementError(
@@ -410,7 +418,9 @@ def _build_source_map_entries(session: Session, arrangement: Arrangement) -> lis
         try:
             size_bytes = path.stat().st_size
         except OSError as exc:
-            raise ArrangementError(f"source_path for item {item.id} is inaccessible: {path}") from exc
+            raise ArrangementError(
+                f"source_path for item {item.id} is inaccessible: {path}"
+            ) from exc
         if size_bytes != item.size_bytes:
             raise ArrangementError(
                 f"source_path for item {item.id} has size {size_bytes}, expected {item.size_bytes}"
@@ -506,7 +516,9 @@ def _one_active_member_by_path(arrangement: Arrangement, member_path: str) -> Ar
     if not matches:
         raise ArrangementError(f"arrangement {arrangement.id} has no active member {member_path!r}")
     if len(matches) > 1:
-        raise ArrangementError(f"arrangement {arrangement.id} has ambiguous active member {member_path!r}")
+        raise ArrangementError(
+            f"arrangement {arrangement.id} has ambiguous active member {member_path!r}"
+        )
     return matches[0]
 
 
@@ -531,9 +543,7 @@ def _validate_live_master(session: Session, item: IngestItem) -> None:
     if intake is None or intake.status != IntakeStatus.REGISTERED:
         raise ArrangementError(f"item {item.id} is not in a registered intake")
     derived_edge = session.scalars(
-        select(AssetDerivation.id)
-        .where(AssetDerivation.derived_item_id == item.id)
-        .limit(1)
+        select(AssetDerivation.id).where(AssetDerivation.derived_item_id == item.id).limit(1)
     ).one_or_none()
     if derived_edge is not None:
         raise ArrangementError(f"item {item.id} is a derived item, not a master")

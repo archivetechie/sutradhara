@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -41,7 +42,7 @@ from sutradhara.catalog.types import (
 
 
 @pytest.fixture
-def engine() -> Engine:
+def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
     try:
@@ -69,7 +70,10 @@ def test_create_from_intake_selects_masters_only(engine: Engine, tmp_path: Path)
             masters[0].id,
             masters[1].id,
         ]
-        assert [member.member_path for member in arrangement.members] == ["DCIM/A.mov", "DCIM/B.mov"]
+        assert [member.member_path for member in arrangement.members] == [
+            "DCIM/A.mov",
+            "DCIM/B.mov",
+        ]
 
         intake = session.get(Intake, "intake-a")
         assert intake is not None
@@ -86,7 +90,11 @@ def test_move_touches_only_arrangement(engine: Engine, tmp_path: Path) -> None:
 
         move_member(session, arrangement.id, "DCIM/A.mov", "satsang/day-1/A.mov")
 
-        assert (item.as_received_path, item.virtual_path, item.item_metadata["source_path"]) == original
+        assert (
+            item.as_received_path,
+            item.virtual_path,
+            item.item_metadata["source_path"],
+        ) == original
         assert Path(str(item.item_metadata["source_path"])).exists()
         assert arrangement.members[0].member_path == "satsang/day-1/A.mov"
 
@@ -162,7 +170,10 @@ def test_submit_emits_source_map_manifest_and_queryable_rows(
             )
         )
         assert [row.archive_path for row in mirror] == ["a.mov", "z.mov"]
-        assert [row.sha256 for row in mirror] == [items[1].logical_asset_hash, items[0].logical_asset_hash]
+        assert [row.sha256 for row in mirror] == [
+            items[1].logical_asset_hash,
+            items[0].logical_asset_hash,
+        ]
         assert [row.source_path for row in mirror] == [
             items[1].item_metadata["source_path"],
             items[0].item_metadata["source_path"],
@@ -185,9 +196,9 @@ def test_submit_validation_fails_closed_before_writing_files(
     assert not (submission_root / "bad-submit").exists()
     with session_scope(engine) as session:
         assert session.get(Submission, "bad-submit") is None
-        arrangement = session.get(Arrangement, arrangement_id)
-        assert arrangement is not None
-        assert arrangement.status == ArrangementStatus.DRAFT
+        loaded = session.get(Arrangement, arrangement_id)
+        assert loaded is not None
+        assert loaded.status == ArrangementStatus.DRAFT
 
 
 @pytest.mark.parametrize(
@@ -227,9 +238,9 @@ def test_submit_rejects_invalid_member_path_variants_before_writing_files(
     assert not any(submission_root.glob("bad-path-*"))
     with session_scope(engine) as session:
         assert session.scalar(select(func.count()).select_from(Submission)) == 0
-        arrangement = session.get(Arrangement, arrangement_id)
-        assert arrangement is not None
-        assert arrangement.status == ArrangementStatus.DRAFT
+        loaded = session.get(Arrangement, arrangement_id)
+        assert loaded is not None
+        assert loaded.status == ArrangementStatus.DRAFT
 
 
 def test_submit_rejects_changed_source_bytes_without_db_row(
@@ -264,7 +275,9 @@ def test_submit_rejects_missing_source_without_db_row(
 
     submit_missing = "missing-submit"
     with pytest.raises(ArrangementError, match="missing or not a file"):
-        _submit_changed_source(engine, arrangement_id, submission_root, submission_id=submit_missing)
+        _submit_changed_source(
+            engine, arrangement_id, submission_root, submission_id=submit_missing
+        )
 
     assert not (submission_root / "missing-submit").exists()
     with session_scope(engine) as session:
@@ -338,9 +351,9 @@ def test_file_first_submit_leaves_only_orphan_files_on_rollback(
     assert (submission_root / "rolled-back" / "source-map.tsv").exists()
     with session_scope(engine) as session:
         assert session.get(Submission, "rolled-back") is None
-        arrangement = session.get(Arrangement, arrangement_id)
-        assert arrangement is not None
-        assert arrangement.status == ArrangementStatus.DRAFT
+        loaded = session.get(Arrangement, arrangement_id)
+        assert loaded is not None
+        assert loaded.status == ArrangementStatus.DRAFT
 
 
 def test_one_submission_per_arrangement_is_db_enforced(

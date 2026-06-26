@@ -45,7 +45,7 @@ def test_s3_minio_live_round_trip_skips_without_env(tmp_path: Path) -> None:
     if not endpoint or not bucket:
         pytest.skip("set SUTRADHARA_MINIO_ENDPOINT and SUTRADHARA_MINIO_BUCKET for live MinIO")
     try:
-        import boto3  # type: ignore[import-not-found]
+        import boto3  # type: ignore[import-untyped]
     except ImportError:
         pytest.skip("boto3 is not installed")
 

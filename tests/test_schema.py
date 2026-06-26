@@ -62,6 +62,8 @@ def _table_sql(db_path: Path, table: str) -> str:
 
 
 def _assert_archive_invariants(db_path: Path) -> None:
+    assert "member_path VARCHAR(2048)" in _table_sql(db_path, "bundle_member")
+    assert "member_path VARCHAR(2048)" in _table_sql(db_path, "asset_locator")
     assert (
         "copy_id",
         "logical_asset_hash",

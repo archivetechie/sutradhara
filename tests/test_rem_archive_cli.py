@@ -119,6 +119,62 @@ def test_run_rem_archive_build_uses_current_flags(
     assert result.stored_digest == hashlib.sha256(b"rao bytes").digest()
 
 
+def test_run_rem_archive_build_uses_map_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rem = _write_executable(tmp_path / "rem")
+    source_map = tmp_path / "source-map.tsv"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_map.write_text(
+        "archive_path\tsource_path\tsha256\tsize\tingest_item_id\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out.rao"
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        output.write_bytes(b"map rao bytes")
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"files": [], "stored_digest": "unused"}) + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("sutradhara.rem_archive_cli.subprocess.run", fake_run)
+
+    run_rem_archive_build(
+        map_path=source_map,
+        source_root=source_root,
+        map_sha256="a" * 64,
+        output_path=output,
+        rem_bin=rem,
+    )
+
+    cmd = captured["cmd"]
+    assert "--map" in cmd
+    assert cmd[cmd.index("--map") + 1] == str(source_map)
+    assert "--source-root" in cmd
+    assert cmd[cmd.index("--source-root") + 1] == str(source_root)
+    assert "--map-sha256" in cmd
+    assert cmd[cmd.index("--map-sha256") + 1] == "a" * 64
+    assert "--inputs" not in cmd
+    assert "--rules" not in cmd
+
+
+def test_run_rem_archive_build_rejects_map_inputs_mix(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="cannot be combined"):
+        run_rem_archive_build(
+            inputs=[tmp_path / "input"],
+            map_path=tmp_path / "source-map.tsv",
+            source_root=tmp_path,
+            output_path=tmp_path / "out.rao",
+        )
+
+
 def test_run_rem_archive_build_failure_includes_command_and_stderr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

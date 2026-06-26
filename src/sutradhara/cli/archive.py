@@ -25,13 +25,14 @@ from sutradhara.archive_restore import (
     resolve_member_asset_hash,
     restore_asset,
 )
+from sutradhara.archive_submission import ArchiveSubmissionError, archive_submission
 from sutradhara.artifactclass_policy import (
     apply_artifactclass_policy_file,
     get_artifactclass_policy,
 )
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
-from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool
+from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool, Submission
 from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.replication import WritableStorageBackend
 from sutradhara.staging import StagingHeld, stage_and_enqueue_artifact
@@ -63,6 +64,39 @@ def artifactclass_apply(artifactclass: str, policy_path: str) -> None:
 @archive_group.group("bundle")
 def bundle_group() -> None:
     """Manage durable bundle accumulators."""
+
+
+@archive_group.group("submission")
+def submission_group() -> None:
+    """Archive frozen arrangement submissions."""
+
+
+@submission_group.command("flush")
+@click.argument("submission_id")
+@click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
+@click.option("--key-epoch", default=None, help="Key epoch for rao-aead-v1 pools.")
+def submission_flush(submission_id: str, rem_bin: str, key_epoch: str | None) -> None:
+    """Flush one pending arrangement submission to its artifactclass pools."""
+    engine = make_engine()
+    with session_scope(engine) as session:
+        submission = session.get(Submission, submission_id)
+        if submission is None:
+            raise click.ClickException(f"no submission {submission_id!r}")
+        backends = _target_backends(session, submission.artifactclass)
+        try:
+            result = archive_submission(
+                session,
+                submission_id,
+                backends=backends,
+                builder=RemArchiveBuilder(rem_bin),
+                key_epoch=key_epoch,
+            )
+        except (ArchiveSubmissionError, BundleHeld, ManifestSigningError) as exc:
+            raise click.ClickException(str(exc)) from exc
+    action = "already archived" if result.noop else "archived"
+    click.echo(
+        f"{action} {result.submission_id}: bundle={result.bundle_id} copies={list(result.copy_ids)}"
+    )
 
 
 @bundle_group.command("enqueue")

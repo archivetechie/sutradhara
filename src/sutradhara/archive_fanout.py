@@ -17,7 +17,7 @@ import os
 import subprocess
 import tarfile
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -118,6 +118,7 @@ class BuiltMember:
     size_bytes: int
     file_sha256: bytes
     native_locator: dict[str, Any]
+    ingest_item_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,9 @@ class ArchiveBuilder(Protocol):
         ruleset: str,
         key_epoch: str | None,
         work_dir: Path,
+        map_path: Path | None = None,
+        source_root: Path | None = None,
+        map_sha256: str | None = None,
     ) -> BuildArtifact:
         """Build one archive object for a pool representation."""
         ...
@@ -261,6 +265,9 @@ class LocalArchiveBuilder:
         ruleset: str,
         key_epoch: str | None,
         work_dir: Path,
+        map_path: Path | None = None,
+        source_root: Path | None = None,
+        map_sha256: str | None = None,
     ) -> BuildArtifact:
         archive_path = work_dir / f"{bundle.id}-{representation.value}.sra"
         manifest_path = work_dir / f"{bundle.id}-{representation.value}.manifest.json"
@@ -345,17 +352,26 @@ class RemArchiveBuilder:
         ruleset: str,
         key_epoch: str | None,
         work_dir: Path,
+        map_path: Path | None = None,
+        source_root: Path | None = None,
+        map_sha256: str | None = None,
     ) -> BuildArtifact:
         output_path = work_dir / f"{bundle.id}-{representation.value}.rao"
         manifest_path = work_dir / f"{bundle.id}-{representation.value}.manifest.json"
         rem_ruleset: str | None = ruleset or None
+        rem_inputs = _rem_input_paths(members) if map_path is None else None
+        if map_path is not None and source_root is None:
+            raise ArchiveFanoutError("map archive build requires source_root")
         if representation is Representation.RAO_AEAD_V1:
             if key_epoch is None:
                 raise ArchiveFanoutError("encrypted RAO archive build requires key_epoch")
             with KeyRegistry().materialized_root_key(key_epoch) as key_file:
                 result = run_rem_archive_build(
-                    inputs=_rem_input_paths(members),
-                    ruleset=rem_ruleset,
+                    inputs=rem_inputs,
+                    ruleset=None if map_path is not None else rem_ruleset,
+                    map_path=map_path,
+                    source_root=source_root,
+                    map_sha256=map_sha256,
                     output_path=output_path,
                     manifest_path=manifest_path,
                     rem_bin=self._rem_bin,
@@ -366,8 +382,11 @@ class RemArchiveBuilder:
                 )
         else:
             result = run_rem_archive_build(
-                inputs=_rem_input_paths(members),
-                ruleset=rem_ruleset,
+                inputs=rem_inputs,
+                ruleset=None if map_path is not None else rem_ruleset,
+                map_path=map_path,
+                source_root=source_root,
+                map_sha256=map_sha256,
                 output_path=output_path,
                 manifest_path=manifest_path,
                 rem_bin=self._rem_bin,
@@ -444,10 +463,22 @@ def flush_bundle(
     deliverables_dir: Path | str | None = None,
     manifest_signer: ManifestSigner | None = None,
     tape_capacity_bytes: int | None = None,
+    map_path: Path | str | None = None,
+    source_root: Path | str | None = None,
+    map_sha256: str | None = None,
+    artifact_validator: Callable[[PoolTarget, BuildArtifact], None] | None = None,
 ) -> FanoutResult:
     """Flush one open bundle, build each pool copy, and record catalog state."""
     if deliverables_dir is not None and manifest_signer is None:
         raise ManifestSigningError("deliverables_dir requires a manifest_signer")
+    resolved_map_path = None if map_path is None else Path(map_path)
+    resolved_source_root = None if source_root is None else Path(source_root)
+    if resolved_map_path is not None and resolved_source_root is None:
+        raise ArchiveFanoutError("map flush requires source_root")
+    if resolved_map_path is None and resolved_source_root is not None:
+        raise ArchiveFanoutError("source_root is only valid for map flush")
+    if resolved_map_path is None and map_sha256 is not None:
+        raise ArchiveFanoutError("map_sha256 is only valid for map flush")
     bundle = (
         session.scalars(
             select(Bundle).options(joinedload(Bundle.members)).where(Bundle.id == bundle_id)
@@ -468,11 +499,17 @@ def flush_bundle(
 
     members = [_member_input(member) for member in bundle.members]
     ruleset = bundle.ruleset or ""
-    scan = builder.scan(bundle=bundle, members=members, ruleset=ruleset)
-    bundle.scan_summary = scan.to_summary()
-    if bundle.expect == "compliant" and scan.has_deviations:
-        hold_bundle(session, bundle, summary=scan.to_summary())
-        raise BundleHeld(f"bundle {bundle.id!r} held for conformance review")
+    if resolved_map_path is None:
+        scan = builder.scan(bundle=bundle, members=members, ruleset=ruleset)
+        bundle.scan_summary = scan.to_summary()
+        if bundle.expect == "compliant" and scan.has_deviations:
+            hold_bundle(session, bundle, summary=scan.to_summary())
+            raise BundleHeld(f"bundle {bundle.id!r} held for conformance review")
+    else:
+        bundle.scan_summary = {
+            "mode": "map",
+            "source_map_path": str(resolved_map_path),
+        }
 
     if bundle.archive_id is None:
         bundle.archive_id = f"archive-{bundle.id}"
@@ -496,7 +533,12 @@ def flush_bundle(
                 builder=builder,
                 key_epoch=key_epoch,
                 work_dir=work_dir,
+                map_path=resolved_map_path,
+                source_root=resolved_source_root,
+                map_sha256=map_sha256,
             )
+            if artifact_validator is not None:
+                artifact_validator(target, artifact)
             record = backend.write_object_to_pool(artifact.artifact_path, target.pool_id)
             storage_metadata = _copy_storage_metadata(
                 target.representation,
@@ -615,6 +657,9 @@ def _build_for_target(
     builder: ArchiveBuilder,
     key_epoch: str | None,
     work_dir: Path,
+    map_path: Path | None = None,
+    source_root: Path | None = None,
+    map_sha256: str | None = None,
 ) -> BuildArtifact:
     representation = Representation(target.representation)
     if representation is Representation.D2TAR_RAW:
@@ -626,6 +671,9 @@ def _build_for_target(
         ruleset=bundle.ruleset or "",
         key_epoch=key_epoch if representation is Representation.RAO_AEAD_V1 else None,
         work_dir=work_dir,
+        map_path=map_path,
+        source_root=source_root,
+        map_sha256=map_sha256,
     )
 
 
@@ -948,6 +996,7 @@ def _normalized_rem_build_report(report: dict[str, Any]) -> dict[str, Any]:
                     "size_bytes": item.get("size_bytes"),
                     "sha256": item.get("file_sha256") or item.get("sha256"),
                     "first_chunk_lba": item.get("first_chunk_lba"),
+                    "ingest_item_id": item.get("ingest_item_id"),
                 }
             )
         normalized["members"] = members
@@ -981,6 +1030,9 @@ def _members_from_manifest(
                     "first_chunk_lba": int(item.get("first_chunk_lba", 0)),
                     "size_bytes": int(item.get("size_bytes", source.size_bytes)),
                 },
+                ingest_item_id=(
+                    None if item.get("ingest_item_id") is None else str(item.get("ingest_item_id"))
+                ),
             )
         )
     return built

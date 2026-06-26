@@ -56,8 +56,11 @@ def resolve_rem_bin(rem_bin: str | Path | None = None) -> str:
 
 def run_rem_archive_build(
     *,
-    inputs: Sequence[Path | str],
-    ruleset: Path | str | None,
+    inputs: Sequence[Path | str] | None = None,
+    ruleset: Path | str | None = None,
+    map_path: Path | str | None = None,
+    source_root: Path | str | None = None,
+    map_sha256: str | None = None,
     output_path: Path,
     manifest_path: Path | None = None,
     rem_bin: str | Path | None = None,
@@ -73,8 +76,19 @@ def run_rem_archive_build(
 ) -> RemArchiveBuildResult:
     """Run `rem archive build` with the current archive CLI contract."""
 
-    if not inputs:
+    input_paths = tuple(inputs or ())
+    if map_path is None and not input_paths:
         raise ValueError("rem archive build requires at least one input")
+    if map_path is not None and input_paths:
+        raise ValueError("rem archive build --map cannot be combined with inputs")
+    if map_path is not None and ruleset is not None:
+        raise ValueError("rem archive build --map cannot be combined with ruleset")
+    if map_path is not None and source_root is None:
+        raise ValueError("rem archive build --map requires source_root")
+    if map_path is None and source_root is not None:
+        raise ValueError("source_root is only valid with rem archive build --map")
+    if map_path is None and map_sha256 is not None:
+        raise ValueError("map_sha256 is only valid with rem archive build --map")
     if encrypt and (key_id is None or key_file is None):
         raise ValueError("encrypted rem archive build requires key_id and key_file")
     if not encrypt and (key_id is not None or key_file is not None):
@@ -89,7 +103,11 @@ def run_rem_archive_build(
         "archive",
         "build",
     ]
-    if ruleset is not None:
+    if map_path is not None:
+        cmd.extend(["--map", str(map_path), "--source-root", str(source_root)])
+        if map_sha256 is not None:
+            cmd.extend(["--map-sha256", map_sha256])
+    elif ruleset is not None:
         cmd.extend(["--rules", str(ruleset)])
     cmd.extend(["--out", str(output_path)])
     if manifest_path is not None:
@@ -107,7 +125,8 @@ def run_rem_archive_build(
         cmd.extend(["--key-file", str(key_file), "--key-id", str(key_id)])
     if timestamp is not None:
         cmd.extend(["--timestamp", timestamp])
-    cmd.extend(["--inputs", *[str(path) for path in inputs]])
+    if map_path is None:
+        cmd.extend(["--inputs", *[str(path) for path in input_paths]])
 
     completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if completed.returncode != 0:
