@@ -274,6 +274,27 @@ def submit_arrangement(
         },
     )
 
+    result = cast(
+        CursorResult[Any],
+        session.execute(
+            update(Arrangement)
+            .where(
+                Arrangement.id == arrangement.id,
+                Arrangement.status != ArrangementStatus.SUBMITTED,
+            )
+            .values(
+                status=ArrangementStatus.SUBMITTED,
+                submitted_at=submitted_at,
+                updated_at=submitted_at,
+            )
+        )
+    )
+    if result.rowcount != 1:
+        raise ArrangementSubmitRace(f"arrangement {arrangement.id} was submitted concurrently")
+    arrangement.status = ArrangementStatus.SUBMITTED
+    arrangement.submitted_at = submitted_at
+    arrangement.updated_at = submitted_at
+
     submission = Submission(
         id=final_submission_id,
         arrangement_id=arrangement.id,
@@ -301,29 +322,8 @@ def submit_arrangement(
             )
         )
 
-    result = cast(
-        CursorResult[Any],
-        session.execute(
-            update(Arrangement)
-            .where(
-                Arrangement.id == arrangement.id,
-                Arrangement.status != ArrangementStatus.SUBMITTED,
-            )
-            .values(
-                status=ArrangementStatus.SUBMITTED,
-                submission_id=final_submission_id,
-                submitted_at=submitted_at,
-                updated_at=submitted_at,
-            )
-        )
-    )
-    if result.rowcount != 1:
-        raise ArrangementSubmitRace(f"arrangement {arrangement.id} was submitted concurrently")
-    session.flush()
-    arrangement.status = ArrangementStatus.SUBMITTED
     arrangement.submission_id = final_submission_id
-    arrangement.submitted_at = submitted_at
-    arrangement.updated_at = submitted_at
+    session.flush()
 
     return SubmissionResult(
         submission_id=final_submission_id,

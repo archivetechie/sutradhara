@@ -10,9 +10,11 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+import sutradhara.arrangement as arrangement_module
 from sutradhara.arrangement import (
     ArrangementError,
     ArrangementFrozen,
+    ArrangementSubmitRace,
     create_from_arrangement,
     create_from_intake,
     exclude_member,
@@ -360,6 +362,57 @@ def test_one_submission_per_arrangement_is_db_enforced(
 
     with pytest.raises(IntegrityError):
         _insert_duplicate_submission(engine, arrangement_id)
+
+
+def test_interleaved_concurrent_submit_hits_status_guard_before_insert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = make_engine(f"sqlite:///{tmp_path / 'race.db'}")
+    create_all(engine)
+    submission_root = tmp_path / "submissions"
+    try:
+        with session_scope(engine) as session:
+            _registered_intake(session, tmp_path, "intake-race", ["clip.mov"])
+            arrangement = create_from_intake(session, "intake-race", label="race")
+            arrangement_id = arrangement.id
+
+        original_write_submission_files = arrangement_module._write_submission_files
+        interleaved = False
+
+        def write_and_interleave(submission_dir: Path, files: dict[str, bytes]) -> None:
+            nonlocal interleaved
+            original_write_submission_files(submission_dir, files)
+            if interleaved:
+                return
+            interleaved = True
+            with session_scope(engine) as winner:
+                submit_arrangement(
+                    winner,
+                    arrangement_id,
+                    submitted_by="winner",
+                    submission_root=submission_root,
+                    submission_id="race-winner",
+                )
+
+        monkeypatch.setattr(arrangement_module, "_write_submission_files", write_and_interleave)
+
+        with session_scope(engine) as loser, pytest.raises(ArrangementSubmitRace):
+            submit_arrangement(
+                loser,
+                arrangement_id,
+                submitted_by="loser",
+                submission_root=submission_root,
+                submission_id="race-loser",
+            )
+
+        assert (submission_root / "race-loser" / "source-map.tsv").exists()
+        with session_scope(engine) as session:
+            assert session.get(Submission, "race-winner") is not None
+            assert session.get(Submission, "race-loser") is None
+            assert session.scalar(select(func.count()).select_from(Submission)) == 1
+    finally:
+        engine.dispose()
 
 
 def test_submit_refuses_existing_submission_directory_without_overwrite(

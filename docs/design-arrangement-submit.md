@@ -29,15 +29,20 @@
 - **The master** is an `IngestItem` (registered by P1.1): `id`, `intake_id`, `logical_asset_hash`
   (= the content sha256), `as_received_path`, `virtual_path`, `size_bytes`, `artifactclass`, and
   `item_metadata["source_path"]` — **the absolute path to the original bytes** in the BagIt landing
-  data (a file, or a normalized-package tar if P1.x ran). Live masters = `IngestItem JOIN Intake
-  WHERE Intake.status = 'registered'` (the P1.1/P1.2 liveness predicate).
+  data (a file, or a normalized-package tar if P1.x ran). Live **masters** = `IngestItem JOIN Intake
+  WHERE Intake.status = 'registered' AND NOT EXISTS (asset_derivation WHERE derived_item_id =
+  IngestItem.id)` — the registered-liveness predicate **and** the master predicate together. The
+  `NOT EXISTS` is load-bearing: P1.2's `record_derivation` writes proxies/mezz/preview as `IngestItem`
+  rows **in the same `intake_id`**, so registered-liveness alone would wrongly pull derivatives in
+  (the full rationale is §3.1).
 - **The source-map contract** (arc §3.8/§3.9): the canonical archive interface is
   `ArchiveEntry(source_path, archive_path, sha256, size, ingest_item_id)`, emitted as a TSV under
   `/replica/submissions/<id>/source-map.tsv` (+ `submission.json` + `manifest-sha256.txt`), consumed
   by P2.5 → `rem archive build --map`.
-- **Nothing arrangement-side is built** — no `arrangement`/`arrangement_member`/`submission` tables,
-  no arrangement module/CLI, no scenario. (arc §4's `arrangement`/`wakeup` sketches predate the P0.3
-  single-table + P1.2 code-registry decisions and are illustrative only; this doc designs fresh.)
+- **Before P2.3a, nothing arrangement-side existed** (this is a pre-implementation design snapshot) —
+  no `arrangement`/`arrangement_member`/`submission` tables, no arrangement module/CLI, no scenario.
+  (arc §4's `arrangement`/`wakeup` sketches predate the P0.3 single-table + P1.2 code-registry decisions
+  and are illustrative only; this doc designed fresh. P2.3a, now committed, builds exactly what follows.)
 
 ## 2. The model (four new tables)
 
@@ -102,12 +107,15 @@ submission_member                 # the frozen, IMMUTABLE source-map rows (DB-qu
     alongside the flip — these are the *only* mutations P2.5 makes; they describe progress, not the
     contract. P2.3a writes `status='pending_archive'`, `archived_at=NULL`, and nothing later touches a
     payload field.
-- **The TSV is a derived export, the rows are authoritative.** `source-map.tsv` is the §3.9 archive
-  export (what P2.5 / `rem --map` reads), generated **from** the `submission_member` rows; the rows are
-  the **DB-queryable** copy. (Review point — this reverses an earlier "TSV-only" call: the deletion
-  gate, §5, must answer *"which unarchived submissions reference this landing `source_path`?"*
-  efficiently, which a TSV-only design can't. `submission_member.source_path` (indexed) +
-  `submission.status` make it a plain query.)
+- **TSV and rows are both rendered from one validated in-memory entry list.** Submit validates the
+  members once into an ordered list of frozen entries, then renders **both** the `source-map.tsv` (the
+  §3.9 archive export P2.5 / `rem --map` reads) **and** the `submission_member` rows from that same
+  list — they cannot diverge. The TSV is written **first** (file-first, §4); the rows are inserted
+  after, so the doc must **not** say "the TSV is generated from the rows" (the rows don't exist yet).
+  Once committed, the `submission_member` rows are the **authoritative DB-queryable mirror**. (Review
+  point — this reverses an earlier "TSV-only" call: the deletion gate, §5, must answer *"which
+  unarchived submissions reference this landing `source_path`?"* efficiently, which a TSV-only design
+  can't. `submission_member.source_path` (indexed) + `submission.status` make it a plain query.)
 
 ## 3. The arrange operations (CLI/API — the surface the watcher will later call)
 P2.3a ships the **imperative** API + CLI; P2.3c's watcher becomes a client of exactly these:
@@ -142,16 +150,17 @@ P2.3a ships the **imperative** API + CLI; P2.3c's watcher becomes a client of ex
 ## 4. `submit` — validate, freeze, emit the source-map
 **Validate** (arc §3.8), refuse on any failure (the draft stays mutable):
 - every non-excluded member resolves to a **live, registered master** `IngestItem`
-  (`Intake.status='registered'`);
+  (`Intake.status='registered'` **and** not the derived side of any `asset_derivation` edge — the §1/§3.1
+  master predicate);
 - **no duplicate `archive_path`** across **non-excluded** members (the partial-unique index guards the
   live set + an explicit check over the same set — excluded members never collide, since they aren't
   archived);
-- every `member_path` is **relative, normalized** (no `..`, no leading `/`, NFC, forward slashes) and
-  **policy-compliant**, and contains **no control characters** — *reject* any `member_path` (or
-  resolved `source_path`) holding a tab, newline, CR, or other C0/C1 control char, so the TSV is
-  unambiguous (a normalized relative path alone does not rule out tabs/newlines). The existing
-  `member_name` escaping covers the deeper non-UTF-8 case; the TSV control-char *rejection* is the
-  simple guarantee here;
+- every `member_path` is **relative and normalized** (no `..`, no leading `/`, NFC, forward slashes) and
+  contains **no control characters** — *reject* any `member_path` (or resolved `source_path`) holding a
+  tab, newline, CR, or other C0/C1 control char, so the TSV is unambiguous (a normalized relative path
+  alone does not rule out tabs/newlines). These rules **are** the path policy for P2.3a — there is no
+  separate named path-policy object; the existing `member_name` escaping covers the deeper non-UTF-8
+  case, and the TSV control-char *rejection* is the simple guarantee here;
 - the arrangement's `artifactclass` is compatible with all members (they are masters, not
   derivatives);
 - **source bytes still match** — for each member, the master's `item_metadata["source_path"]` exists
@@ -185,11 +194,23 @@ then DB** order with the P2.1 durable-write helper:
 1. **Generate the submission `id`** (a submit-time UUID, *not* an autoincrement PK — the directory name
    depends on it and must exist before the DB insert), then build the `submission_member` rows + the
    `source-map.tsv` / `submission.json` content in memory.
-2. **Durably write the files** into `/replica/submissions/<id>/` via `atomic_write_verified_file`
-   (temp → fsync file → `os.replace` → fsync dir) — so each file is complete-or-absent, never partial.
-3. **Then** insert the immutable `submission` + `submission_member` rows (`manifest_digest` = the TSV
-   digest, `status='pending_archive'`) and flip `arrangement.status='submitted'`. The **caller
-   commits** (no-commit discipline).
+2. **Durably write the files** into `/replica/submissions/<id>/`. **Contract: `submission_root`
+   (`/replica/submissions/`) must already exist** — a deployment-provisioned durable directory; submit
+   creates **only** the `<id>/` subdir, then **fsyncs `submission_root`** so the new directory entry is
+   durably linked. (This keeps the fsync requirement to a single, well-defined parent. Auto-creating an
+   arbitrary multi-level root chain — the helper's `mkdir(parents=True)` convenience for tests — does
+   *not* durably fsync each new ancestor and is not the production contract.) The parent fsync is
+   **required, not optional**: without it a committed `submission` row could reference a dir that didn't
+   survive a power loss (the §4 invariant below would break). Then write each file via
+   `atomic_write_verified_file` (temp → fsync file → `os.replace` → fsync the file's dir), so each file
+   is complete-or-absent, never partial.
+3. **Then the DB, in this order** (the order matters — see Concurrency): (a) the **guarded status flip**
+   `UPDATE arrangement SET status='submitted' WHERE id=:aid AND status <> 'submitted'` —
+   **rowcount 0 ⇒ a concurrent submit already won ⇒ abort**; (b) insert the immutable `submission` +
+   `submission_member` rows (`manifest_digest` = the TSV digest, `status='pending_archive'`); (c)
+   `UPDATE arrangement SET submission_id=:id, submitted_at=…`. The flip is **first** so the concurrent
+   loser is rejected before inserting rows; `submission_id` is set **last** because its FK requires the
+   `submission` row to exist. The **caller commits** (no-commit discipline).
 The only failure residue is an **orphan submission dir** (files written in step 2, then the DB rolled
 back) — harmless (no `submission` row references it) and reclaimed by a **bounded orphan sweep**
 (`/replica/submissions/<id>/` with no `submission` row, older than a threshold). A `submission` row
@@ -198,17 +219,24 @@ can never reference a missing/partial file, because the files are durable before
 **Concurrency — two submits of the same draft must not both win (review point).** "One submission per
 arrangement" needs DB enforcement, not just app logic: two callers could each validate the draft, each
 write a dir, and each try to insert. Three layers, defence-in-depth:
-1. **Lock the arrangement row first** — `SELECT … FOR UPDATE` (Postgres) on the `arrangement` at the
-   *start* of submit, **before** validation and the step-2 file write, and re-check `status`. The loser
-   blocks until the winner commits, then sees `status='submitted'` and **rejects before writing any
-   files** (so the common race produces no orphan at all). On SQLite the database-level write lock
-   serializes the two transactions to the same effect.
-2. **Status-guarded flip** — the step-3 update is conditional:
-   `UPDATE arrangement SET status='submitted', submission_id=:id WHERE id=:aid AND status <> 'submitted'`;
-   **0 rows affected ⇒ abort + roll back** (its dir, if any, becomes a swept orphan). This holds even
-   if the row lock is unavailable.
-3. **`UNIQUE(submission.arrangement_id)`** — the final backstop: the loser's `submission` insert raises
-   an integrity error → roll back. No path lets two `submission` rows share an arrangement.
+1. **Lock the arrangement row first** — `SELECT … FOR UPDATE` on the `arrangement` at the *start* of
+   submit, **before** validation and the step-2 file write, and re-check `status`. **On Postgres** the
+   loser blocks until the winner commits, then sees `status='submitted'` and **rejects before writing
+   any files** — so the common race produces *no orphan*. **On SQLite** `SELECT … FOR UPDATE` is a
+   no-op: both submitters can validate and write their dirs before one loses at the step-3 insert/flip,
+   so the SQLite loser **may leave an orphan dir**. That is **safe** — DB correctness still holds via
+   layers 2–3 below, and the orphan (no `submission` row) is swept. So: row-lock is a Postgres
+   optimization to avoid the orphan, not a correctness requirement; correctness comes from layers 2–3.
+2. **Status-guarded flip, *before* the `submission` insert** — `UPDATE arrangement SET status='submitted'
+   WHERE id=:aid AND status <> 'submitted'`; **0 rows affected ⇒ abort + roll back** (its dir, if any,
+   becomes a swept orphan). This is the **live primary** concurrent-loser guard (and where the row lock,
+   when available, makes the loser block then lose). **It must run before the `submission` insert** — if
+   the insert came first, the loser would trip `UNIQUE(arrangement_id)` (layer 3) at the insert flush and
+   *never reach* this rowcount-0 branch, leaving the branch dead. Order: guarded flip → insert → set
+   `submission_id`.
+3. **`UNIQUE(submission.arrangement_id)`** — the backstop: any loser that somehow passed layer 2 trips an
+   integrity error at the `submission` insert → roll back. No path lets two `submission` rows share an
+   arrangement. (With the layer-2-first order this is genuine defence-in-depth, not the only guard.)
 
 ## 5. The source-map is the P2.5 contract (and a lifecycle note)
 P2.5 (archive-from-source-map, gated on P2.4 `rem archive build --map`) consumes the TSV: open each
@@ -252,10 +280,19 @@ concern, noted here so it isn't lost.
   written via `atomic_write_verified_file` **before** the `submission` row; a forced DB-rollback after
   the file write leaves an **orphan dir** with **no** `submission` row (harmless, sweep-reclaimable),
   and **never** a `submission` row pointing at a missing/partial file.
-- **one submission per arrangement (concurrency)** — a second `submit` of the same arrangement (or a
-  direct second `submission` insert sharing `arrangement_id`) is rejected: the status-guarded flip
-  affects 0 rows **and** `UNIQUE(arrangement_id)` raises; exactly one `submission` row survives, and the
-  loser leaves at most a swept orphan dir (never a committed row).
+- **one submission per arrangement** — three *distinct* failure paths, each its own test (they reject at
+  different stages — don't fold them into one bullet):
+  - **terminal-status reject** (the common case): a second `submit` of an already-`submitted` arrangement
+    is refused at the **up-front status check** (`ArrangementFrozen`), before any file is written — no
+    orphan. This is *not* the rowcount-0 path.
+  - **`UNIQUE(arrangement_id)` backstop**: a direct second `submission` insert sharing `arrangement_id`
+    raises an integrity error. Exercises the DB constraint in isolation.
+  - **status-guarded flip, rowcount 0** (`ArrangementSubmitRace`): the genuinely concurrent path — two
+    interleaved sessions both pass the initial status check, then the *loser's* guarded
+    `UPDATE … WHERE status <> 'submitted'` affects **0 rows** → abort. Reachable only because the flip
+    runs **before** the `submission` insert (§4); exercised by an explicit two-session test that injects
+    a winning submit mid-loser via the `_write_submission_files` seam (the single-process happy path
+    never reaches it). The loser leaves at most a swept orphan dir, never a committed row.
 - **migration** — new revision chained from the **current** alembic head (P1.1's
   `6a0f4c2e9d1b` — P1.2/P2.1/P2.2 added none); `create_all` builds the **four** tables (`arrangement`,
   `arrangement_member`, `submission`, `submission_member`).
