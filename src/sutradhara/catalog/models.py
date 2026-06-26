@@ -21,6 +21,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -35,6 +36,7 @@ from sqlalchemy.orm import (
 )
 
 from sutradhara.catalog.types import (
+    ArrangementStatus,
     AssetValidity,
     BackendKind,
     BackendTier,
@@ -43,6 +45,7 @@ from sutradhara.catalog.types import (
     IntakeSourceKind,
     IntakeStatus,
     MediaKind,
+    SubmissionStatus,
 )
 
 
@@ -269,6 +272,191 @@ class AssetDerivation(Base):
             f"<AssetDerivation source_item={self.source_item_id} "
             f"derived_item={self.derived_item_id} kind={self.kind!r}>"
         )
+
+
+class Arrangement(Base):
+    """Mutable pre-archive namespace over registered master ingest items."""
+
+    __tablename__ = "arrangement"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft', 'pending_derivatives', 'ready', 'submitted', 'abandoned')",
+            name="ck_arrangement_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    label: Mapped[str] = mapped_column(String(512), nullable=False)
+    intake_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("intake.intake_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    status: Mapped[ArrangementStatus] = mapped_column(
+        String(32), nullable=False, default=ArrangementStatus.DRAFT, index=True
+    )
+    submission_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey(
+            "submission.id",
+            ondelete="SET NULL",
+            name="fk_arrangement_submission_id",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    submitted_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    intake: Mapped[Intake] = relationship()
+    members: Mapped[list[ArrangementMember]] = relationship(
+        back_populates="arrangement",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="ArrangementMember.member_path",
+    )
+
+    def __repr__(self) -> str:
+        return f"<Arrangement id={self.id} intake={self.intake_id!r} status={self.status!r}>"
+
+
+class ArrangementMember(Base):
+    """One arranged archive entry in a draft arrangement."""
+
+    __tablename__ = "arrangement_member"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    arrangement_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("arrangement.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    ingest_item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("ingest_item.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    member_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    excluded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    arrangement: Mapped[Arrangement] = relationship(back_populates="members")
+    ingest_item: Mapped[IngestItem] = relationship()
+
+    def __repr__(self) -> str:
+        return (
+            f"<ArrangementMember arrangement={self.arrangement_id} "
+            f"path={self.member_path!r} excluded={self.excluded}>"
+        )
+
+
+class Submission(Base):
+    """Frozen source-map payload emitted by arrangement submit."""
+
+    __tablename__ = "submission"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending_archive', 'archived')",
+            name="ck_submission_status",
+        ),
+        UniqueConstraint("arrangement_id", name="uq_submission_arrangement_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    arrangement_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("arrangement.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    source_map_path: Mapped[str] = mapped_column(String(4096), nullable=False)
+    manifest_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    member_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[SubmissionStatus] = mapped_column(
+        String(32), nullable=False, default=SubmissionStatus.PENDING_ARCHIVE, index=True
+    )
+    archived_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    submitted_by: Mapped[str] = mapped_column(String(256), nullable=False)
+    submitted_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    arrangement: Mapped[Arrangement] = relationship(foreign_keys=[arrangement_id])
+    members: Mapped[list[SubmissionMember]] = relationship(
+        back_populates="submission",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="SubmissionMember.ord",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Submission id={self.id!r} arrangement={self.arrangement_id} "
+            f"status={self.status!r}>"
+        )
+
+
+class SubmissionMember(Base):
+    """DB-queryable mirror of one immutable source-map row."""
+
+    __tablename__ = "submission_member"
+    __table_args__ = (
+        UniqueConstraint(
+            "submission_id",
+            "archive_path",
+            name="uq_submission_member_submission_archive_path",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    submission_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("submission.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    ingest_item_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("ingest_item.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    archive_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    source_path: Mapped[str] = mapped_column(String(4096), nullable=False, index=True)
+    sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ord: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    submission: Mapped[Submission] = relationship(back_populates="members")
+    ingest_item: Mapped[IngestItem | None] = relationship()
+
+
+Index(
+    "uq_arrangement_member_path_active",
+    ArrangementMember.arrangement_id,
+    ArrangementMember.member_path,
+    unique=True,
+    sqlite_where=ArrangementMember.excluded.is_(False),
+    postgresql_where=ArrangementMember.excluded.is_(False),
+)
 
 
 class Backend(Base):

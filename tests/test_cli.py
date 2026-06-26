@@ -8,6 +8,7 @@ designed to prove.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -22,11 +23,13 @@ from sutradhara.artifactclass_policy import AppleDoubleStagingPolicy, StagingPol
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     Bundle,
+    IngestItem,
+    Intake,
     LogicalAsset,
     ReviewDecision,
 )
 from sutradhara.catalog.session import make_engine, session_scope
-from sutradhara.catalog.types import AssetValidity
+from sutradhara.catalog.types import AssetValidity, IntakeSourceKind, IntakeStatus
 from sutradhara.cli.main import cli
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job, JobStatus
@@ -79,6 +82,7 @@ def test_help_lists_subcommands(cli_env: dict[str, str]) -> None:
         "scrub",
         "intake",
         "admin",
+        "arrangement",
         "archive",
         "review",
         "receive",
@@ -100,6 +104,26 @@ def test_db_init_creates_schema(cli_env: dict[str, str]) -> None:
     result = _run(["db", "init"])
     assert "OK" in result.output
     assert os.path.exists(cli_env["db"])
+
+
+def test_arrangement_create_and_show_plain_text(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    _run(["db", "init"])
+    _seed_registered_intake(tmp_path, "intake-cli", "DCIM/A001.MOV", b"clip-a")
+
+    created = _run(["arrangement", "create", "--from-intake", "intake-cli", "--label", "plain"])
+
+    assert "arrangement 1: draft" in created.output
+    assert "members=1/1" in created.output
+    assert "submitted arrangement" not in created.output
+
+    shown = _run(["arrangement", "show", "1"])
+
+    assert "arrangement 1: draft" in shown.output
+    assert "DCIM/A001.MOV item=1" in shown.output
+    assert "submitted arrangement" not in shown.output
 
 
 def test_worker_once_cli_drains_validate_job(
@@ -532,3 +556,48 @@ def test_backend_without_required_config_errors(cli_env: dict[str, str]) -> None
     result = _run(["scrub", "--backend", "broken"], expect_exit=2)
     assert "needs config.fixture_path" in result.output
     assert "config.daemon_endpoint" in result.output
+
+
+def _seed_registered_intake(
+    tmp_path: Path,
+    intake_id: str,
+    relpath: str,
+    payload: bytes,
+) -> None:
+    source = tmp_path / intake_id / "data" / relpath
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(payload)
+    digest = hashlib.sha256(payload).digest()
+    now = dt.datetime.now(dt.UTC)
+    engine = make_engine()
+    with session_scope(engine) as session:
+        session.add(
+            Intake(
+                intake_id=intake_id,
+                operator="tester",
+                source_kind=IntakeSourceKind.CARD,
+                source_ref="card-a",
+                artifactclass="s-masters",
+                label=intake_id,
+                manifest_path=str(tmp_path / intake_id / "manifest-sha256.txt"),
+                manifest_digest=hashlib.sha256(payload).hexdigest(),
+                status=IntakeStatus.REGISTERED,
+                registered_at=now,
+            )
+        )
+        session.add(LogicalAsset(content_sha256=digest, size_bytes=len(payload)))
+        session.flush()
+        stat_result = source.stat()
+        session.add(
+            IngestItem(
+                intake_id=intake_id,
+                logical_asset_hash=digest,
+                as_received_path=relpath,
+                virtual_path=relpath,
+                st_dev=stat_result.st_dev,
+                st_ino=stat_result.st_ino,
+                size_bytes=len(payload),
+                artifactclass="s-masters",
+                item_metadata={"source_path": str(source)},
+            )
+        )

@@ -124,6 +124,31 @@ def _assert_intake_invariants(db_path: Path) -> None:
     assert "metadata" in _table_sql(db_path, "ingest_item")
 
 
+def _assert_arrangement_invariants(db_path: Path) -> None:
+    arrangement_sql = _table_sql(db_path, "arrangement")
+    assert "ck_arrangement_status" in arrangement_sql
+    assert "fk_arrangement_submission_id" in arrangement_sql
+    assert "submission_id" in arrangement_sql
+    member_index_sql = _index_sql(db_path, "uq_arrangement_member_path_active")
+    assert "UNIQUE INDEX" in member_index_sql
+    assert "arrangement_id" in member_index_sql
+    assert "member_path" in member_index_sql
+    assert "WHERE" in member_index_sql
+    assert "excluded" in member_index_sql
+
+    submission_sql = _table_sql(db_path, "submission")
+    assert "ck_submission_status" in submission_sql
+    assert "uq_submission_arrangement_id" in submission_sql
+    assert ("arrangement_id",) in _unique_index_columns(db_path, "submission")
+    assert (
+        "submission_id",
+        "archive_path",
+    ) in _unique_index_columns(db_path, "submission_member")
+    submission_member_indexes = _index_columns(db_path, "submission_member")
+    assert ("source_path",) in submission_member_indexes
+    assert ("submission_id",) in submission_member_indexes
+
+
 def test_create_all_creates_job_table_without_prior_job_import(tmp_path: Path) -> None:
     db_path = tmp_path / "create_all.db"
     code = f"""
@@ -150,10 +175,15 @@ engine.dispose()
     assert "intake" in tables
     assert "ingest_item" in tables
     assert "asset_derivation" in tables
+    assert "arrangement" in tables
+    assert "arrangement_member" in tables
+    assert "submission" in tables
+    assert "submission_member" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
+    _assert_arrangement_invariants(db_path)
 
 
 def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
@@ -184,10 +214,15 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     assert "intake" in tables
     assert "ingest_item" in tables
     assert "asset_derivation" in tables
+    assert "arrangement" in tables
+    assert "arrangement_member" in tables
+    assert "submission" in tables
+    assert "submission_member" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
+    _assert_arrangement_invariants(db_path)
 
 
 def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
@@ -216,6 +251,11 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     assert "intake" in tables
     assert "ingest_item" in tables
     assert "asset_derivation" in tables
+    assert "arrangement" in tables
+    assert "arrangement_member" in tables
+    assert "submission" in tables
+    assert "submission_member" in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
+    _assert_arrangement_invariants(db_path)

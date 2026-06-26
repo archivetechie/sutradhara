@@ -109,3 +109,20 @@ class IntakeStatus(StrEnum):
     VERIFYING = "verifying"
     QUARANTINED = "quarantined"
     REGISTERED = "registered"
+
+
+class ArrangementStatus(StrEnum):
+    """Lifecycle for a mutable pre-archive arrangement workspace."""
+
+    DRAFT = "draft"
+    PENDING_DERIVATIVES = "pending_derivatives"
+    READY = "ready"
+    SUBMITTED = "submitted"
+    ABANDONED = "abandoned"
+
+
+class SubmissionStatus(StrEnum):
+    """Archive lifecycle for an immutable submitted source-map payload."""
+
+    PENDING_ARCHIVE = "pending_archive"
+    ARCHIVED = "archived"
