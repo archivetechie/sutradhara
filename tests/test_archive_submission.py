@@ -14,7 +14,11 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
 from sutradhara.archive_fanout import BuildArtifact, BuiltMember, ConformanceScan, MemberInput
-from sutradhara.archive_restore import resolve_member_asset_hash, restore_asset
+from sutradhara.archive_restore import (
+    RestoreNameError,
+    resolve_member_asset_hash,
+    restore_asset,
+)
 from sutradhara.archive_submission import ArchiveSubmissionError, archive_submission
 from sutradhara.arrangement import create_from_intake, move_member, submit_arrangement
 from sutradhara.artifactclass_policy import (
@@ -400,6 +404,129 @@ def test_source_root_escape_fails_before_build_or_write(
 
     assert builder.calls == []
     assert rem_backend.writes == []
+
+
+def test_archive_refuses_tampered_source_map(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    # Per-member source drift is covered elsewhere; this guards the frozen
+    # source-map *receipt* itself (archive_submission._verified_source_map_path).
+    setup = _create_submission(
+        engine,
+        tmp_path,
+        moves={"clip-a.mov": "arranged/day-1/clip-a.mov"},
+    )
+    with session_scope(engine) as session:
+        submission = session.get(Submission, setup.submission_id)
+        assert submission is not None
+        source_map = Path(submission.source_map_path)
+    # Tamper the frozen receipt after submit, before archive.
+    source_map.write_bytes(source_map.read_bytes() + b"# tampered\n")
+
+    builder = _MapArchiveBuilder()
+    rem_backend = _WriteBackend("rem")
+    d2_backend = _WriteBackend("d2")
+    with (
+        pytest.raises(ArchiveSubmissionError, match="digest drifted"),
+        session_scope(engine) as session,
+    ):
+        archive_submission(
+            session,
+            setup.submission_id,
+            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
+            builder=builder,
+            key_epoch="a" * 32,
+        )
+
+    assert builder.calls == []
+    assert rem_backend.writes == []
+    with session_scope(engine) as session:
+        assert session.scalar(select(func.count()).select_from(Bundle)) == 0
+        assert session.scalar(select(func.count()).select_from(Copy)) == 0
+        assert session.scalar(select(func.count()).select_from(AssetLocator)) == 0
+        submission = session.get(Submission, setup.submission_id)
+        assert submission is not None
+        assert submission.status == SubmissionStatus.PENDING_ARCHIVE
+
+
+def test_archive_refuses_missing_source_map(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_submission(engine, tmp_path)
+    with session_scope(engine) as session:
+        submission = session.get(Submission, setup.submission_id)
+        assert submission is not None
+        source_map = Path(submission.source_map_path)
+    source_map.unlink()
+
+    builder = _MapArchiveBuilder()
+    rem_backend = _WriteBackend("rem")
+    with (
+        pytest.raises(ArchiveSubmissionError, match="source-map is missing"),
+        session_scope(engine) as session,
+    ):
+        archive_submission(
+            session,
+            setup.submission_id,
+            backends={setup.rem_backend_id: rem_backend},
+            builder=builder,
+            key_epoch="a" * 32,
+        )
+
+    assert builder.calls == []
+    assert rem_backend.writes == []
+    with session_scope(engine) as session:
+        assert session.scalar(select(func.count()).select_from(Bundle)) == 0
+        submission = session.get(Submission, setup.submission_id)
+        assert submission is not None
+        assert submission.status == SubmissionStatus.PENDING_ARCHIVE
+
+
+def test_resolve_member_rejects_valid_but_absent_name(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_submission(
+        engine,
+        tmp_path,
+        moves={"clip-a.mov": "arranged/day-1/clip-a.mov"},
+    )
+    with session_scope(engine) as session:
+        archive_submission(
+            session,
+            setup.submission_id,
+            backends={
+                setup.rem_backend_id: _WriteBackend("rem"),
+                setup.d2_backend_id: _WriteBackend("d2"),
+            },
+            builder=_MapArchiveBuilder(),
+            key_epoch="a" * 32,
+        )
+        # The arranged member resolves to its asset hash...
+        assert (
+            resolve_member_asset_hash(
+                session,
+                artifactclass="s-masters",
+                member_name="arranged/day-1/clip-a.mov",
+            )
+            == setup.asset_hashes["arranged/day-1/clip-a.mov"]
+        )
+        # ...but a well-formed name that was never arranged misses cleanly (not a crash).
+        with pytest.raises(RestoreNameError, match="no catalog member"):
+            resolve_member_asset_hash(
+                session,
+                artifactclass="s-masters",
+                member_name="arranged/day-1/does-not-exist.mov",
+            )
+        # A real member name under the wrong artifactclass also misses (no cross-class leak).
+        with pytest.raises(RestoreNameError, match="no catalog member"):
+            resolve_member_asset_hash(
+                session,
+                artifactclass="s-proxy",
+                member_name="arranged/day-1/clip-a.mov",
+            )
 
 
 def test_identity_mismatch_fails_before_backend_write(

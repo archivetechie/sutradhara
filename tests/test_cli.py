@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from sqlalchemy import select
 
 from sutradhara.artifactclass_policy import AppleDoubleStagingPolicy, StagingPolicy
 from sutradhara.catalog.models import (
@@ -27,9 +28,15 @@ from sutradhara.catalog.models import (
     Intake,
     LogicalAsset,
     ReviewDecision,
+    Submission,
 )
 from sutradhara.catalog.session import make_engine, session_scope
-from sutradhara.catalog.types import AssetValidity, IntakeSourceKind, IntakeStatus
+from sutradhara.catalog.types import (
+    AssetValidity,
+    IntakeSourceKind,
+    IntakeStatus,
+    SubmissionStatus,
+)
 from sutradhara.cli.main import cli
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job, JobStatus
@@ -124,6 +131,41 @@ def test_arrangement_create_and_show_plain_text(
     assert "arrangement 1: draft" in shown.output
     assert "DCIM/A001.MOV item=1" in shown.output
     assert "submitted arrangement" not in shown.output
+
+
+def test_arrangement_submit_cli_freezes_source_map(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    _run(["db", "init"])
+    _seed_registered_intake(tmp_path, "intake-cli", "DCIM/A001.MOV", b"clip-a")
+    _run(["arrangement", "create", "--from-intake", "intake-cli", "--label", "plain"])
+
+    submission_root = tmp_path / "submissions"
+    submitted = _run(
+        [
+            "arrangement",
+            "submit",
+            "1",
+            "--submission-root",
+            str(submission_root),
+            "--submitted-by",
+            "tester",
+        ]
+    )
+
+    assert "submitted arrangement 1:" in submitted.output
+
+    engine = make_engine()
+    with session_scope(engine) as session:
+        submission = session.scalar(select(Submission))
+        assert submission is not None
+        assert submission.status == SubmissionStatus.PENDING_ARCHIVE
+        assert Path(submission.source_map_path).is_file()
+
+    # show now reflects the frozen (submitted) status.
+    shown = _run(["arrangement", "show", "1"])
+    assert "arrangement 1: submitted" in shown.output
 
 
 def test_worker_once_cli_drains_validate_job(
