@@ -19,7 +19,11 @@
 > `Backend` row at runtime; a key-containment validator (no `..`/abs/control chars); `read_range`
 > seeks the slice rather than loading the whole blob; `RsyncSshTransport` takes an injectable `runner`
 > with a command-construction test; a handler-path integration test; and explicit "adapter only —
-> deployment switch is separate" scope.
+> deployment switch is separate" scope. **Round 2 (2026-06-27):** key containment is **lexical posix**
+> (`posixpath.normpath`, no local `resolve()` of a remote root); enumerate/verify return **`ContentHash`
+> bytes** (`content_hash(bytes.fromhex(...))`), not hex; `ssh_options` validated via `_optional_str_list`;
+> the transport runs **argv lists with `shell=False`** + `rsync --protect-args` and a spaces/quotes test;
+> the cloud_blob fix is `unlink(missing_ok=True)` (preferred over the temp-dir restructure).
 
 ## What already exists — build on it, do not rebuild
 - **Backend contract** (`src/sutradhara/backend/port.py`): `StorageBackend` Protocol
@@ -53,9 +57,11 @@
           raise BackendNotConfigured(f"backend {row.name!r} (kind=ssh_disk) needs config.host and config.root")
       return SshDiskBackend(row.name, host=host, root=root,
           user=_optional_str(cfg, "user"), identity_file=_optional_str(cfg, "identity_file"),
-          ssh_options=cfg.get("ssh_options") or [])
+          ssh_options=_optional_str_list(cfg, "ssh_options"))   # [] if absent; BackendNotConfigured on non-list-of-str
   ```
-  Fix the now-stale factory docstring (s3 is implemented; add ssh_disk).
+  Fix the now-stale factory docstring (s3 is implemented; add ssh_disk). Add an `_optional_str_list`
+  helper beside `_optional_str` — returns `[]` when absent, raises `BackendNotConfigured` if present but
+  not a list of strings (so a bad string/dict/JSON value fails at config time, not at command build).
 
 ### A2. `src/sutradhara/backend/ssh_disk.py`
 A filesystem-over-SSH object store rooted at `config.root` on `config.host`. **Transport is injectable**
@@ -84,18 +90,23 @@ class RemoteTransport(Protocol):
   - `size` = `ssh … "stat -c %s <root>/<relpath>"`; absent → `None`.
   - `remove` = `ssh … "rm -f <root>/<relpath>"`.
   - `list_files` = `ssh … "find <root> -type f ! -name '*.partial' -printf '%P\n'"`.
-  - **Shell-quote every remote path** (`shlex.quote`), pass a connection **timeout**
-    (`-o ConnectTimeout=…`, `-o BatchMode=yes`), and map an SSH connection failure
-    (exit 255 / rsync 255) to **`BackendUnavailableError`**, a genuinely-missing object to
-    **`BackendNotFoundError`**.
+  - **Execution discipline:** run every command **locally as an argv list — `subprocess.run(...,
+    shell=False)`** (no local shell). Only the *remote* command string handed to `ssh` (the
+    `mkdir`/`mv`/`sha256sum`/`stat`/`rm`/`find` line the **remote** shell runs) is **`shlex.quote`d**;
+    for `rsync`, use **`--protect-args` (`-s`)** so remote paths with spaces/quotes aren't re-split by
+    the remote shell. Pass `-o ConnectTimeout=…` + `-o BatchMode=yes` + a `subprocess` timeout. Map an
+    SSH/rsync connection failure (exit 255) to **`BackendUnavailableError`**, a genuinely-missing
+    object to **`BackendNotFoundError`**.
 - **`SshDiskBackend`** wraps a transport (default real, tests inject a fake):
-  - **Key containment (security):** every `key` maps to a filesystem path under `root`, so **validate
-    it as a safe relative path** before any transport call — reject an absolute path, any `..` segment,
-    empty / `.`-only segments, a leading `/`, backslashes, and NUL/control chars; normalize and assert
-    the resolved path stays under `root`. Raise on an unsafe key. (The `cloud-blob` key
-    `intakes/<intake>.rao` is controlled, but the backend must be safe for any key.)
+  - **Key containment (security) — LEXICAL only (`root` is remote):** every `key` maps to a path under
+    the *remote* `root`, so validate it with **`posixpath`/`PurePosixPath` lexical rules only — do NOT
+    call `Path(root).resolve()` (root isn't on this machine). Reject: absolute keys / a leading `/`,
+    backslashes, NUL & control chars, empty or `.`-only segments, and any key whose
+    `posixpath.normpath(key)` is absolute or starts with `..` (escapes the root). Raise on an unsafe
+    key; the transport then joins the validated relative key to the remote `root`. (The `cloud-blob`
+    key `intakes/<intake>.rao` is controlled, but the backend must be safe for any key.)
   - `write_object(source, *, key, pool=None) -> CopyRecord`: validate `key` (above); `digest =
-    sha256(source)`; `transport.put(source, key)`; return `CopyRecord(logical_id=digest,
+    content_hash(sha256_file(source))` (a `ContentHash`); `transport.put(source, key)`; return `CopyRecord(logical_id=digest,
     native_locator={"key": key, "sha256": digest.hex(), "size_bytes": source.stat().st_size},
     integrity_hash=digest, size_bytes=source.stat().st_size, metadata={"pool": pool} if pool)`.
     **The locator carries per-object identity ONLY (`key`/`sha256`/`size`) — NOT `host`/`root`** (those
@@ -108,13 +119,17 @@ class RemoteTransport(Protocol):
     `read_bytes()` the whole file into memory then slice — footage-scale blobs are large). The fetch
     still downloads the whole object (a true `dd`-range over ssh is an optional later optimization), so
     only the requested slice is held in memory. Absent → `BackendNotFoundError`. Clean up the temp file.
-  - `verify(locator)`: `actual = transport.sha256(locator["key"])`; compare to `locator["sha256"]`
-    (remote hashing — no download). Absent or mismatch → `VerifyResult(ok=False, …)`; **never raise on
-    mismatch** (contract).
+  - `verify(locator)`: `hex = transport.sha256(locator["key"])` (remote hashing — no download); absent
+    → `VerifyResult(ok=False, …)`. Else `actual = content_hash(bytes.fromhex(hex))` (a **`ContentHash`**
+    per `port.py`); compare to `content_hash(bytes.fromhex(locator["sha256"]))`; mismatch →
+    `VerifyResult(ok=False, actual_hash=actual, …)`. **Never raise on mismatch** (contract).
   - `delete_object(locator)`: `transport.remove(locator["key"])` (idempotent).
-  - `enumerate()`: for each `relpath` in `transport.list_files()`, `digest = transport.sha256(relpath)`,
-    `size = transport.size(relpath)` → yield `CopyRecord`. (Scrub-time; per-file remote hash is
-    acceptable. Skip files whose sha/size come back `None`.)
+  - `enumerate()`: for each `relpath` in `transport.list_files()`, `hex = transport.sha256(relpath)`,
+    `size = transport.size(relpath)`; skip if either is `None` or `hex` is not valid hex. Yield
+    `CopyRecord(logical_id=content_hash(bytes.fromhex(hex)), integrity_hash=content_hash(bytes.fromhex(
+    hex)), native_locator={"key": relpath, "sha256": hex, "size_bytes": size}, size_bytes=size)`.
+    **`logical_id`/`integrity_hash` are `ContentHash` bytes (`content_hash(bytes.fromhex(...))`), never
+    raw hex** — same as `s3.py`. (Scrub-time; per-file remote hash is acceptable.)
 
 ## B. Fix the `cloud-blob` retry idempotency bug
 Found in the pilot: `cloud-blob` builds the RAO to a **persistent** path
@@ -122,10 +137,12 @@ Found in the pilot: `cloud-blob` builds the RAO to a **persistent** path
 then uploads. If the upload fails (e.g. a transient transport error) the `.rao` is left behind, and the
 retry's `rem archive build --out <that path>` aborts with **`--out … already exists`** (real failure
 trace from the pilot run). Fix in `src/sutradhara/jobs/handlers/cloud_blob.py`:
-- Make the build idempotent on retry — **either** build the blob inside a per-attempt
-  `tempfile.TemporaryDirectory` (preferred — no stale cache artifact ever; upload from there), **or**
-  `destination.unlink(missing_ok=True)` immediately before `run_rem_archive_build`. Apply to both the
-  real and the `SUTRADHARA_FAKE_CLOUD_BLOB` paths.
+- Make the build idempotent on retry. **Preferred (simplest, no signature change):**
+  `destination.unlink(missing_ok=True)` immediately before `run_rem_archive_build`, on **both** the real
+  and the `SUTRADHARA_FAKE_CLOUD_BLOB` paths. *(The temp-dir alternative — build inside a per-attempt
+  `tempfile.TemporaryDirectory` and upload from there — is cleaner about cache litter but requires
+  changing `_build_cloud_blob` to return `(blob_path, digest)` from inside the temp context; only do that
+  if you also want to stop leaving the blob in cache.)*
 
 ## Tests
 - **`tests/test_ssh_disk_backend.py`** (mirror `tests/test_s3_backend.py`), using a
@@ -151,11 +168,13 @@ trace from the pilot run). Fix in `src/sutradhara/jobs/handlers/cloud_blob.py`:
   assert the blob lands in the local "remote" dir and a `Copy` row is recorded through the **unchanged**
   handler. Proves `factory.backend_from_row(kind=ssh_disk)` → `write_object` works end-to-end via the
   temp-copy path, without a live SSH server.
-- **`RsyncSshTransport` command construction** (inject a fake `runner`): assert it issues **mkdir
-  before rsync**, rsync uses `--partial` + `-e ssh …`, ssh carries `-o BatchMode=yes` +
-  `-o ConnectTimeout=…`, remote paths are `shlex.quote`d, `list_files` excludes `*.partial`, and an
-  exit code 255 → `BackendUnavailableError` (a missing file on `get`/`sha256` → `None` /
-  `BackendNotFoundError`). This guards the real transport that the `LocalDirTransport` tests don't exercise.
+- **`RsyncSshTransport` command construction** (inject a fake `runner`): assert every call is an **argv
+  list run with `shell=False`** (no local shell); **mkdir issues before rsync**; rsync uses `--partial`
+  + `--protect-args` + `-e ssh …`; ssh carries `-o BatchMode=yes` + `-o ConnectTimeout=…`; the **remote**
+  command string is `shlex.quote`d; `list_files` excludes `*.partial`; exit code 255 →
+  `BackendUnavailableError` (a missing file on `get`/`sha256` → `None` / `BackendNotFoundError`). **Use a
+  `key` and `root` containing spaces and a quote** so quoting/`--protect-args` is exercised, not
+  theoretical. This guards the real transport that the `LocalDirTransport` tests don't exercise.
 - **Key containment** — unsafe keys (`../x`, `/abs`, empty/`.` segments, control chars) are rejected
   before any transport call.
 - `uv run pytest` green; `uv run ruff check` clean.
