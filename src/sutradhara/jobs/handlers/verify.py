@@ -40,6 +40,8 @@ def handle_verify(ctx: JobContext) -> JobResult:
     copy = ctx.session.get(Copy, raw_copy_id)
     if copy is None:
         raise ValueError(f"no copy with id={raw_copy_id}")
+    if copy.deleted_at is not None:
+        raise ValueError(f"copy id={raw_copy_id} has been tombstoned by retention")
 
     backend = factory.backend_from_row(copy.backend)
     result = backend.verify(copy.native_locator)

@@ -420,6 +420,7 @@ def _healthy_copies(session: Session, asset_hash: bytes) -> list[Copy]:
             .where(
                 Copy.logical_asset_hash == asset_hash,
                 Copy.health == CopyHealth.OK,
+                Copy.deleted_at.is_(None),
             )
             .order_by(Copy.id)
         )

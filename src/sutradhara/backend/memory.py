@@ -87,6 +87,15 @@ class MemoryBackend:
             detail=f"expected {h.hex()[:12]}…, got {actual.hex()[:12]}…",
         )
 
+    def delete_object(self, locator: BackendLocator) -> None:
+        """Remove an object, treating an already-missing object as success."""
+        try:
+            h = self._locator_to_hash(locator)
+        except BackendNotFoundError:
+            return
+        self._objects.pop(h, None)
+        self._extra_metadata.pop(h, None)
+
     # --- helpers ---------------------------------------------------------
 
     def _locator_to_hash(self, locator: BackendLocator) -> ContentHash:

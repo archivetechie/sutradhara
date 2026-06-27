@@ -141,6 +141,11 @@ class S3Backend:
             detail=f"expected {expected.hex()[:12]}..., got {actual.hex()[:12]}...",
         )
 
+    def delete_object(self, locator: BackendLocator) -> None:
+        """Delete an object, using S3's idempotent delete semantics."""
+        bucket, key = self._bucket_key(locator)
+        self._client.delete_object(Bucket=bucket, Key=key)
+
     def _join_key(self, *parts: str) -> str:
         key_parts = [self._prefix, *parts] if self._prefix else list(parts)
         return "/".join(part.strip("/") for part in key_parts if part.strip("/"))

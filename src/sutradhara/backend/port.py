@@ -124,6 +124,19 @@ class StorageBackend(Protocol):
         ...
 
 
+@runtime_checkable
+class DeletableStorageBackend(StorageBackend, Protocol):
+    """Storage backend capability for idempotent object deletion."""
+
+    def delete_object(self, locator: BackendLocator) -> None:
+        """Delete one backend object.
+
+        Implementations must treat an already-absent object as success so
+        callers can safely retry after a delete-before-DB crash window.
+        """
+        ...
+
+
 class BackendError(Exception):
     """Base for adapter-level errors."""
 

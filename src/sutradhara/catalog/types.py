@@ -126,3 +126,11 @@ class SubmissionStatus(StrEnum):
 
     PENDING_ARCHIVE = "pending_archive"
     ARCHIVED = "archived"
+
+
+class RetentionState(StrEnum):
+    """Per-intake lifecycle for temporary-byte retention."""
+
+    HELD = "held"
+    RELEASED = "released"
+    PURGED = "purged"

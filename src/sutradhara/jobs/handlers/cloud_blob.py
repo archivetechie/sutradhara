@@ -16,7 +16,7 @@ from sutradhara.backend import factory
 from sutradhara.backend.port import CopyRecord
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Backend, Bundle, Copy, IngestItem, Intake, Pool
-from sutradhara.catalog.types import CopyHealth, CopySource
+from sutradhara.catalog.types import CopyHealth, CopySource, RetentionState
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 from sutradhara.keys import KeyRegistry
 from sutradhara.rem_archive_cli import run_rem_archive_build, sha256_file
@@ -38,6 +38,17 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
     intake = ctx.session.get(Intake, intake_id)
     if intake is None:
         raise ValueError(f"no Intake with id={intake_id!r}")
+    if intake.retention_state in {RetentionState.RELEASED, RetentionState.PURGED}:
+        return JobResult(
+            ok=True,
+            detail="cloud blob skipped for released intake",
+            step_state={
+                "cloud_blob": {
+                    "kind": "skipped-retention-state",
+                    "retention_state": str(intake.retention_state),
+                }
+            },
+        )
 
     backend_name = str(params.get("backend_name") or "cloud-temp")
     pool_id = str(params.get("pool_id") or "cloud-temp")

@@ -15,6 +15,7 @@ from sutradhara.cli.intake import intake_group, prepare_cmd
 from sutradhara.cli.jobs import jobs_group
 from sutradhara.cli.receive import receive_group
 from sutradhara.cli.reconcile import reconcile_cmd
+from sutradhara.cli.retention import offsite_group, retention_group
 from sutradhara.cli.scrub import scrub_cmd
 from sutradhara.cli.virtual import reject_cmd, tag_group, unreject_cmd, virtual_group
 from sutradhara.cli.worker import worker_cmd
@@ -35,6 +36,8 @@ cli.add_command(prepare_cmd)
 cli.add_command(jobs_group)
 cli.add_command(receive_group)
 cli.add_command(reconcile_cmd)
+cli.add_command(offsite_group)
+cli.add_command(retention_group)
 cli.add_command(worker_cmd)
 cli.add_command(admin_group)
 cli.add_command(archive_group)

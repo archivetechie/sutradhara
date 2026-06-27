@@ -573,6 +573,7 @@ def flush_bundle(
                 builder=builder,
                 work_dir=work_dir,
             )
+            copy.last_verified_at = dt.datetime.now(dt.UTC)
             if (
                 deliverables_dir is not None
                 and artifact.manifest_path is not None

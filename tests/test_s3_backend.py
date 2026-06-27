@@ -38,6 +38,10 @@ def test_s3_backend_write_range_verify_and_enumerate(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0].integrity_hash == hashlib.sha256(b"abcdef").digest()
 
+    backend.delete_object(record.native_locator)
+    assert ("bucket", "sutra/intakes/card-1.rao") not in client.objects
+    backend.delete_object(record.native_locator)
+
 
 def test_s3_minio_live_round_trip_skips_without_env(tmp_path: Path) -> None:
     endpoint = os.environ.get("SUTRADHARA_MINIO_ENDPOINT")
@@ -113,3 +117,8 @@ class _FakeS3Client:
     def get_paginator(self, name: str) -> _FakePaginator:
         assert name == "list_objects_v2"
         return _FakePaginator(self)
+
+    def delete_object(self, *, Bucket: str, Key: str) -> None:
+        self.objects.pop((Bucket, Key), None)
+        self.metadata.pop((Bucket, Key), None)
+        self.extra_args.pop((Bucket, Key), None)

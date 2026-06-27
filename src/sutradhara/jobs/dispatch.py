@@ -127,6 +127,11 @@ def dispatch_restore(
             f"copy id={copy_id} on backend {copy.backend.name!r} has health=missing; "
             "there are no bytes to restore from it"
         )
+    if copy.deleted_at is not None:
+        raise CopyNotRestorable(
+            f"copy id={copy_id} on backend {copy.backend.name!r} is tombstoned; "
+            "there are no bytes to restore from it"
+        )
 
     try:
         dest_text = os.fspath(dest_path)

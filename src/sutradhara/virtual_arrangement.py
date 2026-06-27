@@ -406,6 +406,7 @@ def _healthy_archived_artifactclasses(session: Session, asset_hash: bytes) -> li
         .where(
             AssetLocator.logical_asset_hash == asset_hash,
             Copy.health == CopyHealth.OK,
+            Copy.deleted_at.is_(None),
         )
         .order_by(Bundle.artifactclass)
     )

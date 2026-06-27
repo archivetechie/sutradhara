@@ -1307,6 +1307,19 @@ def test_dispatch_restore_rejects_missing_copy(engine: Engine, tmp_path: Path) -
         dispatch_restore(s, copy_id, tmp_path / "restore.bin")
 
 
+def test_dispatch_restore_rejects_tombstoned_copy(engine: Engine, tmp_path: Path) -> None:
+    from sutradhara.jobs.dispatch import CopyNotRestorable, dispatch_restore
+
+    copy_id = _register_restorable_copy(engine)
+    with session_scope(engine) as s:
+        copy = s.get(Copy, copy_id)
+        assert copy is not None
+        copy.deleted_at = dt.datetime.now(dt.UTC)
+
+    with session_scope(engine) as s, pytest.raises(CopyNotRestorable, match="tombstoned"):
+        dispatch_restore(s, copy_id, tmp_path / "restore.bin")
+
+
 def test_dispatch_restore_allows_suspect_copy(engine: Engine, tmp_path: Path) -> None:
     from sutradhara.jobs.dispatch import dispatch_restore
 

@@ -48,6 +48,11 @@ def handle_restore(ctx: JobContext) -> JobResult:
             "missing-copy",
             f"copy id={copy_id} has health=missing; there are no bytes to restore",
         )
+    if copy.deleted_at is not None:
+        return _failure(
+            "deleted-copy",
+            f"copy id={copy_id} has been tombstoned by retention; there are no bytes to restore",
+        )
     if copy.bundle_id is not None or copy.logical_asset_hash is None:
         return _failure("bundle-unsupported", "bundle restore is not supported by P2.1")
 

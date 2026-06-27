@@ -45,6 +45,7 @@ from sutradhara.catalog.types import (
     IntakeSourceKind,
     IntakeStatus,
     MediaKind,
+    RetentionState,
     SubmissionStatus,
 )
 
@@ -130,6 +131,10 @@ class Intake(Base):
             "status IN ('receiving', 'verifying', 'quarantined', 'registered')",
             name="ck_intake_status",
         ),
+        CheckConstraint(
+            "retention_state IN ('held', 'released', 'purged')",
+            name="ck_intake_retention_state",
+        ),
     )
 
     intake_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -154,6 +159,13 @@ class Intake(Base):
         DateTime(timezone=True), nullable=True
     )
     quarantined_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    retention_state: Mapped[RetentionState] = mapped_column(
+        String(32), nullable=False, default=RetentionState.HELD, server_default="held"
+    )
+    released_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    staging_deleted_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -654,6 +666,53 @@ class Backend(Base):
         return f"<Backend id={self.id} name={self.name!r} kind={self.kind} tier={self.tier}>"
 
 
+class OffsiteConfirmation(Base):
+    """Operator confirmation that one tape/media id is durably offsite."""
+
+    __tablename__ = "offsite_confirmation"
+
+    media_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    confirmed_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    confirmed_by: Mapped[str] = mapped_column(String(256), nullable=False)
+    shipment_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<OffsiteConfirmation media_id={self.media_id!r}>"
+
+
+class RetentionEvent(Base):
+    """Append-only audit event for retention gate and deletion actions."""
+
+    __tablename__ = "retention_event"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('released', 'cloud_blob_deleted', 'staging_deleted')",
+            name="ck_retention_event_action",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    intake_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("intake.intake_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor: Mapped[str] = mapped_column(String(256), nullable=False)
+    at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    intake: Mapped[Intake] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<RetentionEvent intake={self.intake_id!r} action={self.action!r}>"
+
+
 class Pool(Base):
     """A durable storage pool owned by a backend.
 
@@ -1138,6 +1197,7 @@ class Copy(Base):
     last_verified_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     first_observed_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

@@ -187,6 +187,23 @@ def _assert_virtual_arrangement_invariants(db_path: Path) -> None:
     assert "removed_at IS NULL" in tag_index_sql
 
 
+def _assert_retention_invariants(db_path: Path) -> None:
+    intake_sql = _table_sql(db_path, "intake")
+    assert "retention_state" in intake_sql
+    assert "DEFAULT 'held'" in intake_sql
+    assert "released_at" in intake_sql
+    assert "staging_deleted_at" in intake_sql
+    assert "ck_intake_retention_state" in intake_sql
+    assert "deleted_at" in _table_sql(db_path, "copy")
+    assert "offsite_confirmation" in _tables(db_path)
+    assert "media_id" in _table_sql(db_path, "offsite_confirmation")
+    assert "retention_event" in _tables(db_path)
+    event_sql = _table_sql(db_path, "retention_event")
+    assert "ck_retention_event_action" in event_sql
+    assert "detail" in event_sql
+    assert ("intake_id",) in _index_columns(db_path, "retention_event")
+
+
 def test_create_all_creates_job_table_without_prior_job_import(tmp_path: Path) -> None:
     db_path = tmp_path / "create_all.db"
     code = f"""
@@ -221,12 +238,15 @@ engine.dispose()
     assert "virtual_arrangement_member" in tables
     assert "virtual_arrangement_history" in tables
     assert "asset_tag" in tables
+    assert "offsite_confirmation" in tables
+    assert "retention_event" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
     _assert_arrangement_invariants(db_path)
     _assert_virtual_arrangement_invariants(db_path)
+    _assert_retention_invariants(db_path)
 
 
 def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
@@ -265,12 +285,15 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     assert "virtual_arrangement_member" in tables
     assert "virtual_arrangement_history" in tables
     assert "asset_tag" in tables
+    assert "offsite_confirmation" in tables
+    assert "retention_event" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
     _assert_arrangement_invariants(db_path)
     _assert_virtual_arrangement_invariants(db_path)
+    _assert_retention_invariants(db_path)
 
 
 def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
@@ -307,8 +330,11 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     assert "virtual_arrangement_member" in tables
     assert "virtual_arrangement_history" in tables
     assert "asset_tag" in tables
+    assert "offsite_confirmation" in tables
+    assert "retention_event" in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
     _assert_arrangement_invariants(db_path)
     _assert_virtual_arrangement_invariants(db_path)
+    _assert_retention_invariants(db_path)

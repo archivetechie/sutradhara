@@ -33,7 +33,12 @@ from sutradhara.catalog.models import (
     Submission,
     SubmissionMember,
 )
-from sutradhara.catalog.types import ArrangementStatus, IntakeStatus, SubmissionStatus
+from sutradhara.catalog.types import (
+    ArrangementStatus,
+    IntakeStatus,
+    RetentionState,
+    SubmissionStatus,
+)
 from sutradhara.restore import _fsync_directory, atomic_write_verified_file, sha256_file
 
 DEFAULT_SUBMISSION_ROOT = Path("/replica/submissions")
@@ -108,6 +113,7 @@ def create_from_intake(session: Session, intake_id: str, *, label: str) -> Arran
         raise ArrangementError(
             f"intake {intake_id!r} is {intake.status}; arrangement requires registered"
         )
+    _assert_intake_accepts_landing_work(intake)
 
     arrangement = Arrangement(
         label=label,
@@ -136,6 +142,9 @@ def create_from_arrangement(session: Session, arrangement_id: int, *, label: str
     if not label:
         raise ArrangementError("arrangement label must be non-empty")
     source = _get_arrangement(session, arrangement_id)
+    source_intake = session.get(Intake, source.intake_id)
+    if source_intake is not None:
+        _assert_intake_accepts_landing_work(source_intake)
     clone = Arrangement(
         label=label,
         intake_id=source.intake_id,
@@ -542,6 +551,7 @@ def _validate_live_master(session: Session, item: IngestItem) -> None:
     intake = session.get(Intake, item.intake_id)
     if intake is None or intake.status != IntakeStatus.REGISTERED:
         raise ArrangementError(f"item {item.id} is not in a registered intake")
+    _assert_intake_accepts_landing_work(intake)
     derived_edge = session.scalars(
         select(AssetDerivation.id).where(AssetDerivation.derived_item_id == item.id).limit(1)
     ).one_or_none()
@@ -554,6 +564,14 @@ def _source_path_for_item(item: IngestItem) -> str:
     if not isinstance(value, str) or not value:
         raise ArrangementError(f"item {item.id} has no item_metadata['source_path']")
     return value
+
+
+def _assert_intake_accepts_landing_work(intake: Intake) -> None:
+    if intake.retention_state in {RetentionState.RELEASED, RetentionState.PURGED}:
+        raise ArrangementError(
+            f"intake {intake.intake_id!r} is {intake.retention_state}; "
+            "use virtual arrangements for post-archive organizing"
+        )
 
 
 def _reject_control_chars(value: str, label: str) -> None:

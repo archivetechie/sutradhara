@@ -30,6 +30,7 @@ from sutradhara.catalog.types import (
     IntakeSourceKind,
     IntakeStatus,
     MediaKind,
+    RetentionState,
 )
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job
@@ -331,6 +332,11 @@ def prepare_intake(
         raise ValueError(f"intake {intake_id!r} is not registered; register first")
     if intake.status != IntakeStatus.REGISTERED:
         raise ValueError(f"intake {intake_id!r} is {intake.status}; prepare requires registered")
+    if intake.retention_state in {RetentionState.RELEASED, RetentionState.PURGED}:
+        raise ValueError(
+            f"intake {intake_id!r} is {intake.retention_state}; "
+            "use virtual arrangements for post-archive organizing"
+        )
     previous = intake.requested_profile
     intake.requested_profile = profile
     intake.updated_at = _utcnow()

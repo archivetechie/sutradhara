@@ -94,6 +94,8 @@ def test_help_lists_subcommands(cli_env: dict[str, str]) -> None:
         "review",
         "receive",
         "prepare",
+        "offsite",
+        "retention",
         "worker",
         "virtual",
         "reject",
@@ -114,6 +116,15 @@ def test_virtual_and_tag_help_surface_expected_verbs(cli_env: dict[str, str]) ->
 
     restore = _run(["archive", "restore", "--help"])
     assert "--force-rejected" in restore.output
+
+
+def test_retention_help_surfaces_expected_verbs(cli_env: dict[str, str]) -> None:
+    offsite = _run(["offsite", "--help"])
+    assert "confirm" in offsite.output
+
+    retention = _run(["retention", "--help"])
+    for cmd in ("run", "status", "sweep-staging"):
+        assert cmd in retention.output
 
 
 def test_intake_help_replaces_scan_with_explicit_verbs(cli_env: dict[str, str]) -> None:

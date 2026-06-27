@@ -280,7 +280,7 @@ def restore_asset(
     for pool_id in pool_order:
         for locator in by_pool.get(pool_id, []):
             copy = locator.copy
-            if copy is None or copy.health != CopyHealth.OK:
+            if copy is None or copy.health != CopyHealth.OK or copy.deleted_at is not None:
                 continue
             backend = backends.get(copy.backend_id)
             if backend is None:

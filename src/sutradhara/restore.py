@@ -148,6 +148,8 @@ def sha256_file(path: Path) -> bytes:
 
 
 def _expected_asset_hash(session: Session, copy: Copy) -> bytes:
+    if copy.deleted_at is not None:
+        raise RestoreUnsupported(f"copy id={copy.id} has been tombstoned by retention")
     if copy.health == CopyHealth.MISSING:
         raise RestoreUnsupported(f"copy id={copy.id} has health=missing")
     if copy.bundle_id is not None or copy.logical_asset_hash is None:
