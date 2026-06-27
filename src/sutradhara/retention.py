@@ -36,6 +36,7 @@ from sutradhara.catalog.models import (
 from sutradhara.catalog.types import (
     ArrangementStatus,
     CopyHealth,
+    IntakeStatus,
     RetentionState,
     SubmissionStatus,
 )
@@ -174,9 +175,17 @@ def retention_status(
 ) -> IntakeGateStatus:
     """Return the read-only retention gate truth for one intake."""
     row = _get_intake(session, intake)
-    holds = [*_arrangement_holds(session, row), *_prepared_profile_holds(session, row)]
-    assets = tuple(_asset_gate_status(session, item) for item in _intake_items(session, row))
-    assets_releasable = all(asset.releasable for asset in assets)
+    items = tuple(_intake_items(session, row))
+    eligibility_holds = _intake_eligibility_holds(row, items)
+    holds = [
+        *eligibility_holds,
+        *_arrangement_holds(session, row),
+        *_prepared_profile_holds(session, row),
+    ]
+    assets = (
+        tuple(_asset_gate_status(session, item) for item in items) if not eligibility_holds else ()
+    )
+    assets_releasable = bool(assets) and all(asset.releasable for asset in assets)
     state_allows_release = row.retention_state == RetentionState.HELD
     is_releasable = state_allows_release and not holds and assets_releasable
     deadline = (
@@ -245,6 +254,15 @@ def run_retention(
     )
     session.flush()
     return RetentionRunResult(row.intake_id, True, tuple(deleted_ids), "released")
+
+
+def _intake_eligibility_holds(intake: Intake, items: tuple[IngestItem, ...]) -> list[str]:
+    holds: list[str] = []
+    if intake.status != IntakeStatus.REGISTERED:
+        holds.append(f"intake-status:{intake.status}")
+    if not items:
+        holds.append("intake-empty")
+    return holds
 
 
 def sweep_staging(

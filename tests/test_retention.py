@@ -325,6 +325,48 @@ def test_run_retention_deletes_cloud_after_gate_and_is_idempotent(
         assert len(fake_cloud.deleted) == 1
 
 
+def test_retention_fails_closed_for_non_registered_and_empty_intakes(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_cloud = _DeleteBackend()
+    monkeypatch.setattr(retention_module.factory, "backend_from_row", lambda _row: fake_cloud)
+
+    with session_scope(engine) as session:
+        quarantined = _add_empty_intake(
+            session,
+            tmp_path,
+            "intake-quarantined",
+            status=IntakeStatus.QUARANTINED,
+        )
+        cloud_copy = _add_cloud_copy(
+            session, quarantined.intake_id, fake_cloud.add("cloud-quarantined")
+        )
+
+        quarantined_status = retention_module.retention_status(session, quarantined)
+        assert not quarantined_status.releasable
+        assert "intake-status:quarantined" in quarantined_status.holds
+        assert "intake-empty" in quarantined_status.holds
+
+        quarantined_result = run_retention(session, quarantined, actor="ops")
+        assert not quarantined_result.released
+        assert fake_cloud.deleted == []
+        assert session.get(Copy, cloud_copy.id).deleted_at is None
+
+        empty_registered = _add_empty_intake(
+            session,
+            tmp_path,
+            "intake-empty-registered",
+            status=IntakeStatus.REGISTERED,
+        )
+        empty_status = retention_module.retention_status(session, empty_registered)
+        assert not empty_status.releasable
+        assert empty_status.holds == ("intake-empty",)
+        assert empty_status.assets == ()
+        assert not run_retention(session, empty_registered, actor="ops").released
+
+
 def test_release_freezes_new_work_and_sweep_staging_after_grace(
     engine: Engine,
     tmp_path: Path,
@@ -443,6 +485,36 @@ def _add_intake_with_item(
     session.add(item)
     session.flush()
     return item
+
+
+def _add_empty_intake(
+    session: Session,
+    tmp_path: Path,
+    intake_id: str,
+    *,
+    status: IntakeStatus,
+    artifactclass: str = "s-masters",
+) -> Intake:
+    intake_root = tmp_path / intake_id
+    intake_root.mkdir(parents=True, exist_ok=True)
+    manifest = intake_root / "manifest-sha256.txt"
+    manifest.write_text("manifest\n", encoding="utf-8")
+    intake = Intake(
+        intake_id=intake_id,
+        operator="tester",
+        source_kind=IntakeSourceKind.CARD,
+        source_ref="card",
+        artifactclass=artifactclass,
+        manifest_path=str(manifest),
+        manifest_digest="manifest",
+        status=status,
+        registered_at=_now() if status == IntakeStatus.REGISTERED else None,
+        quarantined_at=_now() if status == IntakeStatus.QUARANTINED else None,
+        retention_state=RetentionState.HELD,
+    )
+    session.add(intake)
+    session.flush()
+    return intake
 
 
 def _add_asset_copy(

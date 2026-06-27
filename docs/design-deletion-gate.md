@@ -63,8 +63,10 @@ opens when durability is proven for the content's recipe.
    offsite_confirmed`; the gate only needs **verified** (already readable) + **offsite-confirmed**. So
    P3.2 builds **just the offsite-confirmation record + an audit log** — `ejected`/`in_transit` are
    physical chain-of-custody ops-tracking, deferred (they can become event types later).
-5. **Per-intake aggregation.** The cloud blob and the landing are per-intake. An **intake** releases when
-   **all** its assets are releasable; that triggers the deletions.
+5. **Per-intake aggregation.** The cloud blob and the landing are per-intake. An **intake** is eligible
+   only when it is `registered` and has at least one `IngestItem`; non-registered or empty intakes are
+   explicit fail-closed holds. An eligible intake releases when **all** its assets are releasable; that
+   triggers the deletions.
 6. **Two-phase deletion, both logged.** On release: **delete the cloud-temp blob immediately** (a
    redundant bridge once tape is safe) and **mark staging deletable** (start the grace clock). A
    **separate, grace-gated** step deletes the landing originals after `STAGING_GRACE_DAYS`. This staging
@@ -174,6 +176,10 @@ All verbs are imperative (operator- or cron-triggered), idempotent, and log ever
 ## 5. The gate logic — `releasable(intake)`
 ```
 releasable(intake):
+    # (0) intake eligibility — fail closed before any destructive path
+    if Intake.status != registered or the intake has zero IngestItems:
+        return NOT releasable
+
     # (1) explicit landing-dependency holds (decision 8) — checked FIRST
     if any Arrangement over this intake is non-terminal:
         # terminal-for-landing = abandoned, OR (submitted AND submission EXISTS AND submission==archived)
@@ -238,6 +244,8 @@ Reject is **not** consulted (decision 7). Re-evaluated each `retention run`; a c
 - **per-intake release** — all assets releasable → cloud object `delete_object`'d + `Copy` **tombstoned**
   (`deleted_at`, row kept) + `retention_state='released'` + grace started + audit rows; **one** asset short
   → **nothing deleted**, stays `held`.
+- **intake eligibility fail-closed** — a non-registered/quarantined intake or a registered intake with zero
+  `IngestItem` rows is NOT releasable; retention must not treat `all([])` as durable proof.
 - **delete is idempotent / crash-safe (codex Medium)** — `delete_object` on a missing object is a no-op;
   a "deleted-but-DB-rolled-back" retry re-runs cleanly (delete no-op + DB re-applied); the cloud `Copy`
   row + locator survive as a tombstone for provenance.
@@ -258,7 +266,7 @@ Reject is **not** consulted (decision 7). Re-evaluated each `retention run`; a c
 **Acceptance** (plan P3.2): **nothing deletes before the gate**; on offsite-confirm the cloud blob expires
 and staging becomes deletable; **proxy-only assets release with no offsite event**; plus a `~/system`
 scenario (archive → offsite confirm → retention run deletes the blob + marks staging → sweep-staging after
-grace deletes landing; a not-yet-confirmed sibling stays held).
+grace deletes landing; a not-yet-confirmed sibling stays held; a freshly-prepared intake stays held).
 
 ## 7. Scope & cross-slice dependencies
 - **Hard dependency — a P2.5 amendment (codex High):** P2.5's `flush_bundle` must **stamp

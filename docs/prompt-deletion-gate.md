@@ -60,6 +60,9 @@ Add `Copy.deleted_at.is_(None)` to **every** healthy/usable-copy filter: `_healt
 
 ### D. The gate (`src/sutradhara/retention.py`) — `releasable(session, intake) -> bool`
 Exactly design §5. Pure read, no mutation. In order:
+0. **Intake eligibility fail-closed:** only `registered` intakes with at least one `IngestItem` can release.
+   Non-registered/quarantined intakes and registered-but-empty intakes are held; never let an empty
+   `all([])` durability loop pass the deletion gate.
 1. **Landing-dependency holds (checked first, decision 8):**
    - **non-terminal arrangement** over the intake: status ∈ {`draft`,`pending_derivatives`,`ready`}, **or**
      `submitted` that is NOT (submission row **exists AND** `status=='archived'`) — **fail closed** on a
@@ -133,6 +136,8 @@ All of design §6:
   picked by restore, not counted by the gate.
 - **per-intake release** — all assets releasable → cloud `delete_object`'d + `Copy` tombstoned + `released`
   + grace started + events; **one** asset short → nothing deleted, stays `held`.
+- **intake eligibility fail-closed** — non-registered/quarantined intakes and registered intakes with zero
+  `IngestItem` rows do not release.
 - **released freezes new work** — after `released`, `create_from_intake`/`prepare_intake` **refuse**.
 - **delete idempotent / crash-safe** — `delete_object` on a missing object is a no-op; a deleted-but-DB-
   rolled-back retry re-runs cleanly.
