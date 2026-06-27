@@ -29,6 +29,9 @@
 > mask as "absent"); key validation applies to **every** locator key + each enumerated `relpath` (not
 > just writes); the `metadata=({"pool": pool} if pool else {})` pseudocode is valid Python; acceptance
 > pins `uv run pytest -q` + a `docs/INDEX.md` update (AGENTS.md).
+> **Round 4 (2026-06-27):** reject any `..` *segment* (not merely a normalized `..` prefix — kills the
+> `a/../b` alias); hash parsing catches wrong-length digests too (`content_hash`'s length check, not only
+> `bytes.fromhex`); absence uses a remote `test -e … || exit 42` **sentinel exit**, not stderr text.
 
 ## What already exists — build on it, do not rebuild
 - **Backend contract** (`src/sutradhara/backend/port.py`): `StorageBackend` Protocol
@@ -91,12 +94,12 @@ class RemoteTransport(Protocol):
     <ssh_options>"`); **(3)** `ssh … "mv -f <root>/<relpath>.partial <root>/<relpath>"` — atomic rename
     **within the same directory**, so a re-write is idempotent (no "already exists").
   - `get` = `rsync -a [user@]host:<root>/<relpath> <local>`.
-  - `sha256` = `ssh … "sha256sum <root>/<relpath>"` → first field. **Distinguish absent from error:**
-    only a *proven-missing* file → `None` (remote stderr "No such file", or gate on a `test -e` probe);
-    any other nonzero is NOT "absent" — exit 255 → `BackendUnavailableError`, other nonzero → a backend
-    error carrying stderr (so permission / missing-command / disk errors aren't masked as absence).
-  - `size` = `ssh … "stat -c %s <root>/<relpath>"` — same absent-vs-error rule (proven-missing → `None`,
-    else raise).
+  - `sha256` = `ssh … "test -e <root>/<relpath> || exit 42; sha256sum <root>/<relpath>"` → first field.
+    **Absence is a sentinel exit, not stderr text** (locale/tool-robust): exit **42** → `None` (proven
+    missing); exit **255** → `BackendUnavailableError`; **any other nonzero → a backend error carrying
+    stderr** (permission / missing-command / disk errors are NOT masked as absence).
+  - `size` = `ssh … "test -e <root>/<relpath> || exit 42; stat -c %s <root>/<relpath>"` — same sentinel
+    rule (42 → `None`, 255 → unavailable, any other nonzero → raise with stderr).
   - `remove` = `ssh … "rm -f <root>/<relpath>"`.
   - `list_files` = `ssh … "find <root> -type f ! -name '*.partial' -printf '%P\n'"`.
   - **Execution discipline:** run every command **locally as an argv list — `subprocess.run(...,
@@ -110,8 +113,10 @@ class RemoteTransport(Protocol):
   - **Key containment (security) — LEXICAL only (`root` is remote):** every `key` maps to a path under
     the *remote* `root`, so validate it with **`posixpath`/`PurePosixPath` lexical rules only — do NOT
     call `Path(root).resolve()` (root isn't on this machine). Reject: absolute keys / a leading `/`,
-    backslashes, NUL & control chars, empty or `.`-only segments, and any key whose
-    `posixpath.normpath(key)` is absolute or starts with `..` (escapes the root). Raise on an unsafe
+    backslashes, NUL & control chars, empty or `.`-only segments, and **any segment equal to `..`**
+    (split on `/` and reject — do NOT rely on the normalized form: `a/../b` normalizes to `b` and would
+    alias, and validating the normalized key while passing the original to SSH diverges). As a backstop,
+    also reject any key whose `posixpath.normpath(key)` is absolute or starts with `..`. Raise on an unsafe
     key; the transport then joins the validated relative key to the remote `root`. **Apply this
     validation to EVERY `key` that reaches the transport** — `write_object`'s `key`, `locator["key"]` in
     `read_range`/`verify`/`delete_object`, and each `relpath` from `list_files()` before yielding a
@@ -133,15 +138,18 @@ class RemoteTransport(Protocol):
     only the requested slice is held in memory. Absent → `BackendNotFoundError`. Clean up the temp file.
   - `verify(locator)`: validate `locator["key"]`; `hex = transport.sha256(locator["key"])` (remote
     hashing — no download); absent → `VerifyResult(ok=False, detail="absent")`. **Defensive (mirror
-    `s3.py`): never raise** — if `hex` or `locator["sha256"]` is missing / non-string / not valid hex,
-    return `VerifyResult(ok=False, detail="invalid hash")` (wrap `bytes.fromhex` in try/except
-    `ValueError`). Else `actual = content_hash(bytes.fromhex(hex))` (a **`ContentHash`** per `port.py`);
+    `s3.py`): never raise** — if `hex` or `locator["sha256"]` is missing / non-string / fails
+    conversion, return `VerifyResult(ok=False, detail="invalid hash")`. **Wrap the whole
+    `content_hash(bytes.fromhex(…))` in try/except `ValueError`** — both the hex decode AND
+    `content_hash`'s 32-byte length check raise `ValueError`, so a wrong-length digest must not crash.
+    Else `actual = content_hash(bytes.fromhex(hex))` (a **`ContentHash`** per `port.py`);
     compare to `content_hash(bytes.fromhex(locator["sha256"]))`; mismatch → `VerifyResult(ok=False,
     actual_hash=actual, detail=…)`. **Never raise on mismatch or malformed input** (contract).
   - `delete_object(locator)`: validate `locator["key"]`; `transport.remove(locator["key"])` (idempotent).
   - `enumerate()`: for each `relpath` in `transport.list_files()`, **skip any `relpath` that fails key
     validation** (don't trust the remote listing), then `hex = transport.sha256(relpath)`,
-    `size = transport.size(relpath)`; skip if either is `None` or `hex` is not valid hex. Yield
+    `size = transport.size(relpath)`; skip if either is `None`, or if `content_hash(bytes.fromhex(hex))`
+    raises `ValueError` (bad hex **or** wrong digest length). Yield
     `CopyRecord(logical_id=content_hash(bytes.fromhex(hex)), integrity_hash=content_hash(bytes.fromhex(
     hex)), native_locator={"key": relpath, "sha256": hex, "size_bytes": size}, size_bytes=size)`.
     **`logical_id`/`integrity_hash` are `ContentHash` bytes (`content_hash(bytes.fromhex(...))`), never
@@ -191,7 +199,7 @@ trace from the pilot run). Fix in `src/sutradhara/jobs/handlers/cloud_blob.py`:
   `BackendUnavailableError` (a missing file on `get`/`sha256` → `None` / `BackendNotFoundError`). **Use a
   `key` and `root` containing spaces and a quote** so quoting/`--protect-args` is exercised, not
   theoretical. This guards the real transport that the `LocalDirTransport` tests don't exercise.
-- **Key containment** — unsafe keys (`../x`, `/abs`, empty/`.` segments, control chars) are rejected
+- **Key containment** — unsafe keys (`../x`, **`a/../b`**, `/abs`, empty/`.` segments, control chars) are rejected
   before any transport call, **on writes AND on a hostile `locator["key"]`** passed to
   `read_range`/`verify`/`delete_object` (assert they reject rather than escape `root`).
 - **`verify` is defensive** — a malformed/missing `locator["sha256"]` or bad remote hash returns
