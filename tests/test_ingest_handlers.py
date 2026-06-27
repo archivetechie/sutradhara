@@ -42,6 +42,7 @@ from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.reconcilers import derivation as _derivation_reconciler  # noqa: F401
 from sutradhara.jobs.reconcilers.spine import reconcile
+from sutradhara.rem_archive_cli import RemArchiveBuildResult
 
 
 @pytest.fixture
@@ -107,6 +108,132 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
         assert copy.native_locator["key"] == "intakes/card-100.rao"
         assert copy.storage_metadata["representation"] == "rao-aead-v1"
         assert fake_backend.objects["intakes/card-100.rao"]
+
+
+def test_cloud_blob_handler_uses_ssh_disk_backend_row(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
+    remote_root = tmp_path / "remote"
+    transport = _LocalObjectTransport(remote_root)
+    monkeypatch.setattr(
+        "sutradhara.backend.ssh_disk.RsyncSshTransport",
+        lambda *args, **kwargs: transport,
+    )
+    landing = tmp_path / "landing"
+    _write_intake(landing, "card-ssh", {"clip.mov": b"valid video payload"})
+
+    with session_scope(engine) as session:
+        _add_ssh_cloud_backend(session)
+        register_landing_root(
+            session,
+            landing,
+            artifactclass="s-masters",
+            cache_root=tmp_path / "cache",
+        )
+        job = session.scalars(select(Job).where(Job.kind == "cloud-blob")).one()
+        result = run_one(session, job.id)
+        assert result.ok
+
+    stored = remote_root / "intakes" / "card-ssh.rao"
+    assert stored.exists()
+    with session_scope(engine) as session:
+        copy = session.scalars(select(Copy)).one()
+        assert copy.native_locator["key"] == "intakes/card-ssh.rao"
+        assert copy.native_locator["sha256"] == hashlib.sha256(stored.read_bytes()).hexdigest()
+
+
+def test_cloud_blob_fake_build_unlinks_stale_cache_artifact(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
+    fake_backend = _FakeObjectBackend("cloud-temp")
+    monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: fake_backend)
+    landing = tmp_path / "landing"
+    cache_root = tmp_path / "cache"
+    _write_intake(landing, "card-retry-fake", {"clip.mov": b"valid video payload"})
+
+    with session_scope(engine) as session:
+        _add_cloud_backend(session)
+        register_landing_root(
+            session,
+            landing,
+            artifactclass="s-masters",
+            cache_root=cache_root,
+        )
+        blob_path = cache_root / "intakes" / "card-retry-fake" / "cloud" / "card-retry-fake.rao"
+        blob_path.parent.mkdir(parents=True, exist_ok=True)
+        blob_path.write_text("stale", encoding="utf-8")
+        job = session.scalars(select(Job).where(Job.kind == "cloud-blob")).one()
+        result = run_one(session, job.id)
+        assert result.ok
+
+    payload = json.loads(blob_path.read_text(encoding="utf-8"))
+    assert payload["intake_bundle_id"] == "cloud-blob:card-retry-fake"
+    assert fake_backend.objects["intakes/card-retry-fake.rao"] == blob_path.read_bytes()
+
+
+def test_cloud_blob_real_build_unlinks_stale_cache_artifact(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_backend = _FakeObjectBackend("cloud-temp")
+    monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: fake_backend)
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
+    monkeypatch.setattr(
+        "sutradhara.jobs.handlers.cloud_blob.KeyRegistry",
+        lambda: _FakeKeyRegistry(tmp_path / "root.key"),
+    )
+    build_payload = b"fresh real blob"
+
+    def fake_run_rem_archive_build(
+        *,
+        output_path: Path,
+        manifest_path: Path | None,
+        **kwargs: object,
+    ) -> RemArchiveBuildResult:
+        output_path = Path(output_path)
+        assert not output_path.exists()
+        output_path.write_bytes(build_payload)
+        if manifest_path is not None:
+            Path(manifest_path).write_text("{}", encoding="utf-8")
+        return RemArchiveBuildResult(
+            artifact_path=output_path,
+            stored_digest=hashlib.sha256(build_payload).digest(),
+            stdout_report={},
+            manifest_path=Path(manifest_path) if manifest_path is not None else None,
+        )
+
+    monkeypatch.setattr(
+        "sutradhara.jobs.handlers.cloud_blob.run_rem_archive_build",
+        fake_run_rem_archive_build,
+    )
+    landing = tmp_path / "landing"
+    cache_root = tmp_path / "cache"
+    _write_intake(landing, "card-retry-real", {"clip.mov": b"valid video payload"})
+
+    with session_scope(engine) as session:
+        _add_cloud_backend(session)
+        register_landing_root(
+            session,
+            landing,
+            artifactclass="s-masters",
+            cache_root=cache_root,
+        )
+        blob_path = cache_root / "intakes" / "card-retry-real" / "cloud" / "card-retry-real.rao"
+        blob_path.parent.mkdir(parents=True, exist_ok=True)
+        blob_path.write_text("stale", encoding="utf-8")
+        job = session.scalars(select(Job).where(Job.kind == "cloud-blob")).one()
+        result = run_one(session, job.id)
+        assert result.ok
+
+    assert blob_path.read_bytes() == build_payload
+    assert fake_backend.objects["intakes/card-retry-real.rao"] == build_payload
 
 
 def test_transcode_derivation_facts_are_idempotent(
@@ -415,6 +542,26 @@ def _add_cloud_backend(session: Any) -> None:
     )
 
 
+def _add_ssh_cloud_backend(session: Any) -> None:
+    backend = Backend(
+        name="cloud-temp",
+        kind=BackendKind.SSH_DISK,
+        tier=BackendTier.CATALOG_AUTHORITATIVE,
+        config={"host": "backup.example", "root": "/remote root"},
+    )
+    session.add(backend)
+    session.flush()
+    session.add(
+        Pool(
+            id="cloud-temp",
+            backend_id=backend.id,
+            representation="rao-aead-v1",
+            location="ssh://backup.example/remote-root",
+            tier="lan",
+        )
+    )
+
+
 class _FakeObjectBackend:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -431,3 +578,35 @@ class _FakeObjectBackend:
             size_bytes=len(data),
             metadata={"sha256": digest.hex(), "pool": pool or ""},
         )
+
+
+class _LocalObjectTransport:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def put(self, local: Path, relpath: str) -> None:
+        target = self.root / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(Path(local).read_bytes())
+
+
+class _FakeKeyRegistry:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def materialized_root_key(self, key_epoch: str) -> _FakeKeyFile:
+        return _FakeKeyFile(self._path)
+
+
+class _FakeKeyFile:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def __enter__(self) -> Path:
+        self._path.write_bytes(b"fake key")
+        return self._path
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self._path.unlink(missing_ok=True)
+        return False

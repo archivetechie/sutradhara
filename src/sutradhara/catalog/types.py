@@ -35,6 +35,7 @@ class BackendKind(StrEnum):
     D2_TAPE = "d2_tape"
     REM_DISK = "rem_disk"
     PLAIN_DISK = "plain_disk"
+    SSH_DISK = "ssh_disk"
     S3 = "s3"
     GCS = "gcs"
     AZURE_BLOB = "azure_blob"

@@ -165,6 +165,7 @@ def _build_cloud_blob(
     key_epoch: str,
 ) -> bytes:
     if os.environ.get("SUTRADHARA_FAKE_CLOUD_BLOB") == "1":
+        destination.unlink(missing_ok=True)
         payload = {
             "representation": Representation.RAO_AEAD_V1.value,
             "intake_bundle_id": bundle.id,
@@ -188,6 +189,7 @@ def _build_cloud_blob(
         manifest_path = work_dir / "manifest.json"
         rules_path.write_text("blob **/\n", encoding="utf-8")
         with KeyRegistry().materialized_root_key(key_epoch) as key_file:
+            destination.unlink(missing_ok=True)
             result = run_rem_archive_build(
                 inputs=[intake_root],
                 ruleset=rules_path,

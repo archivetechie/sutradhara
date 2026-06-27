@@ -25,12 +25,14 @@ class UnsupportedBackendKind(Exception):
 def backend_from_row(row: BackendRow) -> StorageBackend:
     """Instantiate a `StorageBackend` from a persisted `Backend` row.
 
-    Day-1 supports:
+    Supported adapters:
       - `memory`     — in-process test backend (config ignored)
       - `rem_tape`   — Remanence daemon Catalog (`daemon_endpoint`) or dev fixture
       - `d2_tape`    — d2tape CLI adapter
+      - `s3`         — S3-compatible object store
+      - `ssh_disk`   — rsync/SSH object store rooted on a LAN file server
 
-    Future kinds (`rem_disk`, `s3`, `gcs`, `azure_blob`, `plain_disk`)
+    Future kinds (`rem_disk`, `gcs`, `azure_blob`, `plain_disk`)
     will land alongside their adapter implementations.
     """
     cfg: dict[str, object] = row.config or {}
@@ -85,6 +87,24 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
             storage_class=_optional_str(cfg, "storage_class"),
         )
 
+    if row.kind == BackendKind.SSH_DISK:
+        from sutradhara.backend.ssh_disk import SshDiskBackend
+
+        host = _optional_str(cfg, "host")
+        root = _optional_str(cfg, "root")
+        if not host or not root:
+            raise BackendNotConfigured(
+                f"backend {row.name!r} (kind=ssh_disk) needs config.host and config.root"
+            )
+        return SshDiskBackend(
+            row.name,
+            host=host,
+            root=root,
+            user=_optional_str(cfg, "user"),
+            identity_file=_optional_str(cfg, "identity_file"),
+            ssh_options=_optional_str_list(cfg, "ssh_options"),
+        )
+
     raise UnsupportedBackendKind(f"backend {row.name!r}: kind={row.kind} has no factory yet")
 
 
@@ -95,6 +115,15 @@ def _optional_str(cfg: dict[str, object], key: str) -> str | None:
     if not isinstance(value, str):
         raise BackendNotConfigured(f"config.{key} must be a string")
     return value
+
+
+def _optional_str_list(cfg: dict[str, object], key: str) -> list[str]:
+    value = cfg.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise BackendNotConfigured(f"config.{key} must be a list of strings")
+    return list(value)
 
 
 def _reject_obsolete_placements(row: BackendRow, cfg: dict[str, object]) -> None:
