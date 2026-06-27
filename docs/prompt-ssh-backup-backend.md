@@ -24,6 +24,11 @@
 > bytes** (`content_hash(bytes.fromhex(...))`), not hex; `ssh_options` validated via `_optional_str_list`;
 > the transport runs **argv lists with `shell=False`** + `rsync --protect-args` and a spaces/quotes test;
 > the cloud_blob fix is `unlink(missing_ok=True)` (preferred over the temp-dir restructure).
+> **Round 3 (2026-06-27):** `verify` is fully defensive (never raises on missing/malformed hashes —
+> mirrors `s3.py`); `sha256`/`stat` distinguish proven-absent (`None`) from real errors (raise, not
+> mask as "absent"); key validation applies to **every** locator key + each enumerated `relpath` (not
+> just writes); the `metadata=({"pool": pool} if pool else {})` pseudocode is valid Python; acceptance
+> pins `uv run pytest -q` + a `docs/INDEX.md` update (AGENTS.md).
 
 ## What already exists — build on it, do not rebuild
 - **Backend contract** (`src/sutradhara/backend/port.py`): `StorageBackend` Protocol
@@ -86,8 +91,12 @@ class RemoteTransport(Protocol):
     <ssh_options>"`); **(3)** `ssh … "mv -f <root>/<relpath>.partial <root>/<relpath>"` — atomic rename
     **within the same directory**, so a re-write is idempotent (no "already exists").
   - `get` = `rsync -a [user@]host:<root>/<relpath> <local>`.
-  - `sha256` = `ssh … "sha256sum <root>/<relpath>"` → first field; absent file (nonzero) → `None`.
-  - `size` = `ssh … "stat -c %s <root>/<relpath>"`; absent → `None`.
+  - `sha256` = `ssh … "sha256sum <root>/<relpath>"` → first field. **Distinguish absent from error:**
+    only a *proven-missing* file → `None` (remote stderr "No such file", or gate on a `test -e` probe);
+    any other nonzero is NOT "absent" — exit 255 → `BackendUnavailableError`, other nonzero → a backend
+    error carrying stderr (so permission / missing-command / disk errors aren't masked as absence).
+  - `size` = `ssh … "stat -c %s <root>/<relpath>"` — same absent-vs-error rule (proven-missing → `None`,
+    else raise).
   - `remove` = `ssh … "rm -f <root>/<relpath>"`.
   - `list_files` = `ssh … "find <root> -type f ! -name '*.partial' -printf '%P\n'"`.
   - **Execution discipline:** run every command **locally as an argv list — `subprocess.run(...,
@@ -103,28 +112,35 @@ class RemoteTransport(Protocol):
     call `Path(root).resolve()` (root isn't on this machine). Reject: absolute keys / a leading `/`,
     backslashes, NUL & control chars, empty or `.`-only segments, and any key whose
     `posixpath.normpath(key)` is absolute or starts with `..` (escapes the root). Raise on an unsafe
-    key; the transport then joins the validated relative key to the remote `root`. (The `cloud-blob`
-    key `intakes/<intake>.rao` is controlled, but the backend must be safe for any key.)
+    key; the transport then joins the validated relative key to the remote `root`. **Apply this
+    validation to EVERY `key` that reaches the transport** — `write_object`'s `key`, `locator["key"]` in
+    `read_range`/`verify`/`delete_object`, and each `relpath` from `list_files()` before yielding a
+    `CopyRecord` (a corrupt locator or a hostile remote listing must not escape `root`). (The
+    `cloud-blob` key `intakes/<intake>.rao` is controlled, but the backend must be safe for any key.)
   - `write_object(source, *, key, pool=None) -> CopyRecord`: validate `key` (above); `digest =
     content_hash(sha256_file(source))` (a `ContentHash`); `transport.put(source, key)`; return `CopyRecord(logical_id=digest,
     native_locator={"key": key, "sha256": digest.hex(), "size_bytes": source.stat().st_size},
-    integrity_hash=digest, size_bytes=source.stat().st_size, metadata={"pool": pool} if pool)`.
+    integrity_hash=digest, size_bytes=source.stat().st_size, metadata=({"pool": pool} if pool else {}))`.
     **The locator carries per-object identity ONLY (`key`/`sha256`/`size`) — NOT `host`/`root`** (those
     are backend config; `read_range`/`verify`/`delete_object` resolve them from the backend instance
     built from the current `Backend` row, so old locators survive a root move / row update). Idempotent
     (atomic-rename overwrite).
   - `write_object_to_pool(source, pool)`: `key = f"{pool.strip('/')}/{source.name}"` → `write_object`.
-  - `read_range(locator, byte_range)`: `transport.get(locator["key"], tmp)`; whole-object → return the
+  - `read_range(locator, byte_range)`: validate `locator["key"]`; `transport.get(locator["key"], tmp)`; whole-object → return the
     file's bytes; for a non-whole range **`seek(start)` + `read(length)` from the temp file** (do NOT
     `read_bytes()` the whole file into memory then slice — footage-scale blobs are large). The fetch
     still downloads the whole object (a true `dd`-range over ssh is an optional later optimization), so
     only the requested slice is held in memory. Absent → `BackendNotFoundError`. Clean up the temp file.
-  - `verify(locator)`: `hex = transport.sha256(locator["key"])` (remote hashing — no download); absent
-    → `VerifyResult(ok=False, …)`. Else `actual = content_hash(bytes.fromhex(hex))` (a **`ContentHash`**
-    per `port.py`); compare to `content_hash(bytes.fromhex(locator["sha256"]))`; mismatch →
-    `VerifyResult(ok=False, actual_hash=actual, …)`. **Never raise on mismatch** (contract).
-  - `delete_object(locator)`: `transport.remove(locator["key"])` (idempotent).
-  - `enumerate()`: for each `relpath` in `transport.list_files()`, `hex = transport.sha256(relpath)`,
+  - `verify(locator)`: validate `locator["key"]`; `hex = transport.sha256(locator["key"])` (remote
+    hashing — no download); absent → `VerifyResult(ok=False, detail="absent")`. **Defensive (mirror
+    `s3.py`): never raise** — if `hex` or `locator["sha256"]` is missing / non-string / not valid hex,
+    return `VerifyResult(ok=False, detail="invalid hash")` (wrap `bytes.fromhex` in try/except
+    `ValueError`). Else `actual = content_hash(bytes.fromhex(hex))` (a **`ContentHash`** per `port.py`);
+    compare to `content_hash(bytes.fromhex(locator["sha256"]))`; mismatch → `VerifyResult(ok=False,
+    actual_hash=actual, detail=…)`. **Never raise on mismatch or malformed input** (contract).
+  - `delete_object(locator)`: validate `locator["key"]`; `transport.remove(locator["key"])` (idempotent).
+  - `enumerate()`: for each `relpath` in `transport.list_files()`, **skip any `relpath` that fails key
+    validation** (don't trust the remote listing), then `hex = transport.sha256(relpath)`,
     `size = transport.size(relpath)`; skip if either is `None` or `hex` is not valid hex. Yield
     `CopyRecord(logical_id=content_hash(bytes.fromhex(hex)), integrity_hash=content_hash(bytes.fromhex(
     hex)), native_locator={"key": relpath, "sha256": hex, "size_bytes": size}, size_bytes=size)`.
@@ -176,8 +192,11 @@ trace from the pilot run). Fix in `src/sutradhara/jobs/handlers/cloud_blob.py`:
   `key` and `root` containing spaces and a quote** so quoting/`--protect-args` is exercised, not
   theoretical. This guards the real transport that the `LocalDirTransport` tests don't exercise.
 - **Key containment** — unsafe keys (`../x`, `/abs`, empty/`.` segments, control chars) are rejected
-  before any transport call.
-- `uv run pytest` green; `uv run ruff check` clean.
+  before any transport call, **on writes AND on a hostile `locator["key"]`** passed to
+  `read_range`/`verify`/`delete_object` (assert they reject rather than escape `root`).
+- **`verify` is defensive** — a malformed/missing `locator["sha256"]` or bad remote hash returns
+  `VerifyResult(ok=False, …)`, never raises.
+- `uv run pytest -q` green; `uv run ruff check` clean (per AGENTS.md).
 
 ## Acceptance
 - `src/sutradhara/backend/ssh_disk.py` implements `StorageBackend` + `DeletableStorageBackend` +
@@ -186,6 +205,8 @@ trace from the pilot run). Fix in `src/sutradhara/jobs/handlers/cloud_blob.py`:
 - `cloud-blob` build is idempotent on retry (no "--out already exists").
 - New + existing tests green, ruff clean. **No schema/migration change** (it's a backend adapter +
   catalog config; the `Copy`/`Backend` tables already carry JSON locator/config).
+- **Per AGENTS.md:** run `uv run pytest -q`, and **update `docs/INDEX.md`** to mark this prompt
+  `implemented` when done.
 - **Scope is explicit:** this lands the **generic `ssh_disk` adapter + the cloud_blob fix + a
   handler-path proof** — it does **not** switch any deployment from MinIO/S3 to LAN SSH. That switch is
   pointing the `cloud-temp` `Backend` row at kind `ssh_disk` (registration still defaults to
