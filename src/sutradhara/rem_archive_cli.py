@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sutradhara.resource_control import run_managed
+
 
 @dataclass(frozen=True)
 class RemArchiveBuildResult:
@@ -73,6 +75,8 @@ def run_rem_archive_build(
     manifest_file_id: str | None = None,
     timestamp: str | None = None,
     failure_label: str = "rem archive build",
+    resource_role: str = "medium",
+    cpu_lease: int | None = None,
 ) -> RemArchiveBuildResult:
     """Run `rem archive build` with the current archive CLI contract."""
 
@@ -128,7 +132,14 @@ def run_rem_archive_build(
     if map_path is None:
         cmd.extend(["--inputs", *[str(path) for path in input_paths]])
 
-    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    completed = run_managed(
+        cmd,
+        role=resource_role,
+        cpu_lease=cpu_lease,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     if completed.returncode != 0:
         raise RuntimeError(
             f"{failure_label} failed (exit {completed.returncode}): "
@@ -152,6 +163,8 @@ def run_rem_archive_scan(
     ruleset: Path | str | None,
     rem_bin: str | Path | None = None,
     failure_label: str = "rem archive scan",
+    resource_role: str = "medium",
+    cpu_lease: int | None = None,
 ) -> dict[str, Any]:
     """Run `rem archive build --scan-only` and return its JSON report."""
 
@@ -168,7 +181,14 @@ def run_rem_archive_scan(
         cmd.extend(["--rules", str(ruleset)])
     cmd.extend(["--inputs", *[str(path) for path in inputs]])
 
-    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    completed = run_managed(
+        cmd,
+        role=resource_role,
+        cpu_lease=cpu_lease,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     if completed.returncode != 0:
         raise RuntimeError(
             f"{failure_label} failed (exit {completed.returncode}): "

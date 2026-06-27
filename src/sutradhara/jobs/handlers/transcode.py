@@ -14,6 +14,7 @@ from sutradhara.catalog.types import AssetValidity, MediaKind
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
 from sutradhara.rem_archive_cli import sha256_file
+from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job, run_managed
 
 
 @register_handler("transcode")
@@ -58,11 +59,13 @@ def handle_transcode(ctx: JobContext) -> JobResult:
     if os.environ.get("SUTRADHARA_FAKE_TRANSCODE") == "1":
         result = _fake_transcode(source_path, mezz_path, preview_path)
     else:
+        threads = _granted_cpu_threads(ctx)
         result = _run_ffmpeg(
             source_path,
             mezz_path,
             preview_path,
-            threads=_granted_cpu_threads(ctx),
+            threads=threads,
+            role=resource_role_for_job(ctx.job.kind, ctx.job.params),
         )
 
     if result["kind"] == "decode_error":
@@ -158,7 +161,14 @@ def _fake_transcode(source: Path, mezz: Path, preview: Path) -> dict[str, Any]:
     return {"kind": "ok", "detail": "fake transcode completed"}
 
 
-def _run_ffmpeg(source: Path, mezz: Path, preview: Path, *, threads: int) -> dict[str, Any]:
+def _run_ffmpeg(
+    source: Path,
+    mezz: Path,
+    preview: Path,
+    *,
+    threads: int,
+    role: str,
+) -> dict[str, Any]:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         return {
@@ -201,8 +211,10 @@ def _run_ffmpeg(source: Path, mezz: Path, preview: Path, *, threads: int) -> dic
         str(preview),
     ]
     try:
-        completed = subprocess.run(
+        completed = run_managed(
             cmd,
+            role=role,
+            cpu_lease=threads,
             check=False,
             capture_output=True,
             text=True,
@@ -254,16 +266,7 @@ def _stderr_is_decode_error(stderr: str) -> bool:
 
 
 def _granted_cpu_threads(ctx: JobContext) -> int:
-    raw = ctx.granted_leases.get("cpu")
-    if raw is None:
-        for resource in ctx.job.required_resources or []:
-            if resource.get("pool") == "cpu":
-                raw = resource.get("count")
-                break
-    try:
-        return max(1, int(raw or 1))
-    except (TypeError, ValueError):
-        return 1
+    return cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources) or 1
 
 
 def _tool_version(tool: str) -> str:
@@ -271,8 +274,10 @@ def _tool_version(tool: str) -> str:
     if path is None:
         return "unknown"
     try:
-        completed = subprocess.run(
+        completed = run_managed(
             [path, "-version"],
+            role="medium",
+            cpu_lease=1,
             check=False,
             capture_output=True,
             text=True,

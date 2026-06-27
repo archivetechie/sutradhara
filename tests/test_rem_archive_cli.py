@@ -82,7 +82,13 @@ def test_run_rem_archive_build_uses_current_flags(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         captured["cmd"] = cmd
-        assert kwargs == {"capture_output": True, "text": True, "check": False}
+        assert kwargs == {
+            "role": "medium",
+            "cpu_lease": None,
+            "capture_output": True,
+            "text": True,
+            "check": False,
+        }
         output.write_bytes(b"rao bytes")
         return subprocess.CompletedProcess(
             cmd,
@@ -91,7 +97,7 @@ def test_run_rem_archive_build_uses_current_flags(
             stderr="",
         )
 
-    monkeypatch.setattr("sutradhara.rem_archive_cli.subprocess.run", fake_run)
+    monkeypatch.setattr("sutradhara.rem_archive_cli.run_managed", fake_run)
 
     result = run_rem_archive_build(
         inputs=inputs,
@@ -136,6 +142,8 @@ def test_run_rem_archive_build_uses_map_flags(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         captured["cmd"] = cmd
+        assert kwargs["role"] == "medium"
+        assert kwargs["cpu_lease"] is None
         output.write_bytes(b"map rao bytes")
         return subprocess.CompletedProcess(
             cmd,
@@ -144,7 +152,7 @@ def test_run_rem_archive_build_uses_map_flags(
             stderr="",
         )
 
-    monkeypatch.setattr("sutradhara.rem_archive_cli.subprocess.run", fake_run)
+    monkeypatch.setattr("sutradhara.rem_archive_cli.run_managed", fake_run)
 
     run_rem_archive_build(
         map_path=source_map,
@@ -183,9 +191,10 @@ def test_run_rem_archive_build_failure_includes_command_and_stderr(
     output = tmp_path / "out.rao"
 
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert kwargs["role"] == "medium"
         return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="bad flag")
 
-    monkeypatch.setattr("sutradhara.rem_archive_cli.subprocess.run", fake_run)
+    monkeypatch.setattr("sutradhara.rem_archive_cli.run_managed", fake_run)
 
     with pytest.raises(RuntimeError, match="bad flag"):
         run_rem_archive_build(
@@ -210,7 +219,13 @@ def test_run_rem_archive_scan_uses_current_flags(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         captured["cmd"] = cmd
-        assert kwargs == {"capture_output": True, "text": True, "check": False}
+        assert kwargs == {
+            "role": "medium",
+            "cpu_lease": None,
+            "capture_output": True,
+            "text": True,
+            "check": False,
+        }
         return subprocess.CompletedProcess(
             cmd,
             0,
@@ -218,7 +233,7 @@ def test_run_rem_archive_scan_uses_current_flags(
             stderr="",
         )
 
-    monkeypatch.setattr("sutradhara.rem_archive_cli.subprocess.run", fake_run)
+    monkeypatch.setattr("sutradhara.rem_archive_cli.run_managed", fake_run)
 
     assert run_rem_archive_scan(inputs=[source], ruleset=rules, rem_bin=rem) == {
         "scan": {"clusters": []}

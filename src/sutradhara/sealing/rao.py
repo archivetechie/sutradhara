@@ -27,6 +27,7 @@ from sutradhara.rem_archive_cli import (
 from sutradhara.rem_archive_cli import (
     run_rem_archive_build,
 )
+from sutradhara.resource_control import run_managed
 from sutradhara.sealing.port import Representation, SealResult
 
 RAO_CHUNK_SIZE = 262144
@@ -182,7 +183,7 @@ def inspect_rao(path: Path | str) -> RaoInspection:
     args = ["archive", "inspect", "--object", str(source)]
     if not _looks_encrypted(source):
         args.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
-    report = _json_report(_run_rem(args))
+    report = _json_report(_run_rem(args, role="medium"))
     rem_representation = report.get("representation")
     if not isinstance(rem_representation, str):
         raise RuntimeError(f"RAO inspect did not report representation: {report!r}")
@@ -263,7 +264,7 @@ def _extract_rao(
         args.extend(["--key-file", str(key_file)])
     else:
         raise ValueError(f"unsupported RAO representation: {representation}")
-    return _json_report(_run_rem(args))
+    return _json_report(_run_rem(args, role="high"))
 
 
 def _deterministic_ids(
@@ -360,9 +361,14 @@ def _looks_encrypted(path: Path) -> bool:
         return handle.read(4) == b"RAO1"
 
 
-def _run_rem(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _run_rem(
+    args: list[str],
+    *,
+    role: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
     cmd = [resolve_rem_bin(), *args]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = run_managed(cmd, role=role, capture_output=True, text=True, check=False)
     if check and result.returncode != 0:
         raise RuntimeError(
             f"rem {' '.join(args[:2])} failed (exit {result.returncode}): "

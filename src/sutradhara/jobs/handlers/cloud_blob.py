@@ -20,6 +20,7 @@ from sutradhara.catalog.types import CopyHealth, CopySource, RetentionState
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 from sutradhara.keys import KeyRegistry
 from sutradhara.rem_archive_cli import run_rem_archive_build, sha256_file
+from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job
 from sutradhara.sealing.port import Representation
 
 
@@ -98,6 +99,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
         member_count=len(members),
     )
     stored_digest = _build_cloud_blob(
+        ctx=ctx,
         bundle=bundle,
         members=members,
         intake_root=intake_root,
@@ -154,6 +156,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
 
 def _build_cloud_blob(
     *,
+    ctx: JobContext,
     bundle: Bundle,
     members: list[MemberInput],
     intake_root: Path,
@@ -194,6 +197,8 @@ def _build_cloud_blob(
                 key_id=key_epoch,
                 key_file=key_file,
                 failure_label="rem archive build for cloud blob",
+                resource_role=resource_role_for_job(ctx.job.kind, ctx.job.params),
+                cpu_lease=cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources),
             )
         return result.stored_digest
 

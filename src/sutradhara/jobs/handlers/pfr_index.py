@@ -14,6 +14,7 @@ from sutradhara.catalog.models import IngestItem, LogicalAsset
 from sutradhara.catalog.types import AssetValidity
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
+from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job, run_managed
 
 
 @register_handler("pfr-index")
@@ -41,7 +42,11 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
     if os.environ.get("SUTRADHARA_FAKE_FFPROBE") == "1":
         probe = {"mode": "fake", "path": str(source), "size_bytes": source.stat().st_size}
     else:
-        probe_result = _run_ffprobe(source)
+        probe_result = _run_ffprobe(
+            source,
+            role=resource_role_for_job(ctx.job.kind, ctx.job.params),
+            cpu_lease=cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources),
+        )
         if probe_result["kind"] == "container_parse_error":
             asset = ctx.session.get(LogicalAsset, item.logical_asset_hash)
             if asset is not None:
@@ -96,7 +101,7 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
     )
 
 
-def _run_ffprobe(source: Path) -> dict[str, Any]:
+def _run_ffprobe(source: Path, *, role: str, cpu_lease: int | None) -> dict[str, Any]:
     ffprobe = shutil.which("ffprobe")
     if ffprobe is None:
         return {
@@ -115,8 +120,10 @@ def _run_ffprobe(source: Path) -> dict[str, Any]:
         str(source),
     ]
     try:
-        completed = subprocess.run(
+        completed = run_managed(
             cmd,
+            role=role,
+            cpu_lease=cpu_lease,
             check=False,
             capture_output=True,
             text=True,
@@ -161,8 +168,10 @@ def _tool_version(tool: str) -> str:
     if path is None:
         return "unknown"
     try:
-        completed = subprocess.run(
+        completed = run_managed(
             [path, "-version"],
+            role="medium",
+            cpu_lease=1,
             check=False,
             capture_output=True,
             text=True,

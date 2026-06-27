@@ -14,7 +14,6 @@ import hashlib
 import hmac
 import json
 import os
-import subprocess
 import tarfile
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -48,6 +47,7 @@ from sutradhara.replication import (
     WritableStorageBackend,
     target_pools,
 )
+from sutradhara.resource_control import run_managed
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 
@@ -1121,7 +1121,7 @@ def _single_restored_member(dest_dir: Path, member_path: str) -> bytes:
 
 
 def _run_rem(cmd: Sequence[str]) -> None:
-    result = subprocess.run(list(cmd), capture_output=True, text=True, check=False)
+    result = run_managed(list(cmd), role="medium", capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise ArchiveFanoutError(
             f"rem command failed (exit {result.returncode}): "

@@ -67,6 +67,12 @@ def engine() -> Iterator[Engine]:
     eng.dispose()
 
 
+def _copy_by_id(session: Session, copy_id: int) -> Copy:
+    copy = session.get(Copy, copy_id)
+    assert copy is not None
+    return copy
+
+
 class _DeleteBackend:
     def __init__(self) -> None:
         self.objects: set[str] = set()
@@ -280,7 +286,7 @@ def test_run_retention_deletes_cloud_after_gate_and_is_idempotent(
         assert row.name == "cloud-temp"
         return fake_cloud
 
-    monkeypatch.setattr(retention_module.factory, "backend_from_row", _backend_from_row)
+    monkeypatch.setattr("sutradhara.retention.factory.backend_from_row", _backend_from_row)
 
     with session_scope(engine) as session:
         pool = _add_pool(
@@ -304,7 +310,7 @@ def test_run_retention_deletes_cloud_after_gate_and_is_idempotent(
         no_op = run_retention(session, "intake-e", actor="ops")
         assert not no_op.released
         assert fake_cloud.deleted == []
-        assert session.get(Copy, cloud_copy.id).deleted_at is None
+        assert _copy_by_id(session, cloud_copy.id).deleted_at is None
 
         confirm_offsite(session, media_id="tape:tape-e", confirmed_by="ops")
         released = run_retention(session, "intake-e", actor="ops")
@@ -312,7 +318,7 @@ def test_run_retention_deletes_cloud_after_gate_and_is_idempotent(
         assert released.deleted_copy_ids == (cloud_copy.id,)
         assert fake_cloud.deleted == [{"key": "cloud-e"}]
         assert fake_cloud.objects == set()
-        assert session.get(Copy, cloud_copy.id).deleted_at is not None
+        assert _copy_by_id(session, cloud_copy.id).deleted_at is not None
         intake = session.get(Intake, "intake-e")
         assert intake is not None
         assert intake.retention_state == RetentionState.RELEASED
@@ -331,7 +337,7 @@ def test_retention_fails_closed_for_non_registered_and_empty_intakes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_cloud = _DeleteBackend()
-    monkeypatch.setattr(retention_module.factory, "backend_from_row", lambda _row: fake_cloud)
+    monkeypatch.setattr("sutradhara.retention.factory.backend_from_row", lambda _row: fake_cloud)
 
     with session_scope(engine) as session:
         quarantined = _add_empty_intake(
@@ -352,7 +358,7 @@ def test_retention_fails_closed_for_non_registered_and_empty_intakes(
         quarantined_result = run_retention(session, quarantined, actor="ops")
         assert not quarantined_result.released
         assert fake_cloud.deleted == []
-        assert session.get(Copy, cloud_copy.id).deleted_at is None
+        assert _copy_by_id(session, cloud_copy.id).deleted_at is None
 
         empty_registered = _add_empty_intake(
             session,
@@ -373,7 +379,7 @@ def test_release_freezes_new_work_and_sweep_staging_after_grace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_cloud = _DeleteBackend()
-    monkeypatch.setattr(retention_module.factory, "backend_from_row", lambda _row: fake_cloud)
+    monkeypatch.setattr("sutradhara.retention.factory.backend_from_row", lambda _row: fake_cloud)
 
     with session_scope(engine) as session:
         pool = _add_pool(session, artifactclass="s-masters", pool_id="pool-a")

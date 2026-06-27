@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import tarfile
 import tempfile
 from dataclasses import dataclass
@@ -34,6 +33,7 @@ from sutradhara.catalog.models import (
 from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
 from sutradhara.keys import KeyRegistry
 from sutradhara.member_name import MemberNameError, escape_member_name, unescape_member_name
+from sutradhara.resource_control import run_managed
 from sutradhara.restore import atomic_write_verified_file
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
@@ -671,7 +671,7 @@ def _format_plugin(storage_metadata: dict[str, Any]) -> str | None:
 
 
 def _run_rem(cmd: list[str]) -> None:
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = run_managed(cmd, role="high", capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise ArchiveRestoreError(
             f"rem archive extract failed (exit {result.returncode}): "
