@@ -13,6 +13,13 @@
 > Two deliverables: **(A)** a new `ssh_disk` storage backend, and **(B)** a small idempotency fix to the
 > existing `cloud-blob` handler (found running the pilot). The temp-copy handler and lifecycle are
 > otherwise **reused unchanged** — only the backend the temp pool maps to differs.
+>
+> **Codex review (2026-06-27) folded in:** `put` does mkdir-**before**-rsync then atomic in-dir rename;
+> the locator carries object identity only (`key`/`sha256`/`size`), resolving `host`/`root` from the
+> `Backend` row at runtime; a key-containment validator (no `..`/abs/control chars); `read_range`
+> seeks the slice rather than loading the whole blob; `RsyncSshTransport` takes an injectable `runner`
+> with a command-construction test; a handler-path integration test; and explicit "adapter only —
+> deployment switch is separate" scope.
 
 ## What already exists — build on it, do not rebuild
 - **Backend contract** (`src/sutradhara/backend/port.py`): `StorageBackend` Protocol
@@ -64,10 +71,14 @@ class RemoteTransport(Protocol):
     def list_files(self) -> Iterator[str]: ...                 # relpaths under root
 ```
 
-- **Default `RsyncSshTransport(host, root, user, identity_file, ssh_options)`** — real subprocess:
-  - `put` = `rsync -a --partial <local> [user@]host:<root>/<relpath>.partial` (with `-e "ssh -i …
-    <ssh_options>"`), then `ssh … "mkdir -p <dir> && mv -f <root>/<relpath>.partial <root>/<relpath>"`
-    (atomic overwrite — so a re-write is idempotent, no "already exists").
+- **Default `RsyncSshTransport(host, root, user, identity_file, ssh_options, *, runner=None)`** — real
+  subprocess (default `runner` shells `subprocess.run` with a timeout; **inject a fake `runner` in
+  tests** to assert command construction without a live server):
+  - `put` (order matters) = **(1)** `ssh … "mkdir -p <root>/<dir>"` — create the parent dir **FIRST**
+    (for a key like `intakes/<id>.rao` the `intakes/` dir must exist before rsync writes into it);
+    **(2)** `rsync -a --partial <local> [user@]host:<root>/<relpath>.partial` (with `-e "ssh -i …
+    <ssh_options>"`); **(3)** `ssh … "mv -f <root>/<relpath>.partial <root>/<relpath>"` — atomic rename
+    **within the same directory**, so a re-write is idempotent (no "already exists").
   - `get` = `rsync -a [user@]host:<root>/<relpath> <local>`.
   - `sha256` = `ssh … "sha256sum <root>/<relpath>"` → first field; absent file (nonzero) → `None`.
   - `size` = `ssh … "stat -c %s <root>/<relpath>"`; absent → `None`.
@@ -78,16 +89,25 @@ class RemoteTransport(Protocol):
     (exit 255 / rsync 255) to **`BackendUnavailableError`**, a genuinely-missing object to
     **`BackendNotFoundError`**.
 - **`SshDiskBackend`** wraps a transport (default real, tests inject a fake):
-  - `write_object(source, *, key, pool=None) -> CopyRecord`: `digest = sha256(source)`;
-    `transport.put(source, key)`; return `CopyRecord(logical_id=digest,
-    native_locator={"host": host, "root": root, "key": key, "sha256": digest.hex()},
+  - **Key containment (security):** every `key` maps to a filesystem path under `root`, so **validate
+    it as a safe relative path** before any transport call — reject an absolute path, any `..` segment,
+    empty / `.`-only segments, a leading `/`, backslashes, and NUL/control chars; normalize and assert
+    the resolved path stays under `root`. Raise on an unsafe key. (The `cloud-blob` key
+    `intakes/<intake>.rao` is controlled, but the backend must be safe for any key.)
+  - `write_object(source, *, key, pool=None) -> CopyRecord`: validate `key` (above); `digest =
+    sha256(source)`; `transport.put(source, key)`; return `CopyRecord(logical_id=digest,
+    native_locator={"key": key, "sha256": digest.hex(), "size_bytes": source.stat().st_size},
     integrity_hash=digest, size_bytes=source.stat().st_size, metadata={"pool": pool} if pool)`.
-    Idempotent (atomic-rename overwrite).
+    **The locator carries per-object identity ONLY (`key`/`sha256`/`size`) — NOT `host`/`root`** (those
+    are backend config; `read_range`/`verify`/`delete_object` resolve them from the backend instance
+    built from the current `Backend` row, so old locators survive a root move / row update). Idempotent
+    (atomic-rename overwrite).
   - `write_object_to_pool(source, pool)`: `key = f"{pool.strip('/')}/{source.name}"` → `write_object`.
-  - `read_range(locator, byte_range)`: `transport.get(locator["key"], tmp)`; whole-object → return all
-    bytes; else return `data[start:end]`. **Whole-object fetch is fine** — this DR copy is restored
-    whole, never partially (a true `dd`-range over ssh is an optional later optimization). Absent →
-    `BackendNotFoundError`. Clean up the temp file.
+  - `read_range(locator, byte_range)`: `transport.get(locator["key"], tmp)`; whole-object → return the
+    file's bytes; for a non-whole range **`seek(start)` + `read(length)` from the temp file** (do NOT
+    `read_bytes()` the whole file into memory then slice — footage-scale blobs are large). The fetch
+    still downloads the whole object (a true `dd`-range over ssh is an optional later optimization), so
+    only the requested slice is held in memory. Absent → `BackendNotFoundError`. Clean up the temp file.
   - `verify(locator)`: `actual = transport.sha256(locator["key"])`; compare to `locator["sha256"]`
     (remote hashing — no download). Absent or mismatch → `VerifyResult(ok=False, …)`; **never raise on
     mismatch** (contract).
@@ -124,6 +144,20 @@ trace from the pilot run). Fix in `src/sutradhara/jobs/handlers/cloud_blob.py`:
   monkeypatch `run_rem_archive_build` with a fake that **raises if `output_path` already exists**
   (mimicking rem), pre-create the stale `<intake>.rao`, run the handler, and assert it **succeeds**
   (the fix avoided/removed the stale artifact) rather than raising "already exists".
+- **Handler-path integration (proves the adapter actually serves the temp copy):** run the existing
+  `cloud-blob` handler against a `Backend` row of **kind `ssh_disk`** (named `cloud-temp`) with the
+  ssh_disk transport overridden to a `LocalDirTransport` (monkeypatch the `ssh_disk` module's default
+  transport, or `factory.backend_from_row`) and `SUTRADHARA_FAKE_CLOUD_BLOB=1` to skip real rem —
+  assert the blob lands in the local "remote" dir and a `Copy` row is recorded through the **unchanged**
+  handler. Proves `factory.backend_from_row(kind=ssh_disk)` → `write_object` works end-to-end via the
+  temp-copy path, without a live SSH server.
+- **`RsyncSshTransport` command construction** (inject a fake `runner`): assert it issues **mkdir
+  before rsync**, rsync uses `--partial` + `-e ssh …`, ssh carries `-o BatchMode=yes` +
+  `-o ConnectTimeout=…`, remote paths are `shlex.quote`d, `list_files` excludes `*.partial`, and an
+  exit code 255 → `BackendUnavailableError` (a missing file on `get`/`sha256` → `None` /
+  `BackendNotFoundError`). This guards the real transport that the `LocalDirTransport` tests don't exercise.
+- **Key containment** — unsafe keys (`../x`, `/abs`, empty/`.` segments, control chars) are rejected
+  before any transport call.
 - `uv run pytest` green; `uv run ruff check` clean.
 
 ## Acceptance
@@ -133,11 +167,17 @@ trace from the pilot run). Fix in `src/sutradhara/jobs/handlers/cloud_blob.py`:
 - `cloud-blob` build is idempotent on retry (no "--out already exists").
 - New + existing tests green, ruff clean. **No schema/migration change** (it's a backend adapter +
   catalog config; the `Copy`/`Backend` tables already carry JSON locator/config).
+- **Scope is explicit:** this lands the **generic `ssh_disk` adapter + the cloud_blob fix + a
+  handler-path proof** — it does **not** switch any deployment from MinIO/S3 to LAN SSH. That switch is
+  pointing the `cloud-temp` `Backend` row at kind `ssh_disk` (registration still defaults to
+  backend/pool `cloud-temp`), a separate catalog/bringup step.
 
 ## Out of scope (do NOT do here)
-- **No catalog/bringup wiring of an actual `lan-backup` backend+pool** — that's a deployment step
-  (a `Backend(kind=ssh_disk, config={host,root})` row + a temp pool the register-time copy points at),
-  done by the operator/bringup, not this prompt. Keep the adapter generic.
+- **No catalog/bringup wiring, and no deployment switch.** Switching the temp copy from MinIO/S3 to LAN
+  SSH = pointing the existing `cloud-temp` `Backend` row at kind `ssh_disk` + config `{host, root, …}`
+  (registration still defaults to backend/pool `cloud-temp` — `intake.py` `accept` + the enqueue
+  params — so flipping that one row's kind+config is the whole switch). That catalog/bringup change is a
+  separate deployment step, not this prompt. Keep the adapter generic.
 - **No rename of the `cloud-blob` handler / `cloud-temp` pool** — functional swap only; the scenario
   harness keeps its MinIO `cloud-temp` (s3) for tests. A cosmetic rename (cloud→backup) is a later
   cleanup with test blast-radius.
