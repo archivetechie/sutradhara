@@ -62,6 +62,10 @@ class RestoreSuspectAsset(ArchiveRestoreError):
     """A normal restore was refused because the asset is flagged suspect."""
 
 
+class RestoreRejectedAsset(ArchiveRestoreError):
+    """A normal restore was refused because the asset is rejected."""
+
+
 @dataclass(frozen=True)
 class RestoreResult:
     """Completed restore details."""
@@ -245,11 +249,17 @@ def restore_asset(
     backends: dict[int, StorageBackend],
     extractor: ArchiveExtractor | None = None,
     force_suspect: bool = False,
+    force_rejected: bool = False,
 ) -> RestoreResult:
     """Restore one asset using the artifactclass ordered pool preference."""
     if not is_content_hash(asset_hash):
         raise ValueError("asset_hash must be a 32-byte SHA-256 hash")
-    _check_asset_restore_allowed(session, asset_hash, force_suspect=force_suspect)
+    _check_asset_restore_allowed(
+        session,
+        asset_hash,
+        force_suspect=force_suspect,
+        force_rejected=force_rejected,
+    )
     archive_extractor = extractor or LocalArchiveExtractor()
     output_path = Path(destination).resolve()
     policy = get_artifactclass_policy(session, artifactclass)
@@ -331,16 +341,21 @@ def _check_asset_restore_allowed(
     asset_hash: bytes,
     *,
     force_suspect: bool,
+    force_rejected: bool,
 ) -> None:
     asset = session.get(LogicalAsset, asset_hash)
     if asset is None:
         return
-    if asset.validity != AssetValidity.SUSPECT or force_suspect:
-        return
-    note = f": {asset.validity_note}" if asset.validity_note else ""
-    raise RestoreSuspectAsset(
-        f"asset {asset_hash.hex()} is flagged suspect{note}; use --force to restore anyway"
-    )
+    if asset.validity == AssetValidity.SUSPECT and not force_suspect:
+        note = f": {asset.validity_note}" if asset.validity_note else ""
+        raise RestoreSuspectAsset(
+            f"asset {asset_hash.hex()} is flagged suspect{note}; use --force to restore anyway"
+        )
+    if asset.rejected_at is not None and not force_rejected:
+        note = f": {asset.rejection_reason}" if asset.rejection_reason else ""
+        raise RestoreRejectedAsset(
+            f"asset {asset_hash.hex()} is rejected{note}; use --force-rejected to restore anyway"
+        )
 
 
 def resolve_member_asset_hash(

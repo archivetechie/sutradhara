@@ -151,6 +151,42 @@ def _assert_arrangement_invariants(db_path: Path) -> None:
     assert ("submission_id",) in submission_member_indexes
 
 
+def _assert_virtual_arrangement_invariants(db_path: Path) -> None:
+    logical_asset_sql = _table_sql(db_path, "logical_asset")
+    assert "rejected_at" in logical_asset_sql
+    assert "rejected_by" in logical_asset_sql
+    assert "rejection_reason" in logical_asset_sql
+    assert "virtual_arrangement" in _tables(db_path)
+    member_sql = _table_sql(db_path, "virtual_arrangement_member")
+    assert "artifactclass" in member_sql
+    assert "path VARCHAR(2048)" in member_sql
+    assert (
+        "va_id",
+        "logical_asset_hash",
+        "artifactclass",
+    ) in _unique_index_columns(db_path, "virtual_arrangement_member")
+    active_path_sql = _index_sql(db_path, "uq_virtual_arrangement_member_path_active")
+    assert "UNIQUE INDEX" in active_path_sql
+    assert "va_id" in active_path_sql
+    assert "path" in active_path_sql
+    assert "WHERE" in active_path_sql
+    assert "excluded" in active_path_sql
+
+    history_sql = _table_sql(db_path, "virtual_arrangement_history")
+    assert "va_member_id" in history_sql
+    assert "logical_asset_hash" in history_sql
+    assert "artifactclass" in history_sql
+    assert "ON DELETE SET NULL" in history_sql
+
+    tag_sql = _table_sql(db_path, "asset_tag")
+    assert "removed_at" in tag_sql
+    tag_index_sql = _index_sql(db_path, "uq_asset_tag_active")
+    assert "UNIQUE INDEX" in tag_index_sql
+    assert "logical_asset_hash" in tag_index_sql
+    assert "tag" in tag_index_sql
+    assert "removed_at IS NULL" in tag_index_sql
+
+
 def test_create_all_creates_job_table_without_prior_job_import(tmp_path: Path) -> None:
     db_path = tmp_path / "create_all.db"
     code = f"""
@@ -181,11 +217,16 @@ engine.dispose()
     assert "arrangement_member" in tables
     assert "submission" in tables
     assert "submission_member" in tables
+    assert "virtual_arrangement" in tables
+    assert "virtual_arrangement_member" in tables
+    assert "virtual_arrangement_history" in tables
+    assert "asset_tag" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
     _assert_arrangement_invariants(db_path)
+    _assert_virtual_arrangement_invariants(db_path)
 
 
 def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
@@ -220,11 +261,16 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     assert "arrangement_member" in tables
     assert "submission" in tables
     assert "submission_member" in tables
+    assert "virtual_arrangement" in tables
+    assert "virtual_arrangement_member" in tables
+    assert "virtual_arrangement_history" in tables
+    assert "asset_tag" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
     _assert_arrangement_invariants(db_path)
+    _assert_virtual_arrangement_invariants(db_path)
 
 
 def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
@@ -257,7 +303,12 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     assert "arrangement_member" in tables
     assert "submission" in tables
     assert "submission_member" in tables
+    assert "virtual_arrangement" in tables
+    assert "virtual_arrangement_member" in tables
+    assert "virtual_arrangement_history" in tables
+    assert "asset_tag" in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
     _assert_arrangement_invariants(db_path)
+    _assert_virtual_arrangement_invariants(db_path)

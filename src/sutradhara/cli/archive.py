@@ -21,6 +21,7 @@ from sutradhara.archive_fanout import (
 from sutradhara.archive_restore import (
     RemArchiveExtractor,
     RestoreNameError,
+    RestoreRejectedAsset,
     RestoreSuspectAsset,
     resolve_member_asset_hash,
     restore_asset,
@@ -275,6 +276,11 @@ def review_cmd(
     is_flag=True,
     help="Restore even when the logical asset is flagged suspect.",
 )
+@click.option(
+    "--force-rejected",
+    is_flag=True,
+    help="Restore even when the logical asset is rejected.",
+)
 def restore_cmd(
     asset_hash_hex: str | None,
     artifactclass: str,
@@ -282,6 +288,7 @@ def restore_cmd(
     rem_bin: str,
     member_name: str | None,
     force_suspect: bool,
+    force_rejected: bool,
 ) -> None:
     """Restore one asset using artifactclass pool preference."""
     engine = make_engine()
@@ -308,8 +315,9 @@ def restore_cmd(
                 backends=backends,
                 extractor=RemArchiveExtractor(rem_bin),
                 force_suspect=force_suspect,
+                force_rejected=force_rejected,
             )
-        except RestoreSuspectAsset as exc:
+        except (RestoreSuspectAsset, RestoreRejectedAsset) as exc:
             raise click.ClickException(str(exc)) from exc
     click.echo(
         f"restored {result.asset_hash.hex()} from pool {result.pool_id} copy {result.copy_id} "

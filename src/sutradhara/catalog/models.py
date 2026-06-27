@@ -87,6 +87,9 @@ class LogicalAsset(Base):
         String(32), nullable=False, default=AssetValidity.UNVALIDATED
     )
     validity_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rejected_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     copies: Mapped[list[Copy]] = relationship(
         back_populates="logical_asset",
@@ -94,6 +97,10 @@ class LogicalAsset(Base):
         lazy="selectin",
     )
     ingest_items: Mapped[list[IngestItem]] = relationship(
+        back_populates="logical_asset",
+        lazy="selectin",
+    )
+    virtual_members: Mapped[list[VirtualArrangementMember]] = relationship(
         back_populates="logical_asset",
         lazy="selectin",
     )
@@ -453,6 +460,168 @@ Index(
     unique=True,
     sqlite_where=ArrangementMember.excluded.is_(False),
     postgresql_where=ArrangementMember.excluded.is_(False),
+)
+
+
+class VirtualArrangement(Base):
+    """A permanently mutable organizational view over archived logical assets."""
+
+    __tablename__ = "virtual_arrangement"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    members: Mapped[list[VirtualArrangementMember]] = relationship(
+        back_populates="view",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="VirtualArrangementMember.path",
+    )
+    history: Mapped[list[VirtualArrangementHistory]] = relationship(
+        back_populates="view",
+        lazy="selectin",
+    )
+
+    def __repr__(self) -> str:
+        return f"<VirtualArrangement id={self.id} name={self.name!r}>"
+
+
+class VirtualArrangementMember(Base):
+    """One archived asset placed at a virtual path within one view."""
+
+    __tablename__ = "virtual_arrangement_member"
+    __table_args__ = (
+        UniqueConstraint(
+            "va_id",
+            "logical_asset_hash",
+            "artifactclass",
+            name="uq_virtual_arrangement_member_asset_class",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    va_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("virtual_arrangement.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    logical_asset_hash: Mapped[bytes] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    excluded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    added_by: Mapped[str] = mapped_column(String(256), nullable=False)
+    added_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    view: Mapped[VirtualArrangement] = relationship(back_populates="members")
+    logical_asset: Mapped[LogicalAsset] = relationship(back_populates="virtual_members")
+    history: Mapped[list[VirtualArrangementHistory]] = relationship(
+        back_populates="member",
+        lazy="selectin",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VirtualArrangementMember va={self.va_id} "
+            f"asset={self.logical_asset_hash.hex()[:12]} class={self.artifactclass!r} "
+            f"path={self.path!r} excluded={self.excluded}>"
+        )
+
+
+class VirtualArrangementHistory(Base):
+    """Append-only audit row for virtual arrangement path moves."""
+
+    __tablename__ = "virtual_arrangement_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    va_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("virtual_arrangement.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    va_member_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("virtual_arrangement_member.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    logical_asset_hash: Mapped[bytes] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    old_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    new_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    actor: Mapped[str] = mapped_column(String(256), nullable=False)
+    changed_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    view: Mapped[VirtualArrangement] = relationship(back_populates="history")
+    member: Mapped[VirtualArrangementMember | None] = relationship(back_populates="history")
+    logical_asset: Mapped[LogicalAsset] = relationship()
+
+
+class AssetTag(Base):
+    """Soft-deleted governance tag attached to a logical asset."""
+
+    __tablename__ = "asset_tag"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    logical_asset_hash: Mapped[bytes] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    tag: Mapped[str] = mapped_column(String(256), nullable=False)
+    added_by: Mapped[str] = mapped_column(String(256), nullable=False)
+    added_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    removed_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    removed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    logical_asset: Mapped[LogicalAsset] = relationship()
+
+
+Index(
+    "uq_virtual_arrangement_member_path_active",
+    VirtualArrangementMember.va_id,
+    VirtualArrangementMember.path,
+    unique=True,
+    sqlite_where=VirtualArrangementMember.excluded.is_(False),
+    postgresql_where=VirtualArrangementMember.excluded.is_(False),
+)
+
+Index(
+    "uq_asset_tag_active",
+    AssetTag.logical_asset_hash,
+    AssetTag.tag,
+    unique=True,
+    sqlite_where=AssetTag.removed_at.is_(None),
+    postgresql_where=AssetTag.removed_at.is_(None),
 )
 
 

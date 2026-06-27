@@ -16,6 +16,7 @@ from sutradhara.cli.jobs import jobs_group
 from sutradhara.cli.receive import receive_group
 from sutradhara.cli.reconcile import reconcile_cmd
 from sutradhara.cli.scrub import scrub_cmd
+from sutradhara.cli.virtual import reject_cmd, tag_group, unreject_cmd, virtual_group
 from sutradhara.cli.worker import worker_cmd
 
 
@@ -39,6 +40,10 @@ cli.add_command(admin_group)
 cli.add_command(archive_group)
 cli.add_command(review_cmd)
 cli.add_command(arrangement_group)
+cli.add_command(virtual_group)
+cli.add_command(reject_cmd)
+cli.add_command(unreject_cmd)
+cli.add_command(tag_group)
 
 
 if __name__ == "__main__":

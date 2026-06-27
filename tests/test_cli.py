@@ -95,8 +95,25 @@ def test_help_lists_subcommands(cli_env: dict[str, str]) -> None:
         "receive",
         "prepare",
         "worker",
+        "virtual",
+        "reject",
+        "unreject",
+        "tag",
     ):
         assert cmd in result.output
+
+
+def test_virtual_and_tag_help_surface_expected_verbs(cli_env: dict[str, str]) -> None:
+    virtual = _run(["virtual", "--help"])
+    for cmd in ("create", "add", "mv", "exclude", "include", "ls", "show", "restore"):
+        assert cmd in virtual.output
+
+    tag = _run(["tag", "--help"])
+    assert "add" in tag.output
+    assert "rm" in tag.output
+
+    restore = _run(["archive", "restore", "--help"])
+    assert "--force-rejected" in restore.output
 
 
 def test_intake_help_replaces_scan_with_explicit_verbs(cli_env: dict[str, str]) -> None:
