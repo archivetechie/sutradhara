@@ -168,7 +168,8 @@ class, derivatives driven by the profile, both reconciled `policy × asset` — 
 two-dimension desired-state model that `design-reconciliation-model.md §3.7` states
 generically; the concrete derivative model lives here.
 
-**cloud-temp is not one of these.** The encrypted cloud DR blob is a *temporary,
+**cloud-temp is not one of these.** The encrypted DR blob (a **LAN `ssh_disk`** copy as
+of 2026-06-27, not cloud) is a *temporary,
 lifecycle-bounded* `Copy` - created automatically at register/prepare, and **expired
 by the deletion-gate (Phase U)** once tape copies are verified + offsite-confirmed. It
 is neither a CLI verb nor a permanent placement (a placement reconciler would fight the
@@ -506,7 +507,8 @@ For non-video assets the same profile may mean thumbnail, PDF preview, OCR/text,
 audio waveform, or no derivative - it is just a different **profile entry**. The CLI
 verb never changes; the profile does.
 
-**cloud-temp (temporary DR) is not part of `prepare`.** The encrypted cloud blob is a
+**cloud-temp (temporary DR) is not part of `prepare`.** The encrypted DR blob (a **LAN
+`ssh_disk`** copy as of 2026-06-27, not cloud) is a
 temporary `Copy` created automatically at register (the DR copy is wanted ASAP,
 independent of any review profile) and **expired by the deletion-gate (Phase U)** once
 durable tape copies are confirmed - not a CLI verb, not a permanent placement (§2.3).

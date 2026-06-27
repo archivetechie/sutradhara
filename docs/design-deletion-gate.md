@@ -4,6 +4,11 @@
 > `~/system` scenario).** Plan item **P3.2** (`docs/implementation-plan-ingest-v2.md`), Phase U of
 > `docs/prompt-ingest-v2-sutradhara.md`. Depends: copies (**P2.5**) + cloud-temp (**P1.3**). The signals
 > it reads come from P2.5 (`submission.archived`), P3.1 (`LogicalAsset.rejected_at`), and the copy model.
+>
+> **2026-06-27 update:** the "cloud-temp" copy this gate expires now targets a **LAN file
+> server via the `ssh_disk` backend** (encrypted, temporary), not cloud. The deletion
+> mechanism here is **unchanged** — `delete_object` on a delete-capable backend, which
+> `ssh_disk` provides; the `cloud-temp`/`cloud-blob` identifiers are kept pending a rename.
 
 ## 0. What this is — the one place bytes get deleted
 Everything else in this system *adds* and *preserves*; **P3.2 is the only thing that deletes.** It
