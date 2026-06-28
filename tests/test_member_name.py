@@ -7,13 +7,20 @@ from pathlib import Path
 
 import pytest
 
-from sutradhara.member_name import (
+from sutradhara_receive.member_name import (
     MemberNameError,
     escape_member_name,
     escape_path_name,
     escape_path_text,
     unescape_member_name,
 )
+
+
+def test_legacy_member_name_import_aliases_extracted_package() -> None:
+    import sutradhara.member_name as legacy_member_name
+    import sutradhara_receive.member_name as extracted_member_name
+
+    assert legacy_member_name is extracted_member_name
 
 
 def test_member_name_escape_round_trips_utf8_backslash_controls_and_invalid_bytes() -> None:

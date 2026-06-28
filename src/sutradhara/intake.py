@@ -35,7 +35,7 @@ from sutradhara.catalog.types import (
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job
 from sutradhara.jobs.reconcilers.profiles import known_profile_names
-from sutradhara.receive import (
+from sutradhara_receive import (
     BAG_INFO_NAME,
     DATA_DIR_NAME,
     MANIFEST_NAME,

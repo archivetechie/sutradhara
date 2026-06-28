@@ -32,12 +32,16 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
 from sutradhara.keys import KeyRegistry
-from sutradhara.member_name import MemberNameError, escape_member_name, unescape_member_name
 from sutradhara.resource_control import run_managed
 from sutradhara.restore import atomic_write_verified_file
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 from sutradhara.staging import StagingError, reverse_transforms_to_path
+from sutradhara_receive.member_name import (
+    MemberNameError,
+    escape_member_name,
+    unescape_member_name,
+)
 
 _MAX_LOCAL_ARCHIVE_HEADER_BYTES = 16 * 1024 * 1024
 

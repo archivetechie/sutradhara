@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sutradhara-receive"
+version = "0.0.1"
+description = "Dependency-light receive filesystem contract for Sutradhara."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "Ada Operator" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Archiving",
+]
+dependencies = []
+
+[project.scripts]
+sutra-receive = "sutradhara_receive.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sutradhara_receive = ["py.typed"]

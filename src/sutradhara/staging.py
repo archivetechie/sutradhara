@@ -36,7 +36,7 @@ from sutradhara.artifactclass_policy import (
     staging_policy_from_json,
 )
 from sutradhara.catalog.models import ArtifactClassPolicyRecord, LogicalAsset, StagingTransform
-from sutradhara.member_name import escape_path_name, escape_path_text
+from sutradhara_receive.member_name import escape_path_name, escape_path_text
 
 APPLEDOUBLE_MERGE_KIND = "appledouble-merge-v1"
 ZSTD_FILE_KIND = "zstd-file-v1"

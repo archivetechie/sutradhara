@@ -32,7 +32,7 @@ from sutradhara.catalog.models import (
     StagingTransform,
 )
 from sutradhara.catalog.types import is_content_hash
-from sutradhara.member_name import escape_path_name, escape_path_text
+from sutradhara_receive.member_name import escape_path_name, escape_path_text
 
 
 class ArchiveBundleError(Exception):

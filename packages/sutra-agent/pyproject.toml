@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sutra-agent"
+version = "0.0.1"
+description = "Operator-facing edge agent for Sutradhara receive workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "Ada Operator" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Archiving",
+]
+dependencies = [
+    "sutradhara-receive==0.0.1",
+]
+
+[project.scripts]
+sutra-agent = "sutra_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sutra_agent = ["py.typed"]
+

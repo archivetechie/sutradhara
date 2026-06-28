@@ -23,7 +23,7 @@ from sutradhara.intake import (
     register_landing_root,
 )
 from sutradhara.jobs.models import Job, JobStatus
-from sutradhara.receive import (
+from sutradhara_receive import (
     BAG_PROFILE,
     PACKAGE_INDEX_NAME,
     bag_info_metadata,

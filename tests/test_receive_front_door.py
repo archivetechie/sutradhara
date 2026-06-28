@@ -23,12 +23,13 @@ from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.cli.main import cli
 from sutradhara.intake import register_landing_root
-from sutradhara.receive import (
+from sutradhara_receive import (
     BAG_PROFILE,
     CANONICALIZATION_VERSION,
     PACKAGE_INDEX_NAME,
     PACKAGE_PROFILE_HASH,
     PACKAGE_PROFILE_VERSION,
+    RECEIVE_PACKAGE,
     RECEIVE_VERSION,
     AtomicWriteObserver,
     CollisionError,
@@ -46,7 +47,8 @@ from sutradhara.receive import (
     wait_for_server_confirmation,
     write_bagit_files,
 )
-from sutradhara.receive import core as receive_core
+from sutradhara_receive import core as receive_core
+from sutradhara_receive.cli import main as receive_cli_main
 
 
 @pytest.fixture
@@ -92,6 +94,13 @@ def test_bagit_writer_round_trips_to_shared_reader_and_payload_oxum(tmp_path: Pa
     validation = validate_bag(bag)
     assert validation.complete is True
     assert validation.valid is True
+
+
+def test_legacy_receive_core_import_aliases_extracted_package() -> None:
+    import sutradhara.receive.core as legacy_core
+    import sutradhara_receive.core as extracted_core
+
+    assert legacy_core is extracted_core
 
 
 def test_receive_output_passes_reference_bagit_validator_when_installed(tmp_path: Path) -> None:
@@ -156,6 +165,7 @@ def test_receive_writes_slim_sentinel_last_and_bag_tags(tmp_path: Path) -> None:
     assert observer.destinations[-1].name == "intake.json"
     bag_info = read_bag_info(result.bag_info_path)
     assert bag_info["Bag-Software-Agent"] == f"sutradhara-receive/{RECEIVE_VERSION}"
+    assert bag_info["Receive-Package"] == RECEIVE_PACKAGE
     assert bag_info["Canonicalization-Version"] == CANONICALIZATION_VERSION
     assert bag_info["Payload-Oxum"] == f"{len(b'video')}.1"
     assert read_manifest_sha256(result.manifest_path) == {
@@ -658,6 +668,57 @@ def test_intake_quarantines_if_tagmanifest_catches_manifest_tamper(
     assert outcomes[0].details["tag_mismatched"][0]["path"] == "manifest-sha256.txt"
 
 
+def test_intake_quarantines_unsupported_receive_package_version(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+    result = receive_source(source, landing=landing, source_kind="card", operator="op")
+    metadata = read_bag_info(result.bag_info_path)
+    metadata["Receive-Package"] = "sutradhara-receive/999.0.0"
+    write_bagit_files(
+        result.intake_dir,
+        entries=read_manifest_sha256(result.manifest_path),
+        metadata=metadata,
+    )
+
+    validation = validate_bag(result.intake_dir)
+    assert validation.complete is True
+    assert validation.valid is False
+    assert validation.details()["errors"] == [
+        f"Receive-Package mismatch: expected {RECEIVE_PACKAGE}, actual 'sutradhara-receive/999.0.0'"
+    ]
+
+    with session_scope(engine) as session:
+        outcomes = register_landing_root(session, landing)
+
+    assert outcomes[0].status == IntakeStatus.QUARANTINED.value
+    assert outcomes[0].reason == "bag-invalid"
+    assert outcomes[0].details["errors"] == validation.details()["errors"]
+
+
+def test_missing_receive_package_label_is_accepted_for_legacy_bags(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+    result = receive_source(source, landing=landing, source_kind="card", operator="op")
+    metadata = read_bag_info(result.bag_info_path)
+    assert metadata.pop("Receive-Package") == RECEIVE_PACKAGE
+    write_bagit_files(
+        result.intake_dir,
+        entries=read_manifest_sha256(result.manifest_path),
+        metadata=metadata,
+    )
+
+    validation = validate_bag(result.intake_dir)
+
+    assert validation.valid is True
+
+
 def test_validate_bag_rejects_unsafe_tagmanifest_path(tmp_path: Path) -> None:
     bag = tmp_path / "bag"
     data = bag / "data"
@@ -776,6 +837,138 @@ def test_cli_receive_fake_source_and_confirm_timeout(tmp_path: Path) -> None:
     assert payload["file_count"] == 1
     assert payload["confirmation"]["status"] == "timeout"
     assert payload["confirmation"]["release_ok"] is False
+
+
+def test_standalone_receive_cli_fake_source_json(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+
+    exit_code = receive_cli_main(
+        [
+            "--fake-source",
+            str(source),
+            "--landing",
+            str(landing),
+            "--source-kind",
+            "card",
+            "--operator",
+            "Op",
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert captured.err == ""
+    assert payload["bag_profile"] == BAG_PROFILE
+    assert payload["file_count"] == 1
+    assert payload["total_bytes"] == len(b"video")
+    assert validate_bag(Path(payload["intake_dir"])).valid is True
+
+
+def test_standalone_receive_cli_confirm_timeout_exits_3(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+
+    exit_code = receive_cli_main(
+        [
+            "--fake-source",
+            str(source),
+            "--landing",
+            str(landing),
+            "--source-kind",
+            "card",
+            "--operator",
+            "Op",
+            "--confirm-timeout",
+            "0",
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 3
+    assert captured.err == ""
+    assert payload["confirmation"]["status"] == "timeout"
+    assert payload["confirmation"]["release_ok"] is False
+
+
+def test_standalone_receive_cli_rejects_source_and_fake_source(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    fake = tmp_path / "fake"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    fake.mkdir()
+
+    exit_code = receive_cli_main(
+        [
+            str(source),
+            "--fake-source",
+            str(fake),
+            "--landing",
+            str(landing),
+            "--source-kind",
+            "card",
+            "--operator",
+            "Op",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "pass either SOURCE or --fake-source" in captured.err
+
+
+def test_standalone_receive_cli_sweep_json(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    landing = tmp_path / "landing"
+    stale = landing / "stale"
+    fresh = landing / "fresh"
+    complete = landing / "complete"
+    for path in (stale, fresh, complete):
+        path.mkdir(parents=True)
+        (path / ".receiving.json").write_text("{}", encoding="utf-8")
+    (complete / "intake.json").write_text("{}", encoding="utf-8")
+    old = dt.datetime.now().timestamp() - 48 * 3600
+    os.utime(stale / ".receiving.json", (old, old))
+
+    exit_code = receive_cli_main(
+        [
+            "sweep",
+            "--landing",
+            str(landing),
+            "--older-than-hours",
+            "24",
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert captured.err == ""
+    assert payload == {"removed": [str(stale)]}
+    assert not stale.exists()
+    assert fresh.exists()
+    assert complete.exists()
 
 
 @pytest.mark.parametrize("source_kind", ["card", "drive", "upload"])

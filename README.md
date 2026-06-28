@@ -25,9 +25,14 @@ The catalog uses **content-hash as the logical asset identity** and is **rebuild
 sutradhara/repo/
 ├── README.md
 ├── LICENSE
+├── packages/
+│   ├── sutra-agent/           # operator-facing edge receive agent
+│   └── sutradhara-receive/    # dependency-light receive filesystem contract
+├── src/
+│   └── sutradhara/            # server/orchestrator package
 ├── docs/
 │   └── spec-v0.1.md          # design doc — start here
-└── (code arrives when Remanence's Layer 5 gRPC is ready)
+└── tests/
 ```
 
 ## Scenario O Operational Notes

@@ -2,24 +2,23 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import json
-import os
 from pathlib import Path
-from typing import Any
 
 import click
 
-from sutradhara.receive import (
-    ConfirmationResult,
-    ReceiveError,
-    ReceiveResult,
-    receive_source,
-    sweep_orphans,
-    wait_for_server_confirmation,
+from sutradhara_receive.cli import (
+    SOURCE_KIND_CHOICES,
+    ReceiveCliRuntimeError,
+    ReceiveCliUsageError,
+    default_operator,
+    receive_result_payload,
+    receive_text_lines,
+    run_receive_command,
+    run_sweep_command,
+    sweep_result_payload,
+    sweep_text_lines,
 )
-
-_SOURCE_KIND_CHOICES = ("card", "drive", "upload", "handoff", "download", "other")
 
 
 class _ReceiveGroup(click.Group):
@@ -47,7 +46,7 @@ def receive_group() -> None:
 @click.option(
     "--source-kind",
     required=True,
-    type=click.Choice(_SOURCE_KIND_CHOICES),
+    type=click.Choice(SOURCE_KIND_CHOICES),
     help="Physical or transfer source category.",
 )
 @click.option("--source-ref", default=None, help="Operator-visible source identifier.")
@@ -57,7 +56,7 @@ def receive_group() -> None:
 @click.option("--label", default=None, help="Human label for this intake.")
 @click.option(
     "--operator",
-    default=lambda: os.environ.get("USER") or "operator",
+    default=default_operator,
     show_default="$USER",
     help="Operator name included in the intake id and sentinel.",
 )
@@ -98,15 +97,9 @@ def receive_run(
 ) -> None:
     """Receive SOURCE into LANDING using a sentinel-last filesystem contract."""
 
-    if fake_source is not None and source is not None:
-        raise click.UsageError("pass either SOURCE or --fake-source, not both")
-    selected_source = fake_source if fake_source is not None else source
-    if selected_source is None and resume is None:
-        raise click.UsageError("SOURCE is required unless --resume is used")
-
     try:
-        result = receive_source(
-            selected_source,
+        result, confirmation = run_receive_command(
+            source,
             landing=landing,
             source_kind=source_kind,
             operator=operator,
@@ -114,23 +107,25 @@ def receive_run(
             artifactclass=artifactclass,
             label=label,
             resume=resume,
+            fake_source=fake_source,
+            confirm_timeout=confirm_timeout,
+            confirm_interval=confirm_interval,
         )
-        confirmation = (
-            wait_for_server_confirmation(
-                result.intake_dir,
-                timeout_seconds=confirm_timeout,
-                poll_interval_seconds=confirm_interval,
-            )
-            if confirm_timeout is not None
-            else None
-        )
-    except (FileNotFoundError, ReceiveError, ValueError) as exc:
+    except ReceiveCliUsageError as exc:
+        raise click.UsageError(str(exc)) from exc
+    except ReceiveCliRuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
 
     if as_json:
-        click.echo(json.dumps(_result_payload(result, confirmation), indent=2, sort_keys=True))
+        click.echo(
+            json.dumps(receive_result_payload(result, confirmation), indent=2, sort_keys=True)
+        )
     else:
-        _echo_result(result, confirmation)
+        stdout_lines, stderr_lines = receive_text_lines(result, confirmation)
+        for line in stdout_lines:
+            click.echo(line)
+        for line in stderr_lines:
+            click.echo(line, err=True)
 
     if confirmation is not None and not confirmation.release_ok:
         raise click.exceptions.Exit(3)
@@ -154,67 +149,12 @@ def receive_run(
 def receive_sweep_orphans(landing: Path, older_than_hours: float, as_json: bool) -> None:
     """Remove stale sentinel-less receive directories."""
 
-    result = sweep_orphans(
-        landing,
-        older_than=dt.timedelta(hours=older_than_hours),
-    )
-    payload = {"removed": [str(path) for path in result.removed]}
+    result = run_sweep_command(landing, older_than_hours=older_than_hours)
     if as_json:
-        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        click.echo(json.dumps(sweep_result_payload(result), indent=2, sort_keys=True))
         return
-    if not result.removed:
-        click.echo("(no stale receives)")
-        return
-    for path in result.removed:
-        click.echo(f"removed {path}")
+    for line in sweep_text_lines(result):
+        click.echo(line)
 
 
 receive_group.add_command(receive_sweep_orphans, "sweep")
-
-
-def _result_payload(
-    result: ReceiveResult,
-    confirmation: ConfirmationResult | None,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "intake_id": result.intake_id,
-        "intake_dir": str(result.intake_dir),
-        "bag_profile": result.bag_profile,
-        "manifest_path": str(result.manifest_path),
-        "bag_info_path": str(result.bag_info_path),
-        "tagmanifest_path": str(result.tagmanifest_path),
-        "sentinel_path": str(result.sentinel_path),
-        "file_count": result.file_count,
-        "total_bytes": result.total_bytes,
-        "skipped_count": result.skipped_count,
-    }
-    if confirmation is not None:
-        payload["confirmation"] = {
-            "release_ok": confirmation.release_ok,
-            "status": confirmation.status,
-            "marker_path": str(confirmation.marker_path) if confirmation.marker_path else None,
-            "detail": confirmation.detail,
-        }
-    return payload
-
-
-def _echo_result(result: ReceiveResult, confirmation: ConfirmationResult | None) -> None:
-    click.echo(
-        f"{result.intake_id}: received {result.file_count} file(s), "
-        f"{result.total_bytes} byte(s), skipped={result.skipped_count}"
-    )
-    click.echo(f"sentinel: {result.sentinel_path}")
-    click.echo(f"bag profile: {result.bag_profile}")
-    click.echo(f"manifest: {result.manifest_path}")
-    click.echo(f"tagmanifest: {result.tagmanifest_path}")
-    if confirmation is None:
-        return
-    if confirmation.release_ok:
-        click.echo("server confirmation: verified; source release allowed")
-        return
-    if confirmation.status == "quarantined":
-        click.echo("server confirmation: quarantined; do not release source", err=True)
-        if confirmation.detail is not None:
-            click.echo(json.dumps(confirmation.detail, indent=2, sort_keys=True), err=True)
-        return
-    click.echo("server confirmation: timeout; do not release source", err=True)
