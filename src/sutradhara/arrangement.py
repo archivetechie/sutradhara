@@ -205,6 +205,27 @@ def exclude_member(session: Session, arrangement_id: int, member_path: str) -> A
     return member
 
 
+def include_member(session: Session, arrangement_id: int, member_path: str) -> ArrangementMember:
+    """Re-show one excluded arrangement member in submit output."""
+
+    arrangement = _get_mutable_arrangement(session, arrangement_id)
+    archive_path = canonical_member_path(member_path)
+    member = _one_excluded_member_by_path(arrangement, archive_path)
+    if any(
+        row.id != member.id and not row.excluded and row.member_path == archive_path
+        for row in arrangement.members
+    ):
+        raise ArrangementError(f"duplicate active archive path {archive_path!r}")
+    member.excluded = False
+    member.updated_at = _utcnow()
+    arrangement.updated_at = member.updated_at
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        raise ArrangementError(f"duplicate active archive path {archive_path!r}") from exc
+    return member
+
+
 def list_arrangements(session: Session) -> list[ArrangementSummary]:
     """Return compact summaries for every arrangement."""
 
@@ -531,6 +552,21 @@ def _one_active_member_by_path(arrangement: Arrangement, member_path: str) -> Ar
     return matches[0]
 
 
+def _one_excluded_member_by_path(arrangement: Arrangement, member_path: str) -> ArrangementMember:
+    matches = [
+        member
+        for member in arrangement.members
+        if member.member_path == member_path and member.excluded
+    ]
+    if not matches:
+        raise ArrangementError(f"arrangement {arrangement.id} has no excluded member {member_path!r}")
+    if len(matches) > 1:
+        raise ArrangementError(
+            f"arrangement {arrangement.id} has ambiguous excluded member {member_path!r}"
+        )
+    return matches[0]
+
+
 def _live_master_items_for_intake(session: Session, intake_id: str) -> list[IngestItem]:
     derived_exists = exists().where(AssetDerivation.derived_item_id == IngestItem.id)
     return list(
@@ -597,6 +633,7 @@ __all__ = [
     "create_from_arrangement",
     "create_from_intake",
     "exclude_member",
+    "include_member",
     "list_arrangements",
     "move_member",
     "render_source_map",

@@ -19,6 +19,7 @@ from sutradhara.arrangement import (
     create_from_arrangement,
     create_from_intake,
     exclude_member,
+    include_member,
     move_member,
     show_arrangement,
     submit_arrangement,
@@ -126,6 +127,29 @@ def test_exclude_frees_archive_path_and_submit_omits_excluded(
         submitted = rows[1].split("\t")
         assert submitted[0] == "foo.mov"
         assert submitted[4] == str(items[1].id)
+
+
+def test_include_member_restores_excluded_member(engine: Engine, tmp_path: Path) -> None:
+    with session_scope(engine) as session:
+        _registered_intake(session, tmp_path, "intake-include", ["foo.mov"])
+        arrangement = create_from_intake(session, "intake-include", label="include")
+
+        exclude_member(session, arrangement.id, "foo.mov")
+        restored = include_member(session, arrangement.id, "foo.mov")
+
+        assert restored.excluded is False
+        assert arrangement.members[0].excluded is False
+
+
+def test_include_member_rejects_active_path_collision(engine: Engine, tmp_path: Path) -> None:
+    with session_scope(engine) as session:
+        _registered_intake(session, tmp_path, "intake-include-collide", ["foo.mov", "bar.mov"])
+        arrangement = create_from_intake(session, "intake-include-collide", label="include")
+
+        exclude_member(session, arrangement.id, "foo.mov")
+        move_member(session, arrangement.id, "bar.mov", "foo.mov")
+        with pytest.raises(ArrangementError, match="duplicate"):
+            include_member(session, arrangement.id, "foo.mov")
 
 
 def test_submit_emits_source_map_manifest_and_queryable_rows(
@@ -304,6 +328,8 @@ def test_submit_is_terminal_and_revision_is_clone(
 
     with pytest.raises(ArrangementFrozen):
         _move_submitted_arrangement(engine, arrangement_id)
+    with pytest.raises(ArrangementFrozen):
+        _include_submitted_arrangement(engine, arrangement_id)
     with pytest.raises(ArrangementFrozen):
         _resubmit_arrangement(engine, arrangement_id, submission_root)
 
@@ -549,6 +575,11 @@ def _submit_changed_source(
 def _move_submitted_arrangement(engine: Engine, arrangement_id: int) -> None:
     with session_scope(engine) as session:
         move_member(session, arrangement_id, "clip.mov", "new.mov")
+
+
+def _include_submitted_arrangement(engine: Engine, arrangement_id: int) -> None:
+    with session_scope(engine) as session:
+        include_member(session, arrangement_id, "clip.mov")
 
 
 def _resubmit_arrangement(
