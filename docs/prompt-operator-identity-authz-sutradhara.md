@@ -72,13 +72,18 @@ groups): `sutradhara-viewer`, `sutradhara-operator`, `sutradhara-admin`.
    idempotencyKey)` binding a **hash of the canonical request body**. Same key + same
    body ⇒ **same `intakeId`** (no second intake); same key + different body ⇒ **409**.
    The record carries an **`in_progress`** state claimed **atomically**, stored
-   **durably + process-safely** (SQLite/catalog — **never** an in-process dict), and a
-   crashed/abandoned `in_progress` is **reclaimable via a TTL**. The PoC runs uvicorn
-   **single-worker, no `--reload`**.
+   **durably + process-safely** (SQLite/catalog — **never** an in-process dict). A
+   crashed/abandoned `in_progress` is **reclaimable via a TTL against a
+   `last_heartbeat` timestamp** — the active receive updates `last_heartbeat`
+   periodically (every N seconds, N ≪ TTL); **only** a row whose
+   `last_heartbeat + TTL < now` is stale and may be reclaimed; a legitimately
+   long-running receive is **never evicted**. The PoC runs uvicorn **single-worker,
+   no `--reload`**.
 6. **Source claim/lease:** claim the `sourceId` for the receive's duration; a
    concurrent `POST /api/receive` on a claimed source ⇒ **409**; reflected as
    `status:"busy"` in `/api/receive/options`. **Durable + process-safe** (same store),
-   **reclaimable via TTL** on crash — never a lost in-process lock.
+   **reclaimable via TTL** (same `last_heartbeat` model as idempotency) — never a
+   lost in-process lock, and **never evicts a legitimately in-progress receive**.
 
 **Error contract:** JSON `{ error, detail }`; 400 (validation/bad class/bad
 source/landing), 403 (capability), 409 (idempotency conflict OR source busy).
@@ -120,9 +125,16 @@ receive (PoC is synchronous behind the idempotency guard); edge-CLI changes.
   - `sources.py` — source+landing catalogs over `/replica/sources` and the configured
     landing root; `resolve_source(id)`/`resolve_landing(id)` (canonicalize + confine).
   - `store.py` — **SQLite-backed** idempotency + source-claim store (atomic
-    `in_progress`/claim via unique constraints; TTL reclamation).
+    `in_progress`/claim via unique constraints; TTL reclamation via **`last_heartbeat`
+    column** updated by the active receive every N seconds; only rows where
+    `last_heartbeat + TTL < now` are reclaimed — a live receive is never evicted).
   - `app.py` — `create_app()`; mounts routers; CSRF/Origin + JSON-only middleware.
 - Modify `src/sutradhara/cli/main.py` — register `serve-api`.
+- Modify `src/sutradhara/catalog/session.py` — add
+  `import_module("sutradhara.api.store")` in both `create_all()` and `reset_all()`
+  alongside the existing `import_module("sutradhara.jobs.models")` call; without this,
+  the idempotency + claim tables are invisible to `Base.metadata.create_all()` used by
+  tests and the bootstrap CLI (tests do not run Alembic).
 - Migration: add an alembic revision for the idempotency + source-claim tables
   (chain from the current head; follow the repo's alembic pattern).
 - Tests under `tests/api/`.
@@ -141,12 +153,20 @@ receive (PoC is synchronous behind the idempotency guard); edge-CLI changes.
 4. **artifactclass validation** (`test_receive_validation.py`): registry class passes;
    unknown → **400**.
 5. **Durable idempotency** (`test_idempotency.py`): same key+body → same `intakeId`,
-   receive core invoked once (spy); same key+different body → **409**; **stale
-   `in_progress` reclaimed after TTL** (simulate a crashed claim row, assert a later
-   call proceeds); concurrent same-key (threads) → one run.
+   receive core invoked once (spy); same key+different body → **409**; concurrent
+   same-key (threads) → one run. **Heartbeat guards live receives:** insert a
+   synthetic `in_progress` row with a recent `last_heartbeat`; the TTL reclaimer must
+   **not** touch it even when its `created_at` is beyond the TTL. **Stale reclaim:**
+   insert a row whose `last_heartbeat + TTL < now`; a subsequent call **reclaims and
+   proceeds** (no duplicate-intake from a legitimately crashed receive). Also: call
+   `create_all()` on a fresh engine and assert both `idempotency_record` and
+   `source_claim` tables exist (schema parity — ensures the `session.py` import is
+   wired).
 6. **Durable source claim** (`test_source_claim.py`): claimed source → second POST
-   **409** + `options` shows `status:"busy"`; claim released on completion **and**
-   reclaimable via TTL after a simulated crash.
+   **409** + `options` shows `status:"busy"`; claim released on completion. **Heartbeat
+   guards live claims:** a claim with a recent `last_heartbeat` is **not** reclaimed by
+   a concurrent second operator; a claim with `last_heartbeat + TTL < now` **is**
+   reclaimable and the second call proceeds.
 7. **CSRF/Origin + JSON-only** (`test_csrf.py`): form-encoded POST → **415/400**;
    foreign `Origin` → **403**; correct JSON+Origin → passes.
 8. **`POST /api/receive` end-to-end** (`test_receive.py`, headers injected): viewer →
