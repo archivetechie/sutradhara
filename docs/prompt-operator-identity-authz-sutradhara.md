@@ -178,7 +178,8 @@ receive (PoC is synchronous behind the idempotency guard); edge-CLI changes.
    **rejects** `0.0.0.0`, `::`, `100.81.52.26` (and accepts `127.0.0.1`).
 
 ### Definition of done
-`tests/api/` green from a clean `pytest`; `sutra serve-api` starts uvicorn on the UDS
-(single-worker, no reload); idempotency + claims survive a process restart (durable
-store); no new deps leak into the edge package; the receive core is reused. INDEX
-prompt status → in-progress on start, implemented on completion.
+`uv run pytest -q` (the **full suite**, per `AGENTS.md` — not just `tests/api/`) green;
+`sutra serve-api` starts uvicorn on the UDS (single-worker, no reload); idempotency +
+claims survive a process restart (durable store); no new deps leak into the edge
+package; the receive core is reused. INDEX prompt status → in-progress on start,
+implemented on completion.
