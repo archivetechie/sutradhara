@@ -6,6 +6,7 @@ import click
 
 from sutradhara import __version__
 from sutradhara.cli.admin import admin_group
+from sutradhara.cli.api import serve_api_cmd
 from sutradhara.cli.archive import archive_group, review_cmd
 from sutradhara.cli.arrangement import arrangement_group
 from sutradhara.cli.assets import list_group
@@ -47,6 +48,7 @@ cli.add_command(virtual_group)
 cli.add_command(reject_cmd)
 cli.add_command(unreject_cmd)
 cli.add_command(tag_group)
+cli.add_command(serve_api_cmd)
 
 
 if __name__ == "__main__":

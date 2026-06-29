@@ -1,6 +1,6 @@
 # Codex prompt — Operator identity & component authZ: **sutradhara API**
 
-> Status: **pending** (round-4 codex review folded). Design:
+> Status: **implemented** (round-4 codex review folded). Design:
 > `docs/design-operator-identity-authz.md` (§15 = the security-review trail every
 > acceptance test traces to). Sibling prompts (identical **Shared contract**):
 > `~/system-ui/docs/prompt-operator-identity-authz-system-ui.md`,

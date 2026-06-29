@@ -26,12 +26,15 @@ dependencies = [
     "sutradhara-receive==0.0.1",
     "cbor2>=5.6",
     "click>=8.1",
+    "fastapi>=0.115",
+    "httpx2>=0.28",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
     "grpcio>=1.60",
     "protobuf>=4.25",
     "zstandard>=0.23",
     "boto3>=1.34",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]

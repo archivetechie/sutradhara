@@ -60,12 +60,14 @@ def create_all(engine: Engine) -> None:
     exists so tests don't need to run Alembic on each fixture.
     """
     import_module("sutradhara.jobs.models")
+    import_module("sutradhara.api.store")
     Base.metadata.create_all(engine)
 
 
 def reset_all(engine: Engine) -> None:
     """Drop and recreate all catalog tables for clean-slate local development."""
     import_module("sutradhara.jobs.models")
+    import_module("sutradhara.api.store")
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
 
