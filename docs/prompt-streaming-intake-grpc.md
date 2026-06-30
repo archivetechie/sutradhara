@@ -1,6 +1,6 @@
 # Codex prompt — streaming card/drive intake over gRPC + mTLS
 
-> Status: **pending**. Design: `docs/design-streaming-intake-grpc.md` (the authority —
+> Status: **implemented** (2026-06-30). Design: `docs/design-streaming-intake-grpc.md` (the authority —
 > read it first; 5 review rounds / 30 findings folded, trail in its §16). Single repo
 > (`sutra-agent` lives at `packages/sutra-agent/`). **Prerequisite satisfied:**
 > `sutra intake watch` is implemented (`docs/design-intake-watch.md`,

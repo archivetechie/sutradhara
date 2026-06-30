@@ -236,7 +236,7 @@ class CancelOperationRequest(_message.Message):
     operation_id: bytes
     idempotency_key: IdempotencyKey
     force: bool
-    def __init__(self, operation_id: _Optional[bytes] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ..., force: bool = ...) -> None: ...
+    def __init__(self, operation_id: _Optional[bytes] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ..., force: _Optional[bool] = ...) -> None: ...
 
 class CancelOperationResponse(_message.Message):
     __slots__ = ("resulting_state", "detail")
@@ -666,7 +666,7 @@ class EnumerateObjectsRequest(_message.Message):
     library_uuid: bytes
     all: _empty_pb2.Empty
     reconcile_from_tape: bool
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., library_uuid: _Optional[bytes] = ..., all: _Optional[_Union[_empty_pb2.Empty, _Mapping]] = ..., reconcile_from_tape: bool = ...) -> None: ...
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., library_uuid: _Optional[bytes] = ..., all: _Optional[_Union[_empty_pb2.Empty, _Mapping]] = ..., reconcile_from_tape: _Optional[bool] = ...) -> None: ...
 
 class GetObjectRequest(_message.Message):
     __slots__ = ("object_id", "content_sha256", "caller_object_id")
@@ -786,7 +786,7 @@ class EnumerateUnitsRequest(_message.Message):
     all: _empty_pb2.Empty
     origin_filter: CatalogUnitOriginFilter
     refresh_from_source: bool
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., library_uuid: _Optional[bytes] = ..., all: _Optional[_Union[_empty_pb2.Empty, _Mapping]] = ..., origin_filter: _Optional[_Union[CatalogUnitOriginFilter, str]] = ..., refresh_from_source: bool = ...) -> None: ...
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., library_uuid: _Optional[bytes] = ..., all: _Optional[_Union[_empty_pb2.Empty, _Mapping]] = ..., origin_filter: _Optional[_Union[CatalogUnitOriginFilter, str]] = ..., refresh_from_source: _Optional[bool] = ...) -> None: ...
 
 class GetCatalogUnitRequest(_message.Message):
     __slots__ = ("unit_id",)
@@ -824,7 +824,7 @@ class ListEntriesInUnitRequest(_message.Message):
     page_token: PageToken
     page_size: int
     refresh_from_source: bool
-    def __init__(self, unit_id: _Optional[bytes] = ..., page_token: _Optional[_Union[PageToken, _Mapping]] = ..., page_size: _Optional[int] = ..., refresh_from_source: bool = ...) -> None: ...
+    def __init__(self, unit_id: _Optional[bytes] = ..., page_token: _Optional[_Union[PageToken, _Mapping]] = ..., page_size: _Optional[int] = ..., refresh_from_source: _Optional[bool] = ...) -> None: ...
 
 class ListEntriesInUnitResponse(_message.Message):
     __slots__ = ("entries", "next_page_token", "archive_gaps")
@@ -934,7 +934,7 @@ class TapeTarget(_message.Message):
     tape_uuid: bytes
     mount_if_needed: bool
     required_pool_id: str
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., mount_if_needed: bool = ..., required_pool_id: _Optional[str] = ...) -> None: ...
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., mount_if_needed: _Optional[bool] = ..., required_pool_id: _Optional[str] = ...) -> None: ...
 
 class TapePoolTarget(_message.Message):
     __slots__ = ("pool_id", "library_uuid", "mount_if_needed")
@@ -944,7 +944,7 @@ class TapePoolTarget(_message.Message):
     pool_id: str
     library_uuid: bytes
     mount_if_needed: bool
-    def __init__(self, pool_id: _Optional[str] = ..., library_uuid: _Optional[bytes] = ..., mount_if_needed: bool = ...) -> None: ...
+    def __init__(self, pool_id: _Optional[str] = ..., library_uuid: _Optional[bytes] = ..., mount_if_needed: _Optional[bool] = ...) -> None: ...
 
 class AppendObjectMessage(_message.Message):
     __slots__ = ("start", "chunk", "finish")
@@ -1107,7 +1107,7 @@ class BytesChunk(_message.Message):
     IS_LAST_FIELD_NUMBER: _ClassVar[int]
     data: bytes
     is_last: bool
-    def __init__(self, data: _Optional[bytes] = ..., is_last: bool = ...) -> None: ...
+    def __init__(self, data: _Optional[bytes] = ..., is_last: _Optional[bool] = ...) -> None: ...
 
 class QueryAuditRequest(_message.Message):
     __slots__ = ("since", "until", "filter")

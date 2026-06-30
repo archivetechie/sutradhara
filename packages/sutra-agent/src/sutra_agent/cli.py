@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -17,7 +19,9 @@ from typing import Any, TextIO
 from sutra_agent import __version__
 from sutra_agent.config import (
     DEFAULT_ARTIFACTCLASS,
+    DEFAULT_CHUNK_BYTES,
     DEFAULT_CONFIRM_INTERVAL_SECONDS,
+    DEFAULT_PARALLELISM,
     DEFAULT_SOURCE_KIND,
     AgentConfig,
     AgentConfigError,
@@ -56,15 +60,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_path_option(init_parser)
     init_parser.add_argument(
         "--landing",
-        required=True,
         type=Path,
         help="Landing share where completed receive intakes appear.",
     )
     init_parser.add_argument(
         "--operator",
-        required=True,
         help="Default operator name recorded in receives.",
     )
+    init_parser.add_argument("--server", dest="server_address", default=None, help="gRPC server address.")
+    init_parser.add_argument("--client-cert", type=Path, default=None, help="Device certificate.")
+    init_parser.add_argument("--client-key", type=Path, default=None, help="Device private key.")
+    init_parser.add_argument("--ca-cert", type=Path, default=None, help="Server CA certificate.")
+    init_parser.add_argument("--device-id", default=None, help="Device id; cert CN is authoritative.")
     init_parser.add_argument(
         "--source-kind",
         choices=SOURCE_KIND_CHOICES,
@@ -88,6 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CONFIRM_INTERVAL_SECONDS,
         help="Seconds between server-confirmation polls.",
     )
+    init_parser.add_argument("--parallelism", type=int, default=DEFAULT_PARALLELISM)
+    init_parser.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES)
     init_parser.add_argument(
         "--force",
         action="store_true",
@@ -147,6 +156,16 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON.")
     status_parser.set_defaults(handler=_handle_status)
 
+    enroll_parser = subparsers.add_parser("enroll", help="generate a local device key and CSR")
+    enroll_parser.add_argument("--server", default=None, help="Server address for operator notes.")
+    enroll_parser.add_argument("--device-id", required=True, help="Device id used as certificate CN.")
+    enroll_parser.add_argument("--operator", required=True, help="Requested server-assigned operator.")
+    enroll_parser.add_argument("--token", required=True, help="One-time enrollment token to submit.")
+    enroll_parser.add_argument("--output-dir", type=Path, default=None, help="Directory for client.key and CSR.")
+    enroll_parser.add_argument("--force", action="store_true", help="Overwrite existing key/CSR.")
+    enroll_parser.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON.")
+    enroll_parser.set_defaults(handler=_handle_enroll)
+
     return parser
 
 
@@ -178,6 +197,13 @@ def _handle_config_init(args: argparse.Namespace) -> int:
         artifactclass=args.artifactclass,
         ledger_path=args.ledger,
         confirm_interval_seconds=args.confirm_interval,
+        server_address=args.server_address,
+        client_cert=args.client_cert,
+        client_key=args.client_key,
+        ca_cert=args.ca_cert,
+        device_id=args.device_id,
+        parallelism=args.parallelism,
+        chunk_bytes=args.chunk_bytes,
     )
     path = write_config(config, args.config, overwrite=args.force)
     payload = {"config_path": str(path), "config": config_payload(config)}
@@ -185,8 +211,12 @@ def _handle_config_init(args: argparse.Namespace) -> int:
         _write_json(payload, sys.stdout)
     else:
         print(f"wrote config: {path}")
-        print(f"landing: {config.landing}")
-        print(f"operator: {config.operator}")
+        if config.streaming_enabled:
+            print(f"server: {config.server_address}")
+            print(f"device: {config.device_id}")
+        else:
+            print(f"landing: {config.landing}")
+            print(f"operator: {config.operator}")
         print(f"ledger: {config.resolved_ledger_path()}")
     return 0
 
@@ -202,8 +232,12 @@ def _handle_config_show(args: argparse.Namespace) -> int:
         _write_json(payload, sys.stdout)
     else:
         print(f"config: {payload['config_path']}")
-        print(f"landing: {config.landing}")
-        print(f"operator: {config.operator}")
+        if config.streaming_enabled:
+            print(f"server: {config.server_address}")
+            print(f"device: {config.device_id}")
+        else:
+            print(f"landing: {config.landing}")
+            print(f"operator: {config.operator}")
         print(f"source kind: {config.source_kind}")
         print(f"artifactclass: {config.artifactclass}")
         print(f"ledger: {config.resolved_ledger_path()}")
@@ -275,6 +309,47 @@ def _handle_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_enroll(args: argparse.Namespace) -> int:
+    output_dir = args.output_dir or default_config_path().parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    key_path = output_dir / "client.key"
+    csr_path = output_dir / f"{args.device_id}.csr"
+    if not args.force and (key_path.exists() or csr_path.exists()):
+        raise AgentReceiveUsageError("client key/CSR already exists; pass --force to replace")
+    for path in (key_path, csr_path):
+        path.unlink(missing_ok=True)
+    _run_openssl(["genrsa", "-out", str(key_path), "4096"])
+    os.chmod(key_path, 0o600)
+    _run_openssl(
+        [
+            "req",
+            "-new",
+            "-key",
+            str(key_path),
+            "-subj",
+            f"/CN={args.device_id}",
+            "-out",
+            str(csr_path),
+        ]
+    )
+    payload = {
+        "device_id": args.device_id,
+        "operator": args.operator,
+        "server": args.server,
+        "token": args.token,
+        "client_key": str(key_path),
+        "csr": str(csr_path),
+    }
+    if args.as_json:
+        _write_json(payload, sys.stdout)
+    else:
+        print(f"device key: {key_path}")
+        print(f"csr: {csr_path}")
+        print(f"operator: {args.operator}")
+        print("submit the CSR, operator, and token to the server admin for signing")
+    return 0
+
+
 def _add_config_path_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
@@ -297,6 +372,11 @@ def _add_runtime_config_options(
         help="Landing share override.",
     )
     parser.add_argument("--operator", default=None, help="Operator override.")
+    parser.add_argument("--server", dest="server_address", default=None, help="gRPC server override.")
+    parser.add_argument("--client-cert", type=Path, default=None, help="Device certificate override.")
+    parser.add_argument("--client-key", type=Path, default=None, help="Device key override.")
+    parser.add_argument("--ca-cert", type=Path, default=None, help="Server CA override.")
+    parser.add_argument("--device-id", default=None, help="Device id override.")
     parser.add_argument("--ledger", type=Path, default=None, help="Ledger path override.")
     if include_receive_defaults:
         parser.add_argument(
@@ -325,6 +405,11 @@ def _resolve_config_from_args(
         artifactclass=args.artifactclass if include_receive_defaults else None,
         ledger_path=args.ledger,
         confirm_interval_seconds=getattr(args, "confirm_interval", None),
+        server_address=args.server_address,
+        client_cert=args.client_cert,
+        client_key=args.client_key,
+        ca_cert=args.ca_cert,
+        device_id=args.device_id,
     )
 
 
@@ -341,6 +426,20 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 def _write_json(payload: dict[str, Any], stream: TextIO) -> None:
     stream.write(json.dumps(payload, indent=2, sort_keys=True))
     stream.write("\n")
+
+
+def _run_openssl(args: list[str]) -> None:
+    try:
+        subprocess.run(
+            ["openssl", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise AgentReceiveRuntimeError("openssl command is required for enroll") from exc
+    except subprocess.CalledProcessError as exc:
+        raise AgentReceiveRuntimeError(exc.stderr.strip() or str(exc)) from exc
 
 
 if __name__ == "__main__":

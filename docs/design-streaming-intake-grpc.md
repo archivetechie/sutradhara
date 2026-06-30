@@ -1,8 +1,9 @@
 # Design — streaming card/drive intake over gRPC + mTLS (`sutra-agent`)
 
-> Status: **current** (brainstorm 2026-06-30, Claude + the owner; **five codex document
-> review rounds folded — 30 findings**, trail in §16). **Prerequisite:**
-> `sutra intake watch` (`design-intake-watch.md`) must be built first. Companion to
+> Status: **implemented** (2026-06-30; brainstorm 2026-06-30, Claude + the owner;
+> **five codex document review rounds folded — 30 findings**, trail in §16).
+> **Prerequisite satisfied:** `sutra intake watch` (`design-intake-watch.md`) is built.
+> Companion to
 > `design-receive-front-door.md`
 > (the BagIt core + payload planner this design reuses) and
 > `design-operator-identity-authz.md` (the HTTP API surface this design runs
@@ -22,8 +23,7 @@ CLI/gRPC, separate design); any change to the existing `sutra serve-api` / HTTP 
 surface (it stays as-is for the browser receive flow); RDMA or kernel-bypass
 networking (10G TCP/HTTP2 is sufficient; card I/O is the bottleneck not the
 protocol); mid-file byte-level resume (v1 re-uploads the partial file; `offset` is in
-the proto for v2); **building `sutra intake watch`** — this design *depends* on that
-registrar but does not implement it (it is a hard prerequisite, §12, §15 Q21).
+the proto for v2); the live `~/system` harness scenario, which remains a follow-up.
 
 ## 2. Why gRPC + mTLS (not HTTPS / rsync / SMB)
 

@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package sutradhara.intake;
+
+service IntakeService {
+  rpc StartIntake(StartIntakeRequest) returns (StartIntakeResponse);
+  rpc UploadFile(stream FileChunk) returns (FileReceipt);
+  rpc ListIntakeFiles(ListIntakeFilesRequest) returns (ListIntakeFilesResponse);
+  rpc CommitIntake(CommitIntakeRequest) returns (CommitIntakeResponse);
+  rpc GetIntakeStatus(IntakeStatusRequest) returns (IntakeStatusResponse);
+  rpc AbortIntake(AbortIntakeRequest) returns (AbortIntakeResponse);
+}
+
+message StartIntakeRequest {
+  string idempotency_key = 1;
+  string artifactclass = 2;
+  string source_kind = 3;
+  string source_ref = 4;
+  string label = 5;
+  string source_plan_digest = 6;
+}
+
+message StartIntakeResponse {
+  string intake_id = 1;
+}
+
+message FileChunk {
+  string intake_id = 1;
+  string relpath = 2;
+  bytes data = 3;
+  int64 offset = 4;
+  bool is_last = 5;
+  int64 file_size = 6;
+}
+
+message FileReceipt {
+  string relpath = 1;
+  string server_sha256 = 2;
+  int64 received_bytes = 3;
+}
+
+message ListIntakeFilesRequest {
+  string intake_id = 1;
+}
+
+message ListIntakeFilesResponse {
+  repeated FileRecord files = 1;
+}
+
+message FileRecord {
+  string relpath = 1;
+  string server_sha256 = 2;
+  int64 bytes = 3;
+}
+
+message CommitIntakeRequest {
+  string intake_id = 1;
+  repeated ManifestEntry files = 2;
+  ReceiveFacts receive_facts = 3;
+  repeated PackageIndex package_indexes = 4;
+  string manifest_digest = 5;
+}
+
+message ManifestEntry {
+  string relpath = 1;
+  string client_sha256 = 2;
+  int64 bytes = 3;
+}
+
+message ReceiveFacts {
+  string canonicalization_version = 1;
+  int64 skipped_count = 2;
+  string package_profile_version = 3;
+}
+
+message PackageIndex {
+  string logical_member_path = 1;
+  string stored_member_path = 2;
+  string sha256 = 3;
+  repeated PackageMemberEntry members = 4;
+}
+
+message PackageMemberEntry {
+  string member = 1;
+  string type = 2;
+  int64 length = 3;
+  optional string sha256 = 4;
+  optional int64 data_offset = 5;
+  optional string linkname = 6;
+}
+
+message CommitIntakeResponse {
+  string intake_id = 1;
+  string status = 2;
+  repeated string reupload_relpaths = 3;
+}
+
+message IntakeStatusRequest {
+  string intake_id = 1;
+}
+
+message IntakeStatusResponse {
+  string intake_id = 1;
+  string status = 2;
+  repeated string errors = 3;
+}
+
+message AbortIntakeRequest {
+  string intake_id = 1;
+}
+
+message AbortIntakeResponse {
+  string intake_id = 1;
+  string status = 2;
+}

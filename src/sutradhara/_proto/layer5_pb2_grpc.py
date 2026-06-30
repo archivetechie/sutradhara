@@ -6,7 +6,7 @@ import warnings
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 from . import layer5_pb2 as layer5__pb2
 
-GRPC_GENERATED_VERSION = '1.80.0'
+GRPC_GENERATED_VERSION = '1.81.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -26,7 +26,7 @@ if _version_not_supported:
     )
 
 
-class DaemonStub(object):
+class DaemonStub:
     """=============================================================================
     DAEMON SERVICE — process-level introspection and operation control.
     =============================================================================
@@ -71,7 +71,7 @@ class DaemonStub(object):
                 _registered_method=True)
 
 
-class DaemonServicer(object):
+class DaemonServicer:
     """=============================================================================
     DAEMON SERVICE — process-level introspection and operation control.
     =============================================================================
@@ -159,7 +159,7 @@ def add_DaemonServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Daemon(object):
+class Daemon:
     """=============================================================================
     DAEMON SERVICE — process-level introspection and operation control.
     =============================================================================
@@ -329,7 +329,7 @@ class Daemon(object):
             _registered_method=True)
 
 
-class LibraryServiceStub(object):
+class LibraryServiceStub:
     """=============================================================================
     LIBRARY SERVICE — Layer 2 surface: inventory and state-changing ops.
     =============================================================================
@@ -389,7 +389,7 @@ class LibraryServiceStub(object):
                 _registered_method=True)
 
 
-class LibraryServiceServicer(object):
+class LibraryServiceServicer:
     """=============================================================================
     LIBRARY SERVICE — Layer 2 surface: inventory and state-changing ops.
     =============================================================================
@@ -510,7 +510,7 @@ def add_LibraryServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class LibraryService(object):
+class LibraryService:
     """=============================================================================
     LIBRARY SERVICE — Layer 2 surface: inventory and state-changing ops.
     =============================================================================
@@ -761,7 +761,7 @@ class LibraryService(object):
             _registered_method=True)
 
 
-class CatalogStub(object):
+class CatalogStub:
     """=============================================================================
     CATALOG SERVICE — Layer 4 query surface over committed tape contents.
 
@@ -850,7 +850,7 @@ class CatalogStub(object):
                 _registered_method=True)
 
 
-class CatalogServicer(object):
+class CatalogServicer:
     """=============================================================================
     CATALOG SERVICE — Layer 4 query surface over committed tape contents.
 
@@ -1041,7 +1041,7 @@ def add_CatalogServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Catalog(object):
+class Catalog:
     """=============================================================================
     CATALOG SERVICE — Layer 4 query surface over committed tape contents.
 
@@ -1431,7 +1431,7 @@ class Catalog(object):
             _registered_method=True)
 
 
-class WriteSessionServiceStub(object):
+class WriteSessionServiceStub:
     """=============================================================================
     WRITE SESSION SERVICE — write objects to tape.
 
@@ -1482,7 +1482,7 @@ class WriteSessionServiceStub(object):
                 _registered_method=True)
 
 
-class WriteSessionServiceServicer(object):
+class WriteSessionServiceServicer:
     """=============================================================================
     WRITE SESSION SERVICE — write objects to tape.
 
@@ -1576,7 +1576,7 @@ def add_WriteSessionServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class WriteSessionService(object):
+class WriteSessionService:
     """=============================================================================
     WRITE SESSION SERVICE — write objects to tape.
 
@@ -1752,7 +1752,7 @@ class WriteSessionService(object):
             _registered_method=True)
 
 
-class ReadSessionServiceStub(object):
+class ReadSessionServiceStub:
     """=============================================================================
     READ SESSION SERVICE — read objects / byte ranges from tape.
 
@@ -1796,7 +1796,7 @@ class ReadSessionServiceStub(object):
                 _registered_method=True)
 
 
-class ReadSessionServiceServicer(object):
+class ReadSessionServiceServicer:
     """=============================================================================
     READ SESSION SERVICE — read objects / byte ranges from tape.
 
@@ -1877,7 +1877,7 @@ def add_ReadSessionServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class ReadSessionService(object):
+class ReadSessionService:
     """=============================================================================
     READ SESSION SERVICE — read objects / byte ranges from tape.
 
@@ -2024,7 +2024,7 @@ class ReadSessionService(object):
             _registered_method=True)
 
 
-class AuditStub(object):
+class AuditStub:
     """=============================================================================
     AUDIT SERVICE — read-only audit log queries.
 
@@ -2048,7 +2048,7 @@ class AuditStub(object):
                 _registered_method=True)
 
 
-class AuditServicer(object):
+class AuditServicer:
     """=============================================================================
     AUDIT SERVICE — read-only audit log queries.
 
@@ -2081,7 +2081,7 @@ def add_AuditServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Audit(object):
+class Audit:
     """=============================================================================
     AUDIT SERVICE — read-only audit log queries.
 

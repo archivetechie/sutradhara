@@ -20,6 +20,7 @@ classifiers = [
     "Topic :: System :: Archiving",
 ]
 dependencies = [
+    "grpcio>=1.60",
     "sutradhara-receive==0.0.1",
 ]
 
@@ -30,5 +31,4 @@ sutra-agent = "sutra_agent.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-sutra_agent = ["py.typed"]
-
+sutra_agent = ["py.typed", "_proto/*.pyi"]

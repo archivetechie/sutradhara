@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from sutra_agent.config import AgentConfig
+from sutra_agent.grpc_client import get_stream_status, stream_source
 from sutra_agent.ledger import (
     ConfirmationSnapshot,
     ReceiveRunRecord,
     confirmation_from_wait_result,
+    now_iso,
     record_from_receive_result,
     refresh_confirmation_records,
     upsert_receive_record,
@@ -94,6 +96,45 @@ def run_agent_receive(
 ) -> AgentReceiveOutcome:
     """Run receive through the shared core and upsert the local agent ledger."""
 
+    if config.streaming_enabled:
+        selected_source = fake_source if fake_source is not None else source
+        if selected_source is None:
+            raise AgentReceiveUsageError("streaming receive requires SOURCE or --fake-source")
+        try:
+            result = stream_source(
+                selected_source,
+                config=config,
+                source_ref=source_ref,
+                label=label,
+                idempotency_key=resume,
+                confirm_timeout=confirm_timeout,
+                confirm_interval=confirm_interval,
+            )
+        except Exception as exc:
+            raise AgentReceiveRuntimeError(str(exc)) from exc
+        timestamp = now_iso()
+        record = ReceiveRunRecord(
+            intake_id=result.intake_id,
+            intake_dir=Path(result.intake_id),
+            landing=Path(config.server_address or "grpc"),
+            source=str(selected_source),
+            source_kind=config.source_kind,
+            artifactclass=config.artifactclass,
+            operator="server-assigned",
+            file_count=result.file_count,
+            total_bytes=result.total_bytes,
+            skipped_count=result.skipped_count,
+            started_at=timestamp,
+            updated_at=timestamp,
+            confirmation=result.confirmation,
+            resume_of=resume,
+        )
+        ledger_path = config.resolved_ledger_path()
+        upsert_receive_record(ledger_path, record)
+        return AgentReceiveOutcome(record=record, ledger_path=ledger_path)
+
+    if config.landing is None or config.operator is None:
+        raise AgentReceiveUsageError("legacy receive requires landing and operator")
     try:
         result, wait_result = run_receive_command(
             source,
@@ -138,6 +179,44 @@ def refresh_agent_status(
     """Refresh tracked receive confirmation state from server marker files."""
 
     ledger_path = config.resolved_ledger_path()
+    if config.streaming_enabled:
+        from sutra_agent.ledger import ledger_records
+
+        records = []
+        now = now_iso()
+        for record in ledger_records(ledger_path):
+            if intake_id is not None and record.intake_id != intake_id:
+                records.append(record)
+                continue
+            marker = get_stream_status(config, record.intake_id)
+            records.append(
+                ReceiveRunRecord(
+                    intake_id=record.intake_id,
+                    intake_dir=record.intake_dir,
+                    landing=record.landing,
+                    source=record.source,
+                    source_kind=record.source_kind,
+                    artifactclass=record.artifactclass,
+                    operator=record.operator,
+                    file_count=record.file_count,
+                    total_bytes=record.total_bytes,
+                    skipped_count=record.skipped_count,
+                    started_at=record.started_at,
+                    updated_at=now,
+                    confirmation=marker,
+                    resume_of=record.resume_of,
+                )
+            )
+        if intake_id is not None and not any(record.intake_id == intake_id for record in records):
+            from sutra_agent.ledger import AgentLedgerError
+
+            raise AgentLedgerError(f"intake is not tracked in agent ledger: {intake_id}")
+        for record in records:
+            upsert_receive_record(ledger_path, record)
+        return AgentStatusOutcome(
+            records=tuple(record for record in records if intake_id is None or record.intake_id == intake_id),
+            ledger_path=ledger_path,
+        )
     records = tuple(refresh_confirmation_records(ledger_path, intake_id=intake_id))
     return AgentStatusOutcome(records=records, ledger_path=ledger_path)
 
@@ -149,6 +228,8 @@ def run_agent_sweep(
 ) -> AgentSweepOutcome:
     """Sweep stale sentinel-less receives from the configured landing root."""
 
+    if config.landing is None:
+        raise AgentReceiveUsageError("sweep is only available in legacy landing mode")
     result = run_sweep_command(config.landing, older_than_hours=older_than_hours)
     return AgentSweepOutcome(removed=result.removed)
 

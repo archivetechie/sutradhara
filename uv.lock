@@ -1210,11 +1210,15 @@ name = "sutra-agent"
 version = "0.0.1"
 source = { editable = "packages/sutra-agent" }
 dependencies = [
+    { name = "grpcio" },
     { name = "sutradhara-receive" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "sutradhara-receive", editable = "packages/sutradhara-receive" }]
+requires-dist = [
+    { name = "grpcio", specifier = ">=1.60" },
+    { name = "sutradhara-receive", editable = "packages/sutradhara-receive" },
+]
 
 [[package]]
 name = "sutradhara"

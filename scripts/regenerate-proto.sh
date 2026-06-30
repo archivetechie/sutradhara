@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Regenerate Python gRPC stubs from proto/layer5.proto.
+# Regenerate Python gRPC stubs from proto/*.proto.
 #
 # Usage:
 #   ./scripts/regenerate-proto.sh
 #
 # Requires grpcio-tools (installed via `pip install -e .[dev]`).
-# Output: src/sutradhara/_proto/layer5_pb2.py + layer5_pb2_grpc.py
+# Output:
+#   src/sutradhara/_proto/*_pb2.py + *_pb2_grpc.py
+#   packages/sutra-agent/src/sutra_agent/_proto/intake_pb2.py + intake_pb2_grpc.py
 #
 # The generated files are committed; do not edit them by hand.
 
@@ -14,7 +16,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PROTO_SRC="proto"
-PROTO_OUT="src/sutradhara/_proto"
+SERVER_PROTO_OUT="src/sutradhara/_proto"
+AGENT_PROTO_OUT="packages/sutra-agent/src/sutra_agent/_proto"
 
 PYTHON_CHECK="${PYTHON:-python3}"
 if [[ -x .venv/bin/python ]]; then
@@ -26,7 +29,7 @@ if ! "${PYTHON_CHECK}" -c "import grpc_tools" 2>/dev/null; then
     exit 1
 fi
 
-mkdir -p "${PROTO_OUT}"
+mkdir -p "${SERVER_PROTO_OUT}" "${AGENT_PROTO_OUT}"
 
 # protoc options:
 #   --python_out      → message classes (*_pb2.py)
@@ -41,10 +44,18 @@ fi
 
 "${PYTHON}" -m grpc_tools.protoc \
     --proto_path="${PROTO_SRC}" \
-    --python_out="${PROTO_OUT}" \
-    --pyi_out="${PROTO_OUT}" \
-    --grpc_python_out="${PROTO_OUT}" \
-    "${PROTO_SRC}/layer5.proto"
+    --python_out="${SERVER_PROTO_OUT}" \
+    --pyi_out="${SERVER_PROTO_OUT}" \
+    --grpc_python_out="${SERVER_PROTO_OUT}" \
+    "${PROTO_SRC}/layer5.proto" \
+    "${PROTO_SRC}/intake.proto"
+
+"${PYTHON}" -m grpc_tools.protoc \
+    --proto_path="${PROTO_SRC}" \
+    --python_out="${AGENT_PROTO_OUT}" \
+    --pyi_out="${AGENT_PROTO_OUT}" \
+    --grpc_python_out="${AGENT_PROTO_OUT}" \
+    "${PROTO_SRC}/intake.proto"
 
 # protoc emits imports like `import layer5_pb2`, which only works if
 # ${PROTO_OUT} is on sys.path. We're a package, so rewrite to a relative
@@ -53,18 +64,24 @@ python3 - <<'PY'
 import pathlib
 import re
 
-out = pathlib.Path("src/sutradhara/_proto")
-grpc_file = out / "layer5_pb2_grpc.py"
-text = grpc_file.read_text()
-text = re.sub(
-    r"^import (\w+_pb2) as",
-    r"from . import \1 as",
-    text,
-    flags=re.MULTILINE,
-)
-grpc_file.write_text(text)
+for out_text in ["src/sutradhara/_proto", "packages/sutra-agent/src/sutra_agent/_proto"]:
+    out = pathlib.Path(out_text)
+    for grpc_file in out.glob("*_pb2_grpc.py"):
+        text = grpc_file.read_text()
+        text = re.sub(
+            r"^import (\w+_pb2) as",
+            r"from . import \1 as",
+            text,
+            flags=re.MULTILINE,
+        )
+        grpc_file.write_text(text)
 PY
 
-echo "generated: ${PROTO_OUT}/layer5_pb2.py"
-echo "generated: ${PROTO_OUT}/layer5_pb2.pyi"
-echo "generated: ${PROTO_OUT}/layer5_pb2_grpc.py"
+touch "${SERVER_PROTO_OUT}/__init__.py" "${AGENT_PROTO_OUT}/__init__.py"
+
+echo "generated: ${SERVER_PROTO_OUT}/*_pb2.py"
+echo "generated: ${SERVER_PROTO_OUT}/*_pb2.pyi"
+echo "generated: ${SERVER_PROTO_OUT}/*_pb2_grpc.py"
+echo "generated: ${AGENT_PROTO_OUT}/intake_pb2.py"
+echo "generated: ${AGENT_PROTO_OUT}/intake_pb2.pyi"
+echo "generated: ${AGENT_PROTO_OUT}/intake_pb2_grpc.py"

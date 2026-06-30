@@ -6,7 +6,17 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from sqlalchemy import CheckConstraint, DateTime, Index, Integer, JSON, String, UniqueConstraint, delete, select
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    delete,
+    select,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
@@ -159,6 +169,32 @@ def abandon_idempotency(
             idempotency_key=idempotency_key,
         )
         if record is not None and record.status == "in_progress":
+            session.delete(record)
+
+
+def release_idempotency(
+    engine: Any,
+    *,
+    operator_username: str,
+    endpoint: str,
+    idempotency_key: str,
+) -> None:
+    """Delete an idempotency row regardless of completion state.
+
+    gRPC AbortIntake uses this after deleting a not-yet-committed intake so the
+    same StartIntake key can mint a fresh id. The HTTP receive endpoint keeps
+    using ``abandon_idempotency`` for non-durable in-progress failures.
+    """
+
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        record = _idempotency_record(
+            session,
+            operator_username=operator_username,
+            endpoint=endpoint,
+            idempotency_key=idempotency_key,
+        )
+        if record is not None:
             session.delete(record)
 
 

@@ -13,16 +13,18 @@ import fnmatch
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import stat
 import tarfile
+import threading
 import time
 import unicodedata
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, cast
@@ -132,6 +134,80 @@ class FileReceipt:
         """Return the operator-facing relpath for this payload object."""
 
         return self.logical_relpath or self.relpath
+
+
+@dataclass
+class PayloadUnit:
+    """One planned payload object for local or streaming receive.
+
+    A unit is either a regular file or a normalized package tar. Planning is
+    metadata-only; ``byte_chunks`` performs the single source read under the same
+    stat-before/stat-after mutation guard used by local ``receive_source``.
+    """
+
+    source_path: Path
+    relpath: str
+    entry_type: str
+    logical_relpath: str | None
+    hint_size: int
+    plan_size: int
+    mtime_ns: int
+    _package_members_cache: tuple[dict[str, Any], ...] = field(
+        default_factory=tuple,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def is_package(self) -> bool:
+        """Return true when this unit streams a normalized package tar."""
+
+        return self.entry_type == "package"
+
+    def byte_chunks(self, chunk_bytes: int = _COPY_BUFFER_BYTES) -> Iterator[bytes]:
+        """Yield source bytes once, failing if the source changes during read."""
+
+        if chunk_bytes <= 0:
+            raise ReceiveError("chunk_bytes must be positive")
+        if self.is_package:
+            yield from _stream_package_unit(self, chunk_bytes=chunk_bytes)
+        else:
+            yield from _stream_file_unit(self, chunk_bytes=chunk_bytes)
+
+    def package_index(self, tar_sha256: str) -> dict[str, Any] | None:
+        """Return the package-index entry for this unit after streaming."""
+
+        if not self.is_package:
+            return None
+        if self.logical_relpath is None:
+            raise ReceiveError(f"package unit missing logical relpath: {self.source_path}")
+        if not self._package_members_cache:
+            raise ReceiveError(f"package unit was not streamed yet: {self.relpath}")
+        return {
+            "logical_member_path": self.logical_relpath,
+            "stored_member_path": self.relpath,
+            "sha256": tar_sha256,
+            "members": list(self._package_members_cache),
+        }
+
+
+@dataclass(frozen=True)
+class PayloadPlan:
+    """Metadata-only source plan shared by local and streaming receives."""
+
+    units: tuple[PayloadUnit, ...]
+    rejected: tuple[RejectedEntry, ...]
+
+    @property
+    def skipped_count(self) -> int:
+        """Return the number of source entries intentionally skipped."""
+
+        return len(self.rejected)
+
+    def source_plan_digest(self) -> str:
+        """Return the metadata-only digest bound into StartIntake."""
+
+        return payload_plan_digest(self)
 
 
 @dataclass(frozen=True)
@@ -419,6 +495,35 @@ def receive_source(
         if intake_dir.exists():
             _write_receive_log(intake_dir / "receive.log", events, observer=atomic_observer)
         raise
+
+
+def plan_payload_units(source: Path | str) -> PayloadPlan:
+    """Return a metadata-only receive plan for a source tree.
+
+    The plan reuses the same package-boundary, symlink/special-file, collision,
+    and canonicalization logic as ``receive_source``. It does not read file
+    contents, so streaming receive still reads each source unit exactly once.
+    """
+
+    source_root = Path(source).resolve()
+    _validate_source_root(source_root)
+    entries, rejected = _scan_source(source_root)
+    _check_collisions(entries)
+    units = tuple(_payload_unit_from_entry(entry) for entry in entries)
+    return PayloadPlan(units=units, rejected=rejected)
+
+
+def payload_plan_digest(plan: PayloadPlan | Iterable[PayloadUnit]) -> str:
+    """Return sha256 over sorted ``{relpath,size,mtime_ns}`` plan metadata."""
+
+    units = plan.units if isinstance(plan, PayloadPlan) else tuple(plan)
+    payload = [
+        {"relpath": unit.relpath, "size": unit.plan_size, "mtime_ns": unit.mtime_ns}
+        for unit in sorted(units, key=lambda item: item.relpath)
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def sweep_orphans(
@@ -1169,6 +1274,154 @@ def _scan_source(source_root: Path) -> tuple[tuple[_SourceEntry, ...], tuple[Rej
     return tuple(sorted(regulars, key=lambda item: item.relpath)), tuple(rejected)
 
 
+def _payload_unit_from_entry(entry: _SourceEntry) -> PayloadUnit:
+    if entry.entry_type == "package":
+        plan_size, mtime_ns = _package_plan_metadata(entry.source_path)
+        return PayloadUnit(
+            source_path=entry.source_path,
+            relpath=entry.relpath,
+            entry_type=entry.entry_type,
+            logical_relpath=entry.logical_relpath,
+            hint_size=0,
+            plan_size=plan_size,
+            mtime_ns=mtime_ns,
+        )
+    snapshot = _stat_snapshot(entry.source_path)
+    return PayloadUnit(
+        source_path=entry.source_path,
+        relpath=entry.relpath,
+        entry_type=entry.entry_type,
+        logical_relpath=entry.logical_relpath,
+        hint_size=snapshot.size,
+        plan_size=snapshot.size,
+        mtime_ns=snapshot.mtime_ns,
+    )
+
+
+def _stream_file_unit(unit: PayloadUnit, *, chunk_bytes: int) -> Iterator[bytes]:
+    before = _stat_snapshot(unit.source_path)
+    with unit.source_path.open("rb") as handle:
+        yield from iter(lambda: handle.read(chunk_bytes), b"")
+    after = _stat_snapshot(unit.source_path)
+    _raise_if_mutated(unit.source_path, before, after)
+
+
+def _stream_package_unit(unit: PayloadUnit, *, chunk_bytes: int) -> Iterator[bytes]:
+    logical_relpath = unit.logical_relpath
+    if logical_relpath is None:
+        raise ReceiveError(f"package unit missing logical relpath: {unit.source_path}")
+    before_tree = _package_tree_snapshot(unit.source_path)
+    output: queue.Queue[bytes | BaseException | None] = queue.Queue(maxsize=16)
+    records: list[dict[str, Any]] = []
+
+    def produce() -> None:
+        try:
+            members = _package_members(unit.source_path, logical_relpath=logical_relpath)
+            writer = _QueueTarWriter(output, chunk_bytes=chunk_bytes)
+            with tarfile.open(
+                fileobj=cast(Any, writer),
+                mode="w",
+                format=tarfile.PAX_FORMAT,
+            ) as tar:
+                for member in members:
+                    info = _tar_info_for_package_member(member)
+                    if member.type_name == "file":
+                        before = _stat_snapshot(member.source_path)
+                        with member.source_path.open("rb") as raw_in:
+                            hashing_in = _HashingReader(raw_in)
+                            tar.addfile(info, hashing_in)
+                        after = _stat_snapshot(member.source_path)
+                        _raise_if_mutated(member.source_path, before, after)
+                        records.append(
+                            {
+                                "member": member.member_name,
+                                "type": "file",
+                                "length": member.size,
+                                "sha256": hashing_in.hexdigest(),
+                                "data_offset": getattr(info, "offset_data", None),
+                            }
+                        )
+                    else:
+                        tar.addfile(info)
+                        record: dict[str, Any] = {
+                            "member": member.member_name,
+                            "type": member.type_name,
+                            "length": 0,
+                            "sha256": None,
+                            "data_offset": None,
+                        }
+                        if member.linkname is not None:
+                            record["linkname"] = member.linkname
+                        records.append(record)
+            writer.flush()
+            after_tree = _package_tree_snapshot(unit.source_path)
+            if before_tree != after_tree:
+                raise SourceMutationError(f"package changed during receive: {unit.source_path}")
+            unit._package_members_cache = tuple(sorted(records, key=lambda item: item["member"]))
+            output.put(None)
+        except BaseException as exc:  # pragma: no cover - exercised through consumer raise
+            output.put(exc)
+
+    thread = threading.Thread(target=produce, daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = output.get()
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        thread.join(timeout=5)
+
+
+def _package_plan_metadata(package_root: Path) -> tuple[int, int]:
+    snapshot = _package_tree_snapshot(package_root)
+    total_size = sum(item[2] for item in snapshot if item[1] == "file")
+    max_mtime = max((item[3] for item in snapshot), default=0)
+    return total_size, max_mtime
+
+
+def _package_tree_snapshot(package_root: Path) -> tuple[tuple[str, str, int, int], ...]:
+    entries: list[tuple[str, str, int, int]] = []
+    try:
+        root_stat = package_root.lstat()
+    except FileNotFoundError as exc:
+        raise SourceScanError(f"package disappeared during receive: {package_root}") from exc
+    if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+        raise ReceiveError(f"package boundary is not a directory: {package_root}")
+    entries.append(("", "directory", 0, root_stat.st_mtime_ns))
+    for root_raw, dirs, files in os.walk(package_root, topdown=True, followlinks=False):
+        root = Path(root_raw)
+        dirs.sort(key=lambda name: canonicalize_filesystem_path(root / name, package_root))
+        for dirname in list(dirs):
+            path = root / dirname
+            relpath = canonicalize_filesystem_path(path, package_root)
+            stat_result = path.lstat()
+            if stat.S_ISLNK(stat_result.st_mode):
+                entries.append((relpath, "symlink", 0, stat_result.st_mtime_ns))
+                dirs.remove(dirname)
+            elif stat.S_ISDIR(stat_result.st_mode):
+                entries.append((relpath, "directory", 0, stat_result.st_mtime_ns))
+            else:
+                raise ReceiveError(f"package contains unsupported {_special_file_reason(stat_result.st_mode)}: {relpath}")
+        for filename in sorted(
+            files,
+            key=lambda name: canonicalize_filesystem_path(root / name, package_root),
+        ):
+            path = root / filename
+            relpath = canonicalize_filesystem_path(path, package_root)
+            stat_result = path.lstat()
+            if stat.S_ISREG(stat_result.st_mode):
+                entries.append((relpath, "file", stat_result.st_size, stat_result.st_mtime_ns))
+            elif stat.S_ISLNK(stat_result.st_mode):
+                entries.append((relpath, "symlink", 0, stat_result.st_mtime_ns))
+            else:
+                raise ReceiveError(f"package contains unsupported {_special_file_reason(stat_result.st_mode)}: {relpath}")
+    return tuple(sorted(entries))
+
+
 def _check_collisions(entries: Iterable[_SourceEntry]) -> None:
     seen: dict[str, _SourceEntry] = {}
     for entry in entries:
@@ -1593,6 +1846,32 @@ class _HashingWriter:
 
     def hexdigest(self) -> str:
         return self._digest.hexdigest()
+
+
+class _QueueTarWriter:
+    """Minimal binary writer that streams tar bytes through a queue."""
+
+    def __init__(self, output: queue.Queue[bytes | BaseException | None], *, chunk_bytes: int) -> None:
+        self._output = output
+        self._chunk_bytes = chunk_bytes
+        self._position = 0
+        self._pending = bytearray()
+
+    def write(self, data: bytes) -> int:
+        self._position += len(data)
+        self._pending.extend(data)
+        while len(self._pending) >= self._chunk_bytes:
+            self._output.put(bytes(self._pending[: self._chunk_bytes]))
+            del self._pending[: self._chunk_bytes]
+        return len(data)
+
+    def tell(self) -> int:
+        return self._position
+
+    def flush(self) -> None:
+        if self._pending:
+            self._output.put(bytes(self._pending))
+            self._pending.clear()
 
 
 class _HashingReader:

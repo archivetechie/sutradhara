@@ -252,6 +252,37 @@ def test_intake_watch_cli_once_registers_prepares_and_surfaces_quarantine(
     assert (bad.intake_dir / "intake.quarantined.json").is_file()
 
 
+def test_serve_grpc_enrollment_admin_actions(cli_env: dict[str, str], tmp_path: Path) -> None:
+    _run(["db", "init"])
+    token = _run(["serve-grpc", "--issue-enroll-token"]).output.strip()
+    assert token
+
+    device_dir = tmp_path / "device"
+    from sutradhara.grpc.ca import generate_device_csr
+
+    material = generate_device_csr(device_dir, device_id="mac-1")
+    cert_path = tmp_path / "client.crt"
+    signed = _run(
+        [
+            "serve-grpc",
+            "--pki-dir",
+            str(tmp_path / "pki"),
+            "--sign-csr",
+            str(material.csr_path),
+            "--operator",
+            "owner",
+            "--token",
+            token,
+            "--cert-out",
+            str(cert_path),
+        ]
+    )
+    assert "signed mac-1 for owner" in signed.output
+    assert cert_path.is_file()
+    revoked = _run(["serve-grpc", "--revoke-device", "mac-1"])
+    assert "revoked 1 enrollment" in revoked.output
+
+
 def test_db_init_creates_schema(cli_env: dict[str, str]) -> None:
     result = _run(["db", "init"])
     assert "OK" in result.output

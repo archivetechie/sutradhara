@@ -11,9 +11,10 @@ from __future__ import annotations
 import errno
 import fcntl
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -21,8 +22,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from sutradhara.catalog.session import make_engine, make_session_factory
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.intake import (
-    IntakeDiscrepancyError,
     InspectReport,
+    IntakeDiscrepancyError,
     accept_intake,
     inspect_intake,
     publish_intake_marker,
@@ -617,7 +618,7 @@ class _WatchLock:
         self._handle: Any | None = None
         self.acquired = False
 
-    def __enter__(self) -> "_WatchLock":
+    def __enter__(self) -> _WatchLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.path.open("a+")
         try:
@@ -643,7 +644,7 @@ class _WatchLock:
 class _NullLock:
     acquired = True
 
-    def __enter__(self) -> "_NullLock":
+    def __enter__(self) -> _NullLock:
         return self
 
     def __exit__(self, *_exc: object) -> None:

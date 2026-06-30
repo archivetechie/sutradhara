@@ -54,6 +54,17 @@ class ConfirmationSnapshot:
 
 
 @dataclass(frozen=True)
+class StreamResumeRecord:
+    """Warm-resume binding for one streaming idempotency key."""
+
+    idempotency_key: str
+    intake_id: str
+    plan_digest: str
+    updated_at: str
+    package_indexes: dict[str, dict[str, Any]]
+
+
+@dataclass(frozen=True)
 class ReceiveRunRecord:
     """One receive attempt tracked by the edge agent."""
 
@@ -144,6 +155,60 @@ def upsert_receive_record(path: Path, record: ReceiveRunRecord) -> None:
     if not replaced:
         next_runs.append(record)
     _write_ledger(path, next_runs)
+
+
+def lookup_stream_resume(path: Path, idempotency_key: str) -> StreamResumeRecord | None:
+    """Return the warm-resume record for a streaming StartIntake key."""
+
+    payload = load_ledger(path)
+    raw = payload.get("streaming_intakes", {}).get(idempotency_key)
+    if not isinstance(raw, dict):
+        return None
+    package_indexes = raw.get("package_indexes", {})
+    if not isinstance(package_indexes, dict):
+        package_indexes = {}
+    return StreamResumeRecord(
+        idempotency_key=idempotency_key,
+        intake_id=_required_string(raw, "intake_id"),
+        plan_digest=_required_string(raw, "plan_digest"),
+        updated_at=_required_string(raw, "updated_at"),
+        package_indexes={
+            str(key): value
+            for key, value in package_indexes.items()
+            if isinstance(value, dict)
+        },
+    )
+
+
+def record_stream_resume(
+    path: Path,
+    *,
+    idempotency_key: str,
+    intake_id: str,
+    plan_digest: str,
+    package_indexes: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Persist the local warm-resume binding for a streaming receive."""
+
+    payload = load_ledger(path)
+    streaming = payload.get("streaming_intakes")
+    if not isinstance(streaming, dict):
+        streaming = {}
+    existing = streaming.get(idempotency_key)
+    existing_packages = (
+        existing.get("package_indexes", {}) if isinstance(existing, dict) else {}
+    )
+    if not isinstance(existing_packages, dict):
+        existing_packages = {}
+    merged_packages = {**existing_packages, **(package_indexes or {})}
+    streaming[idempotency_key] = {
+        "intake_id": intake_id,
+        "plan_digest": plan_digest,
+        "updated_at": now_iso(),
+        "package_indexes": merged_packages,
+    }
+    payload["streaming_intakes"] = streaming
+    _write_payload(path, payload)
 
 
 def refresh_confirmation_records(
@@ -285,11 +350,19 @@ def inspect_confirmation_marker(intake_dir: Path) -> ConfirmationSnapshot:
 
 
 def _write_ledger(path: Path, records: list[ReceiveRunRecord]) -> None:
+    existing = load_ledger(path)
     payload: dict[str, Any] = {
         "schema": LEDGER_SCHEMA,
         "updated_at": now_iso(),
         "runs": [record.payload() for record in records],
     }
+    if isinstance(existing.get("streaming_intakes"), dict):
+        payload["streaming_intakes"] = existing["streaming_intakes"]
+    _write_payload(path, payload)
+
+
+def _write_payload(path: Path, payload: dict[str, Any]) -> None:
+    payload["updated_at"] = now_iso()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"

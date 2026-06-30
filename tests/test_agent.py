@@ -20,6 +20,7 @@ import pytest
 from sqlalchemy import Engine
 
 from sutra_agent.cli import main as agent_main
+from sutra_agent.config import AgentConfig
 from sutra_agent.ledger import inspect_confirmation_marker
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
@@ -166,6 +167,20 @@ def test_agent_marker_reader_blocks_discrepancy_and_bad_verified(tmp_path: Path)
     assert bad_verified_snapshot.status == "pending"
     assert bad_verified_snapshot.release_ok is False
     assert bad_verified_snapshot.marker_path == bad_verified / "intake.verified.json"
+
+
+def test_agent_streaming_config_has_no_client_operator(tmp_path: Path) -> None:
+    config = AgentConfig(
+        server_address="localhost:50051",
+        client_cert=tmp_path / "client.crt",
+        client_key=tmp_path / "client.key",
+        ca_cert=tmp_path / "ca.crt",
+        device_id="mac-1",
+    )
+
+    assert config.streaming_enabled
+    assert config.operator is None
+    assert config.landing is None
 
 
 def test_agent_status_for_specific_missing_ledger_is_error(

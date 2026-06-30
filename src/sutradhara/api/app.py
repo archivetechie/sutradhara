@@ -41,8 +41,7 @@ def create_app(engine: Engine | None = None, *, ensure_schema: bool = True) -> F
             origin = request.headers.get("origin")
             if not host or not origin or not _same_origin(origin, host):
                 return _error_response(403, "forbidden_origin", "Origin must match Host")
-        response = await call_next(request)  # type: ignore[misc]
-        return response
+        return await call_next(request)  # type: ignore[misc]
 
     @app.exception_handler(HTTPException)
     async def _http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:

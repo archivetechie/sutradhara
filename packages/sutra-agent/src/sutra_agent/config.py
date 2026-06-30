@@ -18,6 +18,8 @@ CONFIG_SCHEMA = "sutra-agent-config-v1"
 DEFAULT_SOURCE_KIND = "card"
 DEFAULT_ARTIFACTCLASS = "camera-original"
 DEFAULT_CONFIRM_INTERVAL_SECONDS = 1.0
+DEFAULT_PARALLELISM = 8
+DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024
 
 
 class AgentConfigError(ValueError):
@@ -28,22 +30,49 @@ class AgentConfigError(ValueError):
 class AgentConfig:
     """Resolved receive-agent configuration."""
 
-    landing: Path
-    operator: str
+    landing: Path | None = None
+    operator: str | None = None
     source_kind: str = DEFAULT_SOURCE_KIND
     artifactclass: str = DEFAULT_ARTIFACTCLASS
     ledger_path: Path | None = None
     confirm_interval_seconds: float = DEFAULT_CONFIRM_INTERVAL_SECONDS
+    server_address: str | None = None
+    client_cert: Path | None = None
+    client_key: Path | None = None
+    ca_cert: Path | None = None
+    device_id: str | None = None
+    parallelism: int = DEFAULT_PARALLELISM
+    chunk_bytes: int = DEFAULT_CHUNK_BYTES
 
     def __post_init__(self) -> None:
-        if not self.operator:
-            raise AgentConfigError("operator must be non-empty")
+        if self.server_address and self.landing is not None:
+            raise AgentConfigError("landing and server_address are mutually exclusive")
+        if self.server_address:
+            if not self.client_cert or not self.client_key or not self.ca_cert:
+                raise AgentConfigError("streaming mode requires client_cert, client_key, and ca_cert")
+            if not self.device_id:
+                raise AgentConfigError("streaming mode requires device_id")
+        else:
+            if self.landing is None:
+                raise AgentConfigError("landing is required in legacy receive mode")
+            if not self.operator:
+                raise AgentConfigError("operator must be non-empty in legacy receive mode")
         if not self.source_kind:
             raise AgentConfigError("source_kind must be non-empty")
         if not self.artifactclass:
             raise AgentConfigError("artifactclass must be non-empty")
         if self.confirm_interval_seconds <= 0:
             raise AgentConfigError("confirm_interval_seconds must be a positive number")
+        if self.parallelism < 1 or self.parallelism > 8:
+            raise AgentConfigError("parallelism must be between 1 and 8")
+        if self.chunk_bytes <= 0:
+            raise AgentConfigError("chunk_bytes must be positive")
+
+    @property
+    def streaming_enabled(self) -> bool:
+        """Return true when receive should use the gRPC streaming path."""
+
+        return self.server_address is not None
 
     def resolved_ledger_path(self) -> Path:
         """Return the ledger path, falling back to the platform state directory."""
@@ -118,12 +147,25 @@ def config_payload(config: AgentConfig) -> dict[str, Any]:
 
     payload: dict[str, Any] = {
         "schema": CONFIG_SCHEMA,
-        "landing": str(config.landing),
-        "operator": config.operator,
         "source_kind": config.source_kind,
         "artifactclass": config.artifactclass,
         "confirm_interval_seconds": config.confirm_interval_seconds,
     }
+    if config.server_address is not None:
+        payload.update(
+            {
+                "server_address": config.server_address,
+                "client_cert": str(config.client_cert),
+                "client_key": str(config.client_key),
+                "ca_cert": str(config.ca_cert),
+                "device_id": config.device_id,
+                "parallelism": config.parallelism,
+                "chunk_bytes": config.chunk_bytes,
+            }
+        )
+    else:
+        payload["landing"] = str(config.landing)
+        payload["operator"] = config.operator
     if config.ledger_path is not None:
         payload["ledger_path"] = str(config.ledger_path)
     return payload
@@ -138,6 +180,13 @@ def resolve_config(
     artifactclass: str | None = None,
     ledger_path: Path | None = None,
     confirm_interval_seconds: float | None = None,
+    server_address: str | None = None,
+    client_cert: Path | None = None,
+    client_key: Path | None = None,
+    ca_cert: Path | None = None,
+    device_id: str | None = None,
+    parallelism: int | None = None,
+    chunk_bytes: int | None = None,
 ) -> AgentConfig:
     """Resolve config from a file plus command-line overrides.
 
@@ -151,12 +200,9 @@ def resolve_config(
     if config_path is not None or candidate.exists():
         loaded = load_config(candidate)
 
+    resolved_server = server_address or (loaded.server_address if loaded else None)
     resolved_landing = landing or (loaded.landing if loaded else None)
     resolved_operator = operator or (loaded.operator if loaded else None)
-    if resolved_landing is None:
-        raise AgentConfigError("landing is required; pass --landing or initialize config")
-    if resolved_operator is None:
-        raise AgentConfigError("operator is required; pass --operator or initialize config")
 
     return AgentConfig(
         landing=resolved_landing,
@@ -169,26 +215,51 @@ def resolve_config(
             if confirm_interval_seconds is not None
             else (loaded.confirm_interval_seconds if loaded else DEFAULT_CONFIRM_INTERVAL_SECONDS)
         ),
+        server_address=resolved_server,
+        client_cert=client_cert or (loaded.client_cert if loaded else None),
+        client_key=client_key or (loaded.client_key if loaded else None),
+        ca_cert=ca_cert or (loaded.ca_cert if loaded else None),
+        device_id=device_id or (loaded.device_id if loaded else None),
+        parallelism=parallelism if parallelism is not None else (loaded.parallelism if loaded else DEFAULT_PARALLELISM),
+        chunk_bytes=chunk_bytes if chunk_bytes is not None else (loaded.chunk_bytes if loaded else DEFAULT_CHUNK_BYTES),
     )
 
 
 def _config_from_payload(payload: dict[str, Any], *, base_dir: Path) -> AgentConfig:
-    landing = _required_string(payload, "landing")
-    operator = _required_string(payload, "operator")
+    landing = _optional_string(payload, "landing")
+    operator = _optional_string(payload, "operator")
+    server_address = _optional_string(payload, "server_address")
     source_kind = _optional_string(payload, "source_kind") or DEFAULT_SOURCE_KIND
     artifactclass = _optional_string(payload, "artifactclass") or DEFAULT_ARTIFACTCLASS
     ledger_value = _optional_string(payload, "ledger_path")
     ledger_path = _resolve_path(ledger_value, base_dir=base_dir) if ledger_value else None
+    client_cert = _optional_path(payload, "client_cert", base_dir=base_dir)
+    client_key = _optional_path(payload, "client_key", base_dir=base_dir)
+    ca_cert = _optional_path(payload, "ca_cert", base_dir=base_dir)
+    device_id = _optional_string(payload, "device_id")
     interval_value = payload.get("confirm_interval_seconds", DEFAULT_CONFIRM_INTERVAL_SECONDS)
     if not isinstance(interval_value, int | float) or interval_value <= 0:
         raise AgentConfigError("confirm_interval_seconds must be a positive number")
+    parallelism = payload.get("parallelism", DEFAULT_PARALLELISM)
+    if not isinstance(parallelism, int):
+        raise AgentConfigError("parallelism must be an integer")
+    chunk_bytes = payload.get("chunk_bytes", DEFAULT_CHUNK_BYTES)
+    if not isinstance(chunk_bytes, int):
+        raise AgentConfigError("chunk_bytes must be an integer")
     return AgentConfig(
-        landing=_resolve_path(landing, base_dir=base_dir),
+        landing=_resolve_path(landing, base_dir=base_dir) if landing else None,
         operator=operator,
         source_kind=source_kind,
         artifactclass=artifactclass,
         ledger_path=ledger_path,
         confirm_interval_seconds=float(interval_value),
+        server_address=server_address,
+        client_cert=client_cert,
+        client_key=client_key,
+        ca_cert=ca_cert,
+        device_id=device_id,
+        parallelism=parallelism,
+        chunk_bytes=chunk_bytes,
     )
 
 
@@ -213,6 +284,11 @@ def _resolve_path(value: str | Path, *, base_dir: Path) -> Path:
     if path.is_absolute():
         return path
     return base_dir / path
+
+
+def _optional_path(payload: dict[str, Any], key: str, *, base_dir: Path) -> Path | None:
+    value = _optional_string(payload, key)
+    return _resolve_path(value, base_dir=base_dir) if value else None
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine
 
 from sutradhara.catalog.models import Intake
 from sutradhara.catalog.session import create_all, make_engine, make_session_factory, session_scope
