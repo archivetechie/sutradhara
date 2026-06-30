@@ -1,6 +1,6 @@
 # Codex prompt — `sutra intake watch`: server-side landing registrar
 
-> Status: **pending**. Design: `docs/design-intake-watch.md` (the authority — read it
+> Status: **implemented** (2026-06-30). Design: `docs/design-intake-watch.md` (the authority — read it
 > first; this prompt sequences its §13 plan into green+commit milestones and pins the
 > load-bearing invariants). Single repo (`sutra-agent` lives at
 > `packages/sutra-agent/`). **Prerequisite for** `docs/design-streaming-intake-grpc.md`

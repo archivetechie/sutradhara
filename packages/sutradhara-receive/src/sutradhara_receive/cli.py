@@ -160,6 +160,12 @@ def receive_text_lines(
         stderr_lines.append("server confirmation: quarantined; do not release source")
         if confirmation.detail is not None:
             stderr_lines.append(json.dumps(confirmation.detail, indent=2, sort_keys=True))
+    elif confirmation.status == "discrepancy":
+        stderr_lines.append("server confirmation: discrepancy; do not release source")
+        if confirmation.detail is not None:
+            stderr_lines.append(json.dumps(confirmation.detail, indent=2, sort_keys=True))
+    elif confirmation.status == "pending":
+        stderr_lines.append("server confirmation: pending; do not release source")
     else:
         stderr_lines.append("server confirmation: timeout; do not release source")
     return stdout_lines, stderr_lines

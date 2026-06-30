@@ -456,13 +456,13 @@ def wait_for_server_confirmation(
     root = Path(intake_dir)
     deadline = time.monotonic() + timeout_seconds
     while True:
-        verified = root / "intake.verified.json"
-        if verified.exists():
+        discrepancy = root / "intake.discrepancy.json"
+        if discrepancy.exists():
             return ConfirmationResult(
-                release_ok=True,
-                status="verified",
-                marker_path=verified,
-                detail=_read_json(verified),
+                release_ok=False,
+                status="discrepancy",
+                marker_path=discrepancy,
+                detail=_read_json_or_none(discrepancy),
             )
         quarantined = root / "intake.quarantined.json"
         if quarantined.exists():
@@ -470,7 +470,16 @@ def wait_for_server_confirmation(
                 release_ok=False,
                 status="quarantined",
                 marker_path=quarantined,
-                detail=_read_json(quarantined),
+                detail=_read_json_or_none(quarantined),
+            )
+        verified = root / "intake.verified.json"
+        if verified.exists():
+            detail = _read_json_or_none(verified)
+            return ConfirmationResult(
+                release_ok=detail is not None,
+                status="verified" if detail is not None else "pending",
+                marker_path=verified,
+                detail=detail,
             )
         if time.monotonic() >= deadline:
             return ConfirmationResult(
@@ -1843,6 +1852,13 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ReceiveError(f"{path} JSON root is not an object")
     return data
+
+
+def _read_json_or_none(path: Path) -> dict[str, Any] | None:
+    try:
+        return _read_json(path)
+    except (OSError, json.JSONDecodeError, ReceiveError):
+        return None
 
 
 def _optional_str(value: object) -> str | None:

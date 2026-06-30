@@ -40,6 +40,7 @@ from sutradhara.catalog.types import (
 from sutradhara.cli.main import cli
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job, JobStatus
+from sutradhara_receive import receive_source
 
 FIXTURE = Path(__file__).parent / "fixtures" / "remanence_objects.json"
 
@@ -132,7 +133,123 @@ def test_intake_help_replaces_scan_with_explicit_verbs(cli_env: dict[str, str]) 
     assert "inspect" in result.output
     assert "register" in result.output
     assert "accept" in result.output
+    assert "watch" in result.output
     assert "scan" not in result.output
+
+
+def test_intake_register_and_accept_cli_publish_markers_post_commit(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    _run(["db", "init"])
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+    landing = tmp_path / "landing"
+    first = receive_source(
+        source,
+        landing=landing,
+        source_kind="card",
+        operator="op",
+        artifactclass="video-master",
+    )
+    second = receive_source(
+        source,
+        landing=landing,
+        source_kind="card",
+        operator="op",
+        artifactclass="video-master",
+    )
+
+    _run(["intake", "register", first.intake_id, "--landing-root", str(landing)])
+    _run(
+        [
+            "intake",
+            "accept",
+            second.intake_id,
+            "--landing-root",
+            str(landing),
+            "--prepare",
+            "hd-review",
+        ]
+    )
+
+    assert (first.intake_dir / "intake.verified.json").is_file()
+    accepted_receipt = json.loads((second.intake_dir / "intake.verified.json").read_text())
+    assert accepted_receipt["requested_profile"] == "hd-review"
+
+
+def test_intake_watch_cli_once_registers_prepares_and_surfaces_quarantine(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    _run(["db", "init"])
+    source = tmp_path / "watch-source"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+    landing = tmp_path / "watch-landing"
+    registered = receive_source(
+        source,
+        landing=landing,
+        source_kind="card",
+        operator="op",
+        artifactclass="video-master",
+    )
+
+    result = _run(
+        [
+            "intake",
+            "watch",
+            "--landing-root",
+            str(landing),
+            "--once",
+            "--settle-seconds",
+            "0",
+            "--stable-polls",
+            "1",
+            "--prepare",
+            "hd-review",
+        ]
+    )
+
+    assert "registered items=1" in result.output
+    receipt = json.loads((registered.intake_dir / "intake.verified.json").read_text())
+    assert receipt["requested_profile"] == "hd-review"
+    with session_scope(make_engine()) as session:
+        intake = session.get(Intake, registered.intake_id)
+        assert intake is not None
+        assert intake.requested_profile == "hd-review"
+
+    bad = receive_source(
+        source,
+        landing=landing,
+        source_kind="card",
+        operator="op",
+        artifactclass="video-master",
+    )
+    manifest = bad.manifest_path
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(hashlib.sha256(b"video").hexdigest(), "0" * 64),
+        encoding="utf-8",
+    )
+    quarantined = _run(
+        [
+            "intake",
+            "watch",
+            "--landing-root",
+            str(landing),
+            "--once",
+            "--settle-seconds",
+            "0",
+            "--stable-polls",
+            "1",
+            "--validation-attempts",
+            "1",
+        ],
+        expect_exit=1,
+    )
+    assert "quarantined reason=bag-invalid" in quarantined.output
+    assert (bad.intake_dir / "intake.quarantined.json").is_file()
 
 
 def test_db_init_creates_schema(cli_env: dict[str, str]) -> None:

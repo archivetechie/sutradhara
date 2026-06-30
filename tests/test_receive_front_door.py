@@ -602,20 +602,36 @@ def test_sweep_orphans_removes_only_stale_receiving_dirs(tmp_path: Path) -> None
 def test_confirmation_is_fail_safe_for_verified_quarantine_and_timeout(tmp_path: Path) -> None:
     verified = tmp_path / "verified"
     quarantined = tmp_path / "quarantined"
+    discrepancy = tmp_path / "discrepancy"
+    invalid_verified = tmp_path / "invalid-verified"
     timeout = tmp_path / "timeout"
-    for path in (verified, quarantined, timeout):
+    for path in (verified, quarantined, discrepancy, invalid_verified, timeout):
         path.mkdir()
     (verified / "intake.verified.json").write_text('{"ok": true}', encoding="utf-8")
     (quarantined / "intake.quarantined.json").write_text(
         '{"details": {"missing": ["clip.mov"]}}',
         encoding="utf-8",
     )
+    (quarantined / "intake.verified.json").write_text('{"stale": true}', encoding="utf-8")
+    (discrepancy / "intake.discrepancy.json").write_text(
+        '{"status": "registered"}',
+        encoding="utf-8",
+    )
+    (discrepancy / "intake.verified.json").write_text('{"stale": true}', encoding="utf-8")
+    (invalid_verified / "intake.verified.json").write_text("not json", encoding="utf-8")
 
     assert wait_for_server_confirmation(verified, timeout_seconds=0).release_ok is True
     quarantine = wait_for_server_confirmation(quarantined, timeout_seconds=0)
     assert quarantine.release_ok is False
     assert quarantine.status == "quarantined"
     assert quarantine.detail == {"details": {"missing": ["clip.mov"]}}
+    discrepancy_result = wait_for_server_confirmation(discrepancy, timeout_seconds=0)
+    assert discrepancy_result.release_ok is False
+    assert discrepancy_result.status == "discrepancy"
+    assert discrepancy_result.detail == {"status": "registered"}
+    bad_verified = wait_for_server_confirmation(invalid_verified, timeout_seconds=0)
+    assert bad_verified.release_ok is False
+    assert bad_verified.status == "pending"
     deadline = wait_for_server_confirmation(timeout, timeout_seconds=0)
     assert deadline.release_ok is False
     assert deadline.status == "timeout"

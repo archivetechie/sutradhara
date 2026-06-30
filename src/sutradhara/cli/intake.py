@@ -12,12 +12,15 @@ import click
 from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.intake import (
+    IntakeDiscrepancyError,
     accept_intake,
     inspect_intake,
     inspect_landing_root,
     prepare_intake,
+    publish_intake_marker,
     register_intake,
 )
+from sutradhara.intake_watch import WatchEvent, process_landing_once, watch_landing
 
 
 @click.group("intake")
@@ -100,9 +103,14 @@ def intake_register(
                 cloud_backend_name=cloud_backend,
                 cloud_pool_id=cloud_pool,
             )
+    except IntakeDiscrepancyError as exc:
+        publish_intake_marker(exc.marker)
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(2)
     except (FileNotFoundError, ValueError) as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(2)
+    publish_intake_marker(outcome.marker)
     _emit_outcome(outcome, as_json=as_json)
     if outcome.status == IntakeStatus.QUARANTINED.value:
         sys.exit(1)
@@ -162,12 +170,99 @@ def intake_accept(
                 cloud_backend_name=cloud_backend,
                 cloud_pool_id=cloud_pool,
             )
+    except IntakeDiscrepancyError as exc:
+        publish_intake_marker(exc.marker)
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(2)
     except (FileNotFoundError, ValueError) as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(2)
+    publish_intake_marker(outcome.marker)
     _emit_outcome(outcome, as_json=as_json)
     if outcome.status == IntakeStatus.QUARANTINED.value:
         sys.exit(1)
+
+
+@intake_group.command("watch")
+@click.option(
+    "--landing-root",
+    "--landing",
+    "landing_root",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+    help="Landing root to scan for completed intakes.",
+)
+@click.option("--once", is_flag=True, default=False, help="Scan/process once and exit.")
+@click.option("--interval", "interval_seconds", type=float, default=5.0, show_default=True)
+@click.option("--settle-seconds", type=float, default=2.0, show_default=True)
+@click.option("--stable-polls", type=int, default=2, show_default=True)
+@click.option("--validation-attempts", type=int, default=2, show_default=True)
+@click.option("--artifactclass", default=None, help="Required only for legacy non-BagIt intakes.")
+@click.option("--prepare", "prepare_profile", default=None, help="Prepare profile to record.")
+@click.option(
+    "--cache-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Directory for lock and register-time cloud-temp work.",
+)
+@click.option(
+    "--cloud-backend",
+    default="cloud-temp",
+    show_default=True,
+    help="Backend name for intake cloud blob jobs.",
+)
+@click.option(
+    "--cloud-pool",
+    default="cloud-temp",
+    show_default=True,
+    help="Pool id for intake cloud blob jobs.",
+)
+@click.option("--json-lines", is_flag=True, default=False, help="Emit one JSON object per event.")
+def intake_watch(
+    landing_root: Path,
+    once: bool,
+    interval_seconds: float,
+    settle_seconds: float,
+    stable_polls: int,
+    validation_attempts: int,
+    artifactclass: str | None,
+    prepare_profile: str | None,
+    cache_root: Path | None,
+    cloud_backend: str,
+    cloud_pool: str,
+    json_lines: bool,
+) -> None:
+    """Poll a landing root and register completed intakes."""
+
+    if stable_polls < 1:
+        raise click.BadParameter("must be >= 1", param_hint="--stable-polls")
+    if validation_attempts < 1:
+        raise click.BadParameter("must be >= 1", param_hint="--validation-attempts")
+    engine = make_engine()
+    common = {
+        "engine": engine,
+        "interval_seconds": interval_seconds,
+        "settle_seconds": settle_seconds,
+        "stable_polls": stable_polls,
+        "validation_attempts": validation_attempts,
+        "artifactclass": artifactclass,
+        "prepare_profile": prepare_profile,
+        "cache_root": cache_root,
+        "cloud_backend_name": cloud_backend,
+        "cloud_pool_id": cloud_pool,
+    }
+    if once:
+        events = process_landing_once(landing_root, **common)
+        for event in events:
+            _emit_watch_event(event, json_lines=json_lines)
+        if any(event.is_bad_once_outcome for event in events):
+            sys.exit(1)
+        return
+
+    def emit(event: WatchEvent) -> None:
+        _emit_watch_event(event, json_lines=json_lines)
+
+    watch_landing(landing_root, on_event=emit, **common)
 
 
 @click.command("prepare")
@@ -230,6 +325,48 @@ def _emit_outcome(row: Any, *, as_json: bool) -> None:
     )
 
 
+def _emit_watch_event(event: WatchEvent, *, json_lines: bool) -> None:
+    payload = event.payload()
+    if json_lines:
+        click.echo(json.dumps(payload, default=str, sort_keys=True))
+        return
+    name = event.path.name if event.path is not None else "-"
+    if event.event == "watch-start":
+        click.echo(
+            f"watch-start landing={event.path} "
+            f"interval={event.details.get('interval') if event.details else None} "
+            f"settle={event.details.get('settle_seconds') if event.details else None}"
+        )
+        return
+    if event.event == "watch-stop":
+        click.echo("watch-stop")
+        return
+    if event.event == "intake-skipped":
+        click.echo(f"{name}: skipped reason={event.reason}")
+        return
+    if event.event == "intake-validation-retry":
+        click.echo(f"{name}: validation-retry reason={event.reason}")
+        return
+    if event.event == "intake-error":
+        click.echo(f"{name}: error reason={event.reason}")
+        return
+    if event.event == "intake-discrepancy":
+        click.echo(f"{name}: discrepancy reason={event.reason}")
+        return
+    if event.event == "intake-quarantined":
+        click.echo(f"{name}: quarantined reason={event.reason}")
+        return
+    if event.event == "intake-already-registered":
+        click.echo(
+            f"{name}: already-registered items={event.item_count} jobs={event.jobs_submitted}"
+        )
+        return
+    if event.event == "intake-registered":
+        click.echo(f"{name}: registered items={event.item_count} jobs={event.jobs_submitted}")
+        return
+    click.echo(f"{name}: {event.event} reason={event.reason}")
+
+
 def _report_dict(row: Any) -> dict[str, Any]:
     return {
         "intake_id": row.intake_id,
@@ -241,6 +378,7 @@ def _report_dict(row: Any) -> dict[str, Any]:
         "manifest_digest": row.manifest_digest,
         "artifactclass": row.artifactclass,
         "details": row.details,
+        "marker_path": str(row.marker.path) if getattr(row, "marker", None) else None,
     }
 
 

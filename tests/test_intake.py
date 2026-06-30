@@ -16,9 +16,12 @@ from sutradhara.catalog.models import IngestItem, Intake, LogicalAsset
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.intake import (
+    IntakeDiscrepancyError,
+    IntakeMarker,
     accept_intake,
     inspect_intake,
     prepare_intake,
+    publish_intake_marker,
     register_intake,
     register_landing_root,
 )
@@ -74,6 +77,24 @@ def test_inspect_creates_no_rows(engine: Engine, tmp_path: Path) -> None:
         assert session.scalar(select(func.count()).select_from(Job)) == 0
 
 
+def test_publish_intake_marker_is_atomic(tmp_path: Path) -> None:
+    marker = IntakeMarker(tmp_path / "intake.verified.json", {"ok": True})
+    observed: list[Path] = []
+
+    class Observer:
+        def before_rename(self, temp_path: Path, final_path: Path) -> None:
+            assert temp_path.exists()
+            assert not final_path.exists()
+            observed.append(temp_path)
+
+    publish_intake_marker(marker, observer=Observer())
+
+    assert observed
+    assert marker.path.is_file()
+    assert json.loads(marker.path.read_text(encoding="utf-8")) == {"ok": True}
+    assert not any(path.exists() for path in observed)
+
+
 def test_register_good_manifest_creates_catalog_and_cloud_only(
     engine: Engine,
     tmp_path: Path,
@@ -93,6 +114,9 @@ def test_register_good_manifest_creates_catalog_and_cloud_only(
     assert outcome.status == IntakeStatus.REGISTERED.value
     assert outcome.item_count == 2
     assert outcome.jobs_submitted == 1
+    assert outcome.marker is not None
+    assert not (landing / "card-001" / "intake.verified.json").exists()
+    publish_intake_marker(outcome.marker)
     assert (landing / "card-001" / "intake.verified.json").exists()
     receipt = json.loads((landing / "card-001" / "intake.verified.json").read_text())
     assert receipt["release_signal"] is True
@@ -176,6 +200,7 @@ def test_register_bad_manifest_quarantines_without_registration(
 
     assert outcome.status == IntakeStatus.QUARANTINED.value
     assert outcome.reason == "bag-invalid"
+    publish_intake_marker(outcome.marker)
     assert (landing / "card-002" / "intake.quarantined.json").exists()
     with session_scope(engine) as session:
         intake = session.get(Intake, "card-002")
@@ -239,6 +264,7 @@ def test_register_legacy_payload_requires_explicit_artifactclass(
 
     assert outcome.status == IntakeStatus.REGISTERED.value
     assert outcome.jobs_submitted == 1
+    publish_intake_marker(outcome.marker)
     receipt = json.loads((landing / "upload-001" / "intake.verified.json").read_text())
     assert receipt["release_signal"] is False
     with session_scope(engine) as session:
@@ -298,9 +324,16 @@ def test_registered_changed_payload_rejects_and_preserves_truth(
         register_intake(session, clip.parents[1])
     clip.write_bytes(b"tampered bytes")
 
-    with pytest.raises(ValueError, match="no longer validates"), session_scope(engine) as session:
+    with (
+        pytest.raises(IntakeDiscrepancyError, match="no longer validates") as raised,
+        session_scope(engine) as session,
+    ):
         register_intake(session, clip.parents[1])
 
+    assert raised.value.marker.payload["status"] == "discrepancy"
+    assert raised.value.reason == "registered-intake-invalid"
+    assert not (clip.parents[1] / "intake.discrepancy.json").exists()
+    publish_intake_marker(raised.value.marker)
     assert (clip.parents[1] / "intake.discrepancy.json").exists()
     with session_scope(engine) as session:
         intake = session.get(Intake, "card-change")
@@ -478,6 +511,8 @@ def test_accept_equals_register_plus_prepare(engine: Engine, tmp_path: Path) -> 
 
     assert outcome.status == IntakeStatus.REGISTERED.value
     assert outcome.jobs_submitted == 1
+    assert outcome.marker is not None
+    assert outcome.marker.payload["requested_profile"] == "hd-review"
     with session_scope(engine) as session:
         intake = session.get(Intake, "card-accept")
         assert intake is not None

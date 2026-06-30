@@ -160,4 +160,6 @@ def release_message(confirmation: ConfirmationSnapshot) -> str:
         return "source release: allowed; server verification marker is present"
     if confirmation.status == "quarantined":
         return "source release: blocked; server quarantined this intake"
+    if confirmation.status == "discrepancy":
+        return "source release: blocked; server reported an intake discrepancy"
     return "source release: blocked; waiting for server verification marker"

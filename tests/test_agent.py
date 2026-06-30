@@ -20,9 +20,11 @@ import pytest
 from sqlalchemy import Engine
 
 from sutra_agent.cli import main as agent_main
+from sutra_agent.ledger import inspect_confirmation_marker
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
-from sutradhara.intake import register_landing_root
+from sutradhara.intake import publish_intake_markers, register_landing_root
+from sutradhara.intake_watch import process_landing_once
 from sutradhara_receive import ReceiveError, read_bag_info, receive_source, validate_bag
 
 
@@ -76,10 +78,16 @@ def test_agent_status_sees_server_verified_marker(
     config, _ledger = _init_config(tmp_path, landing, capsys)
     receive_payload = _agent_receive_json(config, source, capsys)
 
-    with session_scope(engine) as session:
-        outcomes = register_landing_root(session, landing, cache_root=tmp_path / "cache")
+    events = process_landing_once(
+        landing,
+        engine=engine,
+        settle_seconds=0,
+        stable_polls=1,
+        cache_root=tmp_path / "cache",
+        use_lock=False,
+    )
 
-    assert outcomes[0].status == IntakeStatus.REGISTERED.value
+    assert events[0].status == IntakeStatus.REGISTERED.value
     assert (Path(receive_payload["intake_dir"]) / "intake.verified.json").is_file()
 
     exit_code = agent_main(
@@ -116,6 +124,7 @@ def test_agent_status_sees_server_quarantine_marker(
 
     with session_scope(engine) as session:
         outcomes = register_landing_root(session, landing)
+    publish_intake_markers(outcomes)
 
     assert outcomes[0].status == IntakeStatus.QUARANTINED.value
     intake_dir = Path(receive_payload["intake_dir"])
@@ -135,6 +144,28 @@ def test_agent_status_sees_server_quarantine_marker(
     assert exit_code == 0
     assert record["confirmation"]["status"] == "quarantined"
     assert record["confirmation"]["release_ok"] is False
+
+
+def test_agent_marker_reader_blocks_discrepancy_and_bad_verified(tmp_path: Path) -> None:
+    discrepancy = tmp_path / "discrepancy"
+    bad_verified = tmp_path / "bad-verified"
+    for path in (discrepancy, bad_verified):
+        path.mkdir()
+    (discrepancy / "intake.verified.json").write_text('{"stale": true}', encoding="utf-8")
+    (discrepancy / "intake.discrepancy.json").write_text(
+        '{"status": "registered"}',
+        encoding="utf-8",
+    )
+    (bad_verified / "intake.verified.json").write_text("[not-an-object]", encoding="utf-8")
+
+    discrepancy_snapshot = inspect_confirmation_marker(discrepancy)
+    assert discrepancy_snapshot.status == "discrepancy"
+    assert discrepancy_snapshot.release_ok is False
+    assert discrepancy_snapshot.detail == {"status": "registered"}
+    bad_verified_snapshot = inspect_confirmation_marker(bad_verified)
+    assert bad_verified_snapshot.status == "pending"
+    assert bad_verified_snapshot.release_ok is False
+    assert bad_verified_snapshot.marker_path == bad_verified / "intake.verified.json"
 
 
 def test_agent_status_for_specific_missing_ledger_is_error(

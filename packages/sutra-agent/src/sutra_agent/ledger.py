@@ -20,10 +20,12 @@ LEDGER_SCHEMA = "sutra-agent-ledger-v1"
 CONFIRMATION_PENDING = "pending"
 CONFIRMATION_VERIFIED = "verified"
 CONFIRMATION_QUARANTINED = "quarantined"
+CONFIRMATION_DISCREPANCY = "discrepancy"
 CONFIRMATION_STATUSES = {
     CONFIRMATION_PENDING,
     CONFIRMATION_VERIFIED,
     CONFIRMATION_QUARANTINED,
+    CONFIRMATION_DISCREPANCY,
 }
 
 
@@ -222,6 +224,20 @@ def confirmation_from_wait_result(
 
     if confirmation is None or confirmation.status == "timeout":
         return ConfirmationSnapshot(status=CONFIRMATION_PENDING, release_ok=False)
+    if confirmation.status == CONFIRMATION_DISCREPANCY:
+        return ConfirmationSnapshot(
+            status=CONFIRMATION_DISCREPANCY,
+            release_ok=False,
+            marker_path=confirmation.marker_path,
+            detail=confirmation.detail,
+        )
+    if confirmation.status == CONFIRMATION_QUARANTINED:
+        return ConfirmationSnapshot(
+            status=CONFIRMATION_QUARANTINED,
+            release_ok=False,
+            marker_path=confirmation.marker_path,
+            detail=confirmation.detail,
+        )
     if confirmation.release_ok:
         return ConfirmationSnapshot(
             status=CONFIRMATION_VERIFIED,
@@ -230,7 +246,7 @@ def confirmation_from_wait_result(
             detail=confirmation.detail,
         )
     return ConfirmationSnapshot(
-        status=CONFIRMATION_QUARANTINED,
+        status=CONFIRMATION_PENDING,
         release_ok=False,
         marker_path=confirmation.marker_path,
         detail=confirmation.detail,
@@ -240,6 +256,14 @@ def confirmation_from_wait_result(
 def inspect_confirmation_marker(intake_dir: Path) -> ConfirmationSnapshot:
     """Inspect server marker files for one received intake."""
 
+    discrepancy = intake_dir / "intake.discrepancy.json"
+    if discrepancy.is_file():
+        return ConfirmationSnapshot(
+            status=CONFIRMATION_DISCREPANCY,
+            release_ok=False,
+            marker_path=discrepancy,
+            detail=_read_json_object(discrepancy),
+        )
     quarantined = intake_dir / "intake.quarantined.json"
     if quarantined.is_file():
         return ConfirmationSnapshot(
@@ -250,11 +274,12 @@ def inspect_confirmation_marker(intake_dir: Path) -> ConfirmationSnapshot:
         )
     verified = intake_dir / "intake.verified.json"
     if verified.is_file():
+        detail = _read_json_object(verified)
         return ConfirmationSnapshot(
-            status=CONFIRMATION_VERIFIED,
-            release_ok=True,
+            status=CONFIRMATION_VERIFIED if detail is not None else CONFIRMATION_PENDING,
+            release_ok=detail is not None,
             marker_path=verified,
-            detail=_read_json_object(verified),
+            detail=detail,
         )
     return ConfirmationSnapshot(status=CONFIRMATION_PENDING, release_ok=False)
 

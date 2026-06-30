@@ -12,7 +12,9 @@ import datetime as dt
 import hashlib
 import json
 import os
-from dataclasses import dataclass, field
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +82,35 @@ PayloadRecord = FileReceipt
 
 
 @dataclass(frozen=True)
+class IntakeMarker:
+    """Terminal marker payload to publish after the caller commits catalog state."""
+
+    path: Path
+    payload: dict[str, Any]
+
+
+class IntakeDiscrepancyError(ValueError):
+    """Raised when an already-registered intake no longer matches its catalog truth."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        marker: IntakeMarker,
+        intake_id: str,
+        path: Path,
+        reason: str,
+        details: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.marker = marker
+        self.intake_id = intake_id
+        self.path = path
+        self.reason = reason
+        self.details = details
+
+
+@dataclass(frozen=True)
 class InspectReport:
     """Read-only validation report for a completed intake directory."""
 
@@ -108,6 +139,7 @@ class IntakeRegisterOutcome:
     manifest_digest: str | None = None
     artifactclass: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    marker: IntakeMarker | None = None
 
 
 @dataclass(frozen=True)
@@ -261,7 +293,12 @@ def register_intake(
         )
         intake.manifest_digest = validated.manifest_digest
         session.flush()
-        _write_quarantine_receipt(ctx.root, intake, validated.details, reason=reason)
+        marker = _quarantine_receipt_marker(
+            ctx.root,
+            intake,
+            validated.details,
+            reason=reason,
+        )
         return IntakeRegisterOutcome(
             intake_id=validated.intake_id,
             path=ctx.root,
@@ -271,6 +308,7 @@ def register_intake(
             manifest_digest=validated.manifest_digest,
             artifactclass=resolved_class,
             details=validated.details,
+            marker=marker,
         )
 
     intake = _upsert_intake(
@@ -297,7 +335,7 @@ def register_intake(
         cloud_backend_name=cloud_backend_name,
         cloud_pool_id=cloud_pool_id,
     )
-    _write_verified_receipt(
+    marker = _verified_receipt_marker(
         ctx.root,
         intake,
         item_count=len(validated.records),
@@ -312,6 +350,7 @@ def register_intake(
         manifest_path=ctx.manifest_path,
         manifest_digest=validated.manifest_digest,
         artifactclass=resolved_class,
+        marker=marker,
     )
 
 
@@ -367,32 +406,15 @@ def accept_landing_root(
     final_cache_root = Path(cache_root).resolve() if cache_root else root / ".sutradhara-cache"
     outcomes: list[IntakeRegisterOutcome] = []
     for path in _iter_intake_dirs(root):
-        outcome = register_intake(
+        outcome = accept_intake(
             session,
             path,
             artifactclass=artifactclass,
+            prepare_profile=prepare_profile,
             cache_root=final_cache_root,
             cloud_backend_name=cloud_backend_name,
             cloud_pool_id=cloud_pool_id,
         )
-        if prepare_profile is not None and outcome.status == IntakeStatus.REGISTERED.value:
-            prepared = prepare_intake(
-                session,
-                outcome.intake_id,
-                profile=prepare_profile,
-            )
-            outcome = IntakeRegisterOutcome(
-                intake_id=outcome.intake_id,
-                path=outcome.path,
-                status=outcome.status,
-                item_count=outcome.item_count,
-                jobs_submitted=outcome.jobs_submitted + prepared.jobs_submitted,
-                reason=outcome.reason,
-                manifest_path=outcome.manifest_path,
-                manifest_digest=outcome.manifest_digest,
-                artifactclass=outcome.artifactclass,
-                details=outcome.details,
-            )
         outcomes.append(outcome)
     return outcomes
 
@@ -424,18 +446,17 @@ def accept_intake(
         outcome.intake_id,
         profile=prepare_profile,
     )
-    return IntakeRegisterOutcome(
-        intake_id=outcome.intake_id,
-        path=outcome.path,
-        status=outcome.status,
-        item_count=outcome.item_count,
-        jobs_submitted=outcome.jobs_submitted + prepared.jobs_submitted,
-        reason=outcome.reason,
-        manifest_path=outcome.manifest_path,
-        manifest_digest=outcome.manifest_digest,
-        artifactclass=outcome.artifactclass,
-        details=outcome.details,
-    )
+    jobs_submitted = outcome.jobs_submitted + prepared.jobs_submitted
+    marker = outcome.marker
+    intake = session.get(Intake, outcome.intake_id)
+    if intake is not None and outcome.status == IntakeStatus.REGISTERED.value:
+        marker = _verified_receipt_marker(
+            outcome.path,
+            intake,
+            item_count=outcome.item_count,
+            jobs_submitted=jobs_submitted,
+        )
+    return replace(outcome, jobs_submitted=jobs_submitted, marker=marker)
 
 
 def _handle_registered_intake(
@@ -450,8 +471,9 @@ def _handle_registered_intake(
     cloud_pool_id: str,
 ) -> IntakeRegisterOutcome:
     if not validated.valid:
+        reason = "registered-intake-invalid"
         details = {
-            "reason": "registered-intake-invalid",
+            "reason": reason,
             "validation": validated.details,
             "expected": {
                 "manifest_digest": existing.manifest_digest,
@@ -462,16 +484,24 @@ def _handle_registered_intake(
                 "artifactclass": resolved_class,
             },
         }
-        _write_discrepancy_receipt(ctx.root, existing, details)
-        raise ValueError(f"registered intake {existing.intake_id!r} no longer validates")
+        marker = _discrepancy_receipt_marker(ctx.root, existing, details)
+        raise IntakeDiscrepancyError(
+            f"registered intake {existing.intake_id!r} no longer validates",
+            marker=marker,
+            intake_id=existing.intake_id,
+            path=ctx.root,
+            reason=reason,
+            details=details,
+        )
 
     same_fingerprint = (
         existing.manifest_digest == validated.manifest_digest
         and existing.artifactclass == resolved_class
     )
     if not same_fingerprint:
+        reason = "fingerprint-mismatch"
         details = {
-            "reason": "fingerprint-mismatch",
+            "reason": reason,
             "expected": {
                 "manifest_digest": existing.manifest_digest,
                 "artifactclass": existing.artifactclass,
@@ -481,8 +511,15 @@ def _handle_registered_intake(
                 "artifactclass": resolved_class,
             },
         }
-        _write_discrepancy_receipt(ctx.root, existing, details)
-        raise ValueError(f"registered intake {existing.intake_id!r} fingerprint changed")
+        marker = _discrepancy_receipt_marker(ctx.root, existing, details)
+        raise IntakeDiscrepancyError(
+            f"registered intake {existing.intake_id!r} fingerprint changed",
+            marker=marker,
+            intake_id=existing.intake_id,
+            path=ctx.root,
+            reason=reason,
+            details=details,
+        )
 
     submitted = _enqueue_missing_cloud_job(
         session,
@@ -492,7 +529,7 @@ def _handle_registered_intake(
         cloud_backend_name=cloud_backend_name,
         cloud_pool_id=cloud_pool_id,
     )
-    _write_verified_receipt(
+    marker = _verified_receipt_marker(
         ctx.root,
         existing,
         item_count=len(existing.items),
@@ -508,6 +545,7 @@ def _handle_registered_intake(
         manifest_path=Path(existing.manifest_path) if existing.manifest_path else ctx.manifest_path,
         manifest_digest=existing.manifest_digest,
         artifactclass=existing.artifactclass,
+        marker=marker,
     )
 
 
@@ -869,13 +907,28 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def _write_verified_receipt(
+def publish_intake_marker(marker: IntakeMarker | None, *, observer: Any | None = None) -> None:
+    """Atomically publish a terminal intake marker after the caller commits."""
+
+    if marker is None:
+        return
+    _atomic_write_json(marker.path, marker.payload, observer=observer)
+
+
+def publish_intake_markers(outcomes: list[IntakeRegisterOutcome]) -> None:
+    """Publish terminal markers from registration outcomes after a batch commit."""
+
+    for outcome in outcomes:
+        publish_intake_marker(outcome.marker)
+
+
+def _verified_receipt_marker(
     intake_dir: Path,
     intake: Intake,
     *,
     item_count: int,
     jobs_submitted: int,
-) -> None:
+) -> IntakeMarker:
     payload = {
         "intake_id": intake.intake_id,
         "status": IntakeStatus.REGISTERED.value,
@@ -889,16 +942,16 @@ def _write_verified_receipt(
         "jobs_submitted": jobs_submitted,
         "release_signal": intake.source_kind == IntakeSourceKind.CARD,
     }
-    _write_json(intake_dir / "intake.verified.json", payload)
+    return IntakeMarker(path=intake_dir / "intake.verified.json", payload=payload)
 
 
-def _write_quarantine_receipt(
+def _quarantine_receipt_marker(
     intake_dir: Path,
     intake: Intake,
     mismatch: dict[str, Any],
     *,
     reason: str = "manifest-mismatch",
-) -> None:
+) -> IntakeMarker:
     payload = {
         "intake_id": intake.intake_id,
         "status": IntakeStatus.QUARANTINED.value,
@@ -908,26 +961,56 @@ def _write_quarantine_receipt(
         "reason": reason,
         "details": mismatch,
     }
-    _write_json(intake_dir / "intake.quarantined.json", payload)
+    return IntakeMarker(path=intake_dir / "intake.quarantined.json", payload=payload)
 
 
-def _write_discrepancy_receipt(
+def _discrepancy_receipt_marker(
     intake_dir: Path,
     intake: Intake,
     details: dict[str, Any],
-) -> None:
+) -> IntakeMarker:
     payload = {
         "intake_id": intake.intake_id,
-        "status": IntakeStatus.REGISTERED.value,
+        "status": "discrepancy",
         "registered_at": intake.registered_at.isoformat() if intake.registered_at else None,
         "reason": "registered-intake-discrepancy",
         "details": details,
     }
-    _write_json(intake_dir / "intake.discrepancy.json", payload)
+    return IntakeMarker(path=intake_dir / "intake.discrepancy.json", payload=payload)
 
 
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+def _atomic_write_json(path: Path, payload: dict[str, Any], *, observer: Any | None = None) -> None:
+    text = json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n"
+    data = text.encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _fsync_dir(path.parent)
+    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        with temp_path.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if observer is not None:
+            observer.before_rename(temp_path, path)
+        temp_path.replace(path)
+        _fsync_dir(path.parent)
+    except Exception:
+        with suppress(FileNotFoundError):
+            temp_path.unlink()
+        raise
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _utcnow() -> dt.datetime:
