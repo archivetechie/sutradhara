@@ -7,8 +7,10 @@ streaming receive once the server commands a card by its opaque id.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib
+import os
 import platform
 import plistlib
 import shutil
@@ -23,6 +25,14 @@ CARD_KIND_CARD = "card"
 CARD_KIND_DRIVE = "drive"
 CARD_KIND_OTHER = "other"
 CARD_KINDS = {CARD_KIND_CARD, CARD_KIND_DRIVE, CARD_KIND_OTHER}
+
+DRIVE_UNKNOWN = 0
+DRIVE_NO_ROOT_DIR = 1
+DRIVE_REMOVABLE = 2
+DRIVE_FIXED = 3
+DRIVE_REMOTE = 4
+DRIVE_CDROM = 5
+DRIVE_RAMDISK = 6
 
 
 @dataclass(frozen=True)
@@ -71,8 +81,11 @@ def current_cards() -> list[MountedCard]:
 def current_mounts() -> list[MountInfo]:
     """Enumerate likely removable/media mounts on the current platform."""
 
-    if platform.system() == "Darwin":
+    system = platform.system()
+    if system == "Darwin":
         return _darwin_mounts()
+    if system == "Windows":
+        return _windows_mounts()
     return _posix_mounts()
 
 
@@ -281,6 +294,104 @@ def _darwin_diskutil_info(path: Path) -> dict[str, object]:
     except (plistlib.InvalidFileException, ValueError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _windows_mounts() -> list[MountInfo]:
+    """Enumerate Windows removable drives and non-system fixed volumes."""
+
+    system_drive = _normalize_win_drive_id(os.environ.get("SYSTEMDRIVE") or os.environ.get("SYSTEMROOT"))
+    mounts: list[MountInfo] = []
+    for drive in _win_logical_drive_letters():
+        drive_id = _normalize_win_drive_id(drive)
+        if drive_id is None:
+            continue
+        drive_type = _win_drive_type(drive_id)
+        if drive_type == DRIVE_REMOVABLE:
+            removable = True
+        elif drive_type == DRIVE_FIXED and drive_id != system_drive:
+            removable = False
+        else:
+            continue
+        volume = _win_volume_info(drive_id)
+        if volume is None:
+            continue
+        label, serial = volume
+        mounts.append(
+            MountInfo(
+                mount_path=Path(f"{drive_id}\\"),
+                label=label or drive_id,
+                source=drive_id,
+                volume_uuid=_win_serial_uuid(serial),
+                removable=removable,
+            )
+        )
+    return mounts
+
+
+def _win_logical_drive_letters() -> list[str]:
+    """Return present Windows drive ids such as ``C:`` from ``GetLogicalDrives``."""
+
+    mask = int(_win_kernel32().GetLogicalDrives())
+    return [f"{chr(ord('A') + index)}:" for index in range(26) if mask & (1 << index)]
+
+
+def _win_drive_type(letter: str) -> int:
+    """Return the Win32 drive type for one drive id."""
+
+    return int(_win_kernel32().GetDriveTypeW(_win_root(letter)))
+
+
+def _win_volume_info(letter: str) -> tuple[str, int] | None:
+    """Return ``(label, serial)`` for one Windows volume, or ``None`` when unavailable."""
+
+    volume_name = ctypes.create_unicode_buffer(261)
+    file_system = ctypes.create_unicode_buffer(261)
+    serial = ctypes.c_ulong()
+    max_component = ctypes.c_ulong()
+    flags = ctypes.c_ulong()
+    ok = _win_kernel32().GetVolumeInformationW(
+        _win_root(letter),
+        volume_name,
+        len(volume_name),
+        ctypes.byref(serial),
+        ctypes.byref(max_component),
+        ctypes.byref(flags),
+        file_system,
+        len(file_system),
+    )
+    if not ok:
+        return None
+    return volume_name.value, int(serial.value)
+
+
+def _win_kernel32() -> object:
+    try:
+        return ctypes.windll.kernel32
+    except AttributeError as exc:
+        raise RuntimeError("Windows mount enumeration requires ctypes.windll.kernel32") from exc
+
+
+def _normalize_win_drive_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.strip().replace("/", "\\")
+    if len(text) >= 2 and text[1] == ":":
+        return f"{text[0].upper()}:"
+    if text.startswith("\\") and len(text) >= 4 and text[2] == ":":
+        return f"{text[1].upper()}:"
+    return None
+
+
+def _win_root(letter: str) -> str:
+    drive_id = _normalize_win_drive_id(letter)
+    if drive_id is None:
+        raise ValueError(f"invalid Windows drive id: {letter!r}")
+    return f"{drive_id}\\"
+
+
+def _win_serial_uuid(serial: int) -> str:
+    value = int(serial) & 0xFFFFFFFF
+    return f"{(value >> 16) & 0xFFFF:04X}-{value & 0xFFFF:04X}"
 
 
 def _posix_mounts() -> list[MountInfo]:

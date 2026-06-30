@@ -1,6 +1,6 @@
 # Codex prompt — operator console: **Windows drive enumeration (helper)**
 
-> Status: **pending**. Gap-fill for `prompt-operator-console-sutra-agent.md` (implemented):
+> Status: **implemented 2026-06-30**. Gap-fill for `prompt-operator-console-sutra-agent.md` (implemented):
 > the helper's mount watcher has a macOS (`_darwin_mounts`) and a Linux
 > (`_posix_mounts`, `/proc/mounts`) path but **no Windows path** — on Windows
 > `current_mounts()` falls through to `_posix_mounts()`, finds no `/proc/mounts`, and
