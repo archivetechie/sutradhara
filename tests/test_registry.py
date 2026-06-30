@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from pathlib import Path
+from collections.abc import Callable
 
 import pytest
 
@@ -14,7 +14,7 @@ from sutradhara.grpc.registry import (
     DeviceOffline,
     StreamClosed,
 )
-from sutradhara.grpc.server import sweep_landing_once
+from sutradhara.grpc.server import start_registry_sweep_loop, sweep_registry_once
 from sutradhara.grpc.store import DeviceIdentity
 
 
@@ -128,15 +128,42 @@ def test_ttl_eviction_removes_device_and_fails_commands() -> None:
         )
 
 
-def test_sweep_landing_once_also_evicts_stale_registry_stream(tmp_path: Path) -> None:
+def test_sweep_registry_once_evicts_stale_registry_stream() -> None:
     registry = ConnectedDeviceRegistry()
     registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
 
-    sweep_landing_once(
-        tmp_path / "landing",
+    evicted = sweep_registry_once(
         registry=registry,
         heartbeat_ttl=dt.timedelta(seconds=1),
         now=dt.datetime.now(dt.UTC) + dt.timedelta(seconds=2),
     )
 
+    assert evicted == ["mac-1"]
     assert registry.devices_for("owner") == []
+
+
+def test_registry_sweep_loop_uses_fast_liveness_tick() -> None:
+    registry = ConnectedDeviceRegistry()
+    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+
+    stop, thread = start_registry_sweep_loop(
+        registry,
+        interval_seconds=0.01,
+        heartbeat_ttl=dt.timedelta(seconds=0),
+    )
+    try:
+        _eventually(lambda: registry.devices_for("owner") == [])
+    finally:
+        stop.set()
+        thread.join(timeout=1)
+
+
+def _eventually(predicate: Callable[[], bool]) -> None:
+    import time
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    assert predicate()

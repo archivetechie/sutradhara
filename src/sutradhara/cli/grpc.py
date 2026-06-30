@@ -15,6 +15,7 @@ from sutradhara.grpc.server import (
     DEFAULT_LANDING_ROOT,
     GrpcServerConfig,
     make_server,
+    start_registry_sweep_loop,
     start_sweep_loop,
 )
 from sutradhara.grpc.store import issue_enroll_token as issue_enroll_token_row
@@ -114,7 +115,8 @@ def serve_grpc_cmd(
         )
     )
     server.start()
-    sweep_stop, sweep_thread = start_sweep_loop(landing_root, registry=registry)
+    sweep_stop, sweep_thread = start_sweep_loop(landing_root)
+    registry_stop, registry_thread = start_registry_sweep_loop(registry)
     click.echo(f"serving gRPC intake on {bind}:{port}")
     try:
         server.wait_for_termination()
@@ -122,4 +124,6 @@ def serve_grpc_cmd(
         server.stop(grace=None)
     finally:
         sweep_stop.set()
+        registry_stop.set()
         sweep_thread.join(timeout=5)
+        registry_thread.join(timeout=5)

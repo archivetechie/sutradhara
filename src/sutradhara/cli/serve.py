@@ -28,6 +28,7 @@ from sutradhara.grpc.server import (
     DEFAULT_LANDING_ROOT,
     GrpcServerConfig,
     make_server,
+    start_registry_sweep_loop,
     start_sweep_loop,
 )
 
@@ -95,7 +96,8 @@ def serve_cmd(
     )
     app = create_app(engine, ensure_schema=False, registry=registry, grpc_pki_dir=pki_dir)
     grpc_server.start()
-    sweep_stop, sweep_thread = start_sweep_loop(landing_root, registry=registry)
+    sweep_stop, sweep_thread = start_sweep_loop(landing_root)
+    registry_stop, registry_thread = start_registry_sweep_loop(registry)
     click.echo(f"serving gRPC intake/control on {grpc_bind}:{grpc_port}")
     try:
         if api_tcp:
@@ -115,4 +117,6 @@ def serve_cmd(
     finally:
         grpc_server.stop(grace=5)
         sweep_stop.set()
+        registry_stop.set()
         sweep_thread.join(timeout=5)
+        registry_thread.join(timeout=5)

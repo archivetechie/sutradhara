@@ -46,8 +46,11 @@ operator-identity HTTP surface — **not** the mTLS port):
   `{intakeId, status:"streaming"}` promptly. Holds a **durable HTTP idempotency record**
   `(operator, "POST /api/devices/receive", key)` binding a `request_hash` over
   `(device_id, card_id, artifactclass, label, source_ref)` — same key+body → replay the
-  `intakeId`; same key + different body → 409. **Timeout is advisory** (a late ack still
-  completes correlation+idempotency, generation-gated; never cancels the helper).
+  completed `intakeId`; same key+body while still in progress → `409 already_in_progress`
+  without a second `StartReceive`; same key + different body → 409. **Timeout is advisory**
+  (a late ack still completes correlation+idempotency, generation-gated; never cancels the helper).
+- `POST /api/devices/{device_id}/revoke` → admin-only, Origin-guarded JSON POST; durable
+  revoke + live `registry.evict(device_id)` in the running `sutra serve` process.
 - `GET /api/intake/{intake_id}/status` → thin HTTP reader over the same
   `grpc_intake`-state → watcher-marker logic the gRPC `GetIntakeStatus` uses.
 - `POST /api/enroll/token` (Authentik-gated **and** Origin-guarded) → mints a one-time,
@@ -63,9 +66,10 @@ operator-identity HTTP surface — **not** the mTLS port):
 surface on the laptop**; **identities meet at the server** (`GET/POST` only expose/command
 devices whose `device→operator` mapping equals the Authentik operator); **per-RPC/per-
 command owner check** with **per-command `resolve_device` re-resolve** (rejects revoked);
-**crash-safe `card_id` correlation** via `ActiveReceives`; the helper is **idempotent on
-`idempotency_key`** (same key → re-ack existing intake; different key on a busy card →
-busy); **`AbortIntake` on a terminal background failure** (no stuck `streaming`);
+**crash-safe `card_id` correlation** via `ActiveReceives`; server retries do not send a
+second command while an idempotency key is still in progress; the helper is still
+idempotent on `idempotency_key` as a defense-in-depth sibling contract; **`AbortIntake` on
+a terminal background failure** (no stuck `streaming`);
 `IntakeService`/`StartIntakeRequest` **unchanged** — `card_id` is **relay-correlated** into
 `grpc_intake`.
 
@@ -77,9 +81,9 @@ busy); **`AbortIntake` on a terminal background failure** (no stuck `streaming`)
 **In:** the `DeviceService` proto + servicer + the `ConnectedDeviceRegistry`; the
 `grpc_intake.card_id` migration; the HTTP console + enrollment endpoints; the `ca.py`
 token-scoped signing; the `serve-api`+`serve-grpc` **merge into one `sutra serve`**; the
-`revoke-device` eviction; the dvarapala Caddy exemption (cross-repo, below). **Out:** the
-helper daemon (sibling prompt), the browser (sibling prompt), the `IntakeService` streaming
-(reused unchanged).
+admin revoke live eviction + durable CLI revoke split; the dvarapala Caddy exemption
+(cross-repo, below). **Out:** the helper daemon (sibling prompt), the browser (sibling
+prompt), the `IntakeService` streaming (reused unchanged).
 
 ### Milestones (each ends green: `uv run pytest -q` + commit)
 
@@ -92,9 +96,9 @@ helper daemon (sibling prompt), the browser (sibling prompt), the `IntakeService
 3. **`ConnectedDeviceRegistry`** (`src/sutradhara/grpc/registry.py`): thread-safe; per-stream
    command queue + pending-ack map + **generation/epoch**; **last-writer-wins `register`**
    (replace + close old stream + fail its pending acks); `devices_for(operator)`;
-   heartbeat-TTL eviction; `evict(device)`. Tests per design §9 (`test_registry.py`,
-   `test_serve_lifecycle.py` concurrency: queue delivery, timeout→409, duplicate-stream
-   replacement).
+   heartbeat-TTL eviction via a dedicated fast registry sweep loop; `evict(device)`.
+   Tests per design §9 (`test_registry.py`, `test_serve_lifecycle.py` concurrency: queue
+   delivery, timeout→409, duplicate-stream replacement).
 4. **`DeviceService` servicer** (`src/sutradhara/grpc/device_service.py`): `Connect`;
    identity from the peer cert + **per-command re-resolve**; feed `CardSnapshot` → registry;
    push `StartReceive`; on `CommandAck` **correlate `card_id` into `grpc_intake` + complete
@@ -103,20 +107,22 @@ helper daemon (sibling prompt), the browser (sibling prompt), the `IntakeService
    incl. the crash-safety reconcile + late-ack drop).
 5. **HTTP console endpoints** (on the operator-identity FastAPI app): `GET /api/devices`
    (registry + durable in-flight from `grpc_intake`), `POST /api/devices/{id}/receive`
-   (owner check + early-ack + HTTP idempotency request-hash), `GET /api/intake/{id}/status`.
+   (owner check + early-ack + HTTP idempotency request-hash),
+   `POST /api/devices/{id}/revoke` (admin-only live eviction), `GET /api/intake/{id}/status`.
    Tests per §9 (`test_device_routes.py`, `test_receive_idempotency.py`,
    `test_receive_retry.py`).
 6. **Enrollment** (`src/sutradhara/grpc/ca.py` + routes): `issue_enroll_token`
    (operator-scoped + `device_id`-bound) behind `POST /api/enroll/token`; `sign_device_csr`
    reads the operator **from the token**, requires `CN==token.device_id`; `POST /api/enroll/csr`
    **exempt from the `_json_origin_guard`** (allowlist the path in `src/sutradhara/api/app.py`)
-   + rate-limited + returns `{cert_pem, ca_pem}`. `revoke-device` calls `registry.evict`.
+   + rate-limited + returns `{cert_pem, ca_pem}`. The standalone `serve-grpc --revoke-device`
+   path is durable revoke only; live eviction is through the admin HTTP route.
    Tests per §9 (`test_enroll.py`: csr reachable with no Authentik/no Origin yet rejects
-   bad/used/expired token + CN-mismatch; revoke evicts the live stream).
+   bad/used/expired token + CN-mismatch; admin revoke evicts the live stream).
 7. **Merge `sutra serve`** (`src/sutradhara/cli/main.py`): one process hosts the mTLS gRPC
    port (`IntakeService`+`DeviceService`) **and** the Unix-socket HTTP app, **sharing one
    registry**; the §3.0 startup/graceful-shutdown + lock/queue concurrency contract; the
-   stale-receive sweep thread. Keep both surfaces' auth distinct. Test: lifecycle
+   hourly stale-receive sweep thread plus the fast registry liveness sweep thread. Keep both surfaces' auth distinct. Test: lifecycle
    (`test_serve_lifecycle.py`) start/shutdown; both listeners up; shared registry.
 8. **Cross-repo: dvarapala Caddy** — exempt `POST /api/enroll/csr` from the forward-auth
    wall (an explicit `route` ordering / matcher before `forward_auth`, like the
@@ -128,5 +134,6 @@ helper daemon (sibling prompt), the browser (sibling prompt), the `IntakeService
 `uv run pytest -q` green (output pasted); `sutra serve` runs both surfaces on one shared
 registry; a helper can `Connect` (mTLS), report cards + `ActiveReceives`, and be commanded;
 `GET /api/devices` shows online cards + durable in-flight receives; enrollment signs a
-device-bound, operator-scoped cert over the CA-pinned, doubly-exempt `enroll/csr`; revoke
-evicts a live stream; the dvarapala Caddy exemption is in place + verified. INDEX updated.
+device-bound, operator-scoped cert over the CA-pinned, doubly-exempt `enroll/csr`; the
+admin revoke API evicts a live stream; the dvarapala Caddy exemption is in place +
+verified. INDEX updated.

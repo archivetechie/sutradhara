@@ -23,6 +23,7 @@ from sutradhara_receive import sweep_orphans
 DEFAULT_GRPC_PORT = 50051
 DEFAULT_LANDING_ROOT = Path("/replica/landing")
 DEFAULT_HEARTBEAT_TTL = dt.timedelta(seconds=60)
+DEFAULT_REGISTRY_SWEEP_INTERVAL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -89,16 +90,12 @@ def sweep_landing_once(
     landing_root: Path,
     *,
     older_than: dt.timedelta = dt.timedelta(hours=24),
-    registry: ConnectedDeviceRegistry | None = None,
-    heartbeat_ttl: dt.timedelta = DEFAULT_HEARTBEAT_TTL,
     now: dt.datetime | None = None,
 ) -> None:
-    """Sweep stale gRPC receive filesystem state and dead helper streams."""
+    """Sweep stale gRPC receive filesystem state."""
 
     current = now or dt.datetime.now(dt.UTC)
     sweep_orphans(landing_root, older_than=older_than, now=current)
-    if registry is not None:
-        registry.evict_stale(ttl=heartbeat_ttl, now=current)
     if not landing_root.exists():
         return
     cutoff = current - older_than
@@ -123,8 +120,6 @@ def start_sweep_loop(
     *,
     interval_seconds: float = 3600.0,
     older_than: dt.timedelta = dt.timedelta(hours=24),
-    registry: ConnectedDeviceRegistry | None = None,
-    heartbeat_ttl: dt.timedelta = DEFAULT_HEARTBEAT_TTL,
 ) -> tuple[threading.Event, threading.Thread]:
     """Start a background stale-receive sweep loop for ``serve-grpc``."""
 
@@ -132,13 +127,39 @@ def start_sweep_loop(
 
     def run() -> None:
         while not stop.wait(interval_seconds):
-            sweep_landing_once(
-                landing_root,
-                older_than=older_than,
-                registry=registry,
-                heartbeat_ttl=heartbeat_ttl,
-            )
+            sweep_landing_once(landing_root, older_than=older_than)
 
     thread = threading.Thread(target=run, name="sutra-grpc-sweep", daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def sweep_registry_once(
+    registry: ConnectedDeviceRegistry,
+    *,
+    heartbeat_ttl: dt.timedelta = DEFAULT_HEARTBEAT_TTL,
+    now: dt.datetime | None = None,
+) -> list[str]:
+    """Evict helper streams that missed the heartbeat TTL."""
+
+    current = now or dt.datetime.now(dt.UTC)
+    return registry.evict_stale(ttl=heartbeat_ttl, now=current)
+
+
+def start_registry_sweep_loop(
+    registry: ConnectedDeviceRegistry,
+    *,
+    interval_seconds: float = DEFAULT_REGISTRY_SWEEP_INTERVAL_SECONDS,
+    heartbeat_ttl: dt.timedelta = DEFAULT_HEARTBEAT_TTL,
+) -> tuple[threading.Event, threading.Thread]:
+    """Start a fast liveness sweep loop for connected helper streams."""
+
+    stop = threading.Event()
+
+    def run() -> None:
+        while not stop.wait(interval_seconds):
+            sweep_registry_once(registry, heartbeat_ttl=heartbeat_ttl)
+
+    thread = threading.Thread(target=run, name="sutra-device-registry-sweep", daemon=True)
     thread.start()
     return stop, thread
