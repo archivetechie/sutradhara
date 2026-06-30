@@ -11,6 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import grpc
 import pytest
 
 from sutra_agent._proto import device_pb2, intake_pb2
@@ -189,6 +190,81 @@ def test_control_daemon_aborts_started_receive_on_background_failure(tmp_path: P
     _eventually(lambda: aborted == ["intake-1"])
 
 
+def test_control_daemon_retries_transient_stream_failure_without_abort(tmp_path: Path) -> None:
+    card = _card(tmp_path)
+    calls = 0
+    first_failed = threading.Event()
+    release = threading.Event()
+    aborted: list[str] = []
+    outbox: queue.Queue[device_pb2.DeviceMessage | None] = queue.Queue()
+    config = _streaming_config(tmp_path)
+
+    def fake_stream_source(_source: Path, **kwargs: Any) -> StreamReceiveResult:
+        nonlocal calls
+        calls += 1
+        kwargs["on_started"]("intake-1")
+        if calls == 1:
+            first_failed.set()
+            raise _FakeRpcError(grpc.StatusCode.UNAVAILABLE)
+        release.wait(timeout=2)
+        return _stream_result("intake-1", "key-1")
+
+    daemon = ControlDaemon(
+        config,
+        card_source=lambda: [card],
+        stream_source_fn=fake_stream_source,
+        abort_intake_fn=lambda _config, intake_id: aborted.append(intake_id),
+        receive_retry_initial_seconds=0.01,
+        receive_retry_max_seconds=0.01,
+    )
+    daemon._send_card_snapshot([card], outbox)
+    _drain(outbox)
+
+    daemon.handle_command(_start_command("cmd-1", card.card_id, "key-1"), outbox)
+
+    ack = _next_ack(outbox)
+    assert ack.command_ack.status == device_pb2.COMMAND_ACK_STATUS_ACCEPTED
+    assert first_failed.wait(timeout=2)
+    assert active_receive_records(config.resolved_ledger_path())[0].intake_id == "intake-1"
+    assert aborted == []
+    _eventually(lambda: calls == 2)
+    release.set()
+    _eventually(lambda: active_receive_records(config.resolved_ledger_path()) == [])
+    assert aborted == []
+
+
+def test_control_daemon_logs_abort_failure_and_clears_terminal_receive(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    card = _card(tmp_path)
+    outbox: queue.Queue[device_pb2.DeviceMessage | None] = queue.Queue()
+    config = _streaming_config(tmp_path)
+
+    def fake_stream_source(_source: Path, **kwargs: Any) -> StreamReceiveResult:
+        kwargs["on_started"]("intake-1")
+        raise RuntimeError("card pulled")
+
+    def failing_abort(_config: AgentConfig, _intake_id: str) -> None:
+        raise RuntimeError("server down")
+
+    daemon = ControlDaemon(
+        config,
+        card_source=lambda: [card],
+        stream_source_fn=fake_stream_source,
+        abort_intake_fn=failing_abort,
+    )
+    daemon._send_card_snapshot([card], outbox)
+    _drain(outbox)
+
+    daemon.handle_command(_start_command("cmd-1", card.card_id, "key-1"), outbox)
+
+    ack = _next_ack(outbox)
+    assert ack.command_ack.status == device_pb2.COMMAND_ACK_STATUS_ACCEPTED
+    _eventually(lambda: active_receive_records(config.resolved_ledger_path()) == [])
+    assert "failed to abort intake intake-1" in caplog.text
+
+
 def test_control_daemon_reports_active_receives_from_ledger(tmp_path: Path) -> None:
     config = _streaming_config(tmp_path)
     record_active_receive(
@@ -229,6 +305,38 @@ def test_control_daemon_run_forever_reconnects_after_stream_end(tmp_path: Path) 
     daemon.run_forever(stop=stop)
 
     assert calls == 2
+
+
+def test_control_daemon_run_forever_resets_backoff_after_stable_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daemon = ControlDaemon(
+        _streaming_config(tmp_path),
+        reconnect_initial_seconds=1.0,
+        reconnect_max_seconds=8.0,
+        reconnect_stable_seconds=5.0,
+    )
+    now = 0.0
+    durations = [1.0, 10.0]
+    calls = 0
+    stop = _RecordingStopAfterWaits(limit=2)
+
+    def fake_monotonic() -> float:
+        return now
+
+    def fake_run_once(*, stop: threading.Event) -> None:
+        nonlocal calls, now
+        now += durations[calls]
+        calls += 1
+
+    monkeypatch.setattr("sutra_agent.controld.time.monotonic", fake_monotonic)
+    daemon.run_once = fake_run_once  # type: ignore[method-assign]
+
+    daemon.run_forever(stop=stop)  # type: ignore[arg-type]
+
+    assert calls == 2
+    assert stop.waits == [1.0, 1.0]
 
 
 def test_agent_serve_status_reports_streaming_config(
@@ -409,6 +517,30 @@ def test_enroll_url_rejects_non_https() -> None:
 class _Obj:
     def __init__(self, **kwargs: object) -> None:
         self.__dict__.update(kwargs)
+
+
+class _FakeRpcError(grpc.RpcError):
+    def __init__(self, code: grpc.StatusCode) -> None:
+        super().__init__()
+        self._code = code
+
+    def code(self) -> grpc.StatusCode:
+        return self._code
+
+
+class _RecordingStopAfterWaits:
+    def __init__(self, *, limit: int) -> None:
+        self.limit = limit
+        self.waits: list[float] = []
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def wait(self, timeout: float) -> bool:
+        self.waits.append(timeout)
+        self._set = len(self.waits) >= self.limit
+        return self._set
 
 
 def _streaming_config(tmp_path: Path) -> AgentConfig:

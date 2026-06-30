@@ -8,8 +8,11 @@ early command acknowledgements as soon as ``StartIntake`` returns.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -28,6 +31,15 @@ from sutra_agent.mounts import MountedCard, current_cards, default_mount_watcher
 DEFAULT_HEARTBEAT_SECONDS = 20.0
 DEFAULT_RECONNECT_INITIAL_SECONDS = 1.0
 DEFAULT_RECONNECT_MAX_SECONDS = 30.0
+DEFAULT_RECONNECT_STABLE_SECONDS = 30.0
+DEFAULT_RECEIVE_RETRY_INITIAL_SECONDS = 1.0
+DEFAULT_RECEIVE_RETRY_MAX_SECONDS = 30.0
+TRANSIENT_RECEIVE_CODES = {
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+}
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ControlDaemonError(RuntimeError):
@@ -58,6 +70,9 @@ class ControlDaemon:
         heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
         reconnect_initial_seconds: float = DEFAULT_RECONNECT_INITIAL_SECONDS,
         reconnect_max_seconds: float = DEFAULT_RECONNECT_MAX_SECONDS,
+        reconnect_stable_seconds: float = DEFAULT_RECONNECT_STABLE_SECONDS,
+        receive_retry_initial_seconds: float = DEFAULT_RECEIVE_RETRY_INITIAL_SECONDS,
+        receive_retry_max_seconds: float = DEFAULT_RECEIVE_RETRY_MAX_SECONDS,
     ) -> None:
         if not config.streaming_enabled:
             raise ControlDaemonError("sutra-agent serve requires streaming config")
@@ -70,6 +85,9 @@ class ControlDaemon:
         self.heartbeat_seconds = heartbeat_seconds
         self.reconnect_initial_seconds = reconnect_initial_seconds
         self.reconnect_max_seconds = reconnect_max_seconds
+        self.reconnect_stable_seconds = reconnect_stable_seconds
+        self.receive_retry_initial_seconds = receive_retry_initial_seconds
+        self.receive_retry_max_seconds = receive_retry_max_seconds
         self._lock = threading.Lock()
         self._cards: dict[str, MountedCard] = {}
         self._active_by_key: dict[str, _InFlightReceive] = {}
@@ -100,14 +118,15 @@ class ControlDaemon:
         stop_event = stop or threading.Event()
         backoff = self.reconnect_initial_seconds
         while not stop_event.is_set():
-            try:
+            started_at = time.monotonic()
+            with contextlib.suppress(grpc.RpcError):
                 self.run_once(stop=stop_event)
-                if stop_event.wait(backoff):
-                    return
-                backoff = min(self.reconnect_max_seconds, backoff * 2)
-            except grpc.RpcError:
-                if stop_event.wait(backoff):
-                    return
+            elapsed = time.monotonic() - started_at
+            if elapsed >= self.reconnect_stable_seconds:
+                backoff = self.reconnect_initial_seconds
+            if stop_event.wait(backoff):
+                return
+            if elapsed < self.reconnect_stable_seconds:
                 backoff = min(self.reconnect_max_seconds, backoff * 2)
 
     def run_once(self, *, stop: threading.Event | None = None) -> None:
@@ -220,20 +239,25 @@ class ControlDaemon:
         outbox: queue.Queue[device_pb2.DeviceMessage | None],
     ) -> None:
         acked = False
+        retry_delay = self.receive_retry_initial_seconds
 
         def on_started(intake_id: str) -> None:
             nonlocal acked
+            send_ack = False
             with self._lock:
                 active.intake_id = intake_id
-                active.started.set()
+                if not active.started.is_set():
+                    active.started.set()
+                    send_ack = not acked
             record_active_receive(
                 self.config.resolved_ledger_path(),
                 card_id=active.card_id,
                 idempotency_key=active.idempotency_key,
                 intake_id=intake_id,
             )
-            outbox.put(_ack(command.command_id, accepted=True, intake_id=intake_id))
-            acked = True
+            if send_ack:
+                outbox.put(_ack(command.command_id, accepted=True, intake_id=intake_id))
+                acked = True
             self._send_active_receives(outbox)
 
         receive_config = replace(
@@ -241,32 +265,60 @@ class ControlDaemon:
             source_kind=card.kind,
             artifactclass=command.artifactclass or self.config.artifactclass,
         )
+        while True:
+            try:
+                result = self.stream_source(
+                    card.mount_path,
+                    config=receive_config,
+                    source_ref=command.source_ref or None,
+                    label=command.label or card.label,
+                    idempotency_key=command.idempotency_key,
+                    confirm_timeout=0,
+                    on_started=on_started,
+                )
+                if not active.started.is_set():
+                    on_started(result.intake_id)
+                self._clear_active_receive(active, outbox)
+                return
+            except Exception as exc:
+                if _is_transient_stream_error(exc):
+                    LOGGER.warning(
+                        "transient receive failure for card %s; retrying idempotency key %s",
+                        active.card_id,
+                        active.idempotency_key,
+                        exc_info=True,
+                    )
+                    self._send_active_receives(outbox)
+                    time.sleep(retry_delay)
+                    retry_delay = min(self.receive_retry_max_seconds, retry_delay * 2)
+                    continue
+
+                intake_id = active.intake_id
+                if intake_id:
+                    self._abort_started_receive(receive_config, intake_id)
+                elif not acked:
+                    outbox.put(_ack(command.command_id, accepted=False, reason=str(exc)))
+                self._clear_active_receive(active, outbox)
+                return
+
+    def _abort_started_receive(self, receive_config: AgentConfig, intake_id: str) -> None:
         try:
-            result = self.stream_source(
-                card.mount_path,
-                config=receive_config,
-                source_ref=command.source_ref or None,
-                label=command.label or card.label,
-                idempotency_key=command.idempotency_key,
-                confirm_timeout=0,
-                on_started=on_started,
-            )
-            if not active.started.is_set():
-                on_started(result.intake_id)
-        except Exception as exc:
-            intake_id = active.intake_id
-            if intake_id:
-                self.abort_intake(receive_config, intake_id)
-            elif not acked:
-                outbox.put(_ack(command.command_id, accepted=False, reason=str(exc)))
-        finally:
-            clear_active_receive(
-                self.config.resolved_ledger_path(),
-                idempotency_key=active.idempotency_key,
-            )
-            self._send_active_receives(outbox)
-            with self._lock:
-                self._active_by_key.pop(active.idempotency_key, None)
+            self.abort_intake(receive_config, intake_id)
+        except Exception:
+            LOGGER.warning("failed to abort intake %s after terminal receive failure", intake_id, exc_info=True)
+
+    def _clear_active_receive(
+        self,
+        active: _InFlightReceive,
+        outbox: queue.Queue[device_pb2.DeviceMessage | None],
+    ) -> None:
+        clear_active_receive(
+            self.config.resolved_ledger_path(),
+            idempotency_key=active.idempotency_key,
+        )
+        self._send_active_receives(outbox)
+        with self._lock:
+            self._active_by_key.pop(active.idempotency_key, None)
 
     def _send_card_snapshot(
         self,
@@ -382,3 +434,13 @@ def _outgoing_messages(
         if item is None:
             return
         yield item
+
+
+def _is_transient_stream_error(exc: Exception) -> bool:
+    if not isinstance(exc, grpc.RpcError):
+        return False
+    try:
+        code = exc.code()
+    except Exception:
+        return False
+    return code in TRANSIENT_RECEIVE_CODES
