@@ -12,6 +12,7 @@ import hashlib
 import json
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,7 @@ def stream_source(
     idempotency_key: str | None = None,
     confirm_timeout: float | None = None,
     confirm_interval: float | None = None,
+    on_started: Callable[[str], None] | None = None,
 ) -> StreamReceiveResult:
     """Stream a source tree to the configured gRPC intake server."""
 
@@ -84,6 +86,8 @@ def stream_source(
             )
         )
         intake_id = start.intake_id
+        if on_started is not None:
+            on_started(intake_id)
         local_resume = lookup_stream_resume(ledger_path, key)
         trusted = (
             local_resume is not None
@@ -174,6 +178,21 @@ def get_stream_status(config: AgentConfig, intake_id: str) -> ConfirmationSnapsh
         stub = intake_pb2_grpc.IntakeServiceStub(channel)
         response = stub.GetIntakeStatus(intake_pb2.IntakeStatusRequest(intake_id=intake_id))
     return _confirmation_from_status(response.status, response.errors)
+
+
+def open_channel(config: AgentConfig) -> grpc.Channel:
+    """Open the configured mTLS gRPC channel."""
+
+    return _channel(config)
+
+
+def abort_stream_intake(config: AgentConfig, intake_id: str) -> ConfirmationSnapshot:
+    """Abort an uncommitted streaming intake after helper-side terminal failure."""
+
+    with _channel(config) as channel:
+        stub = intake_pb2_grpc.IntakeServiceStub(channel)
+        response = stub.AbortIntake(intake_pb2.AbortIntakeRequest(intake_id=intake_id))
+    return _confirmation_from_status(response.status, [])
 
 
 def _upload_units(

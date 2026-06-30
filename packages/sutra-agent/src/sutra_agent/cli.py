@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -31,6 +29,8 @@ from sutra_agent.config import (
     resolve_config,
     write_config,
 )
+from sutra_agent.controld import ControlDaemon, ControlDaemonError
+from sutra_agent.enroll_client import EnrollmentError, enroll_device
 from sutra_agent.ledger import AgentLedgerError
 from sutra_agent.receive import (
     AgentReceiveRuntimeError,
@@ -156,11 +156,26 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON.")
     status_parser.set_defaults(handler=_handle_status)
 
-    enroll_parser = subparsers.add_parser("enroll", help="generate a local device key and CSR")
-    enroll_parser.add_argument("--server", default=None, help="Server address for operator notes.")
+    serve_parser = subparsers.add_parser("serve", help="run the outbound control daemon")
+    _add_runtime_config_options(serve_parser, include_receive_defaults=False)
+    serve_parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Check local daemon configuration/status and exit.",
+    )
+    serve_parser.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON.")
+    serve_parser.set_defaults(handler=_handle_serve)
+
+    enroll_parser = subparsers.add_parser("enroll", help="enroll this helper device")
+    enroll_parser.add_argument("--server", required=True, help="HTTPS API base URL or /api/enroll/csr URL.")
     enroll_parser.add_argument("--device-id", required=True, help="Device id used as certificate CN.")
-    enroll_parser.add_argument("--operator", required=True, help="Requested server-assigned operator.")
     enroll_parser.add_argument("--token", required=True, help="One-time enrollment token to submit.")
+    enroll_parser.add_argument(
+        "--ca-cert",
+        type=Path,
+        required=True,
+        help="Pinned server CA certificate used for the enrollment request.",
+    )
     enroll_parser.add_argument("--output-dir", type=Path, default=None, help="Directory for client.key and CSR.")
     enroll_parser.add_argument("--force", action="store_true", help="Overwrite existing key/CSR.")
     enroll_parser.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON.")
@@ -184,7 +199,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (AgentConfigError, AgentReceiveUsageError) as exc:
         print(f"usage error: {exc}", file=sys.stderr)
         return 2
-    except (AgentLedgerError, AgentReceiveRuntimeError, OSError) as exc:
+    except (
+        AgentLedgerError,
+        AgentReceiveRuntimeError,
+        ControlDaemonError,
+        EnrollmentError,
+        OSError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -309,44 +330,41 @@ def _handle_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_serve(args: argparse.Namespace) -> int:
+    config = _resolve_config_from_args(args, include_receive_defaults=False)
+    daemon = ControlDaemon(config)
+    if args.status:
+        payload = daemon.status_payload()
+        if args.as_json:
+            _write_json(payload, sys.stdout)
+        else:
+            print(f"server: {payload['server']}")
+            print(f"device: {payload['device_id']}")
+            print(f"active receives: {len(payload['active_receives'])}")
+        return 0
+    daemon.run_forever()
+    return 0
+
+
 def _handle_enroll(args: argparse.Namespace) -> int:
     output_dir = args.output_dir or default_config_path().parent
-    output_dir.mkdir(parents=True, exist_ok=True)
-    key_path = output_dir / "client.key"
-    csr_path = output_dir / f"{args.device_id}.csr"
-    if not args.force and (key_path.exists() or csr_path.exists()):
-        raise AgentReceiveUsageError("client key/CSR already exists; pass --force to replace")
-    for path in (key_path, csr_path):
-        path.unlink(missing_ok=True)
-    _run_openssl(["genrsa", "-out", str(key_path), "4096"])
-    os.chmod(key_path, 0o600)
-    _run_openssl(
-        [
-            "req",
-            "-new",
-            "-key",
-            str(key_path),
-            "-subj",
-            f"/CN={args.device_id}",
-            "-out",
-            str(csr_path),
-        ]
+    result = enroll_device(
+        server=args.server,
+        token=args.token,
+        device_id=args.device_id,
+        output_dir=output_dir,
+        ca_cert=args.ca_cert,
+        overwrite=args.force,
     )
-    payload = {
-        "device_id": args.device_id,
-        "operator": args.operator,
-        "server": args.server,
-        "token": args.token,
-        "client_key": str(key_path),
-        "csr": str(csr_path),
-    }
+    payload = result.payload()
+    payload["server"] = args.server
     if args.as_json:
         _write_json(payload, sys.stdout)
     else:
-        print(f"device key: {key_path}")
-        print(f"csr: {csr_path}")
-        print(f"operator: {args.operator}")
-        print("submit the CSR, operator, and token to the server admin for signing")
+        print(f"device key: {result.client_key}")
+        print(f"csr: {result.csr}")
+        print(f"client cert: {result.client_cert}")
+        print(f"ca cert: {result.ca_cert}")
     return 0
 
 
@@ -426,20 +444,6 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 def _write_json(payload: dict[str, Any], stream: TextIO) -> None:
     stream.write(json.dumps(payload, indent=2, sort_keys=True))
     stream.write("\n")
-
-
-def _run_openssl(args: list[str]) -> None:
-    try:
-        subprocess.run(
-            ["openssl", *args],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise AgentReceiveRuntimeError("openssl command is required for enroll") from exc
-    except subprocess.CalledProcessError as exc:
-        raise AgentReceiveRuntimeError(exc.stderr.strip() or str(exc)) from exc
 
 
 if __name__ == "__main__":

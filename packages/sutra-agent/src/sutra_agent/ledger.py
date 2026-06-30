@@ -65,6 +65,28 @@ class StreamResumeRecord:
 
 
 @dataclass(frozen=True)
+class ActiveReceiveRecord:
+    """Locally durable in-flight receive advertised through DeviceService.Connect."""
+
+    card_id: str
+    idempotency_key: str
+    intake_id: str
+    state: str
+    updated_at: str
+
+    def payload(self) -> dict[str, str]:
+        """Return the JSON representation stored in the ledger."""
+
+        return {
+            "card_id": self.card_id,
+            "idempotency_key": self.idempotency_key,
+            "intake_id": self.intake_id,
+            "state": self.state,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass(frozen=True)
 class ReceiveRunRecord:
     """One receive attempt tracked by the edge agent."""
 
@@ -208,6 +230,64 @@ def record_stream_resume(
         "package_indexes": merged_packages,
     }
     payload["streaming_intakes"] = streaming
+    _write_payload(path, payload)
+
+
+def active_receive_records(path: Path) -> list[ActiveReceiveRecord]:
+    """Return active streaming receives that should be reported on Connect."""
+
+    payload = load_ledger(path)
+    raw_items = payload.get("active_receives", [])
+    if not isinstance(raw_items, list):
+        raise AgentLedgerError("agent ledger field 'active_receives' must be a list")
+    return [_active_receive_from_payload(item) for item in raw_items]
+
+
+def record_active_receive(
+    path: Path,
+    *,
+    card_id: str,
+    idempotency_key: str,
+    intake_id: str,
+    state: str = "streaming",
+) -> None:
+    """Insert or replace one active receive record."""
+
+    if not card_id or not idempotency_key or not intake_id:
+        raise AgentLedgerError("active receive requires card_id, idempotency_key, and intake_id")
+    payload = load_ledger(path)
+    raw_items = payload.get("active_receives", [])
+    existing = raw_items if isinstance(raw_items, list) else []
+    next_items = [
+        item
+        for item in existing
+        if isinstance(item, dict) and item.get("idempotency_key") != idempotency_key
+    ]
+    next_items.append(
+        ActiveReceiveRecord(
+            card_id=card_id,
+            idempotency_key=idempotency_key,
+            intake_id=intake_id,
+            state=state,
+            updated_at=now_iso(),
+        ).payload()
+    )
+    payload["active_receives"] = next_items
+    _write_payload(path, payload)
+
+
+def clear_active_receive(path: Path, *, idempotency_key: str) -> None:
+    """Remove one active receive record after it reaches a terminal state."""
+
+    payload = load_ledger(path)
+    raw_items = payload.get("active_receives", [])
+    if not isinstance(raw_items, list):
+        return
+    payload["active_receives"] = [
+        item
+        for item in raw_items
+        if not isinstance(item, dict) or item.get("idempotency_key") != idempotency_key
+    ]
     _write_payload(path, payload)
 
 
@@ -358,6 +438,8 @@ def _write_ledger(path: Path, records: list[ReceiveRunRecord]) -> None:
     }
     if isinstance(existing.get("streaming_intakes"), dict):
         payload["streaming_intakes"] = existing["streaming_intakes"]
+    if isinstance(existing.get("active_receives"), list):
+        payload["active_receives"] = existing["active_receives"]
     _write_payload(path, payload)
 
 
@@ -398,6 +480,18 @@ def _record_from_payload(payload: Any) -> ReceiveRunRecord:
         updated_at=_required_string(payload, "updated_at"),
         resume_of=_optional_string(payload, "resume_of"),
         confirmation=_confirmation_from_payload(confirmation_payload),
+    )
+
+
+def _active_receive_from_payload(payload: Any) -> ActiveReceiveRecord:
+    if not isinstance(payload, dict):
+        raise AgentLedgerError("active receive entries must be JSON objects")
+    return ActiveReceiveRecord(
+        card_id=_required_string(payload, "card_id"),
+        idempotency_key=_required_string(payload, "idempotency_key"),
+        intake_id=_required_string(payload, "intake_id"),
+        state=_required_string(payload, "state"),
+        updated_at=_required_string(payload, "updated_at"),
     )
 
 

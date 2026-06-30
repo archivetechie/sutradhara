@@ -1,6 +1,6 @@
 # Codex prompt — operator console: **sutra-agent helper daemon**
 
-> Status: **pending**. Design: `docs/design-operator-console-relay.md` (the authority).
+> Status: **implemented 2026-06-30**. Design: `docs/design-operator-console-relay.md` (the authority).
 > Sibling prompts (identical **Shared contract**): `docs/prompt-operator-console-sutradhara.md`
 > (the server relay — **the dependency root; build it first**),
 > `~/system-ui/docs/prompt-operator-console-system-ui.md` (the browser). Same repo as the
