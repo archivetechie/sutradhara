@@ -1,7 +1,7 @@
 # Design — streaming card/drive intake over gRPC + mTLS (`sutra-agent`)
 
-> Status: **current** (brainstorm 2026-06-30, Claude + the owner; **four codex document
-> review rounds folded — 25 findings**, trail in §16). **Prerequisite:**
+> Status: **current** (brainstorm 2026-06-30, Claude + the owner; **five codex document
+> review rounds folded — 30 findings**, trail in §16). **Prerequisite:**
 > `sutra intake watch` (`design-intake-watch.md`) must be built first. Companion to
 > `design-receive-front-door.md`
 > (the BagIt core + payload planner this design reuses) and
@@ -124,7 +124,9 @@ service IntakeService {
   // Report status from the watcher's terminal markers, falling back to gRPC state.
   rpc GetIntakeStatus (IntakeStatusRequest) returns (IntakeStatusResponse);
 
-  // Unrecoverable give-up: drop the partial intake dir + abandon the idempotency record.
+  // Unrecoverable give-up, allowed ONLY before committed (before intake.json exists):
+  // drops the partial intake dir + frees the StartIntake idempotency key. After commit
+  // the bag belongs to `sutra intake watch` — Abort then returns FAILED_PRECONDITION.
   rpc AbortIntake (AbortIntakeRequest) returns (AbortIntakeResponse);
 }
 
@@ -167,7 +169,11 @@ message FileChunk {
   bytes  data      = 3;         // raw bytes; 4 MB default chunk size
   int64  offset    = 4;         // byte offset within file (reserved for v2 mid-file resume)
   bool   is_last   = 5;         // true on the final chunk for this relpath
-  int64  file_size = 6;         // total file size in bytes (first chunk only; 0 otherwise)
+  // Optional progress HINT only — never load-bearing (the server streams until is_last
+  // regardless). First chunk only; 0 = unknown. A regular file sends its stat size; a
+  // PACKAGE sends 0 (the deterministic tar size isn't known until it is produced) unless
+  // the client cheaply precomputes the pax tar size. Do NOT require it for packages.
+  int64  file_size = 6;
 }
 
 message FileReceipt {
@@ -212,7 +218,11 @@ message ManifestEntry {
 // Receive-determined facts (NOT bound at StartIntake — known only after planning the
 // source). Folded into bag-info.txt alongside the server-stored StartIntake intent.
 message ReceiveFacts {
-  string canonicalization_version = 1;  // CANONICALIZATION_VERSION the client planner used
+  // CANONICALIZATION_VERSION the client planner used. The server REJECTS a value that
+  // differs from its own constant BEFORE writing the bag (skew guard) — the receive
+  // core validates this field, so a stale value would otherwise quarantine the bag at
+  // the watcher. Same discipline as package_profile_version.
+  string canonicalization_version = 1;
   int64  skipped_count            = 2;  // symlinks / special files intentionally skipped
   // The planner's package-profile version the client used. The SERVER writes the
   // Package-Profile-Version / -Hash constants into bag-info.txt UNCONDITIONALLY (as
@@ -238,15 +248,25 @@ message PackageIndex {
 // Field names + values mirror the receive core's member record EXACTLY
 // (core.py `_PackageTarResult` members): keys member / type / length / sha256 /
 // data_offset, plus linkname for symlinks. type ∈ {"file","directory","symlink"}.
-// For non-"file": length=0, sha256 absent/None, data_offset absent/None.
+// `optional` gives proto3 explicit presence so absent ≠ default ("" / 0) — but the
+// server does NOT depend on wire presence; it derives the JSON deterministically BY
+// TYPE (see the mapping rule below the message), so a non-file member always lands as
+// JSON null regardless of what the client sends.
 message PackageMemberEntry {
-  string member      = 1;  // POSIX path inside the package tar (core key: "member")
-  string type        = 2;  // "file" | "directory" | "symlink"  (core's type_name)
-  int64  length      = 3;  // 0 for non-file
-  string sha256      = 4;  // member content sha256 ("file" only; omit for others)
-  int64  data_offset = 5;  // byte offset within the tar ("file" only; omit for others)
-  string linkname    = 6;  // symlink target ("symlink" only)
+  string          member      = 1;  // POSIX path inside the package tar (core key: "member")
+  string          type        = 2;  // "file" | "directory" | "symlink"  (core's type_name)
+  int64           length      = 3;  // file: byte length; non-file: 0
+  optional string sha256      = 4;  // file: hex; non-file: → JSON null
+  optional int64  data_offset = 5;  // file: tar byte offset; non-file: → JSON null
+  optional string linkname    = 6;  // symlink: target; else → JSON absent
 }
+// Proto → package-index.json member mapping (authoritative — the server applies this,
+// it does NOT trust proto presence to decide nullness):
+//   type=="file":   {member, type, length, sha256:<hex>, data_offset:<int>}
+//   type!="file":   {member, type, length:0, sha256:null, data_offset:null}
+//   type=="symlink": additionally  linkname:<target>
+// This reproduces core.py's records byte-for-byte (sha256/data_offset None for
+// non-file; linkname only on symlinks).
 
 message CommitIntakeResponse {
   string          intake_id = 1;
@@ -387,15 +407,25 @@ or guesses an `intake_id` could upload into, commit, read, or abort someone else
 intake. The `intake_id`'s embedded UUID makes guessing hard, but the check is the
 actual control — unguessability is not relied upon.
 
-**Per-intake state machine (gates concurrency).** Each intake carries an explicit
-state in `.receiving.json`: `streaming → committing → committed`. `UploadFile` is
-accepted only in `streaming`; `CommitIntake` atomically flips `streaming → committing`
-(compare-and-set under a per-intake lock) and is **rejected if any `UploadFile` for
-that intake is still in flight** (the server tracks an in-flight counter per intake
-under the same lock) — so the bag is never sealed mid-write. The `verifying →
-verified | quarantined | discrepancy` states are **not gRPC-owned** — they belong to
-`sutra intake watch` (the single registrar, below); `GetIntakeStatus` reports them by
-reading the landing markers the watcher writes.
+**Durable intake-state store (survives commit — NOT just `.receiving.json`).** The
+authoritative owner + state + committed digest live in a small durable table,
+`grpc_intake` (SQLite, same catalog engine): `intake_id PK, operator, device_id,
+state, manifest_digest NULL, created_at, updated_at`. This is **separate from**
+`.receiving.json`, which is only the filesystem lifecycle hint the watcher/sweep read
+and which is **removed at commit**. Owner checks, the `manifest_digest` retry check,
+`GetIntakeStatus`, and the Abort state-gate all read this table, so they keep working
+**after** `.receiving.json` is gone. (`.receiving.json` mirrors `state` for the
+watcher; the table is the source of truth.)
+
+**Per-intake state machine (gates concurrency).** `grpc_intake.state` runs
+`streaming → committing → committed` (and `aborted`). `UploadFile` is accepted only in
+`streaming`; `CommitIntake` atomically flips `streaming → committing` (compare-and-set
+on the row under a per-intake lock) and is **rejected if any `UploadFile` for that
+intake is still in flight** (the server tracks an in-flight counter per intake under
+the same lock) — so the bag is never sealed mid-write. The `verifying → verified |
+quarantined | discrepancy` states are **not gRPC-owned** — they belong to `sutra intake
+watch` (the single registrar, below); `GetIntakeStatus` reports them by reading the
+landing markers the watcher writes, falling back to `grpc_intake.state`.
 
 **The gRPC server does NOT verify or register — it hands off to `sutra intake watch`.**
 A `CommitIntake` produces **exactly** what a local `sutra receive` produces: a
@@ -418,11 +448,11 @@ returns the **existing** `intake_id`. Same key + a **different** request (change
 artifactclass / source_ref / **a different card → different plan digest**) ⇒
 `FAILED_PRECONDITION` conflict — never silently attaches to the old intake. **The five
 intent fields are stored server-side here** and are the authority for `bag-info.txt`
-(the client does not restate them at Commit). The intake's **owner `(operator,
-device_id)` is also stored here** — every later RPC checks it (owner check, above). A
-first call mints the intake id (`YYYYMMDD-<operator-slug>-<UUID>`) and creates
-`/replica/landing/{intake_id}/` with a `.receiving.json` marker in state `streaming`.
-Returns `intake_id`.
+(the client does not restate them at Commit). A first call mints the intake id
+(`YYYYMMDD-<operator-slug>-<UUID>`), **inserts the `grpc_intake` row** (`operator`,
+`device_id` from the cert, `state="streaming"`, `manifest_digest=NULL`) — the durable
+owner+state every later RPC checks — and creates `/replica/landing/{intake_id}/` with a
+`.receiving.json` marker mirroring `state`. Returns `intake_id`.
 
 **`UploadFile`:** owner-checked; accepted only while the intake is `streaming` (else
 `FAILED_PRECONDITION`); increments the in-flight counter under the per-intake lock.
@@ -470,34 +500,43 @@ file (cross-checks the per-file transit integrity).
   relpaths, so the client can re-`UploadFile` the bad/missing units and re-`CommitIntake`
   (uploads are accepted again in `streaming`). Without this rollback a failed commit
   would strand the intake in `committing` with uploads rejected and no repair path.
-- **On success**, the server builds `bag-info.txt` **from the server-stored StartIntake
-  intent + the Commit `receive_facts`** (operator from the device→operator mapping).
-  It **always** writes the `Package-Profile-Version` / `Package-Profile-Hash` **constants**
-  from its own receive core (never `""`, never absent) — matching
-  `core.bag_info_metadata`; `receive_facts.package_profile_version`, if non-empty, is
-  rejected unless it equals the server constant (version-skew guard). When packages
-  were wrapped, it writes the **single** `package-index.json` tag file from the
-  `package_indexes` (top-level `profile`/`profile_hash` = the constants; one `packages[]`
-  entry per `PackageIndex`), exactly the schema `core.read_package_index` validates.
-  Then `bagit.txt`, `manifest-sha256.txt`, `tagmanifest-sha256.txt`, and `intake.json`
-  (sentinel, written last); **removes `.receiving.json`** and sets state `committed`.
-  Returns `status: "verifying"` (the watcher hasn't processed yet).
-- An explicit **`AbortIntake`** path (owner-checked) handles an unrecoverable
-  give-up: drop the partial intake dir (including `.incoming/`). It must also free the
-  StartIntake idempotency record so the **same `idempotency_key` can start a clean
-  intake** — but the existing `store.abandon_idempotency` only deletes `in_progress`
-  rows, and a minted intake's record is `completed`. So Abort needs a small new store
-  helper (`release_idempotency`: delete a `completed` row for an aborted intake by
-  `(operator, "grpc:StartIntake", key)`); without it the key would forever replay the
-  dead `intake_id`. After release, a re-`StartIntake` with the same key re-mints.
+- **On success**, the server first **rejects skew** — `receive_facts.canonicalization_version`
+  and (if non-empty) `package_profile_version` must equal the server's own
+  `CANONICALIZATION_VERSION` / `PACKAGE_PROFILE_VERSION` constants, else
+  `FAILED_PRECONDITION` **before writing the bag** (the receive core validates both
+  fields, so a stale value would otherwise quarantine the bag at the watcher). Then it
+  builds `bag-info.txt` **from the server-stored StartIntake intent + the Commit
+  `receive_facts`** (operator from the device→operator mapping), **always** writing the
+  `Package-Profile-Version` / `Package-Profile-Hash` and `Canonicalization-Version`
+  **constants** from its own receive core (never `""`, never absent) — matching
+  `core.bag_info_metadata`. When packages were wrapped, it writes the **single**
+  `package-index.json` tag file from the `package_indexes` (top-level
+  `profile`/`profile_hash` = the constants; one `packages[]` entry per `PackageIndex`,
+  members mapped per the proto→JSON rule in §5), exactly the schema
+  `core.read_package_index` validates. Then `bagit.txt`, `manifest-sha256.txt`,
+  `tagmanifest-sha256.txt`, and `intake.json` (sentinel, written last); **sets
+  `grpc_intake.state="committed"` + stores `manifest_digest`**, then **removes
+  `.receiving.json`**. Returns `status: "verifying"` (the watcher hasn't processed yet).
+- An explicit **`AbortIntake`** path (owner-checked) handles an unrecoverable give-up.
+  It is **state-gated: allowed only while `grpc_intake.state ∈ {streaming, committing}`**
+  (i.e. before `intake.json` exists); once `committed` the bag has been handed off and
+  Abort returns `FAILED_PRECONDITION` — deleting a committed bag would race or break
+  `sutra intake watch`. When allowed: drop the partial intake dir (including
+  `.incoming/`), set `state="aborted"`, and free the StartIntake idempotency record so
+  the **same `idempotency_key` can start a clean intake**. The existing
+  `store.abandon_idempotency` only deletes `in_progress` rows and a minted intake's
+  record is `completed`, so Abort calls a small new helper (`release_idempotency`:
+  delete the `completed` row by `(operator, "grpc:StartIntake", key)`); without it the
+  key would forever replay the dead `intake_id`. After release, a re-`StartIntake` with
+  the same key re-mints.
 
 **`GetIntakeStatus`:** owner-checked; reports the landing markers written by
 `sutra intake watch`: `intake.verified.json` → `verified`,
 `intake.quarantined.json` → `quarantined`,
-`intake.discrepancy.json` → `discrepancy`. Before any terminal marker, it falls back
-to the gRPC state: `.receiving.json` present → `streaming`/`committing`; `intake.json`
-present with `.receiving.json` removed and no terminal marker → `verifying` (handed off,
-watcher pending). Returns status + error list on quarantine/discrepancy.
+`intake.discrepancy.json` → `discrepancy`. Before any terminal marker, it reads
+`grpc_intake.state`: `streaming`/`committing` → as-is; `committed` (bag handed off, no
+terminal marker yet) → `verifying`. The durable row means status survives the removal
+of `.receiving.json`. Returns status + error list on quarantine/discrepancy.
 
 ### Verification & registration — owned by `sutra intake watch`, not the gRPC server
 
@@ -694,7 +733,9 @@ def _upload_one(stub, intake_id, unit):
             yield FileChunk(
                 intake_id=intake_id, relpath=unit.relpath, data=data,
                 offset=counter["total"] - len(data), is_last=False,
-                file_size=unit.size if first else 0,
+                # Hint only. A regular file knows its size; a PACKAGE's tar size isn't
+                # known until produced → 0 (unknown). unit.hint_size is 0 for packages.
+                file_size=unit.hint_size if first else 0,
             )
             first = False
         yield FileChunk(intake_id=intake_id, relpath=unit.relpath,
@@ -833,8 +874,9 @@ the sweep as a periodic background task.
 | `packages/sutra-agent/proto/intake.proto` | gRPC service definition |
 | `packages/sutra-agent/proto/intake_pb2*.py` | Generated stubs (committed) |
 | `src/sutradhara/grpc/server.py` | gRPC server + mTLS setup |
-| `src/sutradhara/grpc/servicer.py` | Six RPCs (incl. `AbortIntake`); **per-RPC owner check (cert → stored `(operator, device_id)`)**; per-intake `streaming→committing→committed` state machine + in-flight counter + ledger lock + commit rollback; `.incoming/` staging (temps outside `data/`); `.receiving.json` + `receive-receipts.jsonl` lifecycle; **hands off to `sutra intake watch` — no gRPC verify/register** |
-| `src/sutradhara/grpc/assembly.py` | BagIt assembly from streamed chunks (reuses `sutradhara_receive` writers); builds `bag-info.txt` from server-stored intent + `receive_facts` + always-written profile constants; writes the **single `package-index.json`** the receive core validates |
+| `src/sutradhara/grpc/servicer.py` | Six RPCs (incl. state-gated `AbortIntake`); **per-RPC owner check (cert → durable `(operator, device_id)`)**; `grpc_intake`-backed `streaming→committing→committed`/`aborted` state machine + in-flight counter + ledger lock + commit rollback; `.incoming/` staging (temps outside `data/`); canonicalization/profile skew guards; `.receiving.json` + `receive-receipts.jsonl` lifecycle; **hands off to `sutra intake watch` — no gRPC verify/register** |
+| `src/sutradhara/grpc/store.py` | **New durable `grpc_intake` table** (`intake_id PK, operator, device_id, state, manifest_digest NULL, created_at, updated_at`) — the authoritative owner/state/committed-digest that survives `.receiving.json` removal; + alembic revision |
+| `src/sutradhara/grpc/assembly.py` | BagIt assembly from streamed chunks (reuses `sutradhara_receive` writers); skew-checks then builds `bag-info.txt` from server-stored intent + `receive_facts` + always-written canonicalization/profile constants; writes the **single `package-index.json`** the receive core validates (member JSON mapped by type per §5) |
 | `src/sutradhara/grpc/ca.py` | CA / cert issuance / device→operator mapping / device revocation |
 | `packages/sutra-agent/src/sutra_agent/grpc_client.py` | Streaming upload client (threaded sync, reuses shared payload planner + stat guard; warm/cold resume) |
 
@@ -843,7 +885,7 @@ the sweep as a periodic background task.
 | Path | Change |
 |---|---|
 | `src/sutradhara/cli/main.py` | Add `sutra serve-grpc` command |
-| `src/sutradhara/api/store.py` | Reuse `begin_idempotency` for `grpc:StartIntake` only (method scope + plan digest in the hashed body); **add `release_idempotency`** to delete a *completed* StartIntake row on `AbortIntake` (existing `abandon_idempotency` is `in_progress`-only). Commit idempotency is NOT in this store (intake-state + `manifest_digest`, dynamic status). No new table. |
+| `src/sutradhara/api/store.py` | Reuse `begin_idempotency` for `grpc:StartIntake` only (method scope + plan digest in the hashed body); **add `release_idempotency`** to delete a *completed* StartIntake row on `AbortIntake` (existing `abandon_idempotency` is `in_progress`-only). Commit idempotency is NOT here — it lives in `grpc_intake.manifest_digest` + dynamic status. |
 | `packages/sutra-agent/src/sutra_agent/config.py` | Add `server_address`, cert fields, `device_id`; `landing` optional (no `operator` in streaming mode) |
 | `packages/sutra-agent/src/sutra_agent/receive.py` | Route to `grpc_client` when `server_address` set |
 | `packages/sutra-agent/src/sutra_agent/ledger.py` | Record `idempotency_key → {intake_id, plan_digest}` for the warm-resume trust gate (§11) |
@@ -897,23 +939,30 @@ Neither dependency leaks into `sutradhara-receive` (the lightweight edge package
   in `.incoming/`, never under `data/`** (a leftover `.incoming/*.tmp` after a simulated
   crash does not appear in the committed `data/` nor fail `inspect_intake`) + rejected
   when intake not `streaming`; `CommitIntake` sha256 cross-check fail + **rejected
-  while an upload is in flight** + **idempotent via stored `manifest_digest`** (same
+  while an upload is in flight** + **idempotent via `grpc_intake.manifest_digest`** (same
   digest → live status, different digest → conflict) + **recoverable failure rolls back
-  to `streaming`** and returns `reupload_relpaths` (re-upload + re-commit repairs it);
-  `AbortIntake` drops the dir + **`release_idempotency` frees the completed key** so a
-  re-`StartIntake` with the same key re-mints (not a dead replay);
+  to `streaming`** and returns `reupload_relpaths` (re-upload + re-commit repairs it) +
+  **rejects a `canonicalization_version` / `package_profile_version` skew before writing
+  the bag**; `AbortIntake` is **state-gated** — allowed in `streaming`/`committing`
+  (drops the dir + `release_idempotency` frees the completed key so a re-`StartIntake`
+  re-mints), **`FAILED_PRECONDITION` once `committed`** (won't delete a handed-off bag);
   `ListIntakeFiles` reads the durable ledger and lists only receipt-logged files;
-  `GetIntakeStatus` reports watcher markers (incl. `discrepancy`) over gRPC state.
+  `GetIntakeStatus` survives `.receiving.json` removal (reads `grpc_intake`), reporting
+  watcher markers (incl. `discrepancy`) over `committed`→`verifying`.
+- `test_grpc_store.py`: the `grpc_intake` row carries owner/state/`manifest_digest`;
+  **after commit (`.receiving.json` gone) owner check + status + manifest-digest retry
+  still resolve** from the row; an `aborted` row blocks reuse until `release_idempotency`.
 - `test_assembly.py`: streamed chunks produce a valid BagIt bag (`bagit.validate()`);
   `operator`/`artifactclass`/`source_*`/`label` in `bag-info.txt` come from the
   **server-stored StartIntake intent**, never the Commit payload (client can't restate
   them); a `.fcpbundle` payload unit lands as **one** `package-tar-v1` entry, the server
   writes the **single `package-index.json`** that **`core.read_package_index` accepts**
   (profile/profile_hash constants + `packages[]` with logical/stored/sha256/members),
-  the **member records use the core's exact keys** (`member`/`type`∈`file|directory|
-  symlink`/`length`/`sha256`/`data_offset`/`linkname`), and a ranged extract of one
-  internal member verifies against its sha256; `Package-Profile-Version`/`-Hash` are
-  the **constants** in `bag-info.txt` even for a **non-package** intake (never `""`,
+  the **member records match the core by type** — a **non-file member serializes
+  `sha256:null`/`data_offset:null`** (not `""`/`0`) and a symlink carries `linkname`,
+  per the §5 proto→JSON rule — and a ranged extract of one internal member verifies
+  against its sha256; `Package-Profile-Version`/`-Hash` **and `Canonicalization-Version`**
+  are the **constants** in `bag-info.txt` even for a **non-package** intake (never `""`,
   which the core rejects); sentinel written last; the bag passes `inspect_intake` so
   `sutra intake watch` accepts it (no double-verify).
 - `test_grpc_client.py`: happy path with a local test server; **warm resume** (local
@@ -962,6 +1011,11 @@ receive` against a fake-source directory, and asserts the watcher writes
 | 22 | **Per-RPC owner check** (codex r4) | Every RPC resolves the peer cert → `(operator, device_id)` and requires a match against the intake's stored owner (`PERMISSION_DENIED` otherwise). A valid device cert is not authority over an arbitrary `intake_id`. |
 | 23 | **Temp-file location** (codex r4) | Temps live in `{intake}/.incoming/` **outside `data/`** (UUID-named), atomically renamed into `data/`. A crash can't leave a `*.tmp` under `data/` that the receive validator would hash as extra payload and quarantine the bag. Swept at commit/resume/sweep. |
 | 24 | **Abort frees the idempotency key** (codex r4) | `abandon_idempotency` is `in_progress`-only; a minted intake's record is `completed`. Abort uses a new `release_idempotency` to delete the completed StartIntake row so the same key can re-mint. |
+| 25 | **Where does committed owner/state/digest live?** (codex r5) | A durable **`grpc_intake` table** (`intake_id, operator, device_id, state, manifest_digest, timestamps`), NOT `.receiving.json` (which commit removes). Owner checks, the manifest-digest retry, `GetIntakeStatus`, and the Abort gate all read it, so they survive `.receiving.json` removal. |
+| 26 | **Abort after commit** (codex r5) | `AbortIntake` is **state-gated to `streaming`/`committing`**; once `committed` it returns `FAILED_PRECONDITION` — the bag belongs to `sutra intake watch` and deleting it would race the registrar. |
+| 27 | **Canonicalization skew** (codex r5) | Server rejects `receive_facts.canonicalization_version ≠` its `CANONICALIZATION_VERSION` constant **before writing the bag** (same guard as the package profile); the core validates this field, so a stale value would otherwise quarantine. |
+| 28 | **Nullable package member fields** (codex r5) | proto3 scalars can't express null, so `sha256`/`data_offset`/`linkname` are `optional` AND the server derives the JSON **by `type`**: non-file → `sha256:null`/`data_offset:null`, symlink → `linkname`. Reproduces the core records exactly. |
+| 29 | **`file_size` for packages** (codex r5) | `file_size` is an optional progress **hint** (0 = unknown); a package sends 0 (its deterministic tar size isn't known until produced) — the server never requires it. |
 
 ## 16. Review trail
 
@@ -1057,3 +1111,20 @@ receive` against a fake-source directory, and asserts the watcher writes
   - *Medium* — `PackageMemberEntry` didn't match the core's member JSON (`internal_member`
     /`"dir"` vs core `member`/`"directory"`/`linkname`). Fixed: proto fields renamed to
     the core schema exactly (§5, §15 Q14).
+- **2026-06-30 — codex document review, round 5 (5 findings folded).**
+  - *High* — committed owner/state/digest were said to live in `.receiving.json`, which
+    commit removes — leaving owner checks, the manifest-digest retry, and GetIntakeStatus
+    with nothing durable to read. Fixed: a durable **`grpc_intake` table** is the source
+    of truth; `.receiving.json` is only the watcher/sweep hint (§7, §12, §15 Q25).
+  - *High* — `AbortIntake` wasn't state-gated, so it could delete a committed,
+    handed-off bag and race the watcher. Fixed: Abort allowed only in
+    `streaming`/`committing`; `FAILED_PRECONDITION` once `committed` (§5, §7, §15 Q26).
+  - *Medium* — `canonicalization_version` was client-supplied with no skew check, though
+    the core validates it. Fixed: server rejects a mismatch before writing the bag, like
+    the profile guard (§5, §7, §15 Q27).
+  - *Medium* — proto3 scalars can't represent the core's null `sha256`/`data_offset` for
+    non-file members. Fixed: `optional` fields + an explicit server proto→JSON mapping
+    by `type` (non-file → JSON null; symlink → `linkname`) (§5, §15 Q28).
+  - *Medium* — required `file_size` on the first chunk conflicts with on-the-fly package
+    tar (size unknown until produced). Fixed: `file_size` is an optional hint, 0 for
+    packages (§5, §8, §15 Q29).
