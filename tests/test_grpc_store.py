@@ -66,8 +66,14 @@ def test_device_enrollment_token_revoke_and_schema(engine: Engine) -> None:
     assert {"grpc_intake", "grpc_device_enrollment", "grpc_enroll_token"} <= tables
 
     with session_scope(engine) as session:
-        token = store.issue_enroll_token(session, ttl=dt.timedelta(seconds=1))
-        store.consume_enroll_token(session, token)
+        token = store.issue_enroll_token(
+            session,
+            operator="owner",
+            device_id="mac-1",
+            ttl=dt.timedelta(seconds=1),
+        )
+        grant = store.consume_enroll_token(session, token, device_id="mac-1")
+        assert grant.operator == "owner"
         store.record_device_enrollment(
             session,
             device_id="mac-1",
@@ -94,12 +100,20 @@ def test_device_enrollment_token_revoke_and_schema(engine: Engine) -> None:
 
 def test_expired_or_reused_enrollment_token_is_refused(engine: Engine) -> None:
     with session_scope(engine) as session:
-        expired = store.issue_enroll_token(session, ttl=dt.timedelta(seconds=-1))
-        used = store.issue_enroll_token(session)
-        store.consume_enroll_token(session, used)
+        expired = store.issue_enroll_token(
+            session,
+            operator="owner",
+            device_id="mac-1",
+            ttl=dt.timedelta(seconds=-1),
+        )
+        used = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
+        wrong_device = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
+        store.consume_enroll_token(session, used, device_id="mac-1")
 
     with session_scope(engine) as session:
         with pytest.raises(ValueError, match="expired"):
             store.consume_enroll_token(session, expired)
         with pytest.raises(ValueError, match="already used"):
             store.consume_enroll_token(session, used)
+        with pytest.raises(ValueError, match="common name"):
+            store.consume_enroll_token(session, wrong_device, device_id="mac-2")

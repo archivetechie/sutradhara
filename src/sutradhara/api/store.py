@@ -26,6 +26,7 @@ from sutradhara.catalog.session import make_session_factory
 DEFAULT_TTL = dt.timedelta(minutes=30)
 DEFAULT_HEARTBEAT_INTERVAL = dt.timedelta(seconds=5)
 RECEIVE_ENDPOINT = "/api/receive"
+DEVICE_RECEIVE_ENDPOINT = "POST /api/devices/receive"
 
 IdempotencyState = Literal["claimed", "completed", "conflict", "in_progress"]
 

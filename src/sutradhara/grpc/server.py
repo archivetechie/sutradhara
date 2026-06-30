@@ -13,8 +13,10 @@ from pathlib import Path
 import grpc
 from sqlalchemy import Engine
 
-from sutradhara._proto import intake_pb2_grpc
+from sutradhara._proto import device_pb2_grpc, intake_pb2_grpc
 from sutradhara.grpc.ca import load_server_credentials
+from sutradhara.grpc.device_service import DeviceService, DeviceServiceConfig
+from sutradhara.grpc.registry import ConnectedDeviceRegistry
 from sutradhara.grpc.servicer import GrpcIntakeConfig, IntakeServicer
 from sutradhara_receive import sweep_orphans
 
@@ -32,6 +34,7 @@ class GrpcServerConfig:
     bind: str = "127.0.0.1"
     port: int = DEFAULT_GRPC_PORT
     validate_artifactclass: bool = True
+    registry: ConnectedDeviceRegistry | None = None
 
 
 def make_server(config: GrpcServerConfig) -> grpc.Server:
@@ -39,6 +42,7 @@ def make_server(config: GrpcServerConfig) -> grpc.Server:
 
     validate_bind_address(config.bind)
     ca_cert, server_cert, server_key = load_server_credentials(config.pki_dir)
+    registry = config.registry or ConnectedDeviceRegistry()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     intake_pb2_grpc.add_IntakeServiceServicer_to_server(
         IntakeServicer(
@@ -48,6 +52,10 @@ def make_server(config: GrpcServerConfig) -> grpc.Server:
                 validate_artifactclass=config.validate_artifactclass,
             )
         ),
+        server,
+    )
+    device_pb2_grpc.add_DeviceServiceServicer_to_server(
+        DeviceService(DeviceServiceConfig(engine=config.engine, registry=registry)),
         server,
     )
     creds = grpc.ssl_server_credentials(

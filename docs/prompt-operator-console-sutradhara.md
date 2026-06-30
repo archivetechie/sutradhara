@@ -1,6 +1,6 @@
 # Codex prompt — operator console: **sutradhara server relay**
 
-> Status: **pending**. Design: `docs/design-operator-console-relay.md` (the authority —
+> Status: **implemented 2026-06-30**. Design: `docs/design-operator-console-relay.md` (the authority —
 > read it first; 4 review rounds / 19 findings, trail in §11). Sibling prompts (identical
 > **Shared contract**): `docs/prompt-operator-console-sutra-agent.md` (the helper daemon,
 > same repo), `~/system-ui/docs/prompt-operator-console-system-ui.md` (the browser).

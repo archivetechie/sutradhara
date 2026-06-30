@@ -19,6 +19,7 @@ from sutradhara.cli.receive import receive_group
 from sutradhara.cli.reconcile import reconcile_cmd
 from sutradhara.cli.retention import offsite_group, retention_group
 from sutradhara.cli.scrub import scrub_cmd
+from sutradhara.cli.serve import serve_cmd
 from sutradhara.cli.virtual import reject_cmd, tag_group, unreject_cmd, virtual_group
 from sutradhara.cli.worker import worker_cmd
 
@@ -51,6 +52,7 @@ cli.add_command(unreject_cmd)
 cli.add_command(tag_group)
 cli.add_command(serve_api_cmd)
 cli.add_command(serve_grpc_cmd)
+cli.add_command(serve_cmd)
 
 
 if __name__ == "__main__":

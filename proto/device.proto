@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package sutradhara.device;
+
+service DeviceService {
+  rpc Connect(stream DeviceMessage) returns (stream ServerCommand);
+}
+
+enum CardKind {
+  CARD_KIND_UNSPECIFIED = 0;
+  CARD_KIND_CARD = 1;
+  CARD_KIND_DRIVE = 2;
+  CARD_KIND_OTHER = 3;
+}
+
+enum CommandAckStatus {
+  COMMAND_ACK_STATUS_UNSPECIFIED = 0;
+  COMMAND_ACK_STATUS_ACCEPTED = 1;
+  COMMAND_ACK_STATUS_REJECTED = 2;
+}
+
+message DeviceMessage {
+  oneof payload {
+    CardSnapshot card_snapshot = 1;
+    Heartbeat heartbeat = 2;
+    CommandAck command_ack = 3;
+    ActiveReceives active_receives = 4;
+  }
+}
+
+message CardSnapshot {
+  repeated Card cards = 1;
+}
+
+message Card {
+  string card_id = 1;
+  string label = 2;
+  CardKind kind = 3;
+  int64 size_bytes = 4;
+  string status = 5;
+}
+
+message Heartbeat {}
+
+message CommandAck {
+  string command_id = 1;
+  CommandAckStatus status = 2;
+  string reason = 3;
+  string intake_id = 4;
+}
+
+message ActiveReceives {
+  repeated ActiveReceive receives = 1;
+}
+
+message ActiveReceive {
+  string card_id = 1;
+  string idempotency_key = 2;
+  string intake_id = 3;
+  string state = 4;
+}
+
+message ServerCommand {
+  oneof payload {
+    StartReceive start_receive = 1;
+  }
+}
+
+message StartReceive {
+  string command_id = 1;
+  string card_id = 2;
+  string artifactclass = 3;
+  string label = 4;
+  string source_ref = 5;
+  string idempotency_key = 6;
+}

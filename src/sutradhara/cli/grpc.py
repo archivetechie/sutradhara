@@ -8,6 +8,8 @@ import click
 
 from sutradhara.catalog.session import create_all, make_engine, make_session_factory
 from sutradhara.grpc import ca
+from sutradhara.grpc.admin import revoke_device as revoke_device_admin
+from sutradhara.grpc.registry import ConnectedDeviceRegistry
 from sutradhara.grpc.server import (
     DEFAULT_GRPC_PORT,
     DEFAULT_LANDING_ROOT,
@@ -16,7 +18,6 @@ from sutradhara.grpc.server import (
     start_sweep_loop,
 )
 from sutradhara.grpc.store import issue_enroll_token as issue_enroll_token_row
-from sutradhara.grpc.store import revoke_device as revoke_device_mapping
 
 
 @click.command("serve-grpc")
@@ -37,9 +38,10 @@ from sutradhara.grpc.store import revoke_device as revoke_device_mapping
     help="Sutradhara gRPC PKI directory.",
 )
 @click.option("--issue-enroll-token", is_flag=True, default=False, help="Mint a 24h enrollment token.")
+@click.option("--device-id", default=None, help="Device id for --issue-enroll-token.")
 @click.option("--revoke-device", default=None, help="Revoke all certificates for DEVICE_ID.")
 @click.option("--sign-csr", type=click.Path(path_type=Path, dir_okay=False), default=None)
-@click.option("--operator", "operator_name", default=None, help="Operator for --sign-csr enrollment.")
+@click.option("--operator", "operator_name", default=None, help="Operator for --issue-enroll-token.")
 @click.option("--cert-out", type=click.Path(path_type=Path, dir_okay=False), default=None)
 @click.option("--token", default=None, help="Enrollment token for --sign-csr.")
 @click.option(
@@ -54,6 +56,7 @@ def serve_grpc_cmd(
     landing_root: Path,
     pki_dir: Path,
     issue_enroll_token: bool,
+    device_id: str | None,
     revoke_device: str | None,
     sign_csr: Path | None,
     operator_name: str | None,
@@ -66,19 +69,25 @@ def serve_grpc_cmd(
     engine = make_engine()
     create_all(engine)
     factory = make_session_factory(engine)
+    registry = ConnectedDeviceRegistry()
     if issue_enroll_token:
+        if not operator_name:
+            raise click.ClickException("--operator is required with --issue-enroll-token")
+        if not device_id:
+            raise click.ClickException("--device-id is required with --issue-enroll-token")
         with factory.begin() as session:
-            minted = issue_enroll_token_row(session)
+            minted = issue_enroll_token_row(
+                session,
+                operator=operator_name,
+                device_id=device_id,
+            )
         click.echo(minted)
         return
     if revoke_device is not None:
-        with factory.begin() as session:
-            count = revoke_device_mapping(session, revoke_device)
+        count = revoke_device_admin(engine, revoke_device, registry=registry)
         click.echo(f"revoked {count} enrollment(s) for {revoke_device}")
         return
     if sign_csr is not None:
-        if not operator_name:
-            raise click.ClickException("--operator is required with --sign-csr")
         if not token:
             raise click.ClickException("--token is required with --sign-csr")
         signed = ca.sign_device_csr(
@@ -86,7 +95,6 @@ def serve_grpc_cmd(
             pki_dir=pki_dir,
             csr_path=sign_csr,
             token=token,
-            operator=operator_name,
             cert_path=cert_out,
         )
         click.echo(f"signed {signed.device_id} for {signed.operator}: {signed.cert_path}")
@@ -102,6 +110,7 @@ def serve_grpc_cmd(
             bind=bind,
             port=port,
             validate_artifactclass=not skip_artifactclass_validation,
+            registry=registry,
         )
     )
     server.start()

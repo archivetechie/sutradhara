@@ -254,7 +254,16 @@ def test_intake_watch_cli_once_registers_prepares_and_surfaces_quarantine(
 
 def test_serve_grpc_enrollment_admin_actions(cli_env: dict[str, str], tmp_path: Path) -> None:
     _run(["db", "init"])
-    token = _run(["serve-grpc", "--issue-enroll-token"]).output.strip()
+    token = _run(
+        [
+            "serve-grpc",
+            "--issue-enroll-token",
+            "--operator",
+            "owner",
+            "--device-id",
+            "mac-1",
+        ]
+    ).output.strip()
     assert token
 
     device_dir = tmp_path / "device"
@@ -269,8 +278,6 @@ def test_serve_grpc_enrollment_admin_actions(cli_env: dict[str, str], tmp_path: 
             str(tmp_path / "pki"),
             "--sign-csr",
             str(material.csr_path),
-            "--operator",
-            "owner",
             "--token",
             token,
             "--cert-out",

@@ -9,15 +9,24 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import Engine
 
+from sutradhara.api.routes_devices import install_default_state as install_device_state
+from sutradhara.api.routes_devices import router as devices_router
 from sutradhara.api.routes_receive import install_default_state
 from sutradhara.api.routes_receive import router as receive_router
 from sutradhara.api.routes_session import router as session_router
 from sutradhara.catalog.session import create_all, make_engine
 
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+ORIGIN_GUARD_EXEMPT_PATHS = {"/api/enroll/csr"}
 
 
-def create_app(engine: Engine | None = None, *, ensure_schema: bool = True) -> FastAPI:
+def create_app(
+    engine: Engine | None = None,
+    *,
+    ensure_schema: bool = True,
+    registry: object | None = None,
+    grpc_pki_dir: object | None = None,
+) -> FastAPI:
     """Create the HTTP API with catalog-backed state and strict edge assumptions."""
 
     final_engine = engine or make_engine()
@@ -25,7 +34,12 @@ def create_app(engine: Engine | None = None, *, ensure_schema: bool = True) -> F
         create_all(final_engine)
     app = FastAPI(title="sutradhara API")
     app.state.engine = final_engine
+    if registry is not None:
+        app.state.registry = registry
+    if grpc_pki_dir is not None:
+        app.state.grpc_pki_dir = grpc_pki_dir
     install_default_state(app)
+    install_device_state(app)
 
     @app.middleware("http")
     async def _json_origin_guard(request: Request, call_next: object) -> Response:
@@ -37,10 +51,11 @@ def create_app(engine: Engine | None = None, *, ensure_schema: bool = True) -> F
                     "unsupported_media_type",
                     "mutating API requests must be application/json",
                 )
-            host = request.headers.get("host")
-            origin = request.headers.get("origin")
-            if not host or not origin or not _same_origin(origin, host):
-                return _error_response(403, "forbidden_origin", "Origin must match Host")
+            if request.url.path not in ORIGIN_GUARD_EXEMPT_PATHS:
+                host = request.headers.get("host")
+                origin = request.headers.get("origin")
+                if not host or not origin or not _same_origin(origin, host):
+                    return _error_response(403, "forbidden_origin", "Origin must match Host")
         return await call_next(request)  # type: ignore[misc]
 
     @app.exception_handler(HTTPException)
@@ -59,6 +74,7 @@ def create_app(engine: Engine | None = None, *, ensure_schema: bool = True) -> F
 
     app.include_router(session_router)
     app.include_router(receive_router)
+    app.include_router(devices_router)
     return app
 
 

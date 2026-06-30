@@ -39,6 +39,7 @@ class GrpcIntake(Base):
     device_id: Mapped[str] = mapped_column(String(256), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     manifest_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    card_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     source_plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     artifactclass: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -84,6 +85,8 @@ class GrpcEnrollToken(Base):
         DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
     )
     expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    operator: Mapped[str] = mapped_column(String(128), nullable=False)
+    device_id: Mapped[str] = mapped_column(String(256), nullable=False)
     used_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -94,6 +97,14 @@ class DeviceIdentity:
     operator: str
     device_id: str
     fingerprint: str
+
+
+@dataclass(frozen=True)
+class EnrollTokenGrant:
+    """Validated enrollment-token payload."""
+
+    operator: str
+    device_id: str
 
 
 def insert_intake(
@@ -139,6 +150,47 @@ def get_intake(session: Session, intake_id: str) -> GrpcIntake | None:
     return session.get(GrpcIntake, intake_id)
 
 
+def set_card_id(
+    session: Session,
+    *,
+    intake_id: str,
+    operator: str,
+    device_id: str,
+    card_id: str,
+) -> bool:
+    """Correlate a relay card id into an owned streaming-intake row."""
+
+    row = session.get(GrpcIntake, intake_id)
+    if row is None:
+        return False
+    if row.operator != operator or row.device_id != device_id:
+        return False
+    if row.card_id not in {None, card_id}:
+        return False
+    row.card_id = card_id
+    row.updated_at = _utcnow()
+    return True
+
+
+def operator_for_device(session: Session, device_id: str) -> str | None:
+    """Return the active operator for a non-revoked enrolled device."""
+
+    operators = {
+        row.operator
+        for row in session.scalars(
+            select(GrpcDeviceEnrollment).where(
+                GrpcDeviceEnrollment.device_id == device_id,
+                GrpcDeviceEnrollment.revoked.is_(False),
+            )
+        )
+    }
+    if not operators:
+        return None
+    if len(operators) > 1:
+        raise PermissionError("device has conflicting active operator enrollments")
+    return next(iter(operators))
+
+
 def compare_and_set_state(
     session: Session,
     intake_id: str,
@@ -177,17 +229,37 @@ def set_committed_digest(session: Session, intake_id: str, manifest_digest: str)
     row.updated_at = _utcnow()
 
 
-def issue_enroll_token(session: Session, *, ttl: dt.timedelta = dt.timedelta(hours=24)) -> str:
-    """Create and persist a one-time enrollment token."""
+def issue_enroll_token(
+    session: Session,
+    *,
+    operator: str,
+    device_id: str,
+    ttl: dt.timedelta = dt.timedelta(hours=24),
+) -> str:
+    """Create and persist a one-time operator/device-bound enrollment token."""
 
     token = secrets.token_urlsafe(32)
     now = _utcnow()
-    session.add(GrpcEnrollToken(token=token, created_at=now, expires_at=now + ttl))
+    session.add(
+        GrpcEnrollToken(
+            token=token,
+            created_at=now,
+            expires_at=now + ttl,
+            operator=operator,
+            device_id=device_id,
+        )
+    )
     return token
 
 
-def consume_enroll_token(session: Session, token: str, *, now: dt.datetime | None = None) -> None:
-    """Mark an enrollment token used, rejecting missing, expired, or reused tokens."""
+def consume_enroll_token(
+    session: Session,
+    token: str,
+    *,
+    device_id: str | None = None,
+    now: dt.datetime | None = None,
+) -> EnrollTokenGrant:
+    """Mark an enrollment token used, rejecting missing, expired, reused, or wrong-device tokens."""
 
     timestamp = now or _utcnow()
     row = session.get(GrpcEnrollToken, token)
@@ -197,7 +269,10 @@ def consume_enroll_token(session: Session, token: str, *, now: dt.datetime | Non
         raise ValueError("enrollment token was already used")
     if _aware(row.expires_at) < timestamp:
         raise ValueError("enrollment token has expired")
+    if device_id is not None and row.device_id != device_id:
+        raise ValueError("CSR common name does not match enrollment token device_id")
     row.used_at = timestamp
+    return EnrollTokenGrant(operator=row.operator, device_id=row.device_id)
 
 
 def record_device_enrollment(

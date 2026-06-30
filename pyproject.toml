@@ -72,7 +72,7 @@ members = ["packages/sutra-agent", "packages/sutradhara-receive"]
 # Generated proto stubs live under src/sutradhara/_proto/ and are committed
 # (per grpcio convention) for reproducibility. Regenerate via:
 #   ./scripts/regenerate-proto.sh
-# after editing proto/layer5.proto.
+# after editing proto/layer5.proto, proto/intake.proto, or proto/device.proto.
 
 # --- pytest ---------------------------------------------------------------
 [tool.pytest.ini_options]

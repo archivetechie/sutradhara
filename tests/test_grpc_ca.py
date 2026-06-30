@@ -23,14 +23,13 @@ def test_sign_resolve_and_revoke_device_certificate(engine: Engine, tmp_path) ->
     pki = tmp_path / "pki"
     material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
     with session_scope(engine) as session:
-        token = store.issue_enroll_token(session)
+        token = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
 
     signed = ca.sign_device_csr(
         engine,
         pki_dir=pki,
         csr_path=material.csr_path,
         token=token,
-        operator="owner",
     )
 
     assert signed.device_id == "mac-1"
@@ -54,7 +53,20 @@ def test_wrong_enrollment_token_refuses_signing(engine: Engine, tmp_path) -> Non
             pki_dir=tmp_path / "pki",
             csr_path=material.csr_path,
             token="bad-token",
-            operator="owner",
+        )
+
+
+def test_token_device_id_must_match_csr_common_name(engine: Engine, tmp_path) -> None:
+    material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
+    with session_scope(engine) as session:
+        token = store.issue_enroll_token(session, operator="owner", device_id="mac-2")
+
+    with pytest.raises(ValueError, match="common name"):
+        ca.sign_device_csr(
+            engine,
+            pki_dir=tmp_path / "pki",
+            csr_path=material.csr_path,
+            token=token,
         )
 
 

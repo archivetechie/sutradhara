@@ -7,7 +7,7 @@
 # Requires grpcio-tools (installed via `pip install -e .[dev]`).
 # Output:
 #   src/sutradhara/_proto/*_pb2.py + *_pb2_grpc.py
-#   packages/sutra-agent/src/sutra_agent/_proto/intake_pb2.py + intake_pb2_grpc.py
+#   packages/sutra-agent/src/sutra_agent/_proto/*_pb2.py + *_pb2_grpc.py
 #
 # The generated files are committed; do not edit them by hand.
 
@@ -48,14 +48,16 @@ fi
     --pyi_out="${SERVER_PROTO_OUT}" \
     --grpc_python_out="${SERVER_PROTO_OUT}" \
     "${PROTO_SRC}/layer5.proto" \
-    "${PROTO_SRC}/intake.proto"
+    "${PROTO_SRC}/intake.proto" \
+    "${PROTO_SRC}/device.proto"
 
 "${PYTHON}" -m grpc_tools.protoc \
     --proto_path="${PROTO_SRC}" \
     --python_out="${AGENT_PROTO_OUT}" \
     --pyi_out="${AGENT_PROTO_OUT}" \
     --grpc_python_out="${AGENT_PROTO_OUT}" \
-    "${PROTO_SRC}/intake.proto"
+    "${PROTO_SRC}/intake.proto" \
+    "${PROTO_SRC}/device.proto"
 
 # protoc emits imports like `import layer5_pb2`, which only works if
 # ${PROTO_OUT} is on sys.path. We're a package, so rewrite to a relative
@@ -82,6 +84,6 @@ touch "${SERVER_PROTO_OUT}/__init__.py" "${AGENT_PROTO_OUT}/__init__.py"
 echo "generated: ${SERVER_PROTO_OUT}/*_pb2.py"
 echo "generated: ${SERVER_PROTO_OUT}/*_pb2.pyi"
 echo "generated: ${SERVER_PROTO_OUT}/*_pb2_grpc.py"
-echo "generated: ${AGENT_PROTO_OUT}/intake_pb2.py"
-echo "generated: ${AGENT_PROTO_OUT}/intake_pb2.pyi"
-echo "generated: ${AGENT_PROTO_OUT}/intake_pb2_grpc.py"
+echo "generated: ${AGENT_PROTO_OUT}/*_pb2.py"
+echo "generated: ${AGENT_PROTO_OUT}/*_pb2.pyi"
+echo "generated: ${AGENT_PROTO_OUT}/*_pb2_grpc.py"

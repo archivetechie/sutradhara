@@ -204,6 +204,14 @@ def _assert_retention_invariants(db_path: Path) -> None:
     assert ("intake_id",) in _index_columns(db_path, "retention_event")
 
 
+def _assert_grpc_relay_invariants(db_path: Path) -> None:
+    grpc_intake_sql = _table_sql(db_path, "grpc_intake")
+    assert "card_id" in grpc_intake_sql
+    token_sql = _table_sql(db_path, "grpc_enroll_token")
+    assert "operator" in token_sql
+    assert "device_id" in token_sql
+
+
 def test_create_all_creates_job_table_without_prior_job_import(tmp_path: Path) -> None:
     db_path = tmp_path / "create_all.db"
     code = f"""
@@ -247,6 +255,7 @@ engine.dispose()
     _assert_arrangement_invariants(db_path)
     _assert_virtual_arrangement_invariants(db_path)
     _assert_retention_invariants(db_path)
+    _assert_grpc_relay_invariants(db_path)
 
 
 def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
@@ -294,6 +303,7 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     _assert_arrangement_invariants(db_path)
     _assert_virtual_arrangement_invariants(db_path)
     _assert_retention_invariants(db_path)
+    _assert_grpc_relay_invariants(db_path)
 
 
 def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
@@ -338,3 +348,4 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     _assert_arrangement_invariants(db_path)
     _assert_virtual_arrangement_invariants(db_path)
     _assert_retention_invariants(db_path)
+    _assert_grpc_relay_invariants(db_path)

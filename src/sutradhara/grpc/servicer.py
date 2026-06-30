@@ -30,6 +30,7 @@ from sutradhara.catalog.session import make_session_factory
 from sutradhara.grpc import assembly
 from sutradhara.grpc import ca as grpc_ca
 from sutradhara.grpc import store as grpc_store
+from sutradhara.grpc.status import intake_status
 from sutradhara_receive import (
     CANONICALIZATION_VERSION,
     DATA_DIR_NAME,
@@ -233,9 +234,7 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
 
     def GetIntakeStatus(self, request: Any, context: Any) -> Any:
         row = self._owned_row(request.intake_id, context)
-        status, errors = _marker_status(_intake_dir(row))
-        if status is None:
-            status = "verifying" if row.state == "committed" else row.state
+        status, errors = intake_status(row)
         return intake_pb2.IntakeStatusResponse(
             intake_id=row.intake_id,
             status=status,
@@ -339,8 +338,8 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             grpc_store.set_state(session, intake_id, "streaming")
 
     def _live_status(self, row: grpc_store.GrpcIntake) -> str:
-        status, _errors = _marker_status(_intake_dir(row))
-        return status or "verifying"
+        status, _errors = intake_status(row)
+        return status
 
     def _validate_start_request(self, request: Any, context: Any) -> None:
         if not request.idempotency_key:
@@ -434,34 +433,6 @@ def _reupload_relpaths(
         if digest != str(item.client_sha256).lower() or size != int(item.bytes):
             missing.append(relpath)
     return sorted(missing)
-
-
-def _marker_status(intake_dir: Path) -> tuple[str | None, list[str]]:
-    for name, status in (
-        ("intake.discrepancy.json", "discrepancy"),
-        ("intake.quarantined.json", "quarantined"),
-        ("intake.verified.json", "verified"),
-    ):
-        marker = intake_dir / name
-        if marker.exists():
-            return status, _marker_errors(marker)
-    return None, []
-
-
-def _marker_errors(path: Path) -> list[str]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return [f"unreadable marker: {path.name}"]
-    details = payload.get("details") if isinstance(payload, dict) else None
-    if not isinstance(details, dict):
-        return []
-    errors: list[str] = []
-    for key in ("missing", "extra", "mismatched", "errors"):
-        value = details.get(key)
-        if value:
-            errors.append(f"{key}: {value}")
-    return errors
 
 
 def _intake_dir(row: grpc_store.GrpcIntake) -> Path:

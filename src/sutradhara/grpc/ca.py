@@ -180,17 +180,16 @@ def sign_device_csr(
     pki_dir: Path | str,
     csr_path: Path | str,
     token: str,
-    operator: str,
     cert_path: Path | str | None = None,
 ) -> DeviceCertificate:
-    """Validate an enrollment token, sign a device CSR, and record the mapping."""
+    """Validate a token-bound CSR, sign it, and record the token's operator mapping."""
 
     csr = Path(csr_path)
     device_id = csr_common_name(csr)
     output = Path(cert_path) if cert_path is not None else csr.with_suffix(".crt")
     factory = make_session_factory(engine)
     with factory.begin() as session:
-        store.consume_enroll_token(session, token)
+        grant = store.consume_enroll_token(session, token, device_id=device_id)
     ca_cert, ca_key = ensure_ca(pki_dir)
     _run_openssl(
         [
@@ -216,11 +215,11 @@ def sign_device_csr(
             session,
             device_id=device_id,
             cert_fingerprint=fingerprint,
-            operator=operator,
+            operator=grant.operator,
         )
     return DeviceCertificate(
         device_id=device_id,
-        operator=operator,
+        operator=grant.operator,
         cert_path=output,
         fingerprint=fingerprint,
     )

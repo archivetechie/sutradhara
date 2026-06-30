@@ -252,13 +252,12 @@ def test_real_grpc_stream_hands_off_to_real_watch(tmp_path: Path) -> None:
     ca.ensure_server_certificate(pki, common_name="localhost")
     material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
     with session_scope(engine) as session:
-        token = store.issue_enroll_token(session)
+        token = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
     signed = ca.sign_device_csr(
         engine,
         pki_dir=pki,
         csr_path=material.csr_path,
         token=token,
-        operator="owner",
     )
     port = _free_port()
     landing = tmp_path / "landing"
