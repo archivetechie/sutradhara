@@ -1,7 +1,8 @@
 # Design — streaming card/drive intake over gRPC + mTLS (`sutra-agent`)
 
-> Status: **current** (brainstorm 2026-06-30, Claude + the owner; **codex document review
-> folded — 7 findings**, trail in §16). Companion to `design-receive-front-door.md`
+> Status: **current** (brainstorm 2026-06-30, Claude + the owner; **two codex document
+> review rounds folded — 13 findings**, trail in §16). Companion to
+> `design-receive-front-door.md`
 > (the BagIt core + payload planner this design reuses) and
 > `design-operator-identity-authz.md` (the HTTP API surface this design runs
 > alongside, not through). The implementation prompt will live here when cut.
@@ -116,12 +117,22 @@ service IntakeService {
 // ── StartIntake ──────────────────────────────────────────────────────────────
 
 message StartIntakeRequest {
-  string idempotency_key = 1;  // UUID — same dedup model as HTTP /api/receive
-  string artifactclass   = 2;
-  string source_kind     = 3;  // card | drive | upload | handoff | other
-  string source_ref      = 4;  // optional: card serial / drive label
-  string label           = 5;  // optional: human label for this intake
+  string idempotency_key   = 1;  // UUID — same dedup model as HTTP /api/receive
+  string artifactclass     = 2;
+  string source_kind       = 3;  // card | drive | upload | handoff | download | other
+  string source_ref        = 4;  // optional: card serial / drive label
+  string label             = 5;  // optional: human label for this intake
+  // Digest binding this intake to a SPECIFIC source payload plan (sorted list of
+  // {relpath, size} over the planned units). Bound at StartIntake; a resume against
+  // a DIFFERENT card/mount yields a different digest → idempotency conflict, never a
+  // silent mixed-source intake (§11). The server stores this; the client recomputes
+  // it on resume and the canonical-hash check (§7) catches any mismatch.
+  string source_plan_digest = 6;
 }
+
+// These five intent fields are the AUTHORITY for bag-info.txt — stored server-side
+// at StartIntake and NOT restated by the client at CommitIntake (avoids a second,
+// divergent source of truth). operator is resolved from the device→operator mapping.
 
 message StartIntakeResponse {
   string intake_id = 1;  // YYYYMMDD-<operator-slug>-<UUID>
@@ -163,31 +174,51 @@ message FileRecord {
 // ── CommitIntake ─────────────────────────────────────────────────────────────
 
 message CommitIntakeRequest {
-  string                 intake_id = 1;
-  repeated ManifestEntry files     = 2;
-  BagInfo                bag_info  = 3;
+  string                 intake_id       = 1;
+  repeated ManifestEntry files           = 2;
+  // CommitIntake does NOT restate artifactclass/source_kind/source_ref/label —
+  // those are the StartIntake intent (server-stored authority for bag-info.txt).
+  // Commit carries only receive-DETERMINED facts + package indexes (below).
+  ReceiveFacts           receive_facts   = 3;
+  repeated PackageIndex  package_indexes = 4;
+  // sha256 over the canonical manifest (sorted {relpath, client_sha256, bytes}).
+  // Makes Commit idempotent: same (intake_id, manifest_digest) → returns the current
+  // status; a DIFFERENT digest for an already-committed intake → FAILED_PRECONDITION.
+  string                 manifest_digest = 5;
 }
 
 message ManifestEntry {
-  string relpath       = 1;
+  string relpath       = 1;  // stored name (a package's is "<name>.<ext>.tar")
   string client_sha256 = 2;  // sha256 the client computed while reading the card
   int64  bytes         = 3;
 }
 
-message BagInfo {
-  // operator is NOT client-supplied — the servicer stamps it from the
-  // device→operator enrollment mapping keyed by the peer cert (§6).
-  string source_kind              = 1;
-  string source_ref               = 2;
-  string artifactclass            = 3;
-  string label                    = 4;
-  string canonicalization_version = 5;
-  int64  skipped_count            = 6;  // files intentionally skipped (symlinks etc.)
+// Receive-determined facts (NOT bound at StartIntake — known only after planning the
+// source). Folded into bag-info.txt alongside the server-stored StartIntake intent.
+message ReceiveFacts {
+  string canonicalization_version = 1;  // planner version constant
+  int64  skipped_count            = 2;  // symlinks / special files intentionally skipped
+  string package_profile_version  = 3;  // PACKAGE_PROFILE_VERSION (only if a package was wrapped)
+  string package_profile_hash     = 4;  // PACKAGE_PROFILE_HASH
+}
+
+// Inner index for one normalized package (package-tar-v1). Written by the server as a
+// per-package tag file (out of the payload manifest; the package is one manifest entry,
+// per front-door §12.4). internal_member → {data_offset, length, sha256}.
+message PackageIndex {
+  string                      stored_relpath = 1;  // "<name>.<ext>.tar"
+  repeated PackageMemberEntry members        = 2;
+}
+message PackageMemberEntry {
+  string internal_member = 1;  // POSIX path inside the package tar
+  int64  data_offset     = 2;  // byte offset of the member's data within the tar
+  int64  length          = 3;
+  string sha256          = 4;
 }
 
 message CommitIntakeResponse {
   string intake_id = 1;
-  string status    = 2;  // always "verifying" on success
+  string status    = 2;  // "verifying" on first commit; current status on idempotent retry
 }
 
 // ── GetIntakeStatus ──────────────────────────────────────────────────────────
@@ -226,8 +257,9 @@ device handle.
 the server records a row `(device_id, cert_fingerprint) → operator_username`,
 authorized by an admin (the `--admin-token` below). The `IntakeServicer` reads the
 verified `device_id`/fingerprint from the peer TLS certificate, looks up the operator
-in this table, and stamps **that** server-controlled value as `Intake.operator`. The
-client-supplied `BagInfo` has no `operator` field and the server never trusts one.
+in this table, and stamps **that** server-controlled value as `Intake.operator`. No
+request carries an `operator` field (StartIntake binds intent, Commit carries only
+receive facts) and the server never trusts a client-supplied one.
 This preserves the core invariant from `design-operator-identity-authz.md` — operator
 identity is **server-assigned, never client-asserted** — the binding just happens at
 enrollment (admin-authorized) instead of per-request (Authentik session).
@@ -302,43 +334,67 @@ layer.
 
 ### `servicer.py` — RPC implementations
 
+**Per-intake state machine (gates concurrency).** Each intake carries an explicit
+state in `.receiving.json`: `streaming → committing → verifying →
+verified|quarantined`. The transition is atomic (a compare-and-set on the marker,
+guarded by a per-intake lock). `UploadFile` is accepted only in `streaming`;
+`CommitIntake` atomically flips `streaming → committing` and is **rejected if any
+`UploadFile` for that intake is still in flight** (the server tracks an in-flight
+counter per intake under the same lock) — so the bag is never sealed mid-write.
+
 **`StartIntake`:** resolves the operator from the peer cert (the device→operator
 enrollment mapping, §6); validates artifactclass against the registry (same check as
 HTTP `POST /api/receive`); applies the **same durable idempotency contract the HTTP
 API uses** (`store.begin_idempotency`): the record is scoped to
 `(operator_username, method="grpc:StartIntake", idempotency_key)` and binds a
 **canonical hash** of the request fields (`artifactclass`, `source_kind`,
-`source_ref`, `label`). Same key + identical request ⇒ returns the **existing**
-`intake_id`. Same key + a **different** request (changed artifactclass/source_ref/…)
-⇒ `FAILED_PRECONDITION` conflict — never silently attaches to the old intake. A first
-call mints the intake id (`YYYYMMDD-<operator-slug>-<UUID>`) and creates
-`/replica/landing/{intake_id}/` with a `.receiving.json` marker (see below). Returns
-`intake_id`.
+`source_ref`, `label`, **`source_plan_digest`**). Same key + identical request ⇒
+returns the **existing** `intake_id`. Same key + a **different** request (changed
+artifactclass / source_ref / **a different card → different plan digest**) ⇒
+`FAILED_PRECONDITION` conflict — never silently attaches to the old intake. **The five
+intent fields are stored server-side here** and are the authority for `bag-info.txt`
+(the client does not restate them at Commit). A first call mints the intake id
+(`YYYYMMDD-<operator-slug>-<UUID>`) and creates `/replica/landing/{intake_id}/` with a
+`.receiving.json` marker in state `streaming`. Returns `intake_id`.
 
-**`UploadFile`:** reads the client-streaming `FileChunk` sequence for one file;
-validates `relpath` confinement on the first chunk (POSIX, NFC-normalised, **rejects a
-leading `data/` component** — the wire value is relative to `data/` — plus no `..`,
-no absolute path, must canonicalize to stay inside `data/`); writes chunks to a
-process-unique temp path (`data/{relpath}.tmp.<pid>`), computes sha256 rolling hash;
-on `is_last=true`: `fsync`, atomic `rename` to `data/{relpath}`, `fsync` parent dir,
+**`UploadFile`:** accepted only while the intake is `streaming` (else
+`FAILED_PRECONDITION`); increments the in-flight counter under the per-intake lock.
+Reads the client-streaming `FileChunk` sequence for one unit; validates `relpath`
+confinement on the first chunk (POSIX, NFC-normalised, **rejects a leading `data/`
+component** — the wire value is relative to `data/` — plus no `..`, no absolute path,
+must canonicalize to stay inside `data/`); writes chunks to a **per-RPC UUID temp
+path** (`data/{relpath}.{uuid4}.tmp` — UUID, **not** `<pid>`, so two same-relpath
+streams in one server process can't collide), computes sha256 rolling hash; on
+`is_last=true`: `fsync`, atomic `rename` to `data/{relpath}`, `fsync` parent dir,
 then **appends a receipt line** (`{relpath, server_sha256, bytes}`) to the durable
-per-file receipt ledger `receive-receipts.jsonl` (§11) with `fsync`; returns
-`FileReceipt` with `server_sha256`. On disconnect mid-stream: temp file is discarded
-(never renamed, so no receipt line is written).
+per-file receipt ledger `receive-receipts.jsonl` **holding the per-intake ledger
+lock** (serialized appends; last write for a relpath wins on read); decrements the
+in-flight counter; returns `FileReceipt` with `server_sha256`. On disconnect
+mid-stream: temp file is discarded (never renamed, so no receipt line is written) and
+the in-flight counter is decremented in a `finally`.
 
 **`ListIntakeFiles`:** returns `{relpath, server_sha256, bytes}` read from the durable
 `receive-receipts.jsonl` ledger (a file counts as received only if it has a receipt
-line). Used by the client on resume to skip already-landed files **without re-hashing**
-the landed bytes. (Crash window: a file renamed but not yet logged has no receipt line,
-so the client re-uploads it and the server overwrites with identical bytes — safe.)
+line; on duplicate relpath lines the last wins). Used by the client on resume to skip
+already-landed units **without re-hashing** the landed bytes. (Crash window: a file
+renamed but not yet logged has no receipt line, so the client re-uploads it and the
+server overwrites with identical bytes — safe.)
 
-**`CommitIntake`:** validates that `client_sha256 == server_sha256` for every file
-in the manifest (cross-checks the transit integrity asserted per-file during upload);
-any mismatch → return error, do not commit; writes `bagit.txt`, `bag-info.txt`
-(stamping `operator` from the cert→operator mapping, ignoring any client-supplied
-value), `manifest-sha256.txt`, `tagmanifest-sha256.txt`, `intake.json` (sentinel,
-written last); replaces `.receiving.json` (removes it once `intake.json` lands);
-enqueues the async verify job. Returns `status: "verifying"`.
+**`CommitIntake`:** **idempotent on `(intake_id, manifest_digest)`** — if the intake
+is already past `committing` with the **same** `manifest_digest`, returns the current
+status (a retry after a post-commit timeout is safe); a **different** `manifest_digest`
+for an already-committed intake ⇒ `FAILED_PRECONDITION`. Otherwise atomically flips
+`streaming → committing` (rejecting if any `UploadFile` is still in flight); validates
+`client_sha256 == server_sha256` for every manifest file (cross-checks the per-file
+transit integrity); any mismatch → error, stay in `committing` for retry. Then builds
+`bag-info.txt` **from the server-stored StartIntake intent + the Commit
+`receive_facts`** (operator from the device→operator mapping; `Package-Profile-Version`
+/`-Hash` from `receive_facts` when a package was wrapped) — the client never restates
+the intent; writes each `PackageIndex` as a per-package tag file (out of the payload
+manifest, per front-door §12.4); writes `bagit.txt`, `manifest-sha256.txt`,
+`tagmanifest-sha256.txt`, `intake.json` (sentinel, written last); flips state to
+`verifying` (removes `.receiving.json` once `intake.json` lands); enqueues the verify
+job. Returns `status: "verifying"`.
 
 **`GetIntakeStatus`:** reads the intake directory for `intake.verified.json` or
 `intake.quarantined.json`; falls back to `.receiving.json` presence (vs `intake.json`)
@@ -418,10 +474,14 @@ normalized package. The streaming client turns each unit into one `UploadFile` R
 - a package streams the `package-tar-v1` bytes produced **on the fly in sorted member
   order** (no full local buffer — tar is a streaming format; the member list is walked
   first to fix the deterministic order, then bytes stream). Its `relpath` is the
-  stored name (`<name>.<ext>.tar`); its inner index (`internal_member → {offset,
-  length, sha256}`) is collected during the stream and sent in `CommitIntake` as a tag
-  file, exactly as §12.4 specifies. The package tar's sha256 is its identity (computed
-  in-flight, cross-checked against the server receipt like any file).
+  stored name (`<name>.<ext>.tar`); its inner index (`internal_member → {data_offset,
+  length, sha256}`) is collected during the stream and sent in `CommitIntake` via the
+  **`PackageIndex` repeated field** (the server writes it as a per-package tag file,
+  per §12.4 — it is NOT in the payload manifest). The package tar's sha256 is its
+  identity (computed in-flight, cross-checked against the server receipt like any file).
+  The planner's `Package-Profile-Version` / `Package-Profile-Hash` (the receive core
+  writes these today, `core.py`) travel in `CommitIntakeRequest.receive_facts` so the
+  server can fold them into `bag-info.txt`.
 
 ### Streaming loop (`grpc_client.py`) — threaded sync uploader
 
@@ -435,42 +495,55 @@ def stream_source(source: Path, config: AgentConfig, idempotency_key: str) -> St
     channel = grpc.secure_channel(config.server_address, mtls_creds(config))
     stub = IntakeServiceStub(channel)
 
+    # Plan FIRST (shared planner: regular files AND normalized packages, NOT os.walk),
+    # so the source identity is bound to StartIntake. Re-planning the SAME card yields
+    # the same digest; a different card yields a different digest → StartIntake conflict.
+    plan = plan_payload_units(source)                     # list of payload units
+    plan_digest = digest_plan(plan)                       # sha256 over sorted {relpath,size}
+
     intake_id = stub.StartIntake(StartIntakeRequest(
         idempotency_key=idempotency_key,
         artifactclass=config.artifactclass,
         source_kind=config.source_kind,
         source_ref=config.source_ref,
         label=config.label,
+        source_plan_digest=plan_digest,
     )).intake_id
 
-    # Resume: skip payload units already fully received (durable server ledger)
+    # Resume: skip units already fully received (durable server ledger). Because the
+    # plan digest is bound above, the server-landed set provably belongs to THIS card.
     landed = {f.relpath: (f.server_sha256, f.bytes)
               for f in stub.ListIntakeFiles(ListIntakeFilesRequest(intake_id=intake_id)).files}
+    units = [u for u in plan if u.relpath not in landed]
 
-    # Shared planner: regular files AND normalized packages (NOT a raw os.walk)
-    units = [u for u in plan_payload_units(source) if u.relpath not in landed]
-    manifest = dict(landed)
-    inner_indexes = {}
+    manifest = dict(landed)            # relpath -> (sha, bytes)
+    package_indexes = {}               # relpath -> [PackageMemberEntry]
 
     # N parallel UploadFile RPCs via a thread pool (sync stubs).
     with ThreadPoolExecutor(max_workers=config.parallelism) as pool:
         futures = {pool.submit(_upload_one, stub, intake_id, u): u for u in units}
         for fut in as_completed(futures):
-            relpath, sha, nbytes, inner = fut.result()  # raises on transit mismatch
+            relpath, sha, nbytes, inner = fut.result()    # raises on transit mismatch
             manifest[relpath] = (sha, nbytes)
-            if inner is not None:
-                inner_indexes[relpath] = inner
+            if inner is not None:                          # a normalized package
+                package_indexes[relpath] = inner
 
-    stub.CommitIntake(CommitIntakeRequest(
+    entries = [ManifestEntry(relpath=r, client_sha256=h, bytes=b)
+               for r, (h, b) in sorted(manifest.items())]
+    commit = CommitIntakeRequest(
         intake_id=intake_id,
-        files=[ManifestEntry(relpath=r, client_sha256=h, bytes=b)
-               for r, (h, b) in manifest.items()],
-        bag_info=BagInfo(
-            source_kind=config.source_kind, artifactclass=config.artifactclass,
-            label=config.label, canonicalization_version=CANON_VERSION,
-            skipped_count=count_skipped(source),
-        ),  # NB: no operator field — server stamps it from the cert mapping
-    ))
+        files=entries,
+        receive_facts=ReceiveFacts(
+            canonicalization_version=CANON_VERSION,
+            skipped_count=plan.skipped_count,
+            package_profile_version=PACKAGE_PROFILE_VERSION if package_indexes else "",
+            package_profile_hash=PACKAGE_PROFILE_HASH if package_indexes else "",
+        ),
+        package_indexes=[PackageIndex(stored_relpath=r, members=m)
+                         for r, m in sorted(package_indexes.items())],
+        manifest_digest=digest_manifest(entries),         # makes Commit retry-idempotent
+    )
+    stub.CommitIntake(commit)   # NB: no intent fields — server uses StartIntake-stored authority
     return poll_until_done(stub, intake_id, timeout=config.confirm_timeout)
 
 
@@ -497,13 +570,17 @@ def _upload_one(stub, intake_id, unit):
     client_sha256 = sha.hexdigest()
     if receipt.server_sha256 != client_sha256:
         raise TransitCorruptionError(unit.relpath, client_sha256, receipt.server_sha256)
+    # unit.inner_index() is the [PackageMemberEntry] for a package, else None.
     return unit.relpath, client_sha256, receipt.received_bytes, unit.inner_index()
 ```
 
-Two bugs from the first draft are fixed here: the broken `asyncio.TaskGroup` + sync
-stub mix is gone (explicit thread pool), and the `total += …`-in-a-nested-generator
-`UnboundLocalError` is gone (the counter is a dict the generator mutates by key, not a
-bare local that `+=` would shadow).
+Bugs from earlier drafts are fixed here: the broken `asyncio.TaskGroup` + sync-stub
+mix is gone (explicit thread pool); the `total += …`-in-a-nested-generator
+`UnboundLocalError` is gone (the counter is a dict the generator mutates by key);
+package inner indexes are now actually transmitted (`package_indexes`), not silently
+dropped; the manifest restates **no** StartIntake intent; the source plan is bound to
+`StartIntake` so a resume can't mix two cards; and `manifest_digest` makes a Commit
+retry after a post-commit timeout safe.
 
 ### Windows
 
@@ -560,14 +637,17 @@ Three independent integrity checks. Card held until all three pass.
 Connection drops mid-transfer (network blip, laptop sleep, operator walks away):
 
 1. Agent restarts (or operator re-runs `sutra-agent receive <source>`)
-2. `StartIntake` with the same `idempotency_key` — server returns the existing
-   `intake_id` (idempotent; the canonical-hash check ensures the resumed request
-   matches the original, §7)
-3. `ListIntakeFiles` — server returns fully-received units with their sha256
-4. Client re-plans the source via the shared planner; units in the server's list are
-   skipped (no re-hash of the source bytes for already-landed units)
-5. Remaining units are uploaded normally; `CommitIntake` includes the full manifest
-   (already-landed + newly-uploaded)
+2. Client **re-plans the source first** and recomputes `source_plan_digest`
+3. `StartIntake` with the same `idempotency_key` + the recomputed digest — server
+   returns the existing `intake_id` only if the canonical hash matches (§7). A
+   **different card or wrong mount → different plan digest → `FAILED_PRECONDITION`**,
+   so old server-landed files can never be merged with a different source's uploads
+   (the mixed-source hazard). Same card → same digest → resume proceeds.
+4. `ListIntakeFiles` — server returns fully-received units with their sha256; because
+   the digest is bound, this set provably belongs to this card
+5. Units in the server's list are skipped (no re-hash of the source bytes); remaining
+   units are uploaded; `CommitIntake` includes the full manifest (already-landed +
+   newly-uploaded)
 
 **Durable receipt ledger (what makes resume O(remaining), not O(size)).** The
 "fully-received" set is **persisted**, not recomputed by re-hashing `data/` on
@@ -600,8 +680,8 @@ the sweep as a periodic background task.
 | `packages/sutra-agent/proto/intake.proto` | gRPC service definition |
 | `packages/sutra-agent/proto/intake_pb2*.py` | Generated stubs (committed) |
 | `src/sutradhara/grpc/server.py` | gRPC server + mTLS setup |
-| `src/sutradhara/grpc/servicer.py` | Five RPC implementations; `.receiving.json` + `receive-receipts.jsonl` lifecycle |
-| `src/sutradhara/grpc/assembly.py` | BagIt assembly from streamed chunks (reuses `sutradhara_receive` writers) |
+| `src/sutradhara/grpc/servicer.py` | Five RPC implementations; per-intake `streaming→committing→verifying` state machine + in-flight counter + ledger lock; `.receiving.json` + `receive-receipts.jsonl` lifecycle |
+| `src/sutradhara/grpc/assembly.py` | BagIt assembly from streamed chunks (reuses `sutradhara_receive` writers); builds `bag-info.txt` from server-stored intent + `receive_facts`; writes each `PackageIndex` as a per-package tag file |
 | `src/sutradhara/grpc/ca.py` | CA / cert issuance / device→operator mapping / device revocation |
 | `packages/sutra-agent/src/sutra_agent/grpc_client.py` | Streaming upload client (threaded sync, reuses shared payload planner) |
 
@@ -610,7 +690,7 @@ the sweep as a periodic background task.
 | Path | Change |
 |---|---|
 | `src/sutradhara/cli/main.py` | Add `sutra serve-grpc` command |
-| `src/sutradhara/api/store.py` | Reuse `begin_idempotency` for `grpc:StartIntake` (new method scope); no new table |
+| `src/sutradhara/api/store.py` | Reuse `begin_idempotency` for `grpc:StartIntake` (new method scope, plan digest in the hashed body) **and** `grpc:CommitIntake` (idempotent on `manifest_digest`); no new table |
 | `packages/sutra-agent/src/sutra_agent/config.py` | Add `server_address`, cert fields, `device_id`; `landing` optional (no `operator` in streaming mode) |
 | `packages/sutra-agent/src/sutra_agent/receive.py` | Route to `grpc_client` when `server_address` set |
 | `packages/sutra-agent/src/sutra_agent/cli.py` | `--server` / `--client-cert` / `--ca-cert` / `enroll` |
@@ -644,21 +724,31 @@ Neither dependency leaks into `sutradhara-receive` (the lightweight edge package
 
 **Unit:**
 - `test_servicer.py`: `StartIntake` idempotency — same key+identical request returns
-  the same intake, **same key + changed artifactclass/source_ref → conflict** (not
-  silent attach); `UploadFile` happy path + transit corruption (mismatched sha256 →
-  receipt error) + **leading-`data/` relpath rejected**; `CommitIntake` sha256
-  cross-check fail; `ListIntakeFiles` reads the durable ledger and lists only
-  receipt-logged files; `GetIntakeStatus` state machine.
+  the same intake, **same key + changed artifactclass/source_ref/plan_digest →
+  conflict** (not silent attach); `UploadFile` happy path + transit corruption
+  (mismatched sha256 → receipt error) + **leading-`data/` relpath rejected** + **two
+  same-relpath streams in one process don't collide** (UUID temp names) + rejected
+  when intake not `streaming`; `CommitIntake` sha256 cross-check fail + **rejected
+  while an upload is in flight** + **idempotent on `(intake_id, manifest_digest)`**
+  (same digest → current status, different digest → conflict); `ListIntakeFiles` reads
+  the durable ledger and lists only receipt-logged files; `GetIntakeStatus` state
+  machine `streaming→committing→verifying→verified|quarantined`.
 - `test_assembly.py`: streamed chunks produce a valid BagIt bag (`bagit.validate()`);
-  `operator` is always from the **device→operator mapping**, never the client payload;
-  a `.fcpbundle` payload unit lands as **one** `package-tar-v1` entry with a
-  round-tripping inner index (not exploded into inner files); sentinel written last.
-- `test_grpc_client.py`: happy path with a local test server; **resume skips
-  ledger-listed units without re-hashing**; `TransitCorruptionError` on sha256
-  mismatch; the thread pool caps concurrent RPCs at `parallelism`; the payload planner
-  (not a raw walk) drives the unit list.
+  `operator`/`artifactclass`/`source_*`/`label` in `bag-info.txt` come from the
+  **server-stored StartIntake intent**, never the Commit payload (client can't restate
+  them); a `.fcpbundle` payload unit lands as **one** `package-tar-v1` entry, its
+  `PackageIndex` is written as a per-package tag file and **round-trips** (ranged
+  extract of one internal member verifies against its sha256); `Package-Profile-Version`
+  /`-Hash` appear in `bag-info.txt`; sentinel written last.
+- `test_grpc_client.py`: happy path with a local test server; **resume against the same
+  card skips ledger-listed units without re-hashing**; **resume against a different
+  card → StartIntake conflict** (plan digest changed, no mixed-source merge);
+  `TransitCorruptionError` on sha256 mismatch; the thread pool caps concurrent RPCs at
+  `parallelism`; the payload planner (not a raw walk) drives the unit list; package
+  indexes are actually sent in `CommitIntake`.
 - `test_receipt_ledger.py`: rename-then-log ordering — a data file present without a
-  receipt line is re-uploaded (not falsely skipped); a logged file is skipped.
+  receipt line is re-uploaded (not falsely skipped); a logged file is skipped;
+  concurrent appends under the per-intake lock don't interleave/corrupt lines.
 
 **Integration (harness scenario):**
 A new scenario (or extension of `scenario_r.py`) that runs `sutra serve-grpc` with a
@@ -684,6 +774,11 @@ without real hardware.
 | 11 | Chunk size | 4 MB default; configurable; aligns with ZFS recordsize=1M (4 records per chunk write). |
 | 12 | gRPC port | 50051 default; bind to LAN/Tailscale interface, blocked on public NIC by existing nftables. |
 | 13 | Verify job execution | Thread pool within `serve-grpc` process (shares SQLAlchemy engine); move to a job queue worker if it contends with tape I/O in production. |
+| 14 | **Package inner index + profile carriage** (codex r2) | Carried explicitly: `CommitIntakeRequest.package_indexes` (`PackageIndex`/`PackageMemberEntry`) + `receive_facts.package_profile_version`/`_hash`; server writes per-package tag files + folds the profile fields into `bag-info.txt`. |
+| 15 | **bag-info.txt authority** (codex r2) | The five StartIntake intent fields (artifactclass/source_kind/source_ref/label + server-resolved operator) are **server-stored at StartIntake** and authoritative; Commit carries only receive-determined facts. Client cannot restate intent. |
+| 16 | **Per-intake concurrency** (codex r2) | UUID temp names (not `<pid>`); per-intake ledger lock for serialized appends; explicit `streaming→committing→verifying` state machine; Commit rejected while any upload is in flight. |
+| 17 | **Mixed-source resume hazard** (codex r2) | `source_plan_digest` bound into StartIntake's canonical hash; a resume against a different card → conflict, never a merged intake. |
+| 18 | **Commit retry safety** (codex r2) | Commit idempotent on `(intake_id, manifest_digest)`: same digest → current status; different digest on a committed intake → conflict. |
 
 ## 16. Review trail
 
@@ -711,3 +806,25 @@ without real hardware.
   - *Medium* — resume receipt durability unspecified. Fixed: durable
     `receive-receipts.jsonl` append-after-rename ledger; explicitly rejects O(size)
     re-hash (§7 `ListIntakeFiles`, §11, §15 Q5).
+- **2026-06-30 — codex document review, round 2 (6 findings folded).**
+  - *High* — package inner indexes were described but had no proto carriage (Commit
+    accumulated them and dropped them). Fixed: `CommitIntakeRequest.package_indexes`
+    (`PackageIndex`/`PackageMemberEntry`) + `receive_facts.package_profile_version`/
+    `_hash`; the client now sends them and the server writes per-package tag files
+    (§5, §8, §15 Q14).
+  - *High* — Commit restated metadata already bound at StartIntake (a second,
+    divergent source of truth; the sample even dropped `source_ref`). Fixed: the five
+    intent fields are server-stored at StartIntake and authoritative for `bag-info.txt`;
+    Commit carries only receive-determined facts (§5 `ReceiveFacts`, §7, §15 Q15).
+  - *High* — per-intake concurrency underspecified (`<pid>` temp-name collision for
+    two same-relpath streams, unlocked JSONL ledger, no seal-vs-write ordering). Fixed:
+    UUID temp names, per-intake ledger lock, explicit `streaming→committing→verifying`
+    state machine with Commit gated on a zero in-flight counter (§7, §15 Q16).
+  - *Medium* — resume could merge two cards under a reused key. Fixed:
+    `source_plan_digest` bound into StartIntake's canonical hash; different card →
+    conflict (§5, §8, §11, §15 Q17).
+  - *Medium* — Commit had no retry/idempotency contract. Fixed: idempotent on
+    `(intake_id, manifest_digest)` (§5, §7, §15 Q18).
+  - *Low* — `source_kind` comment dropped `download` (front-door includes it). Fixed
+    to `card | drive | upload | handoff | download | other` (§5), matching
+    `SOURCE_KIND_CHOICES`.
