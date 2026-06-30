@@ -891,15 +891,13 @@ the sweep as a periodic background task.
 | `packages/sutra-agent/src/sutra_agent/ledger.py` | Record `idempotency_key → {intake_id, plan_digest}` for the warm-resume trust gate (§11) |
 | `packages/sutra-agent/src/sutra_agent/cli.py` | `--server` / `--client-cert` / `--ca-cert` / `enroll` |
 
-### Prerequisite (must land first — NOT yet implemented)
+### Prerequisite — **now satisfied**
 
 - **`sutra intake watch`** — the single registrar that verifies fixity, registers into
   the catalog, and writes `intake.verified.json` / `intake.quarantined.json` /
-  `intake.discrepancy.json`. **It does not exist yet** — the intake CLI today has only
-  `inspect`/`register`/`accept`/`prepare`, and `design-intake-watch.md` is still *for
-  review*. This streaming design **cannot function without it** (the gRPC path writes no
-  terminal markers itself), so `intake watch` is a hard prerequisite to be approved +
-  built before this work lands — not a pre-existing reuse.
+  `intake.discrepancy.json`. **Implemented 2026-06-30** (`src/sutradhara/intake_watch.py`,
+  `sutra intake watch`; `design-intake-watch.md` is `current`). The gRPC path writes no
+  terminal markers itself; it hands off complete bags to this watcher.
 
 ### Reused (not reimplemented)
 
@@ -992,7 +990,7 @@ receive` against a fake-source directory, and asserts the watcher writes
 | 3 | **Package normalization: client-side before streaming, or a server planning step?** (codex) | **Client-side**, via the shared `sutradhara_receive` payload planner. The `package-tar-v1` is produced once at receive (its hash is the package identity, per front-door §12.1); it streams on the fly (no full local buffer) as one payload unit; its inner index ships at `CommitIntake`. No server planning RPC. |
 | 4 | StartIntake idempotency scope | Reuses the HTTP API's durable store: scoped `(operator, "grpc:StartIntake", key)` + canonical request hash; reused key with a changed request → conflict. |
 | 5 | Resume receipt durability | Durable `receive-receipts.jsonl` append-after-rename ledger; O(remaining), not O(size) re-hash on restart. |
-| 6 | Proto location | `packages/sutra-agent/proto/` — both client and server are Python in the same repo; move to shared location if a native client (Swift/Go) is ever built. |
+| 6 | Proto location | **Corrected at prompt time:** the repo already uses gRPC — `.proto` source lives in `proto/` (`proto/intake.proto`, beside `proto/layer5.proto`); committed stubs regenerate via `scripts/regenerate-proto.sh` into `src/sutradhara/_proto/` (server) **and** `packages/sutra-agent/src/sutra_agent/_proto/` (agent), keeping `sutradhara-receive` grpc-free. (Was: `packages/sutra-agent/proto/`.) See `prompt-streaming-intake-grpc.md`. |
 | 7 | Mid-file byte-level resume | Deferred (v2); `offset` field reserved in proto; re-upload of a partial unit on disconnect is acceptable on 10G LAN. |
 | 8 | CRL / cert revocation | Device blocklist (drop mapping + block fingerprint) for v1; CRL deferred. |
 | 9 | GUI | Deferred — thin shell over `sutra-agent` CLI, separate design. |
