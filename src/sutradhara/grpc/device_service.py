@@ -8,6 +8,7 @@ gRPC writes single-threaded while HTTP handlers can enqueue work safely.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ from sutradhara.grpc.registry import (
     RegisteredDeviceStream,
     StreamClosed,
 )
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -117,13 +120,22 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
 
     def _complete_ack(self, pending: PendingCommand, ack: Any) -> None:
         if ack.status == device_pb2.COMMAND_ACK_STATUS_ACCEPTED and ack.intake_id:
-            self._complete_receive(
+            completed = self._complete_receive(
                 operator=pending.operator,
                 device_id=pending.device_id,
                 card_id=pending.card_id,
                 idempotency_key=pending.idempotency_key,
                 intake_id=ack.intake_id,
+                abandon_on_failure=pending.abandon_on_reject,
             )
+            if not completed:
+                LOG.warning(
+                    "dropped device receive ack with failed card correlation: "
+                    "device_id=%s intake_id=%s card_id=%s",
+                    pending.device_id,
+                    ack.intake_id,
+                    pending.card_id,
+                )
             return
         if pending.abandon_on_reject:
             api_store.abandon_idempotency(
@@ -143,6 +155,7 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
             card_id=receive.card_id,
             idempotency_key=receive.idempotency_key,
             intake_id=receive.intake_id,
+            abandon_on_failure=False,
         )
 
     def _complete_receive(
@@ -153,16 +166,26 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
         card_id: str,
         idempotency_key: str,
         intake_id: str,
-    ) -> None:
+        abandon_on_failure: bool,
+    ) -> bool:
         factory = make_session_factory(self.config.engine)
         with factory.begin() as session:
-            grpc_store.set_card_id(
+            correlated = grpc_store.set_card_id(
                 session,
                 intake_id=intake_id,
                 operator=operator,
                 device_id=device_id,
                 card_id=card_id,
             )
+        if not correlated:
+            if abandon_on_failure:
+                api_store.abandon_idempotency(
+                    self.config.engine,
+                    operator_username=operator,
+                    endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+                    idempotency_key=idempotency_key,
+                )
+            return False
         api_store.complete_idempotency(
             self.config.engine,
             operator_username=operator,
@@ -171,6 +194,7 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
             intake_id=intake_id,
             response_json={"intakeId": intake_id, "status": "streaming"},
         )
+        return True
 
     def _identity(self, context: Any) -> grpc_store.DeviceIdentity:
         try:

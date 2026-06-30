@@ -109,11 +109,9 @@ def test_device_service_ack_correlates_card_id_and_completes_http_idempotency(
     )
     assert pending.future.result(timeout=2).intake_id == "intake-1"
     _eventually(lambda: _stored_card_id(engine) == "card-1")
+    _eventually(lambda: _idempotency_status(engine) == "completed")
     with session_scope(engine) as session:
-        record = session.scalars(
-            select(api_store.IdempotencyRecord)
-        ).one()
-        assert record.status == "completed"
+        record = session.scalars(select(api_store.IdempotencyRecord)).one()
         assert record.response_json == {"intakeId": "intake-1", "status": "streaming"}
     messages.close()
     responses.close()
@@ -177,10 +175,92 @@ def test_active_receives_rebuilds_card_correlation_after_restart(
     thread.join(timeout=2)
 
 
+def test_device_service_ack_does_not_complete_when_card_correlation_fails(
+    engine: Engine,
+) -> None:
+    registry = ConnectedDeviceRegistry()
+    servicer = DeviceService(DeviceServiceConfig(engine=engine, registry=registry))
+    with session_scope(engine) as session:
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+    api_store.begin_idempotency(
+        engine,
+        operator_username="owner",
+        endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+        idempotency_key="key-1",
+        request_hash="a" * 64,
+    )
+
+    messages = _BlockingIterator()
+    responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
+    next_response: queue.Queue[object] = queue.Queue()
+    thread = threading.Thread(
+        target=lambda: next_response.put(next(responses)),
+        daemon=True,
+    )
+    thread.start()
+    messages.put(
+        device_pb2.DeviceMessage(
+            card_snapshot=device_pb2.CardSnapshot(
+                cards=[
+                    device_pb2.Card(
+                        card_id="card-1",
+                        label="Card 1",
+                        kind=device_pb2.CARD_KIND_CARD,
+                        size_bytes=10,
+                        status="available",
+                    )
+                ]
+            )
+        )
+    )
+    _eventually(lambda: registry.devices_for("owner")[0].cards[0].card_id == "card-1")
+    pending = registry.send_start_receive(
+        operator="owner",
+        device_id="mac-1",
+        card_id="card-1",
+        artifactclass="s-masters",
+        label="Card 1",
+        source_ref=None,
+        idempotency_key="key-1",
+    )
+    response = next_response.get(timeout=2)
+    assert response.start_receive.command_id == pending.command_id
+
+    messages.put(
+        device_pb2.DeviceMessage(
+            command_ack=device_pb2.CommandAck(
+                command_id=pending.command_id,
+                status=device_pb2.COMMAND_ACK_STATUS_ACCEPTED,
+                intake_id="missing-intake",
+            )
+        )
+    )
+    assert pending.future.result(timeout=2).intake_id == "missing-intake"
+    _eventually(lambda: _idempotency_record_count(engine) == 0)
+    messages.close()
+    responses.close()
+
+
 def _stored_card_id(engine: Engine) -> str | None:
     with session_scope(engine) as session:
         row = grpc_store.get_intake(session, "intake-1")
         return None if row is None else row.card_id
+
+
+def _idempotency_record_count(engine: Engine) -> int:
+    with session_scope(engine) as session:
+        return len(list(session.scalars(select(api_store.IdempotencyRecord))))
+
+
+def _idempotency_status(engine: Engine) -> str | None:
+    with session_scope(engine) as session:
+        record = session.scalars(select(api_store.IdempotencyRecord)).one_or_none()
+        return None if record is None else record.status
 
 
 def _ignore_stop_iteration(iterator: Iterator[object]) -> None:

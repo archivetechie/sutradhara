@@ -275,6 +275,16 @@ def consume_enroll_token(
     return EnrollTokenGrant(operator=row.operator, device_id=row.device_id)
 
 
+def release_enroll_token(session: Session, token: str) -> bool:
+    """Clear a consumed enrollment token after certificate signing fails."""
+
+    row = session.get(GrpcEnrollToken, token)
+    if row is None or row.used_at is None:
+        return False
+    row.used_at = None
+    return True
+
+
 def record_device_enrollment(
     session: Session,
     *,

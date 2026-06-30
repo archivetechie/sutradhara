@@ -190,25 +190,30 @@ def sign_device_csr(
     factory = make_session_factory(engine)
     with factory.begin() as session:
         grant = store.consume_enroll_token(session, token, device_id=device_id)
-    ca_cert, ca_key = ensure_ca(pki_dir)
-    _run_openssl(
-        [
-            "x509",
-            "-req",
-            "-in",
-            str(csr),
-            "-CA",
-            str(ca_cert),
-            "-CAkey",
-            str(ca_key),
-            "-CAcreateserial",
-            "-out",
-            str(output),
-            "-days",
-            "825",
-            "-sha256",
-        ]
-    )
+    try:
+        ca_cert, ca_key = ensure_ca(pki_dir)
+        _run_openssl(
+            [
+                "x509",
+                "-req",
+                "-in",
+                str(csr),
+                "-CA",
+                str(ca_cert),
+                "-CAkey",
+                str(ca_key),
+                "-CAcreateserial",
+                "-out",
+                str(output),
+                "-days",
+                "825",
+                "-sha256",
+            ]
+        )
+    except Exception:
+        with factory.begin() as session:
+            store.release_enroll_token(session, token)
+        raise
     fingerprint = cert_fingerprint(output)
     with factory.begin() as session:
         store.record_device_enrollment(

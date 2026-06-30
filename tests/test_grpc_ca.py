@@ -70,6 +70,33 @@ def test_token_device_id_must_match_csr_common_name(engine: Engine, tmp_path) ->
         )
 
 
+def test_signing_failure_releases_enrollment_token(engine: Engine, tmp_path, monkeypatch) -> None:
+    material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
+    with session_scope(engine) as session:
+        token = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
+
+    original_run_openssl = ca._run_openssl
+
+    def fail_device_signing(args: list[str]) -> str:
+        if args[:2] == ["x509", "-req"]:
+            raise ca.CertificateError("signing failed")
+        return original_run_openssl(args)
+
+    monkeypatch.setattr(ca, "_run_openssl", fail_device_signing)
+    with pytest.raises(ca.CertificateError, match="signing failed"):
+        ca.sign_device_csr(
+            engine,
+            pki_dir=tmp_path / "pki",
+            csr_path=material.csr_path,
+            token=token,
+        )
+
+    with session_scope(engine) as session:
+        row = session.get(store.GrpcEnrollToken, token)
+        assert row is not None
+        assert row.used_at is None
+
+
 class _FakeContext:
     def __init__(self, common_name: str, pem: str) -> None:
         self._common_name = common_name

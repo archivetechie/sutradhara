@@ -95,7 +95,7 @@ def serve_cmd(
     )
     app = create_app(engine, ensure_schema=False, registry=registry, grpc_pki_dir=pki_dir)
     grpc_server.start()
-    sweep_stop, sweep_thread = start_sweep_loop(landing_root)
+    sweep_stop, sweep_thread = start_sweep_loop(landing_root, registry=registry)
     click.echo(f"serving gRPC intake/control on {grpc_bind}:{grpc_port}")
     try:
         if api_tcp:

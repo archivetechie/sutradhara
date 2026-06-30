@@ -9,7 +9,6 @@ from sqlalchemy import Engine
 
 from sutradhara.catalog.session import session_scope
 from sutradhara.grpc import ca, store
-from sutradhara.grpc.admin import revoke_device
 from sutradhara.grpc.registry import ConnectedDeviceRegistry
 from sutradhara.grpc.store import DeviceIdentity
 from tests.api.conftest import make_api_app, post_headers
@@ -100,6 +99,16 @@ def test_revoke_device_can_evict_live_registry_stream(api_engine: Engine) -> Non
             cert_fingerprint="AA" * 32,
             operator="owner",
         )
-    assert revoke_device(api_engine, "mac-1", registry=registry) == 1
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
 
+    response = client.post("/api/devices/mac-1/revoke", headers=post_headers("admin"))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "deviceId": "mac-1",
+        "revokedEnrollments": 1,
+        "evicted": True,
+    }
     assert registry.devices_for("owner") == []

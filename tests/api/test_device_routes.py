@@ -6,8 +6,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
 
+from sutradhara.api import store as api_store
 from sutradhara.catalog.session import session_scope
 from sutradhara.grpc import store as grpc_store
 from sutradhara.grpc.registry import Card, CommandAck, ConnectedDeviceRegistry
@@ -147,6 +148,79 @@ def test_post_device_receive_early_ack_completes_idempotency_and_replays(
         row = grpc_store.get_intake(session, "intake-1")
         assert row is not None
         assert row.card_id == "card-1"
+
+
+def test_post_device_receive_in_progress_does_not_recommand(
+    api_engine: Engine,
+) -> None:
+    registry = _online_registry(api_engine)
+    call_count = 0
+    original = registry.send_start_receive
+
+    def no_ack(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original(**kwargs)
+
+    registry.send_start_receive = no_ack  # type: ignore[method-assign]
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    app.state.command_ack_timeout = 0.01
+    client = TestClient(app)
+    payload = {
+        "card_id": "card-1",
+        "artifactclass": "s-masters",
+        "idempotencyKey": str(uuid4()),
+    }
+
+    first = client.post("/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload)
+    retry = client.post("/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload)
+
+    assert first.status_code == 409
+    assert first.json()["error"] == "ack_timeout"
+    assert retry.status_code == 409
+    assert retry.json()["error"] == "already_in_progress"
+    assert call_count == 1
+
+
+def test_post_device_receive_does_not_complete_when_card_correlation_fails(
+    api_engine: Engine,
+) -> None:
+    registry = _online_registry(api_engine)
+    original = registry.send_start_receive
+
+    def bad_ack(**kwargs):
+        pending = original(**kwargs)
+        pending.future.set_result(
+            CommandAck(
+                command_id=pending.command_id,
+                accepted=True,
+                reason=None,
+                intake_id="missing-intake",
+            )
+        )
+        return pending
+
+    registry.send_start_receive = bad_ack  # type: ignore[method-assign]
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/devices/mac-1/receive",
+        headers=post_headers("operator"),
+        json={
+            "card_id": "card-1",
+            "artifactclass": "s-masters",
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "correlation_failed"
+    with session_scope(api_engine) as session:
+        records = list(session.scalars(select(api_store.IdempotencyRecord)))
+        assert records == []
 
 
 def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path: Path) -> None:

@@ -69,7 +69,6 @@ def serve_grpc_cmd(
     engine = make_engine()
     create_all(engine)
     factory = make_session_factory(engine)
-    registry = ConnectedDeviceRegistry()
     if issue_enroll_token:
         if not operator_name:
             raise click.ClickException("--operator is required with --issue-enroll-token")
@@ -84,7 +83,7 @@ def serve_grpc_cmd(
         click.echo(minted)
         return
     if revoke_device is not None:
-        count = revoke_device_admin(engine, revoke_device, registry=registry)
+        count = revoke_device_admin(engine, revoke_device)
         click.echo(f"revoked {count} enrollment(s) for {revoke_device}")
         return
     if sign_csr is not None:
@@ -101,6 +100,7 @@ def serve_grpc_cmd(
         click.echo(f"fingerprint: {signed.fingerprint}")
         return
 
+    registry = ConnectedDeviceRegistry()
     landing_root.mkdir(parents=True, exist_ok=True)
     server = make_server(
         GrpcServerConfig(
@@ -114,7 +114,7 @@ def serve_grpc_cmd(
         )
     )
     server.start()
-    sweep_stop, sweep_thread = start_sweep_loop(landing_root)
+    sweep_stop, sweep_thread = start_sweep_loop(landing_root, registry=registry)
     click.echo(f"serving gRPC intake on {bind}:{port}")
     try:
         server.wait_for_termination()

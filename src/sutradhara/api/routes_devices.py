@@ -14,6 +14,7 @@ import hashlib
 import json
 import tempfile
 import threading
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -94,9 +95,14 @@ async def get_devices(request: Request) -> dict[str, object]:
     identity = _require_view(parse_identity(request.headers))
     registry = _registry(request)
     devices = await anyio.to_thread.run_sync(registry.devices_for, identity.operator_username)
+    receives = await anyio.to_thread.run_sync(
+        _receive_payloads_for_operator,
+        request.app.state.engine,
+        identity.operator_username,
+    )
     return {
         "devices": [_device_payload(device) for device in devices],
-        "receives": _receive_payloads(request, identity),
+        "receives": receives,
     }
 
 
@@ -111,8 +117,15 @@ async def post_device_receive(
     identity = _require_receive(parse_identity(request.headers))
     engine = request.app.state.engine
     try:
-        _validate_device_owner(engine, operator=identity.operator_username, device_id=device_id)
-        _validate_artifactclass(engine, body.artifactclass)
+        await anyio.to_thread.run_sync(
+            partial(
+                _validate_receive_start,
+                engine,
+                operator=identity.operator_username,
+                device_id=device_id,
+                artifactclass=body.artifactclass,
+            )
+        )
     except PermissionError as exc:
         _raise(403, "forbidden", str(exc))
     except ArtifactClassPolicyError as exc:
@@ -120,13 +133,16 @@ async def post_device_receive(
 
     idempotency_key = str(body.idempotencyKey)
     request_hash = _device_receive_hash(device_id, body)
-    decision = api_store.begin_idempotency(
-        engine,
-        operator_username=identity.operator_username,
-        endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
-        idempotency_key=idempotency_key,
-        request_hash=request_hash,
-        ttl=request.app.state.idempotency_ttl,
+    decision = await anyio.to_thread.run_sync(
+        partial(
+            api_store.begin_idempotency,
+            engine,
+            operator_username=identity.operator_username,
+            endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            ttl=request.app.state.idempotency_ttl,
+        )
     )
     if decision.state == "conflict":
         _raise(409, "idempotency_conflict", "same idempotencyKey used with a different body")
@@ -134,23 +150,28 @@ async def post_device_receive(
         if decision.response_json is None:
             _raise(409, "idempotency_conflict", "completed request has no stored response")
         return {str(key): str(value) for key, value in decision.response_json.items()}
+    if decision.state == "in_progress":
+        _raise(409, "already_in_progress", "receive is already in progress")
 
     try:
-        pending = _registry(request).send_start_receive(
-            operator=identity.operator_username,
-            device_id=device_id,
-            card_id=body.card_id,
-            artifactclass=body.artifactclass,
-            label=body.label,
-            source_ref=body.source_ref,
-            idempotency_key=idempotency_key,
-            abandon_on_reject=decision.state == "claimed",
+        pending = await anyio.to_thread.run_sync(
+            partial(
+                _registry(request).send_start_receive,
+                operator=identity.operator_username,
+                device_id=device_id,
+                card_id=body.card_id,
+                artifactclass=body.artifactclass,
+                label=body.label,
+                source_ref=body.source_ref,
+                idempotency_key=idempotency_key,
+                abandon_on_reject=True,
+            )
         )
     except DeviceOwnerMismatch as exc:
-        _abandon_if_new_claim(request, identity, idempotency_key, decision.state)
+        await _abandon_if_new_claim(request, identity, idempotency_key, decision.state)
         _raise(403, "forbidden", str(exc))
     except (DeviceOffline, CardUnavailable) as exc:
-        _abandon_if_new_claim(request, identity, idempotency_key, decision.state)
+        await _abandon_if_new_claim(request, identity, idempotency_key, decision.state)
         _raise(409, "device_unavailable", str(exc))
 
     try:
@@ -158,30 +179,49 @@ async def post_device_receive(
     except TimeoutError:
         _raise(409, "ack_timeout", "device did not ack before the advisory timeout")
     except PermissionError as exc:
-        _abandon_if_new_claim(request, identity, idempotency_key, decision.state)
+        await _abandon_if_new_claim(request, identity, idempotency_key, decision.state)
         _raise(403, "forbidden", str(exc))
     except RuntimeError as exc:
         _raise(409, "device_unavailable", str(exc))
 
     if not ack.accepted or not ack.intake_id:
         if pending.abandon_on_reject:
-            api_store.abandon_idempotency(
-                engine,
-                operator_username=identity.operator_username,
-                endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
-                idempotency_key=idempotency_key,
+            await anyio.to_thread.run_sync(
+                partial(
+                    api_store.abandon_idempotency,
+                    engine,
+                    operator_username=identity.operator_username,
+                    endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+                    idempotency_key=idempotency_key,
+                )
             )
         _raise(409, "receive_rejected", ack.reason or "device rejected receive")
 
-    _complete_http_receive(
-        engine,
-        operator=identity.operator_username,
-        device_id=device_id,
-        card_id=body.card_id,
-        idempotency_key=idempotency_key,
-        intake_id=ack.intake_id,
+    completed = await anyio.to_thread.run_sync(
+        partial(
+            _complete_http_receive,
+            engine,
+            operator=identity.operator_username,
+            device_id=device_id,
+            card_id=body.card_id,
+            idempotency_key=idempotency_key,
+            intake_id=ack.intake_id,
+            abandon_on_failure=pending.abandon_on_reject,
+        )
     )
+    if not completed:
+        _raise(409, "correlation_failed", "device ack did not match an owned intake")
     return {"intakeId": ack.intake_id, "status": "streaming"}
+
+
+@router.post("/api/devices/{device_id}/revoke")
+async def post_revoke_device(device_id: str, request: Request) -> dict[str, object]:
+    """Revoke a device and evict its live stream from this server process."""
+
+    _require_admin(parse_identity(request.headers))
+    return await anyio.to_thread.run_sync(
+        partial(_revoke_device, request.app.state.engine, _registry(request), device_id)
+    )
 
 
 @router.get("/api/intake/{intake_id}/status")
@@ -275,6 +315,24 @@ def _require_receive(identity: Identity) -> Identity:
     return identity
 
 
+def _require_admin(identity: Identity) -> Identity:
+    _require_view(identity)
+    if not identity.has_capability("can_admin"):
+        _raise(403, "forbidden", "your group doesn't permit this")
+    return identity
+
+
+def _validate_receive_start(
+    engine: object,
+    *,
+    operator: str,
+    device_id: str,
+    artifactclass: str,
+) -> None:
+    _validate_device_owner(engine, operator=operator, device_id=device_id)
+    _validate_artifactclass(engine, artifactclass)
+
+
 def _validate_device_owner(engine: object, *, operator: str, device_id: str) -> None:
     factory = make_session_factory(engine)
     with factory() as session:
@@ -307,14 +365,14 @@ def _device_payload(device: object) -> dict[str, object]:
     }
 
 
-def _receive_payloads(request: Request, identity: Identity) -> list[dict[str, str | None]]:
-    factory = make_session_factory(request.app.state.engine)
+def _receive_payloads_for_operator(engine: object, operator_username: str) -> list[dict[str, str | None]]:
+    factory = make_session_factory(engine)
     with factory() as session:
         rows = list(
             session.scalars(
                 select(grpc_store.GrpcIntake)
                 .where(
-                    grpc_store.GrpcIntake.operator == identity.operator_username,
+                    grpc_store.GrpcIntake.operator == operator_username,
                     grpc_store.GrpcIntake.state.in_(("streaming", "committing", "committed")),
                 )
                 .order_by(grpc_store.GrpcIntake.created_at)
@@ -353,7 +411,7 @@ async def _await_ack(future: object, *, timeout: float) -> CommandAck:
     return await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
 
 
-def _abandon_if_new_claim(
+async def _abandon_if_new_claim(
     request: Request,
     identity: Identity,
     idempotency_key: str,
@@ -361,11 +419,14 @@ def _abandon_if_new_claim(
 ) -> None:
     if state != "claimed":
         return
-    api_store.abandon_idempotency(
-        request.app.state.engine,
-        operator_username=identity.operator_username,
-        endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
-        idempotency_key=idempotency_key,
+    await anyio.to_thread.run_sync(
+        partial(
+            api_store.abandon_idempotency,
+            request.app.state.engine,
+            operator_username=identity.operator_username,
+            endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+            idempotency_key=idempotency_key,
+        )
     )
 
 
@@ -377,16 +438,26 @@ def _complete_http_receive(
     card_id: str,
     idempotency_key: str,
     intake_id: str,
-) -> None:
+    abandon_on_failure: bool,
+) -> bool:
     factory = make_session_factory(engine)
     with factory.begin() as session:
-        grpc_store.set_card_id(
+        correlated = grpc_store.set_card_id(
             session,
             intake_id=intake_id,
             operator=operator,
             device_id=device_id,
             card_id=card_id,
         )
+    if not correlated:
+        if abandon_on_failure:
+            api_store.abandon_idempotency(
+                engine,
+                operator_username=operator,
+                endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+                idempotency_key=idempotency_key,
+            )
+        return False
     api_store.complete_idempotency(
         engine,
         operator_username=operator,
@@ -395,6 +466,22 @@ def _complete_http_receive(
         intake_id=intake_id,
         response_json={"intakeId": intake_id, "status": "streaming"},
     )
+    return True
+
+
+def _revoke_device(
+    engine: object,
+    registry: ConnectedDeviceRegistry,
+    device_id: str,
+) -> dict[str, object]:
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        revoked = grpc_store.revoke_device(session, device_id)
+    return {
+        "deviceId": device_id,
+        "revokedEnrollments": revoked,
+        "evicted": registry.evict(device_id),
+    }
 
 
 def _raise(status_code: int, error: str, detail: str) -> None:

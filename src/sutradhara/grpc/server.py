@@ -22,6 +22,7 @@ from sutradhara_receive import sweep_orphans
 
 DEFAULT_GRPC_PORT = 50051
 DEFAULT_LANDING_ROOT = Path("/replica/landing")
+DEFAULT_HEARTBEAT_TTL = dt.timedelta(seconds=60)
 
 
 @dataclass(frozen=True)
@@ -88,12 +89,16 @@ def sweep_landing_once(
     landing_root: Path,
     *,
     older_than: dt.timedelta = dt.timedelta(hours=24),
+    registry: ConnectedDeviceRegistry | None = None,
+    heartbeat_ttl: dt.timedelta = DEFAULT_HEARTBEAT_TTL,
     now: dt.datetime | None = None,
 ) -> None:
-    """Sweep stale gRPC receive filesystem state."""
+    """Sweep stale gRPC receive filesystem state and dead helper streams."""
 
     current = now or dt.datetime.now(dt.UTC)
     sweep_orphans(landing_root, older_than=older_than, now=current)
+    if registry is not None:
+        registry.evict_stale(ttl=heartbeat_ttl, now=current)
     if not landing_root.exists():
         return
     cutoff = current - older_than
@@ -118,6 +123,8 @@ def start_sweep_loop(
     *,
     interval_seconds: float = 3600.0,
     older_than: dt.timedelta = dt.timedelta(hours=24),
+    registry: ConnectedDeviceRegistry | None = None,
+    heartbeat_ttl: dt.timedelta = DEFAULT_HEARTBEAT_TTL,
 ) -> tuple[threading.Event, threading.Thread]:
     """Start a background stale-receive sweep loop for ``serve-grpc``."""
 
@@ -125,7 +132,12 @@ def start_sweep_loop(
 
     def run() -> None:
         while not stop.wait(interval_seconds):
-            sweep_landing_once(landing_root, older_than=older_than)
+            sweep_landing_once(
+                landing_root,
+                older_than=older_than,
+                registry=registry,
+                heartbeat_ttl=heartbeat_ttl,
+            )
 
     thread = threading.Thread(target=run, name="sutra-grpc-sweep", daemon=True)
     thread.start()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from sutradhara.grpc.registry import (
     DeviceOffline,
     StreamClosed,
 )
+from sutradhara.grpc.server import sweep_landing_once
 from sutradhara.grpc.store import DeviceIdentity
 
 
@@ -124,3 +126,17 @@ def test_ttl_eviction_removes_device_and_fails_commands() -> None:
             source_ref=None,
             idempotency_key="key-2",
         )
+
+
+def test_sweep_landing_once_also_evicts_stale_registry_stream(tmp_path: Path) -> None:
+    registry = ConnectedDeviceRegistry()
+    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+
+    sweep_landing_once(
+        tmp_path / "landing",
+        registry=registry,
+        heartbeat_ttl=dt.timedelta(seconds=1),
+        now=dt.datetime.now(dt.UTC) + dt.timedelta(seconds=2),
+    )
+
+    assert registry.devices_for("owner") == []
