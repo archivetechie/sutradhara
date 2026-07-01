@@ -27,6 +27,7 @@ from sutradhara.grpc.registry import (
     CommandAck,
     ConnectedDeviceRegistry,
     PendingCommand,
+    PendingListing,
     RegisteredDeviceStream,
     StreamClosed,
 )
@@ -72,13 +73,16 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
                 if pending is None:
                     continue
                 if not self._dispatch_authorized(identity):
-                    stream.fail_command(
-                        pending.command_id,
+                    stream.fail_pending(
+                        pending,
                         PermissionError("device certificate is no longer enrolled"),
                     )
                     stream.close(PermissionError("device certificate is no longer enrolled"))
                     break
-                yield device_pb2.ServerCommand(start_receive=pending.command)
+                if isinstance(pending, PendingCommand):
+                    yield device_pb2.ServerCommand(start_receive=pending.command)
+                elif isinstance(pending, PendingListing):
+                    yield device_pb2.ServerCommand(list_directory=pending.command)
         finally:
             stop.set()
             stream.close(StreamClosed("device stream ended"))
@@ -104,7 +108,10 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
     def _handle_message(self, stream: RegisteredDeviceStream, message: Any) -> None:
         kind = message.WhichOneof("payload")
         if kind == "card_snapshot":
-            stream.update_cards([_card_from_proto(card) for card in message.card_snapshot.cards])
+            stream.update_cards(
+                [_card_from_proto(card) for card in message.card_snapshot.cards],
+                capabilities=list(message.card_snapshot.capabilities),
+            )
             return
         if kind == "heartbeat":
             stream.heartbeat()
@@ -117,6 +124,9 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
         if kind == "active_receives":
             for receive in message.active_receives.receives:
                 self._rebuild_active_receive(stream, receive)
+            return
+        if kind == "directory_listing":
+            stream.directory_listing(message.directory_listing)
 
     def _complete_ack(self, pending: PendingCommand, ack: Any) -> None:
         if ack.status == device_pb2.COMMAND_ACK_STATUS_ACCEPTED and ack.intake_id:

@@ -79,6 +79,21 @@ class PendingCommand:
 
 
 @dataclass(frozen=True)
+class PendingListing:
+    """A ListDirectory request plus the metadata needed to complete its reply."""
+
+    request_id: str
+    operator: str
+    device_id: str
+    card_id: str
+    rel_path: str
+    generation: int
+    command: device_pb2.ListDirectory
+    future: Future[Any]
+    created_at: dt.datetime
+
+
+@dataclass(frozen=True)
 class DeviceView:
     """Snapshot returned to the HTTP API."""
 
@@ -86,6 +101,7 @@ class DeviceView:
     operator: str
     generation: int
     cards: tuple[Card, ...]
+    capabilities: tuple[str, ...]
     last_seen: dt.datetime
 
 
@@ -93,9 +109,11 @@ class DeviceView:
 class _DeviceEntry:
     identity: DeviceIdentity
     generation: int
-    command_queue: queue.Queue[PendingCommand | None] = field(default_factory=queue.Queue)
+    command_queue: queue.Queue[PendingCommand | PendingListing | None] = field(default_factory=queue.Queue)
     pending: dict[str, PendingCommand] = field(default_factory=dict)
+    pending_listings: dict[str, PendingListing] = field(default_factory=dict)
     cards: dict[str, Card] = field(default_factory=dict)
+    capabilities: tuple[str, ...] = ()
     last_seen: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.UTC))
     close_stream: Any | None = None
     closed: bool = False
@@ -115,10 +133,15 @@ class RegisteredDeviceStream:
         self.device_id = device_id
         self.generation = generation
 
-    def update_cards(self, cards: list[Card]) -> None:
+    def update_cards(self, cards: list[Card], capabilities: list[str] | None = None) -> None:
         """Replace this stream's card snapshot."""
 
-        self._registry.update_cards(self.device_id, self.generation, cards)
+        self._registry.update_cards(
+            self.device_id,
+            self.generation,
+            cards,
+            capabilities=capabilities,
+        )
 
     def heartbeat(self) -> None:
         """Mark this stream alive."""
@@ -130,10 +153,28 @@ class RegisteredDeviceStream:
 
         return self._registry.ack_command(self.device_id, self.generation, ack)
 
-    def next_command(self, *, timeout: float = 0.25) -> PendingCommand | None:
+    def directory_listing(self, listing: Any) -> PendingListing | None:
+        """Resolve a pending directory listing for this stream."""
+
+        return self._registry.complete_directory_listing(
+            self.device_id,
+            self.generation,
+            listing,
+        )
+
+    def next_command(self, *, timeout: float = 0.25) -> PendingCommand | PendingListing | None:
         """Return the next queued command for this stream."""
 
         return self._registry.next_command(self.device_id, self.generation, timeout=timeout)
+
+    def fail_pending(
+        self,
+        pending: PendingCommand | PendingListing,
+        exc: BaseException,
+    ) -> PendingCommand | PendingListing | None:
+        """Fail one pending item on this stream."""
+
+        return self._registry.fail_pending(self.device_id, self.generation, pending, exc)
 
     def fail_command(self, command_id: str, exc: BaseException) -> PendingCommand | None:
         """Fail one pending command on this stream."""
@@ -181,12 +222,20 @@ class ConnectedDeviceRegistry:
                 generation=generation,
             )
 
-    def update_cards(self, device_id: str, generation: int, cards: list[Card]) -> None:
+    def update_cards(
+        self,
+        device_id: str,
+        generation: int,
+        cards: list[Card],
+        *,
+        capabilities: list[str] | None = None,
+    ) -> None:
         """Replace the current card snapshot for a live stream."""
 
         with self._lock:
             entry = self._current_entry_locked(device_id, generation)
             entry.cards = {card.card_id: card for card in cards}
+            entry.capabilities = tuple(sorted(set(capabilities or ())))
             entry.last_seen = dt.datetime.now(dt.UTC)
 
     def heartbeat(self, device_id: str, generation: int) -> None:
@@ -206,12 +255,27 @@ class ConnectedDeviceRegistry:
                     operator=entry.identity.operator,
                     generation=entry.generation,
                     cards=tuple(sorted(entry.cards.values(), key=lambda card: card.card_id)),
+                    capabilities=entry.capabilities,
                     last_seen=entry.last_seen,
                 )
                 for device_id, entry in self._entries.items()
                 if not entry.closed and entry.identity.operator == operator
             ]
         return sorted(devices, key=lambda item: item.device_id)
+
+    def device_for(self, *, operator: str, device_id: str) -> DeviceView:
+        """Return one online device view after owner checks."""
+
+        with self._lock:
+            entry = self._entry_for_operator_locked(operator, device_id)
+            return DeviceView(
+                device_id=device_id,
+                operator=entry.identity.operator,
+                generation=entry.generation,
+                cards=tuple(sorted(entry.cards.values(), key=lambda card: card.card_id)),
+                capabilities=entry.capabilities,
+                last_seen=entry.last_seen,
+            )
 
     def card_for(self, *, operator: str, device_id: str, card_id: str) -> Card:
         """Return one online card after owner and availability checks."""
@@ -266,13 +330,48 @@ class ConnectedDeviceRegistry:
             entry.command_queue.put(pending)
             return pending
 
+    def request_directory_listing(
+        self,
+        *,
+        operator: str,
+        device_id: str,
+        card_id: str,
+        rel_path: str,
+    ) -> PendingListing:
+        """Queue a ListDirectory request for a live, operator-owned device."""
+
+        with self._lock:
+            entry = self._entry_for_operator_locked(operator, device_id)
+            if card_id not in entry.cards:
+                raise CardUnavailable("card is not present on the device")
+            request_id = uuid.uuid4().hex
+            future: Future[Any] = Future()
+            pending = PendingListing(
+                request_id=request_id,
+                operator=operator,
+                device_id=device_id,
+                card_id=card_id,
+                rel_path=rel_path,
+                generation=entry.generation,
+                command=device_pb2.ListDirectory(
+                    request_id=request_id,
+                    card_id=card_id,
+                    rel_path=rel_path,
+                ),
+                future=future,
+                created_at=dt.datetime.now(dt.UTC),
+            )
+            entry.pending_listings[request_id] = pending
+            entry.command_queue.put(pending)
+            return pending
+
     def next_command(
         self,
         device_id: str,
         generation: int,
         *,
         timeout: float,
-    ) -> PendingCommand | None:
+    ) -> PendingCommand | PendingListing | None:
         """Drain the next command for a stream, respecting generation changes."""
 
         with self._lock:
@@ -288,7 +387,11 @@ class ConnectedDeviceRegistry:
             self._current_entry_locked(device_id, generation)
             if pending.generation != generation:
                 raise StreamClosed("device stream was superseded")
-            if pending.command_id not in self._entries[device_id].pending:
+            entry = self._entries[device_id]
+            if isinstance(pending, PendingCommand):
+                if pending.command_id not in entry.pending:
+                    return None
+            elif pending.request_id not in entry.pending_listings:
                 return None
         return pending
 
@@ -313,6 +416,40 @@ class ConnectedDeviceRegistry:
             entry.last_seen = dt.datetime.now(dt.UTC)
             return pending
 
+    def complete_directory_listing(
+        self,
+        device_id: str,
+        generation: int,
+        listing: Any,
+    ) -> PendingListing | None:
+        """Resolve a directory listing only if it belongs to the current generation."""
+
+        with self._lock:
+            try:
+                entry = self._current_entry_locked(device_id, generation)
+            except StreamClosed:
+                return None
+            pending = entry.pending_listings.pop(listing.request_id, None)
+            if pending is None:
+                return None
+            if not pending.future.done():
+                pending.future.set_result(listing)
+            entry.last_seen = dt.datetime.now(dt.UTC)
+            return pending
+
+    def fail_pending(
+        self,
+        device_id: str,
+        generation: int,
+        pending: PendingCommand | PendingListing,
+        exc: BaseException,
+    ) -> PendingCommand | PendingListing | None:
+        """Fail a pending command or listing if it belongs to the current stream."""
+
+        if isinstance(pending, PendingCommand):
+            return self.fail_command(device_id, generation, pending.command_id, exc)
+        return self.fail_listing(device_id, generation, pending.request_id, exc)
+
     def fail_command(
         self,
         device_id: str,
@@ -328,6 +465,25 @@ class ConnectedDeviceRegistry:
             except StreamClosed:
                 return None
             pending = entry.pending.pop(command_id, None)
+            if pending is not None and not pending.future.done():
+                pending.future.set_exception(exc)
+            return pending
+
+    def fail_listing(
+        self,
+        device_id: str,
+        generation: int,
+        request_id: str,
+        exc: BaseException,
+    ) -> PendingListing | None:
+        """Fail a pending directory listing if it belongs to the current stream."""
+
+        with self._lock:
+            try:
+                entry = self._current_entry_locked(device_id, generation)
+            except StreamClosed:
+                return None
+            pending = entry.pending_listings.pop(request_id, None)
             if pending is not None and not pending.future.done():
                 pending.future.set_exception(exc)
             return pending
@@ -405,6 +561,10 @@ class ConnectedDeviceRegistry:
             if not pending.future.done():
                 pending.future.set_exception(reason)
         entry.pending.clear()
+        for pending in list(entry.pending_listings.values()):
+            if not pending.future.done():
+                pending.future.set_exception(reason)
+        entry.pending_listings.clear()
         entry.command_queue.put(None)
         if call_close and entry.close_stream is not None:
             entry.close_stream()

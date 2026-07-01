@@ -25,11 +25,13 @@ message DeviceMessage {
     Heartbeat heartbeat = 2;
     CommandAck command_ack = 3;
     ActiveReceives active_receives = 4;
+    DirectoryListing directory_listing = 5;
   }
 }
 
 message CardSnapshot {
   repeated Card cards = 1;
+  repeated string capabilities = 2;
 }
 
 message Card {
@@ -63,6 +65,7 @@ message ActiveReceive {
 message ServerCommand {
   oneof payload {
     StartReceive start_receive = 1;
+    ListDirectory list_directory = 2;
   }
 }
 
@@ -73,4 +76,36 @@ message StartReceive {
   string label = 4;
   string source_ref = 5;
   string idempotency_key = 6;
+}
+
+message ListDirectory {
+  string request_id = 1;
+  string card_id = 2;
+  string rel_path = 3;
+}
+
+message DirectoryEntry {
+  string name = 1;
+  bool is_dir = 2;
+  int64 size_bytes = 3;
+  bool is_package = 4;
+}
+
+enum DirectoryStatus {
+  DIR_STATUS_UNSPECIFIED = 0;
+  DIR_STATUS_OK = 1;
+  DIR_STATUS_NOT_FOUND = 2;
+  DIR_STATUS_NOT_A_DIRECTORY = 3;
+  DIR_STATUS_PERMISSION_DENIED = 4;
+  DIR_STATUS_CONFINEMENT_VIOLATION = 5;
+  DIR_STATUS_CARD_UNAVAILABLE = 6;
+  DIR_STATUS_IO_ERROR = 7;
+}
+
+message DirectoryListing {
+  string request_id = 1;
+  repeated DirectoryEntry entries = 2;
+  bool truncated = 3;
+  DirectoryStatus status = 4;
+  string detail = 5;
 }

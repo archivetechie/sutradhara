@@ -23,8 +23,10 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from sutradhara._proto import device_pb2
 from sutradhara.api import store as api_store
 from sutradhara.api.identity import Identity, parse_identity
+from sutradhara.api.paths import DevicePathError, canonical_device_rel_path
 from sutradhara.artifactclass_policy import ArtifactClassPolicyError, get_artifactclass_policy
 from sutradhara.catalog.session import make_session_factory
 from sutradhara.grpc import ca as grpc_ca
@@ -35,6 +37,7 @@ from sutradhara.grpc.registry import (
     ConnectedDeviceRegistry,
     DeviceOffline,
     DeviceOwnerMismatch,
+    StreamClosed,
 )
 from sutradhara.grpc.status import intake_status
 
@@ -107,6 +110,99 @@ async def get_devices(request: Request) -> dict[str, object]:
     }
 
 
+@router.get("/api/devices/{device_id}/browse")
+async def get_device_browse(
+    device_id: str,
+    request: Request,
+    card_id: str,
+    path: str | None = None,
+) -> dict[str, object]:
+    """Relay one directory-listing request to a browse-capable helper."""
+
+    identity = _require_receive(parse_identity(request.headers))
+    rel_path = _canonical_device_path_or_400(path)
+    try:
+        await anyio.to_thread.run_sync(
+            partial(
+                _validate_device_owner,
+                request.app.state.engine,
+                operator=identity.operator_username,
+                device_id=device_id,
+            )
+        )
+    except PermissionError as exc:
+        _raise(403, "forbidden", str(exc))
+
+    registry = _registry(request)
+    try:
+        device = await anyio.to_thread.run_sync(
+            partial(
+                registry.device_for,
+                operator=identity.operator_username,
+                device_id=device_id,
+            )
+        )
+    except DeviceOwnerMismatch as exc:
+        _raise(403, "forbidden", str(exc))
+    except DeviceOffline as exc:
+        _raise(404, "device_not_found", str(exc))
+    if "browse" not in device.capabilities:
+        _raise(409, "browse_unsupported", "device helper does not support folder browse")
+    if not any(card.card_id == card_id for card in device.cards):
+        _raise(404, "card_not_found", "card is not present on the device")
+
+    try:
+        pending = await anyio.to_thread.run_sync(
+            partial(
+                registry.request_directory_listing,
+                operator=identity.operator_username,
+                device_id=device_id,
+                card_id=card_id,
+                rel_path=rel_path,
+            )
+        )
+    except DeviceOwnerMismatch as exc:
+        _raise(403, "forbidden", str(exc))
+    except (DeviceOffline, CardUnavailable) as exc:
+        _raise(404, "device_not_found", str(exc))
+
+    try:
+        listing = await _await_listing(
+            pending.future,
+            timeout=request.app.state.directory_listing_timeout,
+        )
+    except TimeoutError:
+        await anyio.to_thread.run_sync(
+            partial(
+                registry.fail_listing,
+                device_id,
+                pending.generation,
+                pending.request_id,
+                TimeoutError("directory listing timed out"),
+            )
+        )
+        _raise(504, "browse_timeout", "device did not return a directory listing in time")
+    except StreamClosed as exc:
+        _raise(409, "device_unavailable", str(exc))
+    except RuntimeError as exc:
+        _raise(409, "device_unavailable", str(exc))
+
+    _raise_for_directory_status(listing)
+    return {
+        "path": rel_path,
+        "entries": [
+            {
+                "name": entry.name,
+                "isDir": entry.is_dir,
+                "sizeBytes": int(entry.size_bytes),
+                "isPackage": entry.is_package,
+            }
+            for entry in listing.entries
+        ],
+        "truncated": listing.truncated,
+    }
+
+
 @router.post("/api/devices/{device_id}/receive")
 async def post_device_receive(
     device_id: str,
@@ -117,6 +213,7 @@ async def post_device_receive(
 
     identity = _require_receive(parse_identity(request.headers))
     engine = request.app.state.engine
+    canonical_source_ref = _canonical_device_path_or_400(body.source_ref)
     try:
         await anyio.to_thread.run_sync(
             partial(
@@ -133,7 +230,7 @@ async def post_device_receive(
         _raise(400, "bad_artifactclass", str(exc))
 
     idempotency_key = str(body.idempotencyKey)
-    request_hash = _device_receive_hash(device_id, body)
+    request_hash = _device_receive_hash(device_id, body, source_ref=canonical_source_ref)
     decision = await anyio.to_thread.run_sync(
         partial(
             api_store.begin_idempotency,
@@ -163,7 +260,7 @@ async def post_device_receive(
                 card_id=body.card_id,
                 artifactclass=body.artifactclass,
                 label=body.label,
-                source_ref=body.source_ref,
+                source_ref=canonical_source_ref,
                 idempotency_key=idempotency_key,
                 abandon_on_reject=True,
             )
@@ -318,6 +415,7 @@ def install_default_state(app: object) -> None:
 
     app.state.registry = getattr(app.state, "registry", ConnectedDeviceRegistry())
     app.state.command_ack_timeout = 5.0
+    app.state.directory_listing_timeout = 5.0
     app.state.enroll_token_ttl = dt.timedelta(hours=24)
     app.state.enroll_csr_limiter = SimpleRateLimiter()
     app.state.grpc_pki_dir = getattr(app.state, "grpc_pki_dir", grpc_ca.DEFAULT_PKI_DIR)
@@ -377,6 +475,7 @@ def _validate_artifactclass(engine: object, artifactclass: str) -> None:
 def _device_payload(device: object) -> dict[str, object]:
     return {
         "deviceId": device.device_id,
+        "capabilities": list(device.capabilities),
         "cards": [
             {
                 "cardId": card.card_id,
@@ -419,13 +518,13 @@ def _receive_payloads_for_operator(engine: object, operator_username: str) -> li
     return payloads
 
 
-def _device_receive_hash(device_id: str, body: DeviceReceiveRequest) -> str:
+def _device_receive_hash(device_id: str, body: DeviceReceiveRequest, *, source_ref: str) -> str:
     payload = {
         "artifactclass": body.artifactclass,
         "card_id": body.card_id,
         "device_id": device_id,
         "label": body.label,
-        "source_ref": body.source_ref,
+        "source_ref": source_ref,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -434,6 +533,50 @@ def _device_receive_hash(device_id: str, body: DeviceReceiveRequest) -> str:
 async def _await_ack(future: object, *, timeout: float) -> CommandAck:
     wrapped = asyncio.wrap_future(future)
     return await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
+
+
+async def _await_listing(future: object, *, timeout: float) -> object:
+    wrapped = asyncio.wrap_future(future)
+    return await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
+
+
+def _canonical_device_path_or_400(value: str | None) -> str:
+    try:
+        return canonical_device_rel_path(value)
+    except DevicePathError as exc:
+        _raise(400, "bad_path", str(exc))
+
+
+def _raise_for_directory_status(listing: object) -> None:
+    status = listing.status
+    if status == device_pb2.DIR_STATUS_OK:
+        return
+    http_status, error, fallback = {
+        device_pb2.DIR_STATUS_NOT_FOUND: (404, "not_found", "directory not found"),
+        device_pb2.DIR_STATUS_NOT_A_DIRECTORY: (
+            422,
+            "not_a_directory",
+            "path is not a directory",
+        ),
+        device_pb2.DIR_STATUS_PERMISSION_DENIED: (
+            403,
+            "permission_denied",
+            "permission denied",
+        ),
+        device_pb2.DIR_STATUS_CONFINEMENT_VIOLATION: (
+            400,
+            "confinement_violation",
+            "path is outside the card",
+        ),
+        device_pb2.DIR_STATUS_CARD_UNAVAILABLE: (
+            409,
+            "card_unavailable",
+            "card is unavailable",
+        ),
+        device_pb2.DIR_STATUS_IO_ERROR: (502, "io_error", "device I/O error"),
+    }.get(status, (502, "listing_failed", "directory listing failed"))
+    detail = listing.detail or fallback
+    _raise(http_status, error, detail)
 
 
 async def _abandon_if_new_claim(

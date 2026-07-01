@@ -78,3 +78,31 @@ def test_device_proto_messages_round_trip_on_server_and_agent_stubs() -> None:
     )
     parsed = agent_device_pb2.DeviceMessage.FromString(snapshot.SerializeToString())
     assert parsed.card_snapshot.cards[0].kind == agent_device_pb2.CARD_KIND_CARD
+
+    browse = device_pb2.ServerCommand(
+        list_directory=device_pb2.ListDirectory(
+            request_id="req-1",
+            card_id="card-1",
+            rel_path="DCIM",
+        )
+    )
+    assert device_pb2.ServerCommand.FromString(browse.SerializeToString()) == browse
+    agent_browse = agent_device_pb2.ServerCommand.FromString(browse.SerializeToString())
+    assert agent_browse.list_directory.rel_path == "DCIM"
+
+    listing = device_pb2.DeviceMessage(
+        directory_listing=device_pb2.DirectoryListing(
+            request_id="req-1",
+            entries=[
+                device_pb2.DirectoryEntry(
+                    name="100MEDIA",
+                    is_dir=True,
+                    is_package=False,
+                )
+            ],
+            status=device_pb2.DIR_STATUS_OK,
+        )
+    )
+    assert device_pb2.DeviceMessage.FromString(listing.SerializeToString()) == listing
+    agent_listing = agent_device_pb2.DeviceMessage.FromString(listing.SerializeToString())
+    assert agent_listing.directory_listing.status == agent_device_pb2.DIR_STATUS_OK

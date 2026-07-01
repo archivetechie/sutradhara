@@ -19,6 +19,17 @@ class CommandAckStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     COMMAND_ACK_STATUS_UNSPECIFIED: _ClassVar[CommandAckStatus]
     COMMAND_ACK_STATUS_ACCEPTED: _ClassVar[CommandAckStatus]
     COMMAND_ACK_STATUS_REJECTED: _ClassVar[CommandAckStatus]
+
+class DirectoryStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    DIR_STATUS_UNSPECIFIED: _ClassVar[DirectoryStatus]
+    DIR_STATUS_OK: _ClassVar[DirectoryStatus]
+    DIR_STATUS_NOT_FOUND: _ClassVar[DirectoryStatus]
+    DIR_STATUS_NOT_A_DIRECTORY: _ClassVar[DirectoryStatus]
+    DIR_STATUS_PERMISSION_DENIED: _ClassVar[DirectoryStatus]
+    DIR_STATUS_CONFINEMENT_VIOLATION: _ClassVar[DirectoryStatus]
+    DIR_STATUS_CARD_UNAVAILABLE: _ClassVar[DirectoryStatus]
+    DIR_STATUS_IO_ERROR: _ClassVar[DirectoryStatus]
 CARD_KIND_UNSPECIFIED: CardKind
 CARD_KIND_CARD: CardKind
 CARD_KIND_DRIVE: CardKind
@@ -26,24 +37,36 @@ CARD_KIND_OTHER: CardKind
 COMMAND_ACK_STATUS_UNSPECIFIED: CommandAckStatus
 COMMAND_ACK_STATUS_ACCEPTED: CommandAckStatus
 COMMAND_ACK_STATUS_REJECTED: CommandAckStatus
+DIR_STATUS_UNSPECIFIED: DirectoryStatus
+DIR_STATUS_OK: DirectoryStatus
+DIR_STATUS_NOT_FOUND: DirectoryStatus
+DIR_STATUS_NOT_A_DIRECTORY: DirectoryStatus
+DIR_STATUS_PERMISSION_DENIED: DirectoryStatus
+DIR_STATUS_CONFINEMENT_VIOLATION: DirectoryStatus
+DIR_STATUS_CARD_UNAVAILABLE: DirectoryStatus
+DIR_STATUS_IO_ERROR: DirectoryStatus
 
 class DeviceMessage(_message.Message):
-    __slots__ = ("card_snapshot", "heartbeat", "command_ack", "active_receives")
+    __slots__ = ("card_snapshot", "heartbeat", "command_ack", "active_receives", "directory_listing")
     CARD_SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
     HEARTBEAT_FIELD_NUMBER: _ClassVar[int]
     COMMAND_ACK_FIELD_NUMBER: _ClassVar[int]
     ACTIVE_RECEIVES_FIELD_NUMBER: _ClassVar[int]
+    DIRECTORY_LISTING_FIELD_NUMBER: _ClassVar[int]
     card_snapshot: CardSnapshot
     heartbeat: Heartbeat
     command_ack: CommandAck
     active_receives: ActiveReceives
-    def __init__(self, card_snapshot: _Optional[_Union[CardSnapshot, _Mapping]] = ..., heartbeat: _Optional[_Union[Heartbeat, _Mapping]] = ..., command_ack: _Optional[_Union[CommandAck, _Mapping]] = ..., active_receives: _Optional[_Union[ActiveReceives, _Mapping]] = ...) -> None: ...
+    directory_listing: DirectoryListing
+    def __init__(self, card_snapshot: _Optional[_Union[CardSnapshot, _Mapping]] = ..., heartbeat: _Optional[_Union[Heartbeat, _Mapping]] = ..., command_ack: _Optional[_Union[CommandAck, _Mapping]] = ..., active_receives: _Optional[_Union[ActiveReceives, _Mapping]] = ..., directory_listing: _Optional[_Union[DirectoryListing, _Mapping]] = ...) -> None: ...
 
 class CardSnapshot(_message.Message):
-    __slots__ = ("cards",)
+    __slots__ = ("cards", "capabilities")
     CARDS_FIELD_NUMBER: _ClassVar[int]
+    CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
     cards: _containers.RepeatedCompositeFieldContainer[Card]
-    def __init__(self, cards: _Optional[_Iterable[_Union[Card, _Mapping]]] = ...) -> None: ...
+    capabilities: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, cards: _Optional[_Iterable[_Union[Card, _Mapping]]] = ..., capabilities: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class Card(_message.Message):
     __slots__ = ("card_id", "label", "kind", "size_bytes", "status")
@@ -94,10 +117,12 @@ class ActiveReceive(_message.Message):
     def __init__(self, card_id: _Optional[str] = ..., idempotency_key: _Optional[str] = ..., intake_id: _Optional[str] = ..., state: _Optional[str] = ...) -> None: ...
 
 class ServerCommand(_message.Message):
-    __slots__ = ("start_receive",)
+    __slots__ = ("start_receive", "list_directory")
     START_RECEIVE_FIELD_NUMBER: _ClassVar[int]
+    LIST_DIRECTORY_FIELD_NUMBER: _ClassVar[int]
     start_receive: StartReceive
-    def __init__(self, start_receive: _Optional[_Union[StartReceive, _Mapping]] = ...) -> None: ...
+    list_directory: ListDirectory
+    def __init__(self, start_receive: _Optional[_Union[StartReceive, _Mapping]] = ..., list_directory: _Optional[_Union[ListDirectory, _Mapping]] = ...) -> None: ...
 
 class StartReceive(_message.Message):
     __slots__ = ("command_id", "card_id", "artifactclass", "label", "source_ref", "idempotency_key")
@@ -114,3 +139,39 @@ class StartReceive(_message.Message):
     source_ref: str
     idempotency_key: str
     def __init__(self, command_id: _Optional[str] = ..., card_id: _Optional[str] = ..., artifactclass: _Optional[str] = ..., label: _Optional[str] = ..., source_ref: _Optional[str] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+
+class ListDirectory(_message.Message):
+    __slots__ = ("request_id", "card_id", "rel_path")
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    CARD_ID_FIELD_NUMBER: _ClassVar[int]
+    REL_PATH_FIELD_NUMBER: _ClassVar[int]
+    request_id: str
+    card_id: str
+    rel_path: str
+    def __init__(self, request_id: _Optional[str] = ..., card_id: _Optional[str] = ..., rel_path: _Optional[str] = ...) -> None: ...
+
+class DirectoryEntry(_message.Message):
+    __slots__ = ("name", "is_dir", "size_bytes", "is_package")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    IS_DIR_FIELD_NUMBER: _ClassVar[int]
+    SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    IS_PACKAGE_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    is_dir: bool
+    size_bytes: int
+    is_package: bool
+    def __init__(self, name: _Optional[str] = ..., is_dir: _Optional[bool] = ..., size_bytes: _Optional[int] = ..., is_package: _Optional[bool] = ...) -> None: ...
+
+class DirectoryListing(_message.Message):
+    __slots__ = ("request_id", "entries", "truncated", "status", "detail")
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    TRUNCATED_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    request_id: str
+    entries: _containers.RepeatedCompositeFieldContainer[DirectoryEntry]
+    truncated: bool
+    status: DirectoryStatus
+    detail: str
+    def __init__(self, request_id: _Optional[str] = ..., entries: _Optional[_Iterable[_Union[DirectoryEntry, _Mapping]]] = ..., truncated: _Optional[bool] = ..., status: _Optional[_Union[DirectoryStatus, str]] = ..., detail: _Optional[str] = ...) -> None: ...

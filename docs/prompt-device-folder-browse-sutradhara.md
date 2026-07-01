@@ -1,6 +1,6 @@
 # Codex prompt — device folder browse (sutradhara / server)
 
-**Repo:** `~/sutradhara/repo` · **Status:** pending · **Server-first (do this one first).**
+**Repo:** `~/sutradhara/repo` · **Status:** implemented 2026-07-01 · **Server-first (do this one first).**
 **Design:** `docs/design-device-folder-browse.md` (authoritative; read it).
 **Companions (identical Shared contract):** `docs/prompt-device-folder-browse-sutra-agent.md`,
 `~/system-ui/docs/prompt-device-folder-browse-system-ui.md`.

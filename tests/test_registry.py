@@ -7,11 +7,13 @@ from collections.abc import Callable
 
 import pytest
 
+from sutradhara._proto import device_pb2
 from sutradhara.grpc.registry import (
     Card,
     CommandAck,
     ConnectedDeviceRegistry,
     DeviceOffline,
+    PendingListing,
     StreamClosed,
 )
 from sutradhara.grpc.server import start_registry_sweep_loop, sweep_registry_once
@@ -126,6 +128,97 @@ def test_ttl_eviction_removes_device_and_fails_commands() -> None:
             source_ref=None,
             idempotency_key="key-2",
         )
+
+
+def test_registry_directory_listing_resolves_matching_future() -> None:
+    registry = ConnectedDeviceRegistry()
+    stream = registry.register(
+        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+    )
+    stream.update_cards(
+        [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")],
+        capabilities=["browse"],
+    )
+
+    pending = registry.request_directory_listing(
+        operator="owner",
+        device_id="mac-1",
+        card_id="card-1",
+        rel_path="DCIM",
+    )
+    delivered = stream.next_command(timeout=0.01)
+    assert isinstance(delivered, PendingListing)
+    assert delivered is pending
+    assert delivered.command.rel_path == "DCIM"
+
+    listing = device_pb2.DirectoryListing(
+        request_id=pending.request_id,
+        status=device_pb2.DIR_STATUS_OK,
+    )
+    assert stream.directory_listing(listing) is pending
+    assert pending.future.result(timeout=0).request_id == pending.request_id
+
+
+def test_registry_drops_stale_or_timed_out_directory_listing() -> None:
+    registry = ConnectedDeviceRegistry()
+    old = registry.register(
+        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+    )
+    old.update_cards(
+        [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")]
+    )
+    pending = registry.request_directory_listing(
+        operator="owner",
+        device_id="mac-1",
+        card_id="card-1",
+        rel_path="DCIM",
+    )
+    registry.fail_listing(
+        "mac-1",
+        old.generation,
+        pending.request_id,
+        TimeoutError("timed out"),
+    )
+
+    stale_listing = device_pb2.DirectoryListing(
+        request_id=pending.request_id,
+        status=device_pb2.DIR_STATUS_OK,
+    )
+    assert old.directory_listing(stale_listing) is None
+    with pytest.raises(TimeoutError):
+        pending.future.result(timeout=0)
+
+
+def test_registry_close_fails_pending_commands_and_listings() -> None:
+    registry = ConnectedDeviceRegistry()
+    stream = registry.register(
+        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+    )
+    stream.update_cards(
+        [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")]
+    )
+    command = registry.send_start_receive(
+        operator="owner",
+        device_id="mac-1",
+        card_id="card-1",
+        artifactclass="s-masters",
+        label=None,
+        source_ref=None,
+        idempotency_key="key-1",
+    )
+    listing = registry.request_directory_listing(
+        operator="owner",
+        device_id="mac-1",
+        card_id="card-1",
+        rel_path="",
+    )
+
+    stream.close(StreamClosed("closed"))
+
+    with pytest.raises(StreamClosed):
+        command.future.result(timeout=0)
+    with pytest.raises(StreamClosed):
+        listing.future.result(timeout=0)
 
 
 def test_sweep_registry_once_evicts_stale_registry_stream() -> None:

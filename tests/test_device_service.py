@@ -175,6 +175,72 @@ def test_active_receives_rebuilds_card_correlation_after_restart(
     thread.join(timeout=2)
 
 
+def test_device_service_dispatches_directory_listing_and_routes_reply(engine: Engine) -> None:
+    registry = ConnectedDeviceRegistry()
+    servicer = DeviceService(DeviceServiceConfig(engine=engine, registry=registry))
+    with session_scope(engine) as session:
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+
+    messages = _BlockingIterator()
+    responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
+    next_response: queue.Queue[object] = queue.Queue()
+    thread = threading.Thread(
+        target=lambda: next_response.put(next(responses)),
+        daemon=True,
+    )
+    thread.start()
+    messages.put(
+        device_pb2.DeviceMessage(
+            card_snapshot=device_pb2.CardSnapshot(
+                capabilities=["browse"],
+                cards=[
+                    device_pb2.Card(
+                        card_id="card-1",
+                        label="Card 1",
+                        kind=device_pb2.CARD_KIND_CARD,
+                        size_bytes=10,
+                        status="available",
+                    )
+                ],
+            )
+        )
+    )
+    _eventually(lambda: registry.devices_for("owner")[0].capabilities == ("browse",))
+    pending = registry.request_directory_listing(
+        operator="owner",
+        device_id="mac-1",
+        card_id="card-1",
+        rel_path="DCIM",
+    )
+    response = next_response.get(timeout=2)
+    assert response.list_directory.request_id == pending.request_id
+    assert response.list_directory.rel_path == "DCIM"
+
+    messages.put(
+        device_pb2.DeviceMessage(
+            directory_listing=device_pb2.DirectoryListing(
+                request_id=pending.request_id,
+                status=device_pb2.DIR_STATUS_OK,
+                entries=[
+                    device_pb2.DirectoryEntry(
+                        name="100MEDIA",
+                        is_dir=True,
+                        is_package=False,
+                    )
+                ],
+            )
+        )
+    )
+    assert pending.future.result(timeout=2).entries[0].name == "100MEDIA"
+    messages.close()
+    responses.close()
+
+
 def test_device_service_ack_does_not_complete_when_card_correlation_fails(
     engine: Engine,
 ) -> None:
