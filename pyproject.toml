@@ -30,8 +30,9 @@ dependencies = [
     "httpx2>=0.28",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
-    "grpcio>=1.60",
-    # Floor must be >= the generated _proto gencode version (currently 6.33.5).
+    # Floors must be >= the versions baked into the generated _proto stubs
+    # (grpcio-tools 1.81.0, protobuf gencode 6.33.5).
+    "grpcio>=1.81.0",
     "protobuf>=6.33.5",
     "zstandard>=0.23",
     "boto3>=1.34",
