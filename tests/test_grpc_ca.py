@@ -97,6 +97,38 @@ def test_signing_failure_releases_enrollment_token(engine: Engine, tmp_path, mon
         assert row.used_at is None
 
 
+def test_signing_refuses_other_operator_and_releases_token(engine: Engine, tmp_path) -> None:
+    material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+        token = store.issue_enroll_token(session, operator="other", device_id="mac-1")
+
+    with pytest.raises(ca.CertificateError, match="different operator"):
+        ca.sign_device_csr(
+            engine,
+            pki_dir=tmp_path / "pki",
+            csr_path=material.csr_path,
+            token=token,
+        )
+
+    with session_scope(engine) as session:
+        row = session.get(store.GrpcEnrollToken, token)
+        assert row is not None
+        assert row.used_at is None
+        assert store.resolve_device(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+        ).operator == "owner"
+        with pytest.raises(PermissionError):
+            store.resolve_device(session, device_id="mac-1", cert_fingerprint="BB" * 32)
+
+
 class _FakeContext:
     def __init__(self, common_name: str, pem: str) -> None:
         self._common_name = common_name

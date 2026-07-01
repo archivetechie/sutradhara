@@ -215,13 +215,18 @@ def sign_device_csr(
             store.release_enroll_token(session, token)
         raise
     fingerprint = cert_fingerprint(output)
-    with factory.begin() as session:
-        store.record_device_enrollment(
-            session,
-            device_id=device_id,
-            cert_fingerprint=fingerprint,
-            operator=grant.operator,
-        )
+    try:
+        with factory.begin() as session:
+            store.record_device_enrollment(
+                session,
+                device_id=device_id,
+                cert_fingerprint=fingerprint,
+                operator=grant.operator,
+            )
+    except PermissionError as exc:
+        with factory.begin() as session:
+            store.release_enroll_token(session, token)
+        raise CertificateError(str(exc)) from exc
     return DeviceCertificate(
         device_id=device_id,
         operator=grant.operator,

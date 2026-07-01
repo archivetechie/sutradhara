@@ -302,7 +302,11 @@ def post_enroll_csr(request: Request, body: EnrollCsrRequest) -> dict[str, str]:
                 token=body.token,
                 cert_path=cert_path,
             )
-        except (ValueError, grpc_ca.CertificateError) as exc:
+        except grpc_ca.CertificateError as exc:
+            if "different operator" in str(exc):
+                _raise(409, "device_other_operator", str(exc))
+            _raise(400, "bad_enrollment", str(exc))
+        except ValueError as exc:
             _raise(400, "bad_enrollment", str(exc))
         ca_pem = (pki_dir / grpc_ca.CA_CERT_NAME).read_text(encoding="utf-8")
         cert_pem = signed.cert_path.read_text(encoding="utf-8")

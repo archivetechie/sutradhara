@@ -150,6 +150,37 @@ def test_enroll_csr_rejects_token_device_mismatch(api_engine: Engine, tmp_path: 
     assert "common name" in response.json()["detail"]
 
 
+def test_enroll_csr_maps_other_operator_refusal_to_conflict(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    app = make_api_app(api_engine)
+    app.state.grpc_pki_dir = tmp_path / "pki"
+    client = TestClient(app)
+    with session_scope(api_engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+        token = store.issue_enroll_token(session, operator="other", device_id="mac-1")
+    material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
+
+    response = client.post(
+        "/api/enroll/csr",
+        headers={"Host": "testserver", "Content-Type": "application/json"},
+        json={"csr_pem": material.csr_path.read_text(encoding="utf-8"), "token": token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "device_other_operator"
+    with session_scope(api_engine) as session:
+        row = session.get(store.GrpcEnrollToken, token)
+        assert row is not None
+        assert row.used_at is None
+
+
 def test_revoke_device_can_evict_live_registry_stream(api_engine: Engine) -> None:
     registry = ConnectedDeviceRegistry()
     registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
