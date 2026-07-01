@@ -1,7 +1,7 @@
 # Codex prompt — device folder browse (sutra-agent / helper)
 
 **Repo:** `~/sutradhara/repo` (package `packages/sutra-agent`, planner in
-`packages/sutradhara-receive`) · **Status:** pending · **After the sutradhara prompt**
+`packages/sutradhara-receive`) · **Status:** implemented 2026-07-01 · **After the sutradhara prompt**
 (consumes the regenerated `_proto` stubs).
 **Design:** `docs/design-device-folder-browse.md` (authoritative; read it).
 

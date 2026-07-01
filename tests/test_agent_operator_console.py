@@ -48,6 +48,7 @@ def test_mount_card_id_uses_volume_identity_and_payload_omits_path(tmp_path: Pat
 
     assert card.card_id == "volume:A1B2-C3D4"
     assert message.card_snapshot.cards[0].card_id == "volume:A1B2-C3D4"
+    assert list(message.card_snapshot.capabilities) == ["browse"]
     assert str(mount_path) not in str(message)
     assert str(mount_path).encode() not in message.SerializeToString()
 
@@ -138,6 +139,127 @@ def test_control_daemon_early_acks_then_background_streams(tmp_path: Path) -> No
     assert active.active_receives.receives[0].intake_id == "intake-1"
     release.set()
     _eventually(lambda: active_receive_records(_streaming_config(tmp_path).resolved_ledger_path()) == [])
+
+
+def test_control_daemon_streams_selected_folder_as_receive_root(tmp_path: Path) -> None:
+    card = _card(tmp_path)
+    selected = card.mount_path / "DCIM" / "100MEDIA"
+    selected.mkdir(parents=True)
+    release = threading.Event()
+    seen: list[tuple[Path, str | None]] = []
+    outbox: queue.Queue[device_pb2.DeviceMessage | None] = queue.Queue()
+
+    def fake_stream_source(source: Path, **kwargs: Any) -> StreamReceiveResult:
+        seen.append((source, kwargs["source_ref"]))
+        kwargs["on_started"]("intake-1")
+        release.wait(timeout=2)
+        return _stream_result("intake-1", "key-1")
+
+    daemon = ControlDaemon(
+        _streaming_config(tmp_path),
+        card_source=lambda: [card],
+        stream_source_fn=fake_stream_source,
+        abort_intake_fn=lambda _config, _intake_id: None,
+    )
+    daemon._send_card_snapshot([card], outbox)
+    _drain(outbox)
+
+    daemon.handle_command(
+        _start_command(
+            "cmd-1",
+            card.card_id,
+            "key-1",
+            source_ref="DCIM/100MEDIA",
+        ),
+        outbox,
+    )
+
+    ack = _next_ack(outbox)
+    assert ack.command_ack.status == device_pb2.COMMAND_ACK_STATUS_ACCEPTED
+    assert seen == [(selected.resolve(), "DCIM/100MEDIA")]
+    release.set()
+    _eventually(lambda: active_receive_records(_streaming_config(tmp_path).resolved_ledger_path()) == [])
+
+
+def test_control_daemon_rejects_unconfined_receive_path_without_local_path_leak(
+    tmp_path: Path,
+) -> None:
+    card = _card(tmp_path)
+    outbox: queue.Queue[device_pb2.DeviceMessage | None] = queue.Queue()
+    daemon = ControlDaemon(
+        _streaming_config(tmp_path),
+        card_source=lambda: [card],
+        stream_source_fn=lambda *_args, **_kwargs: pytest.fail("receive should not start"),
+    )
+    daemon._send_card_snapshot([card], outbox)
+    _drain(outbox)
+
+    daemon.handle_command(
+        _start_command("cmd-1", card.card_id, "key-1", source_ref="../outside"),
+        outbox,
+    )
+
+    ack = _next_ack(outbox)
+    assert ack.command_ack.status == device_pb2.COMMAND_ACK_STATUS_REJECTED
+    assert ack.command_ack.reason == "invalid source path"
+    assert str(tmp_path) not in ack.command_ack.reason
+
+
+def test_control_daemon_rejects_receive_path_inside_package(tmp_path: Path) -> None:
+    card = _card(tmp_path)
+    (card.mount_path / "A001.fcpbundle" / "Event").mkdir(parents=True)
+    outbox: queue.Queue[device_pb2.DeviceMessage | None] = queue.Queue()
+    daemon = ControlDaemon(
+        _streaming_config(tmp_path),
+        card_source=lambda: [card],
+        stream_source_fn=lambda *_args, **_kwargs: pytest.fail("receive should not start"),
+    )
+    daemon._send_card_snapshot([card], outbox)
+    _drain(outbox)
+
+    daemon.handle_command(
+        _start_command(
+            "cmd-1",
+            card.card_id,
+            "key-1",
+            source_ref="A001.fcpbundle/Event",
+        ),
+        outbox,
+    )
+
+    ack = _next_ack(outbox)
+    assert ack.command_ack.status == device_pb2.COMMAND_ACK_STATUS_REJECTED
+    assert ack.command_ack.reason == "source path enters a package: A001.fcpbundle/Event"
+    assert str(tmp_path) not in ack.command_ack.reason
+
+
+def test_control_daemon_handles_list_directory(tmp_path: Path) -> None:
+    card = _card(tmp_path)
+    (card.mount_path / "DCIM").mkdir()
+    (card.mount_path / "clip.mov").write_bytes(b"video")
+    outbox: queue.Queue[device_pb2.DeviceMessage | None] = queue.Queue()
+    daemon = ControlDaemon(_streaming_config(tmp_path), card_source=lambda: [card])
+    daemon._send_card_snapshot([card], outbox)
+    _drain(outbox)
+
+    daemon.handle_command(
+        device_pb2.ServerCommand(
+            list_directory=device_pb2.ListDirectory(
+                request_id="req-1",
+                card_id=card.card_id,
+                rel_path="",
+            )
+        ),
+        outbox,
+    )
+
+    message = outbox.get(timeout=1)
+    assert message is not None
+    assert message.WhichOneof("payload") == "directory_listing"
+    listing = message.directory_listing
+    assert listing.request_id == "req-1"
+    assert listing.status == device_pb2.DIR_STATUS_OK
+    assert [entry.name for entry in listing.entries] == ["DCIM", "clip.mov"]
 
 
 def test_control_daemon_same_key_reacks_and_different_key_busy(tmp_path: Path) -> None:
@@ -395,7 +517,9 @@ def test_real_control_daemon_relays_receive_end_to_end(tmp_path: Path) -> None:
     )
     source = tmp_path / "mounted-card"
     source.mkdir()
-    (source / "clip.mov").write_bytes(b"video")
+    selected = source / "DCIM" / "100MEDIA"
+    selected.mkdir(parents=True)
+    (selected / "IMG001.JPG").write_bytes(b"image")
     card = card_from_mount(
         MountInfo(
             mount_path=source,
@@ -425,7 +549,10 @@ def test_real_control_daemon_relays_receive_end_to_end(tmp_path: Path) -> None:
     try:
         server.start()
         thread.start()
-        _eventually(lambda: len(registry.devices_for("owner")) == 1)
+        _eventually(
+            lambda: len(registry.devices_for("owner")) == 1
+            and len(registry.devices_for("owner")[0].cards) == 1
+        )
 
         pending = registry.send_start_receive(
             operator="owner",
@@ -433,7 +560,7 @@ def test_real_control_daemon_relays_receive_end_to_end(tmp_path: Path) -> None:
             card_id=card.card_id,
             artifactclass="video-master",
             label="Mounted Card",
-            source_ref=None,
+            source_ref="DCIM/100MEDIA",
             idempotency_key="relay-key-1",
         )
         ack = pending.future.result(timeout=10)
@@ -455,6 +582,9 @@ def test_real_control_daemon_relays_receive_end_to_end(tmp_path: Path) -> None:
         )
         assert [event.event for event in events] == ["intake-registered"]
         assert (intake_dir / "intake.verified.json").is_file()
+        manifest = (intake_dir / "manifest-sha256.txt").read_text(encoding="utf-8")
+        assert "data/IMG001.JPG" in manifest
+        assert "DCIM/100MEDIA" not in manifest
     finally:
         stop.set()
         thread.join(timeout=5)
@@ -568,13 +698,20 @@ def _card(tmp_path: Path) -> MountedCard:
     )
 
 
-def _start_command(command_id: str, card_id: str, idempotency_key: str) -> device_pb2.ServerCommand:
+def _start_command(
+    command_id: str,
+    card_id: str,
+    idempotency_key: str,
+    *,
+    source_ref: str | None = None,
+) -> device_pb2.ServerCommand:
     return device_pb2.ServerCommand(
         start_receive=device_pb2.StartReceive(
             command_id=command_id,
             card_id=card_id,
             artifactclass="video-master",
             label="Card",
+            source_ref=source_ref or "",
             idempotency_key=idempotency_key,
         )
     )

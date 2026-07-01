@@ -28,6 +28,30 @@ def test_planner_yields_package_as_one_unit_with_index(tmp_path) -> None:
     assert package_index["stored_member_path"] == "Edit.fcpbundle.tar"
 
 
+def test_planner_packages_package_boundary_stream_root(tmp_path) -> None:
+    package = tmp_path / "Edit.fcpbundle"
+    (package / "Media").mkdir(parents=True)
+    (package / "Media" / "clip.mov").write_bytes(b"clip")
+
+    plan = plan_payload_units(package)
+
+    assert len(plan.units) == 1
+    unit = plan.units[0]
+    assert unit.relpath == "Edit.fcpbundle.tar"
+    assert unit.logical_relpath == "Edit.fcpbundle"
+    assert unit.is_package is True
+
+
+def test_planner_relpaths_are_relative_to_stream_root(tmp_path) -> None:
+    selected = tmp_path / "DCIM" / "100MEDIA"
+    selected.mkdir(parents=True)
+    (selected / "IMG001.JPG").write_bytes(b"image")
+
+    plan = plan_payload_units(selected)
+
+    assert [unit.relpath for unit in plan.units] == ["IMG001.JPG"]
+
+
 def test_file_unit_stat_guard_fails_if_source_mutates_mid_read(tmp_path) -> None:
     source = tmp_path / "source"
     source.mkdir()

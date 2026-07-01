@@ -1237,6 +1237,18 @@ def _annotate_package_records(
 
 
 def _scan_source(source_root: Path) -> tuple[tuple[_SourceEntry, ...], tuple[RejectedEntry, ...]]:
+    if _is_package_boundary(source_root.name):
+        return (
+            (
+                _SourceEntry(
+                    source_root,
+                    f"{source_root.name}.tar",
+                    entry_type="package",
+                    logical_relpath=source_root.name,
+                ),
+            ),
+            (),
+        )
     regulars: list[_SourceEntry] = []
     rejected: list[RejectedEntry] = []
     for root_raw, dirs, files in os.walk(source_root, topdown=True, followlinks=False):

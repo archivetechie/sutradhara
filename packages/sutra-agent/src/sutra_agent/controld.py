@@ -14,12 +14,14 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 import grpc
 
 from sutra_agent._proto import device_pb2, device_pb2_grpc
 from sutra_agent.config import AgentConfig
+from sutra_agent.confine import DevicePathError, directory_listing_message, resolve_directory
 from sutra_agent.grpc_client import abort_stream_intake, open_channel, stream_source
 from sutra_agent.ledger import (
     active_receive_records,
@@ -40,6 +42,7 @@ TRANSIENT_RECEIVE_CODES = {
 }
 
 LOGGER = logging.getLogger(__name__)
+BROWSE_CAPABILITY = "browse"
 
 
 class ControlDaemonError(RuntimeError):
@@ -173,9 +176,12 @@ class ControlDaemon:
     ) -> None:
         """Handle one server command from ``DeviceService.Connect``."""
 
-        if command.WhichOneof("payload") != "start_receive":
+        kind = command.WhichOneof("payload")
+        if kind == "start_receive":
+            self._handle_start_receive(command.start_receive, outbox)
             return
-        self._handle_start_receive(command.start_receive, outbox)
+        if kind == "list_directory":
+            self._handle_list_directory(command.list_directory, outbox)
 
     def _handle_start_receive(
         self,
@@ -203,6 +209,11 @@ class ControlDaemon:
             else:
                 outbox.put(_ack(command.command_id, accepted=False, reason="receive starting"))
             return
+        try:
+            source = resolve_directory(card.mount_path, command.source_ref or "")
+        except DevicePathError as exc:
+            outbox.put(_ack(command.command_id, accepted=False, reason=exc.reason()))
+            return
         with self._lock:
             busy = next(
                 (
@@ -224,17 +235,28 @@ class ControlDaemon:
 
         thread = threading.Thread(
             target=self._run_receive,
-            args=(active, card, command, outbox),
+            args=(active, card, source.path, source.rel_path, command, outbox),
             name=f"sutra-agent-receive-{command.card_id}",
             daemon=True,
         )
         active.thread = thread
         thread.start()
 
+    def _handle_list_directory(
+        self,
+        request: Any,
+        outbox: queue.Queue[device_pb2.DeviceMessage | None],
+    ) -> None:
+        with self._lock:
+            card = self._cards.get(request.card_id)
+        outbox.put(directory_listing_message(card, request))
+
     def _run_receive(
         self,
         active: _InFlightReceive,
         card: MountedCard,
+        source: Path,
+        source_ref: str,
         command: Any,
         outbox: queue.Queue[device_pb2.DeviceMessage | None],
     ) -> None:
@@ -268,9 +290,9 @@ class ControlDaemon:
         while True:
             try:
                 result = self.stream_source(
-                    card.mount_path,
+                    source,
                     config=receive_config,
-                    source_ref=command.source_ref or None,
+                    source_ref=source_ref or None,
                     label=command.label or card.label,
                     idempotency_key=command.idempotency_key,
                     confirm_timeout=0,
@@ -382,6 +404,7 @@ def card_snapshot_message(cards: list[MountedCard]) -> device_pb2.DeviceMessage:
 
     return device_pb2.DeviceMessage(
         card_snapshot=device_pb2.CardSnapshot(
+            capabilities=[BROWSE_CAPABILITY],
             cards=[
                 device_pb2.Card(
                     card_id=card.card_id,
