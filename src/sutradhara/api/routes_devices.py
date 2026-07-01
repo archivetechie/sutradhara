@@ -55,6 +55,7 @@ class EnrollTokenRequest(BaseModel):
     """JSON body accepted by POST /api/enroll/token."""
 
     device_id: str
+    reenroll: bool = False
 
 
 class EnrollCsrRequest(BaseModel):
@@ -249,6 +250,26 @@ def post_enroll_token(request: Request, body: EnrollTokenRequest) -> dict[str, s
     factory = make_session_factory(request.app.state.engine)
     ttl = request.app.state.enroll_token_ttl
     with factory.begin() as session:
+        try:
+            owner = grpc_store.operator_for_device(session, body.device_id)
+        except PermissionError:
+            _raise(
+                409,
+                "device_other_operator",
+                "device is enrolled to a different operator; an admin must revoke it first",
+            )
+        if owner == identity.operator_username and not body.reenroll:
+            _raise(
+                409,
+                "device_already_enrolled",
+                "device already enrolled - re-enroll to rotate its certificate",
+            )
+        if owner is not None and owner != identity.operator_username:
+            _raise(
+                409,
+                "device_other_operator",
+                "device is enrolled to a different operator; an admin must revoke it first",
+            )
         token = grpc_store.issue_enroll_token(
             session,
             operator=identity.operator_username,

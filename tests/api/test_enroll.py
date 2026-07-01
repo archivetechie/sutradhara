@@ -36,6 +36,67 @@ def test_enroll_token_is_origin_guarded_and_operator_scoped(api_engine: Engine) 
     assert ok.json()["deviceId"] == "mac-1"
 
 
+def test_enroll_token_refuses_duplicate_without_reenroll(api_engine: Engine) -> None:
+    with session_scope(api_engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+    client = TestClient(make_api_app(api_engine))
+
+    response = client.post(
+        "/api/enroll/token",
+        headers=post_headers("operator"),
+        json={"device_id": "mac-1"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "device_already_enrolled"
+
+
+def test_enroll_token_allows_same_operator_reenroll(api_engine: Engine) -> None:
+    with session_scope(api_engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+    client = TestClient(make_api_app(api_engine))
+
+    response = client.post(
+        "/api/enroll/token",
+        headers=post_headers("operator"),
+        json={"device_id": "mac-1", "reenroll": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deviceId"] == "mac-1"
+    assert response.json()["token"]
+
+
+def test_enroll_token_refuses_different_operator_device(api_engine: Engine) -> None:
+    with session_scope(api_engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="other",
+        )
+    client = TestClient(make_api_app(api_engine))
+
+    response = client.post(
+        "/api/enroll/token",
+        headers=post_headers("operator"),
+        json={"device_id": "mac-1"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "device_other_operator"
+
+
 def test_enroll_csr_is_reachable_without_authentik_or_origin_and_rejects_reuse(
     api_engine: Engine,
     tmp_path: Path,
