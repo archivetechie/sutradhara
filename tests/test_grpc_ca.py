@@ -108,7 +108,7 @@ def test_signing_refuses_other_operator_and_releases_token(engine: Engine, tmp_p
         )
         token = store.issue_enroll_token(session, operator="other", device_id="mac-1")
 
-    with pytest.raises(ca.CertificateError, match="different operator"):
+    with pytest.raises(ca.DeviceOwnershipCertificateError):
         ca.sign_device_csr(
             engine,
             pki_dir=tmp_path / "pki",

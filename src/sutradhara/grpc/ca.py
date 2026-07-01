@@ -32,6 +32,10 @@ class CertificateError(ValueError):
     """Raised when certificate generation, enrollment, or resolution fails."""
 
 
+class DeviceOwnershipCertificateError(CertificateError):
+    """Raised when CSR signing would assign a device to the wrong operator."""
+
+
 @dataclass(frozen=True)
 class DeviceCertificate:
     """Signed device-certificate result."""
@@ -223,10 +227,10 @@ def sign_device_csr(
                 cert_fingerprint=fingerprint,
                 operator=grant.operator,
             )
-    except PermissionError as exc:
+    except store.DeviceOwnershipError as exc:
         with factory.begin() as session:
             store.release_enroll_token(session, token)
-        raise CertificateError(str(exc)) from exc
+        raise DeviceOwnershipCertificateError(str(exc)) from exc
     return DeviceCertificate(
         device_id=device_id,
         operator=grant.operator,

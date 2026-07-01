@@ -162,7 +162,7 @@ def test_device_reenrollment_refuses_different_operator_without_mutation(engine:
         )
 
     with session_scope(engine) as session:
-        with pytest.raises(PermissionError, match="different operator"):
+        with pytest.raises(store.DeviceOwnershipError):
             store.record_device_enrollment(
                 session,
                 device_id="mac-1",

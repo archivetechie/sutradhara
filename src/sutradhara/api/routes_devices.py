@@ -302,9 +302,9 @@ def post_enroll_csr(request: Request, body: EnrollCsrRequest) -> dict[str, str]:
                 token=body.token,
                 cert_path=cert_path,
             )
+        except grpc_ca.DeviceOwnershipCertificateError as exc:
+            _raise(409, "device_other_operator", str(exc))
         except grpc_ca.CertificateError as exc:
-            if "different operator" in str(exc):
-                _raise(409, "device_other_operator", str(exc))
             _raise(400, "bad_enrollment", str(exc))
         except ValueError as exc:
             _raise(400, "bad_enrollment", str(exc))

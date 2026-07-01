@@ -107,6 +107,10 @@ class EnrollTokenGrant:
     device_id: str
 
 
+class DeviceOwnershipError(PermissionError):
+    """Raised when an enrollment would cross an active device owner boundary."""
+
+
 def insert_intake(
     session: Session,
     *,
@@ -309,7 +313,7 @@ def record_device_enrollment(
         )
     )
     if any(row.operator != operator for row in active_rows):
-        raise PermissionError("device belongs to a different operator")
+        raise DeviceOwnershipError("device belongs to a different operator")
 
     now = _utcnow()
     for row in active_rows:
