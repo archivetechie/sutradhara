@@ -21,6 +21,9 @@ classifiers = [
 ]
 dependencies = [
     "grpcio>=1.60",
+    # Floor must be >= the generated _proto gencode version (currently 6.33.5),
+    # or `import device_pb2` raises a protobuf runtime/gencode VersionError.
+    "protobuf>=6.33.5",
     "sutradhara-receive==0.0.1",
 ]
 
