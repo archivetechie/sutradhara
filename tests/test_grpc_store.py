@@ -6,7 +6,7 @@ import datetime as dt
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import Engine, inspect
+from sqlalchemy import Engine, inspect, select
 
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.grpc import store
@@ -98,6 +98,89 @@ def test_device_enrollment_token_revoke_and_schema(engine: Engine) -> None:
         )
 
 
+def test_device_reenrollment_supersedes_prior_fingerprint(engine: Engine) -> None:
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="BB" * 32,
+            operator="owner",
+        )
+
+    with session_scope(engine) as session:
+        assert store.operator_for_device(session, "mac-1") == "owner"
+        with pytest.raises(PermissionError):
+            store.resolve_device(session, device_id="mac-1", cert_fingerprint="AA" * 32)
+        identity = store.resolve_device(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="BB" * 32,
+        )
+        assert identity.operator == "owner"
+        assert _active_enrollment_count(session, "mac-1") == 1
+
+
+def test_device_reenrollment_same_fingerprint_is_idempotent(engine: Engine) -> None:
+    with session_scope(engine) as session:
+        first = store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+        second = store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+        assert first.id == second.id
+
+    with session_scope(engine) as session:
+        assert _active_enrollment_count(session, "mac-1") == 1
+        identity = store.resolve_device(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+        )
+        assert identity.operator == "owner"
+
+
+def test_device_reenrollment_refuses_different_operator_without_mutation(engine: Engine) -> None:
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+
+    with session_scope(engine) as session:
+        with pytest.raises(PermissionError, match="different operator"):
+            store.record_device_enrollment(
+                session,
+                device_id="mac-1",
+                cert_fingerprint="CC" * 32,
+                operator="other",
+            )
+
+    with session_scope(engine) as session:
+        assert _active_enrollment_count(session, "mac-1") == 1
+        assert store.resolve_device(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+        ).operator == "owner"
+        with pytest.raises(PermissionError):
+            store.resolve_device(session, device_id="mac-1", cert_fingerprint="CC" * 32)
+
+
 def test_expired_or_reused_enrollment_token_is_refused(engine: Engine) -> None:
     with session_scope(engine) as session:
         expired = store.issue_enroll_token(
@@ -117,3 +200,16 @@ def test_expired_or_reused_enrollment_token_is_refused(engine: Engine) -> None:
             store.consume_enroll_token(session, used)
         with pytest.raises(ValueError, match="common name"):
             store.consume_enroll_token(session, wrong_device, device_id="mac-2")
+
+
+def _active_enrollment_count(session, device_id: str) -> int:
+    return len(
+        list(
+            session.scalars(
+                select(store.GrpcDeviceEnrollment).where(
+                    store.GrpcDeviceEnrollment.device_id == device_id,
+                    store.GrpcDeviceEnrollment.revoked.is_(False),
+                )
+            )
+        )
+    )

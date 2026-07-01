@@ -292,9 +292,31 @@ def record_device_enrollment(
     cert_fingerprint: str,
     operator: str,
 ) -> GrpcDeviceEnrollment:
-    """Record or reactivate a certificate fingerprint for a device/operator."""
+    """Record one active certificate fingerprint for a device/operator.
+
+    Re-enrollment by the same operator supersedes any prior active fingerprint
+    for the device. Active ownership by a different operator is refused without
+    mutating the existing rows.
+    """
 
     normalized = normalize_fingerprint(cert_fingerprint)
+    active_rows = list(
+        session.scalars(
+            select(GrpcDeviceEnrollment).where(
+                GrpcDeviceEnrollment.device_id == device_id,
+                GrpcDeviceEnrollment.revoked.is_(False),
+            )
+        )
+    )
+    if any(row.operator != operator for row in active_rows):
+        raise PermissionError("device belongs to a different operator")
+
+    now = _utcnow()
+    for row in active_rows:
+        if row.cert_fingerprint != normalized:
+            row.revoked = True
+            row.revoked_at = now
+
     existing = session.scalars(
         select(GrpcDeviceEnrollment).where(
             GrpcDeviceEnrollment.device_id == device_id,
