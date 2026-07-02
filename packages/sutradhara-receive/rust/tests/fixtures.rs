@@ -4,14 +4,15 @@
 //! therefore checked against the same public contract that will gate the later
 //! write-side, binary, and PyO3 wheel migration stages.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use sutradhara_receive::{
     BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, PACKAGE_GLOBS, PACKAGE_PROFILE_HASH,
-    PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE, RECEIVE_VERSION, bag_info_text, bagit_manifest_text,
-    canonicalize_manifest_path, canonicalize_raw_path_components, escape_member_name,
+    PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE, RECEIVE_VERSION, ReceiveOptions, bag_info_text,
+    bagit_manifest_text, build_package_tar, canonicalize_manifest_path,
+    canonicalize_raw_path_components, escape_member_name, receive_source, sha256_file,
     tagmanifest_text, unescape_member_name,
 };
 
@@ -132,11 +133,175 @@ fn writer_text_fixtures_match_python_contract() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn package_tar_fixture_matches_python_contract() {
+    let fixture = read_fixture("writer_outputs.json");
+    let package_fixture = &fixture["package_tar"];
+    let temp = tempfile::tempdir().unwrap();
+    let package_root = temp.path().join("GOLDEN.fcpbundle");
+    write_package_fixture(&package_root);
+    let tar_path = temp.path().join("GOLDEN.fcpbundle.tar");
+
+    let result = build_package_tar(&package_root, &tar_path, "GOLDEN.fcpbundle").unwrap();
+
+    assert_eq!(result.digest, package_fixture["sha256"].as_str().unwrap());
+    assert_eq!(result.size_bytes, package_fixture["size"].as_u64().unwrap());
+    assert_eq!(
+        fs::metadata(&tar_path).unwrap().len(),
+        package_fixture["size"].as_u64().unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&result.members).unwrap(),
+        package_fixture["package_index"]["packages"][0]["members"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn receive_bag_fixtures_match_python_contract() {
+    let fixture = read_fixture("receive_bags.json");
+    for case in fixture["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let landing = temp.path().join("landing");
+        match name {
+            "mixed-files" => write_mixed_source(&source),
+            "package-with-symlink" => write_package_fixture(&source.join("A001.photoslibrary")),
+            other => panic!("unhandled receive fixture {other}"),
+        }
+
+        let result = receive_source(&source, &landing, &receive_options(name)).unwrap();
+
+        assert_eq!(receive_result_payload(&result), case["result"]);
+        assert_eq!(snapshot_bag_files(&result.intake_dir), case["files"]);
+    }
+}
+
 fn read_fixture(name: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join(name);
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+fn write_mixed_source(source: &Path) {
+    fs::create_dir_all(source).unwrap();
+    fs::write(source.join("clip.mov"), b"video").unwrap();
+    fs::write(source.join("Cafe\u{301}.mov"), b"cafe").unwrap();
+}
+
+#[cfg(unix)]
+fn write_package_fixture(package_root: &Path) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    let render = package_root.join("Render");
+    fs::create_dir_all(&render).unwrap();
+    fs::write(render.join("clip01.mov"), b"clip-one").unwrap();
+    fs::write(render.join("clip02.mov"), b"clip-two").unwrap();
+    fs::write(
+        render.join(Path::new(OsStr::from_bytes(b"\xfelegacy.dat"))),
+        b"legacy",
+    )
+    .unwrap();
+    fs::write(package_root.join("._meta"), b"appledouble").unwrap();
+    fs::write(package_root.join("library.plist"), b"plist").unwrap();
+    symlink("Render/clip01.mov", package_root.join("clip-link.mov")).unwrap();
+}
+
+#[cfg(unix)]
+fn receive_options(name: &str) -> ReceiveOptions {
+    ReceiveOptions {
+        intake_id: format!("fixture-{name}"),
+        created_at: "2026-06-18T12:34:56+00:00".to_string(),
+        bagging_date: "2026-06-18".to_string(),
+        source_kind: "card".to_string(),
+        operator: "Op Name".to_string(),
+        source_ref: Some("SRC".to_string()),
+        artifactclass: "camera-original".to_string(),
+        label: Some("fixture".to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn receive_result_payload(result: &sutradhara_receive::ReceiveSourceResult) -> Value {
+    json!({
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": result.bag_profile,
+        "file_count": result.file_count,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": result.skipped_count,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": result.total_bytes,
+    })
+}
+
+#[cfg(unix)]
+fn snapshot_bag_files(intake_dir: &Path) -> Value {
+    let mut paths = collect_files(intake_dir);
+    paths.sort();
+    let mut records = Vec::new();
+    for path in paths {
+        let relpath = path
+            .strip_prefix(intake_dir)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relpath == "receive.log" {
+            continue;
+        }
+        if matches!(
+            relpath.as_str(),
+            "bagit.txt"
+                | "bag-info.txt"
+                | "manifest-sha256.txt"
+                | "tagmanifest-sha256.txt"
+                | "package-index.json"
+                | "intake.json"
+        ) {
+            records.push(json!({
+                "kind": "text",
+                "path": relpath,
+                "text": normalize_intake_id(&fs::read_to_string(&path).unwrap()),
+            }));
+        } else {
+            records.push(json!({
+                "kind": "bytes",
+                "path": relpath,
+                "sha256": sha256_file(&path).unwrap(),
+                "size": fs::metadata(&path).unwrap().len(),
+            }));
+        }
+    }
+    Value::Array(records)
+}
+
+#[cfg(unix)]
+fn collect_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            result.extend(collect_files(&path));
+        } else {
+            result.push(path);
+        }
+    }
+    result
+}
+
+#[cfg(unix)]
+fn normalize_intake_id(value: &str) -> String {
+    value
+        .replace("fixture-mixed-files", "<INTAKE-ID>")
+        .replace("fixture-package-with-symlink", "<INTAKE-ID>")
 }
 
 fn bag_info_metadata() -> BTreeMap<String, String> {
