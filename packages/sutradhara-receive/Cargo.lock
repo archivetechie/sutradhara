@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "sutradhara-receive"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "filetime",
  "pyo3",

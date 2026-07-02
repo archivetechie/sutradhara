@@ -162,12 +162,12 @@
     "PACKAGE_INDEX_NAME": "package-index.json",
     "PACKAGE_PROFILE_HASH": "fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c",
     "PACKAGE_PROFILE_VERSION": "package-tar-v1",
-    "RECEIVE_PACKAGE": "sutradhara-receive/0.0.1",
+    "RECEIVE_PACKAGE": "sutradhara-receive/0.1.0",
     "RECEIVE_PACKAGE_NAME": "sutradhara-receive",
-    "RECEIVE_PACKAGE_VERSION": "0.0.1",
+    "RECEIVE_PACKAGE_VERSION": "0.1.0",
     "RECEIVE_VERSION": "receive-v2",
     "SUPPORTED_RECEIVE_PACKAGES": [
-      "sutradhara-receive/0.0.1"
+      "sutradhara-receive/0.1.0"
     ]
   },
   "dataclasses": {

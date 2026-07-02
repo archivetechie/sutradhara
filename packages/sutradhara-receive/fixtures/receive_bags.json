@@ -5,7 +5,7 @@
         {
           "kind": "text",
           "path": "bag-info.txt",
-          "text": "Bagging-Date: 2026-06-18\nPayload-Oxum: 9.2\nBag-Software-Agent: sutradhara-receive/receive-v2\nReceive-Package: sutradhara-receive/0.0.1\nIntake-Id: <INTAKE-ID>\nOperator: Op Name\nSource-Kind: card\nSource-Ref: SRC\nArtifactclass: camera-original\nLabel: fixture\nCanonicalization-Version: receive-bagit-path-v2\nPackage-Profile-Version: package-tar-v1\nPackage-Profile-Hash: fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\nSkipped-Count: 0\n"
+          "text": "Bagging-Date: 2026-06-18\nPayload-Oxum: 9.2\nBag-Software-Agent: sutradhara-receive/receive-v2\nReceive-Package: sutradhara-receive/0.1.0\nIntake-Id: <INTAKE-ID>\nOperator: Op Name\nSource-Kind: card\nSource-Ref: SRC\nArtifactclass: camera-original\nLabel: fixture\nCanonicalization-Version: receive-bagit-path-v2\nPackage-Profile-Version: package-tar-v1\nPackage-Profile-Hash: fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\nSkipped-Count: 0\n"
         },
         {
           "kind": "text",
@@ -37,7 +37,7 @@
         {
           "kind": "text",
           "path": "tagmanifest-sha256.txt",
-          "text": "fb121d65de2f46b115ffb8166899f957f6fea76cab4cdff8f005717b3ac223f4  bag-info.txt\n1712ecfb074bf29c4188ad3421032509159a09739fd604f8fe57038b4ddefcc9  bagit.txt\n97c4ea9b31f6c2fe8f8a9e705667b728293e26ba9bef764da20ddbc6c3b4cef5  manifest-sha256.txt\n"
+          "text": "4e2e04760fd6eaede9dfdc930bd7972b6ecb56f04617943a7f5d401a747ff243  bag-info.txt\n1712ecfb074bf29c4188ad3421032509159a09739fd604f8fe57038b4ddefcc9  bagit.txt\n97c4ea9b31f6c2fe8f8a9e705667b728293e26ba9bef764da20ddbc6c3b4cef5  manifest-sha256.txt\n"
         }
       ],
       "name": "mixed-files",
@@ -69,7 +69,7 @@
         {
           "kind": "text",
           "path": "bag-info.txt",
-          "text": "Bagging-Date: 2026-06-18\nPayload-Oxum: 10240.1\nBag-Software-Agent: sutradhara-receive/receive-v2\nReceive-Package: sutradhara-receive/0.0.1\nIntake-Id: <INTAKE-ID>\nOperator: Op Name\nSource-Kind: card\nSource-Ref: SRC\nArtifactclass: camera-original\nLabel: fixture\nCanonicalization-Version: receive-bagit-path-v2\nPackage-Profile-Version: package-tar-v1\nPackage-Profile-Hash: fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\nSkipped-Count: 0\n"
+          "text": "Bagging-Date: 2026-06-18\nPayload-Oxum: 10240.1\nBag-Software-Agent: sutradhara-receive/receive-v2\nReceive-Package: sutradhara-receive/0.1.0\nIntake-Id: <INTAKE-ID>\nOperator: Op Name\nSource-Kind: card\nSource-Ref: SRC\nArtifactclass: camera-original\nLabel: fixture\nCanonicalization-Version: receive-bagit-path-v2\nPackage-Profile-Version: package-tar-v1\nPackage-Profile-Hash: fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\nSkipped-Count: 0\n"
         },
         {
           "kind": "text",
@@ -100,7 +100,7 @@
         {
           "kind": "text",
           "path": "tagmanifest-sha256.txt",
-          "text": "324fd2d8284665ff06ae39a05afb7ec1df3d234a2dbfbc7bab1896909af32abf  bag-info.txt\n1712ecfb074bf29c4188ad3421032509159a09739fd604f8fe57038b4ddefcc9  bagit.txt\n9fdcf871fa709d940ea55b73d93d93412f9d08f4a51867d3fe4c605212e5d0a0  manifest-sha256.txt\ne0b1bec0d169093735e4a1a50417d23a152f69b5f877002dc5df7d8e0be053bc  package-index.json\n"
+          "text": "7c6a017e7f297aa87e44db574fc85b93472c2e139cba433c18959a2926391b0f  bag-info.txt\n1712ecfb074bf29c4188ad3421032509159a09739fd604f8fe57038b4ddefcc9  bagit.txt\n9fdcf871fa709d940ea55b73d93d93412f9d08f4a51867d3fe4c605212e5d0a0  manifest-sha256.txt\ne0b1bec0d169093735e4a1a50417d23a152f69b5f877002dc5df7d8e0be053bc  package-index.json\n"
         }
       ],
       "name": "package-with-symlink",

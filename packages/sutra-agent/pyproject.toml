@@ -25,7 +25,7 @@ dependencies = [
     # / device_pb2 raises a runtime/gencode VersionError.
     "grpcio>=1.81.0",
     "protobuf>=6.33.5",
-    "sutradhara-receive==0.0.1",
+    "sutradhara-receive==0.1.0",
 ]
 
 [project.scripts]

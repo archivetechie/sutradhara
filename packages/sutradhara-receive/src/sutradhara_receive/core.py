@@ -42,12 +42,17 @@ except ImportError:  # pragma: no cover - source-tree fallback before native bui
 
 RECEIVE_VERSION = "receive-v2"
 RECEIVE_PACKAGE_NAME = "sutradhara-receive"
-RECEIVE_PACKAGE_VERSION = "0.0.1"
+RECEIVE_PACKAGE_VERSION = "0.1.0"
 with suppress(PackageNotFoundError):
     RECEIVE_PACKAGE_VERSION = version(RECEIVE_PACKAGE_NAME)
+if _native is not None and RECEIVE_PACKAGE_VERSION != _native.RECEIVE_PACKAGE_VERSION:
+    raise RuntimeError(
+        "sutradhara-receive package metadata version "
+        f"{RECEIVE_PACKAGE_VERSION!r} does not match native core version "
+        f"{_native.RECEIVE_PACKAGE_VERSION!r}"
+    )
 RECEIVE_PACKAGE = f"{RECEIVE_PACKAGE_NAME}/{RECEIVE_PACKAGE_VERSION}"
 SUPPORTED_RECEIVE_PACKAGES = frozenset({RECEIVE_PACKAGE})
-LEGACY_RECEIVE_SOFTWARE_AGENTS = frozenset({f"sutradhara-receive/{RECEIVE_VERSION}"})
 CANONICALIZATION_VERSION = "receive-bagit-path-v2"
 PACKAGE_PROFILE_VERSION = "package-tar-v1"
 PACKAGE_GLOBS = ("*.fcpbundle", "*.photoslibrary", "*.imovielibrary", "*.app")
@@ -1040,8 +1045,6 @@ def manifest_mismatch(actual: Mapping[str, str], expected: Mapping[str, str]) ->
 def _receive_package_error(metadata: Mapping[str, str]) -> str | None:
     actual = metadata.get("Receive-Package")
     if actual in SUPPORTED_RECEIVE_PACKAGES:
-        return None
-    if actual is None and metadata.get("Bag-Software-Agent") in LEGACY_RECEIVE_SOFTWARE_AGENTS:
         return None
     expected = ", ".join(sorted(SUPPORTED_RECEIVE_PACKAGES))
     return f"Receive-Package mismatch: expected {expected}, actual {actual!r}"

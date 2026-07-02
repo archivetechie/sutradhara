@@ -615,10 +615,7 @@ fn bag_info_metadata() -> BTreeMap<String, String> {
             "Bag-Software-Agent".to_string(),
             "sutradhara-receive/receive-v2".to_string(),
         ),
-        (
-            "Receive-Package".to_string(),
-            "sutradhara-receive/0.0.1".to_string(),
-        ),
+        ("Receive-Package".to_string(), RECEIVE_PACKAGE.to_string()),
         ("Intake-Id".to_string(), "bag-001".to_string()),
         ("Operator".to_string(), "op".to_string()),
         ("Source-Kind".to_string(), "card".to_string()),

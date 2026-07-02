@@ -118,11 +118,11 @@
       "complete": true,
       "details": {
         "errors": [
-          "Receive-Package mismatch: expected sutradhara-receive/0.0.1, actual 'sutradhara-receive/999.0.0'"
+          "Receive-Package mismatch: expected sutradhara-receive/0.1.0, actual 'sutradhara-receive/999.0.0'"
         ]
       },
       "errors": [
-        "Receive-Package mismatch: expected sutradhara-receive/0.0.1, actual 'sutradhara-receive/999.0.0'"
+        "Receive-Package mismatch: expected sutradhara-receive/0.1.0, actual 'sutradhara-receive/999.0.0'"
       ],
       "extra": [],
       "mismatched": [],

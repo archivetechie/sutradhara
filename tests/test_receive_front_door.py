@@ -717,7 +717,7 @@ def test_intake_quarantines_unsupported_receive_package_version(
     assert outcomes[0].details["errors"] == validation.details()["errors"]
 
 
-def test_missing_receive_package_label_is_accepted_for_legacy_bags(tmp_path: Path) -> None:
+def test_missing_receive_package_label_is_rejected(tmp_path: Path) -> None:
     source = tmp_path / "source"
     landing = tmp_path / "landing"
     source.mkdir()
@@ -733,7 +733,11 @@ def test_missing_receive_package_label_is_accepted_for_legacy_bags(tmp_path: Pat
 
     validation = validate_bag(result.intake_dir)
 
-    assert validation.valid is True
+    assert validation.complete is True
+    assert validation.valid is False
+    assert validation.details()["errors"] == [
+        f"Receive-Package mismatch: expected {RECEIVE_PACKAGE}, actual None"
+    ]
 
 
 def test_validate_bag_rejects_unsafe_tagmanifest_path(tmp_path: Path) -> None:

@@ -23,7 +23,7 @@ classifiers = [
 # land alongside the feature that needs them (see docs/spec-v0.1.md §11
 # for the committed stack and §12.3 for sequencing).
 dependencies = [
-    "sutradhara-receive==0.0.1",
+    "sutradhara-receive==0.1.0",
     "cbor2>=5.6",
     "click>=8.1",
     "fastapi>=0.115",

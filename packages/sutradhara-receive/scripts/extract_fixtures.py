@@ -35,6 +35,7 @@ from sutradhara_receive import (
     RECEIVE_PACKAGE,
     RECEIVE_VERSION,
     bag_info_metadata,
+    member_name,
     read_bag_info,
     read_manifest_sha256,
     read_package_index,
@@ -44,7 +45,6 @@ from sutradhara_receive import (
 )
 from sutradhara_receive import cli as receive_cli
 from sutradhara_receive import core as receive_core
-from sutradhara_receive import member_name
 from sutradhara_receive.member_name import escape_member_name, unescape_member_name
 
 FIXED_NOW = dt.datetime(2026, 6, 18, 12, 34, 56, tzinfo=dt.UTC)
@@ -823,7 +823,7 @@ def _json_or_none(text: str) -> Any | None:
 def _raises_message(callback: Callable[[], Any]) -> str:
     try:
         callback()
-    except Exception as exc:  # noqa: BLE001 - fixture captures public error text.
+    except Exception as exc:
         return str(exc)
     raise AssertionError("callback did not raise")
 

@@ -1,9 +1,9 @@
 {
   "bagit_writer": {
-    "bag-info.txt": "Bagging-Date: 2026-06-18\nPayload-Oxum: 5.1\nBag-Software-Agent: sutradhara-receive/receive-v2\nReceive-Package: sutradhara-receive/0.0.1\nIntake-Id: bag-001\nOperator: op\nSource-Kind: card\nSource-Ref: A001\nArtifactclass: camera-original\nLabel: shoot\nCanonicalization-Version: receive-bagit-path-v2\nPackage-Profile-Version: package-tar-v1\nPackage-Profile-Hash: fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\nSkipped-Count: 0\n",
+    "bag-info.txt": "Bagging-Date: 2026-06-18\nPayload-Oxum: 5.1\nBag-Software-Agent: sutradhara-receive/receive-v2\nReceive-Package: sutradhara-receive/0.1.0\nIntake-Id: bag-001\nOperator: op\nSource-Kind: card\nSource-Ref: A001\nArtifactclass: camera-original\nLabel: shoot\nCanonicalization-Version: receive-bagit-path-v2\nPackage-Profile-Version: package-tar-v1\nPackage-Profile-Hash: fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\nSkipped-Count: 0\n",
     "bagit.txt": "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n",
     "manifest-sha256.txt": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  data/clip%25.mov\n",
-    "tagmanifest-sha256.txt": "3182d36db5894aa2f0f61600421440f465c6106adb19010bca8ab53d2c67cbd3  bag-info.txt\n1712ecfb074bf29c4188ad3421032509159a09739fd604f8fe57038b4ddefcc9  bagit.txt\ndbe7ac145d965b0cd43d0f04c3a1d943569e60239cabc8023859e83c70654a2e  manifest-sha256.txt\n"
+    "tagmanifest-sha256.txt": "b030c6b3b02e5fe9a79830caa4d1569179afccb65454b6d84446fcea97b02893  bag-info.txt\n1712ecfb074bf29c4188ad3421032509159a09739fd604f8fe57038b4ddefcc9  bagit.txt\ndbe7ac145d965b0cd43d0f04c3a1d943569e60239cabc8023859e83c70654a2e  manifest-sha256.txt\n"
   },
   "constants": {
     "BAG_PROFILE": "bagit-1.0",
@@ -16,7 +16,7 @@
     ],
     "PACKAGE_PROFILE_HASH": "fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c",
     "PACKAGE_PROFILE_VERSION": "package-tar-v1",
-    "RECEIVE_PACKAGE": "sutradhara-receive/0.0.1",
+    "RECEIVE_PACKAGE": "sutradhara-receive/0.1.0",
     "RECEIVE_VERSION": "receive-v2"
   },
   "package_tar": {
