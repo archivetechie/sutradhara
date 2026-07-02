@@ -142,6 +142,28 @@ def test_bagit_writer_uses_native_atomic_observer(
     assert validate_bag(bag).valid is True
 
 
+def test_receive_source_uses_native_write_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert receive_core._native is not None
+    assert hasattr(receive_core._native, "receive_source_json")
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+
+    def fail_python_copy_path(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("pure Python receive copy path should not be called")
+
+    monkeypatch.setattr(receive_core, "_copy_or_verify_entries", fail_python_copy_path)
+
+    result = receive_source(source, landing=landing, source_kind="card", operator="op")
+
+    assert (result.intake_dir / "data" / "clip.mov").read_bytes() == b"video"
+    assert validate_bag(result.intake_dir).valid is True
+
+
 def test_legacy_receive_core_import_aliases_extracted_package() -> None:
     import sutradhara.receive.core as legacy_core
     import sutradhara_receive.core as extracted_core

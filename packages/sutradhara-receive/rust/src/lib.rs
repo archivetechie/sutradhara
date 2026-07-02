@@ -247,10 +247,14 @@ enum SourceEntryType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileReceipt {
+    source_path: PathBuf,
     relpath: String,
     destination_path: PathBuf,
     sha256_hex: String,
     size_bytes: u64,
+    st_dev: Option<u64>,
+    st_ino: Option<u64>,
+    copied: bool,
     logical_relpath: Option<String>,
     stored_relpath: Option<String>,
     package_members: Vec<PackageMemberRecord>,
@@ -602,6 +606,22 @@ pub fn receive_source(
     landing: &Path,
     options: &ReceiveOptions,
 ) -> ReceiveResult<ReceiveSourceResult> {
+    let mut observer = |_temp_path: &Path, _final_path: &Path| Ok(());
+    let mut after_copy = |_data_root: &Path, _receipts: &[FileReceipt]| Ok(());
+    receive_source_with_hooks(source, landing, options, &mut observer, &mut after_copy)
+}
+
+pub(crate) fn receive_source_with_hooks<O, A>(
+    source: &Path,
+    landing: &Path,
+    options: &ReceiveOptions,
+    observer: &mut O,
+    after_copy: &mut A,
+) -> ReceiveResult<ReceiveSourceResult>
+where
+    O: FnMut(&Path, &Path) -> ReceiveResult<()>,
+    A: FnMut(&Path, &[FileReceipt]) -> ReceiveResult<()>,
+{
     let source_root = fs::canonicalize(source)?;
     validate_source_root(&source_root)?;
     fs::create_dir_all(landing)?;
@@ -610,7 +630,7 @@ pub fn receive_source(
     let intake_dir = landing_root.join(&options.intake_id);
     fs::create_dir(&intake_dir)?;
     let receiving_path = intake_dir.join(".receiving.json");
-    write_json_file(
+    write_json_file_with_observer(
         &receiving_path,
         &json!({
             "artifactclass": options.artifactclass,
@@ -625,14 +645,24 @@ pub fn receive_source(
             "source_ref": options.source_ref,
             "started_at": options.created_at,
         }),
+        observer,
     )?;
+    let events = vec![format!(
+        "started intake {} from {}",
+        options.intake_id,
+        source_root.display()
+    )];
     finish_receive(
-        &source_root,
-        &landing_root,
-        &intake_dir,
-        &receiving_path,
-        options,
-        false,
+        FinishReceiveContext {
+            source_root: &source_root,
+            intake_dir: &intake_dir,
+            receiving_path: &receiving_path,
+            options,
+            resume: false,
+            events,
+        },
+        observer,
+        after_copy,
     )
 }
 
@@ -641,6 +671,22 @@ pub fn resume_receive_source(
     intake_id: &str,
     options: &ReceiveOptions,
 ) -> ReceiveResult<ReceiveSourceResult> {
+    let mut observer = |_temp_path: &Path, _final_path: &Path| Ok(());
+    let mut after_copy = |_data_root: &Path, _receipts: &[FileReceipt]| Ok(());
+    resume_receive_source_with_hooks(landing, intake_id, options, &mut observer, &mut after_copy)
+}
+
+pub(crate) fn resume_receive_source_with_hooks<O, A>(
+    landing: &Path,
+    intake_id: &str,
+    options: &ReceiveOptions,
+    observer: &mut O,
+    after_copy: &mut A,
+) -> ReceiveResult<ReceiveSourceResult>
+where
+    O: FnMut(&Path, &Path) -> ReceiveResult<()>,
+    A: FnMut(&Path, &[FileReceipt]) -> ReceiveResult<()>,
+{
     fs::create_dir_all(landing)?;
     let landing_root = fs::canonicalize(landing)?;
     let intake_dir = landing_root.join(intake_id);
@@ -655,6 +701,10 @@ pub fn resume_receive_source(
     let source_root = fs::canonicalize(PathBuf::from(source_text))?;
     validate_source_root(&source_root)?;
     validate_landing_relationship(&source_root, &landing_root)?;
+    let events = vec![format!(
+        "resumed intake {intake_id} from {}",
+        source_root.display()
+    )];
     let resume_options = ReceiveOptions {
         intake_id: intake_id.to_string(),
         created_at: options.created_at.clone(),
@@ -670,23 +720,46 @@ pub fn resume_receive_source(
         label: optional_json_string(&receiving, "label").or_else(|| options.label.clone()),
     };
     finish_receive(
-        &source_root,
-        &landing_root,
-        &intake_dir,
-        &receiving_path,
-        &resume_options,
-        true,
+        FinishReceiveContext {
+            source_root: &source_root,
+            intake_dir: &intake_dir,
+            receiving_path: &receiving_path,
+            options: &resume_options,
+            resume: true,
+            events,
+        },
+        observer,
+        after_copy,
     )
 }
 
-fn finish_receive(
-    source_root: &Path,
-    _landing_root: &Path,
-    intake_dir: &Path,
-    receiving_path: &Path,
-    options: &ReceiveOptions,
+struct FinishReceiveContext<'a> {
+    source_root: &'a Path,
+    intake_dir: &'a Path,
+    receiving_path: &'a Path,
+    options: &'a ReceiveOptions,
     resume: bool,
-) -> ReceiveResult<ReceiveSourceResult> {
+    events: Vec<String>,
+}
+
+fn finish_receive<O, A>(
+    context: FinishReceiveContext<'_>,
+    observer: &mut O,
+    after_copy: &mut A,
+) -> ReceiveResult<ReceiveSourceResult>
+where
+    O: FnMut(&Path, &Path) -> ReceiveResult<()>,
+    A: FnMut(&Path, &[FileReceipt]) -> ReceiveResult<()>,
+{
+    let FinishReceiveContext {
+        source_root,
+        intake_dir,
+        receiving_path,
+        options,
+        resume,
+        events,
+    } = context;
+    let mut events = events;
     let (entries, rejected) = scan_source(source_root)?;
     check_collisions(&entries)?;
     let data_root = intake_dir.join(DATA_DIR_NAME);
@@ -701,8 +774,11 @@ fn finish_receive(
 
     let mut receipts = Vec::new();
     for entry in &entries {
-        receipts.push(copy_or_package_entry(entry, &data_root)?);
+        receipts.push(copy_or_package_entry_with_observer(
+            entry, &data_root, observer,
+        )?);
     }
+    after_copy(&data_root, &receipts)?;
     verify_destination_files(&receipts)?;
 
     let manifest_entries: BTreeMap<String, String> = receipts
@@ -712,7 +788,11 @@ fn finish_receive(
     let package_index = package_index_payload(&receipts);
     let mut extra_tag_files = Vec::new();
     if let Some(package_index) = package_index {
-        write_json_file(&intake_dir.join("package-index.json"), &package_index)?;
+        write_json_file_with_observer(
+            &intake_dir.join("package-index.json"),
+            &package_index,
+            observer,
+        )?;
         extra_tag_files.push("package-index.json".to_string());
     } else {
         match fs::remove_file(intake_dir.join("package-index.json")) {
@@ -723,9 +803,24 @@ fn finish_receive(
     }
 
     let total_bytes = receipts.iter().map(|receipt| receipt.size_bytes).sum();
+    for item in &rejected {
+        events.push(format!("skipped {}: {}", item.relpath, item.reason));
+    }
+    events.push(format!(
+        "verified {} file(s), {total_bytes} byte(s), {} skipped",
+        receipts.len(),
+        rejected.len()
+    ));
+    write_receive_log_with_observer(&intake_dir.join("receive.log"), &events, observer)?;
     let metadata = bag_info_metadata(options, receipts.len(), total_bytes, rejected.len());
-    write_bagit_files(intake_dir, &manifest_entries, &metadata, &extra_tag_files)?;
-    write_json_file(
+    write_bagit_files_with_observer(
+        intake_dir,
+        &manifest_entries,
+        &metadata,
+        &extra_tag_files,
+        observer,
+    )?;
+    write_json_file_with_observer(
         &intake_dir.join("intake.json"),
         &json!({
             "bag_profile": BAG_PROFILE,
@@ -733,6 +828,7 @@ fn finish_receive(
             "intake_id": options.intake_id,
             "status": "complete",
         }),
+        observer,
     )?;
     match fs::remove_file(receiving_path) {
         Ok(()) => {}
@@ -1426,32 +1522,58 @@ fn check_collisions(entries: &[SourceEntry]) -> ReceiveResult<()> {
     Ok(())
 }
 
-fn copy_or_package_entry(entry: &SourceEntry, data_root: &Path) -> ReceiveResult<FileReceipt> {
+fn copy_or_package_entry_with_observer<F>(
+    entry: &SourceEntry,
+    data_root: &Path,
+    observer: &mut F,
+) -> ReceiveResult<FileReceipt>
+where
+    F: FnMut(&Path, &Path) -> ReceiveResult<()>,
+{
     match entry.entry_type {
-        SourceEntryType::File => copy_file_entry(entry, data_root),
-        SourceEntryType::Package => package_entry(entry, data_root),
+        SourceEntryType::File => copy_file_entry_with_observer(entry, data_root, observer),
+        SourceEntryType::Package => package_entry_with_observer(entry, data_root, observer),
     }
 }
 
-fn copy_file_entry(entry: &SourceEntry, data_root: &Path) -> ReceiveResult<FileReceipt> {
+fn copy_file_entry_with_observer<F>(
+    entry: &SourceEntry,
+    data_root: &Path,
+    observer: &mut F,
+) -> ReceiveResult<FileReceipt>
+where
+    F: FnMut(&Path, &Path) -> ReceiveResult<()>,
+{
     let destination = safe_payload_path(data_root, &entry.relpath)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
     reject_existing_unsupported_destination(&destination)?;
-    let (digest, snapshot) = copy_file_with_digest(&entry.source_path, &destination)?;
+    let (digest, snapshot) =
+        copy_file_with_digest_with_observer(&entry.source_path, &destination, observer)?;
     Ok(FileReceipt {
+        source_path: entry.source_path.clone(),
         relpath: entry.relpath.clone(),
         destination_path: destination,
         sha256_hex: digest,
         size_bytes: snapshot.size,
+        st_dev: snapshot.device,
+        st_ino: snapshot.inode,
+        copied: true,
         logical_relpath: None,
         stored_relpath: None,
         package_members: Vec::new(),
     })
 }
 
-fn package_entry(entry: &SourceEntry, data_root: &Path) -> ReceiveResult<FileReceipt> {
+fn package_entry_with_observer<F>(
+    entry: &SourceEntry,
+    data_root: &Path,
+    observer: &mut F,
+) -> ReceiveResult<FileReceipt>
+where
+    F: FnMut(&Path, &Path) -> ReceiveResult<()>,
+{
     let logical_relpath = entry
         .logical_relpath
         .as_ref()
@@ -1469,16 +1591,31 @@ fn package_entry(entry: &SourceEntry, data_root: &Path) -> ReceiveResult<FileRec
             return Err(error);
         }
     };
-    replace_file(&temp_path, &destination)?;
-    Ok(FileReceipt {
-        relpath: entry.relpath.clone(),
-        destination_path: destination,
-        sha256_hex: package.digest,
-        size_bytes: package.size_bytes,
-        logical_relpath: Some(logical_relpath.clone()),
-        stored_relpath: Some(entry.relpath.clone()),
-        package_members: package.members,
-    })
+    let result = (|| {
+        observer(&temp_path, &destination)?;
+        replace_file(&temp_path, &destination)?;
+        if let Some(parent) = destination.parent() {
+            fsync_dir_best_effort(parent);
+        }
+        let source_snapshot = source_stat_snapshot(&entry.source_path)?;
+        Ok(FileReceipt {
+            source_path: entry.source_path.clone(),
+            relpath: entry.relpath.clone(),
+            destination_path: destination,
+            sha256_hex: package.digest,
+            size_bytes: package.size_bytes,
+            st_dev: source_snapshot.device,
+            st_ino: source_snapshot.inode,
+            copied: true,
+            logical_relpath: Some(logical_relpath.clone()),
+            stored_relpath: Some(entry.relpath.clone()),
+            package_members: package.members,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn reject_existing_unsupported_destination(destination: &Path) -> ReceiveResult<()> {
@@ -1503,10 +1640,23 @@ fn reject_existing_unsupported_destination(destination: &Path) -> ReceiveResult<
     Ok(())
 }
 
+#[cfg(test)]
 fn copy_file_with_digest(
     source: &Path,
     destination: &Path,
 ) -> ReceiveResult<(String, SourceStatSnapshot)> {
+    let mut observer = |_temp_path: &Path, _final_path: &Path| Ok(());
+    copy_file_with_digest_with_observer(source, destination, &mut observer)
+}
+
+fn copy_file_with_digest_with_observer<F>(
+    source: &Path,
+    destination: &Path,
+    observer: &mut F,
+) -> ReceiveResult<(String, SourceStatSnapshot)>
+where
+    F: FnMut(&Path, &Path) -> ReceiveResult<()>,
+{
     let before = source_stat_snapshot(source)?;
     let mut raw_in = File::open(source)?;
     let temp_path = temp_path_for(destination)?;
@@ -1530,6 +1680,7 @@ fn copy_file_with_digest(
         drop(raw_out);
         let after = source_stat_snapshot(source)?;
         raise_if_source_mutated(source, &before, &after)?;
+        observer(&temp_path, destination)?;
         replace_file(&temp_path, destination)?;
         if let Some(parent) = destination.parent() {
             fsync_dir_best_effort(parent);
@@ -1681,12 +1832,49 @@ fn bag_info_metadata(
     ])
 }
 
-fn write_json_file(path: &Path, value: &Value) -> ReceiveResult<()> {
-    let mut observer = |_temp_path: &Path, _final_path: &Path| Ok(());
+fn write_json_file_with_observer<F>(
+    path: &Path,
+    value: &Value,
+    observer: &mut F,
+) -> ReceiveResult<()>
+where
+    F: FnMut(&Path, &Path) -> ReceiveResult<()>,
+{
     atomic_write_text(
         path,
         &format!("{}\n", serde_json::to_string_pretty(value)?),
-        &mut observer,
+        observer,
+    )
+}
+
+fn write_receive_log_with_observer<F>(
+    path: &Path,
+    events: &[String],
+    observer: &mut F,
+) -> ReceiveResult<()>
+where
+    F: FnMut(&Path, &Path) -> ReceiveResult<()>,
+{
+    let mut text = String::new();
+    for event in events {
+        text.push_str(&receive_log_timestamp());
+        text.push(' ');
+        text.push_str(event);
+        text.push('\n');
+    }
+    atomic_write_text(path, &text, observer)
+}
+
+fn receive_log_timestamp() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
     )
 }
 

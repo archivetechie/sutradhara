@@ -371,6 +371,21 @@ def receive_source(
     each regular file is stat-guarded before and after the read.
     """
 
+    if _native is not None and _stat_snapshot is globals().get("_ORIGINAL_STAT_SNAPSHOT"):
+        return _receive_source_native(
+            source,
+            landing=landing,
+            source_kind=source_kind,
+            operator=operator,
+            source_ref=source_ref,
+            artifactclass=artifactclass,
+            label=label,
+            resume=resume,
+            now=now,
+            atomic_observer=atomic_observer,
+            after_copy_hook=after_copy_hook,
+        )
+
     started_at = now or _utcnow()
     landing_root = Path(landing).resolve()
     landing_root.mkdir(parents=True, exist_ok=True)
@@ -507,6 +522,58 @@ def receive_source(
         raise
 
 
+def _receive_source_native(
+    source: Path | str | None,
+    *,
+    landing: Path | str,
+    source_kind: str,
+    operator: str,
+    source_ref: str | None,
+    artifactclass: str,
+    label: str | None,
+    resume: str | None,
+    now: dt.datetime | None,
+    atomic_observer: AtomicWriteObserver | None,
+    after_copy_hook: Callable[[Path, tuple[FileReceipt, ...]], None] | None,
+) -> ReceiveResult:
+    started_at = now or _utcnow()
+    landing_root = Path(landing).resolve()
+    landing_root.mkdir(parents=True, exist_ok=True)
+    _fsync_dir(landing_root)
+    if resume is None:
+        if source is None:
+            raise ReceiveError("receive requires SOURCE unless --resume is used")
+        source_arg: Path | None = Path(source).resolve()
+        intake_id = _mint_intake_id(operator, started_at, landing_root)
+    else:
+        source_arg = None
+        intake_id = resume
+    try:
+        payload = cast(
+            dict[str, Any],
+            json.loads(
+                _native.receive_source_json(
+                    source_arg,
+                    landing_root,
+                    intake_id,
+                    started_at.isoformat(),
+                    started_at.date().isoformat(),
+                    source_kind,
+                    operator,
+                    source_ref,
+                    artifactclass,
+                    label,
+                    resume,
+                    atomic_observer,
+                    after_copy_hook,
+                )
+            ),
+        )
+    except RuntimeError as exc:
+        _raise_native_receive_error(exc)
+    return _receive_result_from_native(payload)
+
+
 def plan_payload_units(source: Path | str) -> PayloadPlan:
     """Return a metadata-only receive plan for a source tree.
 
@@ -549,6 +616,21 @@ def _payload_plan_from_native(payload: Mapping[str, Any]) -> PayloadPlan:
     return PayloadPlan(units=units, rejected=rejected)
 
 
+def _receive_result_from_native(payload: Mapping[str, Any]) -> ReceiveResult:
+    return ReceiveResult(
+        intake_id=str(payload["intake_id"]),
+        intake_dir=_path_from_native_payload(payload["intake_dir"]),
+        manifest_path=_path_from_native_payload(payload["manifest_path"]),
+        bag_info_path=_path_from_native_payload(payload["bag_info_path"]),
+        tagmanifest_path=_path_from_native_payload(payload["tagmanifest_path"]),
+        sentinel_path=_path_from_native_payload(payload["sentinel_path"]),
+        file_count=int(payload["file_count"]),
+        total_bytes=int(payload["total_bytes"]),
+        skipped_count=int(payload["skipped_count"]),
+        bag_profile=str(payload["bag_profile"]),
+    )
+
+
 def _payload_unit_from_native(payload: Mapping[str, Any]) -> PayloadUnit:
     return PayloadUnit(
         source_path=_path_from_native_payload(payload["source_path"]),
@@ -582,6 +664,10 @@ def _raise_native_receive_error(exc: RuntimeError) -> None:
     message = str(exc)
     if message.startswith("canonical receive path collision:"):
         raise CollisionError(message) from exc
+    if message.startswith("source changed during receive:"):
+        raise SourceMutationError(message) from exc
+    if message.startswith("destination verification failed:"):
+        raise DestinationVerificationError(message) from exc
     if "during scan" in message:
         raise SourceScanError(message) from exc
     raise ReceiveError(message) from exc
@@ -2147,6 +2233,9 @@ def _stat_snapshot(path: Path) -> _StatSnapshot:
         inode=getattr(st, "st_ino", None),
         device=getattr(st, "st_dev", None),
     )
+
+
+_ORIGINAL_STAT_SNAPSHOT = _stat_snapshot
 
 
 def _raise_if_mutated(path: Path, before: _StatSnapshot, after: _StatSnapshot) -> None:

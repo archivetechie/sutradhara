@@ -12,7 +12,7 @@ use crate::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyModule};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -174,6 +174,91 @@ fn py_plan_payload_units_json(source: &Bound<'_, PyAny>) -> PyResult<String> {
     serde_json::to_string(&plan_payload_json(&plan)).map_err(py_runtime_error)
 }
 
+#[pyfunction(name = "receive_source_json")]
+#[pyo3(signature = (
+    source,
+    landing,
+    intake_id,
+    created_at,
+    bagging_date,
+    source_kind,
+    operator,
+    source_ref = None,
+    artifactclass = "default",
+    label = None,
+    resume = None,
+    observer = None,
+    after_copy_hook = None
+))]
+#[allow(clippy::too_many_arguments)]
+fn py_receive_source_json(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    landing: &Bound<'_, PyAny>,
+    intake_id: &str,
+    created_at: &str,
+    bagging_date: &str,
+    source_kind: &str,
+    operator: &str,
+    source_ref: Option<String>,
+    artifactclass: &str,
+    label: Option<String>,
+    resume: Option<String>,
+    observer: Option<Py<PyAny>>,
+    after_copy_hook: Option<Py<PyAny>>,
+) -> PyResult<String> {
+    let landing = py_path_to_pathbuf(landing)?;
+    let options = crate::ReceiveOptions {
+        intake_id: intake_id.to_string(),
+        created_at: created_at.to_string(),
+        bagging_date: bagging_date.to_string(),
+        source_kind: source_kind.to_string(),
+        operator: operator.to_string(),
+        source_ref,
+        artifactclass: artifactclass.to_string(),
+        label,
+    };
+    let mut observer_callback = |temp_path: &Path, final_path: &Path| {
+        call_atomic_observer(py, observer.as_ref(), temp_path, final_path)
+    };
+    let mut after_copy_callback = |data_root: &Path, receipts: &[crate::FileReceipt]| {
+        if let Some(callback) = after_copy_hook.as_ref() {
+            let data_root = py_path_object(py, data_root).map_err(pyerr_receive_error)?;
+            let receipts = file_receipts_tuple(py, receipts).map_err(pyerr_receive_error)?;
+            callback
+                .bind(py)
+                .call1((data_root, receipts))
+                .map_err(pyerr_receive_error)?;
+        }
+        Ok(())
+    };
+    let result = if let Some(resume) = resume {
+        crate::resume_receive_source_with_hooks(
+            &landing,
+            &resume,
+            &options,
+            &mut observer_callback,
+            &mut after_copy_callback,
+        )
+    } else {
+        if source.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "receive requires SOURCE unless --resume is used",
+            ));
+        }
+        let source = py_path_to_pathbuf(source)?;
+        crate::receive_source_with_hooks(
+            &source,
+            &landing,
+            &options,
+            &mut observer_callback,
+            &mut after_copy_callback,
+        )
+    }
+    .map_err(py_runtime_error)?;
+    serde_json::to_string(&receive_result_json(&result)).map_err(py_runtime_error)
+}
+
 #[pyfunction(name = "hash_payload_tree_json")]
 #[pyo3(signature = (payload_root, *, reject_native_packages = false))]
 fn py_hash_payload_tree_json(
@@ -233,6 +318,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_write_bagit_files, m)?)?;
     m.add_function(wrap_pyfunction!(py_sweep_orphans_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_plan_payload_units_json, m)?)?;
+    m.add_function(wrap_pyfunction!(py_receive_source_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_hash_payload_tree_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_validate_bag_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_slug_operator, m)?)?;
@@ -249,6 +335,82 @@ fn py_value_error(error: ReceiveError) -> PyErr {
 
 fn pyerr_receive_error(error: PyErr) -> ReceiveError {
     ReceiveError::new(error.to_string())
+}
+
+fn call_atomic_observer(
+    py: Python<'_>,
+    observer: Option<&Py<PyAny>>,
+    temp_path: &Path,
+    final_path: &Path,
+) -> crate::ReceiveResult<()> {
+    if let Some(observer) = observer {
+        let temp_path = py_path_object(py, temp_path).map_err(pyerr_receive_error)?;
+        let final_path = py_path_object(py, final_path).map_err(pyerr_receive_error)?;
+        observer
+            .bind(py)
+            .call_method1("before_rename", (temp_path, final_path))
+            .map_err(pyerr_receive_error)?;
+    }
+    Ok(())
+}
+
+fn file_receipts_tuple<'py>(
+    py: Python<'py>,
+    receipts: &[crate::FileReceipt],
+) -> PyResult<Bound<'py, PyAny>> {
+    let list = PyList::empty(py);
+    for receipt in receipts {
+        list.append(file_receipt_object(py, receipt)?)?;
+    }
+    let builtins = PyModule::import(py, "builtins")?;
+    builtins.getattr("tuple")?.call1((list,))
+}
+
+fn file_receipt_object<'py>(
+    py: Python<'py>,
+    receipt: &crate::FileReceipt,
+) -> PyResult<Bound<'py, PyAny>> {
+    let core = PyModule::import(py, "sutradhara_receive.core")?;
+    let receipt_class = core.getattr("FileReceipt")?;
+    let source_path = py_path_object(py, &receipt.source_path)?;
+    let destination_path = py_path_object(py, &receipt.destination_path)?;
+    let package_members = package_members_tuple(py, &receipt.package_members)?;
+    let package_profile = if receipt.package_members.is_empty() {
+        None
+    } else {
+        Some(PACKAGE_PROFILE_VERSION)
+    };
+    let package_index = if receipt.package_members.is_empty() {
+        None
+    } else {
+        Some("package-index.json")
+    };
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("source_path", source_path)?;
+    kwargs.set_item("relpath", receipt.relpath.as_str())?;
+    kwargs.set_item("destination_path", destination_path)?;
+    kwargs.set_item("sha256_hex", receipt.sha256_hex.as_str())?;
+    kwargs.set_item("size_bytes", receipt.size_bytes)?;
+    kwargs.set_item("st_dev", receipt.st_dev)?;
+    kwargs.set_item("st_ino", receipt.st_ino)?;
+    kwargs.set_item("copied", receipt.copied)?;
+    kwargs.set_item("logical_relpath", receipt.logical_relpath.as_deref())?;
+    kwargs.set_item("stored_relpath", receipt.stored_relpath.as_deref())?;
+    kwargs.set_item("package_profile", package_profile)?;
+    kwargs.set_item("package_index", package_index)?;
+    kwargs.set_item("package_members", package_members)?;
+    receipt_class.call((), Some(&kwargs))
+}
+
+fn package_members_tuple<'py>(
+    py: Python<'py>,
+    members: &[crate::PackageMemberRecord],
+) -> PyResult<Bound<'py, PyAny>> {
+    let payload = serde_json::to_string(members).map_err(py_runtime_error)?;
+    let json = PyModule::import(py, "json")?;
+    let list = json.call_method1("loads", (payload,))?;
+    let builtins = PyModule::import(py, "builtins")?;
+    builtins.getattr("tuple")?.call1((list,))
 }
 
 #[cfg(unix)]
@@ -318,6 +480,21 @@ fn plan_payload_json(plan: &crate::PayloadPlan) -> Value {
                 "reason": entry.reason,
             })
         }).collect::<Vec<_>>(),
+    })
+}
+
+fn receive_result_json(result: &crate::ReceiveSourceResult) -> Value {
+    json!({
+        "intake_id": result.intake_id,
+        "intake_dir": path_payload(&result.intake_dir),
+        "manifest_path": path_payload(&result.manifest_path),
+        "bag_info_path": path_payload(&result.bag_info_path),
+        "tagmanifest_path": path_payload(&result.tagmanifest_path),
+        "sentinel_path": path_payload(&result.sentinel_path),
+        "file_count": result.file_count,
+        "total_bytes": result.total_bytes,
+        "skipped_count": result.skipped_count,
+        "bag_profile": result.bag_profile,
     })
 }
 
