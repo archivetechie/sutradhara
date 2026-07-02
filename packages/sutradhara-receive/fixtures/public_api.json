@@ -1,0 +1,504 @@
+{
+  "__all__": [
+    "BAG_INFO_NAME",
+    "BAG_PROFILE",
+    "CANONICALIZATION_VERSION",
+    "DATA_DIR_NAME",
+    "MANIFEST_NAME",
+    "PACKAGE_GLOBS",
+    "PACKAGE_INDEX_NAME",
+    "PACKAGE_PROFILE_HASH",
+    "PACKAGE_PROFILE_VERSION",
+    "RECEIVE_PACKAGE",
+    "RECEIVE_PACKAGE_NAME",
+    "RECEIVE_PACKAGE_VERSION",
+    "RECEIVE_VERSION",
+    "SUPPORTED_RECEIVE_PACKAGES",
+    "AtomicWriteObserver",
+    "BagValidationResult",
+    "BagWriteResult",
+    "CollisionError",
+    "ConfirmationResult",
+    "DestinationVerificationError",
+    "FileReceipt",
+    "OrphanSweepResult",
+    "PayloadPlan",
+    "PayloadUnit",
+    "ReceiveError",
+    "ReceiveResult",
+    "RejectedEntry",
+    "SourceMutationError",
+    "SourceScanError",
+    "bag_info_metadata",
+    "bag_info_text",
+    "bagit_manifest_text",
+    "canonicalize_filesystem_path",
+    "canonicalize_manifest_path",
+    "hash_payload_tree",
+    "manifest_mismatch",
+    "payload_plan_digest",
+    "plan_payload_units",
+    "read_bag_info",
+    "read_manifest_sha256",
+    "read_package_index",
+    "receive_source",
+    "safe_payload_path",
+    "sha256_file",
+    "slug_operator",
+    "sweep_orphans",
+    "tagmanifest_text",
+    "validate_bag",
+    "wait_for_server_confirmation",
+    "write_bagit_files"
+  ],
+  "__all_count": 50,
+  "classes": {
+    "AtomicWriteObserver": [
+      "builtins.object"
+    ],
+    "BagValidationResult": [
+      "builtins.object"
+    ],
+    "BagWriteResult": [
+      "builtins.object"
+    ],
+    "CollisionError": [
+      "sutradhara_receive.core.ReceiveError"
+    ],
+    "ConfirmationResult": [
+      "builtins.object"
+    ],
+    "DestinationVerificationError": [
+      "sutradhara_receive.core.ReceiveError"
+    ],
+    "FileReceipt": [
+      "builtins.object"
+    ],
+    "OrphanSweepResult": [
+      "builtins.object"
+    ],
+    "PayloadPlan": [
+      "builtins.object"
+    ],
+    "PayloadUnit": [
+      "builtins.object"
+    ],
+    "ReceiveError": [
+      "builtins.Exception"
+    ],
+    "ReceiveResult": [
+      "builtins.object"
+    ],
+    "RejectedEntry": [
+      "builtins.object"
+    ],
+    "SourceMutationError": [
+      "sutradhara_receive.core.ReceiveError"
+    ],
+    "SourceScanError": [
+      "sutradhara_receive.core.ReceiveError"
+    ]
+  },
+  "cli_exports": [
+    "ReceiveCliRuntimeError",
+    "ReceiveCliUsageError",
+    "SOURCE_KIND_CHOICES",
+    "build_parser",
+    "default_operator",
+    "main",
+    "receive_result_payload",
+    "receive_text_lines",
+    "run_receive_command",
+    "run_sweep_command",
+    "sweep_result_payload",
+    "sweep_text_lines"
+  ],
+  "cli_json_schema": {
+    "confirmation_keys": [
+      "detail",
+      "marker_path",
+      "release_ok",
+      "status"
+    ],
+    "receive_required_keys": [
+      "bag_info_path",
+      "bag_profile",
+      "file_count",
+      "intake_dir",
+      "intake_id",
+      "manifest_path",
+      "sentinel_path",
+      "skipped_count",
+      "tagmanifest_path",
+      "total_bytes"
+    ],
+    "sweep_required_keys": [
+      "removed"
+    ]
+  },
+  "cli_signatures": {
+    "build_parser": "() -> 'argparse.ArgumentParser'",
+    "default_operator": "() -> 'str'",
+    "main": "(argv: 'Sequence[str] | None' = None) -> 'int'",
+    "receive_result_payload": "(result: 'ReceiveResult', confirmation: 'ConfirmationResult | None') -> 'dict[str, Any]'",
+    "receive_text_lines": "(result: 'ReceiveResult', confirmation: 'ConfirmationResult | None') -> 'tuple[list[str], list[str]]'",
+    "run_receive_command": "(source: 'Path | None', *, landing: 'Path', source_kind: 'str', operator: 'str', source_ref: 'str | None' = None, artifactclass: 'str' = 'default', label: 'str | None' = None, resume: 'str | None' = None, fake_source: 'Path | None' = None, confirm_timeout: 'float | None' = None, confirm_interval: 'float' = 1.0) -> 'tuple[ReceiveResult, ConfirmationResult | None]'",
+    "run_sweep_command": "(landing: 'Path', *, older_than_hours: 'float' = 24.0) -> 'OrphanSweepResult'",
+    "sweep_result_payload": "(result: 'OrphanSweepResult') -> 'dict[str, Any]'",
+    "sweep_text_lines": "(result: 'OrphanSweepResult') -> 'list[str]'"
+  },
+  "constants": {
+    "BAG_INFO_NAME": "bag-info.txt",
+    "BAG_PROFILE": "bagit-1.0",
+    "CANONICALIZATION_VERSION": "receive-bagit-path-v2",
+    "DATA_DIR_NAME": "data",
+    "MANIFEST_NAME": "manifest-sha256.txt",
+    "PACKAGE_GLOBS": [
+      "*.fcpbundle",
+      "*.photoslibrary",
+      "*.imovielibrary",
+      "*.app"
+    ],
+    "PACKAGE_INDEX_NAME": "package-index.json",
+    "PACKAGE_PROFILE_HASH": "fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c",
+    "PACKAGE_PROFILE_VERSION": "package-tar-v1",
+    "RECEIVE_PACKAGE": "sutradhara-receive/0.0.1",
+    "RECEIVE_PACKAGE_NAME": "sutradhara-receive",
+    "RECEIVE_PACKAGE_VERSION": "0.0.1",
+    "RECEIVE_VERSION": "receive-v2",
+    "SUPPORTED_RECEIVE_PACKAGES": [
+      "sutradhara-receive/0.0.1"
+    ]
+  },
+  "dataclasses": {
+    "BagValidationResult": {
+      "fields": [
+        {
+          "default": "<required>",
+          "name": "bag_root"
+        },
+        {
+          "default": "<required>",
+          "name": "data_root"
+        },
+        {
+          "default": "<required>",
+          "name": "metadata"
+        },
+        {
+          "default": "<required>",
+          "name": "manifest"
+        },
+        {
+          "default": "<required>",
+          "name": "actual"
+        },
+        {
+          "default": "<required>",
+          "name": "actual_records"
+        },
+        {
+          "default": "<required>",
+          "name": "missing"
+        },
+        {
+          "default": "<required>",
+          "name": "extra"
+        },
+        {
+          "default": "<required>",
+          "name": "mismatched"
+        },
+        {
+          "default": "<required>",
+          "name": "tag_mismatched"
+        },
+        {
+          "default": "<required>",
+          "name": "errors"
+        }
+      ],
+      "methods": {
+        "details": "(self) -> 'dict[str, Any]'"
+      },
+      "properties": [
+        "complete",
+        "valid"
+      ]
+    },
+    "BagWriteResult": {
+      "fields": [
+        {
+          "default": "<required>",
+          "name": "manifest_path"
+        },
+        {
+          "default": "<required>",
+          "name": "bag_info_path"
+        },
+        {
+          "default": "<required>",
+          "name": "tagmanifest_path"
+        }
+      ],
+      "methods": {},
+      "properties": []
+    },
+    "ConfirmationResult": {
+      "fields": [
+        {
+          "default": "<required>",
+          "name": "release_ok"
+        },
+        {
+          "default": "<required>",
+          "name": "status"
+        },
+        {
+          "default": "<required>",
+          "name": "marker_path"
+        },
+        {
+          "default": null,
+          "name": "detail"
+        }
+      ],
+      "methods": {},
+      "properties": []
+    },
+    "FileReceipt": {
+      "fields": [
+        {
+          "default": "<required>",
+          "name": "source_path"
+        },
+        {
+          "default": "<required>",
+          "name": "relpath"
+        },
+        {
+          "default": "<required>",
+          "name": "destination_path"
+        },
+        {
+          "default": "<required>",
+          "name": "sha256_hex"
+        },
+        {
+          "default": "<required>",
+          "name": "size_bytes"
+        },
+        {
+          "default": "<required>",
+          "name": "st_dev"
+        },
+        {
+          "default": "<required>",
+          "name": "st_ino"
+        },
+        {
+          "default": "<required>",
+          "name": "copied"
+        },
+        {
+          "default": null,
+          "name": "logical_relpath"
+        },
+        {
+          "default": null,
+          "name": "stored_relpath"
+        },
+        {
+          "default": null,
+          "name": "package_profile"
+        },
+        {
+          "default": null,
+          "name": "package_index"
+        },
+        {
+          "default": [],
+          "name": "package_members"
+        }
+      ],
+      "methods": {},
+      "properties": [
+        "as_received_relpath",
+        "sha256_bytes"
+      ]
+    },
+    "OrphanSweepResult": {
+      "fields": [
+        {
+          "default": "<required>",
+          "name": "removed"
+        }
+      ],
+      "methods": {},
+      "properties": []
+    },
+    "PayloadPlan": {
+      "fields": [
+        {
+          "default": "<required>",
+          "name": "units"
+        },
+        {
+          "default": "<required>",
+          "name": "rejected"
+        }
+      ],
+      "methods": {
+        "source_plan_digest": "(self) -> 'str'"
+      },
+      "properties": [
+        "skipped_count"
+      ]
+    },
+    "PayloadUnit": {
+      "fields": [
+        {
+          "default": "<required>",
+          "name": "source_path"
+        },
+        {
+          "default": "<required>",
+          "name": "relpath"
+        },
+        {
+          "default": "<required>",
+          "name": "entry_type"
+        },
+        {
+          "default": "<required>",
+          "name": "logical_relpath"
+        },
+        {
+          "default": "<required>",
+          "name": "hint_size"
+        },
+        {
+          "default": "<required>",
+          "name": "plan_size"
+        },
+        {
+          "default": "<required>",
+          "name": "mtime_ns"
+        },
+        {
+          "default": "<factory>",
+          "name": "_package_members_cache"
+        }
+      ],
+      "methods": {
+        "byte_chunks": "(self, chunk_bytes: 'int' = 1048576) -> 'Iterator[bytes]'",
+        "package_index": "(self, tar_sha256: 'str') -> 'dict[str, Any] | None'"
+      },
+      "properties": [
+        "is_package"
+      ]
+    },
+    "ReceiveResult": {
+      "fields": [
+        {
+          "default": "<required>",
+          "name": "intake_id"
+        },
+        {
+          "default": "<required>",
+          "name": "intake_dir"
+        },
+        {
+          "default": "<required>",
+          "name": "manifest_path"
+        },
+        {
+          "default": "<required>",
+          "name": "bag_info_path"
+        },
+        {
+          "default": "<required>",
+          "name": "tagmanifest_path"
+        },
+        {
+          "default": "<required>",
+          "name": "sentinel_path"
+        },
+        {
+          "default": "<required>",
+          "name": "file_count"
+        },
+        {
+          "default": "<required>",
+          "name": "total_bytes"
+        },
+        {
+          "default": "<required>",
+          "name": "skipped_count"
+        },
+        {
+          "default": "<required>",
+          "name": "bag_profile"
+        }
+      ],
+      "methods": {},
+      "properties": []
+    },
+    "RejectedEntry": {
+      "fields": [
+        {
+          "default": "<required>",
+          "name": "relpath"
+        },
+        {
+          "default": "<required>",
+          "name": "source_path"
+        },
+        {
+          "default": "<required>",
+          "name": "reason"
+        }
+      ],
+      "methods": {},
+      "properties": []
+    }
+  },
+  "functions": {
+    "bag_info_metadata": "(*, intake_id: 'str', source_kind: 'str', operator: 'str', source_ref: 'str | None', artifactclass: 'str', label: 'str | None', started_at: 'dt.datetime', file_count: 'int', total_bytes: 'int', skipped_count: 'int') -> 'dict[str, str]'",
+    "bag_info_text": "(metadata: 'Mapping[str, str]') -> 'str'",
+    "bagit_manifest_text": "(entries: 'Mapping[str, str]') -> 'str'",
+    "canonicalize_filesystem_path": "(path: 'Path | str', root: 'Path | str') -> 'str'",
+    "canonicalize_manifest_path": "(raw: 'str') -> 'str'",
+    "hash_payload_tree": "(payload_root: 'Path | str', *, reject_native_packages: 'bool' = False) -> 'list[FileReceipt]'",
+    "manifest_mismatch": "(actual: 'Mapping[str, str]', expected: 'Mapping[str, str]') -> 'dict[str, Any]'",
+    "payload_plan_digest": "(plan: 'PayloadPlan | Iterable[PayloadUnit]') -> 'str'",
+    "plan_payload_units": "(source: 'Path | str') -> 'PayloadPlan'",
+    "read_bag_info": "(path: 'str | Path') -> 'dict[str, str]'",
+    "read_manifest_sha256": "(path: 'str | Path') -> 'dict[str, str]'",
+    "read_package_index": "(path: 'str | Path') -> 'dict[str, Any]'",
+    "receive_source": "(source: 'Path | str | None', *, landing: 'Path | str', source_kind: 'str', operator: 'str', source_ref: 'str | None' = None, artifactclass: 'str' = 'default', label: 'str | None' = None, resume: 'str | None' = None, now: 'dt.datetime | None' = None, atomic_observer: 'AtomicWriteObserver | None' = None, after_copy_hook: 'Callable[[Path, tuple[FileReceipt, ...]], None] | None' = None) -> 'ReceiveResult'",
+    "safe_payload_path": "(payload_root: 'Path | str', relpath: 'str') -> 'Path'",
+    "sha256_file": "(path: 'Path | str') -> 'str'",
+    "slug_operator": "(operator: 'str') -> 'str'",
+    "sweep_orphans": "(landing: 'Path | str', *, older_than: 'dt.timedelta' = datetime.timedelta(days=1), now: 'dt.datetime | None' = None) -> 'OrphanSweepResult'",
+    "tagmanifest_text": "(bag_root: 'Path | str', tag_files: 'Iterable[str]') -> 'str'",
+    "validate_bag": "(bag_root: 'Path | str') -> 'BagValidationResult'",
+    "wait_for_server_confirmation": "(intake_dir: 'Path | str', *, timeout_seconds: 'float', poll_interval_seconds: 'float' = 1.0) -> 'ConfirmationResult'",
+    "write_bagit_files": "(bag_root: 'Path | str', *, entries: 'Mapping[str, str]', metadata: 'Mapping[str, str]', extra_tag_files: 'Iterable[str]' = (), observer: 'AtomicWriteObserver | None' = None) -> 'BagWriteResult'"
+  },
+  "member_name_exports": [
+    "MemberNameError",
+    "escape_member_name",
+    "escape_path_name",
+    "escape_path_text",
+    "unescape_member_name"
+  ],
+  "member_name_signatures": {
+    "escape_member_name": "(raw: 'bytes') -> 'str'",
+    "escape_path_name": "(path: 'Path | str') -> 'str'",
+    "escape_path_text": "(path: 'str') -> 'str'",
+    "unescape_member_name": "(text: 'str') -> 'bytes'"
+  },
+  "module": "sutradhara_receive",
+  "schema_version": 1
+}

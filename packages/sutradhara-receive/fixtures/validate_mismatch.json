@@ -1,0 +1,135 @@
+{
+  "manifest_mismatch": [
+    {
+      "actual": {
+        "Caf\u00e9.mov": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc"
+      },
+      "expected": {
+        "Cafe\u0301.mov": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc"
+      },
+      "name": "nfc_equivalent",
+      "result": {}
+    },
+    {
+      "actual": {
+        "extra.mov": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc"
+      },
+      "expected": {},
+      "name": "extra",
+      "result": {
+        "extra": [
+          "extra.mov"
+        ],
+        "mismatched": [],
+        "missing": [],
+        "reason": "manifest-has-no-sha256"
+      }
+    },
+    {
+      "actual": {},
+      "expected": {
+        "missing.mov": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc"
+      },
+      "name": "missing",
+      "result": {
+        "extra": [],
+        "mismatched": [],
+        "missing": [
+          "missing.mov"
+        ]
+      }
+    },
+    {
+      "actual": {
+        "clip.mov": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": {
+        "clip.mov": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc"
+      },
+      "name": "mismatched",
+      "result": {
+        "extra": [],
+        "mismatched": [
+          {
+            "actual": "0000000000000000000000000000000000000000000000000000000000000000",
+            "expected": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc",
+            "path": "clip.mov"
+          }
+        ],
+        "missing": []
+      }
+    }
+  ],
+  "schema_version": 1,
+  "validate_bag": [
+    {
+      "complete": false,
+      "details": {
+        "errors": [
+          "Payload-Oxum mismatch: expected 0.0, actual '5.1'"
+        ],
+        "missing": [
+          "clip.mov"
+        ]
+      },
+      "errors": [
+        "Payload-Oxum mismatch: expected 0.0, actual '5.1'"
+      ],
+      "extra": [],
+      "mismatched": [],
+      "missing": [
+        "clip.mov"
+      ],
+      "name": "missing-payload",
+      "tag_mismatched": [],
+      "valid": false
+    },
+    {
+      "complete": true,
+      "details": {
+        "errors": [
+          "Payload-Oxum mismatch: expected 7.1, actual '5.1'"
+        ],
+        "mismatched": [
+          {
+            "actual": "11d510e067d2cdcd7559bd86d27a2f4c20babd43670346b97af99b522c1f0075",
+            "expected": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc",
+            "path": "clip.mov"
+          }
+        ]
+      },
+      "errors": [
+        "Payload-Oxum mismatch: expected 7.1, actual '5.1'"
+      ],
+      "extra": [],
+      "mismatched": [
+        {
+          "actual": "11d510e067d2cdcd7559bd86d27a2f4c20babd43670346b97af99b522c1f0075",
+          "expected": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc",
+          "path": "clip.mov"
+        }
+      ],
+      "missing": [],
+      "name": "corrupt-payload",
+      "tag_mismatched": [],
+      "valid": false
+    },
+    {
+      "complete": true,
+      "details": {
+        "errors": [
+          "Receive-Package mismatch: expected sutradhara-receive/0.0.1, actual 'sutradhara-receive/999.0.0'"
+        ]
+      },
+      "errors": [
+        "Receive-Package mismatch: expected sutradhara-receive/0.0.1, actual 'sutradhara-receive/999.0.0'"
+      ],
+      "extra": [],
+      "mismatched": [],
+      "missing": [],
+      "name": "unsupported-package",
+      "tag_mismatched": [],
+      "valid": false
+    }
+  ]
+}

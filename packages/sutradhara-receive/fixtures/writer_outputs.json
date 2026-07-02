@@ -1,0 +1,106 @@
+{
+  "bagit_writer": {
+    "bag-info.txt": "Bagging-Date: 2026-06-18\nPayload-Oxum: 5.1\nBag-Software-Agent: sutradhara-receive/receive-v2\nReceive-Package: sutradhara-receive/0.0.1\nIntake-Id: bag-001\nOperator: op\nSource-Kind: card\nSource-Ref: A001\nArtifactclass: camera-original\nLabel: shoot\nCanonicalization-Version: receive-bagit-path-v2\nPackage-Profile-Version: package-tar-v1\nPackage-Profile-Hash: fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\nSkipped-Count: 0\n",
+    "bagit.txt": "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n",
+    "manifest-sha256.txt": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  data/clip%25.mov\n",
+    "tagmanifest-sha256.txt": "3182d36db5894aa2f0f61600421440f465c6106adb19010bca8ab53d2c67cbd3  bag-info.txt\n1712ecfb074bf29c4188ad3421032509159a09739fd604f8fe57038b4ddefcc9  bagit.txt\ndbe7ac145d965b0cd43d0f04c3a1d943569e60239cabc8023859e83c70654a2e  manifest-sha256.txt\n"
+  },
+  "constants": {
+    "BAG_PROFILE": "bagit-1.0",
+    "CANONICALIZATION_VERSION": "receive-bagit-path-v2",
+    "PACKAGE_GLOBS": [
+      "*.fcpbundle",
+      "*.photoslibrary",
+      "*.imovielibrary",
+      "*.app"
+    ],
+    "PACKAGE_PROFILE_HASH": "fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c",
+    "PACKAGE_PROFILE_VERSION": "package-tar-v1",
+    "RECEIVE_PACKAGE": "sutradhara-receive/0.0.1",
+    "RECEIVE_VERSION": "receive-v2"
+  },
+  "package_tar": {
+    "package_index": {
+      "package_globs": [
+        "*.fcpbundle",
+        "*.photoslibrary",
+        "*.imovielibrary",
+        "*.app"
+      ],
+      "packages": [
+        {
+          "logical_member_path": "GOLDEN.fcpbundle",
+          "members": [
+            {
+              "data_offset": null,
+              "length": 0,
+              "member": "GOLDEN.fcpbundle",
+              "sha256": null,
+              "type": "directory"
+            },
+            {
+              "data_offset": 1024,
+              "length": 11,
+              "member": "GOLDEN.fcpbundle/._meta",
+              "sha256": "4bc00cc38d8165f834b24b62da9487a72bef512db912b40dfbaa417b955017cf",
+              "type": "file"
+            },
+            {
+              "data_offset": null,
+              "length": 0,
+              "member": "GOLDEN.fcpbundle/Render",
+              "sha256": null,
+              "type": "directory"
+            },
+            {
+              "data_offset": 2560,
+              "length": 6,
+              "member": "GOLDEN.fcpbundle/Render/\\xfelegacy.dat",
+              "sha256": "c49fea7425fa7f8699897a97c159c6690267d9003bb78c53fafa8fc15c325d84",
+              "type": "file"
+            },
+            {
+              "data_offset": 3584,
+              "length": 8,
+              "member": "GOLDEN.fcpbundle/Render/clip01.mov",
+              "sha256": "0f7018bd82dd2f339d27788e98d59626fc0171fc33dd2371076328d1c6d10d48",
+              "type": "file"
+            },
+            {
+              "data_offset": 4608,
+              "length": 8,
+              "member": "GOLDEN.fcpbundle/Render/clip02.mov",
+              "sha256": "dd445cc8671e9d64231c83ac1315e78ff5de522bcb528c2c8acbb30c80791fbb",
+              "type": "file"
+            },
+            {
+              "data_offset": null,
+              "length": 0,
+              "linkname": "Render/clip01.mov",
+              "member": "GOLDEN.fcpbundle/clip-link.mov",
+              "sha256": null,
+              "type": "symlink"
+            },
+            {
+              "data_offset": 6144,
+              "length": 5,
+              "member": "GOLDEN.fcpbundle/library.plist",
+              "sha256": "9ceec13202afbf12ee3abb994c669c711749c18e194326734db6123e94947e04",
+              "type": "file"
+            }
+          ],
+          "profile": "package-tar-v1",
+          "sha256": "c45dd9d8c1b85f09e4fd7c8668c18a99bfea4429ec6f5ea76dd0b540aa8ca4e3",
+          "size_bytes": 10240,
+          "stored_member_path": "GOLDEN.fcpbundle.tar"
+        }
+      ],
+      "profile": "package-tar-v1",
+      "profile_hash": "fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c"
+    },
+    "path": "data/GOLDEN.fcpbundle.tar",
+    "sha256": "c45dd9d8c1b85f09e4fd7c8668c18a99bfea4429ec6f5ea76dd0b540aa8ca4e3",
+    "size": 10240
+  },
+  "schema_version": 1
+}

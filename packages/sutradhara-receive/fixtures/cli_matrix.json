@@ -1,0 +1,330 @@
+{
+  "cases": [
+    {
+      "argv": [
+        "--fake-source",
+        "<SOURCE>",
+        "--landing",
+        "<LANDING>",
+        "--source-kind",
+        "card",
+        "--operator",
+        "Op",
+        "--json"
+      ],
+      "exit_code": 0,
+      "name": "bare-fake-source-json",
+      "stderr": "",
+      "stdout": "{\n  \"bag_info_path\": \"<LANDING>/<INTAKE-ID>/bag-info.txt\",\n  \"bag_profile\": \"bagit-1.0\",\n  \"file_count\": 1,\n  \"intake_dir\": \"<LANDING>/<INTAKE-ID>\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"manifest_path\": \"<LANDING>/<INTAKE-ID>/manifest-sha256.txt\",\n  \"sentinel_path\": \"<LANDING>/<INTAKE-ID>/intake.json\",\n  \"skipped_count\": 0,\n  \"tagmanifest_path\": \"<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt\",\n  \"total_bytes\": 5\n}\n",
+      "stdout_json": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 5
+      }
+    },
+    {
+      "argv": [
+        "run",
+        "--fake-source",
+        "<SOURCE>",
+        "--landing",
+        "<LANDING>",
+        "--source-kind",
+        "card",
+        "--operator",
+        "Op",
+        "--json"
+      ],
+      "exit_code": 0,
+      "name": "explicit-run-json",
+      "stderr": "",
+      "stdout": "{\n  \"bag_info_path\": \"<LANDING>/<INTAKE-ID>/bag-info.txt\",\n  \"bag_profile\": \"bagit-1.0\",\n  \"file_count\": 1,\n  \"intake_dir\": \"<LANDING>/<INTAKE-ID>\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"manifest_path\": \"<LANDING>/<INTAKE-ID>/manifest-sha256.txt\",\n  \"sentinel_path\": \"<LANDING>/<INTAKE-ID>/intake.json\",\n  \"skipped_count\": 0,\n  \"tagmanifest_path\": \"<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt\",\n  \"total_bytes\": 5\n}\n",
+      "stdout_json": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 5
+      }
+    },
+    {
+      "argv": [
+        "--fake-source",
+        "<SOURCE>",
+        "--landing",
+        "<LANDING>",
+        "--source-kind",
+        "card",
+        "--operator",
+        "Op",
+        "--confirm-timeout",
+        "0",
+        "--json"
+      ],
+      "exit_code": 3,
+      "name": "confirm-timeout-exit-3",
+      "stderr": "",
+      "stdout": "{\n  \"bag_info_path\": \"<LANDING>/<INTAKE-ID>/bag-info.txt\",\n  \"bag_profile\": \"bagit-1.0\",\n  \"confirmation\": {\n    \"detail\": null,\n    \"marker_path\": null,\n    \"release_ok\": false,\n    \"status\": \"timeout\"\n  },\n  \"file_count\": 1,\n  \"intake_dir\": \"<LANDING>/<INTAKE-ID>\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"manifest_path\": \"<LANDING>/<INTAKE-ID>/manifest-sha256.txt\",\n  \"sentinel_path\": \"<LANDING>/<INTAKE-ID>/intake.json\",\n  \"skipped_count\": 0,\n  \"tagmanifest_path\": \"<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt\",\n  \"total_bytes\": 5\n}\n",
+      "stdout_json": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "confirmation": {
+          "detail": null,
+          "marker_path": null,
+          "release_ok": false,
+          "status": "timeout"
+        },
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 5
+      }
+    },
+    {
+      "argv": [
+        "<SOURCE>",
+        "--fake-source",
+        "<FIXTURE-ROOT>/source-and-fake-source-usage/fake",
+        "--landing",
+        "<LANDING>",
+        "--source-kind",
+        "card",
+        "--operator",
+        "Op"
+      ],
+      "exit_code": 2,
+      "name": "source-and-fake-source-usage",
+      "stderr": "error: pass either SOURCE or --fake-source, not both\n",
+      "stdout": "",
+      "stdout_json": null
+    },
+    {
+      "argv": [
+        "sweep",
+        "--landing",
+        "<LANDING>",
+        "--older-than-hours",
+        "24",
+        "--json"
+      ],
+      "exit_code": 0,
+      "name": "sweep-json",
+      "stderr": "",
+      "stdout": "{\n  \"removed\": [\n    \"<LANDING>/stale\"\n  ]\n}\n",
+      "stdout_json": {
+        "removed": [
+          "<LANDING>/stale"
+        ]
+      }
+    },
+    {
+      "argv": [
+        "sweep-orphans",
+        "--landing",
+        "<LANDING>",
+        "--older-than-hours",
+        "24",
+        "--json"
+      ],
+      "exit_code": 0,
+      "name": "sweep-orphans-json",
+      "stderr": "",
+      "stdout": "{\n  \"removed\": [\n    \"<LANDING>/stale\"\n  ]\n}\n",
+      "stdout_json": {
+        "removed": [
+          "<LANDING>/stale"
+        ]
+      }
+    }
+  ],
+  "confirmation_rendering": [
+    {
+      "exit_code": 0,
+      "payload": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "confirmation": {
+          "detail": {
+            "ok": true
+          },
+          "marker_path": "<FIXTURE-ROOT>/verified.json",
+          "release_ok": true,
+          "status": "verified"
+        },
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 5
+      },
+      "status": "verified",
+      "stderr_lines": [],
+      "stdout_lines": [
+        "<INTAKE-ID>: received 1 file(s), 5 byte(s), skipped=0",
+        "sentinel: <LANDING>/<INTAKE-ID>/intake.json",
+        "bag profile: bagit-1.0",
+        "manifest: <LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "tagmanifest: <LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "server confirmation: verified; source release allowed"
+      ]
+    },
+    {
+      "exit_code": 3,
+      "payload": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "confirmation": {
+          "detail": null,
+          "marker_path": "<FIXTURE-ROOT>/verified.json",
+          "release_ok": false,
+          "status": "pending"
+        },
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 5
+      },
+      "status": "pending",
+      "stderr_lines": [
+        "server confirmation: pending; do not release source"
+      ],
+      "stdout_lines": [
+        "<INTAKE-ID>: received 1 file(s), 5 byte(s), skipped=0",
+        "sentinel: <LANDING>/<INTAKE-ID>/intake.json",
+        "bag profile: bagit-1.0",
+        "manifest: <LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "tagmanifest: <LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt"
+      ]
+    },
+    {
+      "exit_code": 3,
+      "payload": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "confirmation": {
+          "detail": {
+            "reason": "bag-invalid"
+          },
+          "marker_path": "<FIXTURE-ROOT>/intake.quarantined.json",
+          "release_ok": false,
+          "status": "quarantined"
+        },
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 5
+      },
+      "status": "quarantined",
+      "stderr_lines": [
+        "server confirmation: quarantined; do not release source",
+        "{\n  \"reason\": \"bag-invalid\"\n}"
+      ],
+      "stdout_lines": [
+        "<INTAKE-ID>: received 1 file(s), 5 byte(s), skipped=0",
+        "sentinel: <LANDING>/<INTAKE-ID>/intake.json",
+        "bag profile: bagit-1.0",
+        "manifest: <LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "tagmanifest: <LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt"
+      ]
+    },
+    {
+      "exit_code": 3,
+      "payload": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "confirmation": {
+          "detail": {
+            "details": {
+              "missing": [
+                "clip.mov"
+              ]
+            }
+          },
+          "marker_path": "<FIXTURE-ROOT>/intake.discrepancy.json",
+          "release_ok": false,
+          "status": "discrepancy"
+        },
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 5
+      },
+      "status": "discrepancy",
+      "stderr_lines": [
+        "server confirmation: discrepancy; do not release source",
+        "{\n  \"details\": {\n    \"missing\": [\n      \"clip.mov\"\n    ]\n  }\n}"
+      ],
+      "stdout_lines": [
+        "<INTAKE-ID>: received 1 file(s), 5 byte(s), skipped=0",
+        "sentinel: <LANDING>/<INTAKE-ID>/intake.json",
+        "bag profile: bagit-1.0",
+        "manifest: <LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "tagmanifest: <LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt"
+      ]
+    },
+    {
+      "exit_code": 3,
+      "payload": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "confirmation": {
+          "detail": null,
+          "marker_path": null,
+          "release_ok": false,
+          "status": "timeout"
+        },
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 5
+      },
+      "status": "timeout",
+      "stderr_lines": [
+        "server confirmation: timeout; do not release source"
+      ],
+      "stdout_lines": [
+        "<INTAKE-ID>: received 1 file(s), 5 byte(s), skipped=0",
+        "sentinel: <LANDING>/<INTAKE-ID>/intake.json",
+        "bag profile: bagit-1.0",
+        "manifest: <LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "tagmanifest: <LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt"
+      ]
+    }
+  ],
+  "schema_version": 1
+}

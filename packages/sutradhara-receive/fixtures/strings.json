@@ -1,0 +1,128 @@
+{
+  "canonicalize_filesystem_path": [
+    {
+      "canonical": "Caf\u00e9.mov",
+      "components_hex": [
+        "43616665cc812e6d6f76"
+      ],
+      "name": "nfd_to_nfc"
+    },
+    {
+      "canonical": "\\xff.bin",
+      "components_hex": [
+        "ff2e62696e"
+      ],
+      "name": "invalid_utf8"
+    },
+    {
+      "canonical": "Folder/clip.mov",
+      "components_hex": [
+        "466f6c646572",
+        "636c69702e6d6f76"
+      ],
+      "name": "nested"
+    },
+    {
+      "canonical": "we\\\\ird.mov",
+      "components_hex": [
+        "77655c6972642e6d6f76"
+      ],
+      "name": "backslash"
+    },
+    {
+      "canonical": "a\\x0ab.mov",
+      "components_hex": [
+        "610a622e6d6f76"
+      ],
+      "name": "control"
+    },
+    {
+      "canonical": "\u0378.txt",
+      "components_hex": [
+        "cdb82e747874"
+      ],
+      "name": "unassigned_codepoint"
+    }
+  ],
+  "canonicalize_manifest_path": [
+    {
+      "canonical": "Caf\u00e9.mov",
+      "raw": "./data/Cafe\u0301.mov"
+    },
+    {
+      "canonical": "clip.mov",
+      "raw": "/data/clip.mov"
+    },
+    {
+      "canonical": "\\xff.bin",
+      "raw": "data/\\xff.bin"
+    },
+    {
+      "canonical": "we\\\\ird.mov",
+      "raw": "data/we\\\\ird.mov"
+    }
+  ],
+  "canonicalize_manifest_rejections": [
+    {
+      "error": "relative path is empty",
+      "raw": ""
+    },
+    {
+      "error": "relative paths must not contain '..'",
+      "raw": ".."
+    },
+    {
+      "error": "relative paths must not contain '..'",
+      "raw": "data/../x"
+    },
+    {
+      "error": "invalid escaped manifest member name 'bad\\\\q'",
+      "raw": "data/bad\\q"
+    }
+  ],
+  "escape_member_name": [
+    {
+      "escaped": "clip.mov",
+      "name": "ascii",
+      "raw_hex": "636c69702e6d6f76",
+      "roundtrip_hex": "636c69702e6d6f76"
+    },
+    {
+      "escaped": "Caf\u00e9.mov",
+      "name": "utf8_nfc",
+      "raw_hex": "436166c3a92e6d6f76",
+      "roundtrip_hex": "436166c3a92e6d6f76"
+    },
+    {
+      "escaped": "Cafe\u0301.mov",
+      "name": "utf8_nfd",
+      "raw_hex": "43616665cc812e6d6f76",
+      "roundtrip_hex": "43616665cc812e6d6f76"
+    },
+    {
+      "escaped": "dir\\\\name.mov",
+      "name": "backslash",
+      "raw_hex": "6469725c6e616d652e6d6f76",
+      "roundtrip_hex": "6469725c6e616d652e6d6f76"
+    },
+    {
+      "escaped": "line\\x0afeed\\x7f.mov",
+      "name": "control",
+      "raw_hex": "6c696e650a666565647f2e6d6f76",
+      "roundtrip_hex": "6c696e650a666565647f2e6d6f76"
+    },
+    {
+      "escaped": "\\xffbad\\xc3(.mov",
+      "name": "invalid_utf8",
+      "raw_hex": "ff626164c3282e6d6f76",
+      "roundtrip_hex": "ff626164c3282e6d6f76"
+    },
+    {
+      "escaped": "\u0378.txt",
+      "name": "unassigned_codepoint",
+      "raw_hex": "cdb82e747874",
+      "roundtrip_hex": "cdb82e747874"
+    }
+  ],
+  "schema_version": 1
+}

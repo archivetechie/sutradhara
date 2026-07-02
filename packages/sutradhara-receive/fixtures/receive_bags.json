@@ -1,0 +1,138 @@
+{
+  "cases": [
+    {
+      "files": [
+        {
+          "kind": "text",
+          "path": "bag-info.txt",
+          "text": "Bagging-Date: 2026-06-18\nPayload-Oxum: 9.2\nBag-Software-Agent: sutradhara-receive/receive-v2\nReceive-Package: sutradhara-receive/0.0.1\nIntake-Id: <INTAKE-ID>\nOperator: Op Name\nSource-Kind: card\nSource-Ref: SRC\nArtifactclass: camera-original\nLabel: fixture\nCanonicalization-Version: receive-bagit-path-v2\nPackage-Profile-Version: package-tar-v1\nPackage-Profile-Hash: fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\nSkipped-Count: 0\n"
+        },
+        {
+          "kind": "text",
+          "path": "bagit.txt",
+          "text": "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n"
+        },
+        {
+          "kind": "bytes",
+          "path": "data/Caf\u00e9.mov",
+          "sha256": "a860b858265b22dad3aaf1165cfc2936daf1d3d86e0b7b77e3cc07f59f96858f",
+          "size": 4
+        },
+        {
+          "kind": "bytes",
+          "path": "data/clip.mov",
+          "sha256": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc",
+          "size": 5
+        },
+        {
+          "kind": "text",
+          "path": "intake.json",
+          "text": "{\n  \"bag_profile\": \"bagit-1.0\",\n  \"created_at\": \"2026-06-18T12:34:56+00:00\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"status\": \"complete\"\n}\n"
+        },
+        {
+          "kind": "text",
+          "path": "manifest-sha256.txt",
+          "text": "a860b858265b22dad3aaf1165cfc2936daf1d3d86e0b7b77e3cc07f59f96858f  data/Caf\u00e9.mov\n0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc  data/clip.mov\n"
+        },
+        {
+          "kind": "text",
+          "path": "tagmanifest-sha256.txt",
+          "text": "fb121d65de2f46b115ffb8166899f957f6fea76cab4cdff8f005717b3ac223f4  bag-info.txt\n1712ecfb074bf29c4188ad3421032509159a09739fd604f8fe57038b4ddefcc9  bagit.txt\n97c4ea9b31f6c2fe8f8a9e705667b728293e26ba9bef764da20ddbc6c3b4cef5  manifest-sha256.txt\n"
+        }
+      ],
+      "name": "mixed-files",
+      "result": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "file_count": 2,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 9
+      },
+      "validation": {
+        "complete": true,
+        "details": {},
+        "errors": [],
+        "extra": [],
+        "mismatched": [],
+        "missing": [],
+        "tag_mismatched": [],
+        "valid": true
+      }
+    },
+    {
+      "files": [
+        {
+          "kind": "text",
+          "path": "bag-info.txt",
+          "text": "Bagging-Date: 2026-06-18\nPayload-Oxum: 10240.1\nBag-Software-Agent: sutradhara-receive/receive-v2\nReceive-Package: sutradhara-receive/0.0.1\nIntake-Id: <INTAKE-ID>\nOperator: Op Name\nSource-Kind: card\nSource-Ref: SRC\nArtifactclass: camera-original\nLabel: fixture\nCanonicalization-Version: receive-bagit-path-v2\nPackage-Profile-Version: package-tar-v1\nPackage-Profile-Hash: fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\nSkipped-Count: 0\n"
+        },
+        {
+          "kind": "text",
+          "path": "bagit.txt",
+          "text": "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n"
+        },
+        {
+          "kind": "bytes",
+          "path": "data/A001.photoslibrary.tar",
+          "sha256": "22830bddb1d42bf16c9eb4fb8fa9854a4ecbee0ac72d221e1f9b6e45c8fced54",
+          "size": 10240
+        },
+        {
+          "kind": "text",
+          "path": "intake.json",
+          "text": "{\n  \"bag_profile\": \"bagit-1.0\",\n  \"created_at\": \"2026-06-18T12:34:56+00:00\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"status\": \"complete\"\n}\n"
+        },
+        {
+          "kind": "text",
+          "path": "manifest-sha256.txt",
+          "text": "22830bddb1d42bf16c9eb4fb8fa9854a4ecbee0ac72d221e1f9b6e45c8fced54  data/A001.photoslibrary.tar\n"
+        },
+        {
+          "kind": "text",
+          "path": "package-index.json",
+          "text": "{\n  \"package_globs\": [\n    \"*.fcpbundle\",\n    \"*.photoslibrary\",\n    \"*.imovielibrary\",\n    \"*.app\"\n  ],\n  \"packages\": [\n    {\n      \"logical_member_path\": \"A001.photoslibrary\",\n      \"members\": [\n        {\n          \"data_offset\": null,\n          \"length\": 0,\n          \"member\": \"A001.photoslibrary\",\n          \"sha256\": null,\n          \"type\": \"directory\"\n        },\n        {\n          \"data_offset\": 1024,\n          \"length\": 11,\n          \"member\": \"A001.photoslibrary/._meta\",\n          \"sha256\": \"4bc00cc38d8165f834b24b62da9487a72bef512db912b40dfbaa417b955017cf\",\n          \"type\": \"file\"\n        },\n        {\n          \"data_offset\": null,\n          \"length\": 0,\n          \"member\": \"A001.photoslibrary/Render\",\n          \"sha256\": null,\n          \"type\": \"directory\"\n        },\n        {\n          \"data_offset\": 2560,\n          \"length\": 6,\n          \"member\": \"A001.photoslibrary/Render/\\\\xfelegacy.dat\",\n          \"sha256\": \"c49fea7425fa7f8699897a97c159c6690267d9003bb78c53fafa8fc15c325d84\",\n          \"type\": \"file\"\n        },\n        {\n          \"data_offset\": 3584,\n          \"length\": 8,\n          \"member\": \"A001.photoslibrary/Render/clip01.mov\",\n          \"sha256\": \"0f7018bd82dd2f339d27788e98d59626fc0171fc33dd2371076328d1c6d10d48\",\n          \"type\": \"file\"\n        },\n        {\n          \"data_offset\": 4608,\n          \"length\": 8,\n          \"member\": \"A001.photoslibrary/Render/clip02.mov\",\n          \"sha256\": \"dd445cc8671e9d64231c83ac1315e78ff5de522bcb528c2c8acbb30c80791fbb\",\n          \"type\": \"file\"\n        },\n        {\n          \"data_offset\": null,\n          \"length\": 0,\n          \"linkname\": \"Render/clip01.mov\",\n          \"member\": \"A001.photoslibrary/clip-link.mov\",\n          \"sha256\": null,\n          \"type\": \"symlink\"\n        },\n        {\n          \"data_offset\": 6144,\n          \"length\": 5,\n          \"member\": \"A001.photoslibrary/library.plist\",\n          \"sha256\": \"9ceec13202afbf12ee3abb994c669c711749c18e194326734db6123e94947e04\",\n          \"type\": \"file\"\n        }\n      ],\n      \"profile\": \"package-tar-v1\",\n      \"sha256\": \"22830bddb1d42bf16c9eb4fb8fa9854a4ecbee0ac72d221e1f9b6e45c8fced54\",\n      \"size_bytes\": 10240,\n      \"stored_member_path\": \"A001.photoslibrary.tar\"\n    }\n  ],\n  \"profile\": \"package-tar-v1\",\n  \"profile_hash\": \"fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c\"\n}\n"
+        },
+        {
+          "kind": "text",
+          "path": "tagmanifest-sha256.txt",
+          "text": "324fd2d8284665ff06ae39a05afb7ec1df3d234a2dbfbc7bab1896909af32abf  bag-info.txt\n1712ecfb074bf29c4188ad3421032509159a09739fd604f8fe57038b4ddefcc9  bagit.txt\n9fdcf871fa709d940ea55b73d93d93412f9d08f4a51867d3fe4c605212e5d0a0  manifest-sha256.txt\ne0b1bec0d169093735e4a1a50417d23a152f69b5f877002dc5df7d8e0be053bc  package-index.json\n"
+        }
+      ],
+      "name": "package-with-symlink",
+      "result": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 10240
+      },
+      "validation": {
+        "complete": true,
+        "details": {},
+        "errors": [],
+        "extra": [],
+        "mismatched": [],
+        "missing": [],
+        "tag_mismatched": [],
+        "valid": true
+      }
+    }
+  ],
+  "normalization_tokens": [
+    "<FIXTURE-ROOT>",
+    "<SOURCE>",
+    "<LANDING>",
+    "<INTAKE-ID>"
+  ],
+  "schema_version": 1
+}
