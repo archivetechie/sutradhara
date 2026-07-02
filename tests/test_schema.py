@@ -212,6 +212,47 @@ def _assert_grpc_relay_invariants(db_path: Path) -> None:
     assert "device_id" in token_sql
 
 
+def _assert_hdcache_invariants(db_path: Path) -> None:
+    tables = _tables(db_path)
+    assert "cache_disk" in tables
+    assert "cache_entry" in tables
+    assert "restore_request" in tables
+    assert "restore_request_item" in tables
+
+    disk_sql = _table_sql(db_path, "cache_disk")
+    assert "ck_cache_disk_state" in disk_sql
+    assert "serial VARCHAR(256) NOT NULL" in disk_sql
+    assert ("serial",) in _unique_index_columns(db_path, "cache_disk")
+    assert ("state",) in _index_columns(db_path, "cache_disk")
+
+    entry_sql = _table_sql(db_path, "cache_entry")
+    assert "ck_cache_entry_state" in entry_sql
+    assert "ck_cache_entry_representation" in entry_sql
+    assert "content_sha256 BLOB" in entry_sql
+    assert "FOREIGN KEY(content_sha256) REFERENCES logical_asset" in entry_sql
+    assert "FOREIGN KEY(disk_id) REFERENCES cache_disk" in entry_sql
+    entry_indexes = _index_columns(db_path, "cache_entry")
+    assert ("bundle_key",) in entry_indexes
+    assert ("group_key",) in entry_indexes
+    assert ("disk_id",) in entry_indexes
+    assert ("state",) in entry_indexes
+
+    request_sql = _table_sql(db_path, "restore_request")
+    assert "ck_restore_request_state" in request_sql
+    request_indexes = _index_columns(db_path, "restore_request")
+    assert ("created_at",) in request_indexes
+    assert ("state",) in request_indexes
+
+    item_sql = _table_sql(db_path, "restore_request_item")
+    assert "ck_restore_request_item_state" in item_sql
+    assert "fell_back_to_tape" in item_sql
+    assert "ON DELETE CASCADE" in item_sql
+    item_indexes = _index_columns(db_path, "restore_request_item")
+    assert ("request_id",) in item_indexes
+    assert ("content_sha256",) in item_indexes
+    assert ("state",) in item_indexes
+
+
 def test_create_all_creates_job_table_without_prior_job_import(tmp_path: Path) -> None:
     db_path = tmp_path / "create_all.db"
     code = f"""
@@ -248,6 +289,10 @@ engine.dispose()
     assert "asset_tag" in tables
     assert "offsite_confirmation" in tables
     assert "retention_event" in tables
+    assert "cache_disk" in tables
+    assert "cache_entry" in tables
+    assert "restore_request" in tables
+    assert "restore_request_item" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
@@ -256,6 +301,7 @@ engine.dispose()
     _assert_virtual_arrangement_invariants(db_path)
     _assert_retention_invariants(db_path)
     _assert_grpc_relay_invariants(db_path)
+    _assert_hdcache_invariants(db_path)
 
 
 def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
@@ -296,6 +342,10 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     assert "asset_tag" in tables
     assert "offsite_confirmation" in tables
     assert "retention_event" in tables
+    assert "cache_disk" in tables
+    assert "cache_entry" in tables
+    assert "restore_request" in tables
+    assert "restore_request_item" in tables
     assert "placement_tag_pin" not in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
@@ -304,6 +354,7 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     _assert_virtual_arrangement_invariants(db_path)
     _assert_retention_invariants(db_path)
     _assert_grpc_relay_invariants(db_path)
+    _assert_hdcache_invariants(db_path)
 
 
 def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
@@ -342,6 +393,10 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     assert "asset_tag" in tables
     assert "offsite_confirmation" in tables
     assert "retention_event" in tables
+    assert "cache_disk" in tables
+    assert "cache_entry" in tables
+    assert "restore_request" in tables
+    assert "restore_request_item" in tables
     _assert_archive_invariants(db_path)
     _assert_worker_lease_invariants(db_path)
     _assert_intake_invariants(db_path)
@@ -349,3 +404,4 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     _assert_virtual_arrangement_invariants(db_path)
     _assert_retention_invariants(db_path)
     _assert_grpc_relay_invariants(db_path)
+    _assert_hdcache_invariants(db_path)

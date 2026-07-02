@@ -62,6 +62,7 @@ def create_all(engine: Engine) -> None:
     import_module("sutradhara.jobs.models")
     import_module("sutradhara.api.store")
     import_module("sutradhara.grpc.store")
+    import_module("sutradhara.hdcache.models")
     Base.metadata.create_all(engine)
 
 
@@ -70,6 +71,7 @@ def reset_all(engine: Engine) -> None:
     import_module("sutradhara.jobs.models")
     import_module("sutradhara.api.store")
     import_module("sutradhara.grpc.store")
+    import_module("sutradhara.hdcache.models")
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
 

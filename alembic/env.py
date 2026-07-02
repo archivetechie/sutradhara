@@ -25,6 +25,9 @@ if config.config_file_name is not None:
 config.set_main_option("sqlalchemy.url", database_url())
 
 import_module("sutradhara.jobs.models")
+import_module("sutradhara.api.store")
+import_module("sutradhara.grpc.store")
+import_module("sutradhara.hdcache.models")
 target_metadata = Base.metadata
 
 
