@@ -194,6 +194,16 @@ def test_store_refuses_stream_hash_mismatch_and_bad_reads(tmp_path: Path) -> Non
     with pytest.raises(StoreError, match="stored stream digest mismatch"):
         read_entry_verified(mount, digest)
 
+    target_payload = b"symlink target"
+    target = tmp_path / "outside"
+    target.write_bytes(target_payload)
+    symlink_digest = hashlib.sha256(target_payload).digest()
+    symlink_path = read_entry_path(mount, symlink_digest)
+    symlink_path.parent.mkdir(parents=True, exist_ok=True)
+    symlink_path.symlink_to(target)
+    with pytest.raises(StoreError, match="regular file"):
+        read_entry_verified(mount, symlink_digest)
+
 
 def test_store_enumerates_raw_and_aead_filenames(tmp_path: Path) -> None:
     mount = tmp_path / "d001"
@@ -213,6 +223,18 @@ def test_store_enumerates_raw_and_aead_filenames(tmp_path: Path) -> None:
         key_epoch="hdcache-epoch-1",
         expected_stream_sha256=sealed_digest,
     )
+    with pytest.raises(StoreError, match="key_epoch"):
+        write_entry(
+            mount,
+            plaintext_digest,
+            [sealed],
+            representation=AEAD_REPRESENTATION,
+            key_epoch="bad.epoch",
+            expected_stream_sha256=sealed_digest,
+        )
+    ignored_digest = hashlib.sha256(b"directory-placeholder").digest()
+    ignored_dir = mount / "hdcache" / "v1" / ignored_digest.hex()[:2] / ignored_digest.hex()
+    ignored_dir.mkdir(parents=True)
 
     entries = enumerate_entries(mount)
 
@@ -220,8 +242,8 @@ def test_store_enumerates_raw_and_aead_filenames(tmp_path: Path) -> None:
         (entry.content_sha256, entry.representation, entry.key_epoch) for entry in entries
     ) == sorted(
         [
-        (raw_digest, RAW_REPRESENTATION, None),
-        (plaintext_digest, AEAD_REPRESENTATION, "hdcache-epoch-1"),
+            (raw_digest, RAW_REPRESENTATION, None),
+            (plaintext_digest, AEAD_REPRESENTATION, "hdcache-epoch-1"),
         ]
     )
 
@@ -258,6 +280,18 @@ def test_disk_identity_matrix(tmp_path: Path) -> None:
         secret,
         FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="other")),
     ) == "wrong_fs_uuid"
+    assert _identity_status(
+        mount,
+        expected,
+        secret,
+        FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001", wwn="other")),
+    ) == "wrong_wwn"
+    assert _identity_status(
+        mount,
+        expected,
+        secret,
+        FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001")),
+    ) == "identity_unavailable"
 
     (mount / "hdcache-disk.json").unlink()
     assert _identity_status(mount, expected, secret, ok_probe) == "missing_sentinel"

@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import stat
 import subprocess
 import tempfile
 from collections.abc import Iterable, Iterator
@@ -196,16 +197,45 @@ def verify_disk_identity(
     observed = final_probe.observe(mount)
     if not observed.mounted:
         return DiskIdentityResult(False, "not_mounted", "expected disk is not mounted", observed)
-    if observed.serial is not None and observed.serial != expected.serial:
+    if observed.serial is None:
+        return DiskIdentityResult(
+            False,
+            "identity_unavailable",
+            "block serial is unavailable",
+            observed,
+        )
+    if observed.serial != expected.serial:
         return DiskIdentityResult(False, "wrong_serial", "block serial mismatch", observed)
-    if expected.wwn and observed.wwn is not None and observed.wwn != expected.wwn:
-        return DiskIdentityResult(False, "wrong_wwn", "block WWN mismatch", observed)
-    if observed.fs_uuid is not None and observed.fs_uuid != expected.fs_uuid:
+    if observed.fs_uuid is None:
+        return DiskIdentityResult(
+            False,
+            "identity_unavailable",
+            "filesystem UUID is unavailable",
+            observed,
+        )
+    if observed.fs_uuid != expected.fs_uuid:
         return DiskIdentityResult(False, "wrong_fs_uuid", "filesystem UUID mismatch", observed)
+    if expected.wwn:
+        if observed.wwn is None:
+            return DiskIdentityResult(
+                False,
+                "identity_unavailable",
+                "block WWN is unavailable",
+                observed,
+            )
+        if observed.wwn != expected.wwn:
+            return DiskIdentityResult(False, "wrong_wwn", "block WWN mismatch", observed)
 
     sentinel_path = mount / SENTINEL_NAME
     if not sentinel_path.exists():
         return DiskIdentityResult(False, "missing_sentinel", "disk sentinel is missing", observed)
+    if not _is_regular_file(sentinel_path):
+        return DiskIdentityResult(
+            False,
+            "bad_sentinel",
+            "disk sentinel is not a regular file",
+            observed,
+        )
     try:
         sentinel = json.loads(sentinel_path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -312,6 +342,7 @@ def read_entry_verified(
         content_sha256,
         representation,
     )
+    _require_regular_file(path, "cache entry")
     digest = hashlib.sha256()
     size = 0
     chunks: list[bytes] | None = [] if output is None else None
@@ -373,6 +404,8 @@ def enumerate_entries(mount: Path) -> list[EnumeratedEntry]:
         if len(prefix_dir.name) != 2:
             continue
         for path in sorted(prefix_dir.iterdir()):
+            if not _is_regular_file(path):
+                continue
             parsed = _parse_entry_filename(path.name)
             if parsed is None:
                 continue
@@ -438,8 +471,8 @@ def _entry_filename(
     if representation == AEAD_REPRESENTATION:
         if not key_epoch:
             raise StoreError("AEAD cache entries require key_epoch")
-        if any(separator in key_epoch for separator in ("/", "\\")):
-            raise StoreError("key_epoch must not contain path separators")
+        if any(separator in key_epoch for separator in ("/", "\\", ".")):
+            raise StoreError("key_epoch must not contain path or filename separators")
         return f"{sha}.{AEAD_REPRESENTATION}.{key_epoch}"
     raise StoreError(f"unsupported cache representation: {representation}")
 
@@ -503,6 +536,19 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink()
         raise
+
+
+def _is_regular_file(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(mode)
+
+
+def _require_regular_file(path: Path, label: str) -> None:
+    if not _is_regular_file(path):
+        raise StoreError(f"{label} is not a regular file: {path}")
 
 
 def _fsync_dir(path: Path) -> None:
