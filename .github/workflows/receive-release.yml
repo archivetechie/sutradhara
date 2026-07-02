@@ -1,0 +1,302 @@
+name: Receive Release
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/receive-release.yml"
+      - "packages/sutradhara-receive/**"
+  push:
+    branches:
+      - main
+    tags:
+      - "sutradhara-receive-v*"
+    paths:
+      - ".github/workflows/receive-release.yml"
+      - "packages/sutradhara-receive/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE_DIR: packages/sutradhara-receive
+  BIN_NAME: sutra-receive
+
+jobs:
+  version:
+    name: version guard
+    runs-on: ubuntu-latest
+    outputs:
+      package-version: ${{ steps.version.outputs.package-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify package version
+        id: version
+        run: |
+          set -euo pipefail
+          cargo_version="$(
+            cargo metadata \
+              --manifest-path "$PACKAGE_DIR/Cargo.toml" \
+              --no-deps \
+              --format-version 1 \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])'
+          )"
+          pyproject_version="$(
+            python3 - "$PACKAGE_DIR/pyproject.toml" <<'PY'
+          import sys
+          import tomllib
+
+          with open(sys.argv[1], "rb") as handle:
+              print(tomllib.load(handle)["project"]["version"])
+          PY
+          )"
+          if [ "$cargo_version" != "$pyproject_version" ]; then
+            echo "::error::Cargo version $cargo_version does not match pyproject version $pyproject_version"
+            exit 1
+          fi
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            expected="sutradhara-receive-v$cargo_version"
+            if [ "${GITHUB_REF_NAME:-}" != "$expected" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME:-<unknown>} does not match package version $expected"
+              exit 1
+            fi
+          fi
+          echo "package-version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  manylinux-wheel:
+    name: manylinux wheel
+    runs-on: ubuntu-latest
+    needs: version
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build manylinux wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: ${{ env.PACKAGE_DIR }}
+          command: build
+          args: --release --out dist --find-interpreter
+          manylinux: auto
+          target: x86_64
+          sccache: true
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: receive-wheel-manylinux-x86_64
+          path: ${{ env.PACKAGE_DIR }}/dist/*
+          if-no-files-found: error
+
+  linux-binaries:
+    name: linux binary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: sutra-receive-x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
+            artifact: sutra-receive-x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl linker
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build binary
+        run: |
+          cargo build \
+            --manifest-path "$PACKAGE_DIR/Cargo.toml" \
+            --release \
+            --bin "$BIN_NAME" \
+            --target "${{ matrix.target }}"
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.artifact }}"
+          cp "$PACKAGE_DIR/target/${{ matrix.target }}/release/$BIN_NAME" \
+            "dist/${{ matrix.artifact }}/$BIN_NAME"
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: receive-binary-${{ matrix.target }}
+          path: dist/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  macos-universal-binary:
+    name: macOS universal2 binary
+    runs-on: macos-latest
+    needs: version
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - name: Build binary slices
+        run: |
+          cargo build \
+            --manifest-path "$PACKAGE_DIR/Cargo.toml" \
+            --release \
+            --bin "$BIN_NAME" \
+            --target x86_64-apple-darwin
+          cargo build \
+            --manifest-path "$PACKAGE_DIR/Cargo.toml" \
+            --release \
+            --bin "$BIN_NAME" \
+            --target aarch64-apple-darwin
+      - name: Create universal2 binary
+        run: |
+          set -euo pipefail
+          artifact="sutra-receive-universal2-apple-darwin"
+          mkdir -p "dist/$artifact"
+          lipo -create \
+            "$PACKAGE_DIR/target/x86_64-apple-darwin/release/$BIN_NAME" \
+            "$PACKAGE_DIR/target/aarch64-apple-darwin/release/$BIN_NAME" \
+            -output "dist/$artifact/$BIN_NAME"
+          lipo -verify_arch x86_64 arm64 "dist/$artifact/$BIN_NAME"
+      - name: Sign and notarize
+        env:
+          APPLE_DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          binary="dist/sutra-receive-universal2-apple-darwin/$BIN_NAME"
+          zip_path="dist/sutra-receive-universal2-apple-darwin.zip"
+          required=(
+            APPLE_DEVELOPER_ID_CERTIFICATE_BASE64
+            APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD
+            APPLE_CODESIGN_IDENTITY
+            APPLE_ID
+            APPLE_TEAM_ID
+            APPLE_APP_SPECIFIC_PASSWORD
+          )
+          missing=()
+          for name in "${required[@]}"; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+              printf '::error::Missing macOS signing secret: %s\n' "${missing[@]}"
+              exit 1
+            fi
+            printf 'Signing and notarization skipped for non-tag build; missing: %s\n' "${missing[*]}"
+            ditto -c -k --keepParent "$binary" "$zip_path"
+            exit 0
+          fi
+
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          keychain="$RUNNER_TEMP/receive-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          printf '%s' "$APPLE_DEVELOPER_ID_CERTIFICATE_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -P "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --sign "$APPLE_CODESIGN_IDENTITY" \
+            "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          ditto -c -k --keepParent "$binary" "$zip_path"
+          xcrun notarytool submit "$zip_path" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: receive-binary-universal2-apple-darwin
+          path: dist/sutra-receive-universal2-apple-darwin.zip
+          if-no-files-found: error
+
+  windows-binary:
+    name: Windows binary
+    runs-on: windows-latest
+    needs: version
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build binary
+        shell: pwsh
+        run: |
+          cargo build `
+            --manifest-path "$env:PACKAGE_DIR/Cargo.toml" `
+            --release `
+            --bin "$env:BIN_NAME"
+      - name: Package binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          $artifact = "sutra-receive-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force -Path "dist/$artifact"
+          Copy-Item "$env:PACKAGE_DIR/target/release/$env:BIN_NAME.exe" "dist/$artifact/$env:BIN_NAME.exe"
+          Compress-Archive -Path "dist/$artifact" -DestinationPath "dist/$artifact.zip" -Force
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: receive-binary-x86_64-pc-windows-msvc
+          path: dist/sutra-receive-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+
+  checksums:
+    name: checksums
+    runs-on: ubuntu-latest
+    needs:
+      - manylinux-wheel
+      - linux-binaries
+      - macos-universal-binary
+      - windows-binary
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -type f ! -name SHA256SUMS -printf '%P\n' \
+            | LC_ALL=C sort \
+            | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload checksummed release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: receive-release-files
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

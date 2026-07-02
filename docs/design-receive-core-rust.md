@@ -1,12 +1,15 @@
 # Design — receive core in Rust (one implementation: crate + wheel + edge binary)
 
-**Status:** current
+**Status:** implemented
 **Depends on:** `design-receive-front-door.md` (the receive contract this migrates),
 `design-streaming-intake-grpc.md` (server-side bag assembly), `design-sutra-agent.md`
 (the helper daemon that consumes the contract), `design-intake-watch.md` (the road-mode
 reconciliation path, §8.5).
 **Review:** codex r1 folded (6 findings) 2026-07-02. Nothing is in production, so no
 backwards-compatibility/deprecation ceremony anywhere in this design (the owner, 2026-07-02).
+**Implementation:** M1-M6 landed 2026-07-02. The M6 artifact workflow is
+`.github/workflows/receive-release.yml`; macOS signing and notarization secrets remain
+outside the repository.
 
 ## 1. Problem & scope
 

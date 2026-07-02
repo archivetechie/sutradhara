@@ -41,3 +41,16 @@ Stale partial receives can be swept with:
 ```sh
 sutra-receive sweep --landing /replica/landing --older-than-hours 24 --json
 ```
+
+## Distribution
+
+Release CI lives in `.github/workflows/receive-release.yml`. A tag named
+`sutradhara-receive-v<version>` builds the manylinux wheel, Linux glibc and musl
+CLI archives, a Windows MSVC CLI zip, a macOS universal2 CLI zip, and
+`SHA256SUMS`. The tag version must match the Cargo and Python package version.
+
+macOS tag releases are signed and notarized with GitHub Actions secrets. The
+workflow expects the Developer ID certificate and notarization credentials to be
+configured outside the repository; tag releases fail closed if those secrets are
+missing. Branch and pull-request builds still compile the macOS universal2 binary
+but package it unsigned.
