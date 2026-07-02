@@ -120,6 +120,81 @@ pub struct OrphanSweepResult {
     pub removed: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HashReceipt {
+    pub relpath: String,
+    pub sha256_hex: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManifestDigestMismatch {
+    pub path: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagManifestMismatch {
+    pub path: String,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BagValidationResult {
+    #[serde(skip_serializing)]
+    pub bag_root: PathBuf,
+    #[serde(skip_serializing)]
+    pub data_root: PathBuf,
+    pub metadata: BTreeMap<String, String>,
+    pub manifest: BTreeMap<String, String>,
+    pub actual: BTreeMap<String, String>,
+    pub missing: Vec<String>,
+    pub extra: Vec<String>,
+    pub mismatched: Vec<ManifestDigestMismatch>,
+    pub tag_mismatched: Vec<TagManifestMismatch>,
+    pub errors: Vec<String>,
+}
+
+impl BagValidationResult {
+    pub fn complete(&self) -> bool {
+        self.missing.is_empty()
+            && self.extra.is_empty()
+            && !self
+                .errors
+                .iter()
+                .any(|error| error.starts_with("complete:"))
+    }
+
+    pub fn valid(&self) -> bool {
+        self.complete()
+            && self.mismatched.is_empty()
+            && self.tag_mismatched.is_empty()
+            && self.errors.is_empty()
+    }
+
+    pub fn details(&self) -> Value {
+        let mut payload = serde_json::Map::new();
+        if !self.missing.is_empty() {
+            payload.insert("missing".to_string(), json!(self.missing));
+        }
+        if !self.extra.is_empty() {
+            payload.insert("extra".to_string(), json!(self.extra));
+        }
+        if !self.mismatched.is_empty() {
+            payload.insert("mismatched".to_string(), json!(self.mismatched));
+        }
+        if !self.tag_mismatched.is_empty() {
+            payload.insert("tag_mismatched".to_string(), json!(self.tag_mismatched));
+        }
+        if !self.errors.is_empty() {
+            payload.insert("errors".to_string(), json!(self.errors));
+        }
+        Value::Object(payload)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceEntry {
     source_path: PathBuf,
@@ -599,6 +674,307 @@ pub fn sweep_orphans(
     Ok(OrphanSweepResult { removed })
 }
 
+pub fn hash_payload_tree(payload_root: &Path) -> ReceiveResult<Vec<HashReceipt>> {
+    let mut receipts = Vec::new();
+    collect_payload_hashes(payload_root, payload_root, &mut receipts)?;
+    receipts.sort_by(|left, right| left.relpath.cmp(&right.relpath));
+    Ok(receipts)
+}
+
+pub fn read_bag_info(path: &Path) -> ReceiveResult<BTreeMap<String, String>> {
+    let mut result = BTreeMap::new();
+    let mut current_key: Option<String> = None;
+    for (line_index, raw_line) in fs::read_to_string(path)?.lines().enumerate() {
+        let line_number = line_index + 1;
+        if raw_line.is_empty() {
+            continue;
+        }
+        if raw_line.starts_with(char::is_whitespace)
+            && let Some(current_key) = current_key.as_ref()
+        {
+            let prior = result.get(current_key).cloned().unwrap_or_default();
+            result.insert(current_key.clone(), format!("{prior}\n{}", raw_line.trim()));
+            continue;
+        }
+        let Some((key, value)) = raw_line.split_once(':') else {
+            return Err(ReceiveError::new(format!(
+                "invalid bag-info line {line_number}: {}",
+                python_repr(raw_line)
+            )));
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(ReceiveError::new(format!(
+                "invalid empty bag-info label at line {line_number}"
+            )));
+        }
+        result.insert(key.to_string(), value.trim().to_string());
+        current_key = Some(key.to_string());
+    }
+    Ok(result)
+}
+
+pub fn read_manifest_sha256(path: &Path) -> ReceiveResult<BTreeMap<String, String>> {
+    read_checksum_manifest(path, true)
+}
+
+pub fn read_package_index(path: &Path) -> ReceiveResult<Value> {
+    let payload: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+    if payload["profile"].as_str() != Some(PACKAGE_PROFILE_VERSION) {
+        return Err(ReceiveError::new(format!(
+            "Package-Profile-Version mismatch: expected {PACKAGE_PROFILE_VERSION}, actual {}",
+            python_repr_value(&payload["profile"])
+        )));
+    }
+    if payload["profile_hash"].as_str() != Some(PACKAGE_PROFILE_HASH) {
+        return Err(ReceiveError::new(format!(
+            "Package-Profile-Hash mismatch: expected {PACKAGE_PROFILE_HASH}, actual {}",
+            python_repr_value(&payload["profile_hash"])
+        )));
+    }
+    let Some(packages) = payload["packages"].as_array() else {
+        return Err(ReceiveError::new(
+            "package-index.json packages must be a list",
+        ));
+    };
+    for package in packages {
+        let Some(package) = package.as_object() else {
+            return Err(ReceiveError::new(
+                "package-index.json package entries must be objects",
+            ));
+        };
+        for key in [
+            "logical_member_path",
+            "stored_member_path",
+            "sha256",
+            "members",
+        ] {
+            if !package.contains_key(key) {
+                return Err(ReceiveError::new(format!(
+                    "package-index.json package missing {key}"
+                )));
+            }
+        }
+        let Some(logical_member_path) = package["logical_member_path"].as_str() else {
+            return Err(ReceiveError::new(
+                "package-index.json package logical_member_path must be a string",
+            ));
+        };
+        let Some(stored_member_path) = package["stored_member_path"].as_str() else {
+            return Err(ReceiveError::new(
+                "package-index.json package stored_member_path must be a string",
+            ));
+        };
+        canonicalize_manifest_path(logical_member_path)?;
+        canonicalize_manifest_path(stored_member_path)?;
+        if !package["sha256"].as_str().is_some_and(is_sha256_hex) {
+            return Err(ReceiveError::new(
+                "package-index.json package has invalid sha256",
+            ));
+        }
+        if !package["members"].is_array() {
+            return Err(ReceiveError::new(
+                "package-index.json package members must be a list",
+            ));
+        }
+    }
+    Ok(payload)
+}
+
+pub fn manifest_mismatch(
+    actual: &BTreeMap<String, String>,
+    expected: &BTreeMap<String, String>,
+) -> ReceiveResult<Value> {
+    let mut actual_canonical = BTreeMap::new();
+    for (path, digest) in actual {
+        actual_canonical.insert(
+            canonicalize_manifest_path(path)?,
+            digest.to_ascii_lowercase(),
+        );
+    }
+    let mut expected_canonical = BTreeMap::new();
+    for (path, digest) in expected {
+        expected_canonical.insert(
+            canonicalize_manifest_path(path)?,
+            digest.to_ascii_lowercase(),
+        );
+    }
+    let missing: Vec<String> = expected_canonical
+        .keys()
+        .filter(|path| !actual_canonical.contains_key(*path))
+        .cloned()
+        .collect();
+    let extra: Vec<String> = actual_canonical
+        .keys()
+        .filter(|path| !expected_canonical.contains_key(*path))
+        .cloned()
+        .collect();
+    let mut mismatched = Vec::new();
+    for (path, actual_digest) in &actual_canonical {
+        if let Some(expected_digest) = expected_canonical.get(path)
+            && actual_digest != expected_digest
+        {
+            mismatched.push(ManifestDigestMismatch {
+                path: path.clone(),
+                expected: expected_digest.clone(),
+                actual: actual_digest.clone(),
+            });
+        }
+    }
+    if missing.is_empty()
+        && extra.is_empty()
+        && mismatched.is_empty()
+        && !expected_canonical.is_empty()
+    {
+        return Ok(json!({}));
+    }
+    if expected_canonical.is_empty() {
+        return Ok(json!({
+            "reason": "manifest-has-no-sha256",
+            "missing": [],
+            "extra": extra,
+            "mismatched": [],
+        }));
+    }
+    Ok(json!({
+        "missing": missing,
+        "extra": extra,
+        "mismatched": mismatched,
+    }))
+}
+
+pub fn validate_bag(bag_root: &Path) -> BagValidationResult {
+    let data_root = bag_root.join(DATA_DIR_NAME);
+    let mut errors = Vec::new();
+    let mut metadata = BTreeMap::new();
+    let mut manifest = BTreeMap::new();
+    let mut actual_records = Vec::new();
+
+    if !data_root.is_dir() {
+        errors.push(format!("complete: missing {DATA_DIR_NAME}/ directory"));
+    } else {
+        match hash_payload_tree(&data_root) {
+            Ok(records) => actual_records = records,
+            Err(error) => errors.push(format!("complete: cannot hash {DATA_DIR_NAME}/: {error}")),
+        }
+    }
+
+    match read_manifest_sha256(&bag_root.join("manifest-sha256.txt")) {
+        Ok(read_manifest) => manifest = read_manifest,
+        Err(error) => errors.push(format!(
+            "complete: cannot read manifest-sha256.txt: {error}"
+        )),
+    }
+    match read_bag_info(&bag_root.join("bag-info.txt")) {
+        Ok(read_metadata) => metadata = read_metadata,
+        Err(error) => errors.push(format!("cannot read bag-info.txt: {error}")),
+    }
+    let package_index_path = bag_root.join("package-index.json");
+    if package_index_path.exists()
+        && let Err(error) = read_package_index(&package_index_path)
+    {
+        errors.push(format!("cannot read package-index.json: {error}"));
+    }
+
+    let actual: BTreeMap<String, String> = actual_records
+        .iter()
+        .map(|record| (record.relpath.clone(), record.sha256_hex.clone()))
+        .collect();
+    let mismatch = manifest_mismatch(&actual, &manifest).unwrap_or_else(|error| {
+        errors.push(error.to_string());
+        json!({"missing": [], "extra": [], "mismatched": []})
+    });
+    let missing = json_string_array(&mismatch["missing"]);
+    let extra = json_string_array(&mismatch["extra"]);
+    let mismatched = json_manifest_mismatches(&mismatch["mismatched"]);
+
+    if !metadata.is_empty() {
+        let expected_oxum = format!(
+            "{}.{}",
+            actual_records
+                .iter()
+                .map(|record| record.size_bytes)
+                .sum::<u64>(),
+            actual_records.len()
+        );
+        if metadata.get("Payload-Oxum") != Some(&expected_oxum) {
+            errors.push(format!(
+                "Payload-Oxum mismatch: expected {expected_oxum}, actual {}",
+                python_repr(
+                    metadata
+                        .get("Payload-Oxum")
+                        .map(String::as_str)
+                        .unwrap_or("")
+                )
+            ));
+        }
+        if let Some(error) = receive_package_error(&metadata) {
+            errors.push(error);
+        }
+        if metadata.get("Canonicalization-Version").map(String::as_str)
+            != Some(CANONICALIZATION_VERSION)
+        {
+            errors.push(format!(
+                "Canonicalization-Version mismatch: expected {CANONICALIZATION_VERSION}, actual {}",
+                python_repr(
+                    metadata
+                        .get("Canonicalization-Version")
+                        .map(String::as_str)
+                        .unwrap_or("")
+                )
+            ));
+        }
+        let package_profile = metadata.get("Package-Profile-Version").map(String::as_str);
+        if package_index_path.exists() {
+            if package_profile != Some(PACKAGE_PROFILE_VERSION) {
+                errors.push(format!(
+                    "Package-Profile-Version mismatch: expected {PACKAGE_PROFILE_VERSION}, actual {}",
+                    python_repr(package_profile.unwrap_or(""))
+                ));
+            }
+        } else if !matches!(package_profile, None | Some(PACKAGE_PROFILE_VERSION)) {
+            errors.push(format!(
+                "Package-Profile-Version mismatch: expected {PACKAGE_PROFILE_VERSION}, actual {}",
+                python_repr(package_profile.unwrap_or(""))
+            ));
+        }
+        let package_hash = metadata.get("Package-Profile-Hash").map(String::as_str);
+        if package_index_path.exists() {
+            if package_hash != Some(PACKAGE_PROFILE_HASH) {
+                errors.push(format!(
+                    "Package-Profile-Hash mismatch: expected {PACKAGE_PROFILE_HASH}, actual {}",
+                    python_repr(package_hash.unwrap_or(""))
+                ));
+            }
+        } else if !matches!(package_hash, None | Some(PACKAGE_PROFILE_HASH)) {
+            errors.push(format!(
+                "Package-Profile-Hash mismatch: expected {PACKAGE_PROFILE_HASH}, actual {}",
+                python_repr(package_hash.unwrap_or(""))
+            ));
+        }
+    }
+
+    let required_tags = if package_index_path.exists() {
+        vec!["package-index.json".to_string()]
+    } else {
+        Vec::new()
+    };
+    let tag_mismatched = verify_tagmanifest(bag_root, &required_tags);
+
+    BagValidationResult {
+        bag_root: bag_root.to_path_buf(),
+        data_root,
+        metadata,
+        manifest,
+        actual,
+        missing,
+        extra,
+        mismatched,
+        tag_mismatched,
+        errors,
+    }
+}
+
 pub fn slug_operator(operator: &str) -> String {
     let ascii: String = operator.nfkd().filter(|ch| ch.is_ascii()).collect();
     let mut slug = String::new();
@@ -976,6 +1352,289 @@ fn is_package_boundary(relpath: &str) -> bool {
     })
 }
 
+fn collect_payload_hashes(
+    payload_root: &Path,
+    current_root: &Path,
+    receipts: &mut Vec<HashReceipt>,
+) -> ReceiveResult<()> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(current_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let relpath = canonicalize_filesystem_path(&path, payload_root)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ReceiveError::new(format!(
+                "payload contains unsupported symlink: {relpath}"
+            )));
+        }
+        if metadata.is_dir() {
+            if is_package_boundary(&relpath) {
+                return Err(ReceiveError::new(format!(
+                    "payload contains un-normalized package directory {relpath:?}; re-run sutra receive so it is stored as a {PACKAGE_PROFILE_VERSION} tar"
+                )));
+            }
+            dirs.push((relpath, path));
+        } else if metadata.is_file() {
+            files.push((relpath, path, metadata.len()));
+        } else {
+            return Err(ReceiveError::new(format!(
+                "payload contains unsupported special-file: {relpath}"
+            )));
+        }
+    }
+    dirs.sort_by(|left, right| left.0.cmp(&right.0));
+    for (_relpath, path) in dirs {
+        collect_payload_hashes(payload_root, &path, receipts)?;
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    for (relpath, path, size_bytes) in files {
+        receipts.push(HashReceipt {
+            relpath,
+            sha256_hex: sha256_file(&path)?,
+            size_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn read_checksum_manifest(
+    path: &Path,
+    payload_manifest: bool,
+) -> ReceiveResult<BTreeMap<String, String>> {
+    let mut records = BTreeMap::new();
+    for (line_index, raw_line) in fs::read_to_string(path)?.lines().enumerate() {
+        let line_number = line_index + 1;
+        if raw_line.is_empty() {
+            continue;
+        }
+        if raw_line.len() < 66 {
+            return Err(ReceiveError::new(format!(
+                "invalid checksum line {line_number} in {}",
+                path.display()
+            )));
+        }
+        let bytes = raw_line.as_bytes();
+        let digest_bytes = &bytes[..64];
+        if !digest_bytes.iter().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ReceiveError::new(format!(
+                "invalid sha256 at line {line_number} in {}",
+                path.display()
+            )));
+        }
+        let digest: String = digest_bytes
+            .iter()
+            .map(|byte| (*byte as char).to_ascii_lowercase())
+            .collect();
+        let mut index = 64;
+        if !matches!(bytes.get(index), Some(b' ' | b'\t')) {
+            return Err(ReceiveError::new(format!(
+                "invalid checksum separator at line {line_number} in {}",
+                path.display()
+            )));
+        }
+        while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+            index += 1;
+        }
+        let encoded_path = &raw_line[index..];
+        if encoded_path.is_empty() {
+            return Err(ReceiveError::new(format!(
+                "missing checksum path at line {line_number} in {}",
+                path.display()
+            )));
+        }
+        let decoded_path = decode_bagit_path(encoded_path)?;
+        let relpath = if payload_manifest {
+            canonicalize_payload_manifest_path(&decoded_path)?
+        } else {
+            normalize_posix_path(&decoded_path)
+        };
+        records.insert(relpath, digest);
+    }
+    Ok(records)
+}
+
+fn canonicalize_payload_manifest_path(decoded_path: &str) -> ReceiveResult<String> {
+    let mut value = decoded_path;
+    while let Some(stripped) = value.strip_prefix("./") {
+        value = stripped;
+    }
+    if value.starts_with('/') {
+        return Err(ReceiveError::new(format!(
+            "payload manifest path must be relative: {}",
+            python_repr(decoded_path)
+        )));
+    }
+    let Some(_rest) = value.strip_prefix("data/") else {
+        return Err(ReceiveError::new(format!(
+            "payload manifest path must start with data/: {}",
+            python_repr(decoded_path)
+        )));
+    };
+    canonicalize_manifest_path(value)
+}
+
+fn verify_tagmanifest(root: &Path, required_tag_files: &[String]) -> Vec<TagManifestMismatch> {
+    let path = root.join("tagmanifest-sha256.txt");
+    let expected = match read_checksum_manifest(&path, false) {
+        Ok(expected) => expected,
+        Err(error) => {
+            return vec![TagManifestMismatch {
+                path: "tagmanifest-sha256.txt".to_string(),
+                expected: Some("readable".to_string()),
+                actual: Some(error.to_string()),
+            }];
+        }
+    };
+    let mut mismatched = Vec::new();
+    for relpath in ["bagit.txt", "bag-info.txt", "manifest-sha256.txt"]
+        .into_iter()
+        .map(ToString::to_string)
+        .chain(required_tag_files.iter().cloned())
+    {
+        if !expected.contains_key(&relpath) {
+            mismatched.push(TagManifestMismatch {
+                path: relpath,
+                expected: Some("listed".to_string()),
+                actual: None,
+            });
+        }
+    }
+    for (relpath, expected_digest) in expected {
+        let target = root.join(&relpath);
+        if !is_safe_bag_relative_path(&relpath) {
+            mismatched.push(TagManifestMismatch {
+                path: relpath,
+                expected: Some(expected_digest),
+                actual: Some("unsafe path".to_string()),
+            });
+            continue;
+        }
+        if !target.is_file() {
+            mismatched.push(TagManifestMismatch {
+                path: relpath,
+                expected: Some(expected_digest),
+                actual: None,
+            });
+            continue;
+        }
+        match sha256_file(&target) {
+            Ok(actual) if actual == expected_digest => {}
+            Ok(actual) => mismatched.push(TagManifestMismatch {
+                path: relpath,
+                expected: Some(expected_digest),
+                actual: Some(actual),
+            }),
+            Err(error) => mismatched.push(TagManifestMismatch {
+                path: relpath,
+                expected: Some(expected_digest),
+                actual: Some(error.to_string()),
+            }),
+        }
+    }
+    mismatched
+}
+
+fn decode_bagit_path(path: &str) -> ReceiveResult<String> {
+    let mut output = String::new();
+    let chars: Vec<char> = path.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if current != '%' {
+            output.push(current);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= chars.len() {
+            return Err(ReceiveError::new(format!(
+                "invalid BagIt percent escape in path: {}",
+                python_repr(path)
+            )));
+        }
+        let token = format!("{}{}", chars[index + 1], chars[index + 2]);
+        match token.to_ascii_uppercase().as_str() {
+            "25" => output.push('%'),
+            "0D" => output.push('\r'),
+            "0A" => output.push('\n'),
+            _ => {
+                return Err(ReceiveError::new(format!(
+                    "unsupported BagIt percent escape %{token} in path: {}",
+                    python_repr(path)
+                )));
+            }
+        }
+        index += 3;
+    }
+    Ok(output)
+}
+
+fn normalize_posix_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let normalized = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    if absolute {
+        format!("/{normalized}")
+    } else {
+        normalized
+    }
+}
+
+fn is_safe_bag_relative_path(relpath: &str) -> bool {
+    !relpath.is_empty()
+        && !relpath.starts_with('/')
+        && relpath
+            .split('/')
+            .all(|part| !part.is_empty() && !matches!(part, "." | ".."))
+}
+
+fn json_string_array(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_manifest_mismatches(value: &Value) -> Vec<ManifestDigestMismatch> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(ManifestDigestMismatch {
+                        path: item["path"].as_str()?.to_string(),
+                        expected: item["expected"].as_str()?.to_string(),
+                        actual: item["actual"].as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn receive_package_error(metadata: &BTreeMap<String, String>) -> Option<String> {
+    let actual = metadata.get("Receive-Package").map(String::as_str);
+    if actual == Some(RECEIVE_PACKAGE) {
+        return None;
+    }
+    Some(format!(
+        "Receive-Package mismatch: expected {RECEIVE_PACKAGE}, actual {}",
+        actual
+            .map(python_repr)
+            .unwrap_or_else(|| "None".to_string())
+    ))
+}
+
 fn package_members(
     package_root: &Path,
     logical_relpath: &str,
@@ -1317,6 +1976,16 @@ fn python_repr(value: &str) -> String {
     }
     output.push('\'');
     output
+}
+
+fn python_repr_value(value: &Value) -> String {
+    if value.is_null() {
+        "None".to_string()
+    } else if let Some(text) = value.as_str() {
+        python_repr(text)
+    } else {
+        value.to_string()
+    }
 }
 
 fn join_lines(lines: Vec<String>) -> String {

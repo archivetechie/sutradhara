@@ -14,8 +14,8 @@ use sutradhara_receive::{
     BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, PACKAGE_GLOBS, PACKAGE_PROFILE_HASH,
     PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE, RECEIVE_VERSION, ReceiveOptions, bag_info_text,
     bagit_manifest_text, build_package_tar, canonicalize_manifest_path,
-    canonicalize_raw_path_components, escape_member_name, receive_source, sha256_file,
-    tagmanifest_text, unescape_member_name,
+    canonicalize_raw_path_components, escape_member_name, manifest_mismatch, read_manifest_sha256,
+    receive_source, sha256_file, tagmanifest_text, unescape_member_name, validate_bag,
 };
 
 #[test]
@@ -258,11 +258,142 @@ fn cli_matrix_fixtures_match_rust_binary() {
     }
 }
 
+#[test]
+fn validate_mismatch_fixtures_match_python_contract() {
+    let fixture = read_fixture("validate_mismatch.json");
+
+    for case in fixture["manifest_mismatch"].as_array().unwrap() {
+        let actual = json_object_to_map(&case["actual"]);
+        let expected = json_object_to_map(&case["expected"]);
+        assert_eq!(
+            manifest_mismatch(&actual, &expected).unwrap(),
+            case["result"],
+            "{}",
+            case["name"].as_str().unwrap()
+        );
+    }
+
+    for case in fixture["validate_bag"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let bag = simple_received_bag(temp.path(), name);
+        match name {
+            "missing-payload" => {
+                fs::remove_file(bag.join("data").join("clip.mov")).unwrap();
+            }
+            "corrupt-payload" => {
+                fs::write(bag.join("data").join("clip.mov"), b"corrupt").unwrap();
+            }
+            "unsupported-package" => {
+                rewrite_receive_package(&bag, "sutradhara-receive/999.0.0");
+            }
+            other => panic!("unhandled validate fixture {other}"),
+        }
+
+        assert_eq!(validation_snapshot(name, &validate_bag(&bag)), *case);
+    }
+}
+
+#[test]
+fn manifest_reader_rejects_non_ascii_digest_without_panic() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest = temp.path().join("manifest-sha256.txt");
+    fs::write(
+        &manifest,
+        format!("{}{}  data/clip.mov\n", "a".repeat(63), "\u{e9}"),
+    )
+    .unwrap();
+
+    let error = read_manifest_sha256(&manifest).unwrap_err().to_string();
+    assert!(error.contains("invalid sha256 at line 1"));
+}
+
+#[test]
+fn tagmanifest_absolute_path_is_reported_unsafe() {
+    let temp = tempfile::tempdir().unwrap();
+    let bag = simple_received_bag(temp.path(), "absolute-tagmanifest");
+    let digest = sha256_file(&bag.join("bag-info.txt")).unwrap();
+    fs::write(
+        bag.join("tagmanifest-sha256.txt"),
+        format!("{digest}  /bag-info.txt\n"),
+    )
+    .unwrap();
+
+    let validation = validate_bag(&bag);
+    let tag_mismatches = json!(validation.tag_mismatched);
+    assert!(tag_mismatches.as_array().unwrap().contains(&json!({
+        "actual": "unsafe path",
+        "expected": digest,
+        "path": "/bag-info.txt",
+    })));
+}
+
 fn read_fixture(name: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join(name);
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn json_object_to_map(value: &Value) -> BTreeMap<String, String> {
+    value
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.as_str().unwrap().to_string()))
+        .collect()
+}
+
+fn simple_received_bag(root: &Path, name: &str) -> std::path::PathBuf {
+    let source = root.join("source").join(name);
+    let landing = root.join("landing").join(name);
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("clip.mov"), b"video").unwrap();
+    receive_source(&source, &landing, &receive_options(name))
+        .unwrap()
+        .intake_dir
+}
+
+fn rewrite_receive_package(bag: &Path, receive_package: &str) {
+    let bag_info_path = bag.join("bag-info.txt");
+    let rewritten = fs::read_to_string(&bag_info_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.starts_with("Receive-Package: ") {
+                format!("Receive-Package: {receive_package}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&bag_info_path, rewritten).unwrap();
+    let tag_files = vec![
+        "bagit.txt".to_string(),
+        "bag-info.txt".to_string(),
+        "manifest-sha256.txt".to_string(),
+    ];
+    fs::write(
+        bag.join("tagmanifest-sha256.txt"),
+        tagmanifest_text(bag, &tag_files).unwrap(),
+    )
+    .unwrap();
+}
+
+fn validation_snapshot(name: &str, validation: &sutradhara_receive::BagValidationResult) -> Value {
+    json!({
+        "complete": validation.complete(),
+        "details": validation.details(),
+        "errors": validation.errors,
+        "extra": validation.extra,
+        "mismatched": validation.mismatched,
+        "missing": validation.missing,
+        "name": name,
+        "tag_mismatched": validation.tag_mismatched,
+        "valid": validation.valid(),
+    })
 }
 
 #[cfg(unix)]
