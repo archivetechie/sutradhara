@@ -517,6 +517,13 @@ def plan_payload_units(source: Path | str) -> PayloadPlan:
 
     source_root = Path(source).resolve()
     _validate_source_root(source_root)
+    if _native is not None:
+        try:
+            return _payload_plan_from_native(
+                cast(dict[str, Any], json.loads(_native.plan_payload_units_json(source_root)))
+            )
+        except RuntimeError as exc:
+            _raise_native_receive_error(exc)
     entries, rejected = _scan_source(source_root)
     _check_collisions(entries)
     units = tuple(_payload_unit_from_entry(entry) for entry in entries)
@@ -534,6 +541,50 @@ def payload_plan_digest(plan: PayloadPlan | Iterable[PayloadUnit]) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _payload_plan_from_native(payload: Mapping[str, Any]) -> PayloadPlan:
+    units = tuple(_payload_unit_from_native(item) for item in payload.get("units", ()))
+    rejected = tuple(_rejected_entry_from_native(item) for item in payload.get("rejected", ()))
+    return PayloadPlan(units=units, rejected=rejected)
+
+
+def _payload_unit_from_native(payload: Mapping[str, Any]) -> PayloadUnit:
+    return PayloadUnit(
+        source_path=_path_from_native_payload(payload["source_path"]),
+        relpath=str(payload["relpath"]),
+        entry_type=str(payload["entry_type"]),
+        logical_relpath=_optional_str(payload.get("logical_relpath")),
+        hint_size=int(payload["hint_size"]),
+        plan_size=int(payload["plan_size"]),
+        mtime_ns=int(payload["mtime_ns"]),
+    )
+
+
+def _rejected_entry_from_native(payload: Mapping[str, Any]) -> RejectedEntry:
+    return RejectedEntry(
+        relpath=str(payload["relpath"]),
+        source_path=_path_from_native_payload(payload["source_path"]),
+        reason=str(payload["reason"]),
+    )
+
+
+def _path_from_native_payload(payload: Any) -> Path:
+    if isinstance(payload, Mapping):
+        if "os_hex" in payload:
+            return Path(os.fsdecode(bytes.fromhex(str(payload["os_hex"]))))
+        if "text" in payload:
+            return Path(str(payload["text"]))
+    return Path(str(payload))
+
+
+def _raise_native_receive_error(exc: RuntimeError) -> None:
+    message = str(exc)
+    if message.startswith("canonical receive path collision:"):
+        raise CollisionError(message) from exc
+    if "during scan" in message:
+        raise SourceScanError(message) from exc
+    raise ReceiveError(message) from exc
 
 
 def sweep_orphans(

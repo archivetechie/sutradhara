@@ -15,8 +15,8 @@ use sutradhara_receive::{
     PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE, RECEIVE_VERSION, ReceiveOptions, bag_info_text,
     bagit_manifest_text, build_package_tar, canonicalize_manifest_path,
     canonicalize_raw_path_components, escape_member_name, hash_payload_tree,
-    hash_payload_tree_with_policy, manifest_mismatch, read_manifest_sha256, receive_source,
-    sha256_file, tagmanifest_text, unescape_member_name, validate_bag,
+    hash_payload_tree_with_policy, manifest_mismatch, plan_payload_units, read_manifest_sha256,
+    receive_source, sha256_file, tagmanifest_text, unescape_member_name, validate_bag,
 };
 
 #[test]
@@ -180,6 +180,56 @@ fn receive_bag_fixtures_match_python_contract() {
         assert_eq!(receive_result_payload(&result), case["result"]);
         assert_eq!(snapshot_bag_files(&result.intake_dir), case["files"]);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_payload_planner_matches_receive_scan_contract() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let package = source.join("Edit.fcpbundle");
+    fs::create_dir_all(package.join("Media")).unwrap();
+    fs::write(package.join("Media").join("clip.mov"), b"clip").unwrap();
+    fs::write(source.join("clip.mov"), b"video").unwrap();
+    symlink(source.join("clip.mov"), source.join("link.mov")).unwrap();
+    symlink(&package, source.join("package-link")).unwrap();
+
+    let plan = plan_payload_units(&source).unwrap();
+
+    assert_eq!(
+        plan.units
+            .iter()
+            .map(|unit| (
+                unit.relpath.as_str(),
+                unit.entry_type.as_str(),
+                unit.logical_relpath.as_deref(),
+                unit.hint_size,
+                unit.plan_size,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "Edit.fcpbundle.tar",
+                "package",
+                Some("Edit.fcpbundle"),
+                0,
+                4
+            ),
+            ("clip.mov", "file", None, 5, 5),
+        ]
+    );
+    assert_eq!(
+        plan.rejected
+            .iter()
+            .map(|entry| (entry.relpath.as_str(), entry.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("link.mov", "symlink"),
+            ("package-link", "symlink-directory")
+        ]
+    );
 }
 
 #[cfg(unix)]

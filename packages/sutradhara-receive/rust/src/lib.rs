@@ -18,6 +18,7 @@ use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 
 pub const RECEIVE_VERSION: &str = "receive-v2";
@@ -124,6 +125,30 @@ pub struct OrphanSweepResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PayloadPlan {
+    pub units: Vec<PayloadUnit>,
+    pub rejected: Vec<RejectedEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PayloadUnit {
+    pub source_path: PathBuf,
+    pub relpath: String,
+    pub entry_type: String,
+    pub logical_relpath: Option<String>,
+    pub hint_size: u64,
+    pub plan_size: u64,
+    pub mtime_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RejectedEntry {
+    pub relpath: String,
+    pub source_path: PathBuf,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HashReceipt {
     pub relpath: String,
     pub sha256_hex: String,
@@ -211,11 +236,6 @@ struct SourceEntry {
 enum SourceEntryType {
     File,
     Package,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RejectedEntry {
-    relpath: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -642,6 +662,18 @@ pub fn receive_source(
         skipped_count: rejected.len(),
         bag_profile: BAG_PROFILE.to_string(),
     })
+}
+
+pub fn plan_payload_units(source: &Path) -> ReceiveResult<PayloadPlan> {
+    let source_root = fs::canonicalize(source)?;
+    validate_source_root(&source_root)?;
+    let (entries, rejected) = scan_source(&source_root)?;
+    check_collisions(&entries)?;
+    let units = entries
+        .iter()
+        .map(payload_unit_from_entry)
+        .collect::<ReceiveResult<Vec<_>>>()?;
+    Ok(PayloadPlan { units, rejected })
 }
 
 pub fn sweep_orphans(
@@ -1103,6 +1135,7 @@ fn scan_source(source_root: &Path) -> ReceiveResult<(Vec<SourceEntry>, Vec<Rejec
     let mut rejected = Vec::new();
     scan_source_dir(source_root, source_root, &mut entries, &mut rejected)?;
     entries.sort_by(|left, right| left.relpath.cmp(&right.relpath));
+    rejected.sort_by(|left, right| left.relpath.cmp(&right.relpath));
     Ok((entries, rejected))
 }
 
@@ -1120,7 +1153,12 @@ fn scan_source_dir(
         let metadata = fs::symlink_metadata(&path)?;
         let relpath = canonicalize_filesystem_path(&path, source_root)?;
         if metadata.file_type().is_symlink() {
-            rejected.push(RejectedEntry { relpath });
+            let reason = symlink_rejection_reason(&path).to_string();
+            rejected.push(RejectedEntry {
+                relpath,
+                source_path: path,
+                reason,
+            });
         } else if metadata.is_dir() {
             if is_package_boundary(&relpath) {
                 entries.push(SourceEntry {
@@ -1135,7 +1173,11 @@ fn scan_source_dir(
         } else if metadata.is_file() {
             files.push((relpath, path));
         } else {
-            rejected.push(RejectedEntry { relpath });
+            rejected.push(RejectedEntry {
+                relpath,
+                source_path: path,
+                reason: special_file_reason(&metadata).to_string(),
+            });
         }
     }
     dirs.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1150,6 +1192,80 @@ fn scan_source_dir(
             entry_type: SourceEntryType::File,
             logical_relpath: None,
         });
+    }
+    Ok(())
+}
+
+fn payload_unit_from_entry(entry: &SourceEntry) -> ReceiveResult<PayloadUnit> {
+    match entry.entry_type {
+        SourceEntryType::File => {
+            let metadata = fs::metadata(&entry.source_path)?;
+            Ok(PayloadUnit {
+                source_path: entry.source_path.clone(),
+                relpath: entry.relpath.clone(),
+                entry_type: "file".to_string(),
+                logical_relpath: None,
+                hint_size: metadata.len(),
+                plan_size: metadata.len(),
+                mtime_ns: metadata_mtime_ns(&metadata)?,
+            })
+        }
+        SourceEntryType::Package => {
+            let logical_relpath = entry
+                .logical_relpath
+                .clone()
+                .ok_or_else(|| ReceiveError::new("package entry missing logical relpath"))?;
+            let (plan_size, mtime_ns) = package_plan_metadata(&entry.source_path)?;
+            Ok(PayloadUnit {
+                source_path: entry.source_path.clone(),
+                relpath: entry.relpath.clone(),
+                entry_type: "package".to_string(),
+                logical_relpath: Some(logical_relpath),
+                hint_size: 0,
+                plan_size,
+                mtime_ns,
+            })
+        }
+    }
+}
+
+fn package_plan_metadata(package_root: &Path) -> ReceiveResult<(u64, u64)> {
+    let metadata = fs::symlink_metadata(package_root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ReceiveError::new(format!(
+            "package boundary is not a directory: {}",
+            package_root.display()
+        )));
+    }
+    let mut total_size = 0;
+    let mut max_mtime = metadata_mtime_ns(&metadata)?;
+    collect_package_plan_metadata(package_root, &mut total_size, &mut max_mtime)?;
+    Ok((total_size, max_mtime))
+}
+
+fn collect_package_plan_metadata(
+    current_root: &Path,
+    total_size: &mut u64,
+    max_mtime: &mut u64,
+) -> ReceiveResult<()> {
+    for entry in fs::read_dir(current_root)? {
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        *max_mtime = (*max_mtime).max(metadata_mtime_ns(&metadata)?);
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_package_plan_metadata(&path, total_size, max_mtime)?;
+        } else if metadata.is_file() {
+            *total_size += metadata.len();
+        } else {
+            let relpath = path.to_string_lossy();
+            return Err(ReceiveError::new(format!(
+                "package contains unsupported {}: {relpath}",
+                special_file_reason(&metadata)
+            )));
+        }
     }
     Ok(())
 }
@@ -1367,6 +1483,82 @@ fn is_package_boundary(relpath: &str) -> bool {
         let suffix = pattern.strip_prefix('*').unwrap_or(pattern).to_lowercase();
         name.ends_with(&suffix) || whole.ends_with(&suffix)
     })
+}
+
+fn validate_source_root(source: &Path) -> ReceiveResult<()> {
+    let metadata = fs::metadata(source)?;
+    if !metadata.is_dir() {
+        return Err(ReceiveError::new(format!(
+            "receive source must be a directory: {}",
+            source.display()
+        )));
+    }
+    if is_inside_existing_payload(source) {
+        return Err(ReceiveError::new(format!(
+            "receive source is inside an existing intake payload: {}",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn is_inside_existing_payload(path: &Path) -> bool {
+    path.ancestors().any(|candidate| {
+        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if !matches!(name, DATA_DIR_NAME | "payload") {
+            return false;
+        }
+        candidate.parent().is_some_and(|parent| {
+            parent.join("intake.json").exists() || parent.join(".receiving.json").exists()
+        })
+    })
+}
+
+fn metadata_mtime_ns(metadata: &fs::Metadata) -> ReceiveResult<u64> {
+    let duration = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    Ok(duration.as_nanos().try_into().unwrap_or(u64::MAX))
+}
+
+fn symlink_rejection_reason(path: &Path) -> &'static str {
+    if fs::metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        "symlink-directory"
+    } else {
+        "symlink"
+    }
+}
+
+fn special_file_reason(metadata: &fs::Metadata) -> &'static str {
+    special_file_reason_for_type(metadata.file_type())
+}
+
+#[cfg(unix)]
+fn special_file_reason_for_type(file_type: fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+
+    if file_type.is_fifo() {
+        "fifo"
+    } else if file_type.is_char_device() {
+        "character-device"
+    } else if file_type.is_block_device() {
+        "block-device"
+    } else if file_type.is_socket() {
+        "socket"
+    } else {
+        "non-regular"
+    }
+}
+
+#[cfg(not(unix))]
+fn special_file_reason_for_type(_file_type: fs::FileType) -> &'static str {
+    "non-regular"
 }
 
 fn collect_payload_hashes(

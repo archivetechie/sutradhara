@@ -12,7 +12,9 @@ use crate::{
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyModule};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[pyfunction(name = "escape_member_name")]
@@ -96,6 +98,13 @@ fn py_manifest_mismatch_json(
     serde_json::to_string(&payload).map_err(py_runtime_error)
 }
 
+#[pyfunction(name = "plan_payload_units_json")]
+fn py_plan_payload_units_json(source: &Bound<'_, PyAny>) -> PyResult<String> {
+    let source = py_path_to_pathbuf(source)?;
+    let plan = crate::plan_payload_units(&source).map_err(py_runtime_error)?;
+    serde_json::to_string(&plan_payload_json(&plan)).map_err(py_runtime_error)
+}
+
 #[pyfunction(name = "hash_payload_tree_json")]
 #[pyo3(signature = (payload_root, *, reject_native_packages = false))]
 fn py_hash_payload_tree_json(
@@ -152,6 +161,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_read_manifest_sha256, m)?)?;
     m.add_function(wrap_pyfunction!(py_read_package_index_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_manifest_mismatch_json, m)?)?;
+    m.add_function(wrap_pyfunction!(py_plan_payload_units_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_hash_payload_tree_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_validate_bag_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_slug_operator, m)?)?;
@@ -187,4 +197,39 @@ fn py_path_to_pathbuf(value: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
 
 fn path_to_string(path: &std::path::Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn plan_payload_json(plan: &crate::PayloadPlan) -> Value {
+    json!({
+        "units": plan.units.iter().map(|unit| {
+            json!({
+                "source_path": path_payload(&unit.source_path),
+                "relpath": unit.relpath,
+                "entry_type": unit.entry_type,
+                "logical_relpath": unit.logical_relpath,
+                "hint_size": unit.hint_size,
+                "plan_size": unit.plan_size,
+                "mtime_ns": unit.mtime_ns,
+            })
+        }).collect::<Vec<_>>(),
+        "rejected": plan.rejected.iter().map(|entry| {
+            json!({
+                "source_path": path_payload(&entry.source_path),
+                "relpath": entry.relpath,
+                "reason": entry.reason,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(unix)]
+fn path_payload(path: &Path) -> Value {
+    use std::os::unix::ffi::OsStrExt;
+
+    json!({"os_hex": crate::hex_lower(path.as_os_str().as_bytes())})
+}
+
+#[cfg(not(unix))]
+fn path_payload(path: &Path) -> Value {
+    json!({"text": path.to_string_lossy()})
 }
