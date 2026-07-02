@@ -256,6 +256,14 @@ struct FileReceipt {
     package_members: Vec<PackageMemberRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceStatSnapshot {
+    size: u64,
+    modified: std::time::SystemTime,
+    inode: Option<u64>,
+    device: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PackageTarResult {
     pub digest: String,
@@ -1431,13 +1439,12 @@ fn copy_file_entry(entry: &SourceEntry, data_root: &Path) -> ReceiveResult<FileR
         fs::create_dir_all(parent)?;
     }
     reject_existing_unsupported_destination(&destination)?;
-    let digest = copy_file_with_digest(&entry.source_path, &destination)?;
-    let size_bytes = fs::metadata(&destination)?.len();
+    let (digest, snapshot) = copy_file_with_digest(&entry.source_path, &destination)?;
     Ok(FileReceipt {
         relpath: entry.relpath.clone(),
         destination_path: destination,
         sha256_hex: digest,
-        size_bytes,
+        size_bytes: snapshot.size,
         logical_relpath: None,
         stored_relpath: None,
         package_members: Vec::new(),
@@ -1496,25 +1503,91 @@ fn reject_existing_unsupported_destination(destination: &Path) -> ReceiveResult<
     Ok(())
 }
 
-fn copy_file_with_digest(source: &Path, destination: &Path) -> ReceiveResult<String> {
+fn copy_file_with_digest(
+    source: &Path,
+    destination: &Path,
+) -> ReceiveResult<(String, SourceStatSnapshot)> {
+    let before = source_stat_snapshot(source)?;
     let mut raw_in = File::open(source)?;
+    let temp_path = temp_path_for(destination)?;
     let mut raw_out = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
-        .open(destination)?;
+        .create_new(true)
+        .open(&temp_path)?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = raw_in.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let result = (|| {
+        loop {
+            let read = raw_in.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+            raw_out.write_all(&buffer[..read])?;
         }
-        digest.update(&buffer[..read]);
-        raw_out.write_all(&buffer[..read])?;
+        raw_out.flush()?;
+        raw_out.sync_all()?;
+        drop(raw_out);
+        let after = source_stat_snapshot(source)?;
+        raise_if_source_mutated(source, &before, &after)?;
+        replace_file(&temp_path, destination)?;
+        if let Some(parent) = destination.parent() {
+            fsync_dir_best_effort(parent);
+        }
+        Ok((hex_lower(&digest.finalize()), after))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
     }
-    raw_out.flush()?;
-    Ok(hex_lower(&digest.finalize()))
+    result
+}
+
+fn source_stat_snapshot(path: &Path) -> ReceiveResult<SourceStatSnapshot> {
+    let metadata = fs::metadata(path)?;
+    Ok(SourceStatSnapshot {
+        size: metadata.len(),
+        modified: metadata.modified()?,
+        inode: metadata_inode(&metadata),
+        device: metadata_device(&metadata),
+    })
+}
+
+fn raise_if_source_mutated(
+    path: &Path,
+    before: &SourceStatSnapshot,
+    after: &SourceStatSnapshot,
+) -> ReceiveResult<()> {
+    if before == after {
+        return Ok(());
+    }
+    Err(ReceiveError::new(format!(
+        "source changed during receive: {}",
+        path.display()
+    )))
+}
+
+#[cfg(unix)]
+fn metadata_inode(metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn metadata_inode(_metadata: &fs::Metadata) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn metadata_device(metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(metadata.dev())
+}
+
+#[cfg(not(unix))]
+fn metadata_device(_metadata: &fs::Metadata) -> Option<u64> {
+    None
 }
 
 fn verify_destination_files(receipts: &[FileReceipt]) -> ReceiveResult<()> {
@@ -1609,8 +1682,12 @@ fn bag_info_metadata(
 }
 
 fn write_json_file(path: &Path, value: &Value) -> ReceiveResult<()> {
-    fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))?;
-    Ok(())
+    let mut observer = |_temp_path: &Path, _final_path: &Path| Ok(());
+    atomic_write_text(
+        path,
+        &format!("{}\n", serde_json::to_string_pretty(value)?),
+        &mut observer,
+    )
 }
 
 fn atomic_write_text<F>(path: &Path, text: &str, observer: &mut F) -> ReceiveResult<()>
@@ -2291,6 +2368,7 @@ fn write_tar_octal(field: &mut [u8], value: u64, digits: usize) {
 }
 
 fn copy_file_to_tar(source: &Path, writer: &mut TarHashingWriter<File>) -> ReceiveResult<String> {
+    let before = source_stat_snapshot(source)?;
     let mut digest = Sha256::new();
     let mut handle = File::open(source)?;
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
@@ -2302,6 +2380,8 @@ fn copy_file_to_tar(source: &Path, writer: &mut TarHashingWriter<File>) -> Recei
         digest.update(&buffer[..read]);
         writer.write_all(&buffer[..read])?;
     }
+    let after = source_stat_snapshot(source)?;
+    raise_if_source_mutated(source, &before, &after)?;
     Ok(hex_lower(&digest.finalize()))
 }
 
@@ -2553,6 +2633,42 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("payload destination is a symlink")
+        );
+    }
+
+    #[test]
+    fn copy_file_with_digest_reports_source_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.mov");
+        let destination = temp.path().join("data").join("clip.mov");
+        std::fs::create_dir(destination.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"hello").unwrap();
+
+        let (digest, snapshot) = copy_file_with_digest(&source, &destination).unwrap();
+
+        assert_eq!(
+            digest,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(snapshot.size, 5);
+        assert_eq!(std::fs::read(destination).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn source_stat_guard_rejects_changed_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.mov");
+        std::fs::write(&source, b"hello").unwrap();
+        let before = source_stat_snapshot(&source).unwrap();
+        raise_if_source_mutated(&source, &before, &before).unwrap();
+
+        std::fs::write(&source, b"hello world").unwrap();
+        let after = source_stat_snapshot(&source).unwrap();
+        assert!(
+            raise_if_source_mutated(&source, &before, &after)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed during receive")
         );
     }
 }
