@@ -186,7 +186,10 @@ def _marker_timestamp(
         if isinstance(payload, dict):
             value = payload.get(payload_key)
             if isinstance(value, str) and value:
-                return _iso(_parse_datetime(value))
+                try:
+                    return _iso(_parse_datetime(value))
+                except ValueError:
+                    pass
     try:
         return _iso(dt.datetime.fromtimestamp(marker.stat().st_mtime, tz=dt.UTC))
     except OSError:

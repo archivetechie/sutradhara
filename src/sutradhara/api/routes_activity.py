@@ -19,7 +19,11 @@ async def get_activity(request: Request, days: int = 7) -> dict[str, object]:
 
     _require_view(parse_identity(request.headers))
     if days < MIN_ACTIVITY_DAYS or days > MAX_ACTIVITY_DAYS:
-        _raise(400, "bad_request", f"days must be between {MIN_ACTIVITY_DAYS} and {MAX_ACTIVITY_DAYS}")
+        _raise(
+            400,
+            "bad_request",
+            f"days must be between {MIN_ACTIVITY_DAYS} and {MAX_ACTIVITY_DAYS}",
+        )
     return await anyio.to_thread.run_sync(
         partial(
             read_activity,
