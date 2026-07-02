@@ -13,6 +13,7 @@ from sutradhara.cli.assets import list_group
 from sutradhara.cli.backends import backends_group
 from sutradhara.cli.db import db_group
 from sutradhara.cli.grpc import serve_grpc_cmd
+from sutradhara.cli.hdcache import hdcache_group
 from sutradhara.cli.intake import intake_group, prepare_cmd
 from sutradhara.cli.jobs import jobs_group
 from sutradhara.cli.receive import receive_group
@@ -53,6 +54,7 @@ cli.add_command(tag_group)
 cli.add_command(serve_api_cmd)
 cli.add_command(serve_grpc_cmd)
 cli.add_command(serve_cmd)
+cli.add_command(hdcache_group)
 
 
 if __name__ == "__main__":

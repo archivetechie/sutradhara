@@ -1,0 +1,243 @@
+"""HD cache disk lifecycle commands."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import click
+
+from sutradhara.catalog.session import make_engine
+from sutradhara.hdcache.lifecycle import (
+    BlockDeviceCandidate,
+    HdcacheLifecycleManager,
+    LifecycleError,
+    add_result_payload,
+    dead_result_payload,
+    disk_payload,
+    load_hmac_secret_from_env,
+    status_payload,
+)
+from sutradhara.hdcache.store import StoreError
+
+ManagerFactory = Callable[[], HdcacheLifecycleManager]
+_MANAGER_FACTORY: ManagerFactory | None = None
+
+
+@click.group("hdcache")
+def hdcache_group() -> None:
+    """Manage the expendable HD cache disk tier."""
+
+
+@hdcache_group.group("disk")
+def disk_group() -> None:
+    """Manage enrolled hdcache disks."""
+
+
+@disk_group.command("add")
+@click.argument("block_dev", required=False)
+@click.option("--scan", "scan_mode", is_flag=True, default=False, help="Scan unenrolled disks.")
+@click.option("--yes", is_flag=True, default=False, help="Confirm batch enrollment for --scan.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def disk_add_cmd(
+    block_dev: str | None,
+    scan_mode: bool,
+    yes: bool,
+    as_json: bool,
+) -> None:
+    """Enroll one block device or scan/enroll all candidates."""
+
+    manager = _manager()
+    try:
+        if scan_mode:
+            candidates = manager.scan()
+            if not yes:
+                _emit_scan(candidates, as_json=as_json)
+                return
+            results = manager.add_scan()
+        else:
+            if block_dev is None:
+                raise click.UsageError("provide BLOCK_DEV or --scan")
+            results = [manager.add_disk(block_dev)]
+    except LifecycleError as exc:
+        raise click.ClickException(str(exc)) from exc
+    payload = [add_result_payload(result) for result in results]
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    if not payload:
+        click.echo("no unenrolled disks found")
+    for item in payload:
+        click.echo(
+            "enrolled "
+            f"{item['disk_id']} serial={item['serial']} "
+            f"slot={item['slot'] or '-'} mount={item['mount']}"
+        )
+
+
+@disk_group.command("list")
+@click.option("--all", "include_dead", is_flag=True, default=False, help="Include dead disks.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def disk_list_cmd(include_dead: bool, as_json: bool) -> None:
+    """List enrolled disks."""
+
+    manager = _manager()
+    rows = [disk_payload(row) for row in manager.disks(include_dead=include_dead)]
+    if as_json:
+        click.echo(json.dumps({"disks": rows}, indent=2, sort_keys=True))
+        return
+    for row in rows:
+        click.echo(
+            f"{row['disk_id']} {row['state']} serial={row['serial']} "
+            f"slot={row['slot'] or '-'} filled={row['filled_bytes']}/{row['capacity_bytes']} "
+            f"smart={row['smart_status'] or '-'}"
+        )
+
+
+@disk_group.command("locate")
+@click.argument("disk_id")
+def disk_locate_cmd(disk_id: str) -> None:
+    """Blink or identify a physical disk, best effort."""
+
+    try:
+        click.echo(_manager().locate(disk_id))
+    except LifecycleError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@disk_group.command("retire")
+@click.argument("disk_id")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def disk_retire_cmd(disk_id: str, as_json: bool) -> None:
+    """Mark a disk retiring; entries stay present and servable."""
+
+    try:
+        row = _manager().retire(disk_id)
+    except LifecycleError as exc:
+        raise click.ClickException(str(exc)) from exc
+    payload = disk_payload(row)
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    click.echo(f"{disk_id}: state=retiring; done when entries migrate to other disks")
+
+
+@disk_group.command("dead")
+@click.argument("disk_id")
+@click.option("--yes", is_flag=True, default=False, help="Confirm immediate loss marking.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def disk_dead_cmd(disk_id: str, yes: bool, as_json: bool) -> None:
+    """Mark a disk gone now and flip entries to lost in bounded batches."""
+
+    if not yes:
+        click.echo(
+            f"{disk_id}: would mark disk dead, drop its LUKS key-slot association, "
+            "and mark entries lost; pass --yes to proceed"
+        )
+        return
+    try:
+        result = _manager().mark_dead(disk_id)
+    except LifecycleError as exc:
+        raise click.ClickException(str(exc)) from exc
+    payload = dead_result_payload(result)
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    click.echo(
+        f"{disk_id}: dead; entries_lost={result.entries_lost} "
+        f"batches={result.batches}; done when repopulation clears lost backlog"
+    )
+    if result.luks_key_drop:
+        click.echo(result.luks_key_drop)
+
+
+@disk_group.command("forget")
+@click.argument("disk_id")
+def disk_forget_cmd(disk_id: str) -> None:
+    """Validate that a dead disk has no cache entries and keep its id tombstoned."""
+
+    try:
+        _manager().forget(disk_id)
+    except LifecycleError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{disk_id}: forgotten for operations; disk id retained as a tombstone")
+
+
+@hdcache_group.command("status")
+@click.option("--disks", "show_disks", is_flag=True, default=False, help="Include disk rows.")
+@click.option("--disk", "disk_id", default=None, help="Show one disk in detail.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def hdcache_status_cmd(show_disks: bool, disk_id: str | None, as_json: bool) -> None:
+    """Show hdcache disk summary."""
+
+    manager = _manager()
+    if disk_id is not None:
+        rows = [row for row in manager.disks(include_dead=True) if row.disk_id == disk_id]
+        if not rows:
+            raise click.ClickException(f"unknown cache disk: {disk_id}")
+        payload: dict[str, Any] = {"disk": disk_payload(rows[0])}
+    else:
+        payload = {"summary": status_payload(manager.status())}
+        if show_disks:
+            payload["disks"] = [disk_payload(row) for row in manager.disks(include_dead=True)]
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    if "disk" in payload:
+        row = payload["disk"]
+        click.echo(
+            f"{row['disk_id']} {row['state']} serial={row['serial']} "
+            f"slot={row['slot'] or '-'} mount={row['mount']}"
+        )
+        return
+    summary = payload["summary"]
+    click.echo(
+        f"disks={summary['disks_total']} capacity={summary['capacity_bytes']} "
+        f"filled={summary['filled_bytes']} states={summary['by_state']}"
+    )
+    for row in summary["worst_disks"]:
+        click.echo(f"{row['disk_id']} {row['state']} smart={row['smart_status'] or '-'}")
+
+
+def set_manager_factory(factory: ManagerFactory | None) -> None:
+    """Install a test-only manager factory."""
+
+    global _MANAGER_FACTORY
+    _MANAGER_FACTORY = factory
+
+
+def _manager() -> HdcacheLifecycleManager:
+    if _MANAGER_FACTORY is not None:
+        return _MANAGER_FACTORY()
+    try:
+        return HdcacheLifecycleManager(
+            make_engine(),
+            mount_root=Path("/srv/hdcache"),
+            hmac_secret=load_hmac_secret_from_env(),
+        )
+    except (OSError, StoreError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _emit_scan(candidates: list[BlockDeviceCandidate], *, as_json: bool) -> None:
+    payload = [dataclasses_asdict(candidate) for candidate in candidates]
+    if as_json:
+        click.echo(json.dumps({"candidates": payload}, indent=2, sort_keys=True))
+        return
+    if not payload:
+        click.echo("no unenrolled disks found")
+        return
+    for item in payload:
+        click.echo(
+            f"{item['block_dev']} serial={item['serial']} "
+            f"slot={item['slot'] or '-'} capacity={item['capacity_bytes']}"
+        )
+
+
+def dataclasses_asdict(value: object) -> dict[str, object]:
+    return {
+        key: getattr(value, key)
+        for key in getattr(value, "__dataclass_fields__", {})
+    }
