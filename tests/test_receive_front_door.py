@@ -101,6 +101,7 @@ def test_legacy_receive_core_import_aliases_extracted_package() -> None:
     import sutradhara_receive.core as extracted_core
 
     assert legacy_core is extracted_core
+    assert extracted_core._native is not None
 
 
 def test_receive_output_passes_reference_bagit_validator_when_installed(tmp_path: Path) -> None:

@@ -12,6 +12,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+try:
+    from sutradhara_receive import _native
+except ImportError:  # pragma: no cover - source-tree fallback before native build.
+    _native = None
+
 
 class MemberNameError(ValueError):
     """A member-name string is not in canonical escaped form."""
@@ -19,6 +24,8 @@ class MemberNameError(ValueError):
 
 def escape_member_name(raw: bytes) -> str:
     """Return the catalog/customer escaped form for raw member-name bytes."""
+    if _native is not None:
+        return str(_native.escape_member_name(raw))
     parts: list[str] = []
     index = 0
     while index < len(raw):
@@ -52,6 +59,11 @@ def escape_member_name(raw: bytes) -> str:
 
 def unescape_member_name(text: str) -> bytes:
     """Decode a catalog/customer member-name string back to raw bytes."""
+    if _native is not None:
+        try:
+            return bytes(_native.unescape_member_name(text))
+        except ValueError as exc:
+            raise MemberNameError(str(exc)) from exc
     output = bytearray()
     index = 0
     while index < len(text):

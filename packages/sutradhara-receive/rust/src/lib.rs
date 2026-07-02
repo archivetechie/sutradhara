@@ -3,8 +3,11 @@
 //! The current migration slices cover the fixture-pinned stratum-1 primitives
 //! plus the M3 write-side core: reversible member-name escaping, receive-path
 //! canonicalization, BagIt tag text builders, SHA-256 hashing, package tar
-//! normalization, and deterministic receive-bag writing. Later migration stages
-//! add the command-line binary and PyO3 wheel on top of these primitives.
+//! normalization, deterministic receive-bag writing, the edge CLI, read-side
+//! validation, and the first PyO3 binding layer for the in-place wheel flip.
+
+#[cfg(feature = "python")]
+mod python;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -150,6 +153,7 @@ pub struct BagValidationResult {
     pub metadata: BTreeMap<String, String>,
     pub manifest: BTreeMap<String, String>,
     pub actual: BTreeMap<String, String>,
+    pub actual_records: Vec<HashReceipt>,
     pub missing: Vec<String>,
     pub extra: Vec<String>,
     pub mismatched: Vec<ManifestDigestMismatch>,
@@ -675,8 +679,20 @@ pub fn sweep_orphans(
 }
 
 pub fn hash_payload_tree(payload_root: &Path) -> ReceiveResult<Vec<HashReceipt>> {
+    hash_payload_tree_with_policy(payload_root, false)
+}
+
+pub fn hash_payload_tree_with_policy(
+    payload_root: &Path,
+    reject_native_packages: bool,
+) -> ReceiveResult<Vec<HashReceipt>> {
     let mut receipts = Vec::new();
-    collect_payload_hashes(payload_root, payload_root, &mut receipts)?;
+    collect_payload_hashes(
+        payload_root,
+        payload_root,
+        reject_native_packages,
+        &mut receipts,
+    )?;
     receipts.sort_by(|left, right| left.relpath.cmp(&right.relpath));
     Ok(receipts)
 }
@@ -853,7 +869,7 @@ pub fn validate_bag(bag_root: &Path) -> BagValidationResult {
     if !data_root.is_dir() {
         errors.push(format!("complete: missing {DATA_DIR_NAME}/ directory"));
     } else {
-        match hash_payload_tree(&data_root) {
+        match hash_payload_tree_with_policy(&data_root, true) {
             Ok(records) => actual_records = records,
             Err(error) => errors.push(format!("complete: cannot hash {DATA_DIR_NAME}/: {error}")),
         }
@@ -967,6 +983,7 @@ pub fn validate_bag(bag_root: &Path) -> BagValidationResult {
         metadata,
         manifest,
         actual,
+        actual_records,
         missing,
         extra,
         mismatched,
@@ -1355,6 +1372,7 @@ fn is_package_boundary(relpath: &str) -> bool {
 fn collect_payload_hashes(
     payload_root: &Path,
     current_root: &Path,
+    reject_native_packages: bool,
     receipts: &mut Vec<HashReceipt>,
 ) -> ReceiveResult<()> {
     let mut dirs = Vec::new();
@@ -1370,7 +1388,7 @@ fn collect_payload_hashes(
             )));
         }
         if metadata.is_dir() {
-            if is_package_boundary(&relpath) {
+            if reject_native_packages && is_package_boundary(&relpath) {
                 return Err(ReceiveError::new(format!(
                     "payload contains un-normalized package directory {relpath:?}; re-run sutra receive so it is stored as a {PACKAGE_PROFILE_VERSION} tar"
                 )));
@@ -1386,7 +1404,7 @@ fn collect_payload_hashes(
     }
     dirs.sort_by(|left, right| left.0.cmp(&right.0));
     for (_relpath, path) in dirs {
-        collect_payload_hashes(payload_root, &path, receipts)?;
+        collect_payload_hashes(payload_root, &path, reject_native_packages, receipts)?;
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     for (relpath, path, size_bytes) in files {
@@ -1577,8 +1595,12 @@ fn normalize_posix_path(path: &str) -> String {
         .filter(|part| !part.is_empty() && *part != ".")
         .collect::<Vec<_>>()
         .join("/");
-    if absolute {
+    if absolute && normalized.is_empty() {
+        "/".to_string()
+    } else if absolute {
         format!("/{normalized}")
+    } else if normalized.is_empty() {
+        ".".to_string()
     } else {
         normalized
     }

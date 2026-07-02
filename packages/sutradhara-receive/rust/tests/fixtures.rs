@@ -14,8 +14,9 @@ use sutradhara_receive::{
     BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, PACKAGE_GLOBS, PACKAGE_PROFILE_HASH,
     PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE, RECEIVE_VERSION, ReceiveOptions, bag_info_text,
     bagit_manifest_text, build_package_tar, canonicalize_manifest_path,
-    canonicalize_raw_path_components, escape_member_name, manifest_mismatch, read_manifest_sha256,
-    receive_source, sha256_file, tagmanifest_text, unescape_member_name, validate_bag,
+    canonicalize_raw_path_components, escape_member_name, hash_payload_tree,
+    hash_payload_tree_with_policy, manifest_mismatch, read_manifest_sha256, receive_source,
+    sha256_file, tagmanifest_text, unescape_member_name, validate_bag,
 };
 
 #[test]
@@ -325,6 +326,43 @@ fn tagmanifest_absolute_path_is_reported_unsafe() {
         "actual": "unsafe path",
         "expected": digest,
         "path": "/bag-info.txt",
+    })));
+}
+
+#[test]
+fn hash_payload_tree_rejects_native_packages_only_when_requested() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = temp.path().join("data");
+    let package = payload.join("A001.photoslibrary");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("asset.mov"), b"video").unwrap();
+
+    let receipts = hash_payload_tree(&payload).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].relpath, "A001.photoslibrary/asset.mov");
+
+    let error = hash_payload_tree_with_policy(&payload, true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("un-normalized package directory"));
+}
+
+#[test]
+fn tagmanifest_dot_path_is_reported_unsafe() {
+    let temp = tempfile::tempdir().unwrap();
+    let bag = simple_received_bag(temp.path(), "dot-tagmanifest");
+    fs::write(
+        bag.join("tagmanifest-sha256.txt"),
+        format!("{}  .\n", "0".repeat(64)),
+    )
+    .unwrap();
+
+    let validation = validate_bag(&bag);
+    let tag_mismatches = json!(validation.tag_mismatched);
+    assert!(tag_mismatches.as_array().unwrap().contains(&json!({
+        "actual": "unsafe path",
+        "expected": "0".repeat(64),
+        "path": ".",
     })));
 }
 

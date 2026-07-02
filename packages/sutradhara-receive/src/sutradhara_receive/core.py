@@ -35,6 +35,11 @@ from sutradhara_receive.member_name import (
     unescape_member_name,
 )
 
+try:
+    from sutradhara_receive import _native
+except ImportError:  # pragma: no cover - source-tree fallback before native build.
+    _native = None
+
 RECEIVE_VERSION = "receive-v2"
 RECEIVE_PACKAGE_NAME = "sutradhara-receive"
 RECEIVE_PACKAGE_VERSION = "0.0.1"
@@ -604,6 +609,46 @@ def hash_payload_tree(
     """Hash a payload tree using the same canonical relpaths as receive."""
 
     root = Path(payload_root)
+    if _native is not None:
+        try:
+            records = json.loads(
+                _native.hash_payload_tree_json(
+                    root,
+                    reject_native_packages=reject_native_packages,
+                )
+            )
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
+        receipts: list[FileReceipt] = []
+        actual_paths: dict[str, Path] = {}
+        for candidate in sorted(root.rglob("*")):
+            if candidate.is_file():
+                actual_paths[canonicalize_filesystem_path(candidate, root)] = candidate
+        for record in records:
+            relpath = str(record["relpath"])
+            destination = actual_paths.get(relpath, safe_payload_path(root, relpath))
+            try:
+                stat_result = destination.lstat()
+            except FileNotFoundError:
+                st_dev = None
+                st_ino = None
+            else:
+                st_dev = getattr(stat_result, "st_dev", None)
+                st_ino = getattr(stat_result, "st_ino", None)
+            receipts.append(
+                FileReceipt(
+                    source_path=destination,
+                    relpath=relpath,
+                    destination_path=destination,
+                    sha256_hex=str(record["sha256_hex"]),
+                    size_bytes=int(record["size_bytes"]),
+                    st_dev=st_dev,
+                    st_ino=st_ino,
+                    copied=False,
+                )
+            )
+        return receipts
+
     receipts: list[FileReceipt] = []
     for path in sorted(root.rglob("*")):
         relpath = canonicalize_filesystem_path(path, root)
@@ -644,6 +689,12 @@ def hash_payload_tree(
 def read_package_index(path: str | Path) -> dict[str, Any]:
     """Read and lightly validate a receive package index tag file."""
 
+    if _native is not None:
+        try:
+            return cast(dict[str, Any], json.loads(_native.read_package_index_json(Path(path))))
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
+
     payload = _read_json(Path(path))
     if payload.get("profile") != PACKAGE_PROFILE_VERSION:
         raise ReceiveError(
@@ -681,11 +732,23 @@ def read_manifest_sha256(path: str | Path) -> dict[str, str]:
     receive member-name canonicalization is applied.
     """
 
+    if _native is not None:
+        try:
+            return cast(dict[str, str], _native.read_manifest_sha256(Path(path)))
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
+
     return _read_checksum_manifest(Path(path), payload_manifest=True)
 
 
 def read_bag_info(path: str | Path) -> dict[str, str]:
     """Read a BagIt `bag-info.txt` file into a label dictionary."""
+
+    if _native is not None:
+        try:
+            return cast(dict[str, str], _native.read_bag_info(Path(path)))
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
 
     result: dict[str, str] = {}
     current_key: str | None = None
@@ -773,6 +836,12 @@ def write_bagit_files(
 def bagit_manifest_text(entries: Mapping[str, str]) -> str:
     """Return deterministic BagIt `manifest-sha256.txt` text."""
 
+    if _native is not None:
+        try:
+            return str(_native.bagit_manifest_text(dict(entries)))
+        except ValueError as exc:
+            raise ReceiveError(str(exc)) from exc
+
     lines = []
     for relpath in sorted(entries):
         digest = entries[relpath].lower()
@@ -785,6 +854,9 @@ def bagit_manifest_text(entries: Mapping[str, str]) -> str:
 
 def bag_info_text(metadata: Mapping[str, str]) -> str:
     """Return deterministic BagIt `bag-info.txt` text for intake metadata."""
+
+    if _native is not None:
+        return str(_native.bag_info_text(dict(metadata)))
 
     order = [
         "Bagging-Date",
@@ -813,6 +885,12 @@ def bag_info_text(metadata: Mapping[str, str]) -> str:
 
 def tagmanifest_text(bag_root: Path | str, tag_files: Iterable[str]) -> str:
     """Return deterministic BagIt `tagmanifest-sha256.txt` text."""
+
+    if _native is not None:
+        try:
+            return str(_native.tagmanifest_text(Path(bag_root), list(tag_files)))
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
 
     root = Path(bag_root)
     lines = []
@@ -921,6 +999,15 @@ def validate_bag(bag_root: Path | str) -> BagValidationResult:
 def manifest_mismatch(actual: Mapping[str, str], expected: Mapping[str, str]) -> dict[str, Any]:
     """Return the intake manifest mismatch summary after shared canonicalization."""
 
+    if _native is not None:
+        try:
+            return cast(
+                dict[str, Any],
+                json.loads(_native.manifest_mismatch_json(dict(actual), dict(expected))),
+            )
+        except ValueError as exc:
+            raise ReceiveError(str(exc)) from exc
+
     actual_canonical = {
         canonicalize_manifest_path(path): digest.lower() for path, digest in actual.items()
     }
@@ -963,6 +1050,12 @@ def _receive_package_error(metadata: Mapping[str, str]) -> str | None:
 def canonicalize_filesystem_path(path: Path | str, root: Path | str) -> str:
     """Canonicalize a filesystem path relative to a root into a member name."""
 
+    if _native is not None:
+        try:
+            return str(_native.canonicalize_filesystem_path(Path(path), Path(root)))
+        except ValueError as exc:
+            raise SourceScanError(str(exc)) from exc
+
     source = Path(path)
     base = Path(root)
     try:
@@ -974,6 +1067,12 @@ def canonicalize_filesystem_path(path: Path | str, root: Path | str) -> str:
 
 def canonicalize_manifest_path(raw: str) -> str:
     """Canonicalize a manifest path into the shared receive member-name form."""
+
+    if _native is not None:
+        try:
+            return str(_native.canonicalize_manifest_path(raw))
+        except ValueError as exc:
+            raise ReceiveError(str(exc)) from exc
 
     value = raw
     while value.startswith("./"):
@@ -1102,6 +1201,9 @@ def _is_safe_bag_relative_path(relpath: str) -> bool:
 def slug_operator(operator: str) -> str:
     """Return a path-safe operator slug for receive intake ids."""
 
+    if _native is not None:
+        return str(_native.slug_operator(operator))
+
     normalized = unicodedata.normalize("NFKD", operator).encode("ascii", "ignore").decode()
     slug = re.sub(r"[^A-Za-z0-9]+", "-", normalized.lower()).strip("-")
     return slug or "operator"
@@ -1109,6 +1211,12 @@ def slug_operator(operator: str) -> str:
 
 def sha256_file(path: Path | str) -> str:
     """Return a file's SHA-256 digest without loading it into memory."""
+
+    if _native is not None:
+        try:
+            return str(_native.sha256_file(Path(path)))
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
 
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -1119,6 +1227,12 @@ def sha256_file(path: Path | str) -> str:
 
 def safe_payload_path(payload_root: Path | str, relpath: str) -> Path:
     """Return a payload destination path, rejecting traversal and symlinks."""
+
+    if _native is not None:
+        try:
+            return Path(str(_native.safe_payload_path(Path(payload_root), relpath)))
+        except ValueError as exc:
+            raise ReceiveError(str(exc)) from exc
 
     root = Path(payload_root).resolve()
     pure = PurePosixPath(relpath)

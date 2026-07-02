@@ -8,6 +8,11 @@ description = "Dependency-light receive filesystem contract for Sutradhara."
 [lib]
 name = "sutradhara_receive"
 path = "rust/src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python = ["dep:pyo3"]
 
 [[test]]
 name = "fixtures"
@@ -24,6 +29,7 @@ sha2 = "0.10"
 time = "0.3"
 unicode-normalization = "0.1"
 uuid = { version = "1", default-features = false, features = ["v4"] }
+pyo3 = { version = "0.29", optional = true }
 
 [dev-dependencies]
 filetime = "0.2"

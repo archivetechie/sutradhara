@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.14,<2"]
+build-backend = "maturin"
 
 [project]
 name = "sutradhara-receive"
@@ -24,8 +24,9 @@ dependencies = []
 [project.scripts]
 sutra-receive = "sutradhara_receive.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-sutradhara_receive = ["py.typed"]
+[tool.maturin]
+python-source = "src"
+module-name = "sutradhara_receive._native"
+bindings = "pyo3"
+features = ["python"]
+include = ["src/sutradhara_receive/py.typed"]
