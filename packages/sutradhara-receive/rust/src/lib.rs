@@ -125,6 +125,13 @@ pub struct OrphanSweepResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BagWriteResult {
+    pub manifest_path: PathBuf,
+    pub bag_info_path: PathBuf,
+    pub tagmanifest_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PayloadPlan {
     pub units: Vec<PayloadUnit>,
     pub rejected: Vec<RejectedEntry>,
@@ -674,6 +681,54 @@ pub fn plan_payload_units(source: &Path) -> ReceiveResult<PayloadPlan> {
         .map(payload_unit_from_entry)
         .collect::<ReceiveResult<Vec<_>>>()?;
     Ok(PayloadPlan { units, rejected })
+}
+
+pub fn write_bagit_files(
+    bag_root: &Path,
+    entries: &BTreeMap<String, String>,
+    metadata: &BTreeMap<String, String>,
+    extra_tag_files: &[String],
+) -> ReceiveResult<BagWriteResult> {
+    let mut noop = |_temp_path: &Path, _final_path: &Path| Ok(());
+    write_bagit_files_with_observer(bag_root, entries, metadata, extra_tag_files, &mut noop)
+}
+
+pub fn write_bagit_files_with_observer<F>(
+    bag_root: &Path,
+    entries: &BTreeMap<String, String>,
+    metadata: &BTreeMap<String, String>,
+    extra_tag_files: &[String],
+    observer: &mut F,
+) -> ReceiveResult<BagWriteResult>
+where
+    F: FnMut(&Path, &Path) -> ReceiveResult<()>,
+{
+    let manifest_path = bag_root.join("manifest-sha256.txt");
+    let bag_info_path = bag_root.join("bag-info.txt");
+    let bagit_path = bag_root.join("bagit.txt");
+    let tagmanifest_path = bag_root.join("tagmanifest-sha256.txt");
+
+    atomic_write_text(&bagit_path, BAGIT_TEXT, observer)?;
+    atomic_write_text(&bag_info_path, &bag_info_text(metadata), observer)?;
+    atomic_write_text(&manifest_path, &bagit_manifest_text(entries)?, observer)?;
+
+    let mut tag_files = vec![
+        "bagit.txt".to_string(),
+        "bag-info.txt".to_string(),
+        "manifest-sha256.txt".to_string(),
+    ];
+    tag_files.extend_from_slice(extra_tag_files);
+    atomic_write_text(
+        &tagmanifest_path,
+        &tagmanifest_text(bag_root, &tag_files)?,
+        observer,
+    )?;
+
+    Ok(BagWriteResult {
+        manifest_path,
+        bag_info_path,
+        tagmanifest_path,
+    })
 }
 
 pub fn sweep_orphans(
@@ -1446,35 +1501,78 @@ fn bag_info_metadata(
     ])
 }
 
-fn write_bagit_files(
-    intake_dir: &Path,
-    manifest_entries: &BTreeMap<String, String>,
-    metadata: &BTreeMap<String, String>,
-    extra_tag_files: &[String],
-) -> ReceiveResult<()> {
-    fs::write(intake_dir.join("bagit.txt"), BAGIT_TEXT)?;
-    fs::write(intake_dir.join("bag-info.txt"), bag_info_text(metadata))?;
-    fs::write(
-        intake_dir.join("manifest-sha256.txt"),
-        bagit_manifest_text(manifest_entries)?,
-    )?;
-    let mut tag_files = vec![
-        "bagit.txt".to_string(),
-        "bag-info.txt".to_string(),
-        "manifest-sha256.txt".to_string(),
-    ];
-    tag_files.extend_from_slice(extra_tag_files);
-    fs::write(
-        intake_dir.join("tagmanifest-sha256.txt"),
-        tagmanifest_text(intake_dir, &tag_files)?,
-    )?;
-    Ok(())
-}
-
 fn write_json_file(path: &Path, value: &Value) -> ReceiveResult<()> {
     fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))?;
     Ok(())
 }
+
+fn atomic_write_text<F>(path: &Path, text: &str, observer: &mut F) -> ReceiveResult<()>
+where
+    F: FnMut(&Path, &Path) -> ReceiveResult<()>,
+{
+    atomic_write_bytes(path, text.as_bytes(), observer)
+}
+
+fn atomic_write_bytes<F>(path: &Path, data: &[u8], observer: &mut F) -> ReceiveResult<()>
+where
+    F: FnMut(&Path, &Path) -> ReceiveResult<()>,
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| ReceiveError::new(format!("path has no parent: {}", path.display())))?;
+    fs::create_dir_all(parent)?;
+    fsync_dir_best_effort(parent);
+    let temp_path = temp_path_for(path)?;
+    let result = (|| {
+        let mut handle = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        handle.write_all(data)?;
+        handle.flush()?;
+        handle.sync_all()?;
+        drop(handle);
+        observer(&temp_path, path)?;
+        replace_file(&temp_path, path)?;
+        fsync_dir_best_effort(parent);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn temp_path_for(path: &Path) -> ReceiveResult<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| ReceiveError::new(format!("path has no file name: {}", path.display())))?
+        .to_string_lossy();
+    Ok(path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    )))
+}
+
+fn replace_file(temp_path: &Path, final_path: &Path) -> ReceiveResult<()> {
+    #[cfg(windows)]
+    if final_path.exists() {
+        fs::remove_file(final_path)?;
+    }
+    fs::rename(temp_path, final_path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fsync_dir_best_effort(path: &Path) {
+    if let Ok(handle) = File::open(path) {
+        let _ = handle.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_dir_best_effort(_path: &Path) {}
 
 fn is_package_boundary(relpath: &str) -> bool {
     let whole = relpath.to_lowercase();

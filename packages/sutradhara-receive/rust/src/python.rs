@@ -2,7 +2,8 @@
 //!
 //! The Python package keeps its dataclass-shaped public surface while this module
 //! exposes Rust-backed contract primitives for thin Python wrappers. Hook-aware
-//! write operations are intentionally left for the next binding slice.
+//! write operations invoke Python callbacks at the same atomic-write boundary as
+//! the previous pure-Python implementation.
 
 use crate::{
     BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, DATA_DIR_NAME, PACKAGE_GLOBS,
@@ -98,6 +99,44 @@ fn py_manifest_mismatch_json(
     serde_json::to_string(&payload).map_err(py_runtime_error)
 }
 
+#[pyfunction(name = "write_bagit_files")]
+#[pyo3(signature = (bag_root, entries, metadata, extra_tag_files, observer = None))]
+fn py_write_bagit_files(
+    py: Python<'_>,
+    bag_root: &Bound<'_, PyAny>,
+    entries: BTreeMap<String, String>,
+    metadata: BTreeMap<String, String>,
+    extra_tag_files: Vec<String>,
+    observer: Option<Py<PyAny>>,
+) -> PyResult<String> {
+    let bag_root = py_path_to_pathbuf(bag_root)?;
+    let mut observer_callback = |temp_path: &Path, final_path: &Path| {
+        if let Some(observer) = observer.as_ref() {
+            let temp_path = py_path_object(py, temp_path).map_err(pyerr_receive_error)?;
+            let final_path = py_path_object(py, final_path).map_err(pyerr_receive_error)?;
+            observer
+                .bind(py)
+                .call_method1("before_rename", (temp_path, final_path))
+                .map_err(pyerr_receive_error)?;
+        }
+        Ok(())
+    };
+    let result = crate::write_bagit_files_with_observer(
+        &bag_root,
+        &entries,
+        &metadata,
+        &extra_tag_files,
+        &mut observer_callback,
+    )
+    .map_err(py_runtime_error)?;
+    serde_json::to_string(&json!({
+        "manifest_path": path_payload(&result.manifest_path),
+        "bag_info_path": path_payload(&result.bag_info_path),
+        "tagmanifest_path": path_payload(&result.tagmanifest_path),
+    }))
+    .map_err(py_runtime_error)
+}
+
 #[pyfunction(name = "plan_payload_units_json")]
 fn py_plan_payload_units_json(source: &Bound<'_, PyAny>) -> PyResult<String> {
     let source = py_path_to_pathbuf(source)?;
@@ -161,6 +200,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_read_manifest_sha256, m)?)?;
     m.add_function(wrap_pyfunction!(py_read_package_index_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_manifest_mismatch_json, m)?)?;
+    m.add_function(wrap_pyfunction!(py_write_bagit_files, m)?)?;
     m.add_function(wrap_pyfunction!(py_plan_payload_units_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_hash_payload_tree_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_validate_bag_json, m)?)?;
@@ -174,6 +214,10 @@ fn py_runtime_error(error: impl ToString) -> PyErr {
 
 fn py_value_error(error: ReceiveError) -> PyErr {
     PyValueError::new_err(error.to_string())
+}
+
+fn pyerr_receive_error(error: PyErr) -> ReceiveError {
+    ReceiveError::new(error.to_string())
 }
 
 #[cfg(unix)]
@@ -197,6 +241,30 @@ fn py_path_to_pathbuf(value: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
 
 fn path_to_string(path: &std::path::Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn py_path_object<'py>(py: Python<'py>, path: &Path) -> PyResult<Bound<'py, PyAny>> {
+    let pathlib = PyModule::import(py, "pathlib")?;
+    let path_class = pathlib.getattr("Path")?;
+    path_class.call1((py_path_text(py, path)?,))
+}
+
+#[cfg(unix)]
+fn py_path_text<'py>(py: Python<'py>, path: &Path) -> PyResult<Bound<'py, PyAny>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let os = PyModule::import(py, "os")?;
+    let raw = PyBytes::new(py, path.as_os_str().as_bytes());
+    os.call_method1("fsdecode", (raw,))
+}
+
+#[cfg(not(unix))]
+fn py_path_text<'py>(py: Python<'py>, path: &Path) -> PyResult<Bound<'py, PyAny>> {
+    Ok(path
+        .to_string_lossy()
+        .to_string()
+        .into_pyobject(py)?
+        .into_any())
 }
 
 fn plan_payload_json(plan: &crate::PayloadPlan) -> Value {

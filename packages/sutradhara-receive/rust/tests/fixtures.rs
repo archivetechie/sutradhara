@@ -17,6 +17,7 @@ use sutradhara_receive::{
     canonicalize_raw_path_components, escape_member_name, hash_payload_tree,
     hash_payload_tree_with_policy, manifest_mismatch, plan_payload_units, read_manifest_sha256,
     receive_source, sha256_file, tagmanifest_text, unescape_member_name, validate_bag,
+    write_bagit_files_with_observer,
 };
 
 #[test]
@@ -134,6 +135,54 @@ fn writer_text_fixtures_match_python_contract() {
         tagmanifest_text(temp.path(), &tag_files).unwrap(),
         writer["tagmanifest-sha256.txt"].as_str().unwrap()
     );
+}
+
+#[test]
+fn native_bagit_writer_is_atomic_and_observable() {
+    let temp = tempfile::tempdir().unwrap();
+    let bag = temp.path();
+    fs::create_dir_all(bag.join("data")).unwrap();
+    fs::write(bag.join("data").join("clip%.mov"), b"hello").unwrap();
+    let mut manifest_entries = BTreeMap::new();
+    manifest_entries.insert(
+        "clip%.mov".to_string(),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+    );
+    let extra_tag_files = Vec::new();
+    let mut destinations = Vec::new();
+    let mut observer = |temp_path: &Path, final_path: &Path| {
+        assert!(temp_path.exists());
+        assert!(!final_path.exists());
+        destinations.push(
+            final_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+        );
+        Ok(())
+    };
+
+    let result = write_bagit_files_with_observer(
+        bag,
+        &manifest_entries,
+        &bag_info_metadata(),
+        &extra_tag_files,
+        &mut observer,
+    )
+    .unwrap();
+
+    assert_eq!(result.manifest_path, bag.join("manifest-sha256.txt"));
+    assert_eq!(
+        destinations,
+        vec![
+            "bagit.txt",
+            "bag-info.txt",
+            "manifest-sha256.txt",
+            "tagmanifest-sha256.txt",
+        ]
+    );
+    assert!(bag.join("tagmanifest-sha256.txt").is_file());
 }
 
 #[cfg(unix)]

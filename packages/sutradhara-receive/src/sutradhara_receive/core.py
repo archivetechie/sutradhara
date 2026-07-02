@@ -873,6 +873,27 @@ def write_bagit_files(
     bag_info_path = root / BAG_INFO_NAME
     bagit_path = root / BAGIT_NAME
     tagmanifest_path = root / TAGMANIFEST_NAME
+    if _native is not None:
+        try:
+            payload = cast(
+                dict[str, Any],
+                json.loads(
+                    _native.write_bagit_files(
+                        root,
+                        dict(entries),
+                        dict(metadata),
+                        list(extra_tag_files),
+                        observer,
+                    )
+                ),
+            )
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
+        return BagWriteResult(
+            manifest_path=_path_from_native_payload(payload["manifest_path"]),
+            bag_info_path=_path_from_native_payload(payload["bag_info_path"]),
+            tagmanifest_path=_path_from_native_payload(payload["tagmanifest_path"]),
+        )
     _atomic_write_text(bagit_path, BAGIT_TEXT, observer=observer)
     _atomic_write_text(bag_info_path, bag_info_text(metadata), observer=observer)
     _atomic_write_text(manifest_path, bagit_manifest_text(entries), observer=observer)

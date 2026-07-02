@@ -96,6 +96,52 @@ def test_bagit_writer_round_trips_to_shared_reader_and_payload_oxum(tmp_path: Pa
     assert validation.valid is True
 
 
+def test_bagit_writer_uses_native_atomic_observer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert receive_core._native is not None
+    bag = tmp_path / "bag"
+    data = bag / "data"
+    data.mkdir(parents=True)
+    payload = b"hello"
+    (data / "clip.mov").write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    observer = _RecordingObserver()
+
+    def fail_python_atomic_writer(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("pure Python atomic writer should not be called")
+
+    monkeypatch.setattr(receive_core, "_atomic_write_text", fail_python_atomic_writer)
+
+    result = write_bagit_files(
+        bag,
+        entries={"clip.mov": digest},
+        metadata=bag_info_metadata(
+            intake_id="bag-001",
+            source_kind="card",
+            operator="op",
+            source_ref="A001",
+            artifactclass="camera-original",
+            label="shoot",
+            started_at=dt.datetime(2026, 6, 18, tzinfo=dt.UTC),
+            file_count=1,
+            total_bytes=len(payload),
+            skipped_count=0,
+        ),
+        observer=observer,
+    )
+
+    assert result.manifest_path == bag / "manifest-sha256.txt"
+    assert observer.destinations == [
+        bag / "bagit.txt",
+        bag / "bag-info.txt",
+        bag / "manifest-sha256.txt",
+        bag / "tagmanifest-sha256.txt",
+    ]
+    assert validate_bag(bag).valid is True
+
+
 def test_legacy_receive_core_import_aliases_extracted_package() -> None:
     import sutradhara.receive.core as legacy_core
     import sutradhara_receive.core as extracted_core
