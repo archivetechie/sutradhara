@@ -646,6 +646,40 @@ def test_sweep_orphans_removes_only_stale_receiving_dirs(tmp_path: Path) -> None
     assert complete.exists()
 
 
+def test_sweep_orphans_uses_native_core(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert receive_core._native is not None
+    landing = tmp_path / "landing"
+    stale = landing / "stale"
+    fresh = landing / "fresh"
+    complete = landing / "complete"
+    for path in (stale, fresh, complete):
+        path.mkdir(parents=True)
+        (path / ".receiving.json").write_text("{}", encoding="utf-8")
+    (complete / "intake.json").write_text("{}", encoding="utf-8")
+    now = dt.datetime(2026, 6, 18, 12, tzinfo=dt.UTC)
+    old = (now - dt.timedelta(hours=48)).timestamp()
+    os.utime(stale / ".receiving.json", (old, old))
+
+    def fail_python_rmtree(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("pure Python sweep should not delete paths")
+
+    monkeypatch.setattr(receive_core.shutil, "rmtree", fail_python_rmtree)
+
+    result = sweep_orphans(
+        landing,
+        older_than=dt.timedelta(hours=24),
+        now=now,
+    )
+
+    assert result.removed == (stale,)
+    assert not stale.exists()
+    assert fresh.exists()
+    assert complete.exists()
+
+
 def test_confirmation_is_fail_safe_for_verified_quarantine_and_timeout(tmp_path: Path) -> None:
     verified = tmp_path / "verified"
     quarantined = tmp_path / "quarantined"

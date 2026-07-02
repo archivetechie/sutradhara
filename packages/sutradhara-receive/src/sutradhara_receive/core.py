@@ -597,6 +597,22 @@ def sweep_orphans(
 
     landing_root = Path(landing)
     current = now or _utcnow()
+    if _native is not None:
+        try:
+            return _orphan_sweep_from_native(
+                cast(
+                    dict[str, Any],
+                    json.loads(
+                        _native.sweep_orphans_json(
+                            landing_root,
+                            older_than.total_seconds(),
+                            current.timestamp(),
+                        )
+                    ),
+                )
+            )
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
     removed: list[Path] = []
     if not landing_root.exists():
         return OrphanSweepResult(removed=())
@@ -609,6 +625,12 @@ def sweep_orphans(
             shutil.rmtree(child)
             removed.append(child)
     return OrphanSweepResult(removed=tuple(removed))
+
+
+def _orphan_sweep_from_native(payload: Mapping[str, Any]) -> OrphanSweepResult:
+    return OrphanSweepResult(
+        removed=tuple(_path_from_native_payload(item) for item in payload.get("removed", ()))
+    )
 
 
 def wait_for_server_confirmation(

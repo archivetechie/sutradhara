@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::{Duration, UNIX_EPOCH};
 
 #[pyfunction(name = "escape_member_name")]
 fn py_escape_member_name(raw: &[u8]) -> String {
@@ -137,6 +138,35 @@ fn py_write_bagit_files(
     .map_err(py_runtime_error)
 }
 
+#[pyfunction(name = "sweep_orphans_json")]
+fn py_sweep_orphans_json(
+    landing: &Bound<'_, PyAny>,
+    older_than_seconds: f64,
+    now_timestamp: f64,
+) -> PyResult<String> {
+    if older_than_seconds < 0.0 || !older_than_seconds.is_finite() {
+        return Err(PyValueError::new_err(
+            "older_than_seconds must be finite and non-negative",
+        ));
+    }
+    if now_timestamp < 0.0 || !now_timestamp.is_finite() {
+        return Err(PyValueError::new_err(
+            "now_timestamp must be finite and non-negative",
+        ));
+    }
+    let landing = py_path_to_pathbuf(landing)?;
+    let result = crate::sweep_orphans(
+        &landing,
+        Duration::from_secs_f64(older_than_seconds),
+        UNIX_EPOCH + Duration::from_secs_f64(now_timestamp),
+    )
+    .map_err(py_runtime_error)?;
+    serde_json::to_string(&json!({
+        "removed": result.removed.iter().map(|path| path_payload(path)).collect::<Vec<_>>(),
+    }))
+    .map_err(py_runtime_error)
+}
+
 #[pyfunction(name = "plan_payload_units_json")]
 fn py_plan_payload_units_json(source: &Bound<'_, PyAny>) -> PyResult<String> {
     let source = py_path_to_pathbuf(source)?;
@@ -201,6 +231,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_read_package_index_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_manifest_mismatch_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_write_bagit_files, m)?)?;
+    m.add_function(wrap_pyfunction!(py_sweep_orphans_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_plan_payload_units_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_hash_payload_tree_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_validate_bag_json, m)?)?;

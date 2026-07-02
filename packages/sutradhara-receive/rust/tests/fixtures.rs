@@ -16,8 +16,8 @@ use sutradhara_receive::{
     bagit_manifest_text, build_package_tar, canonicalize_manifest_path,
     canonicalize_raw_path_components, escape_member_name, hash_payload_tree,
     hash_payload_tree_with_policy, manifest_mismatch, plan_payload_units, read_manifest_sha256,
-    receive_source, sha256_file, tagmanifest_text, unescape_member_name, validate_bag,
-    write_bagit_files_with_observer,
+    receive_source, sha256_file, sweep_orphans, tagmanifest_text, unescape_member_name,
+    validate_bag, write_bagit_files_with_observer,
 };
 
 #[test]
@@ -183,6 +183,40 @@ fn native_bagit_writer_is_atomic_and_observable() {
         ]
     );
     assert!(bag.join("tagmanifest-sha256.txt").is_file());
+}
+
+#[test]
+fn native_sweep_orphans_is_deterministic() {
+    use filetime::{FileTime, set_file_mtime};
+
+    let temp = tempfile::tempdir().unwrap();
+    let landing = temp.path().join("landing");
+    let stale = landing.join("stale");
+    let fresh = landing.join("fresh");
+    let complete = landing.join("complete");
+    for path in [&stale, &fresh, &complete] {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join(".receiving.json"), "{}").unwrap();
+    }
+    fs::write(complete.join("intake.json"), "{}").unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000);
+    set_file_mtime(
+        stale.join(".receiving.json"),
+        FileTime::from_system_time(now - Duration::from_secs(48 * 3600)),
+    )
+    .unwrap();
+    set_file_mtime(
+        fresh.join(".receiving.json"),
+        FileTime::from_system_time(now - Duration::from_secs(60)),
+    )
+    .unwrap();
+
+    let result = sweep_orphans(&landing, Duration::from_secs(24 * 3600), now).unwrap();
+
+    assert_eq!(result.removed, vec![stale.clone()]);
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+    assert!(complete.exists());
 }
 
 #[cfg(unix)]
