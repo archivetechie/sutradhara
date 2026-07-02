@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, SystemTime};
 use sutradhara_receive::{
     BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, PACKAGE_GLOBS, PACKAGE_PROFILE_HASH,
     PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE, RECEIVE_VERSION, ReceiveOptions, bag_info_text,
@@ -179,11 +181,143 @@ fn receive_bag_fixtures_match_python_contract() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_matrix_fixtures_match_rust_binary() {
+    let fixture = read_fixture("cli_matrix.json");
+    for case in fixture["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let case_root = temp.path().join(name);
+        let source = case_root.join("source");
+        let landing = case_root.join("landing");
+        if matches!(
+            name,
+            "bare-fake-source-json"
+                | "explicit-run-json"
+                | "confirm-timeout-exit-3"
+                | "source-and-fake-source-usage"
+        ) {
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("clip.mov"), b"video").unwrap();
+        }
+        if matches!(name, "sweep-json" | "sweep-orphans-json") {
+            write_sweep_fixture(&landing);
+        }
+
+        let argv = argv_from_fixture(case, temp.path(), &source, &landing);
+        let output = Command::new(env!("CARGO_BIN_EXE_sutra-receive"))
+            .args(&argv)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let intake_id = json_intake_id(&stdout);
+
+        assert_eq!(
+            output.status.code().unwrap(),
+            case["exit_code"].as_i64().unwrap() as i32,
+            "{name}"
+        );
+        assert_eq!(
+            normalize_cli_text(
+                &stdout,
+                temp.path(),
+                &source,
+                &landing,
+                intake_id.as_deref()
+            ),
+            case["stdout"].as_str().unwrap(),
+            "{name} stdout"
+        );
+        assert_eq!(
+            normalize_cli_text(
+                &stderr,
+                temp.path(),
+                &source,
+                &landing,
+                intake_id.as_deref()
+            ),
+            case["stderr"].as_str().unwrap(),
+            "{name} stderr"
+        );
+        let expected_json = &case["stdout_json"];
+        if expected_json.is_null() {
+            assert!(stdout.trim().is_empty(), "{name}");
+        } else {
+            let normalized_stdout = normalize_cli_text(
+                &stdout,
+                temp.path(),
+                &source,
+                &landing,
+                intake_id.as_deref(),
+            );
+            let actual_json: Value = serde_json::from_str(&normalized_stdout).unwrap();
+            assert_eq!(&actual_json, expected_json, "{name} stdout_json");
+        }
+    }
+}
+
 fn read_fixture(name: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join(name);
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+fn argv_from_fixture(case: &Value, root: &Path, source: &Path, landing: &Path) -> Vec<String> {
+    case["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .unwrap()
+                .replace("<FIXTURE-ROOT>", root.to_str().unwrap())
+                .replace("<SOURCE>", source.to_str().unwrap())
+                .replace("<LANDING>", landing.to_str().unwrap())
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn json_intake_id(stdout: &str) -> Option<String> {
+    serde_json::from_str::<Value>(stdout)
+        .ok()
+        .and_then(|payload| payload["intake_id"].as_str().map(ToString::to_string))
+}
+
+#[cfg(unix)]
+fn normalize_cli_text(
+    value: &str,
+    root: &Path,
+    source: &Path,
+    landing: &Path,
+    intake_id: Option<&str>,
+) -> String {
+    let mut normalized = value
+        .replace(source.to_str().unwrap(), "<SOURCE>")
+        .replace(landing.to_str().unwrap(), "<LANDING>")
+        .replace(root.to_str().unwrap(), "<FIXTURE-ROOT>");
+    if let Some(intake_id) = intake_id {
+        normalized = normalized.replace(intake_id, "<INTAKE-ID>");
+    }
+    normalized
+}
+
+#[cfg(unix)]
+fn write_sweep_fixture(landing: &Path) {
+    use filetime::{FileTime, set_file_mtime};
+
+    for name in ["stale", "fresh", "complete"] {
+        let path = landing.join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(".receiving.json"), "{}").unwrap();
+    }
+    fs::write(landing.join("complete").join("intake.json"), "{}").unwrap();
+    let old = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(48 * 3600));
+    set_file_mtime(landing.join("stale").join(".receiving.json"), old).unwrap();
 }
 
 #[cfg(unix)]

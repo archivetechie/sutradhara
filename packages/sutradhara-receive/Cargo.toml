@@ -13,11 +13,18 @@ path = "rust/src/lib.rs"
 name = "fixtures"
 path = "rust/tests/fixtures.rs"
 
+[[bin]]
+name = "sutra-receive"
+path = "rust/src/bin/sutra-receive.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+time = "0.3"
 unicode-normalization = "0.1"
+uuid = { version = "1", default-features = false, features = ["v4"] }
 
 [dev-dependencies]
+filetime = "0.2"
 tempfile = "3"

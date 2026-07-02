@@ -115,6 +115,11 @@ pub struct ReceiveSourceResult {
     pub bag_profile: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OrphanSweepResult {
+    pub removed: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceEntry {
     source_path: PathBuf,
@@ -558,6 +563,40 @@ pub fn receive_source(
         skipped_count: rejected.len(),
         bag_profile: BAG_PROFILE.to_string(),
     })
+}
+
+pub fn sweep_orphans(
+    landing: &Path,
+    older_than: std::time::Duration,
+    now: std::time::SystemTime,
+) -> ReceiveResult<OrphanSweepResult> {
+    let mut removed = Vec::new();
+    if !landing.exists() {
+        return Ok(OrphanSweepResult { removed });
+    }
+    let mut children = Vec::new();
+    for entry in fs::read_dir(landing)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            children.push(path);
+        }
+    }
+    children.sort();
+    for child in children {
+        let receiving = child.join(".receiving.json");
+        if !receiving.exists() || child.join("intake.json").exists() {
+            continue;
+        }
+        let modified = fs::metadata(&receiving)?.modified()?;
+        let age = now
+            .duration_since(modified)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0));
+        if age >= older_than {
+            fs::remove_dir_all(&child)?;
+            removed.push(child);
+        }
+    }
+    Ok(OrphanSweepResult { removed })
 }
 
 pub fn slug_operator(operator: &str) -> String {
