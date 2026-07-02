@@ -595,8 +595,10 @@ pub fn receive_source(
     options: &ReceiveOptions,
 ) -> ReceiveResult<ReceiveSourceResult> {
     let source_root = fs::canonicalize(source)?;
+    validate_source_root(&source_root)?;
     fs::create_dir_all(landing)?;
     let landing_root = fs::canonicalize(landing)?;
+    validate_landing_relationship(&source_root, &landing_root)?;
     let intake_dir = landing_root.join(&options.intake_id);
     fs::create_dir(&intake_dir)?;
     let receiving_path = intake_dir.join(".receiving.json");
@@ -616,15 +618,82 @@ pub fn receive_source(
             "started_at": options.created_at,
         }),
     )?;
+    finish_receive(
+        &source_root,
+        &landing_root,
+        &intake_dir,
+        &receiving_path,
+        options,
+        false,
+    )
+}
 
-    let (entries, rejected) = scan_source(&source_root)?;
+pub fn resume_receive_source(
+    landing: &Path,
+    intake_id: &str,
+    options: &ReceiveOptions,
+) -> ReceiveResult<ReceiveSourceResult> {
+    fs::create_dir_all(landing)?;
+    let landing_root = fs::canonicalize(landing)?;
+    let intake_dir = landing_root.join(intake_id);
+    if intake_dir.join("intake.json").exists() {
+        return Err(ReceiveError::new(format!(
+            "intake {intake_id:?} is already complete"
+        )));
+    }
+    let receiving_path = intake_dir.join(".receiving.json");
+    let receiving: Value = serde_json::from_str(&fs::read_to_string(&receiving_path)?)?;
+    let source_text = required_json_string(&receiving, "source")?;
+    let source_root = fs::canonicalize(PathBuf::from(source_text))?;
+    validate_source_root(&source_root)?;
+    validate_landing_relationship(&source_root, &landing_root)?;
+    let resume_options = ReceiveOptions {
+        intake_id: intake_id.to_string(),
+        created_at: options.created_at.clone(),
+        bagging_date: options.bagging_date.clone(),
+        source_kind: optional_json_string(&receiving, "source_kind")
+            .unwrap_or_else(|| options.source_kind.clone()),
+        operator: optional_json_string(&receiving, "operator")
+            .unwrap_or_else(|| options.operator.clone()),
+        source_ref: optional_json_string(&receiving, "source_ref")
+            .or_else(|| options.source_ref.clone()),
+        artifactclass: optional_json_string(&receiving, "artifactclass")
+            .unwrap_or_else(|| options.artifactclass.clone()),
+        label: optional_json_string(&receiving, "label").or_else(|| options.label.clone()),
+    };
+    finish_receive(
+        &source_root,
+        &landing_root,
+        &intake_dir,
+        &receiving_path,
+        &resume_options,
+        true,
+    )
+}
+
+fn finish_receive(
+    source_root: &Path,
+    _landing_root: &Path,
+    intake_dir: &Path,
+    receiving_path: &Path,
+    options: &ReceiveOptions,
+    resume: bool,
+) -> ReceiveResult<ReceiveSourceResult> {
+    let (entries, rejected) = scan_source(source_root)?;
     check_collisions(&entries)?;
     let data_root = intake_dir.join(DATA_DIR_NAME);
     fs::create_dir_all(&data_root)?;
+    if resume {
+        let desired_relpaths = entries
+            .iter()
+            .map(|entry| entry.relpath.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        prune_stale_payload_files(&data_root, &desired_relpaths)?;
+    }
 
     let mut receipts = Vec::new();
-    for entry in entries {
-        receipts.push(copy_or_package_entry(&entry, &data_root)?);
+    for entry in &entries {
+        receipts.push(copy_or_package_entry(entry, &data_root)?);
     }
     verify_destination_files(&receipts)?;
 
@@ -637,11 +706,17 @@ pub fn receive_source(
     if let Some(package_index) = package_index {
         write_json_file(&intake_dir.join("package-index.json"), &package_index)?;
         extra_tag_files.push("package-index.json".to_string());
+    } else {
+        match fs::remove_file(intake_dir.join("package-index.json")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
 
     let total_bytes = receipts.iter().map(|receipt| receipt.size_bytes).sum();
     let metadata = bag_info_metadata(options, receipts.len(), total_bytes, rejected.len());
-    write_bagit_files(&intake_dir, &manifest_entries, &metadata, &extra_tag_files)?;
+    write_bagit_files(intake_dir, &manifest_entries, &metadata, &extra_tag_files)?;
     write_json_file(
         &intake_dir.join("intake.json"),
         &json!({
@@ -659,7 +734,7 @@ pub fn receive_source(
 
     Ok(ReceiveSourceResult {
         intake_id: options.intake_id.clone(),
-        intake_dir: intake_dir.clone(),
+        intake_dir: intake_dir.to_path_buf(),
         manifest_path: intake_dir.join("manifest-sha256.txt"),
         bag_info_path: intake_dir.join("bag-info.txt"),
         tagmanifest_path: intake_dir.join("tagmanifest-sha256.txt"),
@@ -1355,6 +1430,7 @@ fn copy_file_entry(entry: &SourceEntry, data_root: &Path) -> ReceiveResult<FileR
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
+    reject_existing_unsupported_destination(&destination)?;
     let digest = copy_file_with_digest(&entry.source_path, &destination)?;
     let size_bytes = fs::metadata(&destination)?.len();
     Ok(FileReceipt {
@@ -1377,7 +1453,16 @@ fn package_entry(entry: &SourceEntry, data_root: &Path) -> ReceiveResult<FileRec
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    let package = build_package_tar(&entry.source_path, &destination, logical_relpath)?;
+    reject_existing_unsupported_destination(&destination)?;
+    let temp_path = temp_path_for(&destination)?;
+    let package = match build_package_tar(&entry.source_path, &temp_path, logical_relpath) {
+        Ok(package) => package,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    replace_file(&temp_path, &destination)?;
     Ok(FileReceipt {
         relpath: entry.relpath.clone(),
         destination_path: destination,
@@ -1387,6 +1472,28 @@ fn package_entry(entry: &SourceEntry, data_root: &Path) -> ReceiveResult<FileRec
         stored_relpath: Some(entry.relpath.clone()),
         package_members: package.members,
     })
+}
+
+fn reject_existing_unsupported_destination(destination: &Path) -> ReceiveResult<()> {
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ReceiveError::new(format!(
+            "payload destination is a symlink: {}",
+            destination.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(ReceiveError::new(format!(
+            "payload destination is unsupported {}: {}",
+            special_file_reason(&metadata),
+            destination.display()
+        )));
+    }
+    Ok(())
 }
 
 fn copy_file_with_digest(source: &Path, destination: &Path) -> ReceiveResult<String> {
@@ -1600,6 +1707,17 @@ fn validate_source_root(source: &Path) -> ReceiveResult<()> {
     Ok(())
 }
 
+fn validate_landing_relationship(source: &Path, landing: &Path) -> ReceiveResult<()> {
+    if landing.starts_with(source) {
+        return Err(ReceiveError::new(format!(
+            "landing root {} must not be inside source {}",
+            landing.display(),
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
 fn is_inside_existing_payload(path: &Path) -> bool {
     path.ancestors().any(|candidate| {
         let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
@@ -1612,6 +1730,73 @@ fn is_inside_existing_payload(path: &Path) -> bool {
             parent.join("intake.json").exists() || parent.join(".receiving.json").exists()
         })
     })
+}
+
+fn required_json_string(value: &Value, key: &str) -> ReceiveResult<String> {
+    optional_json_string(value, key)
+        .ok_or_else(|| ReceiveError::new(format!(".receiving.json missing {key}")))
+}
+
+fn optional_json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .filter(|item| !item.is_empty())
+}
+
+fn prune_stale_payload_files(
+    payload_root: &Path,
+    desired_relpaths: &std::collections::BTreeSet<String>,
+) -> ReceiveResult<()> {
+    if !payload_root.exists() {
+        return Ok(());
+    }
+    let mut paths = collect_payload_paths(payload_root)?;
+    paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in &paths {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.is_dir() {
+            continue;
+        }
+        let relpath = canonicalize_filesystem_path(path, payload_root)?;
+        if desired_relpaths.contains(&relpath) {
+            continue;
+        }
+        fs::remove_file(path)?;
+    }
+    for path in paths {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let _ = fs::remove_dir(&path);
+    }
+    fsync_dir_best_effort(payload_root);
+    Ok(())
+}
+
+fn collect_payload_paths(root: &Path) -> ReceiveResult<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if !root.exists() {
+        return Ok(paths);
+    }
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        paths.push(path.clone());
+        if fs::symlink_metadata(&path)?.is_dir() {
+            paths.extend(collect_payload_paths(&path)?);
+        }
+    }
+    Ok(paths)
 }
 
 fn metadata_mtime_ns(metadata: &fs::Metadata) -> ReceiveResult<u64> {

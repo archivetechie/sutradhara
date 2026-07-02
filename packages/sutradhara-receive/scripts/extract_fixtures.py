@@ -377,6 +377,7 @@ def cli_matrix_fixtures(work_root: Path) -> dict[str, Any]:
         _cli_case(work_root, "explicit-run-json", "run"),
         _cli_case(work_root, "confirm-timeout-exit-3", "timeout"),
         _cli_case(work_root, "source-and-fake-source-usage", "usage"),
+        _cli_case(work_root, "resume-json", "resume"),
         _cli_case(work_root, "sweep-json", "sweep"),
         _cli_case(work_root, "sweep-orphans-json", "sweep-orphans"),
     ]
@@ -440,7 +441,7 @@ def _cli_case(work_root: Path, name: str, kind: str) -> dict[str, Any]:
     case_root = work_root / name
     source = case_root / "source"
     landing = case_root / "landing"
-    if kind in {"receive", "run", "timeout", "usage"}:
+    if kind in {"receive", "run", "timeout", "usage", "resume"}:
         source.mkdir(parents=True, exist_ok=True)
         (source / "clip.mov").write_bytes(b"video")
 
@@ -496,6 +497,43 @@ def _cli_case(work_root: Path, name: str, kind: str) -> dict[str, Any]:
             "card",
             "--operator",
             "Op",
+        ]
+    elif kind == "resume":
+        intake_id = "resume-fixture"
+        intake_dir = landing / intake_id
+        intake_dir.mkdir(parents=True, exist_ok=True)
+        (intake_dir / ".receiving.json").write_text(
+            json.dumps(
+                {
+                    "artifactclass": "camera-original",
+                    "canonicalization_version": CANONICALIZATION_VERSION,
+                    "intake_id": intake_id,
+                    "label": "resume",
+                    "landing": str(landing),
+                    "operator": "Original Op",
+                    "receive_version": RECEIVE_VERSION,
+                    "source": str(source),
+                    "source_kind": "card",
+                    "source_ref": "SRC",
+                    "started_at": FIXED_NOW.isoformat(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        argv = [
+            "run",
+            "--resume",
+            intake_id,
+            "--landing",
+            str(landing),
+            "--source-kind",
+            "card",
+            "--operator",
+            "ignored",
+            "--json",
         ]
     elif kind in {"sweep", "sweep-orphans"}:
         _write_sweep_fixture(landing)

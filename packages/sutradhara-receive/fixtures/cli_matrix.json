@@ -116,6 +116,36 @@
     },
     {
       "argv": [
+        "run",
+        "--resume",
+        "<INTAKE-ID>",
+        "--landing",
+        "<LANDING>",
+        "--source-kind",
+        "card",
+        "--operator",
+        "ignored",
+        "--json"
+      ],
+      "exit_code": 0,
+      "name": "resume-json",
+      "stderr": "",
+      "stdout": "{\n  \"bag_info_path\": \"<LANDING>/<INTAKE-ID>/bag-info.txt\",\n  \"bag_profile\": \"bagit-1.0\",\n  \"file_count\": 1,\n  \"intake_dir\": \"<LANDING>/<INTAKE-ID>\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"manifest_path\": \"<LANDING>/<INTAKE-ID>/manifest-sha256.txt\",\n  \"sentinel_path\": \"<LANDING>/<INTAKE-ID>/intake.json\",\n  \"skipped_count\": 0,\n  \"tagmanifest_path\": \"<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt\",\n  \"total_bytes\": 5\n}\n",
+      "stdout_json": {
+        "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
+        "bag_profile": "bagit-1.0",
+        "file_count": 1,
+        "intake_dir": "<LANDING>/<INTAKE-ID>",
+        "intake_id": "<INTAKE-ID>",
+        "manifest_path": "<LANDING>/<INTAKE-ID>/manifest-sha256.txt",
+        "sentinel_path": "<LANDING>/<INTAKE-ID>/intake.json",
+        "skipped_count": 0,
+        "tagmanifest_path": "<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt",
+        "total_bytes": 5
+      }
+    },
+    {
+      "argv": [
         "sweep",
         "--landing",
         "<LANDING>",

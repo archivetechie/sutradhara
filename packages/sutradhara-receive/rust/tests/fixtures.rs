@@ -16,8 +16,8 @@ use sutradhara_receive::{
     bagit_manifest_text, build_package_tar, canonicalize_manifest_path,
     canonicalize_raw_path_components, escape_member_name, hash_payload_tree,
     hash_payload_tree_with_policy, manifest_mismatch, plan_payload_units, read_manifest_sha256,
-    receive_source, sha256_file, sweep_orphans, tagmanifest_text, unescape_member_name,
-    validate_bag, write_bagit_files_with_observer,
+    receive_source, resume_receive_source, sha256_file, sweep_orphans, tagmanifest_text,
+    unescape_member_name, validate_bag, write_bagit_files_with_observer,
 };
 
 #[test]
@@ -265,6 +265,58 @@ fn receive_bag_fixtures_match_python_contract() {
     }
 }
 
+#[test]
+fn native_resume_reuses_receiving_metadata_and_prunes_stale_payloads() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let landing = temp.path().join("landing");
+    let intake_id = "resume-case";
+    let intake_dir = landing.join(intake_id);
+    let data = intake_dir.join("data");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    fs::write(source.join("keep.mov"), b"keep").unwrap();
+    fs::write(data.join("keep.mov"), b"bad").unwrap();
+    fs::write(data.join("drop.mov"), b"drop").unwrap();
+    fs::write(intake_dir.join("package-index.json"), "{}").unwrap();
+    fs::write(
+        intake_dir.join(".receiving.json"),
+        serde_json::to_string_pretty(&json!({
+            "artifactclass": "camera-original",
+            "canonicalization_version": CANONICALIZATION_VERSION,
+            "intake_id": intake_id,
+            "label": "from-receiving",
+            "landing": landing,
+            "operator": "Original Op",
+            "receive_version": RECEIVE_VERSION,
+            "source": source,
+            "source_kind": "drive",
+            "source_ref": "SRC",
+            "started_at": "2026-06-18T12:00:00+00:00",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let result = resume_receive_source(&landing, intake_id, &receive_options("resume")).unwrap();
+
+    assert_eq!(result.intake_id, intake_id);
+    assert_eq!(fs::read(data.join("keep.mov")).unwrap(), b"keep");
+    assert!(!data.join("drop.mov").exists());
+    assert!(!intake_dir.join("package-index.json").exists());
+    assert!(!intake_dir.join(".receiving.json").exists());
+    assert!(intake_dir.join("intake.json").exists());
+    assert_eq!(
+        read_manifest_sha256(&result.manifest_path).unwrap(),
+        BTreeMap::from([(
+            "keep.mov".to_string(),
+            "6ca7ea2feefc88ecb5ed6356ed963f47dc9137f82526fdd25d618ea626d0803f".to_string(),
+        )])
+    );
+    let validation = validate_bag(&intake_dir);
+    assert!(validation.valid(), "{:#?}", validation.details());
+}
+
 #[cfg(unix)]
 #[test]
 fn native_payload_planner_matches_receive_scan_contract() {
@@ -317,6 +369,60 @@ fn native_payload_planner_matches_receive_scan_contract() {
 
 #[cfg(unix)]
 #[test]
+fn cli_resume_uses_existing_receiving_intake() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let landing = temp.path().join("landing");
+    let intake_id = "resume-cli";
+    let intake_dir = landing.join(intake_id);
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(intake_dir.join("data")).unwrap();
+    fs::write(source.join("clip.mov"), b"video").unwrap();
+    fs::write(
+        intake_dir.join(".receiving.json"),
+        serde_json::to_string_pretty(&json!({
+            "artifactclass": "camera-original",
+            "canonicalization_version": CANONICALIZATION_VERSION,
+            "intake_id": intake_id,
+            "label": null,
+            "landing": landing,
+            "operator": "Original Op",
+            "receive_version": RECEIVE_VERSION,
+            "source": source,
+            "source_kind": "card",
+            "source_ref": null,
+            "started_at": "2026-06-18T12:00:00+00:00",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sutra-receive"))
+        .args([
+            "run",
+            "--resume",
+            intake_id,
+            "--landing",
+            landing.to_str().unwrap(),
+            "--source-kind",
+            "card",
+            "--operator",
+            "ignored",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let payload: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["intake_id"], intake_id);
+    assert_eq!(payload["file_count"], 1);
+    assert!(validate_bag(&intake_dir).valid());
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_matrix_fixtures_match_rust_binary() {
     let fixture = read_fixture("cli_matrix.json");
     for case in fixture["cases"].as_array().unwrap() {
@@ -331,9 +437,13 @@ fn cli_matrix_fixtures_match_rust_binary() {
                 | "explicit-run-json"
                 | "confirm-timeout-exit-3"
                 | "source-and-fake-source-usage"
+                | "resume-json"
         ) {
             fs::create_dir_all(&source).unwrap();
             fs::write(source.join("clip.mov"), b"video").unwrap();
+        }
+        if name == "resume-json" {
+            write_resume_fixture(&source, &landing);
         }
         if matches!(name, "sweep-json" | "sweep-orphans-json") {
             write_sweep_fixture(&landing);
@@ -579,6 +689,7 @@ fn argv_from_fixture(case: &Value, root: &Path, source: &Path, landing: &Path) -
                 .replace("<FIXTURE-ROOT>", root.to_str().unwrap())
                 .replace("<SOURCE>", source.to_str().unwrap())
                 .replace("<LANDING>", landing.to_str().unwrap())
+                .replace("<INTAKE-ID>", "resume-fixture")
         })
         .collect()
 }
@@ -620,6 +731,31 @@ fn write_sweep_fixture(landing: &Path) {
     fs::write(landing.join("complete").join("intake.json"), "{}").unwrap();
     let old = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(48 * 3600));
     set_file_mtime(landing.join("stale").join(".receiving.json"), old).unwrap();
+}
+
+#[cfg(unix)]
+fn write_resume_fixture(source: &Path, landing: &Path) {
+    let intake_id = "resume-fixture";
+    let intake_dir = landing.join(intake_id);
+    fs::create_dir_all(&intake_dir).unwrap();
+    fs::write(
+        intake_dir.join(".receiving.json"),
+        serde_json::to_string_pretty(&json!({
+            "artifactclass": "camera-original",
+            "canonicalization_version": CANONICALIZATION_VERSION,
+            "intake_id": intake_id,
+            "label": "resume",
+            "landing": landing,
+            "operator": "Original Op",
+            "receive_version": RECEIVE_VERSION,
+            "source": source,
+            "source_kind": "card",
+            "source_ref": "SRC",
+            "started_at": "2026-06-18T12:34:56+00:00",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[cfg(unix)]

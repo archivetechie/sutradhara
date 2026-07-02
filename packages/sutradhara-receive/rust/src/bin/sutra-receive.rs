@@ -13,7 +13,8 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use sutradhara_receive::{
-    BAG_PROFILE, ReceiveOptions, ReceiveSourceResult, slug_operator, sweep_orphans,
+    BAG_PROFILE, ReceiveOptions, ReceiveSourceResult, resume_receive_source, slug_operator,
+    sweep_orphans,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -69,6 +70,7 @@ fn run_receive(args: &[String]) -> Result<u8, String> {
     let mut artifactclass = "default".to_string();
     let mut label: Option<String> = None;
     let mut fake_source: Option<PathBuf> = None;
+    let mut resume: Option<String> = None;
     let mut confirm_timeout: Option<f64> = None;
     let mut confirm_interval = 1.0_f64;
     let mut as_json = false;
@@ -100,6 +102,9 @@ fn run_receive(args: &[String]) -> Result<u8, String> {
                     &mut index,
                     "--fake-source",
                 )?));
+            }
+            "--resume" => {
+                resume = Some(require_value(args, &mut index, "--resume")?);
             }
             "--confirm-timeout" => {
                 confirm_timeout = Some(
@@ -133,7 +138,7 @@ fn run_receive(args: &[String]) -> Result<u8, String> {
         return usage_error("pass either SOURCE or --fake-source, not both");
     }
     let selected_source = fake_source.or(source);
-    let Some(selected_source) = selected_source else {
+    if selected_source.is_none() && resume.is_none() {
         return usage_error("SOURCE is required unless --resume is used");
     };
     let Some(landing) = landing else {
@@ -155,8 +160,13 @@ fn run_receive(args: &[String]) -> Result<u8, String> {
         artifactclass,
         label,
     };
-    let result = sutradhara_receive::receive_source(&selected_source, &landing, &options)
-        .map_err(|error| error.to_string())?;
+    let result = if let Some(resume) = resume {
+        resume_receive_source(&landing, &resume, &options).map_err(|error| error.to_string())?
+    } else {
+        let selected_source = selected_source.expect("source checked above");
+        sutradhara_receive::receive_source(&selected_source, &landing, &options)
+            .map_err(|error| error.to_string())?
+    };
     let confirmation = confirm_timeout.map(|timeout| {
         wait_for_confirmation(
             &result.intake_dir,
