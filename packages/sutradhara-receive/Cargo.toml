@@ -1,0 +1,22 @@
+[package]
+name = "sutradhara-receive"
+version = "0.0.1"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Dependency-light receive filesystem contract for Sutradhara."
+
+[lib]
+name = "sutradhara_receive"
+path = "rust/src/lib.rs"
+
+[[test]]
+name = "fixtures"
+path = "rust/tests/fixtures.rs"
+
+[dependencies]
+sha2 = "0.10"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

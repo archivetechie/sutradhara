@@ -1,0 +1,199 @@
+//! Fixture tests for the Rust receive-core M2 implementation.
+//!
+//! These tests read the Python-derived corpus committed in M1. The Rust crate is
+//! therefore checked against the same public contract that will gate the later
+//! write-side, binary, and PyO3 wheel migration stages.
+
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use sutradhara_receive::{
+    BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, PACKAGE_GLOBS, PACKAGE_PROFILE_HASH,
+    PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE, RECEIVE_VERSION, bag_info_text, bagit_manifest_text,
+    canonicalize_manifest_path, canonicalize_raw_path_components, escape_member_name,
+    tagmanifest_text, unescape_member_name,
+};
+
+#[test]
+fn string_fixtures_match_python_contract() {
+    let fixture = read_fixture("strings.json");
+
+    for case in fixture["escape_member_name"].as_array().unwrap() {
+        let raw = parse_hex(case["raw_hex"].as_str().unwrap());
+        let escaped = case["escaped"].as_str().unwrap();
+        assert_eq!(escape_member_name(&raw), escaped, "{case:#?}");
+        assert_eq!(
+            hex_lower(&unescape_member_name(escaped).unwrap()),
+            case["roundtrip_hex"].as_str().unwrap(),
+            "{case:#?}"
+        );
+    }
+
+    for case in fixture["canonicalize_filesystem_path"].as_array().unwrap() {
+        let components: Vec<Vec<u8>> = case["components_hex"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| parse_hex(item.as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            canonicalize_raw_path_components(&components).unwrap(),
+            case["canonical"].as_str().unwrap(),
+            "{case:#?}"
+        );
+    }
+
+    for case in fixture["canonicalize_manifest_path"].as_array().unwrap() {
+        assert_eq!(
+            canonicalize_manifest_path(case["raw"].as_str().unwrap()).unwrap(),
+            case["canonical"].as_str().unwrap(),
+            "{case:#?}"
+        );
+    }
+
+    for case in fixture["canonicalize_manifest_rejections"]
+        .as_array()
+        .unwrap()
+    {
+        let error = canonicalize_manifest_path(case["raw"].as_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, case["error"].as_str().unwrap(), "{case:#?}");
+    }
+}
+
+#[test]
+fn writer_text_fixtures_match_python_contract() {
+    let fixture = read_fixture("writer_outputs.json");
+    let constants = &fixture["constants"];
+    assert_eq!(
+        RECEIVE_VERSION,
+        constants["RECEIVE_VERSION"].as_str().unwrap()
+    );
+    assert_eq!(
+        CANONICALIZATION_VERSION,
+        constants["CANONICALIZATION_VERSION"].as_str().unwrap()
+    );
+    assert_eq!(
+        PACKAGE_PROFILE_VERSION,
+        constants["PACKAGE_PROFILE_VERSION"].as_str().unwrap()
+    );
+    assert_eq!(
+        PACKAGE_PROFILE_HASH,
+        constants["PACKAGE_PROFILE_HASH"].as_str().unwrap()
+    );
+    assert_eq!(BAG_PROFILE, constants["BAG_PROFILE"].as_str().unwrap());
+    assert_eq!(
+        RECEIVE_PACKAGE,
+        constants["RECEIVE_PACKAGE"].as_str().unwrap()
+    );
+    assert_eq!(
+        PACKAGE_GLOBS,
+        constants["PACKAGE_GLOBS"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+
+    let writer = &fixture["bagit_writer"];
+    assert_eq!(BAGIT_TEXT, writer["bagit.txt"].as_str().unwrap());
+
+    let mut manifest_entries = BTreeMap::new();
+    manifest_entries.insert(
+        "clip%.mov".to_string(),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+    );
+    assert_eq!(
+        bagit_manifest_text(&manifest_entries).unwrap(),
+        writer["manifest-sha256.txt"].as_str().unwrap()
+    );
+
+    assert_eq!(
+        bag_info_text(&bag_info_metadata()),
+        writer["bag-info.txt"].as_str().unwrap()
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["bagit.txt", "bag-info.txt", "manifest-sha256.txt"] {
+        fs::write(temp.path().join(name), writer[name].as_str().unwrap()).unwrap();
+    }
+    let tag_files = vec![
+        "bagit.txt".to_string(),
+        "bag-info.txt".to_string(),
+        "manifest-sha256.txt".to_string(),
+    ];
+    assert_eq!(
+        tagmanifest_text(temp.path(), &tag_files).unwrap(),
+        writer["tagmanifest-sha256.txt"].as_str().unwrap()
+    );
+}
+
+fn read_fixture(name: &str) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name);
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn bag_info_metadata() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("Bagging-Date".to_string(), "2026-06-18".to_string()),
+        ("Payload-Oxum".to_string(), "5.1".to_string()),
+        (
+            "Bag-Software-Agent".to_string(),
+            "sutradhara-receive/receive-v2".to_string(),
+        ),
+        (
+            "Receive-Package".to_string(),
+            "sutradhara-receive/0.0.1".to_string(),
+        ),
+        ("Intake-Id".to_string(), "bag-001".to_string()),
+        ("Operator".to_string(), "op".to_string()),
+        ("Source-Kind".to_string(), "card".to_string()),
+        ("Source-Ref".to_string(), "A001".to_string()),
+        ("Artifactclass".to_string(), "camera-original".to_string()),
+        ("Label".to_string(), "shoot".to_string()),
+        (
+            "Canonicalization-Version".to_string(),
+            "receive-bagit-path-v2".to_string(),
+        ),
+        (
+            "Package-Profile-Version".to_string(),
+            "package-tar-v1".to_string(),
+        ),
+        (
+            "Package-Profile-Hash".to_string(),
+            "fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c".to_string(),
+        ),
+        ("Skipped-Count".to_string(), "0".to_string()),
+    ])
+}
+
+fn parse_hex(value: &str) -> Vec<u8> {
+    assert_eq!(value.len() % 2, 0);
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+        .collect()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(hex_digit(byte >> 4));
+        output.push(hex_digit(byte & 0x0f));
+    }
+    output
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'a' + value - 10) as char,
+        _ => unreachable!(),
+    }
+}
