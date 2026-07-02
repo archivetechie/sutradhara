@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import Engine
 
+from sutradhara.api.routes_activity import router as activity_router
 from sutradhara.api.routes_devices import install_default_state as install_device_state
 from sutradhara.api.routes_devices import router as devices_router
 from sutradhara.api.routes_receive import install_default_state
@@ -75,6 +76,7 @@ def create_app(
     app.include_router(session_router)
     app.include_router(receive_router)
     app.include_router(devices_router)
+    app.include_router(activity_router)
     return app
 
 
