@@ -61,8 +61,21 @@ def create_app(
         return await call_next(request)  # type: ignore[misc]
 
     @app.exception_handler(HTTPException)
-    async def _http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+    async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
         detail = exc.detail
+        if (
+            (
+                request.url.path.startswith("/api/ui/restore")
+                or request.url.path == "/api/ui/reconciliation"
+            )
+            and isinstance(detail, dict)
+            and {"error", "detail"} <= set(detail)
+        ):
+            return JSONResponse(
+                {"detail": detail},
+                status_code=exc.status_code,
+                headers=exc.headers,
+            )
         if isinstance(detail, dict) and {"error", "detail"} <= set(detail):
             return JSONResponse(detail, status_code=exc.status_code, headers=exc.headers)
         return _error_response(exc.status_code, "http_error", str(detail), headers=exc.headers)

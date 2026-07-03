@@ -97,17 +97,32 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
     detail = client.get(f"/api/ui/restore-requests/{request_id}", headers=auth_headers("viewer"))
     assert detail.status_code == 200
     body = detail.json()
-    assert set(body) == {"id", "identity", "created_at", "destination_id", "state", "items"}
+    assert set(body) == {
+        "id",
+        "identity",
+        "created_at",
+        "destination_id",
+        "state",
+        "bytes_total",
+        "bytes_restored",
+        "items",
+    }
     assert body["id"] == request_id
     assert body["identity"] == "owner"
     assert body["destination_id"] == "media-server"
     assert body["state"] == "pending"
+    assert body["bytes_total"] == 2
+    assert body["bytes_restored"] == 0
     assert body["items"] == [
         {
             "content_sha256": allowed,
             "artifactclass": "s-masters",
             "state": "queued",
             "detail": None,
+            "denial_kind": None,
+            "size_bytes": 1,
+            "bytes_restored": 0,
+            "source": None,
             "updated_at": body["items"][0]["updated_at"],
         },
         {
@@ -115,6 +130,10 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
             "artifactclass": "private",
             "state": "denied",
             "detail": "requires sutradhara-restore-p3",
+            "denial_kind": "capability",
+            "size_bytes": 1,
+            "bytes_restored": 0,
+            "source": None,
             "updated_at": body["items"][1]["updated_at"],
         },
     ]
@@ -162,9 +181,58 @@ def test_restore_post_unknown_destination_and_malformed_payload(
     )
 
     assert unknown.status_code == 404
-    assert unknown.json()["error"] == "unknown_destination"
+    assert unknown.json()["detail"]["error"] == "unknown_destination"
     assert malformed.status_code == 400
-    assert malformed.json()["error"] == "bad_request"
+    assert malformed.json()["detail"]["error"] == "bad_request"
+
+
+def test_restore_post_idempotency_replays_same_request_and_rejects_different_body(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    digest = hashlib.sha256(b"allowed").hexdigest()
+    other = hashlib.sha256(b"other").hexdigest()
+    _seed_asset(api_engine, bytes.fromhex(digest), privacy="none")
+    _seed_asset(api_engine, bytes.fromhex(other), privacy="none")
+    app = make_api_app(api_engine)
+    app.state.restore_config = RestoreConfig(
+        destinations={
+            "media-server": RestoreDestination(
+                id="media-server",
+                root=root,
+                label="Media server restore",
+                writable=True,
+            )
+        }
+    )
+    client = TestClient(app)
+    payload = {
+        "idempotency_key": "restore-key-1",
+        "destination_id": "media-server",
+        "items": [{"content_sha256": digest, "artifactclass": "s-masters"}],
+    }
+
+    first = client.post("/api/ui/restores", headers=post_headers("viewer"), json=payload)
+    replay = client.post("/api/ui/restores", headers=post_headers("viewer"), json=payload)
+    conflict = client.post(
+        "/api/ui/restores",
+        headers=post_headers("viewer"),
+        json={
+            **payload,
+            "items": [{"content_sha256": other, "artifactclass": "s-masters"}],
+        },
+    )
+
+    assert first.status_code == 201
+    assert replay.status_code == 200
+    assert replay.json()["request_id"] == first.json()["request_id"]
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["error"] == "restore_request_invalid"
+    with api_engine.connect() as conn:
+        assert len(conn.execute(select(Job.id)).all()) == 1
+        assert len(conn.execute(select(RestoreRequest.id)).all()) == 1
 
 
 def test_restore_post_manager_error_returns_sanitized_4xx(
@@ -205,9 +273,9 @@ def test_restore_post_manager_error_returns_sanitized_4xx(
     )
 
     assert response.status_code == 400
-    assert response.json()["error"] == "invalid_restore_destination"
-    assert response.json()["detail"] == "restore destination is invalid"
-    assert "/var/lib/replica" not in response.json()["detail"]
+    assert response.json()["detail"]["error"] == "invalid_restore_destination"
+    assert response.json()["detail"]["detail"] == "restore destination is invalid"
+    assert "/var/lib/replica" not in response.json()["detail"]["detail"]
 
 
 def test_restore_get_sanitizes_persisted_item_detail(api_engine: Engine) -> None:
@@ -343,6 +411,11 @@ def test_restore_post_unmapped_privacy_projects_alarm_via_app_config(
     response = client.get("/api/ui/reconciliation", headers=auth_headers("viewer"))
 
     assert created.status_code == 201
+    detail = client.get(
+        f"/api/ui/restore-requests/{created.json()['request_id']}",
+        headers=auth_headers("viewer"),
+    )
+    assert detail.json()["items"][0]["denial_kind"] == "privacy_unmapped"
     assert response.status_code == 200
     conditions = {row["target_key"]: row for row in response.json()["conditions"]}
     assert conditions["unmapped-privacy-level"]["reason"] == "unmapped-privacy-level"

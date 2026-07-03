@@ -21,6 +21,7 @@ from sqlalchemy import (
     LargeBinary,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -40,7 +41,12 @@ class CacheDisk(Base):
             "state IN ('active', 'absent', 'retiring', 'dead')",
             name="ck_cache_disk_state",
         ),
+        CheckConstraint(
+            "capacity_state IN ('ok', 'over_reserve')",
+            name="ck_cache_disk_capacity_state",
+        ),
         Index("ix_cache_disk_state", "state"),
+        Index("ix_cache_disk_capacity_state", "capacity_state"),
     )
 
     disk_id: Mapped[str] = mapped_column(String(16), primary_key=True)
@@ -53,6 +59,7 @@ class CacheDisk(Base):
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     capacity_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     filled_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    capacity_state: Mapped[str] = mapped_column(String(32), nullable=False, default="ok")
     smart_status: Mapped[str | None] = mapped_column(String(256), nullable=True)
     enrolled_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
@@ -128,6 +135,7 @@ class RestoreRequest(Base):
         ),
         Index("ix_restore_request_created_at", "created_at"),
         Index("ix_restore_request_state", "state"),
+        UniqueConstraint("idempotency_key", name="uq_restore_request_idempotency_key"),
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -140,6 +148,8 @@ class RestoreRequest(Base):
     admitted_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
     admitted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     admitted_capabilities: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    idempotency_body_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     items: Mapped[list[RestoreRequestItem]] = relationship(
         back_populates="request",
@@ -160,6 +170,16 @@ class RestoreRequestItem(Base):
             ")",
             name="ck_restore_request_item_state",
         ),
+        CheckConstraint(
+            "denial_kind IS NULL OR denial_kind IN ("
+            "'capability', 'privacy_unmapped', 'suspect', 'rejected'"
+            ")",
+            name="ck_restore_request_item_denial_kind",
+        ),
+        CheckConstraint(
+            "source IS NULL OR source IN ('cache', 'tape')",
+            name="ck_restore_request_item_source",
+        ),
         Index("ix_restore_request_item_request_id", "request_id"),
         Index("ix_restore_request_item_content_sha256", "content_sha256"),
         Index("ix_restore_request_item_state", "state"),
@@ -179,6 +199,10 @@ class RestoreRequestItem(Base):
     artifactclass: Mapped[str] = mapped_column(String(128), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    denial_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    bytes_restored: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)
     admitted_force_suspect: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     admitted_force_rejected: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(

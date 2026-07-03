@@ -68,7 +68,7 @@ from sutradhara.hdcache.store import (
     verify_disk_identity_with_deadline,
 )
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
-from sutradhara.restore import atomic_write_verified_file, sha256_file
+from sutradhara.restore import atomic_write_verified_file, restore_progress_context, sha256_file
 from sutradhara.sealing.port import Opener, Representation
 from sutradhara.sealing.rao import RaoCliOpener
 
@@ -100,6 +100,7 @@ RestoreBackendResolver = Callable[[Session, str], dict[int, StorageBackend]]
 EventSink = Callable[["RestoreEvent"], None]
 SourceKind = Literal["cache", "tape"]
 SessionFactory = sessionmaker[Session] | Callable[[], Session]
+DenialKind = Literal["capability", "privacy_unmapped", "suspect", "rejected"]
 
 
 class RestoreManagerError(Exception):
@@ -111,6 +112,9 @@ class RestoreDenied(RestoreManagerError):
 
     def __init__(self, required_capability: str | None, detail: str | None = None) -> None:
         self.required_capability = required_capability
+        self.denial_kind: DenialKind = (
+            "privacy_unmapped" if required_capability is None else "capability"
+        )
         self.detail = detail or f"requires {_capability_label(required_capability or '')}"
         super().__init__(self.detail)
 
@@ -463,6 +467,8 @@ def admit_restore_request(
     items: Iterable[RestoreItemSpec],
     force_suspect: bool = False,
     force_rejected: bool = False,
+    idempotency_key: str | None = None,
+    idempotency_body_hash: str | None = None,
     config: RestoreConfig | None = None,
 ) -> RestoreRequest:
     """Persist an API-style restore request, denying inadmissible items individually."""
@@ -478,6 +484,8 @@ def admit_restore_request(
         admitted_by=identity.operator_username,
         admitted_at=admitted_at,
         admitted_capabilities=list(identity.capabilities),
+        idempotency_key=idempotency_key,
+        idempotency_body_hash=idempotency_body_hash,
     )
     session.add(request)
     session.flush([request])
@@ -488,6 +496,10 @@ def admit_restore_request(
             artifactclass=spec.artifactclass,
             state=ITEM_QUEUED,
             detail=None,
+            denial_kind=None,
+            size_bytes=_asset_size_bytes(session, spec.content_sha256),
+            bytes_restored=0,
+            source=None,
             admitted_force_suspect=None,
             admitted_force_rejected=None,
         )
@@ -516,11 +528,13 @@ def admit_restore_request(
             item.admitted_force_suspect = admitted_force_suspect
             item.admitted_force_rejected = admitted_force_rejected
         except RestoreDenied as exc:
-            item.state = ITEM_DENIED
-            item.detail = exc.detail
+            _set_item_denied(item, exc.denial_kind, exc.detail)
         except (RestoreSuspectAsset, RestoreRejectedAsset) as exc:
-            item.state = ITEM_DENIED
-            item.detail = _validity_denial_detail(session, spec.content_sha256, exc)
+            _set_item_denied(
+                item,
+                _validity_denial_kind(exc),
+                _validity_denial_detail(session, spec.content_sha256, exc),
+            )
         session.add(item)
     session.flush()
     _update_request_state(request)
@@ -693,6 +707,7 @@ def serve_restore_item(
     try:
         admission = validate_restore_item_admission(session, item, config=final_config)
         destination = destination_for_request_item(final_config, item.request.destination_id, item)
+        _ensure_item_size_bytes(session, item)
         entry = _select_cache_entry(session, item.content_sha256, config=final_config)
         plan = ResolvedReadSource(
             asset_hash=item.content_sha256,
@@ -705,12 +720,12 @@ def serve_restore_item(
         _set_item_state(item, ITEM_FAILED, _sanitize_detail(str(exc)))
         raise
     except RestoreDenied as exc:
-        _set_item_state(item, ITEM_DENIED, exc.detail)
+        _set_item_denied(item, exc.denial_kind, exc.detail)
         return ServeResult(item.id, "tape", destination or Path(item.content_sha256.hex()), 0)
     except (RestoreSuspectAsset, RestoreRejectedAsset) as exc:
-        _set_item_state(
+        _set_item_denied(
             item,
-            ITEM_DENIED,
+            _validity_denial_kind(exc),
             _validity_denial_detail(session, item.content_sha256, exc),
         )
         return ServeResult(item.id, "tape", destination or Path(item.content_sha256.hex()), 0)
@@ -721,19 +736,21 @@ def serve_restore_item(
     fell_back_to_tape = False
     if plan.source == "cache" and plan.cache_entry is not None:
         try:
-            _set_item_state(item, ITEM_STREAMING, None)
+            _set_item_streaming(item, "cache")
             _update_request_state(item.request)
             session.flush([item.request, item])
             if _runtime is not None and _runtime.commit_state_transitions:
                 session.commit()
-            result = _serve_from_cache_controlled(
-                session,
-                plan.cache_entry,
-                plan.destination,
-                final_config,
-                _runtime,
-            )
+            with restore_progress_context(_progress_callback(session, item)):
+                result = _serve_from_cache_controlled(
+                    session,
+                    plan.cache_entry,
+                    plan.destination,
+                    final_config,
+                    _runtime,
+                )
             _set_item_state(item, ITEM_DONE, None)
+            _finish_item_progress(item, result.size_bytes, source="cache")
             return ServeResult(item.id, "cache", plan.destination, result.size_bytes)
         except CacheServeFailed as exc:
             _emit(
@@ -773,6 +790,8 @@ def serve_restore_item(
                     breaker_already_open=breaker_open,
                 )
             _set_item_state(item, ITEM_FELL_BACK_TO_TAPE, "tape mount pending")
+            item.source = "tape"
+            item.bytes_restored = 0
             _update_request_state(item.request)
             session.flush([item.request, item])
             if _runtime is not None and _runtime.commit_state_transitions:
@@ -781,24 +800,32 @@ def serve_restore_item(
 
     try:
         if not fell_back_to_tape:
-            _set_item_state(item, ITEM_STREAMING, None)
+            _set_item_streaming(item, "tape")
             _update_request_state(item.request)
             session.flush([item.request, item])
             if _runtime is not None and _runtime.commit_state_transitions:
                 session.commit()
-        tape_result = _serve_from_tape(
-            session,
-            item.content_sha256,
-            item.artifactclass,
-            plan.destination,
-            final_config,
-            force_suspect=admission.force_suspect,
-            force_rejected=admission.force_rejected,
-        )
+        else:
+            item.source = "tape"
+            item.bytes_restored = 0
+            item.updated_at = _utcnow()
+            session.flush([item])
+            if _runtime is not None and _runtime.commit_state_transitions:
+                session.commit()
+        with restore_progress_context(_progress_callback(session, item)):
+            tape_result = _serve_from_tape(
+                session,
+                item.content_sha256,
+                item.artifactclass,
+                plan.destination,
+                final_config,
+                force_suspect=admission.force_suspect,
+                force_rejected=admission.force_rejected,
+            )
     except (RestoreSuspectAsset, RestoreRejectedAsset) as exc:
-        _set_item_state(
+        _set_item_denied(
             item,
-            ITEM_DENIED,
+            _validity_denial_kind(exc),
             _validity_denial_detail(session, item.content_sha256, exc),
         )
         return ServeResult(item.id, "tape", plan.destination, 0)
@@ -809,6 +836,7 @@ def serve_restore_item(
         _set_item_state(item, ITEM_FAILED, _sanitize_detail(str(exc)))
         return ServeResult(item.id, "tape", plan.destination, 0)
     _set_item_state(item, ITEM_DONE, None)
+    _finish_item_progress(item, tape_result.size_bytes, source="tape")
     return ServeResult(item.id, "tape", tape_result.output_path, tape_result.size_bytes)
 
 
@@ -1381,6 +1409,22 @@ def _validity_denial_detail(
     return _sanitize_detail(detail)
 
 
+def _validity_denial_kind(exc: RestoreSuspectAsset | RestoreRejectedAsset) -> DenialKind:
+    if isinstance(exc, RestoreSuspectAsset):
+        return "suspect"
+    return "rejected"
+
+
+def _asset_size_bytes(session: Session, asset_hash: bytes) -> int | None:
+    asset = session.get(LogicalAsset, asset_hash)
+    return None if asset is None else asset.size_bytes
+
+
+def _ensure_item_size_bytes(session: Session, item: RestoreRequestItem) -> None:
+    if item.size_bytes is None:
+        item.size_bytes = _asset_size_bytes(session, item.content_sha256)
+
+
 def _check_privacy_gate(
     session: Session,
     asset_hash: bytes,
@@ -1776,9 +1820,58 @@ def _update_request_state(request: RestoreRequest) -> None:
 def _set_item_state(item: RestoreRequestItem, state: str, detail: str | None) -> None:
     item.state = state
     item.detail = detail
+    if state != ITEM_DENIED:
+        item.denial_kind = None
     item.updated_at = _utcnow()
     if item.request is not None:
         _update_request_state(item.request)
+
+
+def _set_item_denied(
+    item: RestoreRequestItem,
+    denial_kind: DenialKind,
+    detail: str | None,
+) -> None:
+    item.state = ITEM_DENIED
+    item.detail = detail
+    item.denial_kind = denial_kind
+    item.source = None
+    item.bytes_restored = 0
+    item.updated_at = _utcnow()
+    if item.request is not None:
+        _update_request_state(item.request)
+
+
+def _set_item_streaming(item: RestoreRequestItem, source: SourceKind) -> None:
+    _set_item_state(item, ITEM_STREAMING, None)
+    item.source = source
+    item.bytes_restored = 0
+
+
+def _finish_item_progress(
+    item: RestoreRequestItem,
+    size_bytes: int,
+    *,
+    source: SourceKind,
+) -> None:
+    item.source = source
+    item.size_bytes = size_bytes if item.size_bytes is None else item.size_bytes
+    item.bytes_restored = size_bytes
+
+
+def _progress_callback(
+    session: Session,
+    item: RestoreRequestItem,
+) -> Callable[[int], None]:
+    def progress(delta: int) -> None:
+        if delta <= 0:
+            return
+        item.bytes_restored = max(0, item.bytes_restored or 0) + delta
+        item.updated_at = _utcnow()
+        session.flush([item])
+        session.commit()
+
+    return progress
 
 
 def _emit(config: RestoreConfig, event: RestoreEvent) -> None:

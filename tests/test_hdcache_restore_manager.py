@@ -341,6 +341,7 @@ def test_admission_validity_denial_details_are_api_safe(
 
         item = request.items[0]
         assert item.state == ITEM_DENIED
+        assert item.denial_kind == ("suspect" if state == "suspect" else "rejected")
         assert item.detail is not None
         assert note in item.detail
         assert flag_text not in item.detail
@@ -473,7 +474,11 @@ def test_request_admission_and_sequential_serve_persist_contract_states(
         assert states[private_digest] == ITEM_DENIED
         denied = next(item for item in request.items if item.content_sha256 == private_digest)
         assert denied.detail == "requires sutradhara-restore-p3"
+        assert denied.denial_kind == "capability"
         admitted = next(item for item in request.items if item.content_sha256 == public_digest)
+        assert admitted.size_bytes == len(b"public bytes")
+        assert admitted.bytes_restored == 0
+        assert admitted.source is None
         assert admitted.admitted_force_suspect is False
         assert admitted.admitted_force_rejected is False
 
@@ -490,6 +495,9 @@ def test_request_admission_and_sequential_serve_persist_contract_states(
             public_digest: ITEM_DONE,
             private_digest: ITEM_DENIED,
         }
+        assert admitted.source == "tape"
+        assert admitted.bytes_restored == len(b"public bytes")
+        assert admitted.size_bytes == len(b"public bytes")
 
 
 def test_forged_queued_row_without_admission_inputs_is_refused(
@@ -604,6 +612,7 @@ def test_force_flags_requested_while_asset_ok_do_not_waive_later_rejection(
         )
 
         assert item.state == ITEM_DENIED
+        assert item.denial_kind == "rejected"
         assert item.detail is not None
         assert "post-admission revoke" in item.detail
         assert not (root / digest.hex()).exists()
@@ -646,6 +655,7 @@ def test_suspect_waiver_at_admission_does_not_waive_later_rejection(
         )
 
         assert item.state == ITEM_DENIED
+        assert item.denial_kind == "rejected"
         assert item.detail is not None
         assert "post-admission reject" in item.detail
         assert not (root / digest.hex()).exists()
@@ -753,6 +763,87 @@ def test_terminal_item_transition_updates_parent_request_state(
 
         assert item.state == ITEM_DONE
         assert request.state == REQUEST_COMPLETED
+        assert item.source == "tape"
+        assert item.bytes_restored == len(b"public bytes")
+
+
+def test_restore_item_progress_advances_while_cache_stream_publishes(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    observed: list[int] = []
+    original_progress = restore_manager._progress_callback
+
+    def tracking_progress(session, item):
+        callback = original_progress(session, item)
+
+        def track(delta: int) -> None:
+            callback(delta)
+            observed.append(item.bytes_restored)
+
+        return track
+
+    monkeypatch.setattr(restore_manager, "_progress_callback", tracking_progress)
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=b"cache progress")
+        _seed_cache_entry(session, tmp_path / "d001", digest, b"cache progress")
+        _request, item = _request_item(session, digest, root)
+
+        result = serve_restore_item(
+            session,
+            item,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=_config(root),
+        )
+
+        assert result.source == "cache"
+        assert observed
+        assert observed[-1] == len(b"cache progress")
+        assert item.bytes_restored == len(b"cache progress")
+        assert item.source == "cache"
+        assert item.size_bytes == len(b"cache progress")
+
+
+def test_restore_item_progress_advances_while_tape_stream_publishes(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    observed: list[int] = []
+    original_progress = restore_manager._progress_callback
+
+    def tracking_progress(session, item):
+        callback = original_progress(session, item)
+
+        def track(delta: int) -> None:
+            callback(delta)
+            observed.append(item.bytes_restored)
+
+        return track
+
+    monkeypatch.setattr(restore_manager, "_progress_callback", tracking_progress)
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"tape progress")
+        _request, item = _request_item(session, digest, root)
+
+        result = serve_restore_item(
+            session,
+            item,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=_config(root, restore_backends={backend_id: memory}),
+        )
+
+        assert result.source == "tape"
+        assert observed
+        assert observed[-1] == len(b"tape progress")
+        assert item.bytes_restored == len(b"tape progress")
+        assert item.source == "tape"
+        assert item.size_bytes == len(b"tape progress")
 
 
 def test_wake_window_marks_only_rolling_cache_items(

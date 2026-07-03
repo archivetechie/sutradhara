@@ -10,11 +10,11 @@ kept separate so replication can reuse the same read/open/verify path.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import os
-import shutil
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +25,11 @@ from sutradhara.catalog.models import Copy, LogicalAsset
 from sutradhara.catalog.types import CopyHealth
 from sutradhara.keys import KeyEpoch
 from sutradhara.sealing.port import Opener, Representation
+
+_PROGRESS_CALLBACK: contextvars.ContextVar[Callable[[int], None] | None] = contextvars.ContextVar(
+    "sutradhara_restore_progress_callback",
+    default=None,
+)
 
 
 class RestoreError(Exception):
@@ -102,7 +107,12 @@ def restore_copy(
             )
 
 
-def atomic_write_verified_file(source: Path, destination: Path) -> None:
+def atomic_write_verified_file(
+    source: Path,
+    destination: Path,
+    *,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
     """Durably replace ``destination`` with bytes from a verified source file."""
     if not destination.is_absolute():
         raise ValueError("restore destination path must be absolute")
@@ -113,9 +123,13 @@ def atomic_write_verified_file(source: Path, destination: Path) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=parent)
     temp_path = Path(temp_name)
     try:
+        callback = progress_callback or _PROGRESS_CALLBACK.get()
         with os.fdopen(fd, "wb") as out_handle:
             with source.open("rb") as in_handle:
-                shutil.copyfileobj(in_handle, out_handle, length=1024 * 1024)
+                for chunk in iter(lambda: in_handle.read(1024 * 1024), b""):
+                    out_handle.write(chunk)
+                    if callback is not None:
+                        callback(len(chunk))
             out_handle.flush()
             os.fsync(out_handle.fileno())
         os.replace(temp_path, destination)
@@ -124,6 +138,17 @@ def atomic_write_verified_file(source: Path, destination: Path) -> None:
         with contextlib.suppress(FileNotFoundError):
             temp_path.unlink()
         raise
+
+
+@contextlib.contextmanager
+def restore_progress_context(callback: Callable[[int], None] | None) -> Iterator[None]:
+    """Apply a byte-progress callback to nested atomic restore publishes."""
+
+    token = _PROGRESS_CALLBACK.set(callback)
+    try:
+        yield
+    finally:
+        _PROGRESS_CALLBACK.reset(token)
 
 
 def validate_restore_destination(value: object) -> Path:

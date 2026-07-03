@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import re
 from dataclasses import replace
 from typing import Any
@@ -10,6 +12,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import Engine, select
+from sqlalchemy.exc import IntegrityError
 
 from sutradhara.api.identity import Identity, parse_identity
 from sutradhara.catalog.session import session_scope
@@ -81,9 +84,26 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
         default=False,
         field="force_rejected",
     )
+    idempotency_key = _optional_idempotency_key(payload.get("idempotency_key"))
+    body_hash = _request_body_hash(
+        destination_id=destination_id,
+        items=items,
+        force=force,
+        force_rejected=force_rejected,
+    )
     config = _restore_config(request)
     try:
         with session_scope(request.app.state.engine) as session:
+            if idempotency_key is not None:
+                existing = _restore_request_for_idempotency(session, idempotency_key)
+                if existing is not None:
+                    if existing.idempotency_body_hash != body_hash:
+                        _raise(
+                            409,
+                            "restore_request_invalid",
+                            "same idempotency_key used with a different body",
+                        )
+                    return JSONResponse({"request_id": existing.id}, status_code=200)
             restore_request = admit_restore_request(
                 session,
                 identity=identity,
@@ -91,6 +111,8 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
                 items=items,
                 force_suspect=force,
                 force_rejected=force_rejected,
+                idempotency_key=idempotency_key,
+                idempotency_body_hash=body_hash if idempotency_key is not None else None,
                 config=config,
             )
             for item in restore_request.items:
@@ -111,6 +133,18 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
         _raise(400, "bad_request", _sanitize_detail(str(exc)))
     except RestoreManagerError as exc:
         _raise(400, "restore_request_invalid", _sanitize_detail(str(exc)))
+    except IntegrityError:
+        if idempotency_key is not None:
+            with session_scope(request.app.state.engine) as session:
+                existing = _restore_request_for_idempotency(session, idempotency_key)
+                if existing is not None and existing.idempotency_body_hash == body_hash:
+                    return JSONResponse({"request_id": existing.id}, status_code=200)
+            _raise(
+                409,
+                "restore_request_invalid",
+                "same idempotency_key is already in use",
+            )
+        raise
     except (ValueError, RuntimeError) as exc:
         _raise(400, "bad_request", _sanitize_detail(str(exc)))
     return JSONResponse({"request_id": request_id}, status_code=201)
@@ -223,14 +257,59 @@ def _optional_bool(raw: Any, *, default: bool, field: str) -> bool:
     return raw
 
 
+def _optional_idempotency_key(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        _raise(400, "bad_request", "idempotency_key must be a non-empty string")
+    value = raw.strip()
+    if len(value) > 128:
+        _raise(400, "bad_request", "idempotency_key must be at most 128 characters")
+    return value
+
+
+def _request_body_hash(
+    *,
+    destination_id: str,
+    items: list[RestoreItemSpec],
+    force: bool,
+    force_rejected: bool,
+) -> str:
+    payload = {
+        "destination_id": destination_id,
+        "items": [
+            {
+                "content_sha256": item.content_sha256.hex(),
+                "artifactclass": item.artifactclass,
+            }
+            for item in items
+        ],
+        "force": force,
+        "force_rejected": force_rejected,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _restore_request_for_idempotency(session: Any, key: str) -> RestoreRequest | None:
+    return session.scalars(
+        select(RestoreRequest).where(RestoreRequest.idempotency_key == key)
+    ).one_or_none()
+
+
 def _request_payload(row: RestoreRequest) -> dict[str, object]:
+    item_payloads = [_item_payload(item) for item in row.items]
+    bytes_total = sum(item.size_bytes or 0 for item in row.items)
+    bytes_restored = sum(item.bytes_restored or 0 for item in row.items)
     return {
         "id": row.id,
         "identity": row.identity,
         "created_at": _iso(row.created_at),
         "destination_id": row.destination_id,
         "state": row.state,
-        "items": [_item_payload(item) for item in row.items],
+        "bytes_total": bytes_total,
+        "bytes_restored": bytes_restored,
+        "items": item_payloads,
     }
 
 
@@ -240,6 +319,10 @@ def _item_payload(item: RestoreRequestItem) -> dict[str, object]:
         "artifactclass": item.artifactclass,
         "state": item.state,
         "detail": None if item.detail is None else _sanitize_detail(item.detail),
+        "denial_kind": item.denial_kind,
+        "size_bytes": item.size_bytes,
+        "bytes_restored": item.bytes_restored,
+        "source": item.source,
         "updated_at": _iso(item.updated_at),
     }
 
