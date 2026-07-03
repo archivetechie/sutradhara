@@ -121,8 +121,12 @@ def test_repopulation_planner_groups_by_source_tape_and_tags_drill(
             targets[0]["digest"].hex(),
             targets[1]["digest"].hex(),
         }
-        singleton = next(job for job in jobs if job.params.get("repopulate_batch") is not True)
-        assert singleton.params["lost_drill_id"] == "d001:20260703T080000Z"
+        singleton = next(job for job in jobs if job.params["source_tape"].endswith("tape_uuid:tape-b"))
+        assert singleton.params["repopulate_batch"] is True
+        assert singleton.params["origin_drill_ids"] == ["d001:20260703T080000Z"]
+        assert [item["lost_drill_id"] for item in singleton.params["items"]] == [
+            "d001:20260703T080000Z"
+        ]
         assert singleton.params["source_tape"].endswith("tape_uuid:tape-b")
 
 
@@ -191,6 +195,67 @@ def test_repopulation_batch_extracts_bundle_once_and_fills_entries(
             assert entry.disk_id == "d002"
             assert entry.refilled_at is not None
             assert entry_path(tmp_path / "active", target["digest"]).read_bytes() == target["data"]
+
+
+def test_singleton_repopulation_uses_restore_not_live_source_path(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    memory = MemoryBackend("mem")
+    landing = tmp_path / "landing" / "clip.mov"
+    landing.parent.mkdir()
+    landing.write_bytes(b"archive-only")
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "dead", state="dead")
+        _add_disk(session, "d002", tmp_path / "active")
+        target = _seed_bundle(
+            session,
+            memory,
+            bundle_id="bundle-a",
+            members=[b"archive-only"],
+            tape_uuid="tape-a",
+            source_paths=[landing],
+        )[0]
+        session.add(
+            CacheEntry(
+                content_sha256=target["digest"],
+                artifactclass="s-masters",
+                bundle_key="bundle-a",
+                group_key="s-masters:test",
+                disk_id="d001",
+                relpath=f"{target['digest'].hex()[:2]}/{target['digest'].hex()}",
+                size_bytes=target["size"],
+                state="lost",
+                representation=RAW_REPRESENTATION,
+                trusted=True,
+                lost_origin_disk_id="d001",
+                lost_drill_id="d001:20260703T080000Z",
+                lost_at=dt.datetime(2026, 7, 3, 8, tzinfo=dt.UTC),
+            )
+        )
+        plan = enqueue_repopulation(
+            session,
+            config=RepopulationConfig(
+                fill_config=HdcacheFillConfig(live_job_cap=10, scratch_root=tmp_path / "scratch"),
+                scratch_root=tmp_path / "scratch",
+            ),
+        )
+        job = session.scalars(select(Job).where(Job.kind == "hdcache_fill")).one()
+
+        results = execute_repopulation_batch(
+            session,
+            job.params,
+            config=RepopulationConfig(
+                fill_config=HdcacheFillConfig(scratch_root=tmp_path / "scratch"),
+                scratch_root=tmp_path / "scratch",
+                restore_backends={1: memory},
+            ),
+        )
+
+        assert plan.scheduled == 1
+        assert job.params["repopulate_batch"] is True
+        assert results[0].source == "restore"
+        assert entry_path(tmp_path / "active", target["digest"]).read_bytes() == b"archive-only"
 
 
 def test_repopulation_priority_yields_to_restore_and_outranks_migration(
@@ -540,6 +605,7 @@ def _seed_bundle(
     bundle_id: str,
     members: list[bytes],
     tape_uuid: str,
+    source_paths: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
     backend = _backend(session)
     _policy(session)
@@ -585,6 +651,7 @@ def _seed_bundle(
                 bundle_id=bundle_id,
                 logical_asset_hash=digest,
                 member_path=member_path,
+                source_path=None if source_paths is None else str(source_paths[index]),
                 size_bytes=len(data),
                 file_sha256=digest,
             )

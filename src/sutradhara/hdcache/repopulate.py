@@ -45,7 +45,6 @@ from sutradhara.hdcache.fill import (
     fill_config_from_env,
     fill_target_from_plaintext,
     resolve_restore_backends,
-    submit_hdcache_fill,
 )
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.store import (
@@ -554,18 +553,6 @@ def _submit_repopulation_batch(
     *,
     config: RepopulationConfig,
 ) -> Job | None:
-    if len(batch.items) == 1:
-        item = batch.items[0]
-        return submit_hdcache_fill(
-            session,
-            item.target,
-            config=config.fill_config,
-            extra_params={
-                "origin_disk_id": item.origin_disk_id,
-                "lost_drill_id": item.lost_drill_id,
-                "source_tape": batch.source_tape,
-            },
-        )
     return submit(
         session,
         "hdcache_fill",
