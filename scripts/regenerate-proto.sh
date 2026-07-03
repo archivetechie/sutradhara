@@ -7,7 +7,6 @@
 # Requires grpcio-tools (installed via `pip install -e .[dev]`).
 # Output:
 #   src/sutradhara/_proto/*_pb2.py + *_pb2_grpc.py
-#   packages/sutra-agent/src/sutra_agent/_proto/*_pb2.py + *_pb2_grpc.py
 #
 # The generated files are committed; do not edit them by hand.
 
@@ -17,7 +16,6 @@ cd "$(dirname "$0")/.."
 
 PROTO_SRC="proto"
 SERVER_PROTO_OUT="src/sutradhara/_proto"
-AGENT_PROTO_OUT="packages/sutra-agent/src/sutra_agent/_proto"
 
 PYTHON_CHECK="${PYTHON:-python3}"
 if [[ -x .venv/bin/python ]]; then
@@ -29,7 +27,7 @@ if ! "${PYTHON_CHECK}" -c "import grpc_tools" 2>/dev/null; then
     exit 1
 fi
 
-mkdir -p "${SERVER_PROTO_OUT}" "${AGENT_PROTO_OUT}"
+mkdir -p "${SERVER_PROTO_OUT}"
 
 # protoc options:
 #   --python_out      → message classes (*_pb2.py)
@@ -51,14 +49,6 @@ fi
     "${PROTO_SRC}/intake.proto" \
     "${PROTO_SRC}/device.proto"
 
-"${PYTHON}" -m grpc_tools.protoc \
-    --proto_path="${PROTO_SRC}" \
-    --python_out="${AGENT_PROTO_OUT}" \
-    --pyi_out="${AGENT_PROTO_OUT}" \
-    --grpc_python_out="${AGENT_PROTO_OUT}" \
-    "${PROTO_SRC}/intake.proto" \
-    "${PROTO_SRC}/device.proto"
-
 # protoc emits imports like `import layer5_pb2`, which only works if
 # ${PROTO_OUT} is on sys.path. We're a package, so rewrite to a relative
 # import. (Standard workaround; see grpc/grpc#9575.)
@@ -66,24 +56,20 @@ python3 - <<'PY'
 import pathlib
 import re
 
-for out_text in ["src/sutradhara/_proto", "packages/sutra-agent/src/sutra_agent/_proto"]:
-    out = pathlib.Path(out_text)
-    for grpc_file in out.glob("*_pb2_grpc.py"):
-        text = grpc_file.read_text()
-        text = re.sub(
-            r"^import (\w+_pb2) as",
-            r"from . import \1 as",
-            text,
-            flags=re.MULTILINE,
-        )
-        grpc_file.write_text(text)
+out = pathlib.Path("src/sutradhara/_proto")
+for grpc_file in out.glob("*_pb2_grpc.py"):
+    text = grpc_file.read_text()
+    text = re.sub(
+        r"^import (\w+_pb2) as",
+        r"from . import \1 as",
+        text,
+        flags=re.MULTILINE,
+    )
+    grpc_file.write_text(text)
 PY
 
-touch "${SERVER_PROTO_OUT}/__init__.py" "${AGENT_PROTO_OUT}/__init__.py"
+touch "${SERVER_PROTO_OUT}/__init__.py"
 
 echo "generated: ${SERVER_PROTO_OUT}/*_pb2.py"
 echo "generated: ${SERVER_PROTO_OUT}/*_pb2.pyi"
 echo "generated: ${SERVER_PROTO_OUT}/*_pb2_grpc.py"
-echo "generated: ${AGENT_PROTO_OUT}/*_pb2.py"
-echo "generated: ${AGENT_PROTO_OUT}/*_pb2.pyi"
-echo "generated: ${AGENT_PROTO_OUT}/*_pb2_grpc.py"

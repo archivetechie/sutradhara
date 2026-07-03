@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from sutra_agent._proto import device_pb2 as agent_device_pb2
-from sutra_agent._proto import intake_pb2 as agent_intake_pb2
 from sutradhara._proto import device_pb2, intake_pb2
 
 
-def test_intake_proto_messages_round_trip_on_server_and_agent_stubs() -> None:
+def test_intake_proto_messages_round_trip_on_server_stubs() -> None:
     start = intake_pb2.StartIntakeRequest(
         idempotency_key="key",
         artifactclass="video-master",
@@ -47,11 +45,9 @@ def test_intake_proto_messages_round_trip_on_server_and_agent_stubs() -> None:
         manifest_digest="d" * 64,
     )
     assert intake_pb2.CommitIntakeRequest.FromString(commit.SerializeToString()) == commit
-    agent_start = agent_intake_pb2.StartIntakeRequest.FromString(start.SerializeToString())
-    assert agent_start.source_plan_digest == "a" * 64
 
 
-def test_device_proto_messages_round_trip_on_server_and_agent_stubs() -> None:
+def test_device_proto_messages_round_trip_on_server_stubs() -> None:
     command = device_pb2.ServerCommand(
         start_receive=device_pb2.StartReceive(
             command_id="cmd-1",
@@ -76,8 +72,8 @@ def test_device_proto_messages_round_trip_on_server_and_agent_stubs() -> None:
             ]
         )
     )
-    parsed = agent_device_pb2.DeviceMessage.FromString(snapshot.SerializeToString())
-    assert parsed.card_snapshot.cards[0].kind == agent_device_pb2.CARD_KIND_CARD
+    parsed = device_pb2.DeviceMessage.FromString(snapshot.SerializeToString())
+    assert parsed.card_snapshot.cards[0].kind == device_pb2.CARD_KIND_CARD
 
     browse = device_pb2.ServerCommand(
         list_directory=device_pb2.ListDirectory(
@@ -87,8 +83,8 @@ def test_device_proto_messages_round_trip_on_server_and_agent_stubs() -> None:
         )
     )
     assert device_pb2.ServerCommand.FromString(browse.SerializeToString()) == browse
-    agent_browse = agent_device_pb2.ServerCommand.FromString(browse.SerializeToString())
-    assert agent_browse.list_directory.rel_path == "DCIM"
+    parsed_browse = device_pb2.ServerCommand.FromString(browse.SerializeToString())
+    assert parsed_browse.list_directory.rel_path == "DCIM"
 
     listing = device_pb2.DeviceMessage(
         directory_listing=device_pb2.DirectoryListing(
@@ -104,5 +100,5 @@ def test_device_proto_messages_round_trip_on_server_and_agent_stubs() -> None:
         )
     )
     assert device_pb2.DeviceMessage.FromString(listing.SerializeToString()) == listing
-    agent_listing = agent_device_pb2.DeviceMessage.FromString(listing.SerializeToString())
-    assert agent_listing.directory_listing.status == agent_device_pb2.DIR_STATUS_OK
+    parsed_listing = device_pb2.DeviceMessage.FromString(listing.SerializeToString())
+    assert parsed_listing.directory_listing.status == device_pb2.DIR_STATUS_OK

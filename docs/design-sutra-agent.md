@@ -1,8 +1,9 @@
-# Design — `sutra-agent`: receive-side operator helper
+# Design — legacy Python `sutra-agent`: receive-side operator helper
 
-> Status: **implemented MVP** (2026-06-28). Lives in
-> `packages/sutra-agent/`. It is a lightweight edge package in the sutradhara
-> repo, not a second implementation of receive.
+> Status: **superseded** (2026-07-03). The active helper is the Rust
+> `~/sutra-agent` binary. The legacy Python package was removed during the
+> Rust control-plane cutover.
+> This document is retained as historical context for the road-mode MVP.
 
 ## Goal
 
@@ -59,4 +60,3 @@ sutra-agent status <intake-id>
 
 The agent can run without a config when all required values are passed as flags,
 which keeps tests and temporary deployments simple.
-

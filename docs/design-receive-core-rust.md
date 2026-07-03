@@ -128,8 +128,7 @@ Rust/Python project — `Cargo.toml` lands at that package root in M2 so `cargo 
 exists as soon as Rust code exists; the Python build backend remains setuptools until it
 flips setuptools→maturin in M4, but the distribution name and the path do not move.
 This is deliberate (codex r1): both this repo's uv workspace
-(`[tool.uv.workspace] members = ["packages/sutra-agent", "packages/sutradhara-receive"]`,
-`[tool.uv.sources]`) and `~/system`'s lock (`editable =
+(`packages/sutradhara-receive`) and `~/system`'s lock (`editable =
 "../sutradhara/repo/packages/sutradhara-receive"`) pin that exact path — relocating the
 package would break the editable-dep chain the harness depends on. OSS split-out to its
 own repo remains §10. Dependency budget honors the "dependency-light" ethos:

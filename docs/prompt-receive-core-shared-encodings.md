@@ -32,14 +32,14 @@ Ground truth for the exact encodings (read these; do not guess):
 - package-index construction (`PackageIndex` for package dirs) — the tar-metadata glue that is
   Python-only today (`core.py`); pair with the existing `build_package_tar`/
   `plan_payload_units`.
-- `card_id` derivation — `packages/sutra-agent/src/sutra_agent/mounts.py:102-105,251-259,392-394`:
+- `card_id` derivation — legacy Python helper `mounts.py` behavior:
   a formatting fn `card_id(volume_uuid: Option<..>, source, mount_path, label) -> "volume:<id>"`
   where the id is the **real volume UUID/serial when present** (Windows serial `"{hi:04X}-{lo:04X}"`,
   macOS diskutil VolumeUUID, Linux blkid UUID) and only **falls back** to `sha256(source|mount_path|
   label)[:24]` when none. (The platform *enumeration* of the serial stays in the agent's
   `platform/`; only the id **formatting/derivation** moves here so both sides agree.)
 - confinement canonicalizer — `canonical_device_rel_path` in
-  `packages/sutra-agent/src/sutra_agent/confine.py:145-167` (reject backslash, leading `/`,
+  legacy Python helper `confine.py` behavior (reject backslash, leading `/`,
   drive-letter prefix, `.`/`..`/empty, `normpath(v)≠v`, `MAX_DEVICE_REL_PATH=1024`, non-final
   casefolded `PACKAGE_GLOBS`; returns canonical forward-slash rel path). Port as a `&str`-level
   `pub fn`; the agent must NOT use `std::path::Component` for wire paths.

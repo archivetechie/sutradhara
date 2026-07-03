@@ -95,8 +95,9 @@ receive front-door design.
 
 ## 5. Proto definition
 
-File: `packages/sutra-agent/proto/intake.proto`. Generated Python stubs committed
-alongside.
+File: `proto/intake.proto`. Generated Python server stubs are committed under
+`src/sutradhara/_proto`; the Rust `~/sutra-agent` client compiles the same proto
+from `build.rs`.
 
 ```protobuf
 syntax = "proto3";
@@ -368,10 +369,8 @@ src/sutradhara/grpc/
   servicer.py        — IntakeServicer: six RPC implementations (incl. AbortIntake)
   assembly.py        — BagIt bag assembly from streamed chunks; reuses sutradhara_receive writers
   ca.py              — CA / cert issuance helpers (sign CSR, device→operator mapping, revoke device)
-packages/sutra-agent/proto/
-  intake.proto       — the definition above
-  intake_pb2.py      — generated (committed)
-  intake_pb2_grpc.py — generated (committed)
+proto/
+  intake.proto       — the definition above; server stubs generated into src/sutradhara/_proto
 ```
 
 ### `server.py` — bind and mTLS
@@ -598,9 +597,9 @@ There is **no `operator` field** in streaming mode — the operator is resolved
 server-side from the device→operator enrollment mapping (§6), never set by the client.
 (Legacy landing mode still carries `operator`, since the local edge CLI has no cert.)
 
-`sutra-agent config init` gains `--server` / `--client-cert` / `--client-key` /
-`--ca-cert` / `--parallelism` flags; `--landing` and `--server` are mutually
-exclusive.
+The Rust `~/sutra-agent` relay config carries `server_address`, cert paths,
+in-flight journal path, chunk size, and file-concurrency knobs. Road-mode landing
+config remains local to the Rust agent's receive path.
 
 ### Payload planning — reuse the shared planner, do NOT raw-walk
 
@@ -871,14 +870,12 @@ the sweep as a periodic background task.
 
 | Path | Purpose |
 |---|---|
-| `packages/sutra-agent/proto/intake.proto` | gRPC service definition |
-| `packages/sutra-agent/proto/intake_pb2*.py` | Generated stubs (committed) |
 | `src/sutradhara/grpc/server.py` | gRPC server + mTLS setup |
 | `src/sutradhara/grpc/servicer.py` | Six RPCs (incl. state-gated `AbortIntake`); **per-RPC owner check (cert → durable `(operator, device_id)`)**; `grpc_intake`-backed `streaming→committing→committed`/`aborted` state machine + in-flight counter + ledger lock + commit rollback; `.incoming/` staging (temps outside `data/`); canonicalization/profile skew guards; `.receiving.json` + `receive-receipts.jsonl` lifecycle; **hands off to `sutra intake watch` — no gRPC verify/register** |
 | `src/sutradhara/grpc/store.py` | **New durable `grpc_intake` table** (`intake_id PK, operator, device_id, state, manifest_digest NULL, created_at, updated_at`) — the authoritative owner/state/committed-digest that survives `.receiving.json` removal; + alembic revision |
 | `src/sutradhara/grpc/assembly.py` | BagIt assembly from streamed chunks (reuses `sutradhara_receive` writers); skew-checks then builds `bag-info.txt` from server-stored intent + `receive_facts` + always-written canonicalization/profile constants; writes the **single `package-index.json`** the receive core validates (member JSON mapped by type per §5) |
 | `src/sutradhara/grpc/ca.py` | CA / cert issuance / device→operator mapping / device revocation |
-| `packages/sutra-agent/src/sutra_agent/grpc_client.py` | Streaming upload client (threaded sync, reuses shared payload planner + stat guard; warm/cold resume) |
+| `~/sutra-agent/src/relay/intake.rs` | Rust streaming upload client (shared payload planner + stat guard; warm/cold resume) |
 
 ### Modified
 
@@ -886,10 +883,9 @@ the sweep as a periodic background task.
 |---|---|
 | `src/sutradhara/cli/main.py` | Add `sutra serve-grpc` command |
 | `src/sutradhara/api/store.py` | Reuse `begin_idempotency` for `grpc:StartIntake` only (method scope + plan digest in the hashed body); **add `release_idempotency`** to delete a *completed* StartIntake row on `AbortIntake` (existing `abandon_idempotency` is `in_progress`-only). Commit idempotency is NOT here — it lives in `grpc_intake.manifest_digest` + dynamic status. |
-| `packages/sutra-agent/src/sutra_agent/config.py` | Add `server_address`, cert fields, `device_id`; `landing` optional (no `operator` in streaming mode) |
-| `packages/sutra-agent/src/sutra_agent/receive.py` | Route to `grpc_client` when `server_address` set |
-| `packages/sutra-agent/src/sutra_agent/ledger.py` | Record `idempotency_key → {intake_id, plan_digest}` for the warm-resume trust gate (§11) |
-| `packages/sutra-agent/src/sutra_agent/cli.py` | `--server` / `--client-cert` / `--ca-cert` / `enroll` |
+| `~/sutra-agent/src/relay/config.rs` | Relay config with server address, cert paths, journal path, and upload knobs |
+| `~/sutra-agent/src/relay/inflight.rs` | Durable `idempotency_key → {intake_id, plan_digest}` journal for crash recovery |
+| `~/sutra-agent/src/relay/enroll.rs` | `enroll` CLI: token from stdin/protected file, CSR POST, credential storage |
 
 ### Prerequisite — **now satisfied**
 
@@ -919,7 +915,7 @@ present — no behavioural change to existing callers.)
 **Server:** `grpcio`, `grpcio-tools` (already in the Python ecosystem; add to
 `pyproject.toml` server extras, not the edge `sutradhara-receive` package).
 
-**sutra-agent:** `grpcio` (add to `packages/sutra-agent/pyproject.toml`).
+**sutra-agent:** Rust `tonic`/`rustls-ring` in the `~/sutra-agent` crate.
 
 Neither dependency leaks into `sutradhara-receive` (the lightweight edge package).
 
@@ -976,10 +972,9 @@ Neither dependency leaks into `sutradhara-receive` (the lightweight edge package
 
 **Integration (harness scenario):**
 A new scenario (or extension of `scenario_r.py`) that runs `sutra serve-grpc` with a
-self-signed test CA **and the `sutra intake watch` registrar**, runs `sutra-agent
-receive` against a fake-source directory, and asserts the watcher writes
-`intake.verified.json` and the registered intake passes `sutra intake inspect`. Uses
-`--fake-source` (already in `sutra-agent` CLI) for CI without real hardware.
+self-signed test CA **and the `sutra intake watch` registrar**, runs the Rust
+`~/sutra-agent` relay path against a test source directory, and asserts the watcher
+writes `intake.verified.json` and the registered intake passes `sutra intake inspect`.
 
 ## 15. Open / decided
 
@@ -990,7 +985,7 @@ receive` against a fake-source directory, and asserts the watcher writes
 | 3 | **Package normalization: client-side before streaming, or a server planning step?** (codex) | **Client-side**, via the shared `sutradhara_receive` payload planner. The `package-tar-v1` is produced once at receive (its hash is the package identity, per front-door §12.1); it streams on the fly (no full local buffer) as one payload unit; its inner index ships at `CommitIntake`. No server planning RPC. |
 | 4 | StartIntake idempotency scope | Reuses the HTTP API's durable store: scoped `(operator, "grpc:StartIntake", key)` + canonical request hash; reused key with a changed request → conflict. |
 | 5 | Resume receipt durability | Durable `receive-receipts.jsonl` append-after-rename ledger; O(remaining), not O(size) re-hash on restart. |
-| 6 | Proto location | **Corrected at prompt time:** the repo already uses gRPC — `.proto` source lives in `proto/` (`proto/intake.proto`, beside `proto/layer5.proto`); committed stubs regenerate via `scripts/regenerate-proto.sh` into `src/sutradhara/_proto/` (server) **and** `packages/sutra-agent/src/sutra_agent/_proto/` (agent), keeping `sutradhara-receive` grpc-free. (Was: `packages/sutra-agent/proto/`.) See `prompt-streaming-intake-grpc.md`. |
+| 6 | Proto location | **Corrected at prompt time:** the repo already uses gRPC — `.proto` source lives in `proto/` (`proto/intake.proto`, beside `proto/layer5.proto`); committed Python stubs regenerate via `scripts/regenerate-proto.sh` into `src/sutradhara/_proto/` for the server, while the Rust `~/sutra-agent` client compiles the same proto in `build.rs`, keeping `sutradhara-receive` grpc-free. |
 | 7 | Mid-file byte-level resume | Deferred (v2); `offset` field reserved in proto; re-upload of a partial unit on disconnect is acceptable on 10G LAN. |
 | 8 | CRL / cert revocation | Device blocklist (drop mapping + block fingerprint) for v1; CRL deferred. |
 | 9 | GUI | Deferred — thin shell over `sutra-agent` CLI, separate design. |

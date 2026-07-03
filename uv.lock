@@ -8,7 +8,6 @@ resolution-markers = [
 
 [manifest]
 members = [
-    "sutra-agent",
     "sutradhara",
     "sutradhara-receive",
 ]
@@ -1206,23 +1205,6 @@ wheels = [
 ]
 
 [[package]]
-name = "sutra-agent"
-version = "0.0.1"
-source = { editable = "packages/sutra-agent" }
-dependencies = [
-    { name = "grpcio" },
-    { name = "protobuf" },
-    { name = "sutradhara-receive" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "grpcio", specifier = ">=1.81.0" },
-    { name = "protobuf", specifier = ">=6.33.5" },
-    { name = "sutradhara-receive", editable = "packages/sutradhara-receive" },
-]
-
-[[package]]
 name = "sutradhara"
 version = "0.0.1"
 source = { editable = "." }
@@ -1249,7 +1231,6 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
-    { name = "sutra-agent" },
     { name = "types-protobuf" },
 ]
 
@@ -1270,7 +1251,6 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "sqlalchemy", specifier = ">=2.0" },
-    { name = "sutra-agent", marker = "extra == 'dev'", editable = "packages/sutra-agent" },
     { name = "sutradhara-receive", editable = "packages/sutradhara-receive" },
     { name = "types-protobuf", marker = "extra == 'dev'", specifier = ">=4.25" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },

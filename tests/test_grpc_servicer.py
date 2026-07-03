@@ -5,7 +5,6 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import os
-import socket
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -13,19 +12,12 @@ import grpc
 import pytest
 from sqlalchemy import Engine
 
-from sutra_agent.config import AgentConfig
-from sutra_agent.grpc_client import get_stream_status, stream_source
 from sutradhara._proto import intake_pb2
 from sutradhara.catalog.models import Intake
 from sutradhara.catalog.session import create_all, make_engine, session_scope
-from sutradhara.grpc import ca, store
+from sutradhara.grpc import store
 from sutradhara.grpc.assembly import manifest_digest
-from sutradhara.grpc.server import (
-    GrpcServerConfig,
-    make_server,
-    sweep_landing_once,
-    validate_bind_address,
-)
+from sutradhara.grpc.server import sweep_landing_once, validate_bind_address
 from sutradhara.grpc.servicer import GrpcIntakeConfig, IntakeServicer
 from sutradhara.intake_watch import process_landing_once
 
@@ -245,73 +237,6 @@ def test_server_sweep_removes_stale_receiving_and_incoming(tmp_path: Path) -> No
     assert not temp.exists()
 
 
-def test_real_grpc_stream_hands_off_to_real_watch(tmp_path: Path) -> None:
-    engine = make_engine(f"sqlite:///{tmp_path / 'grpc.db'}")
-    create_all(engine)
-    pki = tmp_path / "pki"
-    ca.ensure_server_certificate(pki, common_name="localhost")
-    material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
-    with session_scope(engine) as session:
-        token = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
-    signed = ca.sign_device_csr(
-        engine,
-        pki_dir=pki,
-        csr_path=material.csr_path,
-        token=token,
-    )
-    port = _free_port()
-    landing = tmp_path / "landing"
-    server = None
-    try:
-        server = make_server(
-            GrpcServerConfig(
-                engine=engine,
-                landing_root=landing,
-                pki_dir=pki,
-                bind="127.0.0.1",
-                port=port,
-                validate_artifactclass=False,
-            )
-        )
-        server.start()
-        source = tmp_path / "source"
-        source.mkdir()
-        (source / "clip.mov").write_bytes(b"video")
-        config = AgentConfig(
-            server_address=f"localhost:{port}",
-            client_cert=signed.cert_path,
-            client_key=material.key_path,
-            ca_cert=pki / "ca.crt",
-            device_id="mac-1",
-            source_kind="card",
-            artifactclass="video-master",
-            ledger_path=tmp_path / "ledger.json",
-        )
-        result = stream_source(
-            source,
-            config=config,
-            idempotency_key="stream-key",
-            confirm_timeout=0,
-        )
-        assert result.confirmation.status == "pending"
-
-        events = process_landing_once(
-            landing,
-            engine=engine,
-            settle_seconds=0,
-            stable_polls=1,
-            cache_root=tmp_path / "cache",
-            use_lock=False,
-        )
-        assert [event.event for event in events] == ["intake-registered"]
-        assert get_stream_status(config, result.intake_id).status == "verified"
-        assert (landing / result.intake_id / "intake.verified.json").is_file()
-    finally:
-        if server is not None:
-            server.stop(grace=None)
-        engine.dispose()
-
-
 class _Abort(Exception):
     def __init__(self, code: grpc.StatusCode, details: str) -> None:
         super().__init__(details)
@@ -326,9 +251,3 @@ class _FakeContext:
 
     def abort(self, code: grpc.StatusCode, details: str) -> None:
         raise _Abort(code, details)
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
