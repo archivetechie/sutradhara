@@ -152,6 +152,15 @@ def evaluate_hdcache_alarm_conditions(
         rows.append(
             _set_alarm(
                 session,
+                f"capacity-over-reserve:{disk.disk_id}",
+                active=disk.capacity_state == "over_reserve",
+                reason="capacity-over-reserve",
+                message=f"cache disk {disk.disk_id} paused after ENOSPC over-reserve",
+            )
+        )
+        rows.append(
+            _set_alarm(
+                session,
                 f"disk-unreachable:{disk.disk_id}",
                 active=disk.state == "absent",
                 reason="disk-unreachable",

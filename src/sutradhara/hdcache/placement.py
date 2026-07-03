@@ -70,6 +70,7 @@ class DiskState:
     capacity_bytes: int
     filled_bytes: int
     filling_bytes: int = 0
+    capacity_state: str = "ok"
     enclosure: str | None = None
     slot: str | None = None
 
@@ -158,6 +159,7 @@ class DefaultDiskPlacementPolicy:
             disk
             for disk in candidates
             if disk.state == "active"
+            and disk.capacity_state == "ok"
             and disk.free_bytes >= ctx.size_bytes + self.config.reserve_bytes(disk)
         ]
 
@@ -281,6 +283,7 @@ def disk_states_from_catalog(session: Session) -> list[DiskState]:
             state=row.state,
             capacity_bytes=row.capacity_bytes,
             filled_bytes=row.filled_bytes,
+            capacity_state=row.capacity_state,
             enclosure=row.enclosure,
             slot=row.slot,
         )

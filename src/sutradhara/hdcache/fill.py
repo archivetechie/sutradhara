@@ -1362,8 +1362,7 @@ def _copy_landing_to_verified_temp(
 
 
 def _flag_disk_over_reserve(session: Session, disk: CacheDisk) -> None:
-    disk.smart_status = "over-reserve"
-    disk.filled_bytes = max(disk.filled_bytes, disk.capacity_bytes)
+    disk.capacity_state = "over_reserve"
     session.flush([disk])
 
 

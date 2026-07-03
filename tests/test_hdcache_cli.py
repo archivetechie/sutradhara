@@ -110,6 +110,10 @@ def test_hdcache_dead_marks_entries_lost_in_batches_and_forget_checks_references
         add = runner.invoke(hdcache_group, ["disk", "add", "/dev/sda", "--json"])
         assert add.exit_code == 0
         _seed_entries(engine, "d001", count=1005)
+        with session_scope(engine) as session:
+            disk = session.get(CacheDisk, "d001")
+            assert disk is not None
+            disk.filled_bytes = 1005
 
         retire = runner.invoke(hdcache_group, ["disk", "retire", "d001"])
         assert retire.exit_code == 0
@@ -131,6 +135,7 @@ def test_hdcache_dead_marks_entries_lost_in_batches_and_forget_checks_references
             assert {
                 row.state for row in session.scalars(select(CacheEntry).where(CacheEntry.disk_id == "d001"))
             } == {"lost"}
+            assert session.get(CacheDisk, "d001").filled_bytes == 0
 
         hidden = runner.invoke(hdcache_group, ["disk", "list", "--json"])
         assert hidden.exit_code == 0

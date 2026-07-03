@@ -306,6 +306,22 @@ def test_near_reserve_uses_only_viable_candidates() -> None:
     assert policy.choose(states, _ctx(_digest("near-reserve"), size_bytes=10)) == "d002"
 
 
+def test_capacity_over_reserve_disk_is_not_viable_even_with_free_bytes() -> None:
+    policy = DefaultDiskPlacementPolicy(PlacementConfig(reserve_fraction=0))
+    states = [
+        DiskState(
+            "d001",
+            "active",
+            capacity_bytes=1000,
+            filled_bytes=0,
+            capacity_state="over_reserve",
+        ),
+        DiskState("d002", "active", capacity_bytes=1000, filled_bytes=900),
+    ]
+
+    assert policy.choose(states, _ctx(_digest("over-reserve"), size_bytes=10)) == "d002"
+
+
 def test_enclosure_spread_is_optional_and_off_by_default() -> None:
     states = [
         DiskState("d001", "active", 4 * DEFAULT_SPREAD_MIN_BYTES, 0, enclosure="shelf-a"),

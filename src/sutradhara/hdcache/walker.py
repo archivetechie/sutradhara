@@ -45,6 +45,7 @@ from sutradhara.hdcache.store import (
     entry_path,
     enumerate_entries,
     enumerate_rejected_entry_files,
+    probe_disk_liveness_with_deadline,
     run_disk_io_with_deadline,
     tmp_root,
     verify_disk_identity_with_deadline,
@@ -196,8 +197,9 @@ def walk_disk(
     """Walk one cache disk according to the design §8.2 matrix."""
 
     if disk.state == "absent":
-        _emit(config, "walker-disk-absent", "info", disk.disk_id, detail="disk state is absent")
-        return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False)
+        if not _probe_absent_disk_recovery(session, disk, config=config):
+            _emit(config, "walker-disk-absent", "info", disk.disk_id, detail="disk state is absent")
+            return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False)
 
     try:
         identity = _verify_identity(disk, config)
@@ -778,6 +780,61 @@ def _mark_disk_absent(
     disk.state = "absent"
     session.flush([disk])
     _emit(config, "walker-disk-absent", "alarm", disk.disk_id, detail=detail)
+
+
+def _probe_absent_disk_recovery(
+    session: Session,
+    disk: CacheDisk,
+    *,
+    config: HdcacheWalkerConfig,
+) -> bool:
+    if disk.state != "absent":
+        return False
+    try:
+        result = probe_disk_liveness_with_deadline(
+            Path(disk.mount),
+            ExpectedDiskIdentity(
+                disk_id=disk.disk_id,
+                serial=disk.serial,
+                fs_uuid=disk.fs_uuid,
+                wwn=disk.wwn,
+            ),
+            hmac_secret=config.hmac_secret,
+            disk_id=disk.disk_id,
+            probe=config.identity_probe,
+            deadline_monotonic=_deadline(config.identity_probe_deadline_seconds),
+        )
+    except StoreReadTimeout as exc:
+        _emit(
+            config,
+            "walker-disk-recovery-timeout",
+            "alarm",
+            disk.disk_id,
+            detail=str(exc),
+        )
+        return False
+    except Exception as exc:
+        _emit(
+            config,
+            "walker-disk-recovery-failed",
+            "alarm",
+            disk.disk_id,
+            detail=str(exc),
+        )
+        return False
+    if not result.ok:
+        _emit(
+            config,
+            "walker-disk-recovery-failed",
+            "info",
+            disk.disk_id,
+            detail=f"{result.status}: {result.detail}",
+        )
+        return False
+    disk.state = "active"
+    session.flush([disk])
+    _emit(config, "walker-disk-recovered", "info", disk.disk_id, detail="absent disk recovered")
+    return True
 
 
 def _deadline(seconds: float) -> float:

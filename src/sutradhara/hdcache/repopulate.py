@@ -377,7 +377,11 @@ def drain_retiring_disk(
                 entry = _fresh_drain_entry(session, digest, disk_id)
                 if entry is None:
                     continue
-                _restore_single_target(session, target, plaintext, config=final_config)
+                try:
+                    _restore_single_target(session, target, plaintext, config=final_config)
+                except RepopulationError:
+                    failed += 1
+                    continue
                 source_kind = "drain-tape"
                 fallback += 1
             try:

@@ -520,6 +520,63 @@ def test_drain_falls_back_to_tape_on_corrupt_source(
         assert entry_path(tmp_path / "active", target["digest"]).read_bytes() == target["data"]
 
 
+def test_drain_tape_fallback_repopulation_error_counts_failed_and_continues(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = MemoryBackend("mem")
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "retiring", state="retiring")
+        _add_disk(session, "d002", tmp_path / "active")
+        target = _seed_bundle(
+            session,
+            memory,
+            bundle_id="bundle-a",
+            members=[b"tape-missing"],
+            tape_uuid="tape-a",
+        )[0]
+        bad_path = entry_path(tmp_path / "retiring", target["digest"])
+        bad_path.parent.mkdir(parents=True, exist_ok=True)
+        bad_path.write_bytes(b"corrupt")
+        session.get(CacheDisk, "d001").filled_bytes = target["size"]
+        session.add(
+            CacheEntry(
+                content_sha256=target["digest"],
+                artifactclass="s-masters",
+                bundle_key="bundle-a",
+                group_key="s-masters:test",
+                disk_id="d001",
+                relpath=f"{target['digest'].hex()[:2]}/{target['digest'].hex()}",
+                size_bytes=target["size"],
+                state="present",
+                representation=RAW_REPRESENTATION,
+                trusted=True,
+            )
+        )
+
+        def fail_restore(*_args: object, **_kwargs: object) -> None:
+            raise RepopulationError("tape unavailable")
+
+        monkeypatch.setattr(repop_module, "_restore_single_target", fail_restore)
+
+        result = drain_retiring_disk(
+            session,
+            "d001",
+            config=RepopulationConfig(
+                fill_config=HdcacheFillConfig(scratch_root=tmp_path / "scratch"),
+                scratch_root=tmp_path / "scratch",
+                restore_backends={1: memory},
+            ),
+        )
+
+        assert result.moved == 0
+        assert result.fallback_to_tape == 0
+        assert result.failed == 1
+        assert result.auto_dead is False
+        assert session.get(CacheEntry, target["digest"]).state == "present"
+
+
 def test_drain_aborts_on_disk_state_change_without_resurrecting_lost_row(
     engine: Engine,
     tmp_path: Path,
@@ -642,6 +699,7 @@ def test_alarm_condition_matrix(engine: Engine, tmp_path: Path) -> None:
         _add_disk(session, "d001", tmp_path / "full", capacity_bytes=100, filled_bytes=99)
         _add_disk(session, "d002", tmp_path / "absent", state="absent")
         _add_disk(session, "d003", tmp_path / "smart", smart_status="degraded")
+        _add_disk(session, "d004", tmp_path / "paused", capacity_state="over_reserve")
         session.add(LogicalAsset(content_sha256=lost_digest, size_bytes=1))
         session.add(
             CacheEntry(
@@ -695,6 +753,7 @@ def test_alarm_condition_matrix(engine: Engine, tmp_path: Path) -> None:
         assert active["reserve-breach:d001"] == "reserve-breach"
         assert active["disk-unreachable:d002"] == "disk-unreachable"
         assert active["smart-degradation:d003"] == "smart-degradation"
+        assert active["capacity-over-reserve:d004"] == "capacity-over-reserve"
         assert active["lost-backlog"] == "lost-backlog"
         assert active["fill-queue-stalled"] == "fill-queue-stalled"
         assert active["unmapped-privacy-level"] == "unmapped-privacy-level"
@@ -799,6 +858,7 @@ def _add_disk(
     state: str = "active",
     capacity_bytes: int = 10_000_000,
     filled_bytes: int = 0,
+    capacity_state: str = "ok",
     smart_status: str | None = None,
 ) -> None:
     mount.mkdir(parents=True, exist_ok=True)
@@ -811,6 +871,7 @@ def _add_disk(
             state=state,
             capacity_bytes=capacity_bytes,
             filled_bytes=filled_bytes,
+            capacity_state=capacity_state,
             smart_status=smart_status,
         )
     )

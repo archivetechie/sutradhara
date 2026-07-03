@@ -280,6 +280,35 @@ def test_mid_walk_unmount_aborts_before_lost_mark(
         assert session.get(CacheDisk, "d001").state == "absent"
 
 
+def test_walk_absent_disk_reprobes_and_recovers_when_identity_is_healthy(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    secret = b"walker-secret"
+    mount = _mount_with_identity(tmp_path, secret=secret)
+    events: list[HdcacheWalkerEvent] = []
+    with session_scope(engine) as session:
+        disk = _disk(session, mount)
+        disk.state = "absent"
+        session.flush([disk])
+
+        result = walk_disk(
+            session,
+            disk,
+            config=HdcacheWalkerConfig(
+                hmac_secret=secret,
+                identity_probe=FakeProbe(),
+                event_sink=events.append,
+                enqueue_repopulation=False,
+            ),
+        )
+
+        assert result.destructive is True
+        assert result.halted is False
+        assert session.get(CacheDisk, "d001").state == "active"
+        assert [event.code for event in events] == ["walker-disk-recovered"]
+
+
 def test_rebuild_skips_hung_disk_and_continues(
     engine: Engine,
     tmp_path: Path,

@@ -265,10 +265,13 @@ def test_hdcache_fill_enospc_flags_disk_and_replaces(
         result = fill_target(session, target, config=_config(tmp_path))
 
         assert result.disk_id in {"d001", "d002"}
-        overfull = session.scalar(select(CacheDisk).where(CacheDisk.smart_status == "over-reserve"))
+        overfull = session.scalar(
+            select(CacheDisk).where(CacheDisk.capacity_state == "over_reserve")
+        )
         assert overfull is not None
         assert overfull.disk_id != result.disk_id
-        assert overfull.filled_bytes == overfull.capacity_bytes
+        assert overfull.smart_status is None
+        assert overfull.filled_bytes == 0
         assert session.get(CacheDisk, result.disk_id).filled_bytes == target.size_bytes
         assert session.get(CacheEntry, target.content_sha256).state == "present"
         assert calls == 2

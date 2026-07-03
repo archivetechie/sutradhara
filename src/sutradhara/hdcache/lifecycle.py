@@ -461,6 +461,8 @@ class HdcacheLifecycleManager:
             if row is None:
                 raise LifecycleError(f"unknown cache disk: {disk_id}")
             row.state = state
+            if state == "dead":
+                row.filled_bytes = 0
             session.flush()
             session.expunge(row)
             return row
@@ -535,6 +537,7 @@ def _disk_payload(row: CacheDisk) -> dict[str, Any]:
         "state": row.state,
         "capacity_bytes": row.capacity_bytes,
         "filled_bytes": row.filled_bytes,
+        "capacity_state": row.capacity_state,
         "smart_status": row.smart_status,
         "enrolled_at": row.enrolled_at.isoformat() if row.enrolled_at else None,
         "last_walk_at": row.last_walk_at.isoformat() if row.last_walk_at else None,
