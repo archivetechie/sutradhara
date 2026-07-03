@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import errno
 import hashlib
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -31,14 +33,15 @@ from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopyS
 from sutradhara.hdcache.fill import (
     DOMAIN,
     JOB_KIND,
-    HdcacheFillConfig,
     HdcacheFillBlocked,
+    HdcacheFillConfig,
     HdcacheFillTarget,
     count_live_hdcache_jobs,
     dedupe_key,
     fill_target,
     mark_entry_lost_and_delete,
     observe_target,
+    submit_hdcache_fill,
 )
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.store import (
@@ -48,6 +51,7 @@ from sutradhara.hdcache.store import (
     entry_path,
     write_entry,
 )
+from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
@@ -57,6 +61,8 @@ from sutradhara.jobs.reconcilers.conditions import (
     record_observation,
 )
 from sutradhara.jobs.reconcilers.spine import reconcile
+from sutradhara.jobs.registry import JobContext, JobResult
+from sutradhara.jobs.worker import JobWorker
 from sutradhara.keys import KeyEpoch, KeyRegistry
 from sutradhara.sealing.port import Representation, SealResult
 
@@ -244,6 +250,58 @@ def test_hdcache_reconciler_honors_live_cap_and_tops_up_archived_backlog(
         assert count_live_hdcache_jobs(session) == cap
         _assert_live_cap(session, cap)
         assert len(_hdcache_jobs(session, status=JobStatus.SUCCEEDED)) == 3
+
+
+def test_hdcache_fill_jobs_declare_io_lease_and_serialize(
+    engine: Engine,
+) -> None:
+    targets = [
+        HdcacheFillTarget(hashlib.sha256(f"fill-{index}".encode()).digest(), "s-masters", 10)
+        for index in range(2)
+    ]
+    with session_scope(engine) as session:
+        for target in targets:
+            record_observation(
+                session,
+                domain=DOMAIN,
+                target_key=target.sha_hex,
+                desired=True,
+                observed_state=OBSERVED_MISSING,
+            )
+            job = submit_hdcache_fill(session, target, config=HdcacheFillConfig())
+            assert job is not None
+            assert job.required_resources == [{"pool": "io", "count": 1}]
+
+    state = {"active": 0, "max_active": 0}
+    lock = threading.Lock()
+
+    def fake_fill(ctx: JobContext) -> JobResult:
+        assert ctx.granted_leases == {"io": 1}
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        time.sleep(0.05)
+        with lock:
+            state["active"] -= 1
+        return JobResult(ok=True, detail="filled")
+
+    from sutradhara.jobs import registry as _r
+
+    original = _r._HANDLERS[JOB_KIND]
+    _r._HANDLERS[JOB_KIND] = fake_fill
+    try:
+        worker = JobWorker(
+            engine,
+            config=WorkerConfig(
+                capacities={"cpu": 2, "io": 1, "tape_drive": 0, "gpu": 0},
+                executor_workers=2,
+            ),
+        )
+        worker.drain()
+    finally:
+        _r._HANDLERS[JOB_KIND] = original
+
+    assert state["max_active"] == 1
 
 
 def test_hdcache_convergence_marks_privacy_raise_and_retired_epoch_lost(
