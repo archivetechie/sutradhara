@@ -1,216 +1,266 @@
-# Design — copy-grain unification + durability enforcement
+# Design — copy-grain unification + durability enforcement (v2, panel-folded)
 
-**Status:** design, for panel review (2026-07-03). Fable-authored amendment to the
-pool/multi-copy model, from `~/system/docs/report-fable-review-hard-threads-2026-07-03.md`
-(thread 1). Business rule pinned by the owner (B4): **≥3 copies spanning ≥2
-implementation families for archival classes; media-generation diversity is
-explicitly NOT policy.** Companion docs: `design-ingest-v2-rao-archive.md`
-(§B4–B6, still the placement model), `design-reconciler-spine.md` (P0.3).
+**Status:** design, folded after panel — verify round pending (2026-07-03).
+v1 was panel-reviewed same day per `~/system/docs/process-panel-review.md`:
+4 blind lenses (migration/compat, failure/durability, simplicity/cost — Opus;
+contract/code-reality — codex xhigh), ~36 findings, 8 blockers. All folded here;
+the fold materially SHRANK the design (M4 dropped, M3 reduced to a pin).
+Origin: `~/system/docs/report-fable-review-hard-threads-2026-07-03.md` thread 1.
+Business rule pinned by the owner (B4): **≥3 copies spanning ≥2 implementation
+families for archival classes; media-generation diversity is explicitly NOT
+policy.**
+
+## 0. What the panel changed (read this first)
+
+- **Production masters are already bundles** (`flush_bundle` is the s-masters/
+  s-proxy write path); `replicate_asset` is harness-facing (J/N/O/Q) and the
+  `copy` job handler is still a stub. So grain-*unification* work was aimed at
+  the non-production path. The archival gap is bundle status + self-heal — that
+  is M1+M2, and that is where the budget goes.
+- **M4 (legacy backfill + XOR tightening) is DROPPED**, permanently: it risked
+  the persistent pilot catalog, had a shared-asset `bundle.artifactclass`
+  ambiguity, would have crashed scrub's asset-grain insert path under the
+  tightened CHECK, and bought zero durability. The Copy XOR stays loose
+  forever; legacy asset-grain rows convert opportunistically only if/when a
+  real media migration rewrites their bytes anyway.
+- **M3 shrinks to a grain pin** (§2 D1): the byte-identity claim in v1 was
+  false (single-object seal vs archive/tar build are different bytes; Q.8 pins
+  byte-identity), and converting a non-production writer now bought nothing.
 
 ## 1. Problem
 
-Five verified defect classes, all archival-grade (cites in the system report):
-
-1. **The Copy asset-XOR-bundle fork** (`ck_copy_asset_xor_bundle`,
-   `catalog/models.py:1154`) has produced three divergent "healthy copy"
-   predicates (replication asset-only; retention's asset+bundle UNION,
-   `retention.py:418-454`; restore's AssetLocator walk) — and the production
-   bundle path has **no self-heal and no replication_status at all**.
-2. **Durability diversity is unenforced**: nothing at policy-apply or write time
-   prevents all copies of a class landing on one backend/implementation;
-   `_assert_distinct_media` runs only inside `replication_status`
-   (`replication.py:366`), never on any write path.
-3. **Pool lifecycle is dangerous**: no state machine, and
-   `AssetLocator.pool_id`/`BlobRoot.pool_id` are `ondelete=CASCADE`
-   (`models.py:1007,1063`) — a pool-row delete destroys restore coordinates.
-4. **Source selection is split**: `restore_asset` walks policy preference;
-   `self_heal` uses lowest-`Copy.id` (`replication.py:376-427`) with no
-   fallback and no suspect-marking — it can heal from the AEAD offsite copy
-   while a plain working copy exists, and gives up if source #1 fails.
-5. **Durability honesty defects**: restore-discovered corruption never marks
-   the copy suspect (`archive_restore.py:312,326`); cross-artifactclass bundle
-   bleed in restore/retention (no `Bundle.artifactclass` join,
-   `archive_restore.py:271`, `retention.py:432`); `cloud-blob` hardcodes
-   `representation=rao-aead-v1` regardless of pool
-   (`jobs/handlers/cloud_blob.py:129`); `restore_preference` never validated
-   against real pools; `replicate.py:33,74` keys sealing off hardcoded class
-   names.
+Unchanged from v1 (verified, cites in the system report): (a) bundle copies
+have no `replication_status`/self-heal — three divergent healthy-copy
+predicates exist; (b) durability diversity is unenforced anywhere
+(`_assert_distinct_media` runs only inside `replication_status`); (c) pool
+rows can be deleted, CASCADE-destroying `AssetLocator`/`BlobRoot` restore
+coordinates; (d) source selection is split (policy walk vs lowest-`Copy.id`),
+self-heal has no fallback and never marks bad sources; (e) five durability-
+honesty defects (suspect-marking, cross-class bleed, cloud-blob
+representation, unvalidated `restore_preference`, hardcoded class names).
 
 ## 2. Decisions
 
-### D1 — Bundle is the universal storage-copy grain (staged)
+### D1 — Copy grain: bundle for all FUTURE durable writers (a pin, not a migration)
 
-Target model: **every durable placement is a bundle copy.** A single-asset write
-becomes a **degenerate 1-member bundle** (`bundle_id = asset-<hash12>` or
-similar deterministic id; member_path = the canonical single member). One
-`Copy` grain ⇒ one `replication_status`, one self-heal, one reconciler domain,
-one restore dispatch (always via `AssetLocator`).
+- **Pin:** every new durable write path — the real `copy` job handler foremost
+  — records **bundle grain**: a degenerate 1-member bundle row + member +
+  `AssetLocator` + bundle-scoped `Copy`. The degenerate id is deterministic
+  (`asset-<hash16>`), collision-checked against real bundle ids, and its
+  `bundle.artifactclass` is the asset's class *for that placement*.
+- **Bytes:** a 1-member degenerate write KEEPS the existing single-object
+  seal/write path (`RaoCliSealer` / `write_object_to_pool`) — it does NOT use
+  the flush archive/tar container. Only the catalog rows change grain. (Panel:
+  the two build paths are not byte-compatible; Q asserts byte-identity across
+  write→repair, so the seal path is load-bearing.)
+- `replicate_asset` is NOT converted now. If it is still a live writer when
+  the copy handler lands, it converts then, in one prompt, against a real
+  consumer — with the harness shims (J's `lookup_by_hash`, status shape, Q
+  self-heal, scrub expectations) updated in the same change, which the panel
+  enumerated as the true blast radius.
+- The XOR constraint is **never tightened**. Both grains stay legal at the
+  schema level; M1's predicate makes the difference invisible to durability.
 
-Rationale for acting **now**: the `copy` job handler is still a
-`NotImplementedError` stub — the real write machinery for reconciler-driven
-copies has not been built. Choosing the grain before that handler exists is the
-cheap moment; after it lands, every stage doubles in cost.
+### M1 — One durability predicate module (no schema change)
 
-**Staging (each stage lands green on main; J/N/O/Q stay green throughout):**
+New `sutradhara/durability.py`:
 
-- **M1 — one predicate.** Extract a single shared module
-  `sutradhara/durability.py`: `qualifying_copies(session, target, pool)` and
-  `placement_status(session, target)` where `target = AssetTarget(hash) |
-  BundleTarget(bundle_id)`. Implementation lifts retention's asset+bundle UNION.
-  `replication_status`, `retention._qualifying_copies_for_pool`, and the restore
-  preflight all call it. Adds `bundle_replication_status(bundle_id)`
-  (want = `target_pools(bundle.artifactclass)`, have = bundle copies by pool).
-  No schema change.
-- **M2 — bundle self-heal on the spine.** New reconciler domain
-  `bundle_copy` (P0.3's named "highest-value next"): `discover` enumerates
-  sealed bundles × active pools, `observe` = qualifying bundle copy present +
-  healthy, `reconcile_target` enqueues a `bundle-repair` job. The handler
-  restores the bundle's members from a healthy copy (staged, with
-  `staging_transform` fidelity), re-runs the **same per-pool build path
-  `flush_bundle` uses** for just the missing pool, verifies, records the copy.
-  Scrub-marked MISSING/corrupt bundle copies finally have a consumer.
-- **M3 — degenerate-bundle write path.** `replicate_asset` (and the future
-  `copy` handler) write 1-member bundles: create bundle row + member +
-  AssetLocator + bundle-scoped Copy per pool. The o/n-archive scenario shims
-  keep observable behavior byte-identical (same pools, same representations,
-  same locators modulo the bundle wrapper); scenario expectations updated only
-  where they assert `Copy.logical_asset_hash` directly.
-- **M4 — retire the asset grain.** Backfill migration: for each legacy
-  asset-scoped Copy, synthesize its 1-member bundle + AssetLocator (pure
-  catalog rewrite; no tape I/O — locators are unchanged). Then
-  `select_restore_source`/`_healthy_copies` asset filters are deleted in favor
-  of D4's selector, and the XOR constraint tightens to bundle-only
-  (`logical_asset_hash` column retained, NULL, dropped in a later cleanup).
+- `qualifying_copies(session, target, pool_id, *, require_verified: bool,
+  artifactclass: str | None)` where `target = AssetTarget(hash) |
+  BundleTarget(bundle_id)`. This is a NEW target-typed predicate — not a lift
+  of retention's (which is asset-hash-shaped and verified-only) and not of
+  replication's (asset-only, unverified). The **`require_verified` axis is
+  explicit and semantics-preserving**: `replication_status`/fan-out
+  completeness pass `False` (a fresh unscubbed copy still counts — no
+  behavioral drift in J/N/O/Q), the retention delete-gate passes `True`
+  (deletion still demands ever-verified), per `design-deletion-gate.md`.
+- `placement_status(session, target)` — want (via `target_pools`) vs have
+  (via the predicate), returning `PoolTarget`-shaped entries (the harness seam
+  getattr-maps `.pool_id/.backend_name/...`; shape is a compat invariant).
+  Flags duplicate copies per (target, pool) — see D6.
+- `bundle_replication_status(session, bundle_id)` — the new capability.
+- All current readers route through the module **with their current
+  semantics**: `replication_status`, `repair`, `_healthy_copies`,
+  `_healthy_copies_by_pool`, `select_restore_source`, retention's
+  `_qualifying_copies_for_pool`, restore preflight. Six sites enumerated by
+  the panel; routing is refactor-only, zero behavior change, each covered by
+  existing tests.
 
-M1+M2 are independent of M3+M4 and ship first; M3/M4 are gated on M2 green plus
-a clean-slate `make suite`. If the panel finds M4's backfill riskier than
-modeled, M4 alone may defer — M1–M3 already end the fork for all *new* writes.
+### M2 — Bundle self-heal on the reconciler spine
 
-### D2 — Declared durability requirements, enforced twice
+- **Factored build primitive** (the panel's key correction): extract from
+  `archive_fanout` a `build_bundle_copy_for_pool(session, bundle, pool_target,
+  member_sources) -> Copy` that builds, verifies, and records ONE pool's
+  bundle copy — including the per-pool `AssetLocator` + `BlobRoot` rows flush
+  creates — with **no bundle lifecycle mutation, no conformance gate, no
+  customer-manifest emission**. `flush_bundle` refuses non-open bundles and
+  owns lifecycle; repair must not go through it.
+- **Member sources = stored member bytes extracted from a healthy copy** into
+  scratch. NEVER `member.source_path` (retention purges staging at ~30 days —
+  v1's wording made self-heal silently work for only the first month) and
+  NEVER re-staging from logical bytes (AppleDouble merge is irreversible;
+  zstd output is compressor-version-dependent). All pools store the same
+  staged member bytes in different containers/sealing, so extraction from any
+  healthy copy reproduces them exactly.
+- New reconciler domain `bundle_copy` (P0.3's named next domain):
+  - `discover`: sealed bundles × the class's write-eligible pools.
+  - `observe`: **placement complete AND durability floor satisfied** —
+    realized copies meet the class's `min_copies` and `min_impl_families`
+    (D2). This makes drain-below-floor and family-collapse — states with no
+    missing pool copy — visible as open conditions, without inventing a third
+    sweep mechanism.
+  - `reconcile_target`: enqueue a `bundle-repair` job (source via D4
+    `self_heal` purpose, with fallback + suspect-marking).
+- **Scrub adoption fix:** `scrub_backend`'s unknown-object insert classifies:
+  enumerated logical id matches a `Bundle.archive_id` → `add_bundle_copy`;
+  matches a `LogicalAsset` → `add_copy` (asset grain remains legal); matches
+  neither → a quarantine entry in the scrub report, never an invented row.
 
-- `Backend.implementation_family` (string, required; registry-validated values:
-  `remanence`, `d2tape`, `ssh_disk`, `s3`, `memory`, …). Family = independent
-  implementation+format lineage (rem-rust/RAO vs d2-java/tar), NOT media type.
-- Artifactclass policy TOML grows a `durability` table:
-  `min_copies` (int) and `min_impl_families` (int). Defaults for archival
-  (master) classes: `min_copies=3, min_impl_families=2` (the B4 rule). Proxy/
-  derived classes may declare lower.
-- **Enforcement point 1 — policy apply:** `apply_artifactclass_policy`
-  validates that the declared placement pools *can* satisfy the durability
-  table (enough pools, spanning enough families) — violation is a hard error.
-- **Enforcement point 2 — write commit:** after `replicate_asset`/
-  `flush_bundle` fan-out (and after M2 repairs), assert the **realized** copies
-  satisfy: distinct media (`_assert_distinct_media` moves into this path — it
-  currently never runs on writes) AND family count ≥ declared. Failure ⇒ the
-  operation reports failure loudly (copies already written stay recorded; the
-  gap is a named error, not a silent success).
-- `Pool.media_generation` (nullable string, e.g. `LTO-7`, `LTO-9`):
-  **descriptive only** — enables "what still lives on LTO-9" migration-campaign
-  queries. Never consulted by enforcement (B4: generations are economics, not
-  policy).
+### D2 — Declared durability floor, enforced where it can be
 
-### D3 — Pool lifecycle
+- `Backend.implementation_family` (required string; registry maps every
+  `BackendKind` value — all nine — to a family; migration backfills by kind).
+- **Policy:** one global archival default — `min_copies=3,
+  min_impl_families=2` (B4) — inherited by every artifactclass unless the
+  class explicitly declares `[durability]` overrides (e.g. proxies:
+  `min_copies=2, min_impl_families=1`). Safe-by-default: a new class that
+  declares nothing gets the archival floor. Parser: `[durability]` added to
+  the strict allow-list; persisted on `ArtifactClassPolicyRecord` (new
+  columns — the current parser rejects unknown keys, so this is a named
+  schema+parser change, not a drive-by).
+- **EP1 — config time:** policy apply validates the declared write-eligible
+  pools can satisfy the floor. The same validation re-runs on any pool
+  write-fence change (D3's drain guard): flipping `accepts_writes=False` is
+  REFUSED (or `--force`d with a loud alarm) if it would drop any active class
+  below its floor without a complete replacement pool.
+- **EP2 — write time, post-commit, classified:** after the fan-out
+  transaction commits (the assertion cannot live inside it — `session_scope`
+  rolls back and would un-record real copies), a separate transaction checks
+  the realized copies: distinct media via a **per-family identity extractor**
+  (tape → `tape_uuid`, d2 → `volume_uuid`/barcode, ssh_disk → host+fs
+  identity, s3 → bucket, memory → exempt) — v1's plan to reuse
+  `_assert_distinct_media` verbatim would have made every non-tape pool
+  (including the LAN backup) unwritable — plus realized family count vs the
+  floor. Deficiency is routed through the condition vocabulary, not a bare
+  raise: transient backend failure → `backoff` condition (bounded retry);
+  structural floor violation → `blocked` condition + operator alarm, **no
+  hot-retry** (a structurally failing target must not manufacture duplicate
+  copies each attempt). Ongoing floor drift is caught level-triggered by
+  M2's observe.
 
-- `Pool.state ∈ {active, draining, retired}` (default `active`).
-  `draining`: no new placements (`target_pools` excludes it for writes);
-  restores still read it. `retired`: neither; rows retained forever.
-- FK changes: `AssetLocator.pool_id` and `BlobRoot.pool_id` →
-  `ondelete=RESTRICT`. Pool rows are never deleted in normal operation —
-  retirement is a state, not a row delete. (Copy.pool_id stays SET NULL: a
-  copy outliving catalog config is representable; locators — the restore map —
-  are not allowed to be destroyed by config changes.)
-- Media migration shape (documented, not built): stand up new pool → add
-  membership → M2's reconciler backfills → flip old pool to `draining` →
-  verify placement_status complete everywhere → `retired`.
+### D3 — Pool lifecycle (slim)
 
-### D4 — One source selector, purpose-parametrized
+- FK: `asset_locator.pool_id`, `blob_root.pool_id` → `ondelete=RESTRICT`.
+  SQLite requires batch table-recreate; the migration must explicitly
+  re-declare ALL constraints/indexes (house pattern `2f4a8bb0c2d7`) or the
+  copy XOR/uniques silently vanish. A post-migration schema-assert test
+  verifies the constraints survived.
+- `Pool.accepts_writes` bool (write fence; `target_pools` excludes fenced
+  pools for writes; restores still read them) — guarded per D2 EP1.
+  `Pool.retired` bool settable only when the pool holds no live locators.
+  The 3-state enum is deferred to the first real migration campaign.
+- `Pool.media_generation` (nullable string; descriptive only, for
+  migration-campaign queries — never enforcement, per B4).
 
-`select_source(session, target, *, purpose, exclude=()) -> ordered candidates`
-with `purpose ∈ {user_restore, self_heal, verify, dr}`:
+### D4 — Source selection: two purposes, trust-first healing
 
-- `user_restore`: policy `restore_preference` order, then remaining active
-  pools by `sort_order` (current `_restore_pool_order` semantics, now validated
-  — see D5).
-- `self_heal`: **cheapest-trusted** — prefer plain representations over AEAD
-  (no key materialization), local/working over offsite, health=ok with recent
-  verify first; deterministic total order.
-- `verify`/`dr`: all candidates / offsite-preferring respectively (thin now;
-  the enum is the extension point).
+- Formalize the existing `chooser` seam into `select_source(session, target,
+  *, purpose)` with exactly **two** purposes: `user_restore` (policy
+  `restore_preference` walk — current `_restore_pool_order` semantics) and
+  `self_heal`. `verify`/`dr` purposes are dropped until a consumer exists
+  (adding an enum member later is a one-line diff).
+- `self_heal` ordering is **trust-first, cost-tiebreak** (v1 had this
+  backwards): `health=ok` first, then `last_verified_at` DESC, THEN plain-
+  over-AEAD and local-over-offsite as tiebreakers among equally-trusted
+  candidates. Deterministic total order.
+- **Fallback + suspect discipline:** healing iterates candidates; a failed
+  source is handled per the SUSPECT rules below; raise only on exhaustion.
+- **SUSPECT lifecycle (new, explicit):** only a **proven digest mismatch**
+  latches `health=SUSPECT`. Transport/timeout/short-read errors are
+  transient: no latch, condition backoff. Scrub's verify path gains
+  SUSPECT→OK: a copy that re-proves its digest clears to `ok` (today SUSPECT
+  is a one-way latch, which under a flapping drive would mass-condemn good
+  copies and stampede repairs). `restore_asset` keeps its fallthrough but a
+  proven-mismatch copy is marked in the same transaction — corruption
+  discovered by ANY read is a durability event.
+- **hdcache contract untouched** (frozen design): `resolve_read_source`
+  continues to wrap `restore_asset`; `select_restore_source`/`select_source`
+  stays cache-blind. The deletion gate keeps its verified semantics via M1's
+  `require_verified=True` — no re-pointing.
 
-Consumers: `restore_asset`, `self_heal` (which additionally gains **fallback
-iteration** — on source failure, mark that copy `suspect` and try the next
-candidate; raise only when exhausted), M2's `bundle-repair`, hdcache's
-`resolve_read_source` (unchanged behavior, now via the same seam).
+### D5 — Defect fixes (each independently landable; can precede M1)
 
-**Corruption is a durability event:** any integrity failure observed on any
-read path (restore, self-heal source, repair verify) sets `copy.health =
-SUSPECT` in the same transaction and (post-M2) nudges the relevant reconciler
-condition. `restore_asset`'s current append-to-errors-and-continue keeps the
-fallthrough but stops being silent.
+1. Cross-class bleed: restore + retention locator queries join
+   `Bundle.artifactclass` for rows with `bundle_id`; rows with NULL
+   `bundle_id` (legacy/SET-NULL) fall back to the asset's class memberships.
+2. `cloud-blob` records `representation = pool.representation`, refusing
+   pools it cannot produce.
+3. `restore_preference` validated at policy apply (unknown pool → error;
+   write-fenced pool → warning, kept readable).
+4. Drop `replicate.py`'s `{"o-archive","n-archive"}` name set — sealer/epoch
+   provisioning derives from "any target pool has an AEAD representation".
+   Ships together with whatever next touches that write path (it gates epoch
+   minting; not a drive-by).
+5. Duplicates (see D6).
 
-### D5 — Defect fixes riding along
+### D6 — Duplicate-copy stance (explicit)
 
-1. Cross-class bleed: restore and retention locator queries join
-   `Bundle.artifactclass == requested class` (locators without bundles — pre-M4
-   legacy — filter via the asset's class memberships).
-2. `cloud-blob` records `representation = pool.representation` and refuses a
-   pool whose representation it cannot produce.
-3. `restore_preference` validated at policy apply: unknown pool ⇒ error;
-   inactive/draining pool ⇒ warning (kept — restores may still read draining).
-4. `replicate.py` drops the `{"o-archive","n-archive"}` name set: sealer/key
-   provisioning derives from "any target pool has an AEAD representation"
-   (`target_pools` already computes `key_epoch` per pool).
-5. Duplicate-copy write race: `repair`/`bundle-repair` re-check
-   `qualifying_copies` inside the write transaction before recording; and
-   `placement_status` counts distinct pools, tolerating (flagging) duplicates.
-   (A hard partial-unique index on live (target, pool) is rejected: scrub
-   imports and migration transitions legitimately hold transient duplicates.)
+No hard uniqueness on (target, pool) — scrub imports and repair transitions
+legitimately overlap. Instead: `placement_status` counts distinct pools (never
+raw rows) and FLAGS duplicates; a persistent duplicate count >1 for one
+(target, pool) raises an operator alarm (it is a stuck-retry signal); EP2's
+transient/structural classification prevents retry-manufactured duplicates;
+repair re-checks `qualifying_copies` inside its write transaction. Tape
+duplicates are documented as permanent-and-unreclaimable (no GC job — the
+alarm exists so they stay rare); disk-family duplicates may be reclaimed by a
+future janitor, explicitly out of scope here.
 
 ## 3. Schema delta summary
 
-- `backend.implementation_family` (required; backfilled by kind in migration).
-- `pool.state` (default active), `pool.media_generation` (nullable).
-- FK: `asset_locator.pool_id`, `blob_root.pool_id` → RESTRICT.
-- Policy TOML: `[durability] min_copies / min_impl_families` per class.
-- M3/M4 only: degenerate bundles; no new columns (bundle/member/locator reused);
-  M4 backfill migration; XOR tightening deferred to cleanup.
+`backend.implementation_family` (required, backfilled by kind);
+`pool.accepts_writes` (bool, default true), `pool.retired` (bool, default
+false, guarded), `pool.media_generation` (nullable); FK RESTRICT ×2 (batch
+recreate, constraints re-declared); `artifactclass_policy` durability columns
++ `[durability]` in the strict parser. NO Copy/XOR changes. NO backfill.
 
-## 4. Verification members (scenario-or-cover rule)
+## 4. Verification members (scenario-or-cover; failure legs are the point)
 
-- **New hermetic scenario BSH (bundle self-heal):** archive a bundle to 3
-  pools → damage/delete one pool's copy → scrub marks MISSING → `sutra
-  reconcile bundle_copy` + worker → repaired copy on distinct media →
-  `bundle_replication_status` complete; restore from the repaired pool
-  byte-identical.
-- **New hermetic scenario DIV (durability enforcement):** policy declaring 3
-  pools on one family ⇒ apply rejected; conforming policy ⇒ write-commit
-  assertion green; simulated single-family realized fan-out ⇒ loud failure.
-- **POOL-LC legs (can live in DIV):** draining pool excluded from new writes,
-  still restorable; pool-row delete attempt with live locators ⇒ RESTRICT error.
-- Extend Q: self-heal fallback (source #1 corrupt-but-OK ⇒ marked suspect,
-  heal completes from source #2) and preference-aware source choice (heals from
-  plain, not AEAD, in a 3-pool topology with non-insertion preference order).
-- M3/M4 gate: full clean-slate `make suite` (J/N/O/Q byte-compat is the bar).
+- **BSH (bundle self-heal, hermetic):** happy leg (damage one pool's copy →
+  scrub marks → reconcile → repaired on distinct media → restore
+  byte-identical) PLUS: repair **after `sweep_staging` purged the landing
+  bytes**; corrupt-source fallback (source #1 proven-mismatch → SUSPECT →
+  heals from #2); crash-mid-repair leaves no duplicate/no mis-adoption
+  (re-run converges); repaired copy has `BlobRoot` + `AssetLocator`; family
+  count preserved (distinct tape ≠ distinct family).
+- **DIV (durability enforcement, hermetic):** EP1 rejects a 3-pool/1-family
+  policy; drain guard refuses fencing a floor-critical pool; EP2 transient
+  failure → backoff condition (retry converges, no duplicate), structural
+  single-family fan-out → blocked + alarm, bundle state not stuck-open;
+  pool-delete with live locators → RESTRICT error; schema-assert leg
+  (XOR + uniques survive the batch migrations).
+- **Extend Q:** trust-first source choice (stale plain vs fresh AEAD → picks
+  fresh AEAD); transient read error does NOT latch SUSPECT; proven mismatch
+  does, heal falls back, and a later verified-good scrub CLEARS SUSPECT.
+- M1 routing is covered by the existing green suite (J/N/O/Q unchanged
+  semantics) + sutradhara pytest.
 
 ## 5. Non-goals
 
-Significance-driven copy counts (deferred; needs its own placement mechanism —
-not a `target_pools` swap); same-kind multi-backend routing scenario;
-media-generation *policy* (B4: descriptive only); lease/queue changes
-(prompt-jobs-safety-rails owns those); hdcache scope (frozen design owns it);
-any change to rem/d2tape on-tape formats.
+M4-style backfill (dropped, permanently); converting `replicate_asset` now;
+XOR tightening; significance-driven counts; same-kind multi-backend routing;
+media-generation policy; duplicate GC; lease/queue changes
+(`prompt-jobs-safety-rails.md`); hdcache scope; on-tape format changes;
+`verify`/`dr` selector purposes; 3-state pool enum.
 
-## 6. Open questions for the panel
+## 6. Prompt staging (after freeze)
 
-1. M4 backfill: synthesize bundles for legacy asset copies in one migration, or
-   lazily on first touch? (Author leans one migration — lazy leaves the fork
-   alive indefinitely.)
-2. Degenerate-bundle id scheme + whether `bundle.artifactclass` for o/n legacy
-   classes needs a compat alias.
-3. Does the write-commit durability assertion belong per-operation (loud
-   failure return) or as a catalog invariant check the reconciler also sweeps
-   (author: both — the sweep catches drift the write path never saw)?
-4. `implementation_family` on Backend vs Pool (author: Backend — family is a
-   property of the adapter/toolchain, and pools inherit it).
-5. Is `draining` worth having from day one, or does `active/retired` suffice
-   until the first real migration campaign?
+1. **CG-M1** — durability predicate module + routing + duplicate flags
+   (+ D5.1/D5.2/D5.3 riding along; pytest-only verification).
+2. **CG-M2** — build primitive factor-out + `bundle_copy` reconciler domain +
+   `bundle-repair` handler + scrub adoption fix + D4 selector/SUSPECT
+   lifecycle + scenario BSH + Q extension.
+3. **CG-M3** — D2/D3 schema + parser + EP1/EP2 + drain guard + scenario DIV.
+   (D5.4 rides with whichever of these first touches the replicate write
+   path.) Grain pin (D1) binds the future copy-handler prompt, which must
+   also include `--reopen-blocked --reason not-implemented` per
+   `prompt-jobs-safety-rails.md`.
