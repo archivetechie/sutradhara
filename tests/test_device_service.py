@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import queue
 import threading
 from collections.abc import Callable, Iterator
@@ -239,6 +240,75 @@ def test_device_service_dispatches_directory_listing_and_routes_reply(engine: En
     assert pending.future.result(timeout=2).entries[0].name == "100MEDIA"
     messages.close()
     responses.close()
+
+
+def test_device_service_revocation_evicts_on_next_heartbeat(engine: Engine) -> None:
+    registry = ConnectedDeviceRegistry()
+    servicer = DeviceService(DeviceServiceConfig(engine=engine, registry=registry))
+    with session_scope(engine) as session:
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+
+    messages = _BlockingIterator()
+    responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
+    thread = threading.Thread(target=lambda: _ignore_stop_iteration(responses), daemon=True)
+    thread.start()
+    messages.put(
+        device_pb2.DeviceMessage(
+            card_snapshot=device_pb2.CardSnapshot(
+                cards=[
+                    device_pb2.Card(
+                        card_id="card-1",
+                        label="Card 1",
+                        kind=device_pb2.CARD_KIND_CARD,
+                        size_bytes=10,
+                        status="available",
+                    )
+                ]
+            )
+        )
+    )
+    _eventually(lambda: registry.devices_for("owner")[0].cards[0].card_id == "card-1")
+    with session_scope(engine) as session:
+        grpc_store.revoke_device(session, "mac-1")
+
+    messages.put(device_pb2.DeviceMessage(heartbeat=device_pb2.Heartbeat()))
+
+    _eventually(lambda: registry.devices_for("owner") == [])
+    messages.close()
+    thread.join(timeout=2)
+
+
+def test_device_service_max_stream_lifetime_evicts_stream(engine: Engine) -> None:
+    registry = ConnectedDeviceRegistry()
+    servicer = DeviceService(
+        DeviceServiceConfig(
+            engine=engine,
+            registry=registry,
+            command_poll_seconds=0.01,
+            max_stream_lifetime=dt.timedelta(seconds=0),
+        )
+    )
+    with session_scope(engine) as session:
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+
+    messages = _BlockingIterator()
+    responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
+    thread = threading.Thread(target=lambda: _ignore_stop_iteration(responses), daemon=True)
+    thread.start()
+
+    _eventually(lambda: registry.devices_for("owner") == [])
+    messages.close()
+    thread.join(timeout=2)
 
 
 def test_device_service_ack_does_not_complete_when_card_correlation_fails(

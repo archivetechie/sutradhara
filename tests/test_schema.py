@@ -210,6 +210,8 @@ def _assert_grpc_relay_invariants(db_path: Path) -> None:
     token_sql = _table_sql(db_path, "grpc_enroll_token")
     assert "operator" in token_sql
     assert "device_id" in token_sql
+    assert "rotation_authority" in token_sql
+    assert "rotation_fingerprint" in token_sql
 
 
 def _assert_hdcache_invariants(db_path: Path) -> None:

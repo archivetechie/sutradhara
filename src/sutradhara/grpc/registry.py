@@ -287,6 +287,13 @@ class ConnectedDeviceRegistry:
                 raise CardUnavailable("card is not present on the device")
             return card
 
+    def active_fingerprint_for(self, *, operator: str, device_id: str) -> str:
+        """Return the live stream's authenticated cert fingerprint after owner checks."""
+
+        with self._lock:
+            entry = self._entry_for_operator_locked(operator, device_id)
+            return entry.identity.fingerprint
+
     def send_start_receive(
         self,
         *,

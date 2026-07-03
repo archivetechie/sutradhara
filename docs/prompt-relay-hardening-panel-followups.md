@@ -1,6 +1,6 @@
 # Codex prompt — relay hardening (3 follow-ups from the Rust-agent panel)
 
-**Repo:** `~/sutradhara/repo` (server side). **Status:** pending.
+**Repo:** `~/sutradhara/repo` (server side). **Status:** implemented.
 **Origin:** the 5-lens panel on `~/sutra-agent/docs/design-rust-agent-control-plane.md` §13
 found three gaps in the **already-built server relay** — client-independent, so filed here.
 Ordered by severity: #1 is a data-safety issue (a false "safe to eject"); #2–#3 are security

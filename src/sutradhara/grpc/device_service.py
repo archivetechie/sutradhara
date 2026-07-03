@@ -8,6 +8,7 @@ gRPC writes single-threaded while HTTP handlers can enqueue work safely.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import threading
 from collections.abc import Iterable
@@ -42,6 +43,7 @@ class DeviceServiceConfig:
     engine: Engine
     registry: ConnectedDeviceRegistry
     command_poll_seconds: float = 0.25
+    max_stream_lifetime: dt.timedelta = dt.timedelta(hours=24)
 
 
 class DeviceService(device_pb2_grpc.DeviceServiceServicer):
@@ -55,17 +57,22 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
 
         identity = self._identity(context)
         stop = threading.Event()
+        connected_at = dt.datetime.now(dt.UTC)
         stream = self.config.registry.register(identity, close_stream=stop.set)
 
         reader = threading.Thread(
             target=self._read_messages,
-            args=(stream, request_iterator, stop),
+            args=(stream, request_iterator, stop, identity, connected_at),
             name=f"sutra-device-reader-{identity.device_id}",
             daemon=True,
         )
         reader.start()
         try:
             while not stop.is_set():
+                if self._stream_expired(connected_at):
+                    reason = PermissionError("device stream lifetime expired")
+                    stream.close(reason)
+                    break
                 try:
                     pending = stream.next_command(timeout=self.config.command_poll_seconds)
                 except StreamClosed:
@@ -93,10 +100,20 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
         stream: RegisteredDeviceStream,
         request_iterator: Iterable[Any],
         stop: threading.Event,
+        identity: grpc_store.DeviceIdentity,
+        connected_at: dt.datetime,
     ) -> None:
         try:
             for message in request_iterator:
                 if stop.is_set():
+                    break
+                if self._stream_expired(connected_at):
+                    stop.set()
+                    stream.close(PermissionError("device stream lifetime expired"))
+                    break
+                if not self._dispatch_authorized(identity):
+                    stop.set()
+                    stream.close(PermissionError("device certificate is no longer enrolled"))
                     break
                 self._handle_message(stream, message)
         except Exception:
@@ -224,6 +241,9 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
             except PermissionError:
                 return False
         return True
+
+    def _stream_expired(self, connected_at: dt.datetime) -> bool:
+        return connected_at + self.config.max_stream_lifetime < dt.datetime.now(dt.UTC)
 
     def _stream_identity(self, stream: RegisteredDeviceStream) -> grpc_store.DeviceIdentity | None:
         factory = make_session_factory(self.config.engine)

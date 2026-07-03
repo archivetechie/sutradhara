@@ -84,8 +84,23 @@ def test_servicer_start_upload_commit_watch_and_owner_check(engine: Engine, tmp_
                 source_plan_digest="a" * 64,
             ),
             context,
-        )
+    )
     assert conflict.value.code == grpc.StatusCode.FAILED_PRECONDITION
+
+    with pytest.raises(_Abort) as changed_source:
+        servicer.StartIntake(
+            intake_pb2.StartIntakeRequest(
+                idempotency_key="key-1",
+                artifactclass="video-master",
+                source_kind="card",
+                source_ref="card-a",
+                label="Card A",
+                source_plan_digest="b" * 64,
+            ),
+            context,
+        )
+    assert changed_source.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert "source changed" in changed_source.value.details
 
     payload = b"video"
     receipt = servicer.UploadFile(

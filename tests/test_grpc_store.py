@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from collections.abc import Iterator
 
 import pytest
@@ -98,7 +99,66 @@ def test_device_enrollment_token_revoke_and_schema(engine: Engine) -> None:
         )
 
 
-def test_device_reenrollment_supersedes_prior_fingerprint(engine: Engine) -> None:
+def test_device_reenrollment_requires_rotation_proof(engine: Engine) -> None:
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+        with pytest.raises(store.DeviceRotationProofError):
+            store.record_device_enrollment(
+                session,
+                device_id="mac-1",
+                cert_fingerprint="BB" * 32,
+                operator="owner",
+            )
+
+    with session_scope(engine) as session:
+        assert store.operator_for_device(session, "mac-1") == "owner"
+        assert store.resolve_device(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+        ).operator == "owner"
+        with pytest.raises(PermissionError):
+            store.resolve_device(session, device_id="mac-1", cert_fingerprint="BB" * 32)
+        assert _active_enrollment_count(session, "mac-1") == 1
+
+
+def test_device_reenrollment_allows_old_key_proof(engine: Engine, caplog) -> None:
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+        with caplog.at_level(logging.INFO, logger=store.__name__):
+            store.record_device_enrollment(
+                session,
+                device_id="mac-1",
+                cert_fingerprint="BB" * 32,
+                operator="owner",
+                rotation_authority="self",
+                rotation_fingerprint="AA" * 32,
+            )
+    assert "device certificate rotated" in caplog.text
+
+    with session_scope(engine) as session:
+        with pytest.raises(PermissionError):
+            store.resolve_device(session, device_id="mac-1", cert_fingerprint="AA" * 32)
+        identity = store.resolve_device(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="BB" * 32,
+        )
+        assert identity.operator == "owner"
+        assert _active_enrollment_count(session, "mac-1") == 1
+
+
+def test_device_reenrollment_allows_admin_rotation(engine: Engine) -> None:
     with session_scope(engine) as session:
         store.record_device_enrollment(
             session,
@@ -111,19 +171,17 @@ def test_device_reenrollment_supersedes_prior_fingerprint(engine: Engine) -> Non
             device_id="mac-1",
             cert_fingerprint="BB" * 32,
             operator="owner",
+            rotation_authority="admin",
         )
 
     with session_scope(engine) as session:
-        assert store.operator_for_device(session, "mac-1") == "owner"
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="AA" * 32)
-        identity = store.resolve_device(
+        assert store.resolve_device(
             session,
             device_id="mac-1",
             cert_fingerprint="BB" * 32,
-        )
-        assert identity.operator == "owner"
-        assert _active_enrollment_count(session, "mac-1") == 1
+        ).operator == "owner"
 
 
 def test_device_reenrollment_same_fingerprint_is_idempotent(engine: Engine) -> None:

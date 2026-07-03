@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
@@ -56,7 +57,9 @@ def test_enroll_token_refuses_duplicate_without_reenroll(api_engine: Engine) -> 
     assert response.json()["error"] == "device_already_enrolled"
 
 
-def test_enroll_token_allows_same_operator_reenroll(api_engine: Engine) -> None:
+def test_enroll_token_refuses_same_operator_reenroll_without_old_key_proof(
+    api_engine: Engine,
+) -> None:
     with session_scope(api_engine) as session:
         store.record_device_enrollment(
             session,
@@ -72,9 +75,91 @@ def test_enroll_token_allows_same_operator_reenroll(api_engine: Engine) -> None:
         json={"device_id": "mac-1", "reenroll": True},
     )
 
+    assert response.status_code == 409
+    assert response.json()["error"] == "old_key_proof_required"
+
+
+def test_enroll_token_allows_same_operator_reenroll_with_live_old_key_proof(
+    api_engine: Engine,
+) -> None:
+    registry = ConnectedDeviceRegistry()
+    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+    with session_scope(api_engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/enroll/token",
+        headers=post_headers("operator"),
+        json={"device_id": "mac-1", "reenroll": True},
+    )
+
     assert response.status_code == 200
     assert response.json()["deviceId"] == "mac-1"
-    assert response.json()["token"]
+    token = response.json()["token"]
+    with session_scope(api_engine) as session:
+        row = session.get(store.GrpcEnrollToken, token)
+        assert row is not None
+        assert row.rotation_authority == "self"
+        assert row.rotation_fingerprint == store.normalize_fingerprint("AA" * 32)
+
+
+def test_enroll_token_refuses_stale_live_stream_proof(api_engine: Engine) -> None:
+    registry = ConnectedDeviceRegistry()
+    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="BB" * 32))
+    with session_scope(api_engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/enroll/token",
+        headers=post_headers("operator"),
+        json={"device_id": "mac-1", "reenroll": True},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "old_key_proof_required"
+
+
+def test_enroll_token_allows_admin_confirmed_rotation_without_live_stream(
+    api_engine: Engine,
+) -> None:
+    with session_scope(api_engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+    client = TestClient(make_api_app(api_engine))
+
+    response = client.post(
+        "/api/enroll/token",
+        headers=post_headers("admin"),
+        json={"device_id": "mac-1", "reenroll": True},
+    )
+
+    assert response.status_code == 200
+    token = response.json()["token"]
+    with session_scope(api_engine) as session:
+        row = session.get(store.GrpcEnrollToken, token)
+        assert row is not None
+        assert row.rotation_authority == "admin"
+        assert row.rotation_fingerprint is None
 
 
 def test_enroll_token_refuses_different_operator_device(api_engine: Engine) -> None:
@@ -179,6 +264,51 @@ def test_enroll_csr_maps_other_operator_refusal_to_conflict(
         row = session.get(store.GrpcEnrollToken, token)
         assert row is not None
         assert row.used_at is None
+
+
+def test_enroll_csr_with_old_key_proof_rotates_and_evicts_live_stream(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    registry = ConnectedDeviceRegistry()
+    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+    with session_scope(api_engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    app.state.grpc_pki_dir = tmp_path / "pki"
+    client = TestClient(app)
+    token = client.post(
+        "/api/enroll/token",
+        headers=post_headers("operator"),
+        json={"device_id": "mac-1", "reenroll": True},
+    ).json()["token"]
+    material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
+
+    response = client.post(
+        "/api/enroll/csr",
+        headers={"Host": "testserver", "Content-Type": "application/json"},
+        json={"csr_pem": material.csr_path.read_text(encoding="utf-8"), "token": token},
+    )
+
+    assert response.status_code == 200
+    assert registry.devices_for("owner") == []
+    cert_path = tmp_path / "signed.crt"
+    cert_path.write_text(response.json()["cert_pem"], encoding="utf-8")
+    new_fingerprint = ca.cert_fingerprint(cert_path)
+    with session_scope(api_engine) as session:
+        with pytest.raises(PermissionError):
+            store.resolve_device(session, device_id="mac-1", cert_fingerprint="AA" * 32)
+        assert store.resolve_device(
+            session,
+            device_id="mac-1",
+            cert_fingerprint=new_fingerprint,
+        ).operator == "owner"
 
 
 def test_revoke_device_can_evict_live_registry_stream(api_engine: Engine) -> None:

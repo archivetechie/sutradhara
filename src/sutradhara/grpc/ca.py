@@ -36,6 +36,10 @@ class DeviceOwnershipCertificateError(CertificateError):
     """Raised when CSR signing would assign a device to the wrong operator."""
 
 
+class DeviceRotationProofCertificateError(CertificateError):
+    """Raised when CSR signing would rotate a device without old-key proof."""
+
+
 @dataclass(frozen=True)
 class DeviceCertificate:
     """Signed device-certificate result."""
@@ -246,11 +250,17 @@ def sign_device_csr(
                 device_id=device_id,
                 cert_fingerprint=fingerprint,
                 operator=grant.operator,
+                rotation_authority=grant.rotation_authority,
+                rotation_fingerprint=grant.rotation_fingerprint,
             )
     except store.DeviceOwnershipError as exc:
         with factory.begin() as session:
             store.release_enroll_token(session, token)
         raise DeviceOwnershipCertificateError(str(exc)) from exc
+    except store.DeviceRotationProofError as exc:
+        with factory.begin() as session:
+            store.release_enroll_token(session, token)
+        raise DeviceRotationProofCertificateError(str(exc)) from exc
     return DeviceCertificate(
         device_id=device_id,
         operator=grant.operator,

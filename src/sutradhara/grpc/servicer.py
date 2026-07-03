@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import grpc
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
 
 from sutradhara._proto import intake_pb2, intake_pb2_grpc
 from sutradhara.api import store as api_store
@@ -78,8 +78,11 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
         )
         if decision.state == "completed":
             response = decision.response_json or {}
-            return intake_pb2.StartIntakeResponse(intake_id=str(response.get("intake_id", "")))
+            intake_id = str(response.get("intake_id", ""))
+            self._assert_resume_source_plan(intake_id, identity, request.source_plan_digest, context)
+            return intake_pb2.StartIntakeResponse(intake_id=intake_id)
         if decision.state == "conflict":
+            self._abort_if_resume_source_changed(request, identity, context)
             _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "idempotency key conflict")
         if decision.state != "claimed":
             _abort(context, grpc.StatusCode.ALREADY_EXISTS, "intake start already in progress")
@@ -357,6 +360,56 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                     get_artifactclass_policy(session, request.artifactclass)
             except ArtifactClassPolicyError as exc:
                 _abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+
+    def _assert_resume_source_plan(
+        self,
+        intake_id: str,
+        identity: grpc_store.DeviceIdentity,
+        source_plan_digest: str,
+        context: Any,
+    ) -> None:
+        if not intake_id:
+            _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "resume has no intake id")
+        factory = make_session_factory(self.config.engine)
+        with factory() as session:
+            row = grpc_store.get_intake(session, intake_id)
+            if row is None:
+                _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "resume intake is unknown")
+            if row.operator != identity.operator or row.device_id != identity.device_id:
+                _abort(context, grpc.StatusCode.PERMISSION_DENIED, "intake owner mismatch")
+            if row.source_plan_digest != source_plan_digest:
+                _abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "source changed; start a new intake",
+                )
+
+    def _abort_if_resume_source_changed(
+        self,
+        request: Any,
+        identity: grpc_store.DeviceIdentity,
+        context: Any,
+    ) -> None:
+        factory = make_session_factory(self.config.engine)
+        with factory() as session:
+            record = session.scalars(
+                select(api_store.IdempotencyRecord).where(
+                    api_store.IdempotencyRecord.operator_username == identity.operator,
+                    api_store.IdempotencyRecord.endpoint == grpc_store.GRPC_START_ENDPOINT,
+                    api_store.IdempotencyRecord.idempotency_key == request.idempotency_key,
+                )
+            ).one_or_none()
+            if record is None or record.status != "completed" or record.intake_id is None:
+                return
+            row = grpc_store.get_intake(session, record.intake_id)
+            if row is None or row.operator != identity.operator or row.device_id != identity.device_id:
+                return
+            if row.source_plan_digest != request.source_plan_digest:
+                _abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "source changed; start a new intake",
+                )
 
 
 def _start_request_hash(request: Any) -> str:

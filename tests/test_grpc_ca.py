@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from sqlalchemy import Engine
@@ -133,6 +134,39 @@ def test_signing_refuses_other_operator_and_releases_token(engine: Engine, tmp_p
         ).operator == "owner"
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="BB" * 32)
+
+
+def test_signing_refuses_same_operator_rotation_without_proof(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+        token = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
+
+    with pytest.raises(ca.DeviceRotationProofCertificateError):
+        ca.sign_device_csr(
+            engine,
+            pki_dir=tmp_path / "pki",
+            csr_path=material.csr_path,
+            token=token,
+        )
+
+    with session_scope(engine) as session:
+        row = session.get(store.GrpcEnrollToken, token)
+        assert row is not None
+        assert row.used_at is None
+        assert store.resolve_device(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+        ).operator == "owner"
 
 
 class _FakeContext:

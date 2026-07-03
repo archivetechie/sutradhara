@@ -12,6 +12,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import json
+import logging
 import tempfile
 import threading
 from functools import partial
@@ -42,6 +43,7 @@ from sutradhara.grpc.registry import (
 from sutradhara.grpc.status import intake_status
 
 router = APIRouter()
+LOG = logging.getLogger(__name__)
 
 
 class DeviceReceiveRequest(BaseModel):
@@ -367,11 +369,46 @@ def post_enroll_token(request: Request, body: EnrollTokenRequest) -> dict[str, s
                 "device_other_operator",
                 "device is enrolled to a different operator; an admin must revoke it first",
             )
+        try:
+            rotation_authority, rotation_fingerprint = _rotation_authorization(
+                _registry(request),
+                identity,
+                device_id=body.device_id,
+                owner=owner,
+                reenroll=body.reenroll,
+            )
+        except (DeviceOffline, DeviceOwnerMismatch):
+            _raise(
+                409,
+                "old_key_proof_required",
+                "re-enroll requires the current device stream or an admin rotation",
+            )
+        if rotation_authority == "self" and rotation_fingerprint is not None:
+            try:
+                proof_identity = grpc_store.resolve_device(
+                    session,
+                    device_id=body.device_id,
+                    cert_fingerprint=rotation_fingerprint,
+                )
+            except (PermissionError, ValueError):
+                _raise(
+                    409,
+                    "old_key_proof_required",
+                    "re-enroll requires the current active device certificate",
+                )
+            if proof_identity.operator != identity.operator_username:
+                _raise(
+                    409,
+                    "old_key_proof_required",
+                    "re-enroll requires the current active device certificate",
+                )
         token = grpc_store.issue_enroll_token(
             session,
             operator=identity.operator_username,
             device_id=body.device_id,
             ttl=ttl,
+            rotation_authority=rotation_authority,
+            rotation_fingerprint=rotation_fingerprint,
         )
     expires = dt.datetime.now(dt.UTC) + ttl
     return {"token": token, "deviceId": body.device_id, "expiresAt": expires.isoformat()}
@@ -401,10 +438,18 @@ def post_enroll_csr(request: Request, body: EnrollCsrRequest) -> dict[str, str]:
             )
         except grpc_ca.DeviceOwnershipCertificateError as exc:
             _raise(409, "device_other_operator", str(exc))
+        except grpc_ca.DeviceRotationProofCertificateError as exc:
+            _raise(409, "old_key_proof_required", str(exc))
         except grpc_ca.CertificateError as exc:
             _raise(400, "bad_enrollment", str(exc))
         except ValueError as exc:
             _raise(400, "bad_enrollment", str(exc))
+        evicted = _registry(request).evict(
+            signed.device_id,
+            reason=StreamClosed("device certificate rotated"),
+        )
+        if evicted:
+            LOG.info("evicted live device stream after certificate rotation: %s", signed.device_id)
         ca_pem = (pki_dir / grpc_ca.CA_CERT_NAME).read_text(encoding="utf-8")
         cert_pem = signed.cert_path.read_text(encoding="utf-8")
     return {"cert_pem": cert_pem, "ca_pem": ca_pem}
@@ -470,6 +515,29 @@ def _validate_artifactclass(engine: object, artifactclass: str) -> None:
     factory = make_session_factory(engine)
     with factory() as session:
         get_artifactclass_policy(session, artifactclass)
+
+
+def _rotation_authorization(
+    registry: ConnectedDeviceRegistry,
+    identity: Identity,
+    *,
+    device_id: str,
+    owner: str | None,
+    reenroll: bool,
+) -> tuple[grpc_store.RotationAuthority | None, str | None]:
+    if owner is None or owner != identity.operator_username:
+        return None, None
+    if not reenroll:
+        return None, None
+    if identity.has_capability("can_admin"):
+        return "admin", None
+    return (
+        "self",
+        registry.active_fingerprint_for(
+            operator=identity.operator_username,
+            device_id=device_id,
+        ),
+    )
 
 
 def _device_payload(device: object) -> dict[str, object]:

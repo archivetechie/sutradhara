@@ -9,6 +9,7 @@ watcher/sweep hint and disappears after CommitIntake hands the bag to
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import secrets
 from dataclasses import dataclass
 from typing import Literal
@@ -20,6 +21,8 @@ from sutradhara.catalog.models import Base
 
 GRPC_START_ENDPOINT = "grpc:StartIntake"
 GrpcIntakeState = Literal["streaming", "committing", "committed", "aborted"]
+RotationAuthority = Literal["self", "admin"]
+LOG = logging.getLogger(__name__)
 
 
 class GrpcIntake(Base):
@@ -87,6 +90,8 @@ class GrpcEnrollToken(Base):
     expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     operator: Mapped[str] = mapped_column(String(128), nullable=False)
     device_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    rotation_authority: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    rotation_fingerprint: Mapped[str | None] = mapped_column(String(95), nullable=True)
     used_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -105,10 +110,16 @@ class EnrollTokenGrant:
 
     operator: str
     device_id: str
+    rotation_authority: RotationAuthority | None = None
+    rotation_fingerprint: str | None = None
 
 
 class DeviceOwnershipError(PermissionError):
     """Raised when an enrollment would cross an active device owner boundary."""
+
+
+class DeviceRotationProofError(PermissionError):
+    """Raised when a re-enrollment would replace an active cert without proof."""
 
 
 def insert_intake(
@@ -239,11 +250,20 @@ def issue_enroll_token(
     operator: str,
     device_id: str,
     ttl: dt.timedelta = dt.timedelta(hours=24),
+    rotation_authority: RotationAuthority | None = None,
+    rotation_fingerprint: str | None = None,
 ) -> str:
     """Create and persist a one-time operator/device-bound enrollment token."""
 
     token = secrets.token_urlsafe(32)
     now = _utcnow()
+    if rotation_authority is None and rotation_fingerprint is not None:
+        raise ValueError("rotation_fingerprint requires rotation_authority")
+    if rotation_authority == "self" and not rotation_fingerprint:
+        raise ValueError("self rotation requires old certificate fingerprint proof")
+    normalized_rotation_fingerprint = (
+        normalize_fingerprint(rotation_fingerprint) if rotation_fingerprint is not None else None
+    )
     session.add(
         GrpcEnrollToken(
             token=token,
@@ -251,6 +271,8 @@ def issue_enroll_token(
             expires_at=now + ttl,
             operator=operator,
             device_id=device_id,
+            rotation_authority=rotation_authority,
+            rotation_fingerprint=normalized_rotation_fingerprint,
         )
     )
     return token
@@ -276,7 +298,12 @@ def consume_enroll_token(
     if device_id is not None and row.device_id != device_id:
         raise ValueError("CSR common name does not match enrollment token device_id")
     row.used_at = timestamp
-    return EnrollTokenGrant(operator=row.operator, device_id=row.device_id)
+    return EnrollTokenGrant(
+        operator=row.operator,
+        device_id=row.device_id,
+        rotation_authority=row.rotation_authority,
+        rotation_fingerprint=row.rotation_fingerprint,
+    )
 
 
 def release_enroll_token(session: Session, token: str) -> bool:
@@ -295,15 +322,21 @@ def record_device_enrollment(
     device_id: str,
     cert_fingerprint: str,
     operator: str,
+    rotation_authority: RotationAuthority | None = None,
+    rotation_fingerprint: str | None = None,
 ) -> GrpcDeviceEnrollment:
     """Record one active certificate fingerprint for a device/operator.
 
-    Re-enrollment by the same operator supersedes any prior active fingerprint
-    for the device. Active ownership by a different operator is refused without
-    mutating the existing rows.
+    Re-enrollment by the same operator supersedes a prior active fingerprint only
+    when the caller presents old-key proof or an admin-confirmed rotation token.
+    Active ownership by a different operator is refused without mutating the
+    existing rows.
     """
 
     normalized = normalize_fingerprint(cert_fingerprint)
+    normalized_rotation_fingerprint = (
+        normalize_fingerprint(rotation_fingerprint) if rotation_fingerprint is not None else None
+    )
     active_rows = list(
         session.scalars(
             select(GrpcDeviceEnrollment).where(
@@ -314,12 +347,26 @@ def record_device_enrollment(
     )
     if any(row.operator != operator for row in active_rows):
         raise DeviceOwnershipError("device belongs to a different operator")
+    superseded_rows = [row for row in active_rows if row.cert_fingerprint != normalized]
+    if superseded_rows:
+        _require_rotation_authority(
+            active_rows=superseded_rows,
+            rotation_authority=rotation_authority,
+            rotation_fingerprint=normalized_rotation_fingerprint,
+        )
 
     now = _utcnow()
-    for row in active_rows:
-        if row.cert_fingerprint != normalized:
-            row.revoked = True
-            row.revoked_at = now
+    for row in superseded_rows:
+        row.revoked = True
+        row.revoked_at = now
+    if superseded_rows:
+        LOG.info(
+            "device certificate rotated: device_id=%s operator=%s authority=%s superseded=%d",
+            device_id,
+            operator,
+            rotation_authority,
+            len(superseded_rows),
+        )
 
     existing = session.scalars(
         select(GrpcDeviceEnrollment).where(
@@ -380,6 +427,20 @@ def normalize_fingerprint(value: str) -> str:
         raise ValueError("certificate fingerprint must be a SHA-256 hex digest")
     bytes.fromhex(compact)
     return ":".join(compact[index : index + 2] for index in range(0, len(compact), 2))
+
+
+def _require_rotation_authority(
+    *,
+    active_rows: list[GrpcDeviceEnrollment],
+    rotation_authority: RotationAuthority | None,
+    rotation_fingerprint: str | None,
+) -> None:
+    if rotation_authority == "admin":
+        return
+    if rotation_authority == "self" and rotation_fingerprint is not None:
+        if any(row.cert_fingerprint == rotation_fingerprint for row in active_rows):
+            return
+    raise DeviceRotationProofError("active device certificate rotation requires old-key proof")
 
 
 def _aware(value: dt.datetime) -> dt.datetime:
