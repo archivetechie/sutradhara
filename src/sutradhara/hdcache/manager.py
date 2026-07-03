@@ -41,7 +41,7 @@ from sutradhara.artifactclass_policy import (
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
 from sutradhara.catalog.models import ArtifactClassPool, Backend, LogicalAsset, Pool
-from sutradhara.catalog.types import is_content_hash
+from sutradhara.catalog.types import AssetValidity, is_content_hash
 from sutradhara.hdcache.fill import (
     effective_privacy_level,
     entry_policy_conformant,
@@ -365,8 +365,14 @@ def admit_restore_request(
                 force_suspect=force_suspect,
                 force_rejected=force_rejected,
             )
-            item.admitted_force_suspect = bool(force_suspect)
-            item.admitted_force_rejected = bool(force_rejected)
+            admitted_force_suspect, admitted_force_rejected = _admitted_force_waivers(
+                session,
+                spec.content_sha256,
+                force_suspect=force_suspect,
+                force_rejected=force_rejected,
+            )
+            item.admitted_force_suspect = admitted_force_suspect
+            item.admitted_force_rejected = admitted_force_rejected
         except RestoreDenied as exc:
             item.state = ITEM_DENIED
             item.detail = exc.detail
@@ -835,6 +841,24 @@ def _admission_inputs_for_item(item: RestoreRequestItem) -> RestoreAdmissionInpu
         identity=identity,
         force_suspect=item.admitted_force_suspect,
         force_rejected=item.admitted_force_rejected,
+    )
+
+
+def _admitted_force_waivers(
+    session: Session,
+    asset_hash: bytes,
+    *,
+    force_suspect: bool,
+    force_rejected: bool,
+) -> tuple[bool, bool]:
+    """Return the validity conditions actually waived at admission time."""
+
+    asset = session.get(LogicalAsset, asset_hash)
+    if asset is None:
+        return False, False
+    return (
+        bool(force_suspect and asset.validity == AssetValidity.SUSPECT),
+        bool(force_rejected and asset.rejected_at is not None),
     )
 
 

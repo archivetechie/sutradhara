@@ -547,7 +547,7 @@ def test_admitted_force_flags_are_used_at_serve_when_caller_differs(
         assert (root / digest.hex()).read_bytes() == b"suspect bytes"
 
 
-def test_asset_rejected_after_admission_is_denied_at_serve_revalidation(
+def test_force_flags_requested_while_asset_ok_do_not_waive_later_rejection(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -560,8 +560,13 @@ def test_asset_rejected_after_admission_is_denied_at_serve_revalidation(
             identity=_identity("sutradhara-operator"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters")],
+            force_suspect=True,
+            force_rejected=True,
             config=_config(root),
         )
+        item = request.items[0]
+        assert item.admitted_force_suspect is False
+        assert item.admitted_force_rejected is False
         asset = session.get(LogicalAsset, digest)
         assert asset is not None
         asset.rejected_at = dt.datetime.now(dt.UTC)
@@ -576,10 +581,51 @@ def test_asset_rejected_after_admission_is_denied_at_serve_revalidation(
             config=_config(root, restore_backends={backend_id: memory}),
         )
 
-        item = request.items[0]
         assert item.state == ITEM_DENIED
         assert item.detail is not None
         assert "post-admission revoke" in item.detail
+        assert not (root / digest.hex()).exists()
+        assert request.state == REQUEST_COMPLETED_WITH_ERRORS
+
+
+def test_suspect_waiver_at_admission_does_not_waive_later_rejection(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"suspect then rejected")
+        asset = session.get(LogicalAsset, digest)
+        assert asset is not None
+        asset.validity = AssetValidity.SUSPECT
+        asset.validity_note = "decode warning"
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters")],
+            force_suspect=True,
+            config=_config(root),
+        )
+        item = request.items[0]
+        assert item.admitted_force_suspect is True
+        assert item.admitted_force_rejected is False
+
+        asset.rejected_at = dt.datetime.now(dt.UTC)
+        asset.rejected_by = "supervisor"
+        asset.rejection_reason = "post-admission reject"
+
+        serve_restore_request(
+            session,
+            request,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=_config(root, restore_backends={backend_id: memory}),
+        )
+
+        assert item.state == ITEM_DENIED
+        assert item.detail is not None
+        assert "post-admission reject" in item.detail
         assert not (root / digest.hex()).exists()
         assert request.state == REQUEST_COMPLETED_WITH_ERRORS
 
