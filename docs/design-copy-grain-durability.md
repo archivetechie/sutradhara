@@ -1,6 +1,9 @@
 # Design — copy-grain unification + durability enforcement (v2, panel-folded)
 
-**Status:** design, panel-folded + verify-r1 findings folded — verify r2 pending (2026-07-03).
+**Status:** **FROZEN 2026-07-03** — panel (4 lenses, ~36 findings, 8 blockers folded) →
+verify r1 (7 findings folded) → verify r2 (6/7 confirmed resolved; the 7th resolved by
+REMOVING bundle auto-adoption — a scope-reducing fold at the 2-round cap, no new
+machinery). Next: cut prompts CG-M1/M2/M3 (§6).
 v1 was panel-reviewed same day per `~/system/docs/process-panel-review.md`:
 4 blind lenses (migration/compat, failure/durability, simplicity/cost — Opus;
 contract/code-reality — codex xhigh), ~36 findings, 8 blockers. All folded here;
@@ -127,14 +130,17 @@ New `sutradhara/durability.py`:
     copy scan at 100k bundles.
   - `reconcile_target`: enqueue a `bundle-repair` job (source via D4
     `self_heal` purpose, with fallback + suspect-marking).
-- **Scrub adoption fix:** `scrub_backend`'s unknown-object insert classifies:
-  enumerated logical id matches a `Bundle.archive_id` → `add_bundle_copy`;
-  matches a `LogicalAsset` → `add_copy` (asset grain remains legal); matches
-  neither → a quarantine entry in the scrub report, never an invented row.
-  Prerequisites (verify r1): a **partial unique index on non-null
-  `Bundle.archive_id`** and a seal-time assertion that sealed bundles carry a
-  non-null `archive_id` (backfill any sealed rows missing it in the same
-  migration) — today the column is nullable, unindexed, and unenforced.
+- **Scrub adoption fix (verify r2 correction — NO bundle auto-adoption):**
+  `CopyRecord.logical_id` is a stored-content sha256, not an archive id, so
+  matching enumerated objects to `Bundle.archive_id` is type-unsound and is
+  dropped. Final rule: an enumerated object whose `logical_id` matches a
+  `LogicalAsset` → `add_copy` (asset grain, existing behavior); anything else
+  → an **`unknown_object` quarantine entry in the scrub report** (counted;
+  persistent count feeds the D6 alarm), never an invented row. Crash-orphan
+  bundle objects are therefore NOT adopted: the bundle's condition stays open,
+  the next `bundle-repair` writes and records a fresh copy, and the orphan
+  remains a scrub-visible unknown object (tape-space waste accepted — same
+  stance as D6 duplicates; the alarm keeps it rare and visible).
 
 ### D2 — Declared durability floor, enforced where it can be
 
@@ -246,9 +252,9 @@ future janitor, explicitly out of scope here.
 `pool.accepts_writes` (bool, default true), `pool.retired` (bool, default
 false, guarded), `pool.media_generation` (nullable); FK RESTRICT ×2 (batch
 recreate, constraints re-declared); `artifactclass_policy` durability columns
-+ `[durability]` in the strict parser; **partial unique index on non-null
-`bundle.archive_id`** + seal-time non-null assertion (+ backfill of any
-sealed rows missing it). NO Copy/XOR changes. NO grain backfill.
++ `[durability]` in the strict parser. NO Copy/XOR changes. NO grain
+backfill. (The v2.1 `archive_id` index idea was dropped in verify r2 — no
+bundle auto-adoption, so it is not load-bearing.)
 
 ## 4. Verification members (scenario-or-cover; failure legs are the point)
 
