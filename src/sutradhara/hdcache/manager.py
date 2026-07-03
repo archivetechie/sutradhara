@@ -14,14 +14,18 @@ import json
 import logging
 import os
 import tempfile
+import threading
+import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Literal
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from sutradhara.api.identity import Identity
 from sutradhara.archive_restore import (
@@ -64,6 +68,10 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_SCRATCH_ROOT = Path("/var/lib/replica/hdcache-restore-scratch")
 RESTORE_DESTINATIONS_ENV = "SUTRADHARA_HDCACHE_RESTORE_DESTINATIONS"
+DEFAULT_STREAM_POOL_SIZE = 24
+DEFAULT_AEAD_STREAM_CAP = 4
+DEFAULT_WAKE_WINDOW_MULTIPLIER = 2
+DEFAULT_READ_DEADLINE_SECONDS = 70.0
 
 REQUEST_PENDING = "pending"
 REQUEST_ACTIVE = "active"
@@ -82,6 +90,7 @@ CapabilityMap = Mapping[str, str]
 RestoreBackendResolver = Callable[[Session, str], dict[int, StorageBackend]]
 EventSink = Callable[["RestoreEvent"], None]
 SourceKind = Literal["cache", "tape"]
+SessionFactory = sessionmaker[Session] | Callable[[], Session]
 
 
 class RestoreManagerError(Exception):
@@ -117,6 +126,54 @@ class CacheServeFailed(RestoreManagerError):
         self.detail = detail
         self.mark_lost = mark_lost
         super().__init__(detail)
+
+
+class DiskCircuitBreaker:
+    """In-memory per-disk failure breaker for cache serve storms.
+
+    The breaker is intentionally process-local M5 state. It stops one restore
+    worker wave from turning a flapping disk into thousands of lost-mark
+    updates; durable alarm wiring belongs to M6.
+    """
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 5,
+        window_seconds: float = 300.0,
+    ) -> None:
+        if failure_threshold <= 0:
+            raise ValueError("failure_threshold must be positive")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        self.failure_threshold = failure_threshold
+        self.window_seconds = window_seconds
+        self._failures: dict[str, list[float]] = {}
+        self._open: set[str] = set()
+        self._lock = threading.Lock()
+
+    def is_open(self, disk_id: str) -> bool:
+        with self._lock:
+            return disk_id in self._open
+
+    def record_failure(self, disk_id: str, *, now: float | None = None) -> bool:
+        """Record one failure and return true if this call tripped the disk."""
+
+        stamp = time.monotonic() if now is None else now
+        floor = stamp - self.window_seconds
+        with self._lock:
+            values = [value for value in self._failures.get(disk_id, []) if value >= floor]
+            values.append(stamp)
+            self._failures[disk_id] = values
+            if len(values) < self.failure_threshold or disk_id in self._open:
+                return False
+            self._open.add(disk_id)
+            return True
+
+    def reset(self, disk_id: str) -> None:
+        with self._lock:
+            self._failures.pop(disk_id, None)
+            self._open.discard(disk_id)
 
 
 @dataclass(frozen=True)
@@ -181,7 +238,7 @@ class RestoreAdmissionInputs:
 
 @dataclass(frozen=True)
 class RestoreConfig:
-    """Runtime knobs for M4 restore admission and single-stream serve."""
+    """Runtime knobs for restore admission and M5 parallel serve orchestration."""
 
     destinations: Mapping[str, RestoreDestination] = field(default_factory=dict)
     privacy_capability_map: CapabilityMap | None = None
@@ -193,6 +250,21 @@ class RestoreConfig:
     restore_backends: dict[int, StorageBackend] | None = None
     restore_backend_resolver: RestoreBackendResolver | None = None
     overwrite: bool = False
+    stream_pool_size: int = DEFAULT_STREAM_POOL_SIZE
+    aead_stream_cap: int = DEFAULT_AEAD_STREAM_CAP
+    wake_ahead: bool = True
+    wake_window_size: int | None = None
+    read_deadline_seconds: float = DEFAULT_READ_DEADLINE_SECONDS
+    breaker: DiskCircuitBreaker = field(default_factory=DiskCircuitBreaker)
+    worker_session_factory: SessionFactory | None = None
+
+    def __post_init__(self) -> None:
+        if self.stream_pool_size <= 0:
+            raise ValueError("stream_pool_size must be positive")
+        if self.aead_stream_cap <= 0:
+            raise ValueError("aead_stream_cap must be positive")
+        if self.wake_window_size is not None and self.wake_window_size <= 0:
+            raise ValueError("wake_window_size must be positive")
 
     def capability_map(self) -> CapabilityMap:
         return (
@@ -203,6 +275,11 @@ class RestoreConfig:
 
     def registry(self) -> KeyRegistry:
         return self.key_registry or KeyRegistry()
+
+    def wake_window(self) -> int:
+        if not self.wake_ahead:
+            return self.stream_pool_size
+        return self.wake_window_size or (self.stream_pool_size * DEFAULT_WAKE_WINDOW_MULTIPLIER)
 
 
 @dataclass(frozen=True)
@@ -215,6 +292,13 @@ class ServeResult:
     size_bytes: int
 
 
+@dataclass(frozen=True)
+class _ServeRuntime:
+    stream_slots: threading.BoundedSemaphore | None = None
+    aead_slots: threading.BoundedSemaphore | None = None
+    commit_state_transitions: bool = False
+
+
 def restore_config_from_env() -> RestoreConfig:
     """Build hdcache restore config from environment variables."""
 
@@ -222,6 +306,14 @@ def restore_config_from_env() -> RestoreConfig:
     return RestoreConfig(
         destinations=_destinations_from_env(),
         scratch_root=scratch,
+        stream_pool_size=_env_int("SUTRADHARA_HDCACHE_STREAM_POOL_SIZE", DEFAULT_STREAM_POOL_SIZE),
+        aead_stream_cap=_env_int("SUTRADHARA_HDCACHE_AEAD_STREAM_CAP", DEFAULT_AEAD_STREAM_CAP),
+        wake_ahead=_env_bool("SUTRADHARA_HDCACHE_WAKE_AHEAD", True),
+        wake_window_size=_env_optional_int("SUTRADHARA_HDCACHE_WAKE_WINDOW_SIZE"),
+        read_deadline_seconds=_env_float(
+            "SUTRADHARA_HDCACHE_READ_DEADLINE_SECONDS",
+            DEFAULT_READ_DEADLINE_SECONDS,
+        ),
     )
 
 
@@ -394,27 +486,142 @@ def serve_restore_request(
     force_rejected: bool = False,
     config: RestoreConfig | None = None,
 ) -> list[ServeResult]:
-    """Serve queued items sequentially using persisted admission inputs."""
+    """Serve queued items with the M5 wake window and bounded stream pool."""
 
     final_config = config or restore_config_from_env()
+    if final_config.worker_session_factory is not None:
+        return _serve_restore_request_parallel(session, request, config=final_config)
+    return _serve_restore_request_in_session(session, request, config=final_config)
+
+
+def _serve_restore_request_in_session(
+    session: Session,
+    request: RestoreRequest,
+    *,
+    config: RestoreConfig,
+) -> list[ServeResult]:
+    """Serve a request inside the caller's transaction, preserving M4 semantics."""
+
     request.state = REQUEST_ACTIVE
     results: list[ServeResult] = []
-    for item in request.items:
-        if item.state != ITEM_QUEUED:
+    pending = [item for item in request.items if item.state == ITEM_QUEUED]
+    window = config.wake_window()
+    _wake_items(session, request, pending[:window], config=config)
+    for index, item in enumerate(pending):
+        if item.state not in {ITEM_QUEUED, ITEM_WAKING_DISK}:
             continue
         try:
             results.append(
                 serve_restore_item(
                     session,
                     item,
-                    config=final_config,
+                    config=config,
                 )
             )
         finally:
             _update_request_state(request)
             session.flush([request, item])
+            _wake_items(session, request, pending[index + 1 : index + 1 + window], config=config)
     _update_request_state(request)
     return results
+
+
+def _serve_restore_request_parallel(
+    session: Session,
+    request: RestoreRequest,
+    *,
+    config: RestoreConfig,
+) -> list[ServeResult]:
+    """Serve a committed request through worker sessions with bounded concurrency."""
+
+    factory = config.worker_session_factory
+    if factory is None:
+        raise AssertionError("worker_session_factory is required")
+    pending = [item for item in request.items if item.state == ITEM_QUEUED]
+    if not pending:
+        _update_request_state(request)
+        return []
+
+    request.state = REQUEST_ACTIVE
+    window = config.wake_window()
+    _wake_items(session, request, pending[:window], config=config)
+    session.flush()
+    session.commit()
+
+    runtime = _ServeRuntime(
+        stream_slots=threading.BoundedSemaphore(config.stream_pool_size),
+        aead_slots=threading.BoundedSemaphore(config.aead_stream_cap),
+        commit_state_transitions=True,
+    )
+    results: list[ServeResult] = []
+    submitted = 0
+    completed = 0
+    futures: dict[Future[ServeResult], int] = {}
+
+    def submit_next(executor: ThreadPoolExecutor) -> None:
+        nonlocal submitted
+        while submitted < len(pending) and len(futures) < config.stream_pool_size:
+            item_id = pending[submitted].id
+            if item_id is None:
+                raise RestoreManagerError("restore request item must be flushed before parallel serve")
+            futures[
+                executor.submit(
+                    _serve_restore_item_in_worker_session,
+                    factory,
+                    item_id,
+                    config,
+                    runtime,
+                )
+            ] = item_id
+            submitted += 1
+
+    with ThreadPoolExecutor(max_workers=config.stream_pool_size) as executor:
+        submit_next(executor)
+        while futures:
+            done, _not_done = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                futures.pop(future)
+                results.append(future.result())
+                completed += 1
+                _wake_items(
+                    session,
+                    request,
+                    pending[completed : completed + window],
+                    config=config,
+                )
+                session.flush()
+                session.commit()
+            submit_next(executor)
+
+    session.expire_all()
+    refreshed = session.get(RestoreRequest, request.id)
+    if refreshed is not None:
+        _update_request_state(refreshed)
+        session.flush([refreshed])
+        request.state = refreshed.state
+    return results
+
+
+def _serve_restore_item_in_worker_session(
+    factory: SessionFactory,
+    item_id: int,
+    config: RestoreConfig,
+    runtime: _ServeRuntime,
+) -> ServeResult:
+    session = factory()
+    try:
+        item = session.get(RestoreRequestItem, item_id)
+        if item is None:
+            raise RestoreManagerError(f"restore request item id={item_id} disappeared")
+        with _optional_semaphore_slot(runtime.stream_slots):
+            result = serve_restore_item(session, item, config=config, _runtime=runtime)
+        session.commit()
+        return result
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def serve_restore_item(
@@ -426,6 +633,7 @@ def serve_restore_item(
     force_rejected: bool = False,
     gates_already_admitted: bool = False,
     config: RestoreConfig | None = None,
+    _runtime: _ServeRuntime | None = None,
 ) -> ServeResult:
     """Serve one admitted restore item from cache or tape with fallback."""
 
@@ -464,7 +672,17 @@ def serve_restore_item(
     if plan.source == "cache" and plan.cache_entry is not None:
         try:
             _set_item_state(item, ITEM_STREAMING, None)
-            result = _serve_from_cache(session, plan.cache_entry, plan.destination, final_config)
+            _update_request_state(item.request)
+            session.flush([item.request, item])
+            if _runtime is not None and _runtime.commit_state_transitions:
+                session.commit()
+            result = _serve_from_cache_controlled(
+                session,
+                plan.cache_entry,
+                plan.destination,
+                final_config,
+                _runtime,
+            )
             _set_item_state(item, ITEM_DONE, None)
             return ServeResult(item.id, "cache", plan.destination, result.size_bytes)
         except CacheServeFailed as exc:
@@ -481,6 +699,17 @@ def serve_restore_item(
                     destination_id=item.request.destination_id,
                 ),
             )
+            breaker_open = _record_cache_failure(
+                session,
+                plan.cache_entry,
+                exc,
+                final_config,
+                content_sha256=item.content_sha256,
+                artifactclass=item.artifactclass,
+                request_id=item.request_id,
+                item_id=item.id,
+                destination_id=item.request.destination_id,
+            )
             if exc.mark_lost and plan.cache_entry is not None:
                 _try_mark_entry_lost_for_cache_fallback(
                     session,
@@ -491,11 +720,16 @@ def serve_restore_item(
                     request_id=item.request_id,
                     item_id=item.id,
                     destination_id=item.request.destination_id,
+                    breaker_already_open=breaker_open,
                 )
             _set_item_state(item, ITEM_FELL_BACK_TO_TAPE, "tape mount pending")
 
     try:
         _set_item_state(item, ITEM_STREAMING, None)
+        _update_request_state(item.request)
+        session.flush([item.request, item])
+        if _runtime is not None and _runtime.commit_state_transitions:
+            session.commit()
         tape_result = _serve_from_tape(
             session,
             item.content_sha256,
@@ -549,6 +783,13 @@ def restore_to_path(
         restore_backends=backends,
         restore_backend_resolver=final_config.restore_backend_resolver,
         overwrite=final_config.overwrite,
+        stream_pool_size=final_config.stream_pool_size,
+        aead_stream_cap=final_config.aead_stream_cap,
+        wake_ahead=final_config.wake_ahead,
+        wake_window_size=final_config.wake_window_size,
+        read_deadline_seconds=final_config.read_deadline_seconds,
+        breaker=final_config.breaker,
+        worker_session_factory=final_config.worker_session_factory,
     )
     plan = resolve_read_source(
         session,
@@ -562,7 +803,13 @@ def restore_to_path(
     )
     if plan.source == "cache" and plan.cache_entry is not None:
         try:
-            cache_result = _serve_from_cache(session, plan.cache_entry, plan.destination, final_config)
+            cache_result = _serve_from_cache_controlled(
+                session,
+                plan.cache_entry,
+                plan.destination,
+                final_config,
+                None,
+            )
             return ServeResult(None, "cache", plan.destination, cache_result.size_bytes)
         except CacheServeFailed as exc:
             _emit(
@@ -575,6 +822,14 @@ def restore_to_path(
                     detail=_sanitize_detail(exc.detail),
                 ),
             )
+            breaker_open = _record_cache_failure(
+                session,
+                plan.cache_entry,
+                exc,
+                final_config,
+                content_sha256=asset_hash,
+                artifactclass=artifactclass,
+            )
             if exc.mark_lost and plan.cache_entry is not None:
                 _try_mark_entry_lost_for_cache_fallback(
                     session,
@@ -582,6 +837,7 @@ def restore_to_path(
                     final_config,
                     content_sha256=asset_hash,
                     artifactclass=artifactclass,
+                    breaker_already_open=breaker_open,
                 )
     tape_result = _serve_from_tape(
         session,
@@ -678,10 +934,22 @@ def _serve_from_cache(
     disk = session.get(CacheDisk, entry.disk_id)
     if disk is None or disk.state != "active":
         raise CacheServeFailed("disk-inactive", "cache disk is not active", mark_lost=False)
+    if config.breaker.is_open(disk.disk_id):
+        raise CacheServeFailed("disk-circuit-open", "cache disk circuit breaker is open", mark_lost=False)
     live = _cache_disk_live(disk)
     if not live:
         disk.state = "absent"
         session.flush([disk])
+        _emit(
+            config,
+            RestoreEvent(
+                code="disk-absent",
+                severity="alarm",
+                content_sha256=entry.content_sha256.hex(),
+                artifactclass=entry.artifactclass,
+                detail=f"cache disk {disk.disk_id} failed liveness check",
+            ),
+        )
         raise CacheServeFailed("disk-absent", "cache disk is absent", mark_lost=False)
     if not entry_policy_conformant(session, entry, key_registry=config.registry()):
         raise CacheServeFailed(
@@ -689,10 +957,17 @@ def _serve_from_cache(
             "cache entry representation does not satisfy current privacy policy",
             mark_lost=True,
         )
+    if config.read_deadline_seconds <= 0:
+        raise CacheServeFailed(
+            "read-deadline",
+            "cache read deadline exceeded before stream start",
+            mark_lost=True,
+        )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     config.scratch_root.mkdir(parents=True, exist_ok=True)
     os.chmod(config.scratch_root, 0o700)
+    deadline = time.monotonic() + config.read_deadline_seconds
     try:
         with tempfile.TemporaryDirectory(prefix="hdcache-serve-", dir=config.scratch_root) as raw:
             temp_dir = Path(raw)
@@ -704,6 +979,7 @@ def _serve_from_cache(
                         entry.content_sha256,
                         representation=RAW_REPRESENTATION,
                         output=output,
+                        deadline_monotonic=deadline,
                     )
                 atomic_write_verified_file(plaintext, destination)
                 size_bytes = read_result.size_bytes
@@ -717,6 +993,7 @@ def _serve_from_cache(
                         key_epoch=entry.key_epoch,
                         expected_stream_sha256=entry.stored_digest,
                         output=output,
+                        deadline_monotonic=deadline,
                     )
                 opener = config.opener or RaoCliOpener(config.registry(), work_dir=config.scratch_root)
                 key_epoch = _cache_key_epoch(entry)
@@ -744,6 +1021,20 @@ def _serve_from_cache(
         entry.trusted = True
     session.flush([entry])
     return ServeResult(None, "cache", destination, size_bytes)
+
+
+def _serve_from_cache_controlled(
+    session: Session,
+    entry: CacheEntry,
+    destination: Path,
+    config: RestoreConfig,
+    runtime: _ServeRuntime | None,
+) -> ServeResult:
+    aead_slots = None if runtime is None else runtime.aead_slots
+    if entry.representation == AEAD_REPRESENTATION and aead_slots is not None:
+        with _semaphore_slot(aead_slots):
+            return _serve_from_cache(session, entry, destination, config)
+    return _serve_from_cache(session, entry, destination, config)
 
 
 def _serve_from_tape(
@@ -782,7 +1073,43 @@ def _try_mark_entry_lost_for_cache_fallback(
     request_id: str | None = None,
     item_id: int | None = None,
     destination_id: str | None = None,
+    breaker_already_open: bool = False,
 ) -> None:
+    disk = session.get(CacheDisk, entry.disk_id)
+    if disk is None:
+        return
+    if breaker_already_open or config.breaker.is_open(disk.disk_id):
+        _emit(
+            config,
+            RestoreEvent(
+                code="cache-fallback:lost-mark-skipped-breaker",
+                severity="warning",
+                content_sha256=content_sha256.hex(),
+                artifactclass=artifactclass,
+                detail=f"cache disk {disk.disk_id} circuit breaker is open",
+                request_id=request_id,
+                item_id=item_id,
+                destination_id=destination_id,
+            ),
+        )
+        return
+    if not _cache_disk_live(disk):
+        disk.state = "absent"
+        session.flush([disk])
+        _emit(
+            config,
+            RestoreEvent(
+                code="disk-absent",
+                severity="alarm",
+                content_sha256=content_sha256.hex(),
+                artifactclass=artifactclass,
+                detail=f"cache disk {disk.disk_id} failed liveness check before lost mark",
+                request_id=request_id,
+                item_id=item_id,
+                destination_id=destination_id,
+            ),
+        )
+        return
     try:
         mark_entry_lost_and_delete(session, entry)
     except Exception as exc:
@@ -799,6 +1126,43 @@ def _try_mark_entry_lost_for_cache_fallback(
                 destination_id=destination_id,
             ),
         )
+
+
+def _record_cache_failure(
+    session: Session,
+    entry: CacheEntry | None,
+    exc: CacheServeFailed,
+    config: RestoreConfig,
+    *,
+    content_sha256: bytes,
+    artifactclass: str,
+    request_id: str | None = None,
+    item_id: int | None = None,
+    destination_id: str | None = None,
+) -> bool:
+    if entry is None or not exc.mark_lost:
+        return False
+    disk = session.get(CacheDisk, entry.disk_id)
+    if disk is None:
+        return False
+    if exc.reason not in {"read-failed", "read-deadline", "representation-mismatch"}:
+        return config.breaker.is_open(disk.disk_id)
+    tripped = config.breaker.record_failure(disk.disk_id)
+    if tripped:
+        _emit(
+            config,
+            RestoreEvent(
+                code="disk-circuit-open",
+                severity="alarm",
+                content_sha256=content_sha256.hex(),
+                artifactclass=artifactclass,
+                detail=f"cache disk {disk.disk_id} exceeded cache failure threshold",
+                request_id=request_id,
+                item_id=item_id,
+                destination_id=destination_id,
+            ),
+        )
+    return config.breaker.is_open(disk.disk_id)
 
 
 def _admission_inputs_for_item(item: RestoreRequestItem) -> RestoreAdmissionInputs:
@@ -940,11 +1304,58 @@ def _select_cache_entry(session: Session, asset_hash: bytes) -> CacheEntry | Non
     return entry
 
 
+def _wake_items(
+    session: Session,
+    request: RestoreRequest,
+    items: list[RestoreRequestItem],
+    *,
+    config: RestoreConfig,
+) -> None:
+    if not config.wake_ahead:
+        return
+    for item in items:
+        if item.state != ITEM_QUEUED:
+            continue
+        entry = _select_cache_entry(session, item.content_sha256)
+        if entry is None:
+            continue
+        disk = session.get(CacheDisk, entry.disk_id)
+        if disk is None or config.breaker.is_open(disk.disk_id):
+            continue
+        _set_item_state(item, ITEM_WAKING_DISK, None)
+    _update_request_state(request)
+    session.flush([request, *items])
+
+
 def _cache_disk_live(disk: CacheDisk) -> bool:
     mount = Path(disk.mount)
     if not mount.exists() or not mount.is_dir():
         return False
+    try:
+        os.statvfs(mount)
+    except OSError:
+        return False
     return (mount / SENTINEL_NAME).is_file()
+
+
+@contextmanager
+def _semaphore_slot(semaphore: threading.BoundedSemaphore) -> Iterable[None]:
+    semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
+@contextmanager
+def _optional_semaphore_slot(
+    semaphore: threading.BoundedSemaphore | None,
+) -> Iterable[None]:
+    if semaphore is None:
+        yield
+        return
+    with _semaphore_slot(semaphore):
+        yield
 
 
 def _cache_key_epoch(entry: CacheEntry) -> KeyEpoch:
@@ -1109,3 +1520,31 @@ def _new_request_id() -> str:
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
+
+
+def _env_optional_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    return int(raw)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.lower() not in {"0", "false", "no", "off"}

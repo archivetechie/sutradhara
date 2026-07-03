@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import dataclasses
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,14 @@ from sutradhara.hdcache.lifecycle import (
     load_hmac_secret_from_env,
     status_payload,
 )
+from sutradhara.hdcache.models import CacheDisk
 from sutradhara.hdcache.store import StoreError
+from sutradhara.hdcache.walker import (
+    HdcacheWalkerConfig,
+    rebuild_hdcache,
+    walk_all_disks,
+    walk_disk,
+)
 
 ManagerFactory = Callable[[], HdcacheLifecycleManager]
 _MANAGER_FACTORY: ManagerFactory | None = None
@@ -262,6 +270,82 @@ def hdcache_fill_cmd(
     _emit_fill_plan(plan, selector=selector, dry_run=False, as_json=as_json)
 
 
+@hdcache_group.command("walk")
+@click.argument("disk_id", required=False)
+@click.option("--read-only", is_flag=True, default=False, help="Do not delete or mark entries lost.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def hdcache_walk_cmd(disk_id: str | None, read_only: bool, as_json: bool) -> None:
+    """Run the hdcache disk walker for one disk or all disks."""
+
+    engine = make_engine()
+    events: list[dict[str, object]] = []
+    config = HdcacheWalkerConfig(
+        hmac_secret=load_hmac_secret_from_env(),
+        event_sink=lambda event: events.append(dataclasses_asdict(event)),
+    )
+    try:
+        with session_scope(engine) as session:
+            if disk_id is None:
+                results = walk_all_disks(session, config=config, destructive=not read_only)
+            else:
+                disk = session.get(CacheDisk, disk_id)
+                if disk is None:
+                    raise click.ClickException(f"unknown cache disk: {disk_id}")
+                results = [walk_disk(session, disk, config=config, destructive=not read_only)]
+    except CLI_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
+    payload = {
+        "results": [dataclasses_asdict(result) for result in results],
+        "events": events,
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    for result in results:
+        click.echo(
+            f"{result.disk_id}: destructive={result.destructive} halted={result.halted} "
+            f"lost={result.entries_lost} unknown_deleted={result.unknown_deleted} "
+            f"tmp_deleted={result.tmp_deleted} filled={result.filled_bytes}"
+        )
+    for event in events:
+        click.echo(f"event {event['code']} disk={event.get('disk_id') or '-'}")
+
+
+@hdcache_group.command("rebuild")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def hdcache_rebuild_cmd(as_json: bool) -> None:
+    """Rebuild untrusted cache rows from self-describing disk filenames."""
+
+    engine = make_engine()
+    events: list[dict[str, object]] = []
+    config = HdcacheWalkerConfig(
+        hmac_secret=load_hmac_secret_from_env(),
+        event_sink=lambda event: events.append(dataclasses_asdict(event)),
+    )
+    try:
+        with session_scope(engine) as session:
+            result = rebuild_hdcache(session, config=config)
+    except CLI_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
+    payload = {
+        "entries": result.entries,
+        "failures": [dataclasses_asdict(failure) for failure in result.failures],
+        "disks": [dataclasses_asdict(disk) for disk in result.disks],
+        "events": events,
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    for disk in result.disks:
+        status = "rejected" if disk.rejected else "ok"
+        click.echo(
+            f"{disk.index}/{disk.total} {disk.disk_id}: {status}; "
+            f"entries={disk.entries} elapsed={disk.elapsed_seconds:.2f}s"
+        )
+    if result.failures:
+        click.echo(f"withheld={len(result.failures)}")
+
+
 def set_manager_factory(factory: ManagerFactory | None) -> None:
     """Install a test-only manager factory."""
 
@@ -330,7 +414,6 @@ def _emit_scan(candidates: list[BlockDeviceCandidate], *, as_json: bool) -> None
 
 
 def dataclasses_asdict(value: object) -> dict[str, object]:
-    return {
-        key: getattr(value, key)
-        for key in getattr(value, "__dataclass_fields__", {})
-    }
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    return {key: getattr(value, key) for key in getattr(value, "__dataclass_fields__", {})}

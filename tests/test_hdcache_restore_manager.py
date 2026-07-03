@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -28,7 +30,13 @@ from sutradhara.catalog.models import (
     LogicalAsset,
     Pool,
 )
-from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
+from sutradhara.catalog.session import (
+    create_all,
+    locator_key,
+    make_engine,
+    make_session_factory,
+    session_scope,
+)
 from sutradhara.catalog.types import (
     AssetValidity,
     BackendKind,
@@ -38,10 +46,12 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.cli.archive import archive_group
 from sutradhara.hdcache.manager import (
+    DiskCircuitBreaker,
     ITEM_DENIED,
     ITEM_DONE,
     ITEM_QUEUED,
     ITEM_STREAMING,
+    ITEM_WAKING_DISK,
     REQUEST_ACTIVE,
     REQUEST_COMPLETED,
     REQUEST_COMPLETED_WITH_ERRORS,
@@ -65,7 +75,12 @@ from sutradhara.hdcache.manager import (
     serve_restore_request,
 )
 from sutradhara.hdcache.models import CacheDisk, CacheEntry, RestoreRequest, RestoreRequestItem
-from sutradhara.hdcache.store import RAW_REPRESENTATION, SENTINEL_NAME, write_entry
+from sutradhara.hdcache.store import (
+    AEAD_REPRESENTATION,
+    RAW_REPRESENTATION,
+    SENTINEL_NAME,
+    write_entry,
+)
 from sutradhara.sealing.port import Representation
 
 
@@ -687,6 +702,172 @@ def test_request_state_is_active_only_while_item_is_serving(
         assert item.state == ITEM_DONE
 
 
+def test_wake_window_marks_only_rolling_cache_items(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    observed: list[list[str]] = []
+
+    def fake_cache(_session, _entry, destination, _config):
+        observed.append([item.state for item in request.items])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"cache")
+        return restore_manager.ServeResult(None, "cache", destination, 5)
+
+    monkeypatch.setattr(restore_manager, "_serve_from_cache", fake_cache)
+    with session_scope(engine) as session:
+        digests = []
+        for index in range(5):
+            digest, _backend_id, _memory = _seed_archived_asset(
+                session,
+                data=f"cache-{index}".encode(),
+            )
+            _seed_cache_entry(session, tmp_path / "d001", digest, f"cache-{index}".encode())
+            digests.append(digest)
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters") for digest in digests],
+            config=_config(root),
+        )
+
+        serve_restore_request(
+            session,
+            request,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=RestoreConfig(
+                destinations=_config(root).destinations,
+                stream_pool_size=2,
+                wake_window_size=4,
+            ),
+        )
+
+    assert observed[0] == [
+        ITEM_STREAMING,
+        ITEM_WAKING_DISK,
+        ITEM_WAKING_DISK,
+        ITEM_WAKING_DISK,
+        ITEM_QUEUED,
+    ]
+    assert any(states[4] == ITEM_WAKING_DISK for states in observed[1:])
+
+
+def test_parallel_serve_respects_stream_pool_and_aead_subcap(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    lock = threading.Lock()
+    active = 0
+    active_aead = 0
+    max_active = 0
+    max_aead = 0
+
+    def fake_cache(_session, entry, destination, _config):
+        nonlocal active, active_aead, max_active, max_aead
+        with lock:
+            active += 1
+            if entry.representation == AEAD_REPRESENTATION:
+                active_aead += 1
+            max_active = max(max_active, active)
+            max_aead = max(max_aead, active_aead)
+        time.sleep(0.02)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(entry.content_sha256)
+        with lock:
+            if entry.representation == AEAD_REPRESENTATION:
+                active_aead -= 1
+            active -= 1
+        return restore_manager.ServeResult(None, "cache", destination, len(entry.content_sha256))
+
+    monkeypatch.setattr(restore_manager, "_serve_from_cache", fake_cache)
+    with session_scope(engine) as session:
+        digests = []
+        for index in range(50):
+            digest, _backend_id, _memory = _seed_archived_asset(
+                session,
+                data=f"parallel-{index}".encode(),
+            )
+            entry = _seed_cache_entry(session, tmp_path / "d001", digest, f"parallel-{index}".encode())
+            if index < 20:
+                entry.representation = AEAD_REPRESENTATION
+                entry.key_epoch = "hdcache-test-epoch"
+                entry.stored_digest = b"0" * 32
+            digests.append(digest)
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters") for digest in digests],
+            config=_config(root),
+        )
+        request_id = request.id
+
+    factory = make_session_factory(engine)
+    with session_scope(engine) as session:
+        request = session.get(RestoreRequest, request_id)
+        assert request is not None
+        serve_restore_request(
+            session,
+            request,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=RestoreConfig(
+                destinations=_config(root).destinations,
+                stream_pool_size=6,
+                aead_stream_cap=2,
+                worker_session_factory=factory,
+            ),
+        )
+
+    assert 1 < max_active <= 6
+    assert 1 < max_aead <= 2
+    with session_scope(engine) as session:
+        assert set(session.scalars(select(RestoreRequestItem.state))) == {ITEM_DONE}
+
+
+def test_deadline_fallback_trips_breaker_without_lost_marking(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    events: list[RestoreEvent] = []
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"tape truth")
+        entry = _seed_cache_entry(session, tmp_path / "d001", digest, b"tape truth")
+        _request, item = _request_item(session, digest, root)
+        result = serve_restore_item(
+            session,
+            item,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=_config(
+                root,
+                restore_backends={backend_id: memory},
+                events=events,
+                read_deadline_seconds=0,
+                breaker=DiskCircuitBreaker(failure_threshold=1, window_seconds=60),
+            ),
+        )
+
+        assert result.source == "tape"
+        assert item.state == ITEM_DONE
+        assert (root / digest.hex()).read_bytes() == b"tape truth"
+        assert session.get(CacheEntry, digest).state == "present"
+        assert session.get(CacheDisk, entry.disk_id).filled_bytes == len(b"tape truth")
+
+    assert [event.code for event in events] == [
+        "cache-fallback:read-deadline",
+        "disk-circuit-open",
+        "cache-fallback:lost-mark-skipped-breaker",
+    ]
+
+
 def test_untrusted_cache_hit_promotes_after_verified_serve(
     engine: Engine,
     tmp_path: Path,
@@ -930,6 +1111,8 @@ def _config(
     *,
     restore_backends: dict[int, MemoryBackend] | None = None,
     events: list[RestoreEvent] | None = None,
+    read_deadline_seconds: float = restore_manager.DEFAULT_READ_DEADLINE_SECONDS,
+    breaker: DiskCircuitBreaker | None = None,
 ) -> RestoreConfig:
     return RestoreConfig(
         destinations={
@@ -941,6 +1124,8 @@ def _config(
         },
         restore_backends=restore_backends,
         event_sink=None if events is None else events.append,
+        read_deadline_seconds=read_deadline_seconds,
+        breaker=breaker or DiskCircuitBreaker(),
     )
 
 

@@ -19,6 +19,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -332,6 +333,7 @@ def read_entry_verified(
     key_epoch: str | None = None,
     expected_stream_sha256: bytes | None = None,
     output: BinaryIO | None = None,
+    deadline_monotonic: float | None = None,
 ) -> EntryReadResult:
     """Read one entry while verifying the stored stream digest."""
 
@@ -352,6 +354,8 @@ def read_entry_verified(
     chunks: list[bytes] | None = [] if output is None else None
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(BUFFER_SIZE), b""):
+            if deadline_monotonic is not None and time.monotonic() > deadline_monotonic:
+                raise StoreError("cache read deadline exceeded")
             digest.update(chunk)
             size += len(chunk)
             if output is not None:
