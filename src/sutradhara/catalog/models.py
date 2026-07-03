@@ -327,6 +327,17 @@ class Arrangement(Base):
         nullable=True,
         index=True,
     )
+    cloned_from_arrangement_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey(
+            "arrangement.id",
+            ondelete="SET NULL",
+            name="fk_arrangement_cloned_from_arrangement_id",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

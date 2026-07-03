@@ -150,9 +150,15 @@ def list_cmd(as_json: bool) -> None:
         click.echo(json.dumps(rows, indent=2, sort_keys=True, default=str))
         return
     for row in rows:
+        parent = (
+            f" cloned_from={row['cloned_from_arrangement_id']}"
+            if row["cloned_from_arrangement_id"] is not None
+            else ""
+        )
         click.echo(
             f"{row['id']}: {row['status']} intake={row['intake_id']} "
-            f"members={row['active_member_count']}/{row['member_count']} label={row['label']!r}"
+            f"members={row['active_member_count']}/{row['member_count']}{parent} "
+            f"label={row['label']!r}"
         )
 
 
@@ -184,6 +190,7 @@ def _arrangement_payload(
         "artifactclass": arrangement.artifactclass,
         "status": str(arrangement.status),
         "submission_id": arrangement.submission_id,
+        "cloned_from_arrangement_id": arrangement.cloned_from_arrangement_id,
         "member_count": len(arrangement.members),
         "active_member_count": sum(1 for member in arrangement.members if not member.excluded),
     }
@@ -211,9 +218,14 @@ def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
             f"{payload['submission_id']} {payload['source_map_path']}"
         )
         return
+    parent = (
+        f" cloned_from={payload['cloned_from_arrangement_id']}"
+        if payload["cloned_from_arrangement_id"] is not None
+        else ""
+    )
     click.echo(
         f"arrangement {payload['id']}: {payload['status']} "
-        f"members={payload['active_member_count']}/{payload['member_count']} "
+        f"members={payload['active_member_count']}/{payload['member_count']}{parent} "
         f"label={payload['label']!r}"
     )
     if "members" in payload:

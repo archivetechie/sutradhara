@@ -86,6 +86,7 @@ class ArrangementSummary:
     artifactclass: str
     status: str
     submission_id: str | None
+    cloned_from_arrangement_id: int | None
     member_count: int
     active_member_count: int
 
@@ -150,6 +151,7 @@ def create_from_arrangement(session: Session, arrangement_id: int, *, label: str
         intake_id=source.intake_id,
         artifactclass=source.artifactclass,
         status=ArrangementStatus.DRAFT,
+        cloned_from_arrangement_id=source.id,
     )
     session.add(clone)
     session.flush()
@@ -253,6 +255,7 @@ def summarize_arrangement(arrangement: Arrangement) -> ArrangementSummary:
         artifactclass=arrangement.artifactclass,
         status=str(arrangement.status),
         submission_id=arrangement.submission_id,
+        cloned_from_arrangement_id=arrangement.cloned_from_arrangement_id,
         member_count=len(arrangement.members),
         active_member_count=sum(1 for member in arrangement.members if not member.excluded),
     )

@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -22,6 +22,7 @@ from sutradhara.arrangement import (
     include_member,
     move_member,
     show_arrangement,
+    summarize_arrangement,
     submit_arrangement,
 )
 from sutradhara.catalog.models import (
@@ -40,6 +41,7 @@ from sutradhara.catalog.types import (
     IntakeStatus,
     SubmissionStatus,
 )
+from sutradhara.cli.arrangement import _arrangement_payload
 
 
 @pytest.fixture
@@ -67,6 +69,7 @@ def test_create_from_intake_selects_masters_only(engine: Engine, tmp_path: Path)
         arrangement = create_from_intake(session, "intake-a", label="cut")
 
         assert arrangement.status == ArrangementStatus.DRAFT
+        assert arrangement.cloned_from_arrangement_id is None
         assert [member.ingest_item_id for member in arrangement.members] == [
             masters[0].id,
             masters[1].id,
@@ -81,6 +84,95 @@ def test_create_from_intake_selects_masters_only(engine: Engine, tmp_path: Path)
         intake.status = IntakeStatus.VERIFYING
         with pytest.raises(ArrangementError, match="requires registered"):
             create_from_intake(session, "intake-a", label="bad")
+
+
+def test_create_all_arrangement_lineage_column_exists(engine: Engine) -> None:
+    inspector = inspect(engine)
+    columns = {column["name"] for column in inspector.get_columns("arrangement")}
+    indexes = {
+        tuple(index["column_names"])
+        for index in inspector.get_indexes("arrangement")
+        if index["column_names"] is not None
+    }
+    foreign_keys = inspector.get_foreign_keys("arrangement")
+
+    assert "cloned_from_arrangement_id" in columns
+    assert ("cloned_from_arrangement_id",) in indexes
+    assert any(
+        key["referred_table"] == "arrangement"
+        and key["constrained_columns"] == ["cloned_from_arrangement_id"]
+        and key["options"].get("ondelete") == "SET NULL"
+        for key in foreign_keys
+    )
+
+
+def test_create_from_arrangement_records_parent(engine: Engine, tmp_path: Path) -> None:
+    with session_scope(engine) as session:
+        _registered_intake(session, tmp_path, "intake-lineage", ["clip.mov"])
+        parent = create_from_intake(session, "intake-lineage", label="parent")
+
+        clone = create_from_arrangement(session, parent.id, label="clone")
+
+        assert parent.cloned_from_arrangement_id is None
+        assert clone.cloned_from_arrangement_id == parent.id
+        assert [member.member_path for member in clone.members] == ["clip.mov"]
+
+
+def test_parent_arrangement_delete_nulls_child_lineage(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    with session_scope(engine) as session:
+        _registered_intake(session, tmp_path, "intake-delete-parent", ["clip.mov"])
+        parent = create_from_intake(session, "intake-delete-parent", label="parent")
+        child = create_from_arrangement(session, parent.id, label="child")
+        child_id = child.id
+
+        session.delete(parent)
+        session.flush()
+        session.expire_all()
+
+        loaded_child = session.get(Arrangement, child_id)
+        assert loaded_child is not None
+        assert loaded_child.cloned_from_arrangement_id is None
+        assert [member.member_path for member in loaded_child.members] == ["clip.mov"]
+
+
+def test_arrangement_lineage_chain_is_walkable(engine: Engine, tmp_path: Path) -> None:
+    with session_scope(engine) as session:
+        _registered_intake(session, tmp_path, "intake-chain", ["clip.mov"])
+        first = create_from_intake(session, "intake-chain", label="first")
+        second = create_from_arrangement(session, first.id, label="second")
+        third = create_from_arrangement(session, second.id, label="third")
+
+        walked: list[int] = []
+        current: Arrangement | None = third
+        while current is not None:
+            walked.append(current.id)
+            parent_id = current.cloned_from_arrangement_id
+            current = session.get(Arrangement, parent_id) if parent_id is not None else None
+
+        assert walked == [third.id, second.id, first.id]
+
+
+def test_arrangement_lineage_exposed_in_summary_and_cli_payload(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    with session_scope(engine) as session:
+        _registered_intake(session, tmp_path, "intake-summary", ["clip.mov"])
+        parent = create_from_intake(session, "intake-summary", label="parent")
+        clone = create_from_arrangement(session, parent.id, label="clone")
+
+        parent_summary = summarize_arrangement(parent)
+        clone_summary = summarize_arrangement(clone)
+        parent_payload = _arrangement_payload(parent)
+        clone_payload = _arrangement_payload(clone, include_members=True)
+
+        assert parent_summary.cloned_from_arrangement_id is None
+        assert clone_summary.cloned_from_arrangement_id == parent.id
+        assert parent_payload["cloned_from_arrangement_id"] is None
+        assert clone_payload["cloned_from_arrangement_id"] == parent.id
 
 
 def test_move_touches_only_arrangement(engine: Engine, tmp_path: Path) -> None:
