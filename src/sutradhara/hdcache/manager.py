@@ -21,7 +21,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PureWindowsPath
 from typing import Literal
 
@@ -334,10 +334,13 @@ _SERVE_SLOT_CONTEXT = threading.local()
 def restore_config_from_env() -> RestoreConfig:
     """Build hdcache restore config from environment variables."""
 
+    from sutradhara.hdcache.alarms import restore_event_alarm_sink
+
     scratch = Path(os.environ.get("SUTRADHARA_HDCACHE_SCRATCH_ROOT") or DEFAULT_SCRATCH_ROOT)
     return RestoreConfig(
         destinations=_destinations_from_env(),
         scratch_root=scratch,
+        event_sink=restore_event_alarm_sink(),
         stream_pool_size=_env_int("SUTRADHARA_HDCACHE_STREAM_POOL_SIZE", DEFAULT_STREAM_POOL_SIZE),
         aead_stream_cap=_env_int("SUTRADHARA_HDCACHE_AEAD_STREAM_CAP", DEFAULT_AEAD_STREAM_CAP),
         wake_ahead=_env_bool("SUTRADHARA_HDCACHE_WAKE_AHEAD", True),
@@ -363,6 +366,17 @@ def configured_destinations(config: RestoreConfig | None = None) -> list[dict[st
     ]
 
 
+def bind_restore_event_sink_to_session(config: RestoreConfig, session: Session) -> RestoreConfig:
+    """Use the current transaction for the default DB-backed restore alarm sink."""
+
+    from sutradhara.hdcache.alarms import RestoreEventAlarmSink
+
+    sink = config.event_sink
+    if isinstance(sink, RestoreEventAlarmSink) and sink.session is None:
+        return replace(config, event_sink=sink.bind(session))
+    return config
+
+
 def validate_restore_item_admission(
     session: Session,
     item: RestoreRequestItem,
@@ -372,7 +386,7 @@ def validate_restore_item_admission(
     """Validate persisted admission inputs and re-run privacy/validity gates."""
 
     admission = _admission_inputs_for_item(item)
-    final_config = config or restore_config_from_env()
+    final_config = bind_restore_event_sink_to_session(config or restore_config_from_env(), session)
     _check_privacy_gate(
         session,
         item.content_sha256,
@@ -406,7 +420,7 @@ def resolve_read_source(
 
     if not is_content_hash(asset_hash):
         raise ValueError("asset_hash must be a 32-byte SHA-256 hash")
-    final_config = config or restore_config_from_env()
+    final_config = bind_restore_event_sink_to_session(config or restore_config_from_env(), session)
     _check_privacy_gate(
         session,
         asset_hash,
@@ -453,7 +467,7 @@ def admit_restore_request(
 ) -> RestoreRequest:
     """Persist an API-style restore request, denying inadmissible items individually."""
 
-    final_config = config or restore_config_from_env()
+    final_config = bind_restore_event_sink_to_session(config or restore_config_from_env(), session)
     destination = _destination_by_id(final_config, destination_id)
     admitted_at = _utcnow()
     request = RestoreRequest(
@@ -524,7 +538,7 @@ def serve_restore_request(
 ) -> list[ServeResult]:
     """Serve queued items with the M5 wake window and bounded stream pool."""
 
-    final_config = config or restore_config_from_env()
+    final_config = bind_restore_event_sink_to_session(config or restore_config_from_env(), session)
     if final_config.worker_session_factory is not None:
         return _serve_restore_request_parallel(session, request, config=final_config)
     return _serve_restore_request_in_session(session, request, config=final_config)
@@ -672,7 +686,7 @@ def serve_restore_item(
 ) -> ServeResult:
     """Serve one admitted restore item from cache or tape with fallback."""
 
-    final_config = config or restore_config_from_env()
+    final_config = bind_restore_event_sink_to_session(config or restore_config_from_env(), session)
     if item.request is None:
         raise RestoreManagerError("restore request item is not attached to a request")
     destination: Path | None = None
@@ -836,6 +850,7 @@ def restore_to_path(
         hmac_secret=final_config.hmac_secret,
         identity_probe=final_config.identity_probe,
     )
+    final_config = bind_restore_event_sink_to_session(final_config, session)
     plan = resolve_read_source(
         session,
         asset_hash=asset_hash,
@@ -1767,7 +1782,6 @@ def _set_item_state(item: RestoreRequestItem, state: str, detail: str | None) ->
 def _emit(config: RestoreConfig, event: RestoreEvent) -> None:
     if config.event_sink is not None:
         config.event_sink(event)
-        return
     LOGGER.warning(
         "hdcache restore event code=%s severity=%s content_sha256=%s artifactclass=%s detail=%s",
         event.code,

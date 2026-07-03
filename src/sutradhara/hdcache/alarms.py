@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+from sqlalchemy import Engine
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.hdcache.fill import JOB_KIND
-from sutradhara.hdcache.manager import RestoreEvent
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.placement import DiskState, placement_config_from_env
 from sutradhara.hdcache.walker import HdcacheWalkerEvent
@@ -27,11 +29,72 @@ from sutradhara.jobs.reconcilers.conditions import (
     record_observation,
 )
 
+if TYPE_CHECKING:
+    from sutradhara.hdcache.manager import RestoreEvent
+
 ALARM_DOMAIN = "hdcache_alarm"
 ALARM_OWNER = "archive operator"
 DEFAULT_LOST_BACKLOG_THRESHOLD = 1
 DEFAULT_LOST_GROWTH_SECONDS = 30 * 60
 DEFAULT_FILL_QUEUE_STALLED_SECONDS = 15 * 60
+
+
+@dataclass(frozen=True)
+class RestoreEventAlarmSink:
+    """DB-backed sink that projects restore events into alarm conditions."""
+
+    engine: Engine | None = None
+    session: Session | None = None
+
+    def __call__(self, event: RestoreEvent) -> None:
+        if self.session is not None:
+            record_restore_event_alarm(self.session, event)
+            return
+        engine = self.engine or make_engine()
+        with session_scope(engine) as session:
+            record_restore_event_alarm(session, event)
+
+    def bind(self, session: Session) -> RestoreEventAlarmSink:
+        return RestoreEventAlarmSink(session=session)
+
+
+@dataclass(frozen=True)
+class WalkerEventAlarmSink:
+    """DB-backed sink that projects walker events into alarm conditions."""
+
+    engine: Engine | None = None
+    session: Session | None = None
+
+    def __call__(self, event: HdcacheWalkerEvent) -> None:
+        if self.session is not None:
+            record_walker_event_alarm(self.session, event)
+            return
+        engine = self.engine or make_engine()
+        with session_scope(engine) as session:
+            record_walker_event_alarm(session, event)
+
+    def bind(self, session: Session) -> WalkerEventAlarmSink:
+        return WalkerEventAlarmSink(session=session)
+
+
+def restore_event_alarm_sink(
+    *,
+    engine: Engine | None = None,
+    session: Session | None = None,
+) -> RestoreEventAlarmSink:
+    """Return a DB-backed restore event sink."""
+
+    return RestoreEventAlarmSink(engine=engine, session=session)
+
+
+def walker_event_alarm_sink(
+    *,
+    engine: Engine | None = None,
+    session: Session | None = None,
+) -> WalkerEventAlarmSink:
+    """Return a DB-backed walker event sink."""
+
+    return WalkerEventAlarmSink(engine=engine, session=session)
 
 
 @dataclass(frozen=True)

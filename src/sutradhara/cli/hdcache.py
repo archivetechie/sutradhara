@@ -18,6 +18,7 @@ from sutradhara.hdcache.fill import (
     fill_config_from_env,
     top_up_lost_entries,
 )
+from sutradhara.hdcache.alarms import walker_event_alarm_sink
 from sutradhara.hdcache.lifecycle import (
     BlockDeviceCandidate,
     HdcacheLifecycleManager,
@@ -33,6 +34,7 @@ from sutradhara.hdcache.repopulate import drill_status
 from sutradhara.hdcache.store import StoreError
 from sutradhara.hdcache.walker import (
     HdcacheWalkerConfig,
+    HdcacheWalkerEvent,
     rebuild_hdcache,
     walk_all_disks,
     walk_disk,
@@ -313,12 +315,18 @@ def hdcache_walk_cmd(disk_id: str | None, read_only: bool, as_json: bool) -> Non
 
     engine = make_engine()
     events: list[dict[str, object]] = []
-    config = HdcacheWalkerConfig(
-        hmac_secret=load_hmac_secret_from_env(),
-        event_sink=lambda event: events.append(dataclasses_asdict(event)),
-    )
     try:
         with session_scope(engine) as session:
+            alarm_sink = walker_event_alarm_sink(session=session)
+
+            def event_sink(event: HdcacheWalkerEvent) -> None:
+                events.append(dataclasses_asdict(event))
+                alarm_sink(event)
+
+            config = HdcacheWalkerConfig(
+                hmac_secret=load_hmac_secret_from_env(),
+                event_sink=event_sink,
+            )
             if disk_id is None:
                 results = walk_all_disks(session, config=config, destructive=not read_only)
             else:
@@ -352,12 +360,18 @@ def hdcache_rebuild_cmd(as_json: bool) -> None:
 
     engine = make_engine()
     events: list[dict[str, object]] = []
-    config = HdcacheWalkerConfig(
-        hmac_secret=load_hmac_secret_from_env(),
-        event_sink=lambda event: events.append(dataclasses_asdict(event)),
-    )
     try:
         with session_scope(engine) as session:
+            alarm_sink = walker_event_alarm_sink(session=session)
+
+            def event_sink(event: HdcacheWalkerEvent) -> None:
+                events.append(dataclasses_asdict(event))
+                alarm_sink(event)
+
+            config = HdcacheWalkerConfig(
+                hmac_secret=load_hmac_secret_from_env(),
+                event_sink=event_sink,
+            )
             result = rebuild_hdcache(session, config=config)
     except CLI_ERRORS as exc:
         raise click.ClickException(str(exc)) from exc

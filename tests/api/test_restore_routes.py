@@ -4,14 +4,27 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, select
 
-from sutradhara.hdcache.alarms import ALARM_DOMAIN
-from sutradhara.hdcache.manager import RestoreConfig, RestoreDestination
+from sutradhara.api import routes_restore
+from sutradhara.hdcache.alarms import (
+    ALARM_DOMAIN,
+    restore_event_alarm_sink,
+    walker_event_alarm_sink,
+)
+from sutradhara.hdcache.manager import (
+    InvalidRestoreDestination,
+    RestoreConfig,
+    RestoreDestination,
+    RestoreEvent,
+)
 from sutradhara.hdcache.models import RestoreRequest
+from sutradhara.hdcache.walker import HdcacheWalkerEvent
 from sutradhara.jobs.models import Job, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_OPEN
 from tests.api.conftest import auth_headers, make_api_app, post_headers
@@ -153,6 +166,148 @@ def test_restore_post_unknown_destination_and_malformed_payload(
     assert unknown.json()["error"] == "unknown_destination"
     assert malformed.status_code == 400
     assert malformed.json()["error"] == "bad_request"
+
+
+def test_restore_post_manager_error_returns_sanitized_4xx(
+    api_engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    digest = hashlib.sha256(b"allowed").hexdigest()
+    app = make_api_app(api_engine)
+    app.state.restore_config = RestoreConfig(
+        destinations={
+            "media-server": RestoreDestination(
+                id="media-server",
+                root=root,
+                label="Media server restore",
+                writable=True,
+            )
+        }
+    )
+
+    def fake_admit_restore_request(*_args: object, **_kwargs: object) -> RestoreRequest:
+        raise InvalidRestoreDestination(f"{os.getcwd()}/private/export escapes configured root")
+
+    monkeypatch.setattr(routes_restore, "admit_restore_request", fake_admit_restore_request)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/ui/restores",
+        headers=post_headers("viewer"),
+        json={
+            "destination_id": "media-server",
+            "items": [{"content_sha256": digest, "artifactclass": "s-masters"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_restore_destination"
+    assert "<cwd>/private/export escapes configured root" == response.json()["detail"]
+
+
+def test_event_alarm_sinks_project_conditions_visible_in_reconciliation(
+    api_engine: Engine,
+) -> None:
+    restore_sink = restore_event_alarm_sink(engine=api_engine)
+    walker_sink = walker_event_alarm_sink(engine=api_engine)
+    restore_sink(
+        RestoreEvent(
+            code="privacy-unmapped",
+            severity="alarm",
+            detail="privacy level p4 unmapped",
+        )
+    )
+    restore_sink(
+        RestoreEvent(
+            code="cache-fallback:read-deadline",
+            severity="warning",
+            detail="cache read deadline exceeded",
+        )
+    )
+    restore_sink(
+        RestoreEvent(
+            code="disk-circuit-open",
+            severity="alarm",
+            detail="cache disk d001 exceeded failure threshold",
+        )
+    )
+    walker_sink(
+        HdcacheWalkerEvent(
+            code="walker-tripwire-halt",
+            severity="alarm",
+            disk_id="d001",
+            detail="101 unknown files over threshold",
+        )
+    )
+
+    with api_engine.connect() as conn:
+        rows = {
+            target_key: reason
+            for target_key, reason in conn.execute(
+                select(ReconciliationCondition.target_key, ReconciliationCondition.reason).where(
+                    ReconciliationCondition.domain == ALARM_DOMAIN,
+                    ReconciliationCondition.condition == CONDITION_OPEN,
+                )
+            )
+        }
+    assert rows == {
+        "disk-unreachable:restore": "disk-unreachable",
+        "fallback-reason:read-deadline": "fallback-reason-spike",
+        "unmapped-privacy-level": "unmapped-privacy-level",
+        "walker-tripwire:d001": "walker-tripwire",
+    }
+
+    client = TestClient(make_api_app(api_engine))
+    response = client.get("/api/ui/reconciliation", headers=auth_headers("viewer"))
+
+    assert response.status_code == 200
+    visible = {
+        row["target_key"]: row["reason"]
+        for row in response.json()["conditions"]
+        if row["domain"] == ALARM_DOMAIN
+    }
+    assert rows.items() <= visible.items()
+
+
+def test_restore_post_unmapped_privacy_projects_alarm_via_app_config(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    digest = hashlib.sha256(b"private").hexdigest()
+    _seed_asset(api_engine, bytes.fromhex(digest), privacy="p4")
+    app = make_api_app(api_engine)
+    app.state.restore_config = RestoreConfig(
+        destinations={
+            "media-server": RestoreDestination(
+                id="media-server",
+                root=root,
+                label="Media server restore",
+                writable=True,
+            )
+        },
+        privacy_capability_map={},
+    )
+    client = TestClient(app)
+
+    created = client.post(
+        "/api/ui/restores",
+        headers=post_headers("viewer"),
+        json={
+            "destination_id": "media-server",
+            "items": [{"content_sha256": digest, "artifactclass": "private"}],
+        },
+    )
+    response = client.get("/api/ui/reconciliation", headers=auth_headers("viewer"))
+
+    assert created.status_code == 201
+    assert response.status_code == 200
+    conditions = {row["target_key"]: row for row in response.json()["conditions"]}
+    assert conditions["unmapped-privacy-level"]["reason"] == "unmapped-privacy-level"
 
 
 def test_reconciliation_endpoint_includes_hdcache_alarm_owner(

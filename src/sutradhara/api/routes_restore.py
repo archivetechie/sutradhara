@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import Engine, select
 
 from sutradhara.api.identity import Identity, parse_identity
 from sutradhara.catalog.session import session_scope
 from sutradhara.catalog.types import is_content_hash
 from sutradhara.hdcache.alarms import (
     ALARM_DOMAIN,
+    RestoreEventAlarmSink,
     alarm_condition_payload,
     evaluate_hdcache_alarm_conditions,
+    restore_event_alarm_sink,
 )
 from sutradhara.hdcache.fill import OPERATOR_RESTORE_PRIORITY
 from sutradhara.hdcache.manager import (
@@ -24,9 +28,11 @@ from sutradhara.hdcache.manager import (
     REQUEST_COMPLETED,
     REQUEST_COMPLETED_WITH_ERRORS,
     REQUEST_PENDING,
+    InvalidRestoreDestination,
     RestoreAdmissionInvalid,
     RestoreConfig,
     RestoreItemSpec,
+    RestoreManagerError,
     UnknownRestoreDestination,
     admit_restore_request,
     configured_destinations,
@@ -94,8 +100,14 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
             request_id = restore_request.id
     except UnknownRestoreDestination as exc:
         _raise(404, "unknown_destination", str(exc))
-    except (RestoreAdmissionInvalid, ValueError, RuntimeError) as exc:
-        _raise(400, "bad_request", str(exc))
+    except InvalidRestoreDestination as exc:
+        _raise(400, "invalid_restore_destination", _sanitize_detail(str(exc)))
+    except RestoreAdmissionInvalid as exc:
+        _raise(400, "bad_request", _sanitize_detail(str(exc)))
+    except RestoreManagerError as exc:
+        _raise(400, "restore_request_invalid", _sanitize_detail(str(exc)))
+    except (ValueError, RuntimeError) as exc:
+        _raise(400, "bad_request", _sanitize_detail(str(exc)))
     return JSONResponse({"request_id": request_id}, status_code=201)
 
 
@@ -154,9 +166,19 @@ def get_reconciliation(request: Request) -> dict[str, object]:
 
 def _restore_config(request: Request) -> RestoreConfig:
     configured = getattr(request.app.state, "restore_config", None)
+    engine = request.app.state.engine
     if isinstance(configured, RestoreConfig):
-        return configured
-    return restore_config_from_env()
+        return _with_app_alarm_sink(configured, engine)
+    return _with_app_alarm_sink(restore_config_from_env(), engine)
+
+
+def _with_app_alarm_sink(config: RestoreConfig, engine: Engine) -> RestoreConfig:
+    sink = config.event_sink
+    if sink is None:
+        return replace(config, event_sink=restore_event_alarm_sink(engine=engine))
+    if isinstance(sink, RestoreEventAlarmSink) and sink.engine is None and sink.session is None:
+        return replace(config, event_sink=restore_event_alarm_sink(engine=engine))
+    return config
 
 
 def _require_view(identity: Identity) -> Identity:
@@ -239,3 +261,7 @@ def _iso(value: dt.datetime) -> str:
 
 def _raise(status_code: int, error: str, detail: str) -> None:
     raise HTTPException(status_code=status_code, detail={"error": error, "detail": detail})
+
+
+def _sanitize_detail(detail: str) -> str:
+    return detail.replace(os.getcwd(), "<cwd>")
