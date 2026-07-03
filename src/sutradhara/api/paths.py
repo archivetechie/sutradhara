@@ -7,11 +7,10 @@ device; the helper remains authoritative for filesystem confinement.
 
 from __future__ import annotations
 
-import posixpath
-import re
-
-MAX_DEVICE_REL_PATH = 1024
-_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+from sutradhara_receive import (
+    ReceiveError,
+    canonical_device_rel_path as _receive_canonical_device_rel_path,
+)
 
 
 class DevicePathError(ValueError):
@@ -21,20 +20,7 @@ class DevicePathError(ValueError):
 def canonical_device_rel_path(value: str | None) -> str:
     """Return the canonical device-relative path, with ``None``/``""`` as root."""
 
-    if value is None or value == "":
-        return ""
-    if len(value) > MAX_DEVICE_REL_PATH:
-        raise DevicePathError("path is too long")
-    if "\\" in value:
-        raise DevicePathError("path must use forward slashes")
-    if value.startswith("/"):
-        raise DevicePathError("path must be relative")
-    if _DRIVE_PREFIX.match(value):
-        raise DevicePathError("path must not use a drive prefix")
-    parts = value.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
-        raise DevicePathError("path must be normalized and relative")
-    canonical = posixpath.normpath(value)
-    if canonical != value:
-        raise DevicePathError("path must be normalized")
-    return canonical
+    try:
+        return _receive_canonical_device_rel_path(value)
+    except ReceiveError as exc:
+        raise DevicePathError(str(exc)) from exc

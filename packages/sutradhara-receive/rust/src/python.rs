@@ -6,9 +6,9 @@
 //! the previous pure-Python implementation.
 
 use crate::{
-    BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, DATA_DIR_NAME, PACKAGE_GLOBS,
-    PACKAGE_PROFILE_HASH, PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE, RECEIVE_PACKAGE_NAME,
-    RECEIVE_PACKAGE_VERSION, RECEIVE_VERSION, ReceiveError,
+    BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, DATA_DIR_NAME, MAX_DEVICE_REL_PATH,
+    PACKAGE_GLOBS, PACKAGE_PROFILE_HASH, PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE,
+    RECEIVE_PACKAGE_NAME, RECEIVE_PACKAGE_VERSION, RECEIVE_VERSION, ReceiveError,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -33,6 +33,52 @@ fn py_unescape_member_name<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'
 #[pyfunction(name = "canonicalize_manifest_path")]
 fn py_canonicalize_manifest_path(raw: &str) -> PyResult<String> {
     crate::canonicalize_manifest_path(raw).map_err(py_value_error)
+}
+
+#[pyfunction(name = "canonical_device_rel_path")]
+fn py_canonical_device_rel_path(value: Option<&str>) -> PyResult<String> {
+    crate::canonical_device_rel_path(value.unwrap_or("")).map_err(py_value_error)
+}
+
+#[pyfunction(name = "derive_card_id")]
+fn py_derive_card_id(
+    volume_uuid: Option<&str>,
+    source: &str,
+    mount_path: &str,
+    label: &str,
+) -> String {
+    crate::derive_card_id(volume_uuid, source, mount_path, label)
+}
+
+#[pyfunction(name = "manifest_digest")]
+fn py_manifest_digest(entries: Vec<(String, String, u64)>) -> PyResult<String> {
+    let entries = entries
+        .into_iter()
+        .map(|(relpath, client_sha256, bytes)| crate::ManifestEntry {
+            relpath,
+            client_sha256,
+            bytes,
+        })
+        .collect::<Vec<_>>();
+    crate::manifest_digest(&entries).map_err(py_value_error)
+}
+
+#[pyfunction(name = "source_plan_digest")]
+fn py_source_plan_digest(entries: Vec<(String, u64, u64)>) -> String {
+    crate::source_plan_digest(&source_plan_entries(entries))
+}
+
+#[pyfunction(name = "payload_plan_digest")]
+fn py_payload_plan_digest(entries: Vec<(String, u64, u64)>) -> String {
+    crate::source_plan_digest(&source_plan_entries(entries))
+}
+
+#[pyfunction(name = "build_package_index_json")]
+fn py_build_package_index_json(packages_json: &str) -> PyResult<String> {
+    let packages: Vec<crate::PackageIndexPackage> =
+        serde_json::from_str(packages_json).map_err(py_runtime_error)?;
+    serde_json::to_string(&crate::build_package_index(&packages).unwrap_or(Value::Null))
+        .map_err(py_runtime_error)
 }
 
 #[pyfunction(name = "canonicalize_filesystem_path")]
@@ -259,6 +305,17 @@ fn py_receive_source_json(
     serde_json::to_string(&receive_result_json(&result)).map_err(py_runtime_error)
 }
 
+fn source_plan_entries(entries: Vec<(String, u64, u64)>) -> Vec<crate::SourcePlanDigestEntry> {
+    entries
+        .into_iter()
+        .map(|(relpath, size, mtime_ns)| crate::SourcePlanDigestEntry {
+            relpath,
+            size,
+            mtime_ns,
+        })
+        .collect()
+}
+
 #[pyfunction(name = "hash_payload_tree_json")]
 #[pyo3(signature = (payload_root, *, reject_native_packages = false))]
 fn py_hash_payload_tree_json(
@@ -292,6 +349,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PACKAGE_PROFILE_VERSION", PACKAGE_PROFILE_VERSION)?;
     m.add("PACKAGE_PROFILE_HASH", PACKAGE_PROFILE_HASH)?;
     m.add("PACKAGE_GLOBS", PACKAGE_GLOBS.to_vec())?;
+    m.add("MAX_DEVICE_REL_PATH", MAX_DEVICE_REL_PATH)?;
     m.add("BAG_PROFILE", BAG_PROFILE)?;
     m.add("BAGIT_TEXT", BAGIT_TEXT)?;
     m.add("DATA_DIR_NAME", DATA_DIR_NAME)?;
@@ -305,6 +363,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_escape_member_name, m)?)?;
     m.add_function(wrap_pyfunction!(py_unescape_member_name, m)?)?;
     m.add_function(wrap_pyfunction!(py_canonicalize_manifest_path, m)?)?;
+    m.add_function(wrap_pyfunction!(py_canonical_device_rel_path, m)?)?;
+    m.add_function(wrap_pyfunction!(py_derive_card_id, m)?)?;
+    m.add_function(wrap_pyfunction!(py_manifest_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(py_source_plan_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(py_payload_plan_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(py_build_package_index_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_canonicalize_filesystem_path, m)?)?;
     m.add_function(wrap_pyfunction!(py_safe_payload_path, m)?)?;
     m.add_function(wrap_pyfunction!(py_sha256_file, m)?)?;

@@ -17,6 +17,25 @@ dependencies. The main `sutradhara` package imports this package for server-side
 intake validation and keeps compatibility shims for historical
 `sutradhara.receive` imports.
 
+## Public API
+
+The Rust crate exposes the byte-sensitive receive encodings as `pub fn`s so the
+server, PyO3 wheel, and Rust agent use one implementation:
+
+- `manifest_digest` for gRPC `CommitIntake` manifest entries. It preserves the
+  server's Python-compatible spaced JSON encoding.
+- `source_plan_digest` and `payload_plan_digest` for compact source-plan
+  metadata.
+- `build_package_index` and `package_index_package` for package-directory
+  `package-index.json` construction alongside `build_package_tar`.
+- `derive_card_id` for `volume:<id>` card identifiers from a real volume
+  UUID/serial or the stable fallback hash.
+- `canonical_device_rel_path` for forward-slash device-relative wire paths.
+
+The crate also exports the shared constants and primitives used by the agent:
+`CANONICALIZATION_VERSION`, `PACKAGE_PROFILE_VERSION`,
+`canonicalize_manifest_path`, and `PACKAGE_GLOBS`.
+
 ## CLI
 
 The package installs a standalone edge command:

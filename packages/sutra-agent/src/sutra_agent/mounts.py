@@ -8,7 +8,6 @@ streaming receive once the server commands a card by its opaque id.
 from __future__ import annotations
 
 import ctypes
-import hashlib
 import importlib
 import os
 import platform
@@ -20,6 +19,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+from sutradhara_receive import derive_card_id
 
 CARD_KIND_CARD = "card"
 CARD_KIND_DRIVE = "drive"
@@ -99,10 +100,9 @@ def card_from_mount(info: MountInfo) -> MountedCard:
             size = shutil.disk_usage(mount_path).total
         except OSError:
             size = 0
-    volume_id = info.volume_uuid or _stable_volume_id(info)
     kind = CARD_KIND_CARD if info.removable else CARD_KIND_DRIVE
     return MountedCard(
-        card_id=f"volume:{volume_id}",
+        card_id=derive_card_id(info.volume_uuid, info.source, mount_path, info.label),
         label=info.label or mount_path.name,
         kind=kind,
         size_bytes=int(size),
@@ -246,17 +246,6 @@ def default_mount_watcher(source: CardSource = current_cards) -> PollingMountWat
     if platform.system() == "Darwin":
         return FSEventsMountWatcher(source)
     return PollingMountWatcher(source)
-
-
-def _stable_volume_id(info: MountInfo) -> str:
-    seed = "|".join(
-        [
-            str(info.source or ""),
-            str(info.mount_path),
-            str(info.label),
-        ]
-    )
-    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
 def _darwin_mounts() -> list[MountInfo]:

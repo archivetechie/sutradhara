@@ -8,20 +8,20 @@ relative paths are resolved under the mounted card before any filesystem read.
 from __future__ import annotations
 
 import fnmatch
-import posixpath
-import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from sutra_agent._proto import device_pb2
 from sutra_agent.mounts import MountedCard
-from sutradhara_receive import PACKAGE_GLOBS
+from sutradhara_receive import (
+    PACKAGE_GLOBS,
+    ReceiveError,
+    canonical_device_rel_path as _receive_canonical_device_rel_path,
+)
 
-MAX_DEVICE_REL_PATH = 1024
 MAX_DIRECTORY_FOLDERS = 5000
 MAX_DIRECTORY_FILES = 500
-_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 
 
 class DevicePathError(ValueError):
@@ -145,26 +145,10 @@ def resolve_card_path(mount_path: Path, rel_path: str | None) -> ConfinedPath:
 def canonical_device_rel_path(value: str | None) -> str:
     """Return the canonical helper-relative path, with ``None``/``""`` as root."""
 
-    if value is None or value == "":
-        return ""
-    if len(value) > MAX_DEVICE_REL_PATH:
-        raise DevicePathConfinementError("invalid source path")
-    if "\\" in value:
-        raise DevicePathConfinementError("invalid source path")
-    if value.startswith("/"):
-        raise DevicePathConfinementError("invalid source path")
-    if _DRIVE_PREFIX.match(value):
-        raise DevicePathConfinementError("invalid source path")
-    parts = value.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
-        raise DevicePathConfinementError("invalid source path")
-    canonical = posixpath.normpath(value)
-    if canonical != value:
-        raise DevicePathConfinementError("invalid source path")
-    for part in parts[:-1]:
-        if is_package_name(part):
-            raise DevicePathConfinementError("source path enters a package", detail=canonical)
-    return canonical
+    try:
+        return _receive_canonical_device_rel_path(value)
+    except ReceiveError as exc:
+        raise DevicePathConfinementError(str(exc)) from exc
 
 
 def directory_listing_message(

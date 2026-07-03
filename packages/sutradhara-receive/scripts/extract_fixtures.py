@@ -35,7 +35,12 @@ from sutradhara_receive import (
     RECEIVE_PACKAGE,
     RECEIVE_VERSION,
     bag_info_metadata,
+    build_package_index,
+    canonical_device_rel_path,
+    derive_card_id,
+    manifest_digest,
     member_name,
+    payload_plan_digest,
     read_bag_info,
     read_manifest_sha256,
     read_package_index,
@@ -68,6 +73,7 @@ def build_corpus(work_root: Path) -> dict[str, Any]:
         "public_api": public_api_snapshot(),
         "strings": string_fixtures(work_root / "strings"),
         "writer_outputs": writer_output_fixtures(work_root / "writers"),
+        "shared_encodings": shared_encoding_fixtures(work_root / "shared"),
         "receive_bags": receive_bag_fixtures(work_root / "bags"),
         "validate_mismatch": validate_mismatch_fixtures(work_root / "validate"),
         "cli_matrix": cli_matrix_fixtures(work_root / "cli"),
@@ -278,6 +284,131 @@ def writer_output_fixtures(work_root: Path) -> dict[str, Any]:
             "size": package_tar.stat().st_size,
             "package_index": package_index,
         },
+    }
+
+
+def shared_encoding_fixtures(work_root: Path) -> dict[str, Any]:
+    """Build fixtures for receive-core APIs shared with the Rust agent."""
+
+    work_root.mkdir(parents=True, exist_ok=True)
+    manifest_entries = [
+        {
+            "relpath": "data/Z.mov",
+            "client_sha256": "A" * 64,
+            "bytes": 12,
+        },
+        {
+            "relpath": "./data/Cafe\u0301.mov",
+            "client_sha256": hashlib.sha256(b"cafe").hexdigest().upper(),
+            "bytes": 4,
+        },
+    ]
+    source_plan_units = [
+        receive_core.PayloadUnit(
+            source_path=work_root / "source" / "B.mov",
+            relpath="B.mov",
+            entry_type="file",
+            logical_relpath=None,
+            hint_size=7,
+            plan_size=7,
+            mtime_ns=200,
+        ),
+        receive_core.PayloadUnit(
+            source_path=work_root / "source" / "Caf\u00e9.mov",
+            relpath="Caf\u00e9.mov",
+            entry_type="file",
+            logical_relpath=None,
+            hint_size=4,
+            plan_size=4,
+            mtime_ns=100,
+        ),
+    ]
+    package_members = [
+        {
+            "member": "A001.fcpbundle",
+            "type": "directory",
+            "length": 0,
+            "sha256": None,
+            "data_offset": None,
+        },
+        {
+            "member": "A001.fcpbundle/clip.mov",
+            "type": "file",
+            "length": 5,
+            "sha256": hashlib.sha256(b"clip").hexdigest(),
+            "data_offset": 512,
+        },
+    ]
+    package_records = [
+        {
+            "logical_member_path": "A001.fcpbundle",
+            "stored_member_path": "A001.fcpbundle.tar",
+            "profile": PACKAGE_PROFILE_VERSION,
+            "sha256": hashlib.sha256(b"tar").hexdigest(),
+            "size_bytes": 10240,
+            "members": package_members,
+        }
+    ]
+    canonical_cases = [None, "", "DCIM", "DCIM/100MEDIA", "A001.fcpbundle"]
+    canonical_rejections = [
+        "/DCIM",
+        "../DCIM",
+        "DCIM/../PRIVATE",
+        "DCIM\\100MEDIA",
+        "C:/DCIM",
+        "A001.fcpbundle/Event",
+        "a" * 1025,
+    ]
+    return {
+        "schema_version": 1,
+        "manifest_digest": {
+            "entries": manifest_entries,
+            "digest": manifest_digest(manifest_entries),
+        },
+        "source_plan_digest": {
+            "entries": [
+                {
+                    "relpath": unit.relpath,
+                    "size": unit.plan_size,
+                    "mtime_ns": unit.mtime_ns,
+                }
+                for unit in source_plan_units
+            ],
+            "digest": payload_plan_digest(source_plan_units),
+        },
+        "package_index": {
+            "packages": package_records,
+            "payload": build_package_index(package_records),
+        },
+        "card_id": [
+            {
+                "name": "real-volume-id",
+                "volume_uuid": "ABCD-1234",
+                "source": "/dev/disk2",
+                "mount_path": "/Volumes/CARD",
+                "label": "CARD",
+                "card_id": derive_card_id("ABCD-1234", "/dev/disk2", "/Volumes/CARD", "CARD"),
+            },
+            {
+                "name": "fallback",
+                "volume_uuid": None,
+                "source": "/dev/disk2",
+                "mount_path": "/Volumes/CARD",
+                "label": "CARD",
+                "card_id": derive_card_id(None, "/dev/disk2", "/Volumes/CARD", "CARD"),
+            },
+        ],
+        "canonical_device_rel_path": [
+            {"raw": value, "canonical": canonical_device_rel_path(value)}
+            for value in canonical_cases
+        ],
+        "canonical_device_rel_path_rejections": [
+            {
+                "raw": value,
+                "error": _raises_message(lambda value=value: canonical_device_rel_path(value)),
+            }
+            for value in canonical_rejections
+        ],
     }
 
 

@@ -13,6 +13,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import posixpath
 import queue
 import re
 import shutil
@@ -64,6 +65,8 @@ BAG_INFO_NAME = "bag-info.txt"
 BAGIT_NAME = "bagit.txt"
 TAGMANIFEST_NAME = "tagmanifest-sha256.txt"
 PACKAGE_INDEX_NAME = "package-index.json"
+MAX_DEVICE_REL_PATH = 1024
+_DEVICE_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _BAG_TAG_FILES = (BAGIT_NAME, BAG_INFO_NAME, MANIFEST_NAME)
 _COPY_BUFFER_BYTES = 1024 * 1024
 _DEFAULT_ORPHAN_AGE = dt.timedelta(hours=24)
@@ -601,6 +604,12 @@ def payload_plan_digest(plan: PayloadPlan | Iterable[PayloadUnit]) -> str:
     """Return sha256 over sorted ``{relpath,size,mtime_ns}`` plan metadata."""
 
     units = plan.units if isinstance(plan, PayloadPlan) else tuple(plan)
+    if _native is not None and hasattr(_native, "payload_plan_digest"):
+        return str(
+            _native.payload_plan_digest(
+                [(unit.relpath, int(unit.plan_size), int(unit.mtime_ns)) for unit in units]
+            )
+        )
     payload = [
         {"relpath": unit.relpath, "size": unit.plan_size, "mtime_ns": unit.mtime_ns}
         for unit in sorted(units, key=lambda item: item.relpath)
@@ -608,6 +617,64 @@ def payload_plan_digest(plan: PayloadPlan | Iterable[PayloadUnit]) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def source_plan_digest(plan: PayloadPlan | Iterable[PayloadUnit]) -> str:
+    """Alias for the gRPC ``source_plan_digest`` wire field encoding."""
+
+    return payload_plan_digest(plan)
+
+
+def manifest_digest(files: Iterable[Any]) -> str:
+    """Return sha256 over sorted gRPC commit manifest entries."""
+
+    entries = [
+        (
+            str(_field(item, "relpath")),
+            str(_field(item, "client_sha256")),
+            int(_field(item, "bytes")),
+        )
+        for item in files
+    ]
+    if _native is not None and hasattr(_native, "manifest_digest"):
+        try:
+            return str(_native.manifest_digest(entries))
+        except ValueError as exc:
+            raise ReceiveError(str(exc)) from exc
+    payload = [
+        {
+            "relpath": canonicalize_manifest_path(relpath),
+            "client_sha256": client_sha256.lower(),
+            "bytes": size_bytes,
+        }
+        for relpath, client_sha256, size_bytes in entries
+    ]
+    return hashlib.sha256(
+        json.dumps(sorted(payload, key=lambda item: item["relpath"]), sort_keys=True).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def build_package_index(packages: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """Return the shared package-index tag payload for normalized package records."""
+
+    package_list = [dict(package) for package in packages]
+    if _native is not None and hasattr(_native, "build_package_index_json"):
+        payload = json.loads(
+            _native.build_package_index_json(
+                json.dumps(package_list, sort_keys=True, separators=(",", ":"))
+            )
+        )
+        return None if payload is None else cast(dict[str, Any], payload)
+    if not package_list:
+        return None
+    return {
+        "profile": PACKAGE_PROFILE_VERSION,
+        "profile_hash": PACKAGE_PROFILE_HASH,
+        "package_globs": list(PACKAGE_GLOBS),
+        "packages": sorted(package_list, key=lambda item: item["stored_member_path"]),
+    }
 
 
 def _payload_plan_from_native(payload: Mapping[str, Any]) -> PayloadPlan:
@@ -1267,6 +1334,59 @@ def canonicalize_manifest_path(raw: str) -> str:
     return _canonicalize_parts(pure.parts, from_filesystem=False)
 
 
+def canonical_device_rel_path(value: str | None) -> str:
+    """Return the canonical forward-slash card-relative wire path."""
+
+    if _native is not None and hasattr(_native, "canonical_device_rel_path"):
+        try:
+            return str(_native.canonical_device_rel_path(value))
+        except ValueError as exc:
+            raise ReceiveError(str(exc)) from exc
+    if value is None or value == "":
+        return ""
+    if len(value) > MAX_DEVICE_REL_PATH:
+        raise ReceiveError("invalid source path")
+    if "\\" in value:
+        raise ReceiveError("invalid source path")
+    if value.startswith("/"):
+        raise ReceiveError("invalid source path")
+    if _DEVICE_DRIVE_PREFIX.match(value):
+        raise ReceiveError("invalid source path")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ReceiveError("invalid source path")
+    canonical = posixpath.normpath(value)
+    if canonical != value:
+        raise ReceiveError("invalid source path")
+    for part in parts[:-1]:
+        if _is_package_boundary(part):
+            raise ReceiveError(f"source path enters a package: {canonical}")
+    return canonical
+
+
+def derive_card_id(
+    volume_uuid: str | None,
+    source: str | None,
+    mount_path: str | Path,
+    label: str | None,
+) -> str:
+    """Return the shared opaque card id from real volume id or stable fallback."""
+
+    if _native is not None and hasattr(_native, "derive_card_id"):
+        return str(
+            _native.derive_card_id(
+                volume_uuid,
+                str(source or ""),
+                str(mount_path),
+                str(label or ""),
+            )
+        )
+    if volume_uuid:
+        return f"volume:{volume_uuid}"
+    seed = "|".join([str(source or ""), str(mount_path), str(label or "")])
+    return f"volume:{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:24]}"
+
+
 def _read_checksum_manifest(path: Path, *, payload_manifest: bool) -> dict[str, str]:
     records: dict[str, str] = {}
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -1470,12 +1590,7 @@ def _package_index_payload(receipts: Iterable[FileReceipt]) -> dict[str, Any] | 
         )
     if not packages:
         return None
-    return {
-        "profile": PACKAGE_PROFILE_VERSION,
-        "profile_hash": PACKAGE_PROFILE_HASH,
-        "package_globs": list(PACKAGE_GLOBS),
-        "packages": sorted(packages, key=lambda item: item["stored_member_path"]),
-    }
+    return build_package_index(packages)
 
 
 def _annotate_package_records(
@@ -2457,6 +2572,12 @@ def _optional_str(value: object) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _field(item: Any, name: str) -> Any:
+    if isinstance(item, Mapping):
+        return item[name]
+    return getattr(item, name)
 
 
 def _utcnow() -> dt.datetime:

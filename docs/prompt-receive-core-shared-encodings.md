@@ -1,7 +1,7 @@
 # Codex prompt — receive-core shared encodings (M0 for the Rust agent)
 
 **Repo:** `~/sutradhara/repo` · package `packages/sutradhara-receive` (Rust crate + PyO3 wheel).
-**Status:** pending.
+**Status:** implemented 2026-07-03.
 **Why:** the Rust agent control-plane design
 (`~/sutra-agent/docs/design-rust-agent-control-plane.md`, §0 "governing principle") requires
 the drift-sensitive encodings the server *recomputes and rejects* to live in **one shared

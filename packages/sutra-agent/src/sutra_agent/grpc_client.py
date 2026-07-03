@@ -9,7 +9,6 @@ before declaring a source release decision.
 from __future__ import annotations
 
 import hashlib
-import json
 import time
 import uuid
 from collections.abc import Callable
@@ -32,6 +31,7 @@ from sutradhara_receive import (
     PACKAGE_PROFILE_VERSION,
     PayloadPlan,
     PayloadUnit,
+    manifest_digest,
     plan_payload_units,
 )
 
@@ -296,7 +296,7 @@ def _commit(
                 _package_index_proto(package_indexes[relpath])
                 for relpath in sorted(package_indexes)
             ],
-            manifest_digest=_manifest_digest(entries),
+            manifest_digest=manifest_digest(entries),
         )
     )
 
@@ -323,20 +323,6 @@ def _package_member_proto(payload: dict[str, Any]) -> Any:
     if member_type == "symlink" and payload.get("linkname") is not None:
         kwargs["linkname"] = str(payload["linkname"])
     return intake_pb2.PackageMemberEntry(**kwargs)
-
-
-def _manifest_digest(entries: list[Any]) -> str:
-    payload = [
-        {
-            "relpath": item.relpath,
-            "client_sha256": item.client_sha256,
-            "bytes": int(item.bytes),
-        }
-        for item in entries
-    ]
-    return hashlib.sha256(
-        json.dumps(sorted(payload, key=lambda item: item["relpath"]), sort_keys=True).encode("utf-8")
-    ).hexdigest()
 
 
 def _poll_status(

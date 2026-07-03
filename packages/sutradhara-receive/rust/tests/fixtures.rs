@@ -12,12 +12,14 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 use sutradhara_receive::{
     BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, PACKAGE_GLOBS, PACKAGE_PROFILE_HASH,
-    PACKAGE_PROFILE_VERSION, RECEIVE_PACKAGE, RECEIVE_VERSION, ReceiveOptions, bag_info_text,
-    bagit_manifest_text, build_package_tar, canonicalize_manifest_path,
-    canonicalize_raw_path_components, escape_member_name, hash_payload_tree,
-    hash_payload_tree_with_policy, manifest_mismatch, plan_payload_units, read_manifest_sha256,
-    receive_source, resume_receive_source, sha256_file, sweep_orphans, tagmanifest_text,
-    unescape_member_name, validate_bag, write_bagit_files_with_observer,
+    PACKAGE_PROFILE_VERSION, PackageIndexPackage, RECEIVE_PACKAGE, RECEIVE_VERSION, ReceiveOptions,
+    SourcePlanDigestEntry, bag_info_text, bagit_manifest_text, build_package_index,
+    build_package_tar, canonical_device_rel_path, canonicalize_manifest_path,
+    canonicalize_raw_path_components, derive_card_id, escape_member_name, hash_payload_tree,
+    hash_payload_tree_with_policy, manifest_digest, manifest_mismatch, plan_payload_units,
+    read_manifest_sha256, receive_source, resume_receive_source, sha256_file, source_plan_digest,
+    sweep_orphans, tagmanifest_text, unescape_member_name, validate_bag,
+    write_bagit_files_with_observer,
 };
 
 #[test]
@@ -135,6 +137,82 @@ fn writer_text_fixtures_match_python_contract() {
         tagmanifest_text(temp.path(), &tag_files).unwrap(),
         writer["tagmanifest-sha256.txt"].as_str().unwrap()
     );
+}
+
+#[test]
+fn shared_encoding_fixtures_match_python_contract() {
+    let fixture = read_fixture("shared_encodings.json");
+
+    let manifest_entries = fixture["manifest_digest"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| sutradhara_receive::ManifestEntry {
+            relpath: entry["relpath"].as_str().unwrap().to_string(),
+            client_sha256: entry["client_sha256"].as_str().unwrap().to_string(),
+            bytes: entry["bytes"].as_u64().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        manifest_digest(&manifest_entries).unwrap(),
+        fixture["manifest_digest"]["digest"].as_str().unwrap()
+    );
+
+    let source_plan_entries = fixture["source_plan_digest"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| SourcePlanDigestEntry {
+            relpath: entry["relpath"].as_str().unwrap().to_string(),
+            size: entry["size"].as_u64().unwrap(),
+            mtime_ns: entry["mtime_ns"].as_u64().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_plan_digest(&source_plan_entries),
+        fixture["source_plan_digest"]["digest"].as_str().unwrap()
+    );
+
+    let packages: Vec<PackageIndexPackage> =
+        serde_json::from_value(fixture["package_index"]["packages"].clone()).unwrap();
+    assert_eq!(
+        build_package_index(&packages).unwrap(),
+        fixture["package_index"]["payload"]
+    );
+
+    for case in fixture["card_id"].as_array().unwrap() {
+        let volume_uuid = case["volume_uuid"].as_str();
+        assert_eq!(
+            derive_card_id(
+                volume_uuid,
+                case["source"].as_str().unwrap(),
+                case["mount_path"].as_str().unwrap(),
+                case["label"].as_str().unwrap(),
+            ),
+            case["card_id"].as_str().unwrap(),
+            "{}",
+            case["name"].as_str().unwrap()
+        );
+    }
+
+    for case in fixture["canonical_device_rel_path"].as_array().unwrap() {
+        let raw = case["raw"].as_str().unwrap_or("");
+        assert_eq!(
+            canonical_device_rel_path(raw).unwrap(),
+            case["canonical"].as_str().unwrap()
+        );
+    }
+
+    for case in fixture["canonical_device_rel_path_rejections"]
+        .as_array()
+        .unwrap()
+    {
+        let raw = case["raw"].as_str().unwrap();
+        assert_eq!(
+            canonical_device_rel_path(raw).unwrap_err().to_string(),
+            case["error"].as_str().unwrap()
+        );
+    }
 }
 
 #[test]

@@ -1,0 +1,165 @@
+{
+  "canonical_device_rel_path": [
+    {
+      "canonical": "",
+      "raw": null
+    },
+    {
+      "canonical": "",
+      "raw": ""
+    },
+    {
+      "canonical": "DCIM",
+      "raw": "DCIM"
+    },
+    {
+      "canonical": "DCIM/100MEDIA",
+      "raw": "DCIM/100MEDIA"
+    },
+    {
+      "canonical": "A001.fcpbundle",
+      "raw": "A001.fcpbundle"
+    }
+  ],
+  "canonical_device_rel_path_rejections": [
+    {
+      "error": "invalid source path",
+      "raw": "/DCIM"
+    },
+    {
+      "error": "invalid source path",
+      "raw": "../DCIM"
+    },
+    {
+      "error": "invalid source path",
+      "raw": "DCIM/../PRIVATE"
+    },
+    {
+      "error": "invalid source path",
+      "raw": "DCIM\\100MEDIA"
+    },
+    {
+      "error": "invalid source path",
+      "raw": "C:/DCIM"
+    },
+    {
+      "error": "source path enters a package: A001.fcpbundle/Event",
+      "raw": "A001.fcpbundle/Event"
+    },
+    {
+      "error": "invalid source path",
+      "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "card_id": [
+    {
+      "card_id": "volume:ABCD-1234",
+      "label": "CARD",
+      "mount_path": "/Volumes/CARD",
+      "name": "real-volume-id",
+      "source": "/dev/disk2",
+      "volume_uuid": "ABCD-1234"
+    },
+    {
+      "card_id": "volume:9690b5103ddaf62acdf3df8d",
+      "label": "CARD",
+      "mount_path": "/Volumes/CARD",
+      "name": "fallback",
+      "source": "/dev/disk2",
+      "volume_uuid": null
+    }
+  ],
+  "manifest_digest": {
+    "digest": "55f4f2f48e8cc675c6d97d41c657dcb611decfee78ca53555c18e164920c6920",
+    "entries": [
+      {
+        "bytes": 12,
+        "client_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "relpath": "data/Z.mov"
+      },
+      {
+        "bytes": 4,
+        "client_sha256": "A860B858265B22DAD3AAF1165CFC2936DAF1D3D86E0B7B77E3CC07F59F96858F",
+        "relpath": "./data/Cafe\u0301.mov"
+      }
+    ]
+  },
+  "package_index": {
+    "packages": [
+      {
+        "logical_member_path": "A001.fcpbundle",
+        "members": [
+          {
+            "data_offset": null,
+            "length": 0,
+            "member": "A001.fcpbundle",
+            "sha256": null,
+            "type": "directory"
+          },
+          {
+            "data_offset": 512,
+            "length": 5,
+            "member": "A001.fcpbundle/clip.mov",
+            "sha256": "67905ad3cc2dd52b1f5f6a6d2814de0396618b29b4238b9af5207aeb69936e6d",
+            "type": "file"
+          }
+        ],
+        "profile": "package-tar-v1",
+        "sha256": "90aebae315675cbf04612de4f7d5874850f48e0b8dd82becbeaa47ca93f5ebfb",
+        "size_bytes": 10240,
+        "stored_member_path": "A001.fcpbundle.tar"
+      }
+    ],
+    "payload": {
+      "package_globs": [
+        "*.fcpbundle",
+        "*.photoslibrary",
+        "*.imovielibrary",
+        "*.app"
+      ],
+      "packages": [
+        {
+          "logical_member_path": "A001.fcpbundle",
+          "members": [
+            {
+              "data_offset": null,
+              "length": 0,
+              "member": "A001.fcpbundle",
+              "sha256": null,
+              "type": "directory"
+            },
+            {
+              "data_offset": 512,
+              "length": 5,
+              "member": "A001.fcpbundle/clip.mov",
+              "sha256": "67905ad3cc2dd52b1f5f6a6d2814de0396618b29b4238b9af5207aeb69936e6d",
+              "type": "file"
+            }
+          ],
+          "profile": "package-tar-v1",
+          "sha256": "90aebae315675cbf04612de4f7d5874850f48e0b8dd82becbeaa47ca93f5ebfb",
+          "size_bytes": 10240,
+          "stored_member_path": "A001.fcpbundle.tar"
+        }
+      ],
+      "profile": "package-tar-v1",
+      "profile_hash": "fc87e5e8ad47962fa800b2d2e7fac6ae1da148f142319a4c32efca1ed392ef3c"
+    }
+  },
+  "schema_version": 1,
+  "source_plan_digest": {
+    "digest": "e09b43edb84ea3c8cb2a07328771eb0e9cfa15107a163596ea7c22c24260419e",
+    "entries": [
+      {
+        "mtime_ns": 200,
+        "relpath": "B.mov",
+        "size": 7
+      },
+      {
+        "mtime_ns": 100,
+        "relpath": "Caf\u00e9.mov",
+        "size": 4
+      }
+    ]
+  }
+}

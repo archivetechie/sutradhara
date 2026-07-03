@@ -21,13 +21,14 @@ from sutradhara.grpc.store import GrpcIntake
 from sutradhara_receive import (
     BAG_PROFILE,
     CANONICALIZATION_VERSION,
-    PACKAGE_GLOBS,
     PACKAGE_INDEX_NAME,
     PACKAGE_PROFILE_HASH,
     PACKAGE_PROFILE_VERSION,
     ReceiveError,
     bag_info_metadata,
+    build_package_index,
     canonicalize_manifest_path,
+    manifest_digest as receive_manifest_digest,
     write_bagit_files,
 )
 
@@ -54,14 +55,12 @@ def assemble_committed_bag(
     packages = [_package_index_entry(item) for item in package_indexes]
     extra_tags: tuple[str, ...] = ()
     if packages:
+        package_index = build_package_index(packages)
+        if package_index is None:
+            raise AssemblyError("package index unexpectedly empty")
         _atomic_write_json(
             intake_dir / PACKAGE_INDEX_NAME,
-            {
-                "profile": PACKAGE_PROFILE_VERSION,
-                "profile_hash": PACKAGE_PROFILE_HASH,
-                "package_globs": list(PACKAGE_GLOBS),
-                "packages": sorted(packages, key=lambda item: item["stored_member_path"]),
-            },
+            package_index,
         )
         extra_tags = (PACKAGE_INDEX_NAME,)
     else:
@@ -109,19 +108,7 @@ def assemble_committed_bag(
 def manifest_digest(files: Iterable[Any]) -> str:
     """Return sha256 over sorted manifest commit entries."""
 
-    import hashlib
-
-    payload = [
-        {
-            "relpath": canonicalize_manifest_path(str(item.relpath)),
-            "client_sha256": str(item.client_sha256).lower(),
-            "bytes": int(item.bytes),
-        }
-        for item in files
-    ]
-    return hashlib.sha256(
-        json.dumps(sorted(payload, key=lambda item: item["relpath"]), sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return receive_manifest_digest(files)
 
 
 def _check_receive_fact_skew(receive_facts: Any) -> None:

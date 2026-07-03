@@ -9,7 +9,7 @@
 #[cfg(feature = "python")]
 mod python;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -40,6 +40,7 @@ pub const PACKAGE_SYMLINK_MODE: u32 = 0o777;
 pub const PACKAGE_MTIME: u64 = 0;
 pub const TAR_BLOCK_BYTES: u64 = 512;
 pub const TAR_RECORD_BYTES: u64 = 10240;
+pub const MAX_DEVICE_REL_PATH: usize = 1024;
 
 const BAG_INFO_ORDER: &[&str] = &[
     "Bagging-Date",
@@ -135,6 +136,20 @@ pub struct BagWriteResult {
 pub struct PayloadPlan {
     pub units: Vec<PayloadUnit>,
     pub rejected: Vec<RejectedEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestEntry {
+    pub relpath: String,
+    pub client_sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePlanDigestEntry {
+    pub relpath: String,
+    pub size: u64,
+    pub mtime_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -275,7 +290,7 @@ pub struct PackageTarResult {
     pub members: Vec<PackageMemberRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PackageMemberRecord {
     pub member: String,
     #[serde(rename = "type")]
@@ -285,6 +300,17 @@ pub struct PackageMemberRecord {
     pub data_offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub linkname: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PackageIndexPackage {
+    pub logical_member_path: String,
+    pub stored_member_path: String,
+    pub profile: String,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    pub members: Vec<PackageMemberRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +472,116 @@ pub fn canonicalize_filesystem_path(path: &Path, root: &Path) -> ReceiveResult<S
     join_canonical_parts(output)
 }
 
+pub fn canonical_device_rel_path(value: &str) -> ReceiveResult<String> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.len() > MAX_DEVICE_REL_PATH {
+        return Err(ReceiveError::new("invalid source path"));
+    }
+    if value.contains('\\') {
+        return Err(ReceiveError::new("invalid source path"));
+    }
+    if value.starts_with('/') {
+        return Err(ReceiveError::new("invalid source path"));
+    }
+    if has_drive_prefix(value) {
+        return Err(ReceiveError::new("invalid source path"));
+    }
+    let parts: Vec<&str> = value.split('/').collect();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return Err(ReceiveError::new("invalid source path"));
+    }
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        if is_package_boundary(part) {
+            return Err(ReceiveError::new(format!(
+                "source path enters a package: {value}"
+            )));
+        }
+    }
+    Ok(value.to_string())
+}
+
+pub fn derive_card_id(
+    volume_uuid: Option<&str>,
+    source: &str,
+    mount_path: &str,
+    label: &str,
+) -> String {
+    if let Some(volume_uuid) = volume_uuid
+        && !volume_uuid.is_empty()
+    {
+        return format!("volume:{volume_uuid}");
+    }
+    let mut digest = Sha256::new();
+    digest.update(format!("{source}|{mount_path}|{label}").as_bytes());
+    let id = hex_lower(&digest.finalize());
+    format!("volume:{}", &id[..24])
+}
+
+pub fn manifest_digest(entries: &[ManifestEntry]) -> ReceiveResult<String> {
+    let mut rows = Vec::new();
+    for entry in entries {
+        rows.push((
+            canonicalize_manifest_path(&entry.relpath)?,
+            entry.client_sha256.to_ascii_lowercase(),
+            entry.bytes,
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut text = String::from("[");
+    for (index, (relpath, client_sha256, bytes)) in rows.iter().enumerate() {
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_str("{\"bytes\": ");
+        text.push_str(&bytes.to_string());
+        text.push_str(", \"client_sha256\": ");
+        text.push_str(&python_json_string(client_sha256));
+        text.push_str(", \"relpath\": ");
+        text.push_str(&python_json_string(relpath));
+        text.push('}');
+    }
+    text.push(']');
+    Ok(sha256_text(&text))
+}
+
+pub fn source_plan_digest(entries: &[SourcePlanDigestEntry]) -> String {
+    let mut rows = entries.to_vec();
+    rows.sort_by(|left, right| left.relpath.cmp(&right.relpath));
+    let mut text = String::from("[");
+    for (index, entry) in rows.iter().enumerate() {
+        if index > 0 {
+            text.push(',');
+        }
+        text.push_str("{\"mtime_ns\":");
+        text.push_str(&entry.mtime_ns.to_string());
+        text.push_str(",\"relpath\":");
+        text.push_str(&python_json_string(&entry.relpath));
+        text.push_str(",\"size\":");
+        text.push_str(&entry.size.to_string());
+        text.push('}');
+    }
+    text.push(']');
+    sha256_text(&text)
+}
+
+pub fn payload_plan_digest(plan: &PayloadPlan) -> String {
+    let entries = plan
+        .units
+        .iter()
+        .map(|unit| SourcePlanDigestEntry {
+            relpath: unit.relpath.clone(),
+            size: unit.plan_size,
+            mtime_ns: unit.mtime_ns,
+        })
+        .collect::<Vec<_>>();
+    source_plan_digest(&entries)
+}
+
 pub fn bagit_manifest_text(entries: &BTreeMap<String, String>) -> ReceiveResult<String> {
     let mut lines = Vec::new();
     for (relpath, digest) in entries {
@@ -599,6 +735,37 @@ pub fn build_package_tar(
         size_bytes,
         members: records.into_values().collect(),
     })
+}
+
+pub fn build_package_index(packages: &[PackageIndexPackage]) -> Option<Value> {
+    if packages.is_empty() {
+        return None;
+    }
+    let mut packages = packages.to_vec();
+    packages.sort_by(|left, right| left.stored_member_path.cmp(&right.stored_member_path));
+    Some(json!({
+        "profile": PACKAGE_PROFILE_VERSION,
+        "profile_hash": PACKAGE_PROFILE_HASH,
+        "package_globs": PACKAGE_GLOBS,
+        "packages": packages,
+    }))
+}
+
+pub fn package_index_package(
+    logical_member_path: &str,
+    stored_member_path: &str,
+    sha256: &str,
+    size_bytes: u64,
+    members: &[PackageMemberRecord],
+) -> PackageIndexPackage {
+    PackageIndexPackage {
+        logical_member_path: logical_member_path.to_string(),
+        stored_member_path: stored_member_path.to_string(),
+        profile: PACKAGE_PROFILE_VERSION.to_string(),
+        sha256: sha256.to_ascii_lowercase(),
+        size_bytes: Some(size_bytes),
+        members: members.to_vec(),
+    }
 }
 
 pub fn receive_source(
@@ -785,7 +952,7 @@ where
         .iter()
         .map(|receipt| (receipt.relpath.clone(), receipt.sha256_hex.clone()))
         .collect();
-    let package_index = package_index_payload(&receipts);
+    let package_index = package_index_payload_from_receipts(&receipts)?;
     let mut extra_tag_files = Vec::new();
     if let Some(package_index) = package_index {
         write_json_file_with_observer(
@@ -1761,30 +1928,33 @@ fn verify_destination_files(receipts: &[FileReceipt]) -> ReceiveResult<()> {
     }
 }
 
-fn package_index_payload(receipts: &[FileReceipt]) -> Option<Value> {
+fn package_index_payload_from_receipts(receipts: &[FileReceipt]) -> ReceiveResult<Option<Value>> {
     let mut packages = Vec::new();
     for receipt in receipts {
         if receipt.package_members.is_empty() {
             continue;
         }
-        packages.push(json!({
-            "logical_member_path": receipt.logical_relpath,
-            "members": receipt.package_members,
-            "profile": PACKAGE_PROFILE_VERSION,
-            "sha256": receipt.sha256_hex,
-            "size_bytes": receipt.size_bytes,
-            "stored_member_path": receipt.stored_relpath,
-        }));
+        let Some(logical_relpath) = receipt.logical_relpath.as_deref() else {
+            return Err(ReceiveError::new(format!(
+                "package receipt missing logical/stored relpath: {}",
+                receipt.relpath
+            )));
+        };
+        let Some(stored_relpath) = receipt.stored_relpath.as_deref() else {
+            return Err(ReceiveError::new(format!(
+                "package receipt missing logical/stored relpath: {}",
+                receipt.relpath
+            )));
+        };
+        packages.push(package_index_package(
+            logical_relpath,
+            stored_relpath,
+            &receipt.sha256_hex,
+            receipt.size_bytes,
+            &receipt.package_members,
+        ));
     }
-    if packages.is_empty() {
-        return None;
-    }
-    Some(json!({
-        "package_globs": PACKAGE_GLOBS,
-        "packages": packages,
-        "profile": PACKAGE_PROFILE_VERSION,
-        "profile_hash": PACKAGE_PROFILE_HASH,
-    }))
+    Ok(build_package_index(&packages))
 }
 
 fn bag_info_metadata(
@@ -2680,6 +2850,53 @@ fn hex_lower(bytes: &[u8]) -> String {
         output.push(hex_digit(byte & 0x0f));
     }
     output
+}
+
+fn sha256_text(text: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(text.as_bytes());
+    hex_lower(&digest.finalize())
+}
+
+fn python_json_string(value: &str) -> String {
+    let mut output = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\u{00}'..='\u{1f}' => push_json_u_escape(&mut output, character as u32),
+            '\u{20}'..='\u{7e}' => output.push(character),
+            _ => {
+                let codepoint = character as u32;
+                if codepoint <= 0xffff {
+                    push_json_u_escape(&mut output, codepoint);
+                } else {
+                    let shifted = codepoint - 0x1_0000;
+                    push_json_u_escape(&mut output, 0xd800 + (shifted >> 10));
+                    push_json_u_escape(&mut output, 0xdc00 + (shifted & 0x03ff));
+                }
+            }
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn push_json_u_escape(output: &mut String, value: u32) {
+    output.push_str("\\u");
+    for shift in [12, 8, 4, 0] {
+        output.push(hex_digit(((value >> shift) & 0x0f) as u8));
+    }
+}
+
+fn has_drive_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
 fn is_sha256_hex(value: &str) -> bool {
