@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
-import os
 from pathlib import Path
 
 import pytest
@@ -189,7 +188,9 @@ def test_restore_post_manager_error_returns_sanitized_4xx(
     )
 
     def fake_admit_restore_request(*_args: object, **_kwargs: object) -> RestoreRequest:
-        raise InvalidRestoreDestination(f"{os.getcwd()}/private/export escapes configured root")
+        raise InvalidRestoreDestination(
+            "restore destination escapes configured root: /var/lib/replica/private/export"
+        )
 
     monkeypatch.setattr(routes_restore, "admit_restore_request", fake_admit_restore_request)
     client = TestClient(app)
@@ -205,7 +206,8 @@ def test_restore_post_manager_error_returns_sanitized_4xx(
 
     assert response.status_code == 400
     assert response.json()["error"] == "invalid_restore_destination"
-    assert "<cwd>/private/export escapes configured root" == response.json()["detail"]
+    assert response.json()["detail"] == "restore destination is invalid"
+    assert "/var/lib/replica" not in response.json()["detail"]
 
 
 def test_event_alarm_sinks_project_conditions_visible_in_reconciliation(

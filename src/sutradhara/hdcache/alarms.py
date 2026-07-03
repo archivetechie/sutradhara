@@ -205,11 +205,19 @@ def record_restore_event_alarm(
             reason="unmapped-privacy-level",
             message=event.detail or "privacy level is not mapped to a restore capability",
         )
-    if event.code == "disk-circuit-open" or "disk-circuit" in event.code:
+    if event.code == "disk-circuit-open":
         return _set_alarm(
             session,
             "disk-unreachable:restore",
             active=True,
+            reason="disk-unreachable",
+            message=event.detail or event.code,
+        )
+    if event.code == "disk-circuit-closed":
+        return _set_alarm(
+            session,
+            "disk-unreachable:restore",
+            active=False,
             reason="disk-unreachable",
             message=event.detail or event.code,
         )

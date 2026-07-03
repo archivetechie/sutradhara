@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
-import os
+import re
 from dataclasses import replace
 from typing import Any
 
@@ -52,6 +52,10 @@ REQUEST_STATES = {
     REQUEST_COMPLETED_WITH_ERRORS,
 }
 MAX_RESTORE_REQUEST_LIMIT = 200
+INVALID_RESTORE_DESTINATION_DETAIL = "restore destination is invalid"
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![\w.-])(?:[A-Za-z]:[\\/][^\s'\"<>\]\[{}(),;]*|/(?!/)[^\s'\"<>\]\[{}(),;]*)"
+)
 
 
 @router.get("/api/ui/restore-destinations")
@@ -100,8 +104,8 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
             request_id = restore_request.id
     except UnknownRestoreDestination as exc:
         _raise(404, "unknown_destination", str(exc))
-    except InvalidRestoreDestination as exc:
-        _raise(400, "invalid_restore_destination", _sanitize_detail(str(exc)))
+    except InvalidRestoreDestination:
+        _raise(400, "invalid_restore_destination", INVALID_RESTORE_DESTINATION_DETAIL)
     except RestoreAdmissionInvalid as exc:
         _raise(400, "bad_request", _sanitize_detail(str(exc)))
     except RestoreManagerError as exc:
@@ -264,4 +268,6 @@ def _raise(status_code: int, error: str, detail: str) -> None:
 
 
 def _sanitize_detail(detail: str) -> str:
-    return detail.replace(os.getcwd(), "<cwd>")
+    """Remove host-local absolute paths from public restore API error details."""
+
+    return _ABSOLUTE_PATH_RE.sub("<path>", detail)

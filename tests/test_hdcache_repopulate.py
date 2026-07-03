@@ -49,6 +49,7 @@ from sutradhara.hdcache.store import RAW_REPRESENTATION, entry_path, write_entry
 from sutradhara.hdcache.walker import HdcacheWalkerEvent
 from sutradhara.jobs.engine import pending_candidates, submit
 from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
+from sutradhara.jobs.reconcilers.conditions import CONDITION_OPEN, CONDITION_SATISFIED
 from sutradhara.sealing.port import Representation
 
 
@@ -520,6 +521,45 @@ def test_alarm_condition_matrix(engine: Engine, tmp_path: Path) -> None:
         assert active["fill-queue-stalled"] == "fill-queue-stalled"
         assert active["unmapped-privacy-level"] == "unmapped-privacy-level"
         assert active["walker-tripwire:d001"] == "walker-tripwire"
+
+
+def test_disk_circuit_closed_satisfies_restore_alarm(engine: Engine) -> None:
+    with session_scope(engine) as session:
+        opened = record_restore_event_alarm(
+            session,
+            RestoreEvent(
+                code="disk-circuit-open",
+                severity="alarm",
+                detail="cache disk d001 exceeded failure threshold",
+            ),
+        )
+
+        assert opened is not None
+        assert opened.target_key == "disk-unreachable:restore"
+        assert opened.condition == CONDITION_OPEN
+
+        closed = record_restore_event_alarm(
+            session,
+            RestoreEvent(
+                code="disk-circuit-closed",
+                severity="info",
+                detail="cache disk d001 recovered",
+            ),
+        )
+
+        assert closed is not None
+        assert closed.target_key == "disk-unreachable:restore"
+        assert closed.condition == CONDITION_SATISFIED
+        active = {
+            row.target_key
+            for row in session.scalars(
+                select(ReconciliationCondition).where(
+                    ReconciliationCondition.domain == ALARM_DOMAIN,
+                    ReconciliationCondition.condition == CONDITION_OPEN,
+                )
+            )
+        }
+        assert "disk-unreachable:restore" not in active
 
 
 def test_restore_assets_from_bundle_uses_one_batch_extractor(
