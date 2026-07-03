@@ -12,15 +12,19 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from sutradhara.archive_restore import (
+    ArchiveRestoreError,
     RemArchiveExtractor,
-    RestoreRejectedAsset,
-    RestoreSuspectAsset,
-    restore_asset,
 )
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
 from sutradhara.catalog.models import ArtifactClassPool, Backend, Pool, VirtualArrangement
 from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.hdcache.manager import (
+    PrivacyOverride,
+    RestoreDenied,
+    RestoreManagerError,
+    restore_to_path,
+)
 from sutradhara.virtual_arrangement import (
     VirtualArrangementError,
     add_member,
@@ -204,6 +208,11 @@ def show_cmd(name: str, as_json: bool) -> None:
 @click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
 @click.option("--force", "force_suspect", is_flag=True, help="Restore suspect assets.")
 @click.option("--force-rejected", is_flag=True, help="Restore rejected assets.")
+@click.option(
+    "--privacy-override",
+    default=None,
+    help="Trusted CLI reason for restoring private hdcache assets without API grants.",
+)
 def restore_cmd(
     name: str,
     path: str,
@@ -211,6 +220,7 @@ def restore_cmd(
     rem_bin: str,
     force_suspect: bool,
     force_rejected: bool,
+    privacy_override: str | None,
 ) -> None:
     """Restore one member by virtual path."""
 
@@ -219,21 +229,25 @@ def restore_cmd(
         with session_scope(engine) as session:
             asset_hash, artifactclass = resolve(session, name, path)
             backends = _restore_backends(session, artifactclass)
-            result = restore_asset(
+            result = restore_to_path(
                 session,
                 asset_hash=asset_hash,
                 artifactclass=artifactclass,
                 destination=destination,
+                identity_or_override=(
+                    PrivacyOverride(privacy_override) if privacy_override is not None else None
+                ),
                 backends=backends,
                 extractor=RemArchiveExtractor(rem_bin),
                 force_suspect=force_suspect,
                 force_rejected=force_rejected,
             )
-    except (RestoreRejectedAsset, RestoreSuspectAsset, VirtualArrangementError) as exc:
+    except RestoreDenied as exc:
+        raise click.ClickException(exc.detail) from exc
+    except (ArchiveRestoreError, RestoreManagerError, VirtualArrangementError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(
-        f"restored {result.asset_hash.hex()} from pool {result.pool_id} copy {result.copy_id} "
-        f"to {result.output_path}"
+        f"restored {asset_hash.hex()} from {result.source} to {result.output_path}"
     )
 
 

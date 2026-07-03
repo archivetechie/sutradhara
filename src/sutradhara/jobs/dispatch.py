@@ -13,17 +13,16 @@ The caller owns the transaction (`session.commit()`), matching the
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset
-from sutradhara.catalog.types import BackendKind, CopyHealth, is_content_hash
+from sutradhara.catalog.models import Backend, LogicalAsset
+from sutradhara.catalog.types import BackendKind, is_content_hash
+from sutradhara.hdcache.models import RestoreRequestItem
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job
-from sutradhara.restore import validate_restore_destination
 
 
 class DispatchError(Exception):
@@ -42,16 +41,12 @@ class AmbiguousBackend(DispatchError):
     """More than one Backend can satisfy the request."""
 
 
-class UnknownCopy(DispatchError):
-    """The copy_id does not name a registered Copy."""
+class UnknownRestoreRequestItem(DispatchError):
+    """The restore_request_item_id does not name a gated restore item."""
 
 
-class CopyNotRestorable(DispatchError):
-    """The copy cannot be restored from (e.g. health == MISSING)."""
-
-
-class InvalidRestoreDestination(DispatchError):
-    """The requested restore destination cannot be written safely."""
+class RestoreRequestItemNotRunnable(DispatchError):
+    """The restore request item is not queued for worker execution."""
 
 
 def dispatch_write_to_tape(
@@ -102,55 +97,40 @@ def dispatch_write_to_tape(
 
 def dispatch_restore(
     session: Session,
-    copy_id: int,
-    dest_path: str | os.PathLike[str],
+    restore_request_item_id: int,
 ) -> dict[str, Any]:
-    """Dispatch a read-only `restore` job for one existing copy.
+    """Dispatch a gated operator restore job for one request item.
 
-    Pure dispatch: validate the copy, submit a PENDING `restore` job, and return
-    a handle. The caller (a future copy-selection policy layer) chooses which
-    `copy_id` to restore; this helper is the mechanism, not the policy.
+    The request item is created by the hdcache restore admission path after
+    privacy, validity, and destination gates run. Raw copy ids and destination
+    paths are deliberately not accepted here.
 
-    Returns a handle: `{"job_id", "kind", "params", "copy_id", "source_backend"}`.
+    Returns a handle: `{"job_id", "kind", "params", "restore_request_item_id"}`.
 
     Raises:
-        UnknownCopy                — no Copy with that id.
-        CopyNotRestorable          — the copy's health is MISSING (no bytes to read).
-        InvalidRestoreDestination  — dest_path is not absolute or its parent is absent.
+        UnknownRestoreRequestItem       — no restore request item with that id.
+        RestoreRequestItemNotRunnable   — item is denied/done/failed already.
     """
-    copy = session.get(Copy, copy_id)
-    if copy is None:
-        raise UnknownCopy(f"no Copy with id={copy_id}; nothing to restore")
-
-    if copy.health == CopyHealth.MISSING:
-        raise CopyNotRestorable(
-            f"copy id={copy_id} on backend {copy.backend.name!r} has health=missing; "
-            "there are no bytes to restore from it"
+    item = session.get(RestoreRequestItem, restore_request_item_id)
+    if item is None:
+        raise UnknownRestoreRequestItem(
+            f"no RestoreRequestItem with id={restore_request_item_id}; nothing to restore"
         )
-    if copy.deleted_at is not None:
-        raise CopyNotRestorable(
-            f"copy id={copy_id} on backend {copy.backend.name!r} is tombstoned; "
-            "there are no bytes to restore from it"
+    if item.state != "queued":
+        raise RestoreRequestItemNotRunnable(
+            f"restore request item id={restore_request_item_id} is state={item.state!r}"
         )
-
-    try:
-        dest_text = os.fspath(dest_path)
-        destination = validate_restore_destination(dest_text)
-    except (TypeError, ValueError) as exc:
-        raise InvalidRestoreDestination(str(exc)) from exc
 
     job: Job = submit(
         session,
         "restore",
-        {"copy_id": copy_id, "dest_path": str(destination)},
+        {"restore_request_item_id": restore_request_item_id},
     )
     return {
         "job_id": job.id,
         "kind": job.kind,
         "params": job.params,
-        "copy_id": copy_id,
-        "source_backend": copy.backend.name,
-        "dest_path": str(destination),
+        "restore_request_item_id": restore_request_item_id,
     }
 
 

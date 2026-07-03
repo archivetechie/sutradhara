@@ -33,6 +33,7 @@ from sutradhara.catalog.types import (
     CopySource,
 )
 from sutradhara.cli.main import cli
+from sutradhara.hdcache.models import RestoreRequest, RestoreRequestItem
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
 from sutradhara.jobs.config import RetryPolicy, WorkerConfig
 from sutradhara.jobs.engine import (
@@ -1268,80 +1269,76 @@ def _register_restorable_copy(
         return copy.id
 
 
-def test_dispatch_restore_creates_pending_restore_job(engine: Engine, tmp_path: Path) -> None:
+def _register_restore_request_item(
+    engine: Engine,
+    *,
+    content: bytes = b"restore-me",
+    state: str = "queued",
+) -> int:
+    """Register one gated restore request item and return its id."""
+    asset_hash = hashlib.sha256(content).digest()
+    with session_scope(engine) as s:
+        if s.get(LogicalAsset, asset_hash) is None:
+            s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(content)))
+        request = RestoreRequest(
+            id=f"restore-{asset_hash.hex()[:12]}",
+            identity="owner",
+            destination_id="media-server",
+            state="active",
+        )
+        item = RestoreRequestItem(
+            content_sha256=asset_hash,
+            artifactclass="s-masters",
+            state=state,
+        )
+        request.items.append(item)
+        s.add(request)
+        s.flush()
+        return item.id
+
+
+def test_dispatch_restore_creates_pending_restore_job(engine: Engine) -> None:
     from sutradhara.jobs.dispatch import dispatch_restore
 
-    copy_id = _register_restorable_copy(engine, backend_name="tape-1")
-    dest_path = tmp_path / "restored.bin"
+    item_id = _register_restore_request_item(engine)
 
     with session_scope(engine) as s:
-        handle = dispatch_restore(s, copy_id, dest_path)
+        handle = dispatch_restore(s, item_id)
 
     assert handle["kind"] == "restore"
-    assert handle["copy_id"] == copy_id
-    assert handle["source_backend"] == "tape-1"
-    assert handle["dest_path"] == str(dest_path)
-    assert handle["params"] == {"copy_id": copy_id, "dest_path": str(dest_path)}
+    assert handle["restore_request_item_id"] == item_id
+    assert handle["params"] == {"restore_request_item_id": item_id}
 
     with session_scope(engine) as s:
         job = s.get(Job, handle["job_id"])
         assert job is not None
         assert job.status == JobStatus.PENDING
         assert job.kind == "restore"
-        assert job.params == {"copy_id": copy_id, "dest_path": str(dest_path)}
+        assert job.params == {"restore_request_item_id": item_id}
 
 
-def test_dispatch_restore_raises_for_unknown_copy(engine: Engine) -> None:
-    from sutradhara.jobs.dispatch import UnknownCopy, dispatch_restore
+def test_dispatch_restore_raises_for_unknown_request_item(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import UnknownRestoreRequestItem, dispatch_restore
 
-    with session_scope(engine) as s, pytest.raises(UnknownCopy, match="no Copy with id"):
-        dispatch_restore(s, 999, Path.cwd() / "restore.bin")
-
-
-def test_dispatch_restore_rejects_missing_copy(engine: Engine, tmp_path: Path) -> None:
-    from sutradhara.jobs.dispatch import CopyNotRestorable, dispatch_restore
-
-    copy_id = _register_restorable_copy(engine, health=CopyHealth.MISSING)
-
-    with session_scope(engine) as s, pytest.raises(CopyNotRestorable, match="missing"):
-        dispatch_restore(s, copy_id, tmp_path / "restore.bin")
+    with session_scope(engine) as s, pytest.raises(UnknownRestoreRequestItem, match="no Restore"):
+        dispatch_restore(s, 999)
 
 
-def test_dispatch_restore_rejects_tombstoned_copy(engine: Engine, tmp_path: Path) -> None:
-    from sutradhara.jobs.dispatch import CopyNotRestorable, dispatch_restore
+def test_dispatch_restore_rejects_nonqueued_item(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import RestoreRequestItemNotRunnable, dispatch_restore
 
-    copy_id = _register_restorable_copy(engine)
-    with session_scope(engine) as s:
-        copy = s.get(Copy, copy_id)
-        assert copy is not None
-        copy.deleted_at = dt.datetime.now(dt.UTC)
+    item_id = _register_restore_request_item(engine, state="denied")
 
-    with session_scope(engine) as s, pytest.raises(CopyNotRestorable, match="tombstoned"):
-        dispatch_restore(s, copy_id, tmp_path / "restore.bin")
+    with session_scope(engine) as s, pytest.raises(RestoreRequestItemNotRunnable, match="denied"):
+        dispatch_restore(s, item_id)
 
 
-def test_dispatch_restore_allows_suspect_copy(engine: Engine, tmp_path: Path) -> None:
-    from sutradhara.jobs.dispatch import dispatch_restore
-
-    copy_id = _register_restorable_copy(engine, health=CopyHealth.SUSPECT)
-
-    with session_scope(engine) as s:
-        handle = dispatch_restore(s, copy_id, tmp_path / "restore.bin")
-
-    assert handle["kind"] == "restore"
-    assert handle["copy_id"] == copy_id
-
-
-def test_dispatch_restore_rejects_invalid_destination(engine: Engine, tmp_path: Path) -> None:
-    from sutradhara.jobs.dispatch import InvalidRestoreDestination, dispatch_restore
-
-    copy_id = _register_restorable_copy(engine)
-
-    with session_scope(engine) as s, pytest.raises(InvalidRestoreDestination, match="absolute"):
-        dispatch_restore(s, copy_id, "relative.bin")
-
-    with session_scope(engine) as s, pytest.raises(InvalidRestoreDestination, match="parent"):
-        dispatch_restore(s, copy_id, tmp_path / "missing" / "restore.bin")
+def test_jobs_submit_refuses_public_restore_kind(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUTRADHARA_DB_URL", "sqlite:///:memory:")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["jobs", "submit", "restore", "-p", "restore_request_item_id=1"])
+    assert result.exit_code == 2
+    assert "restore jobs must be created from gated restore requests" in result.output
 
 
 def test_restore_kind_is_registered() -> None:
@@ -1358,4 +1355,37 @@ def test_restore_handler_fails_cleanly_does_not_fake_success(
         assert not result.ok
         assert job.status == JobStatus.FAILED
         assert job.last_error is not None
-        assert "destination" in job.last_error
+        assert "rejects raw copy_id/dest_path" in job.last_error
+
+
+def test_restore_handler_runs_gated_request_item(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sutradhara.hdcache.manager import ITEM_DONE, RestoreConfig, ServeResult
+    import sutradhara.jobs.handlers.restore as restore_handler
+
+    item_id = _register_restore_request_item(engine)
+    output = tmp_path / "restored.bin"
+
+    def fake_config() -> RestoreConfig:
+        return RestoreConfig()
+
+    def fake_serve(session, item, *, gates_already_admitted, config):
+        assert item.id == item_id
+        assert gates_already_admitted is True
+        item.state = ITEM_DONE
+        item.detail = None
+        return ServeResult(item.id, "tape", output, 12)
+
+    monkeypatch.setattr(restore_handler, "restore_config_from_env", fake_config)
+    monkeypatch.setattr(restore_handler, "serve_restore_item", fake_serve)
+
+    with session_scope(engine) as s:
+        job = submit(s, "restore", {"restore_request_item_id": item_id})
+        result = run_one(s, job.id)
+        assert result.ok
+        assert job.status == JobStatus.SUCCEEDED
+        assert job.step_state["restore"]["restore_request_item_id"] == item_id
+        assert job.step_state["restore"]["source"] == "tape"

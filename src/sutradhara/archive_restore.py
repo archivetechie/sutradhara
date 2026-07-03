@@ -258,7 +258,7 @@ def restore_asset(
     """Restore one asset using the artifactclass ordered pool preference."""
     if not is_content_hash(asset_hash):
         raise ValueError("asset_hash must be a 32-byte SHA-256 hash")
-    _check_asset_restore_allowed(
+    check_asset_restore_allowed(
         session,
         asset_hash,
         force_suspect=force_suspect,
@@ -337,6 +337,23 @@ def restore_asset(
         )
     raise RestoreSourceUnavailable(
         f"no healthy locator for asset {asset_hash.hex()} in artifactclass {artifactclass!r}"
+    )
+
+
+def check_asset_restore_allowed(
+    session: Session,
+    asset_hash: bytes,
+    *,
+    force_suspect: bool,
+    force_rejected: bool,
+) -> None:
+    """Apply the operator restore validity gate shared by tape and hdcache serves."""
+
+    _check_asset_restore_allowed(
+        session,
+        asset_hash,
+        force_suspect=force_suspect,
+        force_rejected=force_rejected,
     )
 
 

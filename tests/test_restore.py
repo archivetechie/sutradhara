@@ -1,9 +1,9 @@
-"""Tests for P2.1 whole-copy restore jobs and primitives.
+"""Tests for P2.1 whole-copy restore primitives.
 
 These tests exercise the asset-scoped restore boundary without depending on a
 live Remanence daemon or the RAO CLI. Stored bytes live in a populated
-``MemoryBackend`` instance injected through the handler seam, while a fake
-opener models representation reversal and encrypted key-epoch selection.
+``MemoryBackend`` instance, while a fake opener models representation reversal
+and encrypted key-epoch selection.
 """
 
 from __future__ import annotations
@@ -22,12 +22,8 @@ from sutradhara.backend.memory import MemoryBackend
 from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
-from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
-from sutradhara.jobs.dispatch import dispatch_restore
-from sutradhara.jobs.engine import run_one, submit
-from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.keys import KeyEpoch
-from sutradhara.restore import restore_copy
+from sutradhara.restore import RestoreError, atomic_write_verified_file, restore_copy
 from sutradhara.sealing.port import Representation
 
 
@@ -141,10 +137,9 @@ def _add_copy(
     "representation",
     [Representation.RAW_BYTES, Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1],
 )
-def test_restore_job_round_trips_asset_per_representation(
+def test_restore_copy_round_trips_asset_per_representation(
     engine: Engine,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     representation: Representation,
 ) -> None:
     backend = MemoryBackend("mem")
@@ -153,21 +148,14 @@ def test_restore_job_round_trips_asset_per_representation(
     copy_id = _add_copy(engine, backend, data=data, representation=representation)
     dest = tmp_path / f"{representation.value}.bin"
 
-    import sutradhara.jobs.handlers.restore as restore_handler
-
-    monkeypatch.setattr(restore_handler, "resolve_restore_backend", lambda _copy: backend)
-    monkeypatch.setattr(restore_handler, "RaoCliOpener", lambda _registry: opener)
     with session_scope(engine) as s:
-        handle = dispatch_restore(s, copy_id, dest)
-        assert isinstance(handle["params"]["dest_path"], str)
-        result = run_one(s, handle["job_id"])
-        job = s.get(Job, handle["job_id"])
+        copy = s.get(Copy, copy_id)
+        assert copy is not None
+        with restore_copy(s, copy, backend=backend, opener=opener) as result:
+            atomic_write_verified_file(result.path, dest)
 
-    assert result.ok
-    assert job is not None
-    assert job.status == JobStatus.SUCCEEDED
     assert dest.read_bytes() == data
-    assert job.step_state["restore"]["sha256"] == _sha(data).hex()
+    assert result.sha256 == _sha(data)
     if representation is Representation.RAO_AEAD_V1:
         assert opener.calls == [(representation, "epoch-1")]
 
@@ -175,10 +163,7 @@ def test_restore_job_round_trips_asset_per_representation(
 def test_restore_fails_closed_for_stored_and_content_corruption(
     engine: Engine,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sutradhara.jobs.handlers.restore as restore_handler
-
     backend = MemoryBackend("mem")
     opener = _FakeOpener()
     copy_id = _add_copy(engine, backend, data=b"good", representation=Representation.RAW_BYTES)
@@ -189,13 +174,12 @@ def test_restore_fails_closed_for_stored_and_content_corruption(
         assert copy is not None
         backend.corrupt(content_hash(bytes.fromhex(copy.native_locator["hash_hex"])), b"corrupt")
 
-    monkeypatch.setattr(restore_handler, "resolve_restore_backend", lambda _copy: backend)
-    monkeypatch.setattr(restore_handler, "RaoCliOpener", lambda _registry: opener)
-    with session_scope(engine) as s:
-        job = submit(s, "restore", {"copy_id": copy_id, "dest_path": str(dest)})
-        result = run_one(s, job.id)
+    with session_scope(engine) as s, pytest.raises(RestoreError, match="stored-corrupt"):
+        copy = s.get(Copy, copy_id)
+        assert copy is not None
+        with restore_copy(s, copy, backend=backend, opener=opener) as result:
+            atomic_write_verified_file(result.path, dest)
 
-    assert not result.ok
     assert dest.read_bytes() == b"old"
 
     backend2 = MemoryBackend("mem")
@@ -208,22 +192,19 @@ def test_restore_fails_closed_for_stored_and_content_corruption(
         stored_bytes=wrong_stored,
     )
     dest2 = tmp_path / "content-corrupt.bin"
-    monkeypatch.setattr(restore_handler, "resolve_restore_backend", lambda _copy: backend2)
-    with session_scope(engine) as s:
-        job = submit(s, "restore", {"copy_id": copy_id2, "dest_path": str(dest2)})
-        result = run_one(s, job.id)
+    with session_scope(engine) as s, pytest.raises(RestoreError, match="content-corrupt"):
+        copy = s.get(Copy, copy_id2)
+        assert copy is not None
+        with restore_copy(s, copy, backend=backend2, opener=opener) as result:
+            atomic_write_verified_file(result.path, dest2)
 
-    assert not result.ok
     assert not dest2.exists()
 
 
 def test_restore_rejects_missing_bundle_and_bad_representation(
     engine: Engine,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sutradhara.jobs.handlers.restore as restore_handler
-
     backend = MemoryBackend("mem")
     opener = _FakeOpener()
     missing_copy = _add_copy(
@@ -260,19 +241,17 @@ def test_restore_rejects_missing_bundle_and_bad_representation(
         s.flush()
         bundle_copy_id = bundle_copy.id
 
-    monkeypatch.setattr(restore_handler, "resolve_restore_backend", lambda _copy: backend)
-    monkeypatch.setattr(restore_handler, "RaoCliOpener", lambda _registry: opener)
     for copy_id, reason in [
         (missing_copy, "missing"),
         (bundle_copy_id, "bundle"),
         (bad_meta_copy, "representation"),
     ]:
         dest = tmp_path / f"{copy_id}.bin"
-        with session_scope(engine) as s:
-            job = submit(s, "restore", {"copy_id": copy_id, "dest_path": str(dest)})
-            result = run_one(s, job.id)
-        assert not result.ok
-        assert reason in result.detail
+        with session_scope(engine) as s, pytest.raises(RestoreError, match=reason):
+            copy = s.get(Copy, copy_id)
+            assert copy is not None
+            with restore_copy(s, copy, backend=backend, opener=opener) as result:
+                atomic_write_verified_file(result.path, dest)
         assert not dest.exists()
 
 

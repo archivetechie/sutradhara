@@ -8,11 +8,17 @@ from dataclasses import dataclass
 VIEWER_GROUP = "sutradhara-viewer"
 OPERATOR_GROUP = "sutradhara-operator"
 ADMIN_GROUP = "sutradhara-admin"
+RESTORE_P2_GROUP = "sutradhara-restore-p2"
+RESTORE_P3_GROUP = "sutradhara-restore-p3"
 
 ROLE_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "viewer": ("can_view",),
     "operator": ("can_view", "can_receive"),
     "admin": ("can_view", "can_receive", "can_admin"),
+}
+RESTORE_GROUP_CAPABILITIES: dict[str, tuple[str, ...]] = {
+    RESTORE_P2_GROUP: ("can_restore_p2",),
+    RESTORE_P3_GROUP: ("can_restore_p2", "can_restore_p3"),
 }
 
 _ROLE_GROUPS: tuple[tuple[str, str], ...] = (
@@ -50,7 +56,7 @@ def parse_identity(headers: Mapping[str, str] | Sequence[tuple[str, str]]) -> Id
     email = _nonempty(normalized.get("x-authentik-email"))
     groups = _parse_groups(normalized.get("x-authentik-groups"))
     role = _highest_role(groups)
-    capabilities = ROLE_CAPABILITIES.get(role, ())
+    capabilities = _capabilities_for(groups, role)
     return Identity(
         operator_username=username,
         display_name=display_name,
@@ -79,6 +85,20 @@ def _highest_role(groups: tuple[str, ...]) -> str | None:
         if group in group_set:
             return role
     return None
+
+
+def _capabilities_for(groups: tuple[str, ...], role: str | None) -> tuple[str, ...]:
+    capabilities: list[str] = list(ROLE_CAPABILITIES.get(role, ()))
+    seen = set(capabilities)
+    group_set = set(groups)
+    for group, grants in RESTORE_GROUP_CAPABILITIES.items():
+        if group not in group_set:
+            continue
+        for grant in grants:
+            if grant not in seen:
+                seen.add(grant)
+                capabilities.append(grant)
+    return tuple(capabilities)
 
 
 def _nonempty(value: str | None) -> str | None:

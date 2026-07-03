@@ -1,82 +1,68 @@
-"""`restore` job: read verified whole-asset bytes back from one copy.
+"""`restore` job: execute one gated hdcache restore request item.
 
-The handler is the imperative P2.1 restore mechanism: it restores the caller's
-chosen asset-scoped ``copy_id`` to a validated absolute ``dest_path``. Copy
-selection, path resolution, member extraction, and corruption response remain
-outside this job; this handler only reads, opens, verifies, and atomically
-places one whole object.
+M4 closes the operator restore bypass: worker restore jobs no longer accept raw
+``copy_id`` / ``dest_path`` parameters. Admission through the hdcache manager
+creates a ``restore_request_item`` after privacy, validity, and destination
+gates; this handler only validates that gated row and asks the manager to serve
+it from cache or tape fallback.
 """
 
 from __future__ import annotations
 
-from sutradhara.backend.factory import backend_from_row
-from sutradhara.backend.port import BackendError, StorageBackend
-from sutradhara.catalog.models import Copy
-from sutradhara.catalog.types import CopyHealth
-from sutradhara.jobs.registry import JobContext, JobResult, register_handler
-from sutradhara.keys import KeyRegistry
-from sutradhara.restore import (
-    RestoreError,
-    atomic_write_verified_file,
-    restore_copy,
-    validate_restore_destination,
+from sutradhara.hdcache.manager import (
+    ITEM_DONE,
+    restore_config_from_env,
+    serve_restore_item,
 )
-from sutradhara.sealing.rao import RaoCliOpener
-
-
-def resolve_restore_backend(copy: Copy) -> StorageBackend:
-    """Return the backend instance used to read this restore copy."""
-    return backend_from_row(copy.backend)
+from sutradhara.hdcache.models import RestoreRequestItem
+from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 
 
 @register_handler("restore")
 def handle_restore(ctx: JobContext) -> JobResult:
     params = ctx.job.params
-    copy_id = params.get("copy_id")
-    if not isinstance(copy_id, int):
-        return _failure("bad-params", "restore job requires params.copy_id (int)")
-    try:
-        destination = validate_restore_destination(params.get("dest_path"))
-    except ValueError as exc:
-        return _failure("bad-destination", str(exc))
-
-    copy = ctx.session.get(Copy, copy_id)
-    if copy is None:
-        return _failure("unknown-copy", f"no Copy with id={copy_id}; nothing to restore")
-    if copy.health == CopyHealth.MISSING:
+    if "copy_id" in params or "dest_path" in params:
         return _failure(
-            "missing-copy",
-            f"copy id={copy_id} has health=missing; there are no bytes to restore",
+            "bad-params",
+            "restore job rejects raw copy_id/dest_path params; use restore_request_item_id",
         )
-    if copy.deleted_at is not None:
+    item_id = params.get("restore_request_item_id")
+    if not isinstance(item_id, int):
+        return _failure("bad-params", "restore job requires params.restore_request_item_id (int)")
+    item = ctx.session.get(RestoreRequestItem, item_id)
+    if item is None:
         return _failure(
-            "deleted-copy",
-            f"copy id={copy_id} has been tombstoned by retention; there are no bytes to restore",
+            "unknown-request-item",
+            f"no RestoreRequestItem with id={item_id}; nothing to restore",
         )
-    if copy.bundle_id is not None or copy.logical_asset_hash is None:
-        return _failure("bundle-unsupported", "bundle restore is not supported by P2.1")
-
+    if item.state != "queued":
+        return _failure(
+            "not-queued",
+            f"restore request item id={item_id} is state={item.state!r}",
+        )
     try:
-        backend = resolve_restore_backend(copy)
-        opener = RaoCliOpener(KeyRegistry())
-        with restore_copy(ctx.session, copy, backend=backend, opener=opener) as result:
-            atomic_write_verified_file(result.path, destination)
-    except RestoreError as exc:
-        return _failure("restore-failed", str(exc))
-    except (BackendError, OSError, RuntimeError, ValueError, KeyError) as exc:
+        result = serve_restore_item(
+            ctx.session,
+            item,
+            gates_already_admitted=True,
+            config=restore_config_from_env(),
+        )
+    except Exception as exc:
         return _failure("restore-failed", f"{type(exc).__name__}: {exc}")
 
+    if item.state != ITEM_DONE:
+        return _failure("restore-failed", item.detail or f"item ended in state={item.state!r}")
     return JobResult(
         ok=True,
-        detail=f"restored copy id={copy_id} to {destination}",
+        detail=f"restored request item id={item_id} to {result.output_path}",
         step_state={
             "restore": {
                 "kind": "ok",
-                "copy_id": copy_id,
-                "path": str(destination),
-                "sha256": result.sha256.hex(),
+                "restore_request_item_id": item_id,
+                "path": str(result.output_path),
+                "sha256": item.content_sha256.hex(),
                 "bytes": result.size_bytes,
-                "representation": result.representation.value,
+                "source": result.source,
             }
         },
     )

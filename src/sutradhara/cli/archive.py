@@ -19,12 +19,10 @@ from sutradhara.archive_fanout import (
     flush_bundle,
 )
 from sutradhara.archive_restore import (
+    ArchiveRestoreError,
     RemArchiveExtractor,
     RestoreNameError,
-    RestoreRejectedAsset,
-    RestoreSuspectAsset,
     resolve_member_asset_hash,
-    restore_asset,
 )
 from sutradhara.archive_submission import ArchiveSubmissionError, archive_submission
 from sutradhara.artifactclass_policy import (
@@ -35,6 +33,12 @@ from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
 from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool, Submission
 from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.hdcache.manager import (
+    PrivacyOverride,
+    RestoreDenied,
+    RestoreManagerError,
+    restore_to_path,
+)
 from sutradhara.replication import WritableStorageBackend
 from sutradhara.staging import StagingHeld, stage_and_enqueue_artifact
 
@@ -281,6 +285,11 @@ def review_cmd(
     is_flag=True,
     help="Restore even when the logical asset is rejected.",
 )
+@click.option(
+    "--privacy-override",
+    default=None,
+    help="Trusted CLI reason for restoring private hdcache assets without API grants.",
+)
 def restore_cmd(
     asset_hash_hex: str | None,
     artifactclass: str,
@@ -289,6 +298,7 @@ def restore_cmd(
     member_name: str | None,
     force_suspect: bool,
     force_rejected: bool,
+    privacy_override: str | None,
 ) -> None:
     """Restore one asset using artifactclass pool preference."""
     engine = make_engine()
@@ -307,21 +317,25 @@ def restore_cmd(
         policy = get_artifactclass_policy(session, artifactclass)
         backends = _restore_backends(session, artifactclass, policy.restore_preference)
         try:
-            result = restore_asset(
+            result = restore_to_path(
                 session,
                 asset_hash=asset_hash,
                 artifactclass=artifactclass,
                 destination=destination,
+                identity_or_override=(
+                    PrivacyOverride(privacy_override) if privacy_override is not None else None
+                ),
                 backends=backends,
                 extractor=RemArchiveExtractor(rem_bin),
                 force_suspect=force_suspect,
                 force_rejected=force_rejected,
             )
-        except (RestoreSuspectAsset, RestoreRejectedAsset) as exc:
+        except RestoreDenied as exc:
+            raise click.ClickException(exc.detail) from exc
+        except (ArchiveRestoreError, RestoreManagerError) as exc:
             raise click.ClickException(str(exc)) from exc
     click.echo(
-        f"restored {result.asset_hash.hex()} from pool {result.pool_id} copy {result.copy_id} "
-        f"to {result.output_path}"
+        f"restored {asset_hash.hex()} from {result.source} to {result.output_path}"
     )
 
 

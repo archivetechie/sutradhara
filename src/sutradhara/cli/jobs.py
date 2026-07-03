@@ -54,6 +54,12 @@ def jobs_submit(
     dedupe_key: str | None,
 ) -> None:
     """Submit a new job of KIND with --param key=value pairs."""
+    if kind == "restore":
+        click.echo(
+            "error: restore jobs must be created from gated restore requests",
+            err=True,
+        )
+        sys.exit(2)
     if kind not in registered_kinds():
         click.echo(
             f"error: no handler registered for kind {kind!r}; known: {sorted(registered_kinds())}",
