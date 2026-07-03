@@ -789,6 +789,44 @@ def test_replication_status_reports_missing_and_complete(
         assert status["missing"] == set()
 
 
+def test_replication_status_counts_fresh_unverified_copy(
+    engine: Engine,
+) -> None:
+    data = b"fresh copy"
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="private-copy-1",
+        artifactclass="video-priv",
+        representation=Representation.RAW_BYTES,
+    )
+
+    with session_scope(engine) as s:
+        copy, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            pool_id="private-copy-1",
+            native_locator={"pool_id": "private-copy-1", "tape_uuid": "1" * 32},
+            integrity_hash=asset_hash,
+            source=CopySource.INGEST,
+            storage_metadata=_metadata(Representation.RAW_BYTES),
+        )
+        assert copy.last_verified_at is None
+
+        status = replication_status(
+            s,
+            asset_hash,
+            "video-priv",
+            {backend_id: _PoolWriteBackend("rem")},
+        )
+
+    assert status["complete"] is True
+    assert {target.pool_id for target in status["have"]} == {"private-copy-1"}
+
+
 def test_replication_status_rejects_same_tape_for_multiple_pools(
     engine: Engine,
 ) -> None:

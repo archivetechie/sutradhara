@@ -344,13 +344,15 @@ def replication_status(
     key_epoch: str | None = None,
 ) -> ReplicationStatus:
     """Report whether an asset has healthy copies in all active pools."""
+    from sutradhara.durability import direct_copies
+
     targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
     targets_by_key = {_pool_key(target): target for _, target in targets}
     want = set(targets_by_key.values())
     have: set[PoolTarget] = set()
     media_id_by_target: dict[PoolTarget, str] = {}
 
-    for copy in _healthy_copies(session, asset_hash):
+    for copy in direct_copies(session, asset_hash):
         key = _copy_pool_key(copy)
         if key is None:
             continue
@@ -414,17 +416,9 @@ def _healthy_copies_by_pool(
 
 
 def _healthy_copies(session: Session, asset_hash: bytes) -> list[Copy]:
-    return list(
-        session.scalars(
-            select(Copy)
-            .where(
-                Copy.logical_asset_hash == asset_hash,
-                Copy.health == CopyHealth.OK,
-                Copy.deleted_at.is_(None),
-            )
-            .order_by(Copy.id)
-        )
-    )
+    from sutradhara.durability import direct_copies
+
+    return direct_copies(session, asset_hash)
 
 
 def _pool_key(target: PoolTarget) -> tuple[int, str]:

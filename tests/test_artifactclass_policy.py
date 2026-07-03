@@ -287,3 +287,38 @@ def test_apply_artifactclass_policy_rejects_unknown_pool(engine: Engine) -> None
     policy = parse_artifactclass_policy(_policy_text())
     with session_scope(engine) as s, pytest.raises(UnknownPolicyPool, match="unknown"):
         apply_artifactclass_policy(s, "o-archive", policy)
+
+
+def test_apply_artifactclass_policy_rejects_unknown_restore_preference_pool(
+    engine: Engine,
+) -> None:
+    text = _policy_text().replace(
+        'preference = ["o-copy-1-pool", "o-copy-2-pool"]',
+        'preference = ["o-copy-1-pool", "missing-restore-pool"]',
+    )
+    policy = parse_artifactclass_policy(text)
+    with session_scope(engine) as s:
+        backend = Backend(
+            name="rem",
+            kind=BackendKind.REM_TAPE,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        s.add(backend)
+        s.flush()
+        s.add_all(
+            [
+                Pool(
+                    id="o-copy-1-pool",
+                    backend_id=backend.id,
+                    representation=Representation.RAO_PLAIN_V1.value,
+                ),
+                Pool(
+                    id="o-copy-2-pool",
+                    backend_id=backend.id,
+                    representation=Representation.RAO_AEAD_V1.value,
+                ),
+            ]
+        )
+
+        with pytest.raises(ArtifactClassPolicyError, match=r"restore\.preference"):
+            apply_artifactclass_policy(s, "o-archive", policy)

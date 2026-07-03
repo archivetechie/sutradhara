@@ -23,7 +23,6 @@ from sutradhara.backend.port import BackendLocator, ByteRange, StorageBackend, V
 from sutradhara.catalog.models import (
     Arrangement,
     ArtifactClassPool,
-    AssetLocator,
     Backend,
     Copy,
     IngestItem,
@@ -35,11 +34,11 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.types import (
     ArrangementStatus,
-    CopyHealth,
     IntakeStatus,
     RetentionState,
     SubmissionStatus,
 )
+from sutradhara.durability import AssetTarget, durable_placements
 from sutradhara.intake import media_kind_for_path
 from sutradhara.jobs.models import ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED, CONDITION_SATISFIED
@@ -370,7 +369,12 @@ def _pool_gate_status(
     asset_hash: bytes,
     target: PoolTarget,
 ) -> PoolGateStatus:
-    candidates = _qualifying_copies_for_pool(session, asset_hash, target.pool_id)
+    candidates = _qualifying_copies_for_pool(
+        session,
+        asset_hash,
+        target.pool_id,
+        target.artifactclass,
+    )
     if not candidates:
         return PoolGateStatus(
             pool_id=target.pool_id,
@@ -415,43 +419,22 @@ def _pool_gate_status(
     )
 
 
-def _qualifying_copies_for_pool(session: Session, asset_hash: bytes, pool_id: str) -> list[Copy]:
-    asset_copies = list(
-        session.scalars(
-            select(Copy)
-            .where(
-                Copy.logical_asset_hash == asset_hash,
-                Copy.pool_id == pool_id,
-                Copy.health == CopyHealth.OK,
-                Copy.last_verified_at.is_not(None),
-                Copy.deleted_at.is_(None),
-            )
-            .order_by(Copy.id)
+def _qualifying_copies_for_pool(
+    session: Session,
+    asset_hash: bytes,
+    pool_id: str,
+    artifactclass: str,
+) -> list[Copy]:
+    return [
+        copy
+        for copy in durable_placements(
+            session,
+            AssetTarget(asset_hash, artifactclass),
+            require_verified=True,
+            artifactclass=artifactclass,
+            pool_id=pool_id,
         )
-    )
-    bundle_copies = list(
-        session.scalars(
-            select(Copy)
-            .join(AssetLocator, AssetLocator.copy_id == Copy.id)
-            .where(
-                AssetLocator.logical_asset_hash == asset_hash,
-                AssetLocator.pool_id == pool_id,
-                Copy.pool_id == pool_id,
-                Copy.health == CopyHealth.OK,
-                Copy.last_verified_at.is_not(None),
-                Copy.deleted_at.is_(None),
-            )
-            .order_by(Copy.id)
-        )
-    )
-    seen: set[int] = set()
-    result: list[Copy] = []
-    for copy in [*asset_copies, *bundle_copies]:
-        if copy.id in seen:
-            continue
-        seen.add(copy.id)
-        result.append(copy)
-    return result
+    ]
 
 
 def _policy_targets(session: Session, artifactclass: str) -> list[PoolTarget]:

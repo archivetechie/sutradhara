@@ -31,6 +31,7 @@ from sutradhara.catalog.models import (
     StagingTransform,
 )
 from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
+from sutradhara.durability import locator_artifactclass_filter
 from sutradhara.keys import KeyRegistry
 from sutradhara.resource_control import run_managed
 from sutradhara.restore import atomic_write_verified_file
@@ -334,7 +335,11 @@ def restore_asset(
         session.scalars(
             select(AssetLocator)
             .options(joinedload(AssetLocator.copy).joinedload(Copy.backend))
-            .where(AssetLocator.logical_asset_hash == asset_hash)
+            .outerjoin(Bundle, AssetLocator.bundle_id == Bundle.id)
+            .where(
+                AssetLocator.logical_asset_hash == asset_hash,
+                locator_artifactclass_filter(session, asset_hash, artifactclass),
+            )
         )
     )
     by_pool: dict[str, list[AssetLocator]] = {pool_id: [] for pool_id in pool_order}
@@ -627,7 +632,11 @@ def _choose_bundle_restore_group(
         session.scalars(
             select(AssetLocator)
             .options(joinedload(AssetLocator.copy).joinedload(Copy.backend))
-            .where(AssetLocator.logical_asset_hash.in_(asset_hashes))
+            .outerjoin(Bundle, AssetLocator.bundle_id == Bundle.id)
+            .where(
+                AssetLocator.logical_asset_hash.in_(asset_hashes),
+                Bundle.artifactclass == artifactclass,
+            )
         )
     )
     grouped: dict[tuple[int, str, int, str], dict[bytes, AssetLocator]] = {}

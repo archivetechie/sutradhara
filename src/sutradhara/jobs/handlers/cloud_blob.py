@@ -66,6 +66,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
             f"pool {pool_id!r} belongs to backend_id={pool.backend_id}, "
             f"not backend {backend_name!r}"
         )
+    representation = _cloud_blob_representation(pool)
 
     bundle_id = _bundle_id(intake_id)
     existing = ctx.session.scalars(
@@ -105,6 +106,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
         intake_root=intake_root,
         payload_root=payload_root,
         destination=blob_path,
+        representation=representation,
         key_epoch=key_epoch,
     )
 
@@ -128,7 +130,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
         health=CopyHealth.OK,
         storage_metadata={
             **record.metadata,
-            "representation": Representation.RAO_AEAD_V1.value,
+            "representation": representation.value,
             "key_epoch": key_epoch,
             "payload_root": str(payload_root),
             "intake_root": str(intake_root),
@@ -162,12 +164,13 @@ def _build_cloud_blob(
     intake_root: Path,
     payload_root: Path,
     destination: Path,
+    representation: Representation,
     key_epoch: str,
 ) -> bytes:
     if os.environ.get("SUTRADHARA_FAKE_CLOUD_BLOB") == "1":
         destination.unlink(missing_ok=True)
         payload = {
-            "representation": Representation.RAO_AEAD_V1.value,
+            "representation": representation.value,
             "intake_bundle_id": bundle.id,
             "payload_root": str(payload_root),
             "key_epoch": key_epoch,
@@ -203,6 +206,21 @@ def _build_cloud_blob(
                 cpu_lease=cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources),
             )
         return result.stored_digest
+
+
+def _cloud_blob_representation(pool: Pool) -> Representation:
+    try:
+        representation = Representation(pool.representation)
+    except ValueError as exc:
+        raise ValueError(
+            f"pool {pool.id!r} has unsupported representation {pool.representation!r}"
+        ) from exc
+    if representation is not Representation.RAO_AEAD_V1:
+        raise ValueError(
+            f"cloud-blob pool {pool.id!r} has representation {representation.value!r}; "
+            f"cloud-blob can only produce {Representation.RAO_AEAD_V1.value!r}"
+        )
+    return representation
 
 
 def _cloud_key_epoch(value: Any) -> str:

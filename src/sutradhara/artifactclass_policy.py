@@ -272,12 +272,17 @@ def apply_artifactclass_policy(
     from the document are marked inactive.
     """
     pool_ids = [placement.pool for placement in policy.placements]
-    pools = {pool.id: pool for pool in session.scalars(select(Pool).where(Pool.id.in_(pool_ids)))}
+    referenced_pool_ids = set(pool_ids) | set(policy.restore_preference)
+    pools = {
+        pool.id: pool
+        for pool in session.scalars(select(Pool).where(Pool.id.in_(referenced_pool_ids)))
+    }
     missing = sorted(set(pool_ids) - set(pools))
     if missing:
         raise UnknownPolicyPool(
             f"artifactclass {artifactclass!r} references unknown pools: " + ", ".join(missing)
         )
+    _validate_restore_preference_pools(policy, pools)
     _validate_hdcache_privacy_mapping(policy)
     _warn_if_appledouble_ruleset_preservation_is_unproven(policy)
 
@@ -333,6 +338,18 @@ def _warn_if_appledouble_ruleset_preservation_is_unproven(
         ArtifactClassPolicyWarning,
         stacklevel=3,
     )
+
+
+def _validate_restore_preference_pools(
+    policy: ArtifactClassPolicy,
+    pools: dict[str, Pool],
+) -> None:
+    missing = sorted(set(policy.restore_preference) - set(pools))
+    if missing:
+        raise ArtifactClassPolicyError(
+            "restore.preference references unknown pools: " + ", ".join(missing)
+        )
+    # M3/D3: warn here for restore-preference pools that are write-fenced.
 
 
 def apply_artifactclass_policy_file(

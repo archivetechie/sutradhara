@@ -1,0 +1,326 @@
+"""Durability predicates shared by replication, retention, and bundle status.
+
+The catalog records durable bytes at two grains: whole-asset ``Copy`` rows and
+bundle-scoped ``Copy`` rows reached through ``AssetLocator``. This module keeps
+that grain choice explicit so callers can ask for the accounting view
+(``durable_placements``) or the physical whole-copy restore view
+(``direct_copies``) without re-implementing subtly different health predicates.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, TypedDict
+
+from sqlalchemy import and_, false, or_, select
+from sqlalchemy.orm import Session
+
+from sutradhara.backend.port import BackendLocator, ByteRange, StorageBackend, VerifyResult
+from sutradhara.catalog.models import (
+    ArtifactClassPool,
+    AssetLocator,
+    Backend,
+    Bundle,
+    Copy,
+    IngestItem,
+    Intake,
+    Pool,
+    VirtualArrangementMember,
+)
+from sutradhara.catalog.types import CopyHealth, IntakeStatus
+from sutradhara.replication import PoolTarget, target_pools
+
+
+@dataclass(frozen=True)
+class AssetTarget:
+    """A logical asset viewed under one artifactclass."""
+
+    asset_hash: bytes
+    artifactclass: str
+
+
+@dataclass(frozen=True)
+class BundleTarget:
+    """A sealed bundle viewed as the durability target."""
+
+    bundle_id: str
+
+
+Target = AssetTarget | BundleTarget
+
+
+@dataclass(frozen=True)
+class PlacementTarget(PoolTarget):
+    """One wanted pool target annotated with realized-copy status."""
+
+    have: bool = False
+    duplicate_count: int = 0
+    is_duplicate: bool = False
+
+
+class PlacementStatus(TypedDict):
+    complete: bool
+    have: set[PlacementTarget]
+    want: set[PlacementTarget]
+    missing: set[PlacementTarget]
+
+
+class _TargetBackend(StorageBackend):
+    """Read-only placeholder used to expand PoolTarget rows through target_pools."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def enumerate(self) -> Any:
+        return iter(())
+
+    def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+        raise NotImplementedError
+
+    def verify(self, locator: BackendLocator) -> VerifyResult:
+        raise NotImplementedError
+
+
+def durable_placements(
+    session: Session,
+    target: Target,
+    *,
+    require_verified: bool,
+    artifactclass: str | None,
+    pool_id: str | None = None,
+) -> list[Copy]:
+    """Return healthy durability-accounting copies for an asset or bundle target.
+
+    For an ``AssetTarget`` this is asset-grain copies plus bundle copies reached
+    through ``AssetLocator`` rows, de-duplicated by ``Copy.id``. The
+    ``artifactclass`` argument filters the bundle-locator leg; ``pool_id``
+    applies the pool predicate at the grain where each copy is proven.
+    """
+    if isinstance(target, BundleTarget):
+        query = select(Copy).where(
+            Copy.bundle_id == target.bundle_id,
+            Copy.health == CopyHealth.OK,
+            Copy.deleted_at.is_(None),
+        )
+        if pool_id is not None:
+            query = query.where(Copy.pool_id == pool_id)
+        if require_verified:
+            query = query.where(Copy.last_verified_at.is_not(None))
+        return list(session.scalars(query.order_by(Copy.id)))
+
+    asset_query = _copy_health_filter(
+        select(Copy).where(Copy.logical_asset_hash == target.asset_hash),
+        require_verified=require_verified,
+    )
+    if pool_id is not None:
+        asset_query = asset_query.where(Copy.pool_id == pool_id)
+    asset_copies = list(
+        session.scalars(asset_query.order_by(Copy.id))
+    )
+    bundle_query = (
+        select(Copy)
+        .join(AssetLocator, AssetLocator.copy_id == Copy.id)
+        .where(AssetLocator.logical_asset_hash == target.asset_hash)
+    )
+    bundle_query = _copy_health_filter(bundle_query, require_verified=require_verified)
+    if pool_id is not None:
+        bundle_query = bundle_query.where(
+            AssetLocator.pool_id == pool_id,
+            Copy.pool_id == pool_id,
+        )
+    if artifactclass is not None:
+        bundle_query = bundle_query.outerjoin(Bundle, AssetLocator.bundle_id == Bundle.id).where(
+            _locator_artifactclass_filter(session, target.asset_hash, artifactclass)
+        )
+    bundle_copies = list(session.scalars(bundle_query.order_by(Copy.id)))
+    return _dedupe_by_copy_id([*asset_copies, *bundle_copies])
+
+
+def direct_copies(session: Session, asset_hash: bytes) -> list[Copy]:
+    """Return healthy asset-grain copies that whole-copy restore can use today."""
+    return list(
+        session.scalars(
+            select(Copy)
+            .where(
+                Copy.logical_asset_hash == asset_hash,
+                Copy.health == CopyHealth.OK,
+                Copy.deleted_at.is_(None),
+            )
+            .order_by(Copy.id)
+        )
+    )
+
+
+def placement_status(session: Session, target: Target) -> PlacementStatus:
+    """Report wanted pools versus realized durable placements for a target.
+
+    Entries extend ``PoolTarget`` with ``have``, ``duplicate_count``, and
+    ``is_duplicate`` while keeping the original PoolTarget attributes available
+    for harness seams that getattr-map pool/backend/representation fields.
+    """
+    artifactclass = _artifactclass_for_target(session, target)
+    targets = [target for _, target in _policy_targets(session, artifactclass)]
+    counts_by_key: dict[tuple[int, str], int] = {}
+    for copy in durable_placements(
+        session,
+        target,
+        require_verified=False,
+        artifactclass=artifactclass,
+    ):
+        if copy.pool_id is None:
+            continue
+        key = (copy.backend_id, copy.pool_id)
+        counts_by_key[key] = counts_by_key.get(key, 0) + 1
+
+    want: set[PlacementTarget] = set()
+    have: set[PlacementTarget] = set()
+    missing: set[PlacementTarget] = set()
+    for pool_target in targets:
+        count = counts_by_key.get((pool_target.backend_id, pool_target.pool_id), 0)
+        entry = _placement_entry(pool_target, count)
+        want.add(entry)
+        if entry.have:
+            have.add(entry)
+        else:
+            missing.add(entry)
+    return {
+        "complete": not missing,
+        "have": have,
+        "want": want,
+        "missing": missing,
+    }
+
+
+def bundle_replication_status(session: Session, bundle_id: str) -> PlacementStatus:
+    """Return replication-style status for one sealed bundle target."""
+    return placement_status(session, BundleTarget(bundle_id))
+
+
+def asset_has_artifactclass_membership(
+    session: Session,
+    asset_hash: bytes,
+    artifactclass: str,
+) -> bool:
+    """Return whether catalog membership places an asset in ``artifactclass``.
+
+    The D5.1 legacy-locator fallback uses ``IngestItem.artifactclass`` from
+    registered intakes as the primary per-asset class occurrence. It also honors
+    active ``VirtualArrangementMember`` rows, which are the catalog's mutable
+    archived-asset class memberships. The fallback is used only when an
+    ``AssetLocator`` has ``bundle_id`` set to NULL and can no longer be joined
+    to its bundle's artifactclass.
+    """
+    ingest_match = session.scalar(
+        select(IngestItem.id)
+        .join(Intake, IngestItem.intake_id == Intake.intake_id)
+        .where(
+            IngestItem.logical_asset_hash == asset_hash,
+            IngestItem.artifactclass == artifactclass,
+            Intake.status == IntakeStatus.REGISTERED,
+        )
+        .limit(1)
+    )
+    if ingest_match is not None:
+        return True
+    virtual_match = session.scalar(
+        select(VirtualArrangementMember.id)
+        .where(
+            VirtualArrangementMember.logical_asset_hash == asset_hash,
+            VirtualArrangementMember.artifactclass == artifactclass,
+            VirtualArrangementMember.excluded.is_(False),
+        )
+        .limit(1)
+    )
+    return virtual_match is not None
+
+
+def locator_artifactclass_filter(
+    session: Session,
+    asset_hash: bytes,
+    artifactclass: str,
+) -> Any:
+    """Return the D5.1 locator class filter for one asset and artifactclass."""
+    return _locator_artifactclass_filter(session, asset_hash, artifactclass)
+
+
+def _copy_health_filter(query: Any, *, require_verified: bool) -> Any:
+    query = query.where(
+        Copy.health == CopyHealth.OK,
+        Copy.deleted_at.is_(None),
+    )
+    if require_verified:
+        query = query.where(Copy.last_verified_at.is_not(None))
+    return query
+
+
+def _locator_artifactclass_filter(
+    session: Session,
+    asset_hash: bytes,
+    artifactclass: str,
+) -> Any:
+    legacy_ok = asset_has_artifactclass_membership(session, asset_hash, artifactclass)
+    legacy_clause = AssetLocator.bundle_id.is_(None) if legacy_ok else false()
+    return or_(
+        and_(
+            AssetLocator.bundle_id.is_not(None),
+            Bundle.artifactclass == artifactclass,
+        ),
+        legacy_clause,
+    )
+
+
+def _artifactclass_for_target(session: Session, target: Target) -> str:
+    if isinstance(target, AssetTarget):
+        return target.artifactclass
+    bundle = session.get(Bundle, target.bundle_id)
+    if bundle is None:
+        raise ValueError(f"bundle {target.bundle_id!r} does not exist")
+    return bundle.artifactclass
+
+
+def _policy_targets(session: Session, artifactclass: str) -> list[tuple[StorageBackend, PoolTarget]]:
+    backend_rows: dict[int, StorageBackend] = {}
+    for backend_id, backend_name in session.execute(
+        select(Backend.id, Backend.name)
+        .join(Pool, Pool.backend_id == Backend.id)
+        .join(ArtifactClassPool, ArtifactClassPool.pool_id == Pool.id)
+        .where(
+            ArtifactClassPool.artifactclass == artifactclass,
+            ArtifactClassPool.active.is_(True),
+        )
+    ):
+        backend_rows[int(backend_id)] = _TargetBackend(str(backend_name))
+    return target_pools(session, artifactclass, backend_rows)
+
+
+def _placement_entry(target: PoolTarget, duplicate_count: int) -> PlacementTarget:
+    return PlacementTarget(
+        pool_id=target.pool_id,
+        artifactclass=target.artifactclass,
+        backend_id=target.backend_id,
+        backend_name=target.backend_name,
+        representation=target.representation,
+        key_epoch=target.key_epoch,
+        location=target.location,
+        offsite_gate=target.offsite_gate,
+        tier=target.tier,
+        sort_order=target.sort_order,
+        have=duplicate_count > 0,
+        duplicate_count=duplicate_count,
+        is_duplicate=duplicate_count > 1,
+    )
+
+
+def _dedupe_by_copy_id(copies: list[Copy]) -> list[Copy]:
+    seen: set[int] = set()
+    result: list[Copy] = []
+    for copy in copies:
+        if copy.id in seen:
+            continue
+        seen.add(copy.id)
+        result.append(copy)
+    return result

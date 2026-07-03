@@ -188,6 +188,67 @@ def test_bundle_asset_locator_copy_counts_for_durability(
         assert releasable(session, "intake-b")
 
 
+def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    with session_scope(engine) as session:
+        offsite = _add_pool(
+            session,
+            artifactclass="s-masters",
+            pool_id="offsite-pool",
+            offsite_gate=True,
+            kind=BackendKind.REM_TAPE,
+        )
+        wrong_pool = _add_pool(
+            session,
+            artifactclass="other-class",
+            pool_id="wrong-pool",
+            kind=BackendKind.REM_TAPE,
+        )
+        item = _add_intake_with_item(session, tmp_path, "intake-mismatch", artifactclass="s-masters")
+        bundle = Bundle(id="submission-mismatch", artifactclass="s-masters", status="sealed")
+        session.add(bundle)
+        session.flush()
+        locator = {"tape_uuid": "tape-mismatch", "object_id": "bundle-copy"}
+        copy = Copy(
+            bundle_id=bundle.id,
+            backend_id=offsite.backend_id,
+            pool_id=offsite.id,
+            native_locator=locator,
+            native_locator_key=locator_key(locator),
+            storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
+            integrity_hash=item.logical_asset_hash,
+            health=CopyHealth.OK,
+            last_verified_at=_now(),
+            source=CopySource.INGEST,
+        )
+        session.add(copy)
+        session.flush()
+        session.add(
+            AssetLocator(
+                logical_asset_hash=item.logical_asset_hash,
+                pool_id=wrong_pool.id,
+                copy_id=copy.id,
+                bundle_id=bundle.id,
+                native_locator={"first_chunk_lba": 1, "size_bytes": item.size_bytes},
+                member_path=item.as_received_path,
+                representation=Representation.RAO_PLAIN_V1.value,
+            )
+        )
+        confirm_offsite(session, media_id="tape:tape-mismatch", confirmed_by="ops")
+
+        status = retention_module.retention_status(session, "intake-mismatch")
+
+    assert not status.releasable
+    [asset] = status.assets
+    [pool_status] = asset.pools
+    assert pool_status.pool_id == "offsite-pool"
+    assert pool_status.satisfied is False
+    assert pool_status.copy_id is None
+    assert pool_status.reason == "no-verified-copy"
+
+
 def test_landing_holds_arrangement_and_prepared_profile_fail_closed(
     engine: Engine,
     tmp_path: Path,

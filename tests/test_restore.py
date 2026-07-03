@@ -133,6 +133,18 @@ def _add_copy(
         return copy.id
 
 
+def _restore_to_destination(
+    session: Session,
+    copy: Copy,
+    *,
+    backend: MemoryBackend,
+    opener: _FakeOpener,
+    destination: Path,
+) -> None:
+    with restore_copy(session, copy, backend=backend, opener=opener) as result:
+        atomic_write_verified_file(result.path, destination)
+
+
 @pytest.mark.parametrize(
     "representation",
     [Representation.RAW_BYTES, Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1],
@@ -160,6 +172,26 @@ def test_restore_copy_round_trips_asset_per_representation(
         assert opener.calls == [(representation, "epoch-1")]
 
 
+def test_restore_copy_reads_suspect_direct_copy(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    backend = MemoryBackend("mem")
+    opener = _FakeOpener()
+    data = b"suspect copy remains break-glass readable"
+    copy_id = _add_copy(engine, backend, data=data, health=CopyHealth.SUSPECT)
+    dest = tmp_path / "suspect.bin"
+
+    with session_scope(engine) as s:
+        copy = s.get(Copy, copy_id)
+        assert copy is not None
+        with restore_copy(s, copy, backend=backend, opener=opener) as result:
+            atomic_write_verified_file(result.path, dest)
+
+    assert dest.read_bytes() == data
+    assert result.sha256 == _sha(data)
+
+
 def test_restore_fails_closed_for_stored_and_content_corruption(
     engine: Engine,
     tmp_path: Path,
@@ -174,11 +206,11 @@ def test_restore_fails_closed_for_stored_and_content_corruption(
         assert copy is not None
         backend.corrupt(content_hash(bytes.fromhex(copy.native_locator["hash_hex"])), b"corrupt")
 
-    with session_scope(engine) as s, pytest.raises(RestoreError, match="stored-corrupt"):
+    with session_scope(engine) as s:
         copy = s.get(Copy, copy_id)
         assert copy is not None
-        with restore_copy(s, copy, backend=backend, opener=opener) as result:
-            atomic_write_verified_file(result.path, dest)
+        with pytest.raises(RestoreError, match="stored-corrupt"):
+            _restore_to_destination(s, copy, backend=backend, opener=opener, destination=dest)
 
     assert dest.read_bytes() == b"old"
 
@@ -192,11 +224,11 @@ def test_restore_fails_closed_for_stored_and_content_corruption(
         stored_bytes=wrong_stored,
     )
     dest2 = tmp_path / "content-corrupt.bin"
-    with session_scope(engine) as s, pytest.raises(RestoreError, match="content-corrupt"):
+    with session_scope(engine) as s:
         copy = s.get(Copy, copy_id2)
         assert copy is not None
-        with restore_copy(s, copy, backend=backend2, opener=opener) as result:
-            atomic_write_verified_file(result.path, dest2)
+        with pytest.raises(RestoreError, match="content-corrupt"):
+            _restore_to_destination(s, copy, backend=backend2, opener=opener, destination=dest2)
 
     assert not dest2.exists()
 
@@ -247,11 +279,11 @@ def test_restore_rejects_missing_bundle_and_bad_representation(
         (bad_meta_copy, "representation"),
     ]:
         dest = tmp_path / f"{copy_id}.bin"
-        with session_scope(engine) as s, pytest.raises(RestoreError, match=reason):
+        with session_scope(engine) as s:
             copy = s.get(Copy, copy_id)
             assert copy is not None
-            with restore_copy(s, copy, backend=backend, opener=opener) as result:
-                atomic_write_verified_file(result.path, dest)
+            with pytest.raises(RestoreError, match=reason):
+                _restore_to_destination(s, copy, backend=backend, opener=opener, destination=dest)
         assert not dest.exists()
 
 

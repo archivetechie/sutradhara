@@ -43,6 +43,7 @@ from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.reconcilers import derivation as _derivation_reconciler  # noqa: F401
 from sutradhara.jobs.reconcilers.spine import reconcile
 from sutradhara.rem_archive_cli import RemArchiveBuildResult
+from sutradhara.sealing.port import Representation
 
 
 @pytest.fixture
@@ -61,6 +62,8 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
     monkeypatch.setenv("SUTRADHARA_FAKE_TRANSCODE", "1")
     monkeypatch.setenv("SUTRADHARA_FAKE_FFPROBE", "1")
     monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
+    monkeypatch.setenv("SUTRADHARA_CACHE_ROOT", str(tmp_path / "cache"))
     fake_backend = _FakeObjectBackend("cloud-temp")
     monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: fake_backend)
 
@@ -105,8 +108,10 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
         assert bundle is not None
         assert bundle.status == "sealed"
         copy = session.scalars(select(Copy).where(Copy.bundle_id == bundle.id)).one()
+        pool = session.get(Pool, "cloud-temp")
+        assert pool is not None
         assert copy.native_locator["key"] == "intakes/card-100.rao"
-        assert copy.storage_metadata["representation"] == "rao-aead-v1"
+        assert copy.storage_metadata["representation"] == pool.representation
         assert fake_backend.objects["intakes/card-100.rao"]
 
 
@@ -116,6 +121,7 @@ def test_cloud_blob_handler_uses_ssh_disk_backend_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
     remote_root = tmp_path / "remote"
     transport = _LocalObjectTransport(remote_root)
     monkeypatch.setattr(
@@ -151,6 +157,7 @@ def test_cloud_blob_fake_build_unlinks_stale_cache_artifact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
     fake_backend = _FakeObjectBackend("cloud-temp")
     monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: fake_backend)
     landing = tmp_path / "landing"
@@ -174,7 +181,39 @@ def test_cloud_blob_fake_build_unlinks_stale_cache_artifact(
 
     payload = json.loads(blob_path.read_text(encoding="utf-8"))
     assert payload["intake_bundle_id"] == "cloud-blob:card-retry-fake"
+    assert payload["representation"] == Representation.RAO_AEAD_V1.value
     assert fake_backend.objects["intakes/card-retry-fake.rao"] == blob_path.read_bytes()
+
+
+def test_cloud_blob_refuses_pool_representation_it_cannot_produce(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
+    fake_backend = _FakeObjectBackend("cloud-temp")
+    monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: fake_backend)
+    landing = tmp_path / "landing"
+    _write_intake(landing, "card-raw-pool", {"clip.mov": b"valid video payload"})
+
+    with session_scope(engine) as session:
+        _add_cloud_backend(session)
+        pool = session.get(Pool, "cloud-temp")
+        assert pool is not None
+        pool.representation = Representation.RAW_BYTES.value
+        register_landing_root(
+            session,
+            landing,
+            artifactclass="s-masters",
+            cache_root=tmp_path / "cache",
+        )
+        job = session.scalars(select(Job).where(Job.kind == "cloud-blob")).one()
+        result = run_one(session, job.id)
+
+    assert not result.ok
+    assert "cloud-blob can only produce" in result.detail
+    assert fake_backend.objects == {}
 
 
 def test_cloud_blob_real_build_unlinks_stale_cache_artifact(
