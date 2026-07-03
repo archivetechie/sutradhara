@@ -1,6 +1,13 @@
 # Design - Intake acceptance, arrangement, submission, and virtual segregation
 
-> Status: **design, for review** (2026-06-18).
+> **Superseded-as-spec (2026-07-03):** every phase this arc spawned is
+> implemented. Authoritative in-repo specs are `design-arrangement-submit.md`,
+> `design-virtual-arrangement.md`, and `design-deletion-gate.md`; the requested
+> gateway `design-gateway-convergence.md` is not present in this repo. The schema
+> sketches in §4.6-§4.8 are historical illustration only and do not match the
+> shipped schema.
+>
+> Status: **historical / superseded (2026-07-03)**.
 >
 > This document replaces the older "rough segregation on staging" framing with a
 > stricter model:

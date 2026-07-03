@@ -1,7 +1,7 @@
 # Design — the reconciler spine (P0.3): the condition table + the reconcile loop
 
-> Status: **design, for review** (the owner + Claude, 2026-06-25). Implementation item
-> **P0.3** in `implementation-plan-ingest-v2.md`. This is the **concrete, buildable**
+> Status: **implemented (2026-06-25; commit 31e82f8) — §4.1 version-gated reopen NOT yet implemented, see `prompt-jobs-safety-rails`**.
+> Original implementation item **P0.3** in `implementation-plan-ingest-v2.md`. This is the **concrete, buildable**
 > form of `design-reconciliation-model.md` Phase 3 — that doc defines *the model*
 > (intent as desired-state, jobs as attempts, level-triggered convergence); this doc
 > defines *the table and the control loop* that make it real, and wires the **first

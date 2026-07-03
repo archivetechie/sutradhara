@@ -1,6 +1,6 @@
 # Design — sutradhara job execution model: worker, resource leases, granularity, validation
 
-> Status: **design, for review** (the owner + Claude, 2026-06-16). Synthesised from a
+> Status: **implemented** (2026-06-16; pre-dates P0.x numbering; built + green at ingest-v2 baseline). Synthesised from a
 > three-generation job-framework comparison (d2 custom / d3 Prefect / sutradhara)
 > — memory `job-framework-lineage-lessons`. Decisions taken: **single-node lease
 > worker now**; **atomic jobs + DAG, no per-file sub-rows**; **archive-everything:

@@ -5,6 +5,9 @@
 > Same ideas, no code — written for archivists, operators, and anyone who wants to
 > understand *why* the system works the way it does. If you ever wonder "why can't I
 > just drag the files into folders like normal?", the answer is in here.
+>
+> Terminology note (2026-06-27): "virtual segregation" was the old name; current
+> docs and CLI use **virtual arrangement** / `sutra virtual`.
 
 ---
 
@@ -87,7 +90,7 @@ So the journey is deliberately broken into distinct steps, each with one clear j
 - **Arrange** — *lay it out.* Let a human organize, over cheap review copies.
 - **Submit** — *freeze the layout* into the map that drives archiving.
 - **Archive** — *write to tape* under the submitted names.
-- **Virtual segregation** — *organize forever*, after archive, in catalogue metadata only.
+- **Virtual arrangement** — *organize forever*, after archive, in catalogue metadata only.
 
 The value isn't bureaucracy; it's **predictability**. Each step has a name, does exactly what its name says, and can be repeated safely. "Inspect" never has surprise costs. "Register" is the one place custody begins. An operator always knows what a command will and won't do.
 
@@ -195,7 +198,7 @@ If you remember nothing else, remember these:
 - **Proxy** — a lightweight preview/editing copy used so humans can sort and review without touching 4K masters.
 - **Projection** — the temporary, normal-looking folder of proxy files an operator arranges in Finder/Explorer; the system records their moves as intentions.
 - **Source-map (the frozen layout)** — the immutable list submitted before archiving: "this archive name ← this original file, this fingerprint." Archiving streams originals through it; no wasteful staging copy.
-- **Virtual segregation** — post-archive organization: editing virtual names and tags in the catalogue. The tape never moves; nothing is deleted.
+- **Virtual arrangement** — post-archive organization: editing virtual names and tags in the catalogue. The tape never moves; nothing is deleted.
 - **Reconciler (the tireless librarian)** — the background process that continuously compares "what should exist" to "what does exist" and closes the gap. Self-healing; the reason work is never silently lost.
 - **Package normalization** — sealing a folder-that-is-really-one-thing (a Final Cut library) into a single object at first contact, so it doesn't explode into a million catalogue entries.
 
