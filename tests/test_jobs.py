@@ -1366,14 +1366,14 @@ def test_dispatch_restore_rejects_nonqueued_item(engine: Engine) -> None:
         dispatch_restore(s, item_id)
 
 
-def test_dispatch_restore_rejects_queued_item_without_admission_proof(engine: Engine) -> None:
+def test_dispatch_restore_rejects_queued_item_without_admission_inputs(engine: Engine) -> None:
     from sutradhara.jobs.dispatch import RestoreRequestItemNotRunnable, dispatch_restore
 
     item_id = _register_restore_request_item(engine, admitted=False)
 
     with session_scope(engine) as s, pytest.raises(
         RestoreRequestItemNotRunnable,
-        match="missing admission proof",
+        match="missing admission inputs",
     ):
         dispatch_restore(s, item_id)
 
@@ -1403,7 +1403,7 @@ def test_restore_handler_fails_cleanly_does_not_fake_success(
         assert "rejects raw copy_id/dest_path" in job.last_error
 
 
-def test_restore_handler_refuses_queued_item_without_admission_proof(engine: Engine) -> None:
+def test_restore_handler_refuses_queued_item_without_admission_inputs(engine: Engine) -> None:
     item_id = _register_restore_request_item(engine, admitted=False)
 
     with session_scope(engine) as s:
@@ -1413,7 +1413,7 @@ def test_restore_handler_refuses_queued_item_without_admission_proof(engine: Eng
         assert not result.ok
         assert job.status == JobStatus.FAILED
         assert job.last_error is not None
-        assert "missing admission proof" in job.last_error
+        assert "missing admission inputs" in job.last_error
         assert s.get(RestoreRequestItem, item_id).state == "failed"
 
 

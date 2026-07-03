@@ -15,6 +15,7 @@ from sqlalchemy import Engine, select
 import sutradhara.hdcache.manager as restore_manager
 from sutradhara.api.identity import parse_identity
 from sutradhara.archive_restore import RestoreRejectedAsset, RestoreResult, RestoreSuspectAsset
+from sutradhara.artifactclass_policy import ArtifactClassPolicyError
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
@@ -47,6 +48,7 @@ from sutradhara.hdcache.manager import (
     REQUEST_PENDING,
     RESTORE_DESTINATIONS_ENV,
     InvalidRestoreDestination,
+    RestoreAdmissionInvalid,
     RestoreConfig,
     RestoreDenied,
     RestoreDestination,
@@ -385,6 +387,35 @@ def test_configured_destinations_do_not_expose_raw_root_paths(
     assert str(second_root) not in encoded
 
 
+@pytest.mark.parametrize("destination_id", ["media/server", r"media\server", "C:restore"])
+def test_path_like_destination_id_is_rejected_at_config_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination_id: str,
+) -> None:
+    monkeypatch.setenv(
+        RESTORE_DESTINATIONS_ENV,
+        json.dumps({destination_id: str(tmp_path / "restore-root")}),
+    )
+
+    with pytest.raises(ArtifactClassPolicyError, match="opaque"):
+        configured_destinations()
+
+
+def test_path_like_destination_label_is_rejected_at_config_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    monkeypatch.setenv(
+        RESTORE_DESTINATIONS_ENV,
+        json.dumps({"media-server": {"root": str(root), "label": "exports/restore"}}),
+    )
+
+    with pytest.raises(ArtifactClassPolicyError, match="label must not be a raw path"):
+        configured_destinations()
+
+
 def test_request_admission_and_sequential_serve_persist_contract_states(
     engine: Engine,
     tmp_path: Path,
@@ -411,12 +442,18 @@ def test_request_admission_and_sequential_serve_persist_contract_states(
             ],
             config=config,
         )
+        assert request.admitted_by == "owner"
+        assert request.admitted_at is not None
+        assert request.admitted_capabilities == ["can_view", "can_receive"]
         assert request.state == REQUEST_PENDING
         states = {item.content_sha256: item.state for item in request.items}
         assert states[public_digest] == ITEM_QUEUED
         assert states[private_digest] == ITEM_DENIED
         denied = next(item for item in request.items if item.content_sha256 == private_digest)
         assert denied.detail == "requires sutradhara-restore-p3"
+        admitted = next(item for item in request.items if item.content_sha256 == public_digest)
+        assert admitted.admitted_force_suspect is False
+        assert admitted.admitted_force_rejected is False
 
         serve_restore_request(
             session,
@@ -431,6 +468,120 @@ def test_request_admission_and_sequential_serve_persist_contract_states(
             public_digest: ITEM_DONE,
             private_digest: ITEM_DENIED,
         }
+
+
+def test_forged_queued_row_without_admission_inputs_is_refused(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=b"public bytes")
+        request = RestoreRequest(
+            id="forged",
+            identity="owner",
+            destination_id="media-server",
+            state=REQUEST_PENDING,
+        )
+        request.items.append(
+            RestoreRequestItem(
+                content_sha256=digest,
+                artifactclass="s-masters",
+                state=ITEM_QUEUED,
+            )
+        )
+        session.add(request)
+        session.flush()
+        item = request.items[0]
+
+        with pytest.raises(RestoreAdmissionInvalid, match="missing admission inputs"):
+            serve_restore_item(
+                session,
+                item,
+                identity_or_override=_identity("sutradhara-operator"),
+                force_suspect=True,
+                force_rejected=True,
+                config=_config(root),
+            )
+
+        assert item.state == "failed"
+        assert item.detail is not None
+        assert "missing admission inputs" in item.detail
+
+
+def test_admitted_force_flags_are_used_at_serve_when_caller_differs(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"suspect bytes")
+        asset = session.get(LogicalAsset, digest)
+        assert asset is not None
+        asset.validity = AssetValidity.SUSPECT
+        asset.validity_note = "operator accepted warning"
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters")],
+            force_suspect=True,
+            config=_config(root),
+        )
+
+        serve_restore_request(
+            session,
+            request,
+            identity_or_override=_identity("sutradhara-operator"),
+            force_suspect=False,
+            force_rejected=True,
+            config=_config(root, restore_backends={backend_id: memory}),
+        )
+
+        item = request.items[0]
+        assert item.admitted_force_suspect is True
+        assert item.admitted_force_rejected is False
+        assert item.state == ITEM_DONE
+        assert (root / digest.hex()).read_bytes() == b"suspect bytes"
+
+
+def test_asset_rejected_after_admission_is_denied_at_serve_revalidation(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"later rejected")
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters")],
+            config=_config(root),
+        )
+        asset = session.get(LogicalAsset, digest)
+        assert asset is not None
+        asset.rejected_at = dt.datetime.now(dt.UTC)
+        asset.rejected_by = "supervisor"
+        asset.rejection_reason = "post-admission revoke"
+
+        serve_restore_request(
+            session,
+            request,
+            identity_or_override=_identity("sutradhara-operator"),
+            force_rejected=True,
+            config=_config(root, restore_backends={backend_id: memory}),
+        )
+
+        item = request.items[0]
+        assert item.state == ITEM_DENIED
+        assert item.detail is not None
+        assert "post-admission revoke" in item.detail
+        assert not (root / digest.hex()).exists()
+        assert request.state == REQUEST_COMPLETED_WITH_ERRORS
 
 
 def test_request_state_is_active_only_while_item_is_serving(
@@ -739,7 +890,7 @@ def _config(
             "media-server": RestoreDestination(
                 id="media-server",
                 root=root,
-                label="Media server /restore",
+                label="Media server restore",
             )
         },
         restore_backends=restore_backends,
@@ -947,11 +1098,16 @@ def _request_item(
         identity="owner",
         destination_id="media-server",
         state="active",
+        admitted_by="owner",
+        admitted_at=dt.datetime.now(dt.UTC),
+        admitted_capabilities=["can_view", "can_receive"],
     )
     item = RestoreRequestItem(
         content_sha256=digest,
         artifactclass="s-masters",
         state=ITEM_QUEUED,
+        admitted_force_suspect=False,
+        admitted_force_rejected=False,
     )
     request.items.append(item)
     session.add(request)

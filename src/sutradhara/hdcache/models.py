@@ -8,7 +8,6 @@ the HD cache is expendable operational state derived from durable archive truth.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any
 
 from sqlalchemy import (
     JSON,
@@ -134,6 +133,9 @@ class RestoreRequest(Base):
     )
     destination_id: Mapped[str] = mapped_column(String(128), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    admitted_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    admitted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    admitted_capabilities: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
 
     items: Mapped[list[RestoreRequestItem]] = relationship(
         back_populates="request",
@@ -173,7 +175,8 @@ class RestoreRequestItem(Base):
     artifactclass: Mapped[str] = mapped_column(String(128), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
-    admission_proof: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    admitted_force_suspect: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    admitted_force_rejected: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

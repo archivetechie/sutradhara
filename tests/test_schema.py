@@ -249,7 +249,11 @@ def _assert_hdcache_invariants(db_path: Path) -> None:
     item_sql = _table_sql(db_path, "restore_request_item")
     assert "ck_restore_request_item_state" in item_sql
     assert "fell_back_to_tape" in item_sql
-    assert "admission_proof" in item_sql
+    assert "admitted_by" in request_sql
+    assert "admitted_at" in request_sql
+    assert "admitted_capabilities" in request_sql
+    assert "admitted_force_suspect" in item_sql
+    assert "admitted_force_rejected" in item_sql
     assert "ON DELETE CASCADE" in item_sql
     item_indexes = _index_columns(db_path, "restore_request_item")
     assert ("request_id",) in item_indexes
