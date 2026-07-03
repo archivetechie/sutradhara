@@ -22,7 +22,7 @@ from sutradhara.hdcache.manager import (
     RestoreDestination,
     RestoreEvent,
 )
-from sutradhara.hdcache.models import RestoreRequest
+from sutradhara.hdcache.models import RestoreRequest, RestoreRequestItem
 from sutradhara.hdcache.walker import HdcacheWalkerEvent
 from sutradhara.jobs.models import Job, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_OPEN
@@ -122,8 +122,8 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
     assert listed.status_code == 200
     assert listed.json()["requests"][0]["id"] == request_id
     with api_engine.connect() as conn:
-        jobs = conn.execute(select(Job.kind, Job.params)).all()
-    assert jobs == [("restore", {"restore_request_item_id": 1})]
+        jobs = conn.execute(select(Job.kind, Job.params, Job.required_resources)).all()
+    assert jobs == [("restore", {"restore_request_item_id": 1}, [{"pool": "io", "count": 1}])]
 
 
 def test_restore_post_unknown_destination_and_malformed_payload(
@@ -208,6 +208,42 @@ def test_restore_post_manager_error_returns_sanitized_4xx(
     assert response.json()["error"] == "invalid_restore_destination"
     assert response.json()["detail"] == "restore destination is invalid"
     assert "/var/lib/replica" not in response.json()["detail"]
+
+
+def test_restore_get_sanitizes_persisted_item_detail(api_engine: Engine) -> None:
+    digest = hashlib.sha256(b"failed").digest()
+    _seed_asset(api_engine, digest, privacy="none")
+    request_id = "req-path-detail"
+    with api_engine.begin() as conn:
+        conn.execute(
+            RestoreRequest.__table__.insert(),
+            {
+                "id": request_id,
+                "identity": "owner",
+                "destination_id": "media-server",
+                "state": "completed_with_errors",
+                "created_at": dt.datetime(2026, 7, 3, tzinfo=dt.UTC),
+            },
+        )
+        conn.execute(
+            RestoreRequestItem.__table__.insert(),
+            {
+                "request_id": request_id,
+                "content_sha256": digest,
+                "artifactclass": "s-masters",
+                "state": "failed",
+                "detail": "restore failed at /var/lib/replica/private/export.mov",
+                "updated_at": dt.datetime(2026, 7, 3, tzinfo=dt.UTC),
+            },
+        )
+    client = TestClient(make_api_app(api_engine))
+
+    response = client.get(f"/api/ui/restore-requests/{request_id}", headers=auth_headers("viewer"))
+
+    assert response.status_code == 200
+    detail = response.json()["items"][0]["detail"]
+    assert detail == "restore failed at <path>"
+    assert "/var/lib/replica" not in detail
 
 
 def test_event_alarm_sinks_project_conditions_visible_in_reconciliation(

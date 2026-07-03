@@ -1777,6 +1777,8 @@ def _set_item_state(item: RestoreRequestItem, state: str, detail: str | None) ->
     item.state = state
     item.detail = detail
     item.updated_at = _utcnow()
+    if item.request is not None:
+        _update_request_state(item.request)
 
 
 def _emit(config: RestoreConfig, event: RestoreEvent) -> None:

@@ -99,6 +99,7 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
                         session,
                         "restore",
                         {"restore_request_item_id": item.id},
+                        required_resources=[{"pool": "io", "count": 1}],
                         priority=OPERATOR_RESTORE_PRIORITY,
                     )
             request_id = restore_request.id
@@ -238,7 +239,7 @@ def _item_payload(item: RestoreRequestItem) -> dict[str, object]:
         "content_sha256": item.content_sha256.hex(),
         "artifactclass": item.artifactclass,
         "state": item.state,
-        "detail": item.detail,
+        "detail": None if item.detail is None else _sanitize_detail(item.detail),
         "updated_at": _iso(item.updated_at),
     }
 

@@ -709,6 +709,52 @@ def test_request_state_is_active_only_while_item_is_serving(
         assert item.state == ITEM_DONE
 
 
+def test_terminal_item_transition_updates_parent_request_state(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=b"public bytes")
+        config = _config(root)
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters")],
+            config=config,
+        )
+        item = request.items[0]
+
+        def fake_serve_from_tape(
+            _session,
+            asset_hash,
+            _artifactclass,
+            destination,
+            _config,
+            *,
+            force_suspect,
+            force_rejected,
+        ):
+            destination.write_bytes(b"public bytes")
+            return RestoreResult(
+                asset_hash=asset_hash,
+                pool_id="mem-pool",
+                copy_id=1,
+                output_path=destination,
+                size_bytes=len(b"public bytes"),
+            )
+
+        monkeypatch.setattr(restore_manager, "_serve_from_tape", fake_serve_from_tape)
+
+        serve_restore_item(session, item, config=config)
+
+        assert item.state == ITEM_DONE
+        assert request.state == REQUEST_COMPLETED
+
+
 def test_wake_window_marks_only_rolling_cache_items(
     engine: Engine,
     tmp_path: Path,
@@ -1343,7 +1389,7 @@ def test_untrusted_cache_hit_promotes_after_verified_serve(
         assert (root / digest.hex()).read_bytes() == b"cache hit"
         assert session.get(CacheEntry, digest).trusted is True
         assert item.state == ITEM_DONE
-        assert request.state in {"pending", "active"}
+        assert request.state == REQUEST_COMPLETED
         assert entry.last_read_at is not None
 
 
