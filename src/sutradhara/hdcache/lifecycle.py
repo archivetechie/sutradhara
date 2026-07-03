@@ -83,6 +83,7 @@ class DeadDiskResult:
     entries_lost: int
     batches: int
     luks_key_drop: str | None
+    drill_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -351,10 +352,17 @@ class HdcacheLifecycleManager:
                 f"disk {disk_id} still appears mounted; pass --confirm-mounted to mark it dead"
             )
         disk = self._set_disk_state(disk_id, "dead")
+        drill_started_at = dt.datetime.now(dt.UTC)
+        drill_id = _drill_id(disk_id, drill_started_at)
         total = 0
         batches = 0
         while True:
-            changed = self._mark_lost_batch(disk_id, batch_size=batch_size)
+            changed = self._mark_lost_batch(
+                disk_id,
+                batch_size=batch_size,
+                drill_id=drill_id,
+                lost_at=drill_started_at,
+            )
             if changed == 0:
                 break
             total += changed
@@ -369,6 +377,7 @@ class HdcacheLifecycleManager:
             entries_lost=total,
             batches=batches,
             luks_key_drop=luks_result,
+            drill_id=drill_id if total else None,
         )
 
     def forget(self, disk_id: str) -> CacheDisk:
@@ -456,7 +465,14 @@ class HdcacheLifecycleManager:
             session.expunge(row)
             return row
 
-    def _mark_lost_batch(self, disk_id: str, *, batch_size: int) -> int:
+    def _mark_lost_batch(
+        self,
+        disk_id: str,
+        *,
+        batch_size: int,
+        drill_id: str,
+        lost_at: dt.datetime,
+    ) -> int:
         factory = make_session_factory(self.engine)
         with factory.begin() as session:
             rows = list(
@@ -469,6 +485,10 @@ class HdcacheLifecycleManager:
             )
             for row in rows:
                 row.state = "lost"
+                row.lost_origin_disk_id = disk_id
+                row.lost_drill_id = drill_id
+                row.lost_at = lost_at
+                row.refilled_at = None
             return len(rows)
 
     @staticmethod
@@ -519,6 +539,11 @@ def _disk_payload(row: CacheDisk) -> dict[str, Any]:
         "enrolled_at": row.enrolled_at.isoformat() if row.enrolled_at else None,
         "last_walk_at": row.last_walk_at.isoformat() if row.last_walk_at else None,
     }
+
+
+def _drill_id(disk_id: str, started_at: dt.datetime) -> str:
+    stamp = started_at.astimezone(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"{disk_id}:{stamp}"
 
 
 def load_hmac_secret_from_env() -> bytes:

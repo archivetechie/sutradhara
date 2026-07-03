@@ -96,6 +96,21 @@ class ArchiveExtractor(Protocol):
         ...
 
 
+class BundleArchiveExtractor(ArchiveExtractor, Protocol):
+    """Extractor variant that can share copy materialization across members."""
+
+    def extract_bundle_to_paths(
+        self,
+        *,
+        locators: list[AssetLocator],
+        copy: Copy,
+        backend: StorageBackend,
+        destinations: dict[bytes, Path],
+    ) -> None:
+        """Write several stored members from one bundle copy to paths keyed by hash."""
+        ...
+
+
 class LocalArchiveExtractor:
     """Extractor for d2 tar copies, local test archives, and offset locators."""
 
@@ -113,6 +128,22 @@ class LocalArchiveExtractor:
             asset_locator=locator,
             dest=destination,
         )
+
+    def extract_bundle_to_paths(
+        self,
+        *,
+        locators: list[AssetLocator],
+        copy: Copy,
+        backend: StorageBackend,
+        destinations: dict[bytes, Path],
+    ) -> None:
+        for locator in locators:
+            self.extract_to_path(
+                locator=locator,
+                copy=copy,
+                backend=backend,
+                destination=destinations[locator.logical_asset_hash],
+            )
 
 
 class RemArchiveExtractor(LocalArchiveExtractor):
@@ -142,6 +173,37 @@ class RemArchiveExtractor(LocalArchiveExtractor):
             dest=destination,
             rem_bin=self._rem_bin,
             keys=self._keys,
+        )
+
+    def extract_bundle_to_paths(
+        self,
+        *,
+        locators: list[AssetLocator],
+        copy: Copy,
+        backend: StorageBackend,
+        destinations: dict[bytes, Path],
+    ) -> None:
+        if not locators:
+            return
+        representation = Representation(locators[0].representation)
+        if representation is Representation.D2TAR_RAW:
+            _extract_d2_bundle_to_paths(locators, copy, backend, destinations)
+            return
+        if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
+            _extract_rao_bundle_with_rem_to_paths(
+                backend=backend,
+                copy=copy,
+                locators=locators,
+                destinations=destinations,
+                rem_bin=self._rem_bin,
+                keys=self._keys,
+            )
+            return
+        super().extract_bundle_to_paths(
+            locators=locators,
+            copy=copy,
+            backend=backend,
+            destinations=destinations,
         )
 
 
@@ -340,6 +402,103 @@ def restore_asset(
     )
 
 
+def restore_assets_from_bundle(
+    session: Session,
+    *,
+    asset_hashes: list[bytes],
+    artifactclass: str,
+    destination_dir: Path | str,
+    backends: dict[int, StorageBackend],
+    extractor: BundleArchiveExtractor | ArchiveExtractor | None = None,
+    force_suspect: bool = False,
+    force_rejected: bool = False,
+) -> list[RestoreResult]:
+    """Restore several members from one bundle copy with shared materialization.
+
+    The caller supplies members that should be co-located in archive truth. The
+    function chooses the first healthy copy, in artifactclass restore-pool order,
+    that has locators for every requested hash. Each member still reverses its
+    own staging transforms and verifies against its logical asset hash before a
+    result is returned.
+    """
+
+    if not asset_hashes:
+        return []
+    unique_hashes: list[bytes] = []
+    seen: set[bytes] = set()
+    for asset_hash in asset_hashes:
+        if not is_content_hash(asset_hash):
+            raise ValueError("asset_hashes must contain 32-byte SHA-256 hashes")
+        if asset_hash in seen:
+            continue
+        check_asset_restore_allowed(
+            session,
+            asset_hash,
+            force_suspect=force_suspect,
+            force_rejected=force_rejected,
+        )
+        seen.add(asset_hash)
+        unique_hashes.append(asset_hash)
+
+    destination_root = Path(destination_dir).resolve()
+    destination_root.mkdir(parents=True, exist_ok=True)
+    archive_extractor = extractor or LocalArchiveExtractor()
+    chosen = _choose_bundle_restore_group(
+        session,
+        unique_hashes,
+        artifactclass,
+        backends=backends,
+    )
+    if chosen is None:
+        hashes = ", ".join(asset_hash.hex() for asset_hash in unique_hashes)
+        raise RestoreSourceUnavailable(
+            f"no healthy bundle copy can restore all requested assets for "
+            f"artifactclass {artifactclass!r}: {hashes}"
+        )
+    pool_id, copy, backend, locator_by_hash = chosen
+
+    with tempfile.TemporaryDirectory(prefix=".sutradhara-bundle-restore-", dir=destination_root) as raw:
+        temp_dir = Path(raw)
+        stored_dir = temp_dir / "stored"
+        restored_dir = temp_dir / "restored"
+        stored_dir.mkdir()
+        restored_dir.mkdir()
+        stored_destinations = {
+            asset_hash: stored_dir / asset_hash.hex() for asset_hash in unique_hashes
+        }
+        _extract_bundle_to_paths(
+            archive_extractor,
+            locators=[locator_by_hash[asset_hash] for asset_hash in unique_hashes],
+            copy=copy,
+            backend=backend,
+            destinations=stored_destinations,
+        )
+        results_by_hash: dict[bytes, RestoreResult] = {}
+        for asset_hash in unique_hashes:
+            locator = locator_by_hash[asset_hash]
+            restored_path = restored_dir / asset_hash.hex()
+            restored = reverse_transforms_to_path(
+                stored_destinations[asset_hash],
+                restored_path,
+                _locator_transforms(session, locator),
+            )
+            if restored.sha256 != asset_hash:
+                raise RestoreIntegrityError(
+                    f"bundle restore copy id={copy.id} pool={pool_id}: "
+                    f"{restored.sha256.hex()} != {asset_hash.hex()}"
+                )
+            output_path = destination_root / asset_hash.hex()
+            atomic_write_verified_file(restored_path, output_path)
+            results_by_hash[asset_hash] = RestoreResult(
+                asset_hash=asset_hash,
+                pool_id=pool_id,
+                copy_id=copy.id,
+                output_path=output_path,
+                size_bytes=restored.size_bytes,
+            )
+    return [results_by_hash[asset_hash] for asset_hash in asset_hashes]
+
+
 def check_asset_restore_allowed(
     session: Session,
     asset_hash: bytes,
@@ -452,6 +611,77 @@ def _locator_transforms(
     )
 
 
+def _choose_bundle_restore_group(
+    session: Session,
+    asset_hashes: list[bytes],
+    artifactclass: str,
+    *,
+    backends: dict[int, StorageBackend],
+) -> tuple[str, Copy, StorageBackend, dict[bytes, AssetLocator]] | None:
+    policy = get_artifactclass_policy(session, artifactclass)
+    pool_order = _restore_pool_order(session, artifactclass, policy.restore_preference)
+    pool_rank = {pool_id: index for index, pool_id in enumerate(pool_order)}
+    if not pool_rank:
+        return None
+    locators = list(
+        session.scalars(
+            select(AssetLocator)
+            .options(joinedload(AssetLocator.copy).joinedload(Copy.backend))
+            .where(AssetLocator.logical_asset_hash.in_(asset_hashes))
+        )
+    )
+    grouped: dict[tuple[int, str, int, str], dict[bytes, AssetLocator]] = {}
+    copy_by_key: dict[tuple[int, str, int, str], Copy] = {}
+    for locator in locators:
+        copy = locator.copy
+        if (
+            copy is None
+            or copy.health != CopyHealth.OK
+            or copy.deleted_at is not None
+            or copy.bundle_id is None
+            or locator.bundle_id is None
+            or locator.pool_id not in pool_rank
+            or copy.backend_id not in backends
+        ):
+            continue
+        key = (pool_rank[locator.pool_id], locator.pool_id, copy.id, locator.bundle_id)
+        grouped.setdefault(key, {}).setdefault(locator.logical_asset_hash, locator)
+        copy_by_key[key] = copy
+    wanted = set(asset_hashes)
+    for key in sorted(grouped):
+        locator_by_hash = grouped[key]
+        if set(locator_by_hash) >= wanted:
+            copy = copy_by_key[key]
+            return key[1], copy, backends[copy.backend_id], locator_by_hash
+    return None
+
+
+def _extract_bundle_to_paths(
+    extractor: ArchiveExtractor,
+    *,
+    locators: list[AssetLocator],
+    copy: Copy,
+    backend: StorageBackend,
+    destinations: dict[bytes, Path],
+) -> None:
+    batch_method = getattr(extractor, "extract_bundle_to_paths", None)
+    if callable(batch_method):
+        batch_method(
+            locators=locators,
+            copy=copy,
+            backend=backend,
+            destinations=destinations,
+        )
+        return
+    for locator in locators:
+        extractor.extract_to_path(
+            locator=locator,
+            copy=copy,
+            backend=backend,
+            destination=destinations[locator.logical_asset_hash],
+        )
+
+
 def _restore_pool_order(
     session: Session,
     artifactclass: str,
@@ -507,6 +737,27 @@ def _extract_d2_to_path(
         object_path = Path(raw_tmp) / "copy.tar"
         _materialize_copy_to_path(backend, copy, object_path)
         _extract_tar_member_to_path(object_path, locator.member_path, destination)
+
+
+def _extract_d2_bundle_to_paths(
+    locators: list[AssetLocator],
+    copy: Copy,
+    backend: StorageBackend,
+    destinations: dict[bytes, Path],
+) -> None:
+    if all("block_range" in locator.native_locator for locator in locators):
+        for locator in locators:
+            _extract_d2_to_path(locator, copy, backend, destinations[locator.logical_asset_hash])
+        return
+    with tempfile.TemporaryDirectory(prefix="sutradhara-d2-bundle-restore-") as raw_tmp:
+        object_path = Path(raw_tmp) / "copy.tar"
+        _materialize_copy_to_path(backend, copy, object_path)
+        for locator in locators:
+            _extract_tar_member_to_path(
+                object_path,
+                locator.member_path,
+                destinations[locator.logical_asset_hash],
+            )
 
 
 def _extract_tar_member_to_path(
@@ -608,14 +859,62 @@ def _extract_rao_with_rem_to_path(
     rem_bin: str | Path,
     keys: KeyRegistry,
 ) -> None:
-    member_path = _member_path(locator.native_locator)
-    size = _size_bytes(locator.native_locator)
     with tempfile.TemporaryDirectory(prefix="sutradhara-restore-") as raw:
         temp_dir = Path(raw)
         object_path = temp_dir / "bundle.rao"
-        dest_dir = temp_dir / "out"
-        dest_dir.mkdir()
         _materialize_copy_to_path(backend, copy, object_path)
+        _extract_rao_materialized_member_to_path(
+            object_path=object_path,
+            copy=copy,
+            locator=locator,
+            representation=representation,
+            destination=destination,
+            rem_bin=rem_bin,
+            keys=keys,
+        )
+
+
+def _extract_rao_bundle_with_rem_to_paths(
+    *,
+    backend: StorageBackend,
+    copy: Copy,
+    locators: list[AssetLocator],
+    destinations: dict[bytes, Path],
+    rem_bin: str | Path,
+    keys: KeyRegistry,
+) -> None:
+    if not locators:
+        return
+    with tempfile.TemporaryDirectory(prefix="sutradhara-bundle-restore-") as raw:
+        object_path = Path(raw) / "bundle.rao"
+        _materialize_copy_to_path(backend, copy, object_path)
+        for locator in locators:
+            _extract_rao_materialized_member_to_path(
+                object_path=object_path,
+                copy=copy,
+                locator=locator,
+                representation=Representation(locator.representation),
+                destination=destinations[locator.logical_asset_hash],
+                rem_bin=rem_bin,
+                keys=keys,
+            )
+
+
+def _extract_rao_materialized_member_to_path(
+    *,
+    object_path: Path,
+    copy: Any,
+    locator: Any,
+    representation: Representation,
+    destination: Path,
+    rem_bin: str | Path,
+    keys: KeyRegistry,
+) -> None:
+    member_path = _member_path(locator.native_locator)
+    size = _size_bytes(locator.native_locator)
+    with tempfile.TemporaryDirectory(prefix="sutradhara-rem-member-") as raw:
+        dest_dir = Path(raw) / "out"
+        dest_dir.mkdir()
         cmd = [
             str(rem_bin),
             "archive",
@@ -640,11 +939,13 @@ def _extract_rao_with_rem_to_path(
         if representation is Representation.RAO_PLAIN_V1:
             cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
             _run_rem(cmd)
-        else:
+        elif representation is Representation.RAO_AEAD_V1:
             key_epoch = _key_epoch(copy.storage_metadata)
             with keys.materialized_root_key(key_epoch) as key_file:
                 cmd.extend(["--key-file", str(key_file)])
                 _run_rem(cmd)
+        else:
+            raise ArchiveRestoreError(f"unsupported RAO representation {representation.value!r}")
         _copy_restored_member(dest_dir, member_path, destination)
 
 

@@ -14,6 +14,7 @@ from sutradhara.hdcache.fill import (
     fill_target,
     fill_target_from_params,
 )
+from sutradhara.hdcache.repopulate import RepopulationError, execute_repopulation_batch
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BACKOFF, CONDITION_BLOCKED
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
 
@@ -23,6 +24,28 @@ def handle_hdcache_fill(ctx: JobContext) -> JobResult:
     """Fill one hdcache entry from landing or archive restore fallback."""
 
     try:
+        if ctx.job.params.get("repopulate_batch") is True:
+            results = execute_repopulation_batch(ctx.session, ctx.job.params)
+            return JobResult(
+                ok=True,
+                detail=f"hdcache repopulation batch filled {len(results)} entries",
+                step_state={
+                    "hdcache_fill": {
+                        "kind": "repopulation-batch",
+                        "batch_id": ctx.job.params.get("batch_id"),
+                        "count": len(results),
+                        "items": [
+                            {
+                                "content_sha256": result.content_sha256.hex(),
+                                "disk_id": result.disk_id,
+                                "bytes": result.size_bytes,
+                                "source": result.source,
+                            }
+                            for result in results
+                        ],
+                    }
+                },
+            )
         target = fill_target_from_params(ctx.session, ctx.job.params)
         result = fill_target(ctx.session, target, config=fill_config_from_env())
     except HdcacheFillBlocked as exc:
@@ -36,7 +59,7 @@ def handle_hdcache_fill(ctx: JobContext) -> JobResult:
                 message=exc.detail,
             ),
         )
-    except (HdcacheFillError, OSError, RuntimeError, ValueError) as exc:
+    except (HdcacheFillError, RepopulationError, OSError, RuntimeError, ValueError) as exc:
         detail = f"{type(exc).__name__}: {exc}"
         return JobResult(
             ok=False,

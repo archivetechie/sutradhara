@@ -109,6 +109,10 @@ class CacheEntry(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     last_read_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lost_origin_disk_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    lost_drill_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lost_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refilled_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     disk: Mapped[CacheDisk] = relationship(back_populates="entries")
 

@@ -29,6 +29,7 @@ from sutradhara.hdcache.lifecycle import (
     status_payload,
 )
 from sutradhara.hdcache.models import CacheDisk
+from sutradhara.hdcache.repopulate import drill_status
 from sutradhara.hdcache.store import StoreError
 from sutradhara.hdcache.walker import (
     HdcacheWalkerConfig,
@@ -270,6 +271,39 @@ def hdcache_fill_cmd(
     _emit_fill_plan(plan, selector=selector, dry_run=False, as_json=as_json)
 
 
+@hdcache_group.group("drill")
+def drill_group() -> None:
+    """Inspect dead-disk repopulation drills."""
+
+
+@drill_group.command("status")
+@click.argument("disk_id", required=False)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def drill_status_cmd(disk_id: str | None, as_json: bool) -> None:
+    """Show remaining/refilled counts and ETA for repopulation drills."""
+
+    engine = make_engine()
+    with session_scope(engine) as session:
+        rows = drill_status(session, disk_id)
+    payload = {"drills": [_drill_payload(row) for row in rows]}
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    if not rows:
+        click.echo("no hdcache repopulation drills")
+        return
+    for row in payload["drills"]:
+        eta = "-" if row["eta_seconds"] is None else f"{row['eta_seconds']:.0f}s"
+        rate = "-" if row["bytes_per_hour"] is None else f"{row['bytes_per_hour']:.0f} B/hr"
+        state = "complete" if row["completed"] else "active"
+        click.echo(
+            f"{row['disk_id']} {state} drill={row['drill_id']} "
+            f"remaining={row['remaining_entries']}/{row['remaining_bytes']} "
+            f"refilled={row['refilled_entries']}/{row['refilled_bytes']} "
+            f"rate={rate} eta={eta}"
+        )
+
+
 @hdcache_group.command("walk")
 @click.argument("disk_id", required=False)
 @click.option("--read-only", is_flag=True, default=False, help="Do not delete or mark entries lost.")
@@ -396,6 +430,14 @@ def _emit_fill_plan(
         f"{selector}: {prefix} {payload['scheduled'] if not dry_run else payload['count']} "
         f"of {payload['count']} asset(s), bytes={payload['bytes']}"
     )
+
+
+def _drill_payload(row: object) -> dict[str, object]:
+    payload = dataclasses_asdict(row)
+    started_at = payload.get("started_at")
+    if hasattr(started_at, "isoformat"):
+        payload["started_at"] = started_at.isoformat()
+    return payload
 
 
 def _emit_scan(candidates: list[BlockDeviceCandidate], *, as_json: bool) -> None:

@@ -14,6 +14,7 @@ from sutradhara.api.routes_devices import install_default_state as install_devic
 from sutradhara.api.routes_devices import router as devices_router
 from sutradhara.api.routes_receive import install_default_state
 from sutradhara.api.routes_receive import router as receive_router
+from sutradhara.api.routes_restore import router as restore_router
 from sutradhara.api.routes_session import router as session_router
 from sutradhara.catalog.session import create_all, make_engine
 
@@ -77,6 +78,7 @@ def create_app(
     app.include_router(receive_router)
     app.include_router(devices_router)
     app.include_router(activity_router)
+    app.include_router(restore_router)
     return app
 
 
