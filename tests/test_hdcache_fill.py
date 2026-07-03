@@ -36,11 +36,13 @@ from sutradhara.hdcache.fill import (
     count_live_hdcache_jobs,
     dedupe_key,
     fill_target,
+    mark_entry_lost_and_delete,
 )
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.store import (
     AEAD_REPRESENTATION,
     RAW_REPRESENTATION,
+    StoreError,
     entry_path,
     write_entry,
 )
@@ -325,6 +327,60 @@ def test_hdcache_convergence_marks_privacy_raise_and_retired_epoch_lost(
         ).digest()
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(OSError(errno.EACCES, "permission denied"), id="oserror"),
+        pytest.param(StoreError("delete failed"), id="storeerror"),
+    ],
+)
+def test_mark_entry_lost_preserves_accounting_when_delete_fails(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    data = b"stale cache bytes"
+    digest = hashlib.sha256(data).digest()
+
+    def fail_delete(*_args: Any, **_kwargs: Any) -> bool:
+        raise failure
+
+    monkeypatch.setattr("sutradhara.hdcache.fill.delete_entry", fail_delete)
+
+    with session_scope(engine) as session:
+        entry = _seed_present_cache_entry(session, tmp_path / "d001", digest, len(data))
+
+        with pytest.raises(type(failure)):
+            mark_entry_lost_and_delete(session, entry)
+
+        assert session.get(CacheDisk, "d001").filled_bytes == len(data)
+        assert session.get(CacheEntry, digest).state == "present"
+
+
+@pytest.mark.parametrize("file_present", [True, False])
+def test_mark_entry_lost_releases_accounting_when_deleted_or_absent(
+    engine: Engine,
+    tmp_path: Path,
+    file_present: bool,
+) -> None:
+    data = b"stale cache bytes"
+    digest = hashlib.sha256(data).digest()
+
+    with session_scope(engine) as session:
+        entry = _seed_present_cache_entry(session, tmp_path / "d001", digest, len(data))
+        path = entry_path(tmp_path / "d001", digest, representation=RAW_REPRESENTATION)
+        if file_present:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+
+        mark_entry_lost_and_delete(session, entry)
+
+        assert session.get(CacheDisk, "d001").filled_bytes == 0
+        assert session.get(CacheEntry, digest).state == "lost"
+        assert not path.exists()
+
+
 def test_hdcache_fill_handler_projects_blocked_condition(
     engine: Engine,
     tmp_path: Path,
@@ -423,6 +479,31 @@ def _add_disk(
             filled_bytes=0,
         )
     )
+
+
+def _seed_present_cache_entry(
+    session: Any,
+    mount: Path,
+    digest: bytes,
+    size_bytes: int,
+) -> CacheEntry:
+    session.merge(LogicalAsset(content_sha256=digest, size_bytes=size_bytes))
+    _add_disk(session, "d001", mount)
+    disk = session.get(CacheDisk, "d001")
+    disk.filled_bytes = size_bytes
+    entry = CacheEntry(
+        content_sha256=digest,
+        artifactclass="s-masters",
+        disk_id="d001",
+        relpath=f"{digest.hex()[:2]}/{digest.hex()}",
+        size_bytes=size_bytes,
+        state="present",
+        representation=RAW_REPRESENTATION,
+        trusted=True,
+    )
+    session.add(entry)
+    session.flush()
+    return entry
 
 
 def _seed_archived_backlog(

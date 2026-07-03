@@ -647,13 +647,12 @@ def mark_entry_lost_and_delete(session: Session, entry: CacheEntry) -> None:
 
     disk = session.get(CacheDisk, entry.disk_id)
     if disk is not None:
-        with contextlib.suppress(OSError, StoreError):
-            delete_entry(
-                Path(disk.mount),
-                entry.content_sha256,
-                representation=entry.representation,
-                key_epoch=entry.key_epoch,
-            )
+        delete_entry(
+            Path(disk.mount),
+            entry.content_sha256,
+            representation=entry.representation,
+            key_epoch=entry.key_epoch,
+        )
     _release_entry_accounting(session, entry)
     entry.state = "lost"
     session.flush([obj for obj in (entry, disk) if obj is not None])
