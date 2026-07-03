@@ -65,7 +65,7 @@ from sutradhara.hdcache.store import (
     probe_disk_liveness_with_deadline,
     read_hmac_secret,
     read_entry_verified,
-    verify_disk_identity,
+    verify_disk_identity_with_deadline,
 )
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import atomic_write_verified_file, sha256_file
@@ -981,7 +981,22 @@ def _serve_from_cache(
         raise CacheServeFailed("disk-inactive", "cache disk is not active", mark_lost=False)
     if config.breaker.is_open(disk.disk_id):
         raise CacheServeFailed("disk-circuit-open", "cache disk circuit breaker is open", mark_lost=False)
-    identity = _verify_cache_disk_identity(disk, config)
+    if config.read_deadline_seconds <= 0:
+        raise CacheServeFailed(
+            "read-deadline",
+            "cache read deadline exceeded before stream start",
+            mark_lost=False,
+            count_breaker=True,
+        )
+    try:
+        identity = _verify_cache_disk_identity(disk, config)
+    except StoreReadTimeout as exc:
+        raise CacheServeFailed(
+            "disk-identity-timeout",
+            str(exc),
+            mark_lost=False,
+            count_breaker=True,
+        ) from exc
     if not identity.ok:
         _emit(
             config,
@@ -1003,13 +1018,6 @@ def _serve_from_cache(
             "representation-mismatch",
             "cache entry representation does not satisfy current privacy policy",
             mark_lost=True,
-        )
-    if config.read_deadline_seconds <= 0:
-        raise CacheServeFailed(
-            "read-deadline",
-            "cache read deadline exceeded before stream start",
-            mark_lost=False,
-            count_breaker=True,
         )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1170,7 +1178,40 @@ def _try_mark_entry_lost_for_cache_fallback(
             ),
         )
         return
-    identity = _verify_cache_disk_identity(disk, config)
+    try:
+        identity = _verify_cache_disk_identity(disk, config)
+    except StoreReadTimeout as exc:
+        failure = CacheServeFailed(
+            "disk-identity-timeout",
+            str(exc),
+            mark_lost=False,
+            count_breaker=True,
+        )
+        _emit(
+            config,
+            RestoreEvent(
+                code=f"cache-fallback:{failure.reason}",
+                severity="alarm",
+                content_sha256=content_sha256.hex(),
+                artifactclass=artifactclass,
+                detail=_sanitize_detail(failure.detail),
+                request_id=request_id,
+                item_id=item_id,
+                destination_id=destination_id,
+            ),
+        )
+        _record_cache_failure(
+            session,
+            entry,
+            failure,
+            config,
+            content_sha256=content_sha256,
+            artifactclass=artifactclass,
+            request_id=request_id,
+            item_id=item_id,
+            destination_id=destination_id,
+        )
+        return
     if not identity.ok:
         _emit(
             config,
@@ -1402,6 +1443,10 @@ def _select_cache_entry(
 
 
 def _probe_cache_disk_recovery(session: Session, disk: CacheDisk, config: RestoreConfig) -> bool:
+    if disk.state in {"retiring", "dead"}:
+        return False
+    if disk.state != "absent" and not config.breaker.is_open(disk.disk_id):
+        return False
     deadline = time.monotonic() + config.liveness_probe_deadline_seconds
     try:
         result = probe_disk_liveness_with_deadline(
@@ -1491,7 +1536,7 @@ def _wake_items(
 
 def _verify_cache_disk_identity(disk: CacheDisk, config: RestoreConfig) -> DiskIdentityResult:
     try:
-        return verify_disk_identity(
+        return verify_disk_identity_with_deadline(
             Path(disk.mount),
             ExpectedDiskIdentity(
                 disk_id=disk.disk_id,
@@ -1500,8 +1545,12 @@ def _verify_cache_disk_identity(disk: CacheDisk, config: RestoreConfig) -> DiskI
                 wwn=disk.wwn,
             ),
             hmac_secret=config.disk_hmac_secret(),
+            disk_id=disk.disk_id,
             probe=config.identity_probe,
+            deadline_monotonic=time.monotonic() + config.liveness_probe_deadline_seconds,
         )
+    except StoreReadTimeout:
+        raise
     except Exception as exc:
         return DiskIdentityResult(
             False,

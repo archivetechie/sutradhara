@@ -921,6 +921,7 @@ def test_deadline_fallback_trips_breaker_without_lost_marking(
     events: list[RestoreEvent] = []
     read_started = threading.Event()
     unblock_read = threading.Event()
+    disk_id = "ddeadline"
 
     class BlockingReader:
         def __enter__(self):
@@ -936,8 +937,14 @@ def test_deadline_fallback_trips_breaker_without_lost_marking(
 
     with session_scope(engine) as session:
         digest, backend_id, memory = _seed_archived_asset(session, data=b"tape truth")
-        entry = _seed_cache_entry(session, tmp_path / "d001", digest, b"tape truth")
-        blocked_path = entry_path(tmp_path / "d001", digest, representation=RAW_REPRESENTATION)
+        entry = _seed_cache_entry(
+            session,
+            tmp_path / disk_id,
+            digest,
+            b"tape truth",
+            disk_id=disk_id,
+        )
+        blocked_path = entry_path(tmp_path / disk_id, digest, representation=RAW_REPRESENTATION)
         original_open = Path.open
 
         def open_maybe_blocking(path: Path, mode: str = "r", *args, **kwargs):
@@ -978,13 +985,79 @@ def test_deadline_fallback_trips_breaker_without_lost_marking(
     ]
 
 
-def test_repeated_hung_disk_restore_does_not_spawn_another_reader(
+def test_hung_identity_check_falls_back_with_breaker_without_lost_marking(
     engine: Engine,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "restore-root"
     root.mkdir()
+    events: list[RestoreEvent] = []
+    identity_read_started = threading.Event()
+    unblock_identity_read = threading.Event()
+    disk_id = "didenthung"
+
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"tape truth")
+        _seed_cache_entry(
+            session,
+            tmp_path / disk_id,
+            digest,
+            b"tape truth",
+            disk_id=disk_id,
+            serial="SERIDENT",
+            fs_uuid="fs-ident",
+        )
+        sentinel_path = tmp_path / disk_id / SENTINEL_NAME
+        original_read_text = Path.read_text
+
+        def read_text_maybe_blocking(path: Path, *args, **kwargs) -> str:
+            if path == sentinel_path:
+                identity_read_started.set()
+                unblock_identity_read.wait()
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text_maybe_blocking)
+        _request, item = _request_item(session, digest, root)
+        started = time.monotonic()
+        result = serve_restore_item(
+            session,
+            item,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=_config(
+                root,
+                restore_backends={backend_id: memory},
+                events=events,
+                liveness_probe_deadline_seconds=0.05,
+                breaker=DiskCircuitBreaker(failure_threshold=1, window_seconds=60),
+                identity_probe=FakeDiskIdentityProbe(serial="SERIDENT", fs_uuid="fs-ident"),
+            ),
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.source == "tape"
+        assert item.state == ITEM_DONE
+        assert (root / digest.hex()).read_bytes() == b"tape truth"
+        assert session.get(CacheEntry, digest).state == "present"
+        assert session.get(CacheDisk, disk_id).state == "absent"
+        assert identity_read_started.is_set()
+        assert elapsed < 0.5
+    unblock_identity_read.set()
+
+    assert [event.code for event in events] == [
+        "cache-fallback:disk-identity-timeout",
+        "disk-circuit-open",
+    ]
+
+
+def test_repeated_hung_disk_restore_uses_one_recovery_generation(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    events: list[RestoreEvent] = []
     read_started = threading.Event()
     disk_id = "dhung"
 
@@ -1024,6 +1097,7 @@ def test_repeated_hung_disk_restore_does_not_spawn_another_reader(
         config = _config(
             root,
             restore_backends={backend_id: memory},
+            events=events,
             read_deadline_seconds=0.05,
             liveness_probe_deadline_seconds=0.05,
             breaker=breaker,
@@ -1052,8 +1126,16 @@ def test_repeated_hung_disk_restore_does_not_spawn_another_reader(
         )
 
         assert second_result.source == "tape"
-        assert _reader_thread_count(disk_id) == 1
+        assert _reader_thread_count(disk_id) == 2
         assert session.get(CacheEntry, digest).state == "present"
+
+    assert [event.code for event in events] == [
+        "cache-fallback:read-deadline",
+        "disk-circuit-open",
+        "disk-circuit-closed",
+        "cache-fallback:read-deadline",
+        "disk-circuit-open",
+    ]
 
 
 def test_half_open_probe_reactivates_disk_and_resets_breaker(
@@ -1103,6 +1185,57 @@ def test_half_open_probe_reactivates_disk_and_resets_breaker(
         assert not breaker.is_open(disk_id)
 
     assert [event.code for event in events] == ["disk-circuit-closed"]
+
+
+def test_recovery_probe_refuses_retiring_and_dead_disks_without_touching_disk(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    breaker = DiskCircuitBreaker(failure_threshold=1, window_seconds=60)
+
+    class ExplodingProbe:
+        def observe(self, _mount: Path) -> ObservedBlockIdentity:
+            raise AssertionError("recovery probe touched lifecycle-terminal disk")
+
+    with session_scope(engine) as session:
+        for state in ("retiring", "dead"):
+            disk_id = f"d{state}"
+            digest, _backend_id, _memory = _seed_archived_asset(
+                session,
+                data=f"cache truth {state}".encode(),
+            )
+            _seed_cache_entry(
+                session,
+                tmp_path / disk_id,
+                digest,
+                f"cache truth {state}".encode(),
+                disk_id=disk_id,
+                serial=f"SER-{state}",
+                fs_uuid=f"fs-{state}",
+            )
+            disk = session.get(CacheDisk, disk_id)
+            assert disk is not None
+            disk.state = state
+            breaker.record_failure(disk_id)
+            session.flush([disk])
+
+            plan = resolve_read_source(
+                session,
+                asset_hash=digest,
+                artifactclass="s-masters",
+                destination=root / digest.hex(),
+                identity_or_override=_identity("sutradhara-operator"),
+                config=_config(
+                    root,
+                    breaker=breaker,
+                    identity_probe=ExplodingProbe(),
+                ),
+            )
+
+            assert plan.source == "tape"
+            assert session.get(CacheDisk, disk_id).state == state
 
 
 def test_hung_disk_read_does_not_consume_stream_slot(

@@ -172,26 +172,72 @@ class _DiskReaderRequest:
     operation: Callable[[], Any]
 
 
+@dataclass(frozen=True)
+class _DiskActorSubmission:
+    future: Future[Any]
+    generation: int
+
+
 class _DiskReaderActor:
-    """One daemon worker serializing all deadline-covered operations for one disk."""
+    """One logical per-disk actor for all deadline-covered disk I/O.
+
+    A timed-out worker cannot be killed safely, so the actor abandons that
+    worker generation. Until a recovery probe succeeds, normal reads are
+    rejected before they can queue behind the abandoned generation.
+    """
 
     def __init__(self, disk_id: str) -> None:
+        self._disk_id = disk_id
+        self._lock = threading.Lock()
+        self._state = "normal"
+        self._generation = 0
         self._queue: queue.Queue[_DiskReaderRequest] = queue.Queue()
-        self._thread = threading.Thread(
+        self._start_worker_locked()
+
+    def submit(
+        self,
+        operation: Callable[[], Any],
+        *,
+        recovery_probe: bool = False,
+    ) -> _DiskActorSubmission:
+        future: Future[Any] = Future()
+        with self._lock:
+            if self._state != "normal" and not recovery_probe:
+                future.set_exception(
+                    StoreReadTimeout("cache disk reader is awaiting recovery probe")
+                )
+                return _DiskActorSubmission(future=future, generation=self._generation)
+            if recovery_probe and self._state == "abandoned":
+                self._queue = queue.Queue()
+                self._generation += 1
+                self._state = "recovering"
+                self._start_worker_locked()
+            generation = self._generation
+            self._queue.put(_DiskReaderRequest(future=future, operation=operation))
+            return _DiskActorSubmission(future=future, generation=generation)
+
+    def mark_abandoned(self, generation: int) -> None:
+        with self._lock:
+            if generation == self._generation:
+                self._state = "abandoned"
+
+    def mark_recovered(self, generation: int) -> None:
+        with self._lock:
+            if generation == self._generation:
+                self._state = "normal"
+
+    def _start_worker_locked(self) -> None:
+        thread = threading.Thread(
             target=self._run,
-            name=f"hdcache-reader-{_thread_token(disk_id)}",
+            args=(self._queue,),
+            name=f"hdcache-reader-{_thread_token(self._disk_id)}",
             daemon=True,
         )
-        self._thread.start()
+        thread.start()
 
-    def submit(self, operation: Callable[[], Any]) -> Future[Any]:
-        future: Future[Any] = Future()
-        self._queue.put(_DiskReaderRequest(future=future, operation=operation))
-        return future
-
-    def _run(self) -> None:
+    def _run(self, requests: queue.Queue[_DiskReaderRequest]) -> None:
         while True:
-            request = self._queue.get()
+            request = requests.get()
             if not request.future.set_running_or_notify_cancel():
                 continue
             try:
@@ -324,6 +370,30 @@ def verify_disk_identity(
     return DiskIdentityResult(True, "ok", "disk identity verified", observed)
 
 
+def verify_disk_identity_with_deadline(
+    mount: Path,
+    expected: ExpectedDiskIdentity,
+    *,
+    hmac_secret: bytes,
+    disk_id: str,
+    probe: DiskIdentityProbe | None = None,
+    deadline_monotonic: float,
+) -> DiskIdentityResult:
+    """Verify disk identity through the per-disk actor with a bounded deadline."""
+
+    return _run_disk_actor_operation(
+        disk_id,
+        lambda: verify_disk_identity(
+            mount,
+            expected,
+            hmac_secret=hmac_secret,
+            probe=probe,
+        ),
+        deadline_monotonic=deadline_monotonic,
+        timeout_message="cache disk identity check deadline exceeded",
+    )
+
+
 def probe_disk_liveness_with_deadline(
     mount: Path,
     expected: ExpectedDiskIdentity,
@@ -349,6 +419,8 @@ def probe_disk_liveness_with_deadline(
         operation,
         deadline_monotonic=deadline_monotonic,
         timeout_message="cache disk liveness probe deadline exceeded",
+        recovery_probe=True,
+        recovery_succeeded=lambda result: result.ok,
     )
 
 
@@ -627,16 +699,23 @@ def _run_disk_actor_operation(
     *,
     deadline_monotonic: float,
     timeout_message: str,
+    recovery_probe: bool = False,
+    recovery_succeeded: Callable[[Any], bool] | None = None,
 ) -> Any:
     remaining = deadline_monotonic - time.monotonic()
     if remaining <= 0:
         raise StoreReadTimeout(timeout_message)
-    future = _reader_for_disk(disk_id).submit(operation)
+    actor = _reader_for_disk(disk_id)
+    submission = actor.submit(operation, recovery_probe=recovery_probe)
     try:
-        return future.result(timeout=remaining)
+        result = submission.future.result(timeout=remaining)
     except TimeoutError as exc:
-        future.cancel()
+        submission.future.cancel()
+        actor.mark_abandoned(submission.generation)
         raise StoreReadTimeout(timeout_message) from exc
+    if recovery_probe and (recovery_succeeded is None or recovery_succeeded(result)):
+        actor.mark_recovered(submission.generation)
+    return result
 
 
 def _reader_for_disk(disk_id: str) -> _DiskReaderActor:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -27,7 +29,9 @@ from sutradhara.hdcache.store import (
     ExpectedDiskIdentity,
     ObservedBlockIdentity,
     StoreError,
+    StoreReadTimeout,
     enumerate_entries,
+    probe_disk_liveness_with_deadline,
     read_entry_verified,
     verify_disk_identity,
     write_disk_sentinel,
@@ -299,6 +303,91 @@ def test_store_validates_aead_key_epoch_and_stored_digest_contract(tmp_path: Pat
             key_epoch="hdcache-epoch-1",
             expected_stream_sha256=b"short",
         )
+
+
+def test_abandoned_reader_rejects_normal_reads_but_allows_recovery_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mount = tmp_path / "dactor"
+    mount.mkdir()
+    disk_id = "dactor"
+    secret = b"actor-abandonment-secret"
+    expected = ExpectedDiskIdentity(disk_id, "SER-ACTOR", "fs-actor")
+    write_disk_sentinel(mount, expected, hmac_secret=secret)
+    payload = b"cache payload"
+    digest = hashlib.sha256(payload).digest()
+    write_entry(mount, digest, payload, representation=RAW_REPRESENTATION)
+    blocked_path = mount / "hdcache" / "v1" / digest.hex()[:2] / digest.hex()
+    read_started = threading.Event()
+    unblock_read = threading.Event()
+    block_entry_reads = True
+
+    class BlockingReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            read_started.set()
+            unblock_read.wait()
+            return b""
+
+    class Probe:
+        def observe(self, _mount: Path) -> ObservedBlockIdentity:
+            return ObservedBlockIdentity(mounted=True, serial="SER-ACTOR", fs_uuid="fs-actor")
+
+    original_open = Path.open
+
+    def open_maybe_blocking(path: Path, mode: str = "r", *args, **kwargs):
+        if block_entry_reads and path == blocked_path and "r" in mode and "b" in mode:
+            return BlockingReader()
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_maybe_blocking)
+
+    with pytest.raises(StoreReadTimeout):
+        read_entry_verified(
+            mount,
+            digest,
+            deadline_monotonic=time.monotonic() + 0.05,
+            disk_id=disk_id,
+        )
+    assert read_started.is_set()
+
+    started = time.monotonic()
+    with pytest.raises(StoreReadTimeout, match="recovery probe"):
+        read_entry_verified(
+            mount,
+            digest,
+            deadline_monotonic=time.monotonic() + 10.0,
+            disk_id=disk_id,
+        )
+    assert time.monotonic() - started < 0.2
+
+    result = probe_disk_liveness_with_deadline(
+        mount,
+        expected,
+        hmac_secret=secret,
+        disk_id=disk_id,
+        probe=Probe(),
+        deadline_monotonic=time.monotonic() + 0.5,
+    )
+    assert result.ok
+
+    block_entry_reads = False
+    unblock_read.set()
+    assert (
+        read_entry_verified(
+            mount,
+            digest,
+            deadline_monotonic=time.monotonic() + 0.5,
+            disk_id=disk_id,
+        ).data
+        == payload
+    )
 
 
 def test_disk_identity_matrix(tmp_path: Path) -> None:
