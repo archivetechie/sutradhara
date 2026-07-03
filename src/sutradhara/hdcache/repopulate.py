@@ -411,6 +411,8 @@ def drain_retiring_disk(
                 digest,
                 representation=old_representation,
                 key_epoch=old_key_epoch,
+                deadline_monotonic=time.monotonic() + final_config.read_deadline_seconds,
+                disk_id=disk.disk_id,
             )
         moved += 1
     auto_dead = _maybe_auto_dead(session, disk)

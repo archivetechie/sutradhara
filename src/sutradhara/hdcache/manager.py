@@ -1271,7 +1271,42 @@ def _try_mark_entry_lost_for_cache_fallback(
         )
         return
     try:
-        mark_entry_lost_and_delete(session, entry)
+        mark_entry_lost_and_delete(
+            session,
+            entry,
+            deadline_monotonic=time.monotonic() + config.read_deadline_seconds,
+        )
+    except StoreReadTimeout as exc:
+        failure = CacheServeFailed(
+            "delete-timeout",
+            str(exc),
+            mark_lost=False,
+            count_breaker=True,
+        )
+        _emit(
+            config,
+            RestoreEvent(
+                code=f"cache-fallback:{failure.reason}",
+                severity="alarm",
+                content_sha256=content_sha256.hex(),
+                artifactclass=artifactclass,
+                detail=_sanitize_detail(failure.detail),
+                request_id=request_id,
+                item_id=item_id,
+                destination_id=destination_id,
+            ),
+        )
+        _record_cache_failure(
+            session,
+            entry,
+            failure,
+            config,
+            content_sha256=content_sha256,
+            artifactclass=artifactclass,
+            request_id=request_id,
+            item_id=item_id,
+            destination_id=destination_id,
+        )
     except Exception as exc:
         _emit(
             config,

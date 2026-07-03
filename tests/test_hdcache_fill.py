@@ -159,7 +159,7 @@ def test_hdcache_aead_fill_records_hdcache_epoch_and_stored_digest(
         )
 
 
-def test_mid_fill_privacy_raise_deletes_raw_write_and_restarts_aead(
+def test_policy_sha_change_between_reservation_and_finalize_refills_under_new_policy(
     engine: Engine,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -179,14 +179,19 @@ def test_mid_fill_privacy_raise_deletes_raw_write_and_restarts_aead(
             source_path=source,
             hdcache_config={"enabled": True, "privacy_level": "none"},
         )
+        policy = session.get(ArtifactClassPolicyRecord, "race")
+        policy.policy_sha256 = "policy-none"
+        session.flush([policy])
 
         def racing_write(*args: Any, **kwargs: Any) -> Any:
             nonlocal raised
             result = original_write(*args, **kwargs)
             if not raised and kwargs["representation"] == RAW_REPRESENTATION:
-                policy = session.get(ArtifactClassPolicyRecord, "race")
-                policy.hdcache_config = {"enabled": True, "privacy_level": "p2"}
-                session.flush([policy])
+                with session_scope(engine) as policy_session:
+                    policy = policy_session.get(ArtifactClassPolicyRecord, "race")
+                    policy.hdcache_config = {"enabled": True, "privacy_level": "p2"}
+                    policy.policy_sha256 = "policy-p2"
+                    policy_session.flush([policy])
                 raised = True
             return result
 
@@ -502,7 +507,11 @@ def test_mark_entry_lost_preserves_accounting_when_delete_fails(
         entry = _seed_present_cache_entry(session, tmp_path / "d001", digest, len(data))
 
         with pytest.raises(type(failure)):
-            mark_entry_lost_and_delete(session, entry)
+            mark_entry_lost_and_delete(
+                session,
+                entry,
+                deadline_monotonic=time.monotonic() + 1.0,
+            )
 
         assert session.get(CacheDisk, "d001").filled_bytes == len(data)
         assert session.get(CacheEntry, digest).state == "present"
@@ -524,11 +533,86 @@ def test_mark_entry_lost_releases_accounting_when_deleted_or_absent(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
 
-        mark_entry_lost_and_delete(session, entry)
+        mark_entry_lost_and_delete(
+            session,
+            entry,
+            deadline_monotonic=time.monotonic() + 1.0,
+        )
 
         assert session.get(CacheDisk, "d001").filled_bytes == 0
         assert session.get(CacheEntry, digest).state == "lost"
         assert not path.exists()
+
+
+def test_hung_lost_mark_delete_returns_within_deadline_and_preserves_accounting(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = b"stale private cache bytes"
+    delete_started = threading.Event()
+    release_delete = threading.Event()
+    original_unlink = Path.unlink
+
+    with session_scope(engine) as session:
+        target = _seed_archived_asset(
+            session,
+            data=data,
+            artifactclass="private-timeout",
+            hdcache_config={"enabled": True, "privacy_level": "p2"},
+        )
+        entry = _seed_present_cache_entry(
+            session,
+            tmp_path / "d-timeout",
+            target.content_sha256,
+            len(data),
+            disk_id="d-timeout",
+            artifactclass="private-timeout",
+        )
+        path = entry_path(tmp_path / "d-timeout", target.content_sha256, representation=RAW_REPRESENTATION)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+        def blocking_unlink(path_obj: Path, *args: Any, **kwargs: Any) -> None:
+            if path_obj == path:
+                delete_started.set()
+                release_delete.wait()
+            return original_unlink(path_obj, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", blocking_unlink)
+
+        started = time.monotonic()
+        try:
+            desired, observed = observe_target(
+                session,
+                target.sha_hex,
+                mutate=True,
+                config=HdcacheFillConfig(
+                    scratch_root=tmp_path / "scratch",
+                    hmac_secret=TEST_HDCACHE_HMAC_SECRET,
+                    identity_probe=FillIdentityProbe(),
+                    delete_deadline_seconds=0.05,
+                ),
+            )
+            elapsed = time.monotonic() - started
+
+            condition = session.scalar(
+                select(ReconciliationCondition).where(
+                    ReconciliationCondition.domain == DOMAIN,
+                    ReconciliationCondition.target_key == target.sha_hex,
+                )
+            )
+            assert desired is True
+            assert observed == OBSERVED_MISSING
+            assert elapsed < 0.5
+            assert delete_started.is_set()
+            assert session.get(CacheDisk, "d-timeout").state == "absent"
+            assert session.get(CacheDisk, "d-timeout").filled_bytes == len(data)
+            assert session.get(CacheEntry, target.content_sha256).state == "present"
+            assert condition is not None
+            assert condition.reason == "disk-delete-timeout"
+        finally:
+            release_delete.set()
 
 
 def test_present_entry_on_absent_disk_is_not_lost_or_replaced(
@@ -683,15 +767,18 @@ def _seed_present_cache_entry(
     mount: Path,
     digest: bytes,
     size_bytes: int,
+    *,
+    disk_id: str = "d001",
+    artifactclass: str = "s-masters",
 ) -> CacheEntry:
     session.merge(LogicalAsset(content_sha256=digest, size_bytes=size_bytes))
-    _add_disk(session, "d001", mount)
-    disk = session.get(CacheDisk, "d001")
+    _add_disk(session, disk_id, mount)
+    disk = session.get(CacheDisk, disk_id)
     disk.filled_bytes = size_bytes
     entry = CacheEntry(
         content_sha256=digest,
-        artifactclass="s-masters",
-        disk_id="d001",
+        artifactclass=artifactclass,
+        disk_id=disk_id,
         relpath=f"{digest.hex()[:2]}/{digest.hex()}",
         size_bytes=size_bytes,
         state="present",

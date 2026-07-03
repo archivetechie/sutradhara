@@ -735,7 +735,15 @@ def _mark_entry_lost_after_identity_proof(
             detail=f"{detail} before lost mark",
         )
         raise DiskWalkAborted(detail)
-    mark_entry_lost_and_delete(session, entry)
+    try:
+        mark_entry_lost_and_delete(
+            session,
+            entry,
+            deadline_monotonic=_deadline(config.disk_io_deadline_seconds),
+        )
+    except StoreReadTimeout as exc:
+        _mark_disk_absent(session, disk, config=config, detail=str(exc))
+        raise DiskWalkAborted(str(exc)) from exc
 
 
 def _entry_file_status(

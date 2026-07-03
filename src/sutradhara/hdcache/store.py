@@ -592,6 +592,8 @@ def delete_entry(
     *,
     representation: str = RAW_REPRESENTATION,
     key_epoch: str | None = None,
+    deadline_monotonic: float | None = None,
+    disk_id: str | None = None,
 ) -> bool:
     """Delete one entry, confined by construction to ``hdcache/v1``."""
 
@@ -601,6 +603,17 @@ def delete_entry(
         representation=representation,
         key_epoch=key_epoch,
     )
+    if deadline_monotonic is not None:
+        return _run_disk_actor_operation(
+            disk_id or os.fspath(mount),
+            lambda: _delete_entry_path(path),
+            deadline_monotonic=deadline_monotonic,
+            timeout_message="cache delete deadline exceeded",
+        )
+    return _delete_entry_path(path)
+
+
+def _delete_entry_path(path: Path) -> bool:
     try:
         path.unlink()
     except FileNotFoundError:

@@ -78,6 +78,7 @@ DEFAULT_LIVE_JOB_CAP = 500
 DEFAULT_SCRATCH_ROOT = Path("/var/lib/replica/hdcache-scratch")
 DEFAULT_REPOPULATION_BACKOFF_SECONDS = 60
 DEFAULT_FILL_IDENTITY_PROBE_DEADLINE_SECONDS = 2.0
+DEFAULT_FILL_DELETE_DEADLINE_SECONDS = 70.0
 ACCOUNTED_ENTRY_STATES = frozenset({"filling", "present"})
 
 
@@ -113,6 +114,7 @@ class HdcacheFillConfig:
     repopulation_live_job_cap: int | None = None
     repopulation_priority: int | None = None
     identity_probe_deadline_seconds: float = DEFAULT_FILL_IDENTITY_PROBE_DEADLINE_SECONDS
+    delete_deadline_seconds: float = DEFAULT_FILL_DELETE_DEADLINE_SECONDS
     hmac_secret: bytes | None = None
     identity_probe: DiskIdentityProbe | None = None
 
@@ -131,6 +133,8 @@ class HdcacheFillConfig:
             raise ValueError("repopulation priority must sit between fill and migration")
         if self.identity_probe_deadline_seconds <= 0:
             raise ValueError("identity_probe_deadline_seconds must be positive")
+        if self.delete_deadline_seconds <= 0:
+            raise ValueError("delete_deadline_seconds must be positive")
         if self.hmac_secret is not None and not self.hmac_secret:
             raise ValueError("hmac_secret must not be empty")
         object.__setattr__(self, "scratch_root", Path(self.scratch_root))
@@ -205,6 +209,7 @@ class _FillReservation:
     representation: str
     key_epoch: str | None
     reserved_size: int
+    policy_sha256: str | None
 
 
 RestoreBackendResolver = Callable[[Session, bytes], dict[int, StorageBackend]]
@@ -229,6 +234,10 @@ def fill_config_from_env() -> HdcacheFillConfig:
         identity_probe_deadline_seconds=_env_float(
             "SUTRADHARA_HDCACHE_IDENTITY_PROBE_DEADLINE_SECONDS",
             DEFAULT_FILL_IDENTITY_PROBE_DEADLINE_SECONDS,
+        ),
+        delete_deadline_seconds=_env_float(
+            "SUTRADHARA_HDCACHE_DELETE_DEADLINE_SECONDS",
+            DEFAULT_FILL_DELETE_DEADLINE_SECONDS,
         ),
         hmac_secret=_env_secret_bytes("SUTRADHARA_HDCACHE_HMAC_SECRET_HEX"),
     )
@@ -636,6 +645,7 @@ def fill_target(
             representation=representation,
             key_epoch=None if epoch is None else epoch.key_id,
             reserved_size=entry.size_bytes,
+            policy_sha256=_artifactclass_policy_sha256(session, target.artifactclass),
         )
         session.commit()
         try:
@@ -665,6 +675,7 @@ def fill_target(
                 write_result=write_result,
                 source_kind=source_kind,
                 key_registry=registry,
+                config=final_config,
             )
             if finalized is None:
                 continue
@@ -765,6 +776,7 @@ def fill_target_from_plaintext(
             representation=representation,
             key_epoch=None if epoch is None else epoch.key_id,
             reserved_size=entry.size_bytes,
+            policy_sha256=_artifactclass_policy_sha256(session, target.artifactclass),
         )
         session.commit()
         try:
@@ -785,6 +797,7 @@ def fill_target_from_plaintext(
                 write_result=write_result,
                 source_kind=source_kind,
                 key_registry=registry,
+                config=final_config,
             )
             if finalized is None:
                 continue
@@ -838,7 +851,12 @@ def entry_policy_conformant(
         return False
 
 
-def mark_entry_lost_and_delete(session: Session, entry: CacheEntry) -> None:
+def mark_entry_lost_and_delete(
+    session: Session,
+    entry: CacheEntry,
+    *,
+    deadline_monotonic: float,
+) -> None:
     """Delete a nonconforming cache file and mark the row lost."""
 
     disk = session.get(CacheDisk, entry.disk_id)
@@ -849,6 +867,8 @@ def mark_entry_lost_and_delete(session: Session, entry: CacheEntry) -> None:
             entry.content_sha256,
             representation=entry.representation,
             key_epoch=entry.key_epoch,
+            deadline_monotonic=deadline_monotonic,
+            disk_id=disk.disk_id,
         )
     _release_entry_accounting(session, entry)
     entry.lost_origin_disk_id = origin_disk_id
@@ -867,17 +887,20 @@ def _finalize_filling_entry(
     write_result: EntryWriteResult,
     source_kind: str,
     key_registry: KeyRegistry,
+    config: HdcacheFillConfig,
 ) -> HdcacheFillResult | None:
     """Finalize a reserved fill after reloading current row and privacy policy."""
 
+    _begin_finalize_write_transaction(session)
+    current_policy_sha256 = _artifactclass_policy_sha256(session, target.artifactclass)
     entry = session.get(CacheEntry, target.content_sha256)
     if entry is None:
-        _delete_written_entry(target, reservation)
+        _delete_written_entry(target, reservation, config=config)
         raise HdcacheFillError(f"cache fill reservation disappeared for {target.sha_hex}")
     session.refresh(entry)
     disk = session.get(CacheDisk, reservation.disk.disk_id)
     if disk is None:
-        _delete_written_entry(target, reservation)
+        _delete_written_entry(target, reservation, config=config)
         raise HdcacheFillBlocked("missing-disk", f"cache disk {reservation.disk.disk_id!r} is missing")
     session.refresh(disk)
     if (
@@ -886,12 +909,18 @@ def _finalize_filling_entry(
         or entry.representation != reservation.representation
         or entry.key_epoch != reservation.key_epoch
     ):
-        _delete_written_entry(target, reservation)
+        _delete_written_entry(target, reservation, config=config)
         raise HdcacheFillError(f"cache fill reservation changed before finalize for {target.sha_hex}")
+
+    if current_policy_sha256 != reservation.policy_sha256:
+        _delete_written_entry(target, reservation, config=config)
+        _release_entry_accounting(session, entry)
+        session.commit()
+        return None
 
     current_representation = _expected_representation(session, target.content_sha256)
     if current_representation != reservation.representation:
-        _delete_written_entry(target, reservation)
+        _delete_written_entry(target, reservation, config=config)
         _release_entry_accounting(session, entry)
         session.commit()
         return None
@@ -911,7 +940,7 @@ def _finalize_filling_entry(
         write_result.size_bytes - reservation.reserved_size,
     )
     if not entry_policy_conformant(session, entry, key_registry=key_registry):
-        _delete_written_entry(target, reservation)
+        _delete_written_entry(target, reservation, config=config)
         _release_entry_accounting(session, entry)
         session.commit()
         return None
@@ -945,17 +974,37 @@ def _release_reserved_entry(
     session.commit()
 
 
-def _delete_written_entry(target: HdcacheFillTarget, reservation: _FillReservation) -> None:
+def _delete_written_entry(
+    target: HdcacheFillTarget,
+    reservation: _FillReservation,
+    *,
+    config: HdcacheFillConfig,
+) -> None:
     delete_entry(
         Path(reservation.disk.mount),
         target.content_sha256,
         representation=reservation.representation,
         key_epoch=reservation.key_epoch,
+        deadline_monotonic=time.monotonic() + config.delete_deadline_seconds,
+        disk_id=reservation.disk.disk_id,
     )
 
 
 def _expected_representation(session: Session, content_sha256: bytes) -> str:
     return AEAD_REPRESENTATION if effective_privacy_level(session, content_sha256) != "none" else RAW_REPRESENTATION
+
+
+def _artifactclass_policy_sha256(session: Session, artifactclass: str) -> str | None:
+    record = session.get(ArtifactClassPolicyRecord, artifactclass, populate_existing=True)
+    return None if record is None else record.policy_sha256
+
+
+def _begin_finalize_write_transaction(session: Session) -> None:
+    if session.in_transaction():
+        return
+    bind = session.get_bind()
+    if bind.dialect.name == "sqlite":
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
 
 
 def _epoch_for_representation(
@@ -991,7 +1040,19 @@ def _mark_entry_lost_for_fill(
             f"cache disk {disk.disk_id} identity was not verified before stale delete: "
             f"{identity.status}: {identity.detail}",
         )
-    mark_entry_lost_and_delete(session, entry)
+    try:
+        mark_entry_lost_and_delete(
+            session,
+            entry,
+            deadline_monotonic=time.monotonic() + config.delete_deadline_seconds,
+        )
+    except StoreReadTimeout as exc:
+        disk.state = "absent"
+        session.flush([disk])
+        raise HdcacheFillBlocked(
+            "disk-delete-timeout",
+            f"cache disk {disk.disk_id} delete timed out before stale lost mark: {exc}",
+        ) from exc
 
 
 def _verify_disk_identity_for_fill(
