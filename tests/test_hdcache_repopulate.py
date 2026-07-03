@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine, select
 
+import sutradhara.hdcache.repopulate as repop_module
 import sutradhara.jobs.handlers as _handlers  # noqa: F401
 from sutradhara.archive_restore import restore_assets_from_bundle
 from sutradhara.backend.port import ByteRange
@@ -40,6 +41,7 @@ from sutradhara.hdcache.manager import RestoreEvent
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.repopulate import (
     RepopulationConfig,
+    RepopulationError,
     drain_retiring_disk,
     drill_status,
     enqueue_repopulation,
@@ -114,7 +116,9 @@ def test_repopulation_planner_groups_by_source_tape_and_tags_drill(
         jobs = list(session.scalars(select(Job).where(Job.kind == "hdcache_fill").order_by(Job.id)))
         assert plan.count == 3
         assert plan.scheduled == 2
-        assert [job.priority for job in jobs] == [50, 50]
+        assert [job.priority for job in jobs] == [75, 75]
+        assert {job.recon_domain for job in jobs} == {"hdcache"}
+        assert all((job.recon_target_key or "").startswith("repop:d001:20260703T080000Z:") for job in jobs)
         batch = next(job for job in jobs if job.params.get("repopulate_batch") is True)
         assert batch.params["source_tape"].endswith("tape_uuid:tape-a")
         assert batch.params["origin_drill_ids"] == ["d001:20260703T080000Z"]
@@ -129,6 +133,55 @@ def test_repopulation_planner_groups_by_source_tape_and_tags_drill(
             "d001:20260703T080000Z"
         ]
         assert singleton.params["source_tape"].endswith("tape_uuid:tape-b")
+
+
+def test_repopulation_cap_leaves_live_fill_headroom(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    memory = MemoryBackend("mem")
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "dead", state="dead")
+        _add_disk(session, "d002", tmp_path / "active")
+        for index in range(5):
+            target = _seed_bundle(
+                session,
+                memory,
+                bundle_id=f"bundle-{index}",
+                members=[f"clip-{index}".encode()],
+                tape_uuid=f"tape-{index}",
+            )[0]
+            session.add(
+                CacheEntry(
+                    content_sha256=target["digest"],
+                    artifactclass="s-masters",
+                    bundle_key=target["bundle_id"],
+                    group_key="s-masters:test",
+                    disk_id="d001",
+                    relpath=f"{target['digest'].hex()[:2]}/{target['digest'].hex()}",
+                    size_bytes=target["size"],
+                    state="lost",
+                    representation=RAW_REPRESENTATION,
+                    trusted=True,
+                    lost_origin_disk_id="d001",
+                    lost_drill_id="d001:20260703T080000Z",
+                    lost_at=dt.datetime(2026, 7, 3, 8, tzinfo=dt.UTC),
+                )
+            )
+
+        plan = enqueue_repopulation(
+            session,
+            config=RepopulationConfig(
+                fill_config=HdcacheFillConfig(live_job_cap=10, scratch_root=tmp_path / "scratch"),
+                scratch_root=tmp_path / "scratch",
+            ),
+        )
+
+        jobs = list(session.scalars(select(Job).where(Job.kind == "hdcache_fill")))
+        assert plan.count == 5
+        assert plan.scheduled == 2
+        assert len(jobs) == 2
+        assert all(job.priority == 75 for job in jobs)
 
 
 def test_repopulation_batch_extracts_bundle_once_and_fills_entries(
@@ -257,6 +310,67 @@ def test_singleton_repopulation_uses_restore_not_live_source_path(
         assert job.params["repopulate_batch"] is True
         assert results[0].source == "restore"
         assert entry_path(tmp_path / "active", target["digest"]).read_bytes() == b"archive-only"
+
+
+def test_repopulation_batch_skips_stale_drill_payload(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    memory = MemoryBackend("mem")
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "dead", state="dead")
+        _add_disk(session, "d002", tmp_path / "active")
+        target = _seed_bundle(
+            session,
+            memory,
+            bundle_id="bundle-a",
+            members=[b"clip-a"],
+            tape_uuid="tape-a",
+        )[0]
+        old_drill = "d001:20260703T080000Z"
+        session.add(
+            CacheEntry(
+                content_sha256=target["digest"],
+                artifactclass="s-masters",
+                bundle_key="bundle-a",
+                group_key="s-masters:test",
+                disk_id="d001",
+                relpath=f"{target['digest'].hex()[:2]}/{target['digest'].hex()}",
+                size_bytes=target["size"],
+                state="lost",
+                representation=RAW_REPRESENTATION,
+                trusted=True,
+                lost_origin_disk_id="d001",
+                lost_drill_id=old_drill,
+                lost_at=dt.datetime(2026, 7, 3, 8, tzinfo=dt.UTC),
+            )
+        )
+        enqueue_repopulation(
+            session,
+            config=RepopulationConfig(
+                fill_config=HdcacheFillConfig(live_job_cap=10, scratch_root=tmp_path / "scratch"),
+                scratch_root=tmp_path / "scratch",
+            ),
+        )
+        job = session.scalars(select(Job).where(Job.kind == "hdcache_fill")).one()
+        entry = session.get(CacheEntry, target["digest"])
+        entry.lost_drill_id = "d001:20260703T090000Z"
+        session.flush([entry])
+
+        results = execute_repopulation_batch(
+            session,
+            job.params,
+            config=RepopulationConfig(
+                fill_config=HdcacheFillConfig(scratch_root=tmp_path / "scratch"),
+                scratch_root=tmp_path / "scratch",
+                restore_backends={1: memory},
+            ),
+        )
+
+        assert results == []
+        assert session.get(CacheEntry, target["digest"]).state == "lost"
+        assert session.get(CacheEntry, target["digest"]).lost_drill_id == "d001:20260703T090000Z"
+        assert not entry_path(tmp_path / "active", target["digest"]).exists()
 
 
 def test_repopulation_priority_yields_to_restore_and_outranks_migration(
@@ -404,6 +518,70 @@ def test_drain_falls_back_to_tape_on_corrupt_source(
 
         assert result.fallback_to_tape == 1
         assert entry_path(tmp_path / "active", target["digest"]).read_bytes() == target["data"]
+
+
+def test_drain_aborts_on_disk_state_change_without_resurrecting_lost_row(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = MemoryBackend("mem")
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "retiring", state="retiring")
+        _add_disk(session, "d002", tmp_path / "active")
+        target = _seed_bundle(
+            session,
+            memory,
+            bundle_id="bundle-a",
+            members=[b"local-good"],
+            tape_uuid="tape-a",
+        )[0]
+        write_entry(tmp_path / "retiring", target["digest"], target["data"])
+        session.get(CacheDisk, "d001").filled_bytes = target["size"]
+        session.add(
+            CacheEntry(
+                content_sha256=target["digest"],
+                artifactclass="s-masters",
+                bundle_key="bundle-a",
+                group_key="s-masters:test",
+                disk_id="d001",
+                relpath=f"{target['digest'].hex()[:2]}/{target['digest'].hex()}",
+                size_bytes=target["size"],
+                state="present",
+                representation=RAW_REPRESENTATION,
+                trusted=True,
+            )
+        )
+
+        def race_mark_dead(_session, _disk, entry, destination, *, config):
+            destination.write_bytes(target["data"])
+            disk = _session.get(CacheDisk, "d001")
+            stale = _session.get(CacheEntry, entry.content_sha256)
+            disk.state = "dead"
+            stale.state = "lost"
+            stale.lost_origin_disk_id = "d001"
+            stale.lost_drill_id = "d001:20260703T081500Z"
+            stale.lost_at = dt.datetime(2026, 7, 3, 8, 15, tzinfo=dt.UTC)
+            _session.flush([disk, stale])
+
+        monkeypatch.setattr(repop_module, "_read_entry_plaintext", race_mark_dead)
+
+        with pytest.raises(RepopulationError, match="aborting retire drain"):
+            drain_retiring_disk(
+                session,
+                "d001",
+                config=RepopulationConfig(
+                    fill_config=HdcacheFillConfig(scratch_root=tmp_path / "scratch"),
+                    scratch_root=tmp_path / "scratch",
+                    restore_backends={1: memory},
+                ),
+            )
+
+        entry = session.get(CacheEntry, target["digest"])
+        assert entry.state == "lost"
+        assert entry.disk_id == "d001"
+        assert entry.lost_drill_id == "d001:20260703T081500Z"
+        assert not entry_path(tmp_path / "active", target["digest"]).exists()
 
 
 def test_drill_status_eta_math(engine: Engine, tmp_path: Path) -> None:

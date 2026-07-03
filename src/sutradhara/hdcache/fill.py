@@ -14,6 +14,7 @@ import errno
 import hashlib
 import os
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,8 +42,14 @@ from sutradhara.hdcache.placement import PlacementError, choose_placement
 from sutradhara.hdcache.store import (
     AEAD_REPRESENTATION,
     RAW_REPRESENTATION,
+    DiskIdentityProbe,
+    EntryWriteResult,
+    ExpectedDiskIdentity,
     StoreError,
+    StoreReadTimeout,
     delete_entry,
+    read_hmac_secret,
+    verify_disk_identity_with_deadline,
     write_entry,
 )
 from sutradhara.jobs.engine import submit
@@ -52,6 +59,7 @@ from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BLOCKED,
     OBSERVED_MISSING,
     OBSERVED_PRESENT,
+    record_observation,
 )
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.sealing.port import Representation
@@ -68,6 +76,8 @@ MIGRATION_PRIORITY = 100
 # the job engine's io lease declared by submit_hdcache_fill.
 DEFAULT_LIVE_JOB_CAP = 500
 DEFAULT_SCRATCH_ROOT = Path("/var/lib/replica/hdcache-scratch")
+DEFAULT_REPOPULATION_BACKOFF_SECONDS = 60
+DEFAULT_FILL_IDENTITY_PROBE_DEADLINE_SECONDS = 2.0
 ACCOUNTED_ENTRY_STATES = frozenset({"filling", "present"})
 
 
@@ -100,6 +110,11 @@ class HdcacheFillConfig:
     operator_restore_priority: int = OPERATOR_RESTORE_PRIORITY
     migration_priority: int = MIGRATION_PRIORITY
     scratch_root: Path = DEFAULT_SCRATCH_ROOT
+    repopulation_live_job_cap: int | None = None
+    repopulation_priority: int | None = None
+    identity_probe_deadline_seconds: float = DEFAULT_FILL_IDENTITY_PROBE_DEADLINE_SECONDS
+    hmac_secret: bytes | None = None
+    identity_probe: DiskIdentityProbe | None = None
 
     def __post_init__(self) -> None:
         if self.live_job_cap < 0:
@@ -108,7 +123,34 @@ class HdcacheFillConfig:
             raise ValueError("hdcache priority must be below operator restores")
         if self.priority >= self.migration_priority:
             raise ValueError("hdcache priority must be above migration")
+        if self.repopulation_live_job_cap is not None and self.repopulation_live_job_cap < 0:
+            raise ValueError("repopulation_live_job_cap must be non-negative")
+        if self.repopulation_priority is not None and not (
+            self.priority < self.repopulation_priority < self.migration_priority
+        ):
+            raise ValueError("repopulation priority must sit between fill and migration")
+        if self.identity_probe_deadline_seconds <= 0:
+            raise ValueError("identity_probe_deadline_seconds must be positive")
+        if self.hmac_secret is not None and not self.hmac_secret:
+            raise ValueError("hmac_secret must not be empty")
         object.__setattr__(self, "scratch_root", Path(self.scratch_root))
+
+    @property
+    def effective_repopulation_live_job_cap(self) -> int:
+        if self.live_job_cap == 0:
+            return 0
+        if self.repopulation_live_job_cap is not None:
+            return min(self.live_job_cap, self.repopulation_live_job_cap)
+        return min(self.live_job_cap, max(1, self.live_job_cap // 5))
+
+    @property
+    def effective_repopulation_priority(self) -> int:
+        if self.repopulation_priority is not None:
+            return self.repopulation_priority
+        return (self.priority + self.migration_priority) // 2
+
+    def disk_hmac_secret(self) -> bytes:
+        return self.hmac_secret if self.hmac_secret is not None else read_hmac_secret()
 
 
 @dataclass(frozen=True)
@@ -151,6 +193,20 @@ class HdcacheFillResult:
     already_present: bool = False
 
 
+@dataclass(frozen=True)
+class _DiskWriteTarget:
+    disk_id: str
+    mount: str
+
+
+@dataclass(frozen=True)
+class _FillReservation:
+    disk: _DiskWriteTarget
+    representation: str
+    key_epoch: str | None
+    reserved_size: int
+
+
 RestoreBackendResolver = Callable[[Session, bytes], dict[int, StorageBackend]]
 
 
@@ -168,6 +224,13 @@ def fill_config_from_env() -> HdcacheFillConfig:
         scratch_root=Path(
             os.environ.get("SUTRADHARA_HDCACHE_SCRATCH_ROOT") or DEFAULT_SCRATCH_ROOT
         ),
+        repopulation_live_job_cap=_env_optional_int("SUTRADHARA_HDCACHE_REPOP_LIVE_JOB_CAP"),
+        repopulation_priority=_env_optional_int("SUTRADHARA_HDCACHE_REPOP_PRIORITY"),
+        identity_probe_deadline_seconds=_env_float(
+            "SUTRADHARA_HDCACHE_IDENTITY_PROBE_DEADLINE_SECONDS",
+            DEFAULT_FILL_IDENTITY_PROBE_DEADLINE_SECONDS,
+        ),
+        hmac_secret=_env_secret_bytes("SUTRADHARA_HDCACHE_HMAC_SECRET_HEX"),
     )
 
 
@@ -303,7 +366,19 @@ def enqueue_targets(
     for target in targets:
         if submit_hdcache_fill(session, target, config=final_config) is None:
             if count_live_hdcache_jobs(session) >= final_config.live_job_cap:
+                _record_fill_backoff_condition(
+                    session,
+                    target,
+                    reason="live-cap",
+                    message="hdcache live job cap is full; fill will retry from the condition worklist",
+                )
                 break
+            _record_fill_backoff_condition(
+                session,
+                target,
+                reason="held",
+                message="hdcache fill target is currently held by backoff or blocked condition",
+            )
             continue
         scheduled += 1
     return HdcacheFillPlan(count=len(targets), bytes_total=bytes_total, scheduled=scheduled)
@@ -465,6 +540,7 @@ def observe_target(
     *,
     mutate: bool,
     key_registry: KeyRegistry | None = None,
+    config: HdcacheFillConfig | None = None,
 ) -> tuple[bool, str]:
     """Return desired/observed state for one hdcache reconciler target."""
 
@@ -483,7 +559,15 @@ def observe_target(
     if entry_policy_conformant(session, entry, key_registry=key_registry):
         return True, OBSERVED_PRESENT
     if mutate:
-        mark_entry_lost_and_delete(session, entry)
+        try:
+            _mark_entry_lost_for_fill(session, entry, config=config or fill_config_from_env())
+        except HdcacheFillBlocked as exc:
+            _record_fill_backoff_condition(
+                session,
+                target,
+                reason=exc.reason,
+                message=exc.detail,
+            )
     return True, OBSERVED_MISSING
 
 
@@ -510,13 +594,6 @@ def fill_target(
     asset = session.get(LogicalAsset, target.content_sha256)
     if asset is None:
         raise HdcacheFillBlocked("unknown-asset", f"no logical asset {target.sha_hex}")
-    privacy = effective_privacy_level(session, target.content_sha256)
-    representation = AEAD_REPRESENTATION if privacy != "none" else RAW_REPRESENTATION
-    epoch = key_epoch
-    if representation == AEAD_REPRESENTATION:
-        epoch = epoch or registry.create_epoch(domain=KEY_DOMAIN_HDCACHE)
-        assert_key_epoch_domain(epoch, KEY_DOMAIN_HDCACHE, context="hdcache fill")
-
     existing = session.get(CacheEntry, target.content_sha256)
     if existing is not None and existing.state == "present":
         disk = session.get(CacheDisk, existing.disk_id)
@@ -537,10 +614,13 @@ def fill_target(
                 source="cache",
                 already_present=True,
             )
-        mark_entry_lost_and_delete(session, existing)
+        _mark_entry_lost_for_fill(session, existing, config=final_config)
+        session.commit()
 
     last_enospc: OSError | None = None
-    for _attempt in range(2):
+    for _attempt in range(4):
+        representation = _expected_representation(session, target.content_sha256)
+        epoch = _epoch_for_representation(representation, registry, key_epoch)
         entry = _prepare_filling_entry(
             session,
             target,
@@ -551,6 +631,13 @@ def fill_target(
         disk = session.get(CacheDisk, entry.disk_id)
         if disk is None:
             raise HdcacheFillBlocked("missing-disk", f"cache disk {entry.disk_id!r} is missing")
+        reservation = _FillReservation(
+            disk=_DiskWriteTarget(disk_id=disk.disk_id, mount=disk.mount),
+            representation=representation,
+            key_epoch=None if epoch is None else epoch.key_id,
+            reserved_size=entry.size_bytes,
+        )
+        session.commit()
         try:
             with _plaintext_source(
                 session,
@@ -559,9 +646,10 @@ def fill_target(
                 restore_backends=restore_backends,
                 restore_backend_resolver=restore_backend_resolver or resolve_restore_backends,
             ) as source:
+                session.commit()
                 write_result = _write_source_to_disk(
                     target,
-                    disk,
+                    reservation.disk,
                     source.path,
                     representation=representation,
                     key_epoch=epoch,
@@ -570,43 +658,30 @@ def fill_target(
                     sealer=sealer,
                 )
                 source_kind = source.kind
-            entry.relpath = write_result.relpath
-            reserved_size = entry.size_bytes
-            entry.size_bytes = write_result.size_bytes
-            entry.state = "present"
-            entry.representation = representation
-            entry.key_epoch = None if epoch is None else epoch.key_id
-            entry.stored_digest = write_result.stored_digest
-            entry.trusted = True
-            if entry.lost_drill_id is not None:
-                entry.refilled_at = _utcnow()
-            _adjust_disk_committed_bytes(
+            finalized = _finalize_filling_entry(
                 session,
-                disk.disk_id,
-                write_result.size_bytes - reserved_size,
+                target,
+                reservation=reservation,
+                write_result=write_result,
+                source_kind=source_kind,
+                key_registry=registry,
             )
-            session.flush([entry, disk])
-            return HdcacheFillResult(
-                content_sha256=target.content_sha256,
-                disk_id=disk.disk_id,
-                relpath=entry.relpath,
-                size_bytes=entry.size_bytes,
-                representation=entry.representation,
-                key_epoch=entry.key_epoch,
-                stored_digest=entry.stored_digest,
-                source=source_kind,
-            )
+            if finalized is None:
+                continue
+            return finalized
         except OSError as exc:
             if not _is_enospc(exc):
-                _release_entry_accounting(session, entry)
+                _release_reserved_entry(session, target.content_sha256, reservation=reservation)
                 raise
             last_enospc = exc
-            _release_entry_accounting(session, entry)
-            _flag_disk_over_reserve(session, disk)
-            session.flush([entry, disk])
+            _release_reserved_entry(session, target.content_sha256, reservation=reservation)
+            disk = session.get(CacheDisk, reservation.disk.disk_id)
+            if disk is not None:
+                _flag_disk_over_reserve(session, disk)
+            session.commit()
             continue
         except Exception:
-            _release_entry_accounting(session, entry)
+            _release_reserved_entry(session, target.content_sha256, reservation=reservation)
             raise
 
     detail = f"cache disk write ran out of space for {target.sha_hex}: {last_enospc}"
@@ -647,13 +722,6 @@ def fill_target_from_plaintext(
             "source-integrity",
             f"source bytes for {target.sha_hex} do not match the logical asset digest",
         )
-    privacy = effective_privacy_level(session, target.content_sha256)
-    representation = AEAD_REPRESENTATION if privacy != "none" else RAW_REPRESENTATION
-    epoch = key_epoch
-    if representation == AEAD_REPRESENTATION:
-        epoch = epoch or registry.create_epoch(domain=KEY_DOMAIN_HDCACHE)
-        assert_key_epoch_domain(epoch, KEY_DOMAIN_HDCACHE, context="hdcache fill")
-
     existing = session.get(CacheEntry, target.content_sha256)
     if existing is not None and existing.state == "present":
         disk = session.get(CacheDisk, existing.disk_id)
@@ -670,7 +738,8 @@ def fill_target_from_plaintext(
                     source="cache",
                     already_present=True,
                 )
-            mark_entry_lost_and_delete(session, existing)
+            _mark_entry_lost_for_fill(session, existing, config=final_config)
+            session.commit()
         elif disk is None or disk.state != "retiring":
             raise HdcacheFillBlocked(
                 "disk-unavailable",
@@ -678,7 +747,9 @@ def fill_target_from_plaintext(
             )
 
     last_enospc: OSError | None = None
-    for _attempt in range(2):
+    for _attempt in range(4):
+        representation = _expected_representation(session, target.content_sha256)
+        epoch = _epoch_for_representation(representation, registry, key_epoch)
         entry = _prepare_filling_entry(
             session,
             target,
@@ -689,10 +760,17 @@ def fill_target_from_plaintext(
         disk = session.get(CacheDisk, entry.disk_id)
         if disk is None:
             raise HdcacheFillBlocked("missing-disk", f"cache disk {entry.disk_id!r} is missing")
+        reservation = _FillReservation(
+            disk=_DiskWriteTarget(disk_id=disk.disk_id, mount=disk.mount),
+            representation=representation,
+            key_epoch=None if epoch is None else epoch.key_id,
+            reserved_size=entry.size_bytes,
+        )
+        session.commit()
         try:
             write_result = _write_source_to_disk(
                 target,
-                disk,
+                reservation.disk,
                 source_path,
                 representation=representation,
                 key_epoch=epoch,
@@ -700,43 +778,30 @@ def fill_target_from_plaintext(
                 registry=registry,
                 sealer=sealer,
             )
-            entry.relpath = write_result.relpath
-            reserved_size = entry.size_bytes
-            entry.size_bytes = write_result.size_bytes
-            entry.state = "present"
-            entry.representation = representation
-            entry.key_epoch = None if epoch is None else epoch.key_id
-            entry.stored_digest = write_result.stored_digest
-            entry.trusted = True
-            if entry.lost_drill_id is not None:
-                entry.refilled_at = _utcnow()
-            _adjust_disk_committed_bytes(
+            finalized = _finalize_filling_entry(
                 session,
-                disk.disk_id,
-                write_result.size_bytes - reserved_size,
+                target,
+                reservation=reservation,
+                write_result=write_result,
+                source_kind=source_kind,
+                key_registry=registry,
             )
-            session.flush([entry, disk])
-            return HdcacheFillResult(
-                content_sha256=target.content_sha256,
-                disk_id=disk.disk_id,
-                relpath=entry.relpath,
-                size_bytes=entry.size_bytes,
-                representation=entry.representation,
-                key_epoch=entry.key_epoch,
-                stored_digest=entry.stored_digest,
-                source=source_kind,
-            )
+            if finalized is None:
+                continue
+            return finalized
         except OSError as exc:
             if not _is_enospc(exc):
-                _release_entry_accounting(session, entry)
+                _release_reserved_entry(session, target.content_sha256, reservation=reservation)
                 raise
             last_enospc = exc
-            _release_entry_accounting(session, entry)
-            _flag_disk_over_reserve(session, disk)
-            session.flush([entry, disk])
+            _release_reserved_entry(session, target.content_sha256, reservation=reservation)
+            disk = session.get(CacheDisk, reservation.disk.disk_id)
+            if disk is not None:
+                _flag_disk_over_reserve(session, disk)
+            session.commit()
             continue
         except Exception:
-            _release_entry_accounting(session, entry)
+            _release_reserved_entry(session, target.content_sha256, reservation=reservation)
             raise
 
     detail = f"cache disk write ran out of space for {target.sha_hex}: {last_enospc}"
@@ -792,6 +857,193 @@ def mark_entry_lost_and_delete(session: Session, entry: CacheEntry) -> None:
     entry.refilled_at = None
     entry.state = "lost"
     session.flush([obj for obj in (entry, disk) if obj is not None])
+
+
+def _finalize_filling_entry(
+    session: Session,
+    target: HdcacheFillTarget,
+    *,
+    reservation: _FillReservation,
+    write_result: EntryWriteResult,
+    source_kind: str,
+    key_registry: KeyRegistry,
+) -> HdcacheFillResult | None:
+    """Finalize a reserved fill after reloading current row and privacy policy."""
+
+    entry = session.get(CacheEntry, target.content_sha256)
+    if entry is None:
+        _delete_written_entry(target, reservation)
+        raise HdcacheFillError(f"cache fill reservation disappeared for {target.sha_hex}")
+    session.refresh(entry)
+    disk = session.get(CacheDisk, reservation.disk.disk_id)
+    if disk is None:
+        _delete_written_entry(target, reservation)
+        raise HdcacheFillBlocked("missing-disk", f"cache disk {reservation.disk.disk_id!r} is missing")
+    session.refresh(disk)
+    if (
+        entry.state != "filling"
+        or entry.disk_id != reservation.disk.disk_id
+        or entry.representation != reservation.representation
+        or entry.key_epoch != reservation.key_epoch
+    ):
+        _delete_written_entry(target, reservation)
+        raise HdcacheFillError(f"cache fill reservation changed before finalize for {target.sha_hex}")
+
+    current_representation = _expected_representation(session, target.content_sha256)
+    if current_representation != reservation.representation:
+        _delete_written_entry(target, reservation)
+        _release_entry_accounting(session, entry)
+        session.commit()
+        return None
+
+    entry.relpath = write_result.relpath
+    entry.size_bytes = write_result.size_bytes
+    entry.state = "present"
+    entry.representation = reservation.representation
+    entry.key_epoch = reservation.key_epoch
+    entry.stored_digest = write_result.stored_digest
+    entry.trusted = True
+    if entry.lost_drill_id is not None:
+        entry.refilled_at = _utcnow()
+    _adjust_disk_committed_bytes(
+        session,
+        disk.disk_id,
+        write_result.size_bytes - reservation.reserved_size,
+    )
+    if not entry_policy_conformant(session, entry, key_registry=key_registry):
+        _delete_written_entry(target, reservation)
+        _release_entry_accounting(session, entry)
+        session.commit()
+        return None
+    session.flush([entry, disk])
+    session.commit()
+    return HdcacheFillResult(
+        content_sha256=target.content_sha256,
+        disk_id=disk.disk_id,
+        relpath=entry.relpath,
+        size_bytes=entry.size_bytes,
+        representation=entry.representation,
+        key_epoch=entry.key_epoch,
+        stored_digest=entry.stored_digest,
+        source=source_kind,
+    )
+
+
+def _release_reserved_entry(
+    session: Session,
+    content_sha256: bytes,
+    *,
+    reservation: _FillReservation,
+) -> None:
+    entry = session.get(CacheEntry, content_sha256)
+    if entry is None:
+        return
+    session.refresh(entry)
+    if entry.state != "filling" or entry.disk_id != reservation.disk.disk_id:
+        return
+    _release_entry_accounting(session, entry)
+    session.commit()
+
+
+def _delete_written_entry(target: HdcacheFillTarget, reservation: _FillReservation) -> None:
+    delete_entry(
+        Path(reservation.disk.mount),
+        target.content_sha256,
+        representation=reservation.representation,
+        key_epoch=reservation.key_epoch,
+    )
+
+
+def _expected_representation(session: Session, content_sha256: bytes) -> str:
+    return AEAD_REPRESENTATION if effective_privacy_level(session, content_sha256) != "none" else RAW_REPRESENTATION
+
+
+def _epoch_for_representation(
+    representation: str,
+    registry: KeyRegistry,
+    key_epoch: KeyEpoch | None,
+) -> KeyEpoch | None:
+    if representation == RAW_REPRESENTATION:
+        return None
+    if representation != AEAD_REPRESENTATION:
+        raise HdcacheFillError(f"unsupported hdcache representation {representation!r}")
+    epoch = key_epoch or registry.create_epoch(domain=KEY_DOMAIN_HDCACHE)
+    assert_key_epoch_domain(epoch, KEY_DOMAIN_HDCACHE, context="hdcache fill")
+    return epoch
+
+
+def _mark_entry_lost_for_fill(
+    session: Session,
+    entry: CacheEntry,
+    *,
+    config: HdcacheFillConfig,
+) -> None:
+    disk = session.get(CacheDisk, entry.disk_id)
+    if disk is None or disk.state != "active":
+        raise HdcacheFillBlocked(
+            "disk-unavailable",
+            f"cache entry {entry.content_sha256.hex()} is present on unavailable disk {entry.disk_id!r}",
+        )
+    identity = _verify_disk_identity_for_fill(session, disk, config=config)
+    if not identity.ok:
+        raise HdcacheFillBlocked(
+            "disk-identity-unverified",
+            f"cache disk {disk.disk_id} identity was not verified before stale delete: "
+            f"{identity.status}: {identity.detail}",
+        )
+    mark_entry_lost_and_delete(session, entry)
+
+
+def _verify_disk_identity_for_fill(
+    session: Session,
+    disk: CacheDisk,
+    *,
+    config: HdcacheFillConfig,
+):
+    try:
+        return verify_disk_identity_with_deadline(
+            Path(disk.mount),
+            ExpectedDiskIdentity(
+                disk_id=disk.disk_id,
+                serial=disk.serial,
+                fs_uuid=disk.fs_uuid,
+                wwn=disk.wwn,
+            ),
+            hmac_secret=config.disk_hmac_secret(),
+            disk_id=disk.disk_id,
+            probe=config.identity_probe,
+            deadline_monotonic=time.monotonic() + config.identity_probe_deadline_seconds,
+        )
+    except StoreReadTimeout as exc:
+        raise HdcacheFillBlocked(
+            "disk-identity-timeout",
+            f"cache disk {disk.disk_id} identity proof timed out before stale delete: {exc}",
+        ) from exc
+
+
+def _record_fill_backoff_condition(
+    session: Session,
+    target: HdcacheFillTarget,
+    *,
+    reason: str,
+    message: str,
+) -> None:
+    now = _utcnow()
+    row = record_observation(
+        session,
+        domain=DOMAIN,
+        target_key=target.sha_hex,
+        desired=True,
+        observed_state=OBSERVED_MISSING,
+    )
+    if reason == "held" or row.condition == CONDITION_BLOCKED:
+        return
+    row.condition = CONDITION_BACKOFF
+    row.reason = reason
+    row.message = message
+    row.next_eligible_at = now + dt.timedelta(seconds=DEFAULT_REPOPULATION_BACKOFF_SECONDS)
+    row.updated_at = now
+    session.flush([row])
 
 
 def effective_privacy_level(session: Session, content_sha256: bytes) -> str:
@@ -1225,3 +1477,24 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or raw == "":
         return default
     return int(raw)
+
+
+def _env_optional_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    return int(raw)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
+
+
+def _env_secret_bytes(name: str) -> bytes | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    return bytes.fromhex(raw)

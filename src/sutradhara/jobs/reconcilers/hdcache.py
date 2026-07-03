@@ -13,6 +13,7 @@ from sutradhara.hdcache.fill import (
     DOMAIN,
     desired_target_for_asset,
     enumerate_desired_targets,
+    fill_config_from_env,
     observe_target,
     submit_hdcache_fill,
 )
@@ -42,7 +43,12 @@ def enumerate_targets(
 def observe(session: Session, target_key: str) -> TargetObservation:
     """Observe one hdcache target, converging stale present rows to lost."""
 
-    desired, observed = observe_target(session, target_key, mutate=True)
+    desired, observed = observe_target(
+        session,
+        target_key,
+        mutate=True,
+        config=fill_config_from_env(),
+    )
     return TargetObservation(
         target_key=target_key,
         desired=desired,

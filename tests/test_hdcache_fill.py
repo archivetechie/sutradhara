@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine, func, select
 
+import sutradhara.hdcache.fill as fill_module
 import sutradhara.jobs.handlers as _handlers  # noqa: F401
 import sutradhara.jobs.reconcilers.hdcache as _hdcache_reconciler  # noqa: F401
 from sutradhara.backend.memory import MemoryBackend
@@ -38,6 +39,7 @@ from sutradhara.hdcache.fill import (
     HdcacheFillTarget,
     count_live_hdcache_jobs,
     dedupe_key,
+    enqueue_targets,
     fill_target,
     mark_entry_lost_and_delete,
     observe_target,
@@ -47,8 +49,11 @@ from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.store import (
     AEAD_REPRESENTATION,
     RAW_REPRESENTATION,
+    ExpectedDiskIdentity,
+    ObservedBlockIdentity,
     StoreError,
     entry_path,
+    write_disk_sentinel,
     write_entry,
 )
 from sutradhara.jobs.config import WorkerConfig
@@ -65,6 +70,8 @@ from sutradhara.jobs.registry import JobContext, JobResult
 from sutradhara.jobs.worker import JobWorker
 from sutradhara.keys import KeyEpoch, KeyRegistry
 from sutradhara.sealing.port import Representation, SealResult
+
+TEST_HDCACHE_HMAC_SECRET = b"hdcache-fill-test-secret"
 
 
 @pytest.fixture
@@ -150,6 +157,56 @@ def test_hdcache_aead_fill_records_hdcache_epoch_and_stored_digest(
         assert session.get(CacheDisk, result.disk_id).filled_bytes == len(
             b"sealed:" + source.read_bytes()
         )
+
+
+def test_mid_fill_privacy_raise_deletes_raw_write_and_restarts_aead(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "clip.mov"
+    source.write_bytes(b"privacy race")
+    registry = KeyRegistry(tmp_path / "keys")
+    original_write = fill_module._write_source_to_disk
+    raised = False
+
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "d001")
+        target = _seed_archived_asset(
+            session,
+            data=source.read_bytes(),
+            artifactclass="race",
+            source_path=source,
+            hdcache_config={"enabled": True, "privacy_level": "none"},
+        )
+
+        def racing_write(*args: Any, **kwargs: Any) -> Any:
+            nonlocal raised
+            result = original_write(*args, **kwargs)
+            if not raised and kwargs["representation"] == RAW_REPRESENTATION:
+                policy = session.get(ArtifactClassPolicyRecord, "race")
+                policy.hdcache_config = {"enabled": True, "privacy_level": "p2"}
+                session.flush([policy])
+                raised = True
+            return result
+
+        monkeypatch.setattr(fill_module, "_write_source_to_disk", racing_write)
+
+        result = fill_target(
+            session,
+            target,
+            config=_config(tmp_path),
+            key_registry=registry,
+            sealer=FakeSealer(),
+        )
+
+        entry = session.get(CacheEntry, target.content_sha256)
+        raw_path = entry_path(tmp_path / "d001", target.content_sha256, representation=RAW_REPRESENTATION)
+        assert raised is True
+        assert result.representation == AEAD_REPRESENTATION
+        assert entry.representation == AEAD_REPRESENTATION
+        assert entry.key_epoch is not None
+        assert not raw_path.exists()
 
 
 def test_hdcache_fill_adopts_lost_row_and_replaces_dead_disk(
@@ -252,6 +309,33 @@ def test_hdcache_reconciler_honors_live_cap_and_tops_up_archived_backlog(
         assert len(_hdcache_jobs(session, status=JobStatus.SUCCEEDED)) == 3
 
 
+def test_enqueue_targets_records_backoff_when_live_cap_drops_work(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "d001")
+        targets = _seed_archived_backlog(session, tmp_path, count=2)
+
+        plan = enqueue_targets(
+            session,
+            targets,
+            config=HdcacheFillConfig(live_job_cap=1, scratch_root=tmp_path / "scratch"),
+        )
+
+        condition = session.scalar(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == DOMAIN,
+                ReconciliationCondition.target_key == targets[1].sha_hex,
+            )
+        )
+        assert plan.scheduled == 1
+        assert condition is not None
+        assert condition.condition == "backoff"
+        assert condition.reason == "live-cap"
+        assert condition.next_eligible_at is not None
+
+
 def test_hdcache_fill_jobs_declare_io_lease_and_serialize(
     engine: Engine,
 ) -> None:
@@ -312,7 +396,9 @@ def test_hdcache_convergence_marks_privacy_raise_and_retired_epoch_lost(
     registry = KeyRegistry(tmp_path / "keys")
     monkeypatch.setenv("SUTRADHARA_KEY_REGISTRY_DIR", str(registry.registry_dir))
     monkeypatch.setenv("SUTRADHARA_HDCACHE_SCRATCH_ROOT", str(tmp_path / "scratch"))
+    monkeypatch.setenv("SUTRADHARA_HDCACHE_HMAC_SECRET_HEX", TEST_HDCACHE_HMAC_SECRET.hex())
     monkeypatch.setattr("sutradhara.hdcache.fill.RaoCliSealer", FakeSealer)
+    monkeypatch.setattr(_hdcache_reconciler, "fill_config_from_env", lambda: _config(tmp_path))
     raw_source = tmp_path / "raw.mov"
     raw_source.write_bytes(b"raw")
     private_source = tmp_path / "private.mov"
@@ -534,6 +620,16 @@ class FakeSealer:
         )
 
 
+class FillIdentityProbe:
+    def observe(self, mount: Path) -> ObservedBlockIdentity:
+        disk_id = mount.name
+        return ObservedBlockIdentity(
+            True,
+            serial=f"SER-{disk_id}",
+            fs_uuid=f"fs-{disk_id}",
+        )
+
+
 def _assert_live_cap(session: Any, cap: int) -> None:
     assert count_live_hdcache_jobs(session) <= cap
 
@@ -546,7 +642,11 @@ def _hdcache_jobs(session: Any, *, status: JobStatus | None = None) -> list[Job]
 
 
 def _config(tmp_path: Path) -> HdcacheFillConfig:
-    return HdcacheFillConfig(scratch_root=tmp_path / "scratch")
+    return HdcacheFillConfig(
+        scratch_root=tmp_path / "scratch",
+        hmac_secret=TEST_HDCACHE_HMAC_SECRET,
+        identity_probe=FillIdentityProbe(),
+    )
 
 
 def _add_disk(
@@ -557,6 +657,11 @@ def _add_disk(
     state: str = "active",
 ) -> None:
     mount.mkdir(parents=True, exist_ok=True)
+    write_disk_sentinel(
+        mount,
+        ExpectedDiskIdentity(disk_id, f"SER-{disk_id}", f"fs-{disk_id}"),
+        hmac_secret=TEST_HDCACHE_HMAC_SECRET,
+    )
     session.add(
         CacheDisk(
             disk_id=disk_id,

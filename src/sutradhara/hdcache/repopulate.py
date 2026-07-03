@@ -35,6 +35,7 @@ from sutradhara.backend.port import StorageBackend
 from sutradhara.catalog.models import ArtifactClassPool, AssetLocator, Copy
 from sutradhara.catalog.types import CopyHealth
 from sutradhara.hdcache.fill import (
+    DOMAIN,
     HdcacheFillBlocked,
     HdcacheFillConfig,
     HdcacheFillPlan,
@@ -57,7 +58,8 @@ from sutradhara.hdcache.store import (
     read_entry_verified,
 )
 from sutradhara.jobs.engine import submit
-from sutradhara.jobs.models import Job
+from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job
+from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, record_observation
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import sha256_file
 from sutradhara.sealing.port import Opener, Representation
@@ -207,7 +209,12 @@ def enqueue_repopulation(
     """Plan and submit tape-grouped fill work for currently lost entries."""
 
     final_config = config or repopulation_config_from_env()
-    slots = final_config.fill_config.live_job_cap - count_live_hdcache_jobs(session)
+    total_slots = final_config.fill_config.live_job_cap - count_live_hdcache_jobs(session)
+    repop_slots = (
+        final_config.fill_config.effective_repopulation_live_job_cap
+        - count_live_repopulation_jobs(session)
+    )
+    slots = min(total_slots, repop_slots)
     if slots <= 0:
         return HdcacheFillPlan(count=0, bytes_total=0, scheduled=0)
     lost_targets = list(_lost_targets(session))
@@ -236,7 +243,16 @@ def execute_repopulation_batch(
     """Execute one hdcache_fill job carrying a repopulation batch payload."""
 
     final_config = config or repopulation_config_from_env()
-    targets = [_target_from_item(item) for item in _batch_items(params)]
+    raw_items = _batch_items(params)
+    items_by_sha = {
+        _target_from_item(item).content_sha256: item
+        for item in raw_items
+    }
+    targets = [
+        target
+        for item in raw_items
+        if (target := _revalidate_repopulation_item(session, item)) is not None
+    ]
     if not targets:
         return []
     final_config.scratch_root.mkdir(parents=True, exist_ok=True)
@@ -245,14 +261,31 @@ def execute_repopulation_batch(
     with tempfile.TemporaryDirectory(prefix="hdcache-repop-batch-", dir=final_config.scratch_root) as raw:
         root = Path(raw)
         for group in _group_targets_for_restore(targets):
+            group = [
+                target
+                for target in group
+                if _revalidate_repopulation_item(
+                    session,
+                    items_by_sha[target.content_sha256],
+                )
+                is not None
+            ]
+            if not group:
+                continue
             if len(group) > 1 and group[0].bundle_key:
                 restored = _restore_bundle_group(session, group, root, config=final_config)
                 for target in group:
+                    current_target = _revalidate_repopulation_item(
+                        session,
+                        items_by_sha[target.content_sha256],
+                    )
+                    if current_target is None:
+                        continue
                     result = restored[target.content_sha256]
                     results.append(
                         fill_target_from_plaintext(
                             session,
-                            target,
+                            current_target,
                             source_path=result.output_path,
                             source_kind="restore-batch",
                             config=final_config.fill_config,
@@ -263,12 +296,24 @@ def execute_repopulation_batch(
                     )
                 continue
             target = group[0]
+            current_target = _revalidate_repopulation_item(
+                session,
+                items_by_sha[target.content_sha256],
+            )
+            if current_target is None:
+                continue
             restored_path = root / target.sha_hex
-            _restore_single_target(session, target, restored_path, config=final_config)
+            _restore_single_target(session, current_target, restored_path, config=final_config)
+            current_target = _revalidate_repopulation_item(
+                session,
+                items_by_sha[target.content_sha256],
+            )
+            if current_target is None:
+                continue
             results.append(
                 fill_target_from_plaintext(
                     session,
-                    target,
+                    current_target,
                     source_path=restored_path,
                     source_kind="restore",
                     config=final_config.fill_config,
@@ -302,13 +347,20 @@ def drain_retiring_disk(
     )
     if limit is not None:
         query = query.limit(limit)
-    entries = list(session.scalars(query))
+    entries = [
+        entry.content_sha256
+        for entry in session.scalars(query)
+    ]
     moved = 0
     fallback = 0
     failed = 0
     final_config.scratch_root.mkdir(parents=True, exist_ok=True)
     os.chmod(final_config.scratch_root, 0o700)
-    for entry in entries:
+    for digest in entries:
+        disk = _fresh_retiring_disk(session, disk_id)
+        entry = _fresh_drain_entry(session, digest, disk_id)
+        if entry is None:
+            continue
         target = desired_target_for_asset(session, entry.content_sha256)
         if target is None:
             failed += 1
@@ -321,10 +373,18 @@ def drain_retiring_disk(
                 _read_entry_plaintext(session, disk, entry, plaintext, config=final_config)
                 source_kind = "drain-local"
             except (StoreContentMismatch, StoreReadTimeout, StoreError, OSError, RuntimeError, ValueError):
+                disk = _fresh_retiring_disk(session, disk_id)
+                entry = _fresh_drain_entry(session, digest, disk_id)
+                if entry is None:
+                    continue
                 _restore_single_target(session, target, plaintext, config=final_config)
                 source_kind = "drain-tape"
                 fallback += 1
             try:
+                disk = _fresh_retiring_disk(session, disk_id)
+                entry = _fresh_drain_entry(session, digest, disk_id)
+                if entry is None:
+                    continue
                 fill_target_from_plaintext(
                     session,
                     target,
@@ -335,13 +395,16 @@ def drain_retiring_disk(
                     sealer=final_config.sealer,
                     key_epoch=final_config.key_epoch,
                 )
+            except RepopulationError:
+                raise
             except (HdcacheFillBlocked, OSError, RuntimeError, ValueError):
                 failed += 1
                 continue
+        disk = _fresh_retiring_disk(session, disk_id)
         with contextlib.suppress(Exception):
             delete_entry(
                 Path(disk.mount),
-                entry.content_sha256,
+                digest,
                 representation=old_representation,
                 key_epoch=old_key_epoch,
             )
@@ -420,6 +483,15 @@ def repopulation_batch_payload(batch: RepopulationBatch) -> dict[str, Any]:
         ),
         "items": [_batch_item_payload(item) for item in batch.items],
     }
+
+
+def count_live_repopulation_jobs(session: Session) -> int:
+    """Count live hdcache-fill jobs that carry repopulation batch payloads."""
+
+    rows = session.scalars(
+        select(Job).where(Job.kind == "hdcache_fill", Job.status.in_(LIVE_JOB_STATUS_VALUES))
+    )
+    return sum(1 for job in rows if job.params.get("repopulate_batch") is True)
 
 
 def _lost_targets(session: Session) -> Iterable[LostTarget]:
@@ -553,14 +625,32 @@ def _submit_repopulation_batch(
     *,
     config: RepopulationConfig,
 ) -> Job | None:
+    target_key = _repopulation_recon_target_key(batch)
+    record_observation(
+        session,
+        domain=DOMAIN,
+        target_key=target_key,
+        desired=True,
+        observed_state=OBSERVED_MISSING,
+    )
     return submit(
         session,
         "hdcache_fill",
         repopulation_batch_payload(batch),
         required_resources=[{"pool": "io", "count": 1}],
-        priority=config.fill_config.priority,
+        priority=config.fill_config.effective_repopulation_priority,
         dedupe_key=f"{REPOP_BATCH_DEDUPE_PREFIX}{batch.batch_id}",
+        recon_domain=DOMAIN,
+        recon_target_key=target_key,
     )
+
+
+def _repopulation_recon_target_key(batch: RepopulationBatch) -> str:
+    drills = sorted({item.lost_drill_id for item in batch.items if item.lost_drill_id})
+    drill_part = ",".join(drills) if drills else "untracked"
+    if len(drill_part) > 96:
+        drill_part = hashlib.sha256(drill_part.encode("utf-8")).hexdigest()[:24]
+    return f"repop:{drill_part}:{batch.batch_id}"
 
 
 def _batch_item_payload(item: LostTarget) -> dict[str, Any]:
@@ -604,6 +694,26 @@ def _target_from_item(item: dict[str, Any]) -> HdcacheFillTarget:
         group_key=_optional_str(item.get("group_key")),
         source_path=_optional_str(item.get("source_path")),
     )
+
+
+def _revalidate_repopulation_item(
+    session: Session,
+    item: dict[str, Any],
+) -> HdcacheFillTarget | None:
+    payload_target = _target_from_item(item)
+    entry = session.get(CacheEntry, payload_target.content_sha256)
+    if entry is None:
+        return None
+    session.refresh(entry)
+    if entry.state != "lost":
+        return None
+    expected_drill_id = _optional_str(item.get("lost_drill_id"))
+    if expected_drill_id is not None and entry.lost_drill_id != expected_drill_id:
+        return None
+    expected_origin_disk = _optional_str(item.get("origin_disk_id"))
+    if expected_origin_disk is not None and entry.lost_origin_disk_id != expected_origin_disk:
+        return None
+    return desired_target_for_asset(session, payload_target.content_sha256)
 
 
 def _group_targets_for_restore(targets: list[HdcacheFillTarget]) -> list[list[HdcacheFillTarget]]:
@@ -722,6 +832,32 @@ def _read_entry_plaintext(
         with plaintext.open("rb") as raw_in, destination.open("wb") as raw_out:
             for chunk in iter(lambda: raw_in.read(1024 * 1024), b""):
                 raw_out.write(chunk)
+
+
+def _fresh_retiring_disk(session: Session, disk_id: str) -> CacheDisk:
+    disk = session.get(CacheDisk, disk_id)
+    if disk is None:
+        raise RepopulationError(f"unknown cache disk: {disk_id}")
+    session.refresh(disk)
+    if disk.state != "retiring":
+        raise RepopulationError(
+            f"cache disk {disk_id} changed to state={disk.state!r}; aborting retire drain"
+        )
+    return disk
+
+
+def _fresh_drain_entry(
+    session: Session,
+    digest: bytes,
+    disk_id: str,
+) -> CacheEntry | None:
+    entry = session.get(CacheEntry, digest)
+    if entry is None:
+        return None
+    session.refresh(entry)
+    if entry.state != "present" or entry.disk_id != disk_id:
+        return None
+    return entry
 
 
 def _maybe_auto_dead(session: Session, disk: CacheDisk) -> bool:
