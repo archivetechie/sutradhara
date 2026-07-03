@@ -34,6 +34,12 @@ def test_sign_resolve_and_revoke_device_certificate(engine: Engine, tmp_path) ->
 
     assert signed.device_id == "mac-1"
     assert signed.cert_path.is_file()
+    cert_text = ca._run_openssl(["x509", "-in", str(signed.cert_path), "-noout", "-text"])
+    assert "Version: 3 (0x2)" in cert_text
+    assert "CA:FALSE" in cert_text
+    assert "Digital Signature" in cert_text
+    assert "TLS Web Client Authentication" in cert_text
+
     context = _FakeContext("mac-1", signed.cert_path.read_text(encoding="utf-8"))
     identity = ca.resolve_peer_identity(engine, context)
     assert identity.operator == "owner"

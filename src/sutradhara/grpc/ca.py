@@ -194,8 +194,23 @@ def sign_device_csr(
     factory = make_session_factory(engine)
     with factory.begin() as session:
         grant = store.consume_enroll_token(session, token, device_id=device_id)
+    extfile: Path | None = None
     try:
         ca_cert, ca_key = ensure_ca(pki_dir)
+        with tempfile.NamedTemporaryFile("w", suffix=".cnf", delete=False) as handle:
+            handle.write(
+                "\n".join(
+                    [
+                        "basicConstraints=critical,CA:FALSE",
+                        "keyUsage=critical,digitalSignature",
+                        "extendedKeyUsage=clientAuth",
+                        "subjectKeyIdentifier=hash",
+                        "authorityKeyIdentifier=keyid,issuer",
+                    ]
+                )
+                + "\n"
+            )
+            extfile = Path(handle.name)
         _run_openssl(
             [
                 "x509",
@@ -212,12 +227,17 @@ def sign_device_csr(
                 "-days",
                 "825",
                 "-sha256",
+                "-extfile",
+                str(extfile),
             ]
         )
     except Exception:
         with factory.begin() as session:
             store.release_enroll_token(session, token)
         raise
+    finally:
+        if extfile is not None:
+            extfile.unlink(missing_ok=True)
     fingerprint = cert_fingerprint(output)
     try:
         with factory.begin() as session:
