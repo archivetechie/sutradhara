@@ -199,6 +199,30 @@ def test_policy_shrink_to_zero_closes_existing_due_row(engine: Engine) -> None:
         assert session.scalar(select(func.count()).select_from(Job)) == 0
 
 
+def test_write_fenced_pool_does_not_open_copy_condition(engine: Engine) -> None:
+    asset_hash = _add_registered_asset(engine, b"asset-fenced", "class-a")
+    with session_scope(engine) as session:
+        _add_pool(session, "pool-a", "class-a")
+        _add_pool(session, "pool-fenced", "class-a", accepts_writes=False)
+
+    active_key = copy_reconciler.make_target_key(asset_hash, "pool-a")
+    fenced_key = copy_reconciler.make_target_key(asset_hash, "pool-fenced")
+
+    with session_scope(engine) as session:
+        discover(session, "copy")
+
+        assert _condition(session, active_key).condition == CONDITION_OPEN
+        assert session.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "copy",
+                ReconciliationCondition.target_key == fenced_key,
+            )
+        ).one_or_none() is None
+        fenced = copy_reconciler.observe(session, fenced_key)
+        assert fenced.desired is False
+        assert fenced.observed_state == "missing"
+
+
 def test_missing_policy_on_discovery_logs_diagnostic_and_skips(
     engine: Engine,
     caplog: pytest.LogCaptureFixture,
@@ -295,7 +319,13 @@ def _add_membership_rows(
     )
 
 
-def _add_pool(session: Session, pool_id: str, artifactclass: str) -> None:
+def _add_pool(
+    session: Session,
+    pool_id: str,
+    artifactclass: str,
+    *,
+    accepts_writes: bool = True,
+) -> None:
     backend_name = f"backend-{pool_id}"
     backend = Backend(
         name=backend_name,
@@ -310,6 +340,7 @@ def _add_pool(session: Session, pool_id: str, artifactclass: str) -> None:
             id=pool_id,
             backend_id=backend.id,
             representation=Representation.RAW_BYTES.value,
+            accepts_writes=accepts_writes,
         )
     )
     session.add(ArtifactClassPool(artifactclass=artifactclass, pool_id=pool_id))

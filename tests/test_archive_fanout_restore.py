@@ -16,9 +16,9 @@ from sqlalchemy import Engine, select
 from sutradhara.archive_bundle import bundle_due, enqueue_artifact
 from sutradhara.archive_fanout import (
     ArchiveFanoutError,
+    BuildArtifact,
     BuiltBlobRoot,
     BuiltExclusion,
-    BuildArtifact,
     BundleHeld,
     BundleOversize,
     ConformanceScan,
@@ -51,7 +51,13 @@ from sutradhara.artifactclass_policy import (
     apply_artifactclass_policy,
     get_artifactclass_policy,
 )
-from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, VerifyResult
+from sutradhara.backend.port import (
+    BackendError,
+    BackendLocator,
+    ByteRange,
+    CopyRecord,
+    VerifyResult,
+)
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import (
     AssetLocator,
@@ -73,10 +79,16 @@ from sutradhara.catalog.types import (
     CopySource,
     content_hash,
 )
+from sutradhara.durability import bundle_replication_status
+from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register bundle-repair
+from sutradhara.jobs.engine import run_one, submit
+from sutradhara.jobs.handlers import bundle_repair
+from sutradhara.jobs.models import ReconciliationCondition
+from sutradhara.jobs.reconcilers.conditions import CONDITION_BACKOFF, OBSERVED_MISSING
+from sutradhara.replication import target_pools
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 from sutradhara.staging import stage_and_enqueue_artifact
-from sutradhara.replication import target_pools
 
 
 @pytest.fixture
@@ -146,6 +158,17 @@ class _ArchiveWriteBackend:
     def corrupt(self, locator: BackendLocator) -> None:
         object_id = str(locator["object_id"])
         self._objects[object_id] = b"corrupt" + self._objects[object_id]
+
+
+class _TransientWriteBackend(_ArchiveWriteBackend):
+    def __init__(self, name: str, failing_pools: set[str]) -> None:
+        super().__init__(name)
+        self.failing_pools = failing_pools
+
+    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+        if pool in self.failing_pools:
+            raise BackendError(f"transport unavailable for pool {pool}")
+        return super().write_object_to_pool(source, pool)
 
 
 class _DeviationBuilder(LocalArchiveBuilder):
@@ -413,6 +436,95 @@ def test_enqueue_due_and_flush_fans_out_bundle_copies(
         assert all(copy.logical_asset_hash is None for copy in copies)
         assert len(list(s.scalars(select(AssetLocator)))) == 4
         assert rem_backend.writes == ["o-copy-1-pool"]
+        assert d2_backend.writes == ["d2-shelf-pool"]
+
+
+def test_flush_bundle_transient_partial_seals_and_repair_heals(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _create_bundle(engine, tmp_path, target_gb=0.000000001)
+    rem_backend = _ArchiveWriteBackend("rem")
+    d2_backend = _TransientWriteBackend("d2", {"d2-shelf-pool"})
+
+    with session_scope(engine) as s:
+        result = flush_bundle(
+            s,
+            bundle_id=setup.bundle_id,
+            backends={
+                setup.rem_backend_id: rem_backend,
+                setup.d2_backend_id: d2_backend,
+            },
+            builder=LocalArchiveBuilder(),
+            deliverables_dir=tmp_path / "manifests",
+            manifest_signer=HmacManifestSigner(b"receipt-secret", "test-key"),
+        )
+
+        sealed = s.get(Bundle, setup.bundle_id)
+        assert sealed is not None
+        assert sealed.status == "sealed"
+        assert result.partial is True
+        assert result.failed_pools == ("d2-shelf-pool",)
+        assert result.condition_reason == "transient-backend-failure"
+        assert result.condition_message is not None
+        assert "d2-shelf-pool" in result.condition_message
+        assert len(result.copy_ids) == 1
+        assert result.manifest_path is not None
+        assert Path(result.manifest_path).exists()
+
+        copies = list(s.scalars(select(Copy).order_by(Copy.pool_id)))
+        assert {copy.pool_id for copy in copies} == {"o-copy-1-pool"}
+        condition = s.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "bundle_copy",
+                ReconciliationCondition.target_key == setup.bundle_id,
+            )
+        ).one()
+        assert condition.condition == CONDITION_BACKOFF
+        assert condition.reason == "transient-backend-failure"
+        assert condition.observed_state == OBSERVED_MISSING
+        assert condition.message is not None
+        assert "d2-shelf-pool" in condition.message
+
+        status = bundle_replication_status(s, setup.bundle_id)
+        assert status["complete"] is False
+        assert {target.pool_id for target in status["missing"]} == {"d2-shelf-pool"}
+
+    d2_backend.failing_pools.clear()
+
+    def backend_from_row(row: Backend) -> _ArchiveWriteBackend:
+        if row.id == setup.rem_backend_id:
+            return rem_backend
+        if row.id == setup.d2_backend_id:
+            return d2_backend
+        raise AssertionError(f"unexpected backend row {row.id}")
+
+    monkeypatch.setattr(bundle_repair.factory, "backend_from_row", backend_from_row)
+    monkeypatch.setattr(
+        bundle_repair,
+        "make_archive_builder",
+        lambda rem_bin=None: LocalArchiveBuilder(),
+    )
+    with session_scope(engine) as s:
+        job = submit(
+            s,
+            "bundle-repair",
+            {"bundle_id": setup.bundle_id},
+            recon_domain="bundle_copy",
+            recon_target_key=setup.bundle_id,
+            dedupe_key=f"bundle_copy:{setup.bundle_id}",
+        )
+        repair_result = run_one(s, job.id)
+
+        assert repair_result.ok
+        assert "d2-shelf-pool" in repair_result.detail
+        status = bundle_replication_status(s, setup.bundle_id)
+        assert status["complete"] is True
+        assert {copy.pool_id for copy in s.scalars(select(Copy).order_by(Copy.pool_id))} == {
+            "d2-shelf-pool",
+            "o-copy-1-pool",
+        }
         assert d2_backend.writes == ["d2-shelf-pool"]
 
 

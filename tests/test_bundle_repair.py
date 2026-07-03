@@ -36,8 +36,8 @@ from sutradhara.backend.port import (
 )
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import (
-    AssetLocator,
     ArtifactClassPolicyRecord,
+    AssetLocator,
     Backend,
     BlobRoot,
     Bundle,
@@ -55,6 +55,7 @@ from sutradhara.jobs.handlers import bundle_repair
 from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers import bundle_copy
 from sutradhara.jobs.reconcilers.conditions import (
+    CONDITION_BACKOFF,
     CONDITION_BLOCKED,
     CONDITION_SATISFIED,
     OBSERVED_MISSING,
@@ -296,6 +297,62 @@ def test_bundle_repair_failed_target_verification_commits_suspect_copy_then_reru
         assert second_job.status == JobStatus.SUCCEEDED
         status = bundle_replication_status(s, bundle_id)
         assert status["complete"] is True
+
+
+def test_bundle_repair_reports_write_fenced_missing_pools(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _Backend()
+    bundle_id, _backend_id, _assets = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
+
+    with session_scope(engine) as s:
+        p2 = s.get(Pool, "p2")
+        assert p2 is not None
+        p2.accepts_writes = False
+        p2_copy = s.scalars(select(Copy).where(Copy.pool_id == "p2")).one()
+        p2_copy.health = CopyHealth.MISSING
+        policy = s.get(ArtifactClassPolicyRecord, "class-a")
+        assert policy is not None
+        policy.min_copies = 1
+        condition = s.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "bundle_copy",
+                ReconciliationCondition.target_key == bundle_id,
+            )
+        ).one()
+        assert condition.condition == CONDITION_SATISFIED
+
+        monkeypatch.setattr(bundle_repair.factory, "backend_from_row", lambda _row: backend)
+        monkeypatch.setattr(
+            bundle_repair,
+            "make_archive_builder",
+            lambda rem_bin=None: _OutputsBuilder(),
+        )
+        job = submit(
+            s,
+            "bundle-repair",
+            {"bundle_id": bundle_id},
+            recon_domain="bundle_copy",
+            recon_target_key=bundle_id,
+            dedupe_key=f"bundle_copy:{bundle_id}",
+        )
+        result = run_one(s, job.id)
+
+        assert result.ok
+        assert "write-fenced" in result.detail
+        assert "p2" in result.detail
+        assert result.step_state["bundle_repair"]["repaired_pools"] == []
+        assert result.step_state["bundle_repair"]["remaining_write_fenced_pools"] == ["p2"]
+        status = bundle_replication_status(s, bundle_id)
+        assert status["complete"] is False
+        assert {target.pool_id for target in status["missing"]} == {"p2"}
+        assert condition.condition == CONDITION_BACKOFF
+        assert condition.reason == "fenced-missing"
+        assert condition.observed_state == OBSERVED_MISSING
+        assert condition.message is not None
+        assert "p2" in condition.message
 
 
 def test_bundle_copy_reconciler_observes_placement_complete_without_default_floor(

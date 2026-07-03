@@ -33,12 +33,17 @@ from sutradhara.archive_bundle import (
     record_exclusion,
 )
 from sutradhara.archive_restore import ArchiveRestoreError, read_member_bytes
-from sutradhara.backend.port import ByteRange
+from sutradhara.backend.port import BackendError, ByteRange
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Bundle, BundleMember, Copy
 from sutradhara.catalog.types import CopyHealth, CopySource
 from sutradhara.hdcache.fill import enqueue_post_flush_hdcache_fills
-from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, record_observation
+from sutradhara.jobs.reconcilers.conditions import (
+    CONDITION_BACKOFF,
+    OBSERVED_MISSING,
+    record_condition,
+    record_observation,
+)
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.rem_archive_cli import (
     resolve_rem_bin,
@@ -72,6 +77,19 @@ class BundleOversize(ArchiveFanoutError):
 
 class ManifestSigningError(ArchiveFanoutError):
     """A customer receipt could not be signed with a real keyed signature."""
+
+
+class TransientPoolFanoutError(BackendError, ArchiveFanoutError):
+    """A target pool failed with a retryable backend transport error."""
+
+    def __init__(self, pool_id: str, backend_name: str, cause: BaseException) -> None:
+        self.pool_id = pool_id
+        self.backend_name = backend_name
+        self.cause = cause
+        super().__init__(
+            f"transient backend failure for pool {pool_id!r} "
+            f"on backend {backend_name!r}: {cause}"
+        )
 
 
 @dataclass(frozen=True)
@@ -238,11 +256,15 @@ class HmacManifestSigner:
 
 @dataclass(frozen=True)
 class FanoutResult:
-    """Summary of a successful bundle fan-out."""
+    """Summary of a bundle fan-out that reached sealed state."""
 
     bundle_id: str
     copy_ids: tuple[int, ...]
     manifest_path: str | None
+    partial: bool = False
+    failed_pools: tuple[str, ...] = ()
+    condition_reason: str | None = None
+    condition_message: str | None = None
 
 
 ArtifactObserver = Callable[[BuildArtifact], None]
@@ -533,6 +555,7 @@ def flush_bundle(
     targets = target_pools(session, bundle.artifactclass, backends, key_epoch=key_epoch)
     _require_key_epoch(targets)
     copy_ids: list[int] = []
+    transient_failures: list[TransientPoolFanoutError] = []
     manifest_receipt: str | None = None
     bundle.status = "flushing"
     bundle.flushed_at = dt.datetime.now(dt.UTC)
@@ -540,32 +563,36 @@ def flush_bundle(
     with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-{bundle.id}-") as raw:
         work_dir = Path(raw)
         for backend, target in targets:
-            # The DB transaction closes after all targets are written. A process
-            # crash here leaves physical orphan objects for scrub/reconcile,
-            # but not partial catalog rows.
+            # Each target owns a savepoint so retryable backend failures do not
+            # erase catalog rows for earlier successful placements.
             built: list[BuildArtifact] = []
-            copy = build_bundle_copy_for_pool(
-                session,
-                bundle=bundle,
-                target=target,
-                member_sources=members,
-                builder=builder,
-                backend=backend,
-                key_epoch=key_epoch,
-                work_dir=work_dir,
-                map_path=resolved_map_path,
-                source_root=resolved_source_root,
-                map_sha256=map_sha256,
-                artifact_validator=artifact_validator,
-                artifact_observer=built.append,
-            )
-            [artifact] = built
+            try:
+                with session.begin_nested():
+                    copy = build_bundle_copy_for_pool(
+                        session,
+                        bundle=bundle,
+                        target=target,
+                        member_sources=members,
+                        builder=builder,
+                        backend=backend,
+                        key_epoch=key_epoch,
+                        work_dir=work_dir,
+                        map_path=resolved_map_path,
+                        source_root=resolved_source_root,
+                        map_sha256=map_sha256,
+                        artifact_validator=artifact_validator,
+                        artifact_observer=built.append,
+                    )
+                    [artifact] = built
+                    _record_build_exclusions(
+                        session,
+                        bundle=bundle,
+                        artifact=artifact,
+                    )
+            except TransientPoolFanoutError as exc:
+                transient_failures.append(exc)
+                continue
             copy_ids.append(copy.id)
-            _record_build_exclusions(
-                session,
-                bundle=bundle,
-                artifact=artifact,
-            )
             if (
                 deliverables_dir is not None
                 and artifact.manifest_path is not None
@@ -584,10 +611,28 @@ def flush_bundle(
                 bundle.customer_manifest_path = manifest_receipt
 
     close_bundle(session, bundle)
-    _record_bundle_copy_outbox(session, bundle.id)
+    if transient_failures:
+        condition_message = _record_bundle_copy_transient_backoff(
+            session,
+            bundle.id,
+            transient_failures,
+        )
+        condition_reason = "transient-backend-failure"
+    else:
+        _record_bundle_copy_outbox(session, bundle.id)
+        condition_message = None
+        condition_reason = None
     _schedule_bundle_copy_fast_path(session, bundle.id)
     enqueue_post_flush_hdcache_fills(session, bundle.id)
-    return FanoutResult(bundle.id, tuple(copy_ids), manifest_receipt)
+    return FanoutResult(
+        bundle.id,
+        tuple(copy_ids),
+        manifest_receipt,
+        partial=bool(transient_failures),
+        failed_pools=tuple(failure.pool_id for failure in transient_failures),
+        condition_reason=condition_reason,
+        condition_message=condition_message,
+    )
 
 
 def _record_bundle_copy_outbox(session: Session, bundle_id: str) -> None:
@@ -600,6 +645,38 @@ def _record_bundle_copy_outbox(session: Session, bundle_id: str) -> None:
         reason="durability-unverified",
         message="bundle fan-out committed copies; post-commit durability check pending",
     )
+
+
+def _record_bundle_copy_transient_backoff(
+    session: Session,
+    bundle_id: str,
+    failures: Sequence[TransientPoolFanoutError],
+) -> str:
+    detail = "; ".join(
+        f"pool {failure.pool_id}: {failure.cause}" for failure in failures
+    )
+    message = (
+        f"bundle {bundle_id} sealed with partial fan-out; "
+        f"transient backend failure for {detail}"
+    )
+    record_observation(
+        session,
+        domain="bundle_copy",
+        target_key=bundle_id,
+        desired=True,
+        observed_state=OBSERVED_MISSING,
+        reason="transient-backend-failure",
+        message=message,
+    )
+    record_condition(
+        session,
+        domain="bundle_copy",
+        target_key=bundle_id,
+        condition=CONDITION_BACKOFF,
+        reason="transient-backend-failure",
+        message=message,
+    )
+    return message
 
 
 def _schedule_bundle_copy_fast_path(session: Session, bundle_id: str) -> None:
@@ -665,7 +742,10 @@ def build_bundle_copy_for_pool(
     )
     if artifact_validator is not None:
         artifact_validator(target, artifact)
-    record = backend.write_object_to_pool(artifact.artifact_path, target.pool_id)
+    try:
+        record = backend.write_object_to_pool(artifact.artifact_path, target.pool_id)
+    except (BackendError, OSError) as exc:
+        raise TransientPoolFanoutError(target.pool_id, target.backend_name, exc) from exc
     storage_metadata = _copy_storage_metadata(
         target.representation,
         key_epoch=target.key_epoch,
@@ -699,6 +779,9 @@ def build_bundle_copy_for_pool(
             builder=builder,
             work_dir=work_dir,
         )
+    except (BackendError, OSError) as exc:
+        copy.health = CopyHealth.SUSPECT
+        raise TransientPoolFanoutError(target.pool_id, target.backend_name, exc) from exc
     except Exception:
         copy.health = CopyHealth.SUSPECT
         raise

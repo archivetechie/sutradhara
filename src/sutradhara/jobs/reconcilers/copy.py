@@ -155,6 +155,7 @@ def _active_pool_ids_for_class(session: Session, artifactclass: str) -> set[str]
             select(ArtifactClassPool.pool_id).where(
                 ArtifactClassPool.artifactclass == artifactclass,
                 ArtifactClassPool.active.is_(True),
+                ArtifactClassPool.pool.has(Pool.accepts_writes.is_(True)),
             )
         )
     )

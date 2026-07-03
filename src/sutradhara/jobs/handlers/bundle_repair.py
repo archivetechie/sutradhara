@@ -29,10 +29,14 @@ from sutradhara.backend.port import BackendError
 from sutradhara.catalog.models import ArtifactClassPool, AssetLocator, Backend, Bundle, Pool
 from sutradhara.catalog.types import CopyHealth
 from sutradhara.durability import BundleTarget, bundle_replication_status
-from sutradhara.jobs.registry import JobContext, JobResult, register_handler
-from sutradhara.jobs.registry import ConditionProjection
 from sutradhara.jobs.reconcilers import bundle_copy
-from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
+from sutradhara.jobs.reconcilers.conditions import (
+    CONDITION_BACKOFF,
+    CONDITION_BLOCKED,
+    OBSERVED_MISSING,
+    record_observation,
+)
+from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
 from sutradhara.replication import (
     PoolTargetEntry,
     SelfHealUnavailable,
@@ -114,6 +118,41 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
             errors.append(f"copy id={source.id}: {exc}")
             continue
 
+        remaining_missing = _missing_pool_ids(ctx, bundle.id)
+        fenced_missing = _write_fenced_pool_ids(ctx, remaining_missing)
+        if remaining_missing and remaining_missing == fenced_missing:
+            message = _write_fenced_missing_message(
+                bundle.id,
+                repaired=repaired,
+                fenced_missing=fenced_missing,
+            )
+            record_observation(
+                ctx.session,
+                domain=DOMAIN,
+                target_key=bundle.id,
+                desired=True,
+                observed_state=OBSERVED_MISSING,
+                reason="fenced-missing",
+                message=message,
+            )
+            return JobResult(
+                ok=True,
+                detail=message,
+                step_state={
+                    "bundle_repair": {
+                        "bundle_id": bundle.id,
+                        "source_copy_id": source.id,
+                        "repaired_pools": sorted(repaired),
+                        "remaining_write_fenced_pools": sorted(fenced_missing),
+                    }
+                },
+                condition=ConditionProjection(
+                    condition=CONDITION_BACKOFF,
+                    reason="fenced-missing",
+                    message=message,
+                ),
+            )
+
         return JobResult(
             ok=True,
             detail=f"bundle {bundle.id} repaired pools={sorted(repaired)}",
@@ -182,6 +221,31 @@ def _missing_pool_ids(ctx: JobContext, bundle_id: str) -> set[str]:
     return {
         target.pool_id for target in bundle_replication_status(ctx.session, bundle_id)["missing"]
     }
+
+
+def _write_fenced_pool_ids(ctx: JobContext, pool_ids: set[str]) -> set[str]:
+    if not pool_ids:
+        return set()
+    return set(
+        ctx.session.scalars(
+            select(Pool.id).where(
+                Pool.id.in_(pool_ids),
+                Pool.accepts_writes.is_(False),
+            )
+        )
+    )
+
+
+def _write_fenced_missing_message(
+    bundle_id: str,
+    *,
+    repaired: set[str],
+    fenced_missing: set[str],
+) -> str:
+    return (
+        f"bundle {bundle_id} repaired pools={sorted(repaired)}; "
+        f"remaining missing pools are write-fenced: {sorted(fenced_missing)}"
+    )
 
 
 def _extract_member_sources(
