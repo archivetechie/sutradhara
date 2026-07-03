@@ -234,6 +234,10 @@ def _assert_hdcache_invariants(db_path: Path) -> None:
     assert "content_sha256 BLOB" in entry_sql
     assert "FOREIGN KEY(content_sha256) REFERENCES logical_asset" in entry_sql
     assert "FOREIGN KEY(disk_id) REFERENCES cache_disk" in entry_sql
+    assert "lost_origin_disk_id" in entry_sql
+    assert "lost_drill_id" in entry_sql
+    assert "lost_at" in entry_sql
+    assert "refilled_at" in entry_sql
     entry_indexes = _index_columns(db_path, "cache_entry")
     assert ("bundle_key",) in entry_indexes
     assert ("group_key",) in entry_indexes
