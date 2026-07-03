@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -31,6 +32,7 @@ RAW_REPRESENTATION = "raw-bytes"
 AEAD_REPRESENTATION = "rao-aead-v1"
 DEFAULT_HMAC_KEY_PATH = Path("/var/lib/replica/hdcache-disk-hmac.key")
 BUFFER_SIZE = 1024 * 1024
+KEY_EPOCH_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class StoreError(RuntimeError):
@@ -281,9 +283,10 @@ def write_entry(
     tmp_dir = tmp_root(mount)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     final_path.parent.mkdir(parents=True, exist_ok=True)
-    expected = expected_stream_sha256 or _default_expected_digest(
+    expected = _expected_stream_digest(
         content_sha256,
         representation,
+        expected_stream_sha256,
     )
     fd, tmp_name = tempfile.mkstemp(prefix=".entry.", suffix=".tmp", dir=tmp_dir)
     tmp_path = Path(tmp_name)
@@ -338,9 +341,10 @@ def read_entry_verified(
         representation=representation,
         key_epoch=key_epoch,
     )
-    expected = expected_stream_sha256 or _default_expected_digest(
+    expected = _expected_stream_digest(
         content_sha256,
         representation,
+        expected_stream_sha256,
     )
     _require_regular_file(path, "cache entry")
     digest = hashlib.sha256()
@@ -471,8 +475,7 @@ def _entry_filename(
     if representation == AEAD_REPRESENTATION:
         if not key_epoch:
             raise StoreError("AEAD cache entries require key_epoch")
-        if any(separator in key_epoch for separator in ("/", "\\", ".")):
-            raise StoreError("key_epoch must not contain path or filename separators")
+        _validate_key_epoch(key_epoch)
         return f"{sha}.{AEAD_REPRESENTATION}.{key_epoch}"
     raise StoreError(f"unsupported cache representation: {representation}")
 
@@ -487,15 +490,40 @@ def _parse_entry_filename(name: str) -> tuple[bytes, str, str | None] | None:
         return None
     if len(parts) == 1:
         return content_sha256, RAW_REPRESENTATION, None
-    if len(parts) == 3 and parts[1] == AEAD_REPRESENTATION and parts[2]:
+    if len(parts) == 3 and parts[1] == AEAD_REPRESENTATION and _is_valid_key_epoch(parts[2]):
         return content_sha256, AEAD_REPRESENTATION, parts[2]
     return None
+
+
+def _expected_stream_digest(
+    content_sha256: bytes,
+    representation: str,
+    expected_stream_sha256: bytes | None,
+) -> bytes:
+    if expected_stream_sha256 is not None:
+        _validate_digest(expected_stream_sha256, "expected_stream_sha256")
+        return expected_stream_sha256
+    return _default_expected_digest(content_sha256, representation)
 
 
 def _default_expected_digest(content_sha256: bytes, representation: str) -> bytes:
     if representation == RAW_REPRESENTATION:
         return content_sha256
     raise StoreError("expected_stream_sha256 is required for sealed cache entries")
+
+
+def _validate_digest(value: bytes, label: str) -> None:
+    if len(value) != 32:
+        raise StoreError(f"{label} must be 32 bytes")
+
+
+def _validate_key_epoch(key_epoch: str) -> None:
+    if not _is_valid_key_epoch(key_epoch):
+        raise StoreError("key_epoch must be 1-128 ASCII letters, digits, '_' or '-'")
+
+
+def _is_valid_key_epoch(key_epoch: str) -> bool:
+    return KEY_EPOCH_PATTERN.fullmatch(key_epoch) is not None
 
 
 def _iter_chunks(source: BinaryIO | Iterable[bytes] | bytes) -> Iterator[bytes]:

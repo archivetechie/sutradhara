@@ -58,10 +58,10 @@ class CacheDisk(Base):
     )
     last_walk_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    entries: Mapped[list["CacheEntry"]] = relationship(
+    entries: Mapped[list[CacheEntry]] = relationship(
         back_populates="disk",
         cascade="all, delete-orphan",
-        lazy="selectin",
+        lazy="raise",
     )
 
 
@@ -133,7 +133,7 @@ class RestoreRequest(Base):
     destination_id: Mapped[str] = mapped_column(String(128), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
 
-    items: Mapped[list["RestoreRequestItem"]] = relationship(
+    items: Mapped[list[RestoreRequestItem]] = relationship(
         back_populates="request",
         cascade="all, delete-orphan",
         lazy="selectin",

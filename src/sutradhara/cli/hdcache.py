@@ -24,6 +24,7 @@ from sutradhara.hdcache.store import StoreError
 
 ManagerFactory = Callable[[], HdcacheLifecycleManager]
 _MANAGER_FACTORY: ManagerFactory | None = None
+CLI_ERRORS = (LifecycleError, OSError, StoreError)
 
 
 @click.group("hdcache")
@@ -52,8 +53,8 @@ def disk_add_cmd(
     manager = _manager()
     try:
         if scan_mode:
-            candidates = manager.scan()
             if not yes:
+                candidates = manager.scan()
                 _emit_scan(candidates, as_json=as_json)
                 return
             results = manager.add_scan()
@@ -61,7 +62,7 @@ def disk_add_cmd(
             if block_dev is None:
                 raise click.UsageError("provide BLOCK_DEV or --scan")
             results = [manager.add_disk(block_dev)]
-    except LifecycleError as exc:
+    except CLI_ERRORS as exc:
         raise click.ClickException(str(exc)) from exc
     payload = [add_result_payload(result) for result in results]
     if as_json:
@@ -84,7 +85,10 @@ def disk_list_cmd(include_dead: bool, as_json: bool) -> None:
     """List enrolled disks."""
 
     manager = _manager()
-    rows = [disk_payload(row) for row in manager.disks(include_dead=include_dead)]
+    try:
+        rows = [disk_payload(row) for row in manager.disks(include_dead=include_dead)]
+    except CLI_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
     if as_json:
         click.echo(json.dumps({"disks": rows}, indent=2, sort_keys=True))
         return
@@ -103,7 +107,7 @@ def disk_locate_cmd(disk_id: str) -> None:
 
     try:
         click.echo(_manager().locate(disk_id))
-    except LifecycleError as exc:
+    except CLI_ERRORS as exc:
         raise click.ClickException(str(exc)) from exc
 
 
@@ -115,7 +119,7 @@ def disk_retire_cmd(disk_id: str, as_json: bool) -> None:
 
     try:
         row = _manager().retire(disk_id)
-    except LifecycleError as exc:
+    except CLI_ERRORS as exc:
         raise click.ClickException(str(exc)) from exc
     payload = disk_payload(row)
     if as_json:
@@ -127,8 +131,14 @@ def disk_retire_cmd(disk_id: str, as_json: bool) -> None:
 @disk_group.command("dead")
 @click.argument("disk_id")
 @click.option("--yes", is_flag=True, default=False, help="Confirm immediate loss marking.")
+@click.option(
+    "--confirm-mounted",
+    is_flag=True,
+    default=False,
+    help="Confirm marking a disk dead even though it still appears mounted.",
+)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
-def disk_dead_cmd(disk_id: str, yes: bool, as_json: bool) -> None:
+def disk_dead_cmd(disk_id: str, yes: bool, confirm_mounted: bool, as_json: bool) -> None:
     """Mark a disk gone now and flip entries to lost in bounded batches."""
 
     if not yes:
@@ -138,8 +148,8 @@ def disk_dead_cmd(disk_id: str, yes: bool, as_json: bool) -> None:
         )
         return
     try:
-        result = _manager().mark_dead(disk_id)
-    except LifecycleError as exc:
+        result = _manager().mark_dead(disk_id, confirm_mounted=confirm_mounted)
+    except CLI_ERRORS as exc:
         raise click.ClickException(str(exc)) from exc
     payload = dead_result_payload(result)
     if as_json:
@@ -160,7 +170,7 @@ def disk_forget_cmd(disk_id: str) -> None:
 
     try:
         _manager().forget(disk_id)
-    except LifecycleError as exc:
+    except CLI_ERRORS as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"{disk_id}: forgotten for operations; disk id retained as a tombstone")
 
@@ -173,15 +183,18 @@ def hdcache_status_cmd(show_disks: bool, disk_id: str | None, as_json: bool) -> 
     """Show hdcache disk summary."""
 
     manager = _manager()
-    if disk_id is not None:
-        rows = [row for row in manager.disks(include_dead=True) if row.disk_id == disk_id]
-        if not rows:
-            raise click.ClickException(f"unknown cache disk: {disk_id}")
-        payload: dict[str, Any] = {"disk": disk_payload(rows[0])}
-    else:
-        payload = {"summary": status_payload(manager.status())}
-        if show_disks:
-            payload["disks"] = [disk_payload(row) for row in manager.disks(include_dead=True)]
+    try:
+        if disk_id is not None:
+            rows = [row for row in manager.disks(include_dead=True) if row.disk_id == disk_id]
+            if not rows:
+                raise click.ClickException(f"unknown cache disk: {disk_id}")
+            payload: dict[str, Any] = {"disk": disk_payload(rows[0])}
+        else:
+            payload = {"summary": status_payload(manager.status())}
+            if show_disks:
+                payload["disks"] = [disk_payload(row) for row in manager.disks(include_dead=True)]
+    except CLI_ERRORS as exc:
+        raise click.ClickException(str(exc)) from exc
     if as_json:
         click.echo(json.dumps(payload, indent=2, sort_keys=True))
         return

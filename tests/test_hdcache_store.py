@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import json
 from collections.abc import Iterator
@@ -248,6 +247,60 @@ def test_store_enumerates_raw_and_aead_filenames(tmp_path: Path) -> None:
     )
 
 
+def test_store_validates_aead_key_epoch_and_stored_digest_contract(tmp_path: Path) -> None:
+    mount = tmp_path / "d001"
+    mount.mkdir()
+    plaintext_digest = hashlib.sha256(b"plaintext").digest()
+    sealed = b"sealed bytes"
+    sealed_digest = hashlib.sha256(sealed).digest()
+
+    result = write_entry(
+        mount,
+        plaintext_digest,
+        [sealed],
+        representation=AEAD_REPRESENTATION,
+        key_epoch="hdcache-epoch-1",
+        expected_stream_sha256=sealed_digest,
+    )
+
+    with pytest.raises(StoreError, match="expected_stream_sha256"):
+        read_entry_verified(
+            mount,
+            plaintext_digest,
+            representation=AEAD_REPRESENTATION,
+            key_epoch="hdcache-epoch-1",
+        )
+    assert (
+        read_entry_verified(
+            mount,
+            plaintext_digest,
+            representation=AEAD_REPRESENTATION,
+            key_epoch="hdcache-epoch-1",
+            expected_stream_sha256=result.stored_digest,
+        ).data
+        == sealed
+    )
+    for bad_epoch in ("a" * 129, "bad epoch", "bad.epoch", "bad:epoch"):
+        with pytest.raises(StoreError, match="key_epoch"):
+            write_entry(
+                mount,
+                plaintext_digest,
+                [sealed],
+                representation=AEAD_REPRESENTATION,
+                key_epoch=bad_epoch,
+                expected_stream_sha256=sealed_digest,
+            )
+    with pytest.raises(StoreError, match="32 bytes"):
+        write_entry(
+            mount,
+            plaintext_digest,
+            [sealed],
+            representation=AEAD_REPRESENTATION,
+            key_epoch="hdcache-epoch-1",
+            expected_stream_sha256=b"short",
+        )
+
+
 def test_disk_identity_matrix(tmp_path: Path) -> None:
     mount = tmp_path / "d001"
     mount.mkdir()
@@ -316,7 +369,7 @@ def _identity_status(
     mount: Path,
     expected: ExpectedDiskIdentity,
     secret: bytes,
-    probe: "FakeProbe",
+    probe: FakeProbe,
 ) -> str:
     result = verify_disk_identity(mount, expected, hmac_secret=secret, probe=probe)
     assert isinstance(result, DiskIdentityResult)

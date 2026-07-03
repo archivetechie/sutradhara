@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, Integer, cast, func, select
 
 from sutradhara.catalog.session import make_session_factory
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
@@ -117,6 +117,12 @@ class DiskProvisioner(Protocol):
     def drop_luks_key_slot(self, disk: CacheDisk) -> str | None:
         """Drop the LUKS key-slot association for a dead disk, if available."""
 
+    def cleanup_failed_enrollment(self, disk: ProvisionedDisk) -> str | None:
+        """Undo a failed post-provision enrollment, including unmount/close if possible."""
+
+    def is_mounted(self, disk: CacheDisk) -> bool:
+        """Return whether an enrolled disk still appears mounted/alive."""
+
 
 class ShellDiskProvisioner:
     """Best-effort shell-backed provisioner boundary.
@@ -178,6 +184,18 @@ class ShellDiskProvisioner:
     def drop_luks_key_slot(self, disk: CacheDisk) -> str | None:
         return f"no LUKS key-slot dropper configured for {disk.disk_id}"
 
+    def cleanup_failed_enrollment(self, disk: ProvisionedDisk) -> str | None:
+        return (
+            f"manual cleanup required for failed enrollment of {disk.block_dev} "
+            f"at {disk.mount}; no cleanup hook configured"
+        )
+
+    def is_mounted(self, disk: CacheDisk) -> bool:
+        try:
+            return Path(disk.mount).is_mount()
+        except OSError:
+            return False
+
 
 class HdcacheLifecycleManager:
     """Stateful hdcache disk lifecycle operations."""
@@ -210,42 +228,62 @@ class HdcacheLifecycleManager:
     def add_disk(self, block_dev: str) -> DiskAddResult:
         """Provision one disk and insert its cache_disk row."""
 
-        candidate = self._candidate_for_block_dev(block_dev)
+        return self._add_disk(block_dev)
+
+    def _add_disk(
+        self,
+        block_dev: str,
+        *,
+        candidate: BlockDeviceCandidate | None = None,
+    ) -> DiskAddResult:
+        candidate = candidate or self._candidate_for_block_dev(block_dev)
         if candidate is not None and candidate.serial in self._enrolled_serials():
             raise LifecycleError(f"cache disk serial is already enrolled: {candidate.serial}")
-        disk_id = self._next_disk_id()
-        provisioned = self.provisioner.provision(
-            block_dev,
-            disk_id=disk_id,
-            mount_root=self.mount_root,
-        )
-        expected = ExpectedDiskIdentity(
-            disk_id=disk_id,
-            serial=provisioned.serial,
-            fs_uuid=provisioned.fs_uuid,
-            wwn=provisioned.wwn,
-        )
-        write_disk_sentinel(provisioned.mount, expected, hmac_secret=self.hmac_secret)
-        now = dt.datetime.now(dt.UTC)
         factory = make_session_factory(self.engine)
-        with factory.begin() as session:
-            if self._serial_exists(session, provisioned.serial):
-                raise LifecycleError(f"cache disk serial is already enrolled: {provisioned.serial}")
-            row = CacheDisk(
-                disk_id=disk_id,
-                serial=provisioned.serial,
-                wwn=provisioned.wwn,
-                fs_uuid=provisioned.fs_uuid,
-                enclosure=provisioned.enclosure,
-                slot=provisioned.slot,
-                mount=str(provisioned.mount),
-                state="active",
-                capacity_bytes=provisioned.capacity_bytes,
-                filled_bytes=0,
-                smart_status=provisioned.smart_status,
-                enrolled_at=now,
-            )
-            session.add(row)
+        provisioned: ProvisionedDisk | None = None
+        disk_id = ""
+        try:
+            with factory.begin() as session:
+                if candidate is not None and self._serial_exists(session, candidate.serial):
+                    raise LifecycleError(f"cache disk serial is already enrolled: {candidate.serial}")
+                disk_id = self._next_disk_id(session)
+                provisioned = self.provisioner.provision(
+                    block_dev,
+                    disk_id=disk_id,
+                    mount_root=self.mount_root,
+                )
+                expected = ExpectedDiskIdentity(
+                    disk_id=disk_id,
+                    serial=provisioned.serial,
+                    fs_uuid=provisioned.fs_uuid,
+                    wwn=provisioned.wwn,
+                )
+                write_disk_sentinel(provisioned.mount, expected, hmac_secret=self.hmac_secret)
+                if self._serial_exists(session, provisioned.serial):
+                    raise LifecycleError(
+                        f"cache disk serial is already enrolled: {provisioned.serial}"
+                    )
+                row = CacheDisk(
+                    disk_id=disk_id,
+                    serial=provisioned.serial,
+                    wwn=provisioned.wwn,
+                    fs_uuid=provisioned.fs_uuid,
+                    enclosure=provisioned.enclosure,
+                    slot=provisioned.slot,
+                    mount=str(provisioned.mount),
+                    state="active",
+                    capacity_bytes=provisioned.capacity_bytes,
+                    filled_bytes=0,
+                    smart_status=provisioned.smart_status,
+                    enrolled_at=dt.datetime.now(dt.UTC),
+                )
+                session.add(row)
+        except Exception as exc:
+            if provisioned is not None:
+                self._cleanup_failed_enrollment(provisioned, exc)
+            if isinstance(exc, LifecycleError):
+                raise
+            raise LifecycleError(f"failed to enroll {block_dev}: {exc}") from exc
         return DiskAddResult(
             disk_id=disk_id,
             serial=provisioned.serial,
@@ -256,10 +294,23 @@ class HdcacheLifecycleManager:
             smart_status=provisioned.smart_status,
         )
 
+    def _cleanup_failed_enrollment(
+        self,
+        disk: ProvisionedDisk,
+        original: BaseException,
+    ) -> None:
+        try:
+            self.provisioner.cleanup_failed_enrollment(disk)
+        except Exception as cleanup_exc:
+            raise LifecycleError(
+                f"failed to enroll {disk.block_dev}: {original}; "
+                f"cleanup also failed: {cleanup_exc}"
+            ) from cleanup_exc
+
     def add_scan(self) -> list[DiskAddResult]:
         """Provision every currently unenrolled scan candidate."""
 
-        return [self.add_disk(candidate.block_dev) for candidate in self.scan()]
+        return [self._add_disk(candidate.block_dev, candidate=candidate) for candidate in self.scan()]
 
     def disks(self, *, include_dead: bool = False) -> list[CacheDisk]:
         """Return enrolled disks sorted by disk_id."""
@@ -290,9 +341,15 @@ class HdcacheLifecycleManager:
         disk_id: str,
         *,
         batch_size: int = LOST_MARK_BATCH_SIZE,
+        confirm_mounted: bool = False,
     ) -> DeadDiskResult:
         """Mark a disk dead and flip its entries to lost in bounded transactions."""
 
+        disk = self._disk_or_error(disk_id)
+        if self._is_mounted(disk) and not confirm_mounted:
+            raise LifecycleError(
+                f"disk {disk_id} still appears mounted; pass --confirm-mounted to mark it dead"
+            )
         disk = self._set_disk_state(disk_id, "dead")
         total = 0
         batches = 0
@@ -303,7 +360,10 @@ class HdcacheLifecycleManager:
             total += changed
             batches += 1
             self.on_entries_lost(disk_id, changed)
-        luks_result = self.provisioner.drop_luks_key_slot(disk)
+        try:
+            luks_result = self.provisioner.drop_luks_key_slot(disk)
+        except Exception as exc:
+            luks_result = f"WARNING: failed to drop LUKS key slot for {disk_id}: {exc}"
         return DeadDiskResult(
             disk_id=disk_id,
             entries_lost=total,
@@ -350,12 +410,13 @@ class HdcacheLifecycleManager:
             worst_disks=[_disk_payload(row) for row in worst],
         )
 
-    def _next_disk_id(self) -> str:
-        rows = self.disks(include_dead=True)
-        max_number = 0
-        for row in rows:
-            if row.disk_id.startswith("d") and row.disk_id[1:].isdigit():
-                max_number = max(max_number, int(row.disk_id[1:]))
+    def _next_disk_id(self, session: Any) -> str:
+        max_number = session.scalar(
+            select(func.max(cast(func.substr(CacheDisk.disk_id, 2), Integer))).where(
+                CacheDisk.disk_id.like("d%")
+            )
+        )
+        max_number = int(max_number or 0)
         return f"d{max_number + 1:03d}"
 
     def _enrolled_serials(self) -> set[str]:
@@ -368,6 +429,12 @@ class HdcacheLifecycleManager:
             if candidate.block_dev == block_dev:
                 return candidate
         return None
+
+    def _is_mounted(self, disk: CacheDisk) -> bool:
+        try:
+            return self.provisioner.is_mounted(disk)
+        except Exception as exc:
+            raise LifecycleError(f"failed to probe mount state for {disk.disk_id}: {exc}") from exc
 
     def _disk_or_error(self, disk_id: str) -> CacheDisk:
         factory = make_session_factory(self.engine)
