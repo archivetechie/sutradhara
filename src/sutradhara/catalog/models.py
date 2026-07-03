@@ -27,6 +27,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -47,6 +48,7 @@ from sutradhara.catalog.types import (
     MediaKind,
     RetentionState,
     SubmissionStatus,
+    implementation_family_for_kind,
 )
 
 
@@ -656,6 +658,7 @@ class Backend(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     kind: Mapped[BackendKind] = mapped_column(String(32), nullable=False)
+    implementation_family: Mapped[str] = mapped_column(String(64), nullable=False)
     config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     tier: Mapped[BackendTier] = mapped_column(String(32), nullable=False)
     added_at: Mapped[dt.datetime] = mapped_column(
@@ -674,7 +677,23 @@ class Backend(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<Backend id={self.id} name={self.name!r} kind={self.kind} tier={self.tier}>"
+        return (
+            f"<Backend id={self.id} name={self.name!r} kind={self.kind} "
+            f"family={self.implementation_family!r} tier={self.tier}>"
+        )
+
+
+@event.listens_for(Backend, "before_insert")
+@event.listens_for(Backend, "before_update")
+def _set_backend_implementation_family(
+    mapper: object,
+    connection: object,
+    target: Backend,
+) -> None:
+    """Populate the required durability family from the backend kind registry."""
+
+    del mapper, connection
+    target.implementation_family = implementation_family_for_kind(target.kind)
 
 
 class OffsiteConfirmation(Base):
@@ -751,6 +770,9 @@ class Pool(Base):
     location: Mapped[str] = mapped_column(String(256), nullable=False, default="")
     offsite_gate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     tier: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    accepts_writes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    retired: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    media_generation: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -820,6 +842,8 @@ class ArtifactClassPolicyRecord(Base):
     target_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     max_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     restore_preference: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    min_copies: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    min_impl_families: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     staging_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     hdcache_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     policy_source: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -1015,7 +1039,7 @@ class AssetLocator(Base):
     )
     pool_id: Mapped[str] = mapped_column(
         String(128),
-        ForeignKey("pool.id", ondelete="CASCADE"),
+        ForeignKey("pool.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -1071,7 +1095,7 @@ class BlobRoot(Base):
     )
     pool_id: Mapped[str] = mapped_column(
         String(128),
-        ForeignKey("pool.id", ondelete="CASCADE"),
+        ForeignKey("pool.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )

@@ -36,13 +36,15 @@ def discover(
     reconciler = get_reconciler(domain)
     count = 0
     for observation in reconciler.enumerate_targets(session, cursor, batch):
-        record_observation(
+        condition = record_observation(
             session,
             domain=domain,
             target_key=observation.target_key,
             desired=observation.desired,
             observed_state=observation.observed_state,
         )
+        if reconciler.classify_condition is not None:
+            reconciler.classify_condition(session, observation.target_key, condition)
         count += 1
     return count
 
@@ -66,6 +68,8 @@ def process(
             desired=observation.desired,
             observed_state=observation.observed_state,
         )
+        if reconciler.classify_condition is not None:
+            reconciler.classify_condition(session, condition.target_key, refreshed)
         if gate_open(
             session,
             domain=domain,

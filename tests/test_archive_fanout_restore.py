@@ -45,6 +45,7 @@ from sutradhara.artifactclass_policy import (
     ArtifactClassPolicy,
     BundlingPolicy,
     CompressionStagingPolicy,
+    DurabilityPolicy,
     PlacementPolicy,
     StagingPolicy,
     apply_artifactclass_policy,
@@ -257,6 +258,7 @@ def _install_policy(
                 restore_preference=("o-copy-1-pool", "d2-shelf-pool"),
                 expect=expect,
                 staging=staging,
+                durability=DurabilityPolicy(min_copies=2, min_impl_families=2),
             ),
         )
         return rem.id, d2.id
@@ -501,6 +503,7 @@ def test_local_archive_builder_aead_offsets_verify_without_builder_fallback(
                 bundling=BundlingPolicy(target_gb=0.000000001, max_age_seconds=60),
                 restore_preference=("aead-pool",),
                 expect="messy",
+                durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
             ),
         )
         policy = get_artifactclass_policy(s, "aead-archive")
@@ -1138,6 +1141,7 @@ out.write_bytes(b"encrypted member")
                 bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
                 restore_preference=("encrypted-pool",),
                 expect="messy",
+                durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
             ),
         )
         record = backend.write_object_to_pool(object_path, "encrypted-pool")

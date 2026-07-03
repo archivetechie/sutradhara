@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.catalog.models import ArtifactClassPolicyRecord, ArtifactClassPool, Pool
 
@@ -113,6 +113,14 @@ class HdcachePolicy:
 
 
 @dataclass(frozen=True)
+class DurabilityPolicy:
+    """Declared minimum copy and implementation-family floor for an artifactclass."""
+
+    min_copies: int = 3
+    min_impl_families: int = 2
+
+
+@dataclass(frozen=True)
 class ArtifactClassPolicy:
     ruleset: str
     placements: tuple[PlacementPolicy, ...]
@@ -121,6 +129,7 @@ class ArtifactClassPolicy:
     expect: str
     staging: StagingPolicy = StagingPolicy()
     hdcache: HdcachePolicy = HdcachePolicy()
+    durability: DurabilityPolicy = DurabilityPolicy()
 
 
 _DURATION_RE = re.compile(r"^(?P<value>[1-9][0-9]*)(?P<unit>s|m|h|d)$")
@@ -201,7 +210,16 @@ def parse_artifactclass_policy(
     )
     _reject_keys(
         raw,
-        {"ruleset", "placements", "bundling", "restore", "expect", "staging", "hdcache"},
+        {
+            "ruleset",
+            "placements",
+            "bundling",
+            "restore",
+            "expect",
+            "staging",
+            "hdcache",
+            "durability",
+        },
         source,
     )
 
@@ -245,6 +263,7 @@ def parse_artifactclass_policy(
 
     staging = _parse_staging(raw.get("staging"), f"{source}: staging")
     hdcache = _parse_hdcache(raw.get("hdcache"), f"{source}: hdcache")
+    durability = _parse_durability(raw.get("durability"), f"{source}: durability")
 
     return ArtifactClassPolicy(
         ruleset=ruleset,
@@ -254,6 +273,7 @@ def parse_artifactclass_policy(
         expect=expect,
         staging=staging,
         hdcache=hdcache,
+        durability=durability,
     )
 
 
@@ -275,7 +295,11 @@ def apply_artifactclass_policy(
     referenced_pool_ids = set(pool_ids) | set(policy.restore_preference)
     pools = {
         pool.id: pool
-        for pool in session.scalars(select(Pool).where(Pool.id.in_(referenced_pool_ids)))
+        for pool in session.scalars(
+            select(Pool)
+            .options(joinedload(Pool.backend))
+            .where(Pool.id.in_(referenced_pool_ids))
+        )
     }
     missing = sorted(set(pool_ids) - set(pools))
     if missing:
@@ -283,6 +307,7 @@ def apply_artifactclass_policy(
             f"artifactclass {artifactclass!r} references unknown pools: " + ", ".join(missing)
         )
     _validate_restore_preference_pools(policy, pools)
+    _validate_write_eligible_floor(policy, pools, artifactclass=artifactclass)
     _validate_hdcache_privacy_mapping(policy)
     _warn_if_appledouble_ruleset_preservation_is_unproven(policy)
 
@@ -318,6 +343,8 @@ def apply_artifactclass_policy(
     record.target_bytes = policy.bundling.target_bytes
     record.max_age_seconds = policy.bundling.max_age_seconds
     record.restore_preference = list(policy.restore_preference)
+    record.min_copies = policy.durability.min_copies
+    record.min_impl_families = policy.durability.min_impl_families
     record.staging_config = policy.staging.to_json()
     record.hdcache_config = policy.hdcache.to_json()
     record.policy_source = source
@@ -349,7 +376,44 @@ def _validate_restore_preference_pools(
         raise ArtifactClassPolicyError(
             "restore.preference references unknown pools: " + ", ".join(missing)
         )
-    # M3/D3: warn here for restore-preference pools that are write-fenced.
+    fenced = sorted(
+        pool_id
+        for pool_id in policy.restore_preference
+        if pool_id in pools and not pools[pool_id].accepts_writes
+    )
+    if fenced:
+        warnings.warn(
+            "restore.preference includes write-fenced pool(s): " + ", ".join(fenced),
+            ArtifactClassPolicyWarning,
+            stacklevel=3,
+        )
+
+
+def _validate_write_eligible_floor(
+    policy: ArtifactClassPolicy,
+    pools: dict[str, Pool],
+    *,
+    artifactclass: str,
+) -> None:
+    write_eligible = [
+        pools[placement.pool]
+        for placement in policy.placements
+        if placement.active and pools[placement.pool].accepts_writes
+    ]
+    families = {
+        pool.backend.implementation_family
+        for pool in write_eligible
+        if pool.backend.implementation_family
+    }
+    min_copies = policy.durability.min_copies
+    min_families = policy.durability.min_impl_families
+    if len(write_eligible) >= min_copies and len(families) >= min_families:
+        return
+    raise ArtifactClassPolicyError(
+        f"artifactclass {artifactclass!r} write-eligible pools cannot satisfy durability "
+        f"floor min_copies={min_copies}, min_impl_families={min_families}: "
+        f"eligible_pools={len(write_eligible)}, implementation_families={len(families)}"
+    )
 
 
 def apply_artifactclass_policy_file(
@@ -409,6 +473,21 @@ def _parse_hdcache(raw: object, label: str) -> HdcachePolicy:
     if privacy_level != "none" and re.fullmatch(r"p[1-9][0-9]*", privacy_level) is None:
         raise ArtifactClassPolicyError(f"{label}.privacy_level must be 'none' or a p<N> level")
     return HdcachePolicy(enabled=enabled, privacy_level=privacy_level)
+
+
+def _parse_durability(raw: object, label: str) -> DurabilityPolicy:
+    if raw is None:
+        return DurabilityPolicy()
+    table = _required_table(raw, label)
+    _require_keys(table, {"min_copies", "min_impl_families"}, label)
+    _reject_keys(table, {"min_copies", "min_impl_families"}, label)
+    return DurabilityPolicy(
+        min_copies=_positive_int(table["min_copies"], f"{label}.min_copies"),
+        min_impl_families=_positive_int(
+            table["min_impl_families"],
+            f"{label}.min_impl_families",
+        ),
+    )
 
 
 def _validate_hdcache_privacy_mapping(policy: ArtifactClassPolicy) -> None:
@@ -509,6 +588,14 @@ def _optional_int(raw: object, label: str) -> int | None:
         return None
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise ArtifactClassPolicyError(f"{label} must be an integer")
+    return raw
+
+
+def _positive_int(raw: object, label: str) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ArtifactClassPolicyError(f"{label} must be an integer")
+    if raw < 1:
+        raise ArtifactClassPolicyError(f"{label} must be >= 1")
     return raw
 
 

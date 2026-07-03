@@ -42,6 +42,31 @@ class BackendKind(StrEnum):
     MEMORY = "memory"  # in-process test backend (sutradhara.backend.memory)
 
 
+BACKEND_IMPLEMENTATION_FAMILIES: dict[BackendKind, str] = {
+    BackendKind.REM_TAPE: "tape",
+    BackendKind.D2_TAPE: "d2tape",
+    BackendKind.REM_DISK: "disk",
+    BackendKind.PLAIN_DISK: "disk",
+    BackendKind.SSH_DISK: "disk",
+    BackendKind.S3: "cloud",
+    BackendKind.GCS: "cloud",
+    BackendKind.AZURE_BLOB: "cloud",
+    BackendKind.MEMORY: "memory",
+}
+
+
+def implementation_family_for_kind(kind: BackendKind | str) -> str:
+    """Return the durability implementation family for a registered backend kind."""
+
+    backend_kind = BackendKind(kind)
+    try:
+        return BACKEND_IMPLEMENTATION_FAMILIES[backend_kind]
+    except KeyError as exc:
+        raise ValueError(
+            f"backend kind {backend_kind.value!r} has no implementation family mapping"
+        ) from exc
+
+
 class BackendTier(StrEnum):
     """First-class distinction from spec-v0.1.md §5.2 / §5.3.
 

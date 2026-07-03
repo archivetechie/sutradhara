@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import logging
 import os
 import tarfile
 import tempfile
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.archive_bundle import (
@@ -37,6 +38,7 @@ from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Bundle, BundleMember, Copy
 from sutradhara.catalog.types import CopyHealth, CopySource
 from sutradhara.hdcache.fill import enqueue_post_flush_hdcache_fills
+from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, record_observation
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.rem_archive_cli import (
     resolve_rem_bin,
@@ -51,6 +53,9 @@ from sutradhara.replication import (
 from sutradhara.resource_control import run_managed
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+
+LOGGER = logging.getLogger(__name__)
+_BUNDLE_COPY_FAST_PATH_KEY = "sutradhara_bundle_copy_fast_path"
 
 
 class ArchiveFanoutError(Exception):
@@ -579,8 +584,47 @@ def flush_bundle(
                 bundle.customer_manifest_path = manifest_receipt
 
     close_bundle(session, bundle)
+    _record_bundle_copy_outbox(session, bundle.id)
+    _schedule_bundle_copy_fast_path(session, bundle.id)
     enqueue_post_flush_hdcache_fills(session, bundle.id)
     return FanoutResult(bundle.id, tuple(copy_ids), manifest_receipt)
+
+
+def _record_bundle_copy_outbox(session: Session, bundle_id: str) -> None:
+    record_observation(
+        session,
+        domain="bundle_copy",
+        target_key=bundle_id,
+        desired=True,
+        observed_state=OBSERVED_MISSING,
+        reason="durability-unverified",
+        message="bundle fan-out committed copies; post-commit durability check pending",
+    )
+
+
+def _schedule_bundle_copy_fast_path(session: Session, bundle_id: str) -> None:
+    pending = session.info.setdefault(_BUNDLE_COPY_FAST_PATH_KEY, set())
+    pending.add(bundle_id)
+
+
+@event.listens_for(Session, "after_commit")
+def _run_bundle_copy_fast_path(session: Session) -> None:
+    bundle_ids = session.info.pop(_BUNDLE_COPY_FAST_PATH_KEY, set())
+    if not bundle_ids:
+        return
+    try:
+        bind = session.get_bind()
+        with Session(bind=bind, future=True) as fast_session:
+            from sutradhara.jobs.reconcilers import bundle_copy
+
+            for bundle_id in sorted(bundle_ids):
+                bundle_copy.refresh_condition(fast_session, str(bundle_id))
+            fast_session.commit()
+    except Exception:
+        LOGGER.exception(
+            "bundle_copy_fast_path_failed",
+            extra={"bundle_ids": sorted(str(bundle_id) for bundle_id in bundle_ids)},
+        )
 
 
 def build_bundle_copy_for_pool(

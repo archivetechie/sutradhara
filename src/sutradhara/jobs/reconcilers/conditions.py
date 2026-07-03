@@ -44,6 +44,8 @@ def record_observation(
     target_key: str,
     desired: bool,
     observed_state: str,
+    reason: str | None = None,
+    message: str | None = None,
 ) -> ReconciliationCondition:
     """Record Axis-A reality for one reconciliation target.
 
@@ -84,6 +86,8 @@ def record_observation(
 
     row.observed_state = observed_state
     row.condition = CONDITION_OPEN
+    row.reason = reason
+    row.message = message
     if row.next_eligible_at is None:
         row.next_eligible_at = now
     row.updated_at = now

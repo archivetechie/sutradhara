@@ -30,6 +30,9 @@ from sutradhara.catalog.models import ArtifactClassPool, AssetLocator, Backend, 
 from sutradhara.catalog.types import CopyHealth
 from sutradhara.durability import BundleTarget, bundle_replication_status
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
+from sutradhara.jobs.registry import ConditionProjection
+from sutradhara.jobs.reconcilers import bundle_copy
+from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
 from sutradhara.replication import (
     PoolTargetEntry,
     SelfHealUnavailable,
@@ -58,6 +61,18 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
     backends = _target_backends(ctx, bundle.artifactclass)
     targets = target_pools(ctx.session, bundle.artifactclass, backends, key_epoch=key_epoch)
     missing = _missing_pool_ids(ctx, bundle.id)
+    blocked_projection = bundle_copy.blocked_projection_for_bundle(ctx.session, bundle.id)
+    if blocked_projection is not None:
+        reason, message = blocked_projection
+        return JobResult(
+            ok=False,
+            detail=message,
+            condition=ConditionProjection(
+                condition=CONDITION_BLOCKED,
+                reason=reason,
+                message=message,
+            ),
+        )
     if not missing:
         return JobResult(ok=True, detail=f"bundle {bundle.id} already has complete placement")
 
@@ -147,6 +162,7 @@ def _target_backends(ctx: JobContext, artifactclass: str) -> dict[int, WritableS
             .where(
                 ArtifactClassPool.artifactclass == artifactclass,
                 ArtifactClassPool.active.is_(True),
+                Pool.accepts_writes.is_(True),
             )
             .order_by(Backend.id)
         ).unique()

@@ -64,6 +64,18 @@ representation, unvalidated `restore_preference`, hardcoded class names).
 - The XOR constraint is **never tightened**. Both grains stay legal at the
   schema level; M1's predicate makes the difference invisible to durability.
 
+#### Forward — copy-handler grain pin
+
+The future real `copy` job handler MUST record bundle grain: a degenerate
+1-member bundle row plus member, `AssetLocator`, and bundle-scoped `Copy`, with
+deterministic id `asset-<hash16>` collision-checked against real bundle ids.
+It still keeps the existing single-object seal/write path
+(`RaoCliSealer` / `write_object_to_pool`) and does not use the flush
+archive/tar container, because the two build paths are not byte-compatible and
+Q asserts write→repair byte identity. That prompt must also carry
+`sutra reconcile copy --reopen-blocked --reason not-implemented` per
+`prompt-jobs-safety-rails.md`.
+
 ### M1 — One durability predicate module (no schema change)
 
 New `sutradhara/durability.py`:

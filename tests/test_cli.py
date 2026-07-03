@@ -411,12 +411,14 @@ def test_backends_add_and_list(cli_env: dict[str, str]) -> None:
     result = _run(["backends", "list"])
     assert "rem-primary" in result.output
     assert "rem_tape" in result.output
+    assert "tape" in result.output
 
     # JSON mode round-trips.
     result_json = _run(["backends", "list", "--json"])
     payload = json.loads(result_json.output.strip())
     assert payload["name"] == "rem-primary"
     assert payload["kind"] == "rem_tape"
+    assert payload["implementation_family"] == "tape"
     assert payload["config"] == {"fixture_path": str(FIXTURE)}
 
 

@@ -24,6 +24,7 @@ from sutradhara.arrangement import create_from_intake, move_member, submit_arran
 from sutradhara.artifactclass_policy import (
     ArtifactClassPolicy,
     BundlingPolicy,
+    DurabilityPolicy,
     PlacementPolicy,
     apply_artifactclass_policy,
 )
@@ -638,6 +639,7 @@ def _install_policy(session: Session) -> tuple[int, int]:
             bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
             restore_preference=("working-pool", "offsite-pool", "d2-shelf-pool"),
             expect="compliant",
+            durability=DurabilityPolicy(min_copies=3, min_impl_families=2),
         ),
     )
     return rem.id, d2.id

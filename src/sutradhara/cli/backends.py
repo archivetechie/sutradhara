@@ -10,7 +10,8 @@ from sqlalchemy import select
 
 from sutradhara.catalog.models import Backend
 from sutradhara.catalog.session import make_engine, session_scope
-from sutradhara.catalog.types import BackendKind, BackendTier
+from sutradhara.catalog.types import BackendKind, BackendTier, implementation_family_for_kind
+from sutradhara.pools import PoolError, set_pool_retired, set_pool_write_fence
 
 
 @click.group("backends")
@@ -72,6 +73,7 @@ def backends_add(
             Backend(
                 name=name,
                 kind=BackendKind(kind),
+                implementation_family=implementation_family_for_kind(kind),
                 tier=BackendTier(tier),
                 config=config or None,
             )
@@ -106,6 +108,7 @@ def backends_list(as_json: bool) -> None:
                     {
                         "name": r.name,
                         "kind": r.kind,
+                        "implementation_family": r.implementation_family,
                         "tier": r.tier,
                         "config": r.config or {},
                         "added_at": r.added_at.isoformat(),
@@ -115,10 +118,65 @@ def backends_list(as_json: bool) -> None:
         return
 
     width = max(len(r.name) for r in rows)
-    click.echo(f"{'NAME'.ljust(width)}  KIND        TIER")
-    click.echo(f"{'-' * width}  ----------  ----------")
+    click.echo(f"{'NAME'.ljust(width)}  KIND        FAMILY    TIER")
+    click.echo(f"{'-' * width}  ----------  --------  ----------")
     for r in rows:
-        click.echo(f"{r.name.ljust(width)}  {r.kind:<10}  {r.tier}")
+        click.echo(f"{r.name.ljust(width)}  {r.kind:<10}  {r.implementation_family:<8}  {r.tier}")
+
+
+@backends_group.command("set-pool-writes")
+@click.argument("pool_id")
+@click.option(
+    "--accepts-writes/--no-accepts-writes",
+    default=None,
+    required=True,
+    help="Enable or disable new writes to this pool.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Override durability-floor drain refusal and record an alarm.",
+)
+def set_pool_writes_cmd(
+    pool_id: str,
+    accepts_writes: bool,
+    force: bool,
+) -> None:
+    """Set a pool's write fence with durability-floor validation."""
+
+    engine = make_engine()
+    try:
+        with session_scope(engine) as s:
+            pool = set_pool_write_fence(
+                s,
+                pool_id,
+                accepts_writes=accepts_writes,
+                force=force,
+            )
+            click.echo(f"Pool {pool.id!r}: accepts_writes={pool.accepts_writes}.")
+    except PoolError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@backends_group.command("set-pool-retired")
+@click.argument("pool_id")
+@click.option(
+    "--retired/--active",
+    default=None,
+    required=True,
+    help="Set or clear the descriptive retired flag.",
+)
+def set_pool_retired_cmd(pool_id: str, retired: bool) -> None:
+    """Set a pool's descriptive retired flag."""
+
+    engine = make_engine()
+    try:
+        with session_scope(engine) as s:
+            pool = set_pool_retired(s, pool_id, retired=retired)
+            click.echo(f"Pool {pool.id!r}: retired={pool.retired}.")
+    except PoolError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _parse_config(pairs: tuple[str, ...]) -> dict[str, Any]:

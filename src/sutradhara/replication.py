@@ -97,16 +97,25 @@ def target_pools(
     backends: Mapping[int, TBackend],
     *,
     key_epoch: str | None = None,
+    write_eligible_only: bool = True,
 ) -> list[PoolTargetEntry[TBackend]]:
-    """Return active pool targets for ``artifactclass`` in catalog order."""
+    """Return pool targets for ``artifactclass`` in catalog order.
+
+    The default is the write path view: active memberships whose pools currently
+    accept writes. Reader/status callers pass ``write_eligible_only=False`` to
+    keep existing placements visible.
+    """
+    predicates = [
+        ArtifactClassPool.artifactclass == artifactclass,
+        ArtifactClassPool.active.is_(True),
+    ]
+    if write_eligible_only:
+        predicates.append(ArtifactClassPool.pool.has(Pool.accepts_writes.is_(True)))
     memberships = list(
         session.scalars(
             select(ArtifactClassPool)
             .options(joinedload(ArtifactClassPool.pool).joinedload(Pool.backend))
-            .where(
-                ArtifactClassPool.artifactclass == artifactclass,
-                ArtifactClassPool.active.is_(True),
-            )
+            .where(*predicates)
             .order_by(ArtifactClassPool.sort_order, ArtifactClassPool.pool_id)
         )
     )
@@ -165,7 +174,7 @@ def replicate_asset(
     sealer: Sealer | None = None,
     key_epoch: str | None = None,
 ) -> list[Copy]:
-    """Replicate one asset to every active pool for an artifactclass."""
+    """Replicate one asset to every active write-eligible pool for an artifactclass."""
     targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
     existing = _healthy_copies_by_pool(session, asset_hash, targets)
     sealer = sealer or RaoCliSealer(KeyRegistry())
@@ -216,7 +225,7 @@ def repair(
     sealer: Sealer | None = None,
     key_epoch: str | None = None,
 ) -> list[Copy]:
-    """Write copies for active pools currently missing from replication status."""
+    """Write copies for write-eligible pools currently missing from replication status."""
     status = replication_status(
         session,
         asset_hash,
@@ -370,7 +379,13 @@ def replication_status(
     """Report whether an asset has healthy copies in all active pools."""
     from sutradhara.durability import direct_copies
 
-    targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
+    targets = target_pools(
+        session,
+        artifactclass,
+        backends,
+        key_epoch=key_epoch,
+        write_eligible_only=False,
+    )
     targets_by_key = {_pool_key(target): target for _, target in targets}
     want = set(targets_by_key.values())
     have: set[PoolTarget] = set()
@@ -612,22 +627,23 @@ def _pool_for_copy(
     key = _copy_pool_key(copy)
     if key is None:
         return None
-    targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
+    targets = target_pools(
+        session,
+        artifactclass,
+        backends,
+        key_epoch=key_epoch,
+        write_eligible_only=False,
+    )
     return {_pool_key(target): target for _, target in targets}.get(key)
 
 
 def _copy_media_id(copy: Copy) -> str | None:
-    value = copy.native_locator.get("tape_uuid")
-    if isinstance(value, str) and value:
-        return f"tape:{value}"
-    if copy.backend.kind == BackendKind.D2_TAPE:
-        value = copy.native_locator.get("volume_uuid")
-        if isinstance(value, str) and value:
-            return f"d2_tape:{value}"
-        value = copy.native_locator.get("barcode")
-        if isinstance(value, str) and value:
-            return f"d2_tape:{value}"
-    return None
+    from sutradhara.durability import DurabilityMediaIdentityError, copy_media_id
+
+    try:
+        return copy_media_id(copy)
+    except DurabilityMediaIdentityError:
+        return None
 
 
 def _epoch_for(

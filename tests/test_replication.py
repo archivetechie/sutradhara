@@ -211,6 +211,7 @@ def _add_pool(
     artifactclass: str,
     representation: Representation,
     sort_order: int = 0,
+    accepts_writes: bool = True,
 ) -> None:
     with session_scope(engine) as s:
         s.add(
@@ -218,6 +219,7 @@ def _add_pool(
                 id=pool_id,
                 backend_id=backend_id,
                 representation=representation.value,
+                accepts_writes=accepts_writes,
             )
         )
         s.add(
@@ -282,6 +284,51 @@ def test_target_pools_reads_active_memberships_and_representations(
         Representation.RAO_AEAD_V1.value,
     ]
     assert [target.key_epoch for _, target in targets] == [None, "1" * 32]
+
+
+def test_target_pools_excludes_write_fenced_by_default_but_status_keeps_it(
+    engine: Engine,
+) -> None:
+    data = b"fenced source"
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="active-pool",
+        artifactclass="o-archive",
+        representation=Representation.RAW_BYTES,
+        sort_order=0,
+    )
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="fenced-pool",
+        artifactclass="o-archive",
+        representation=Representation.RAW_BYTES,
+        sort_order=1,
+        accepts_writes=False,
+    )
+    backend = _PoolWriteBackend("rem")
+
+    with session_scope(engine) as s:
+        add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            pool_id="active-pool",
+            native_locator={"object": "active", "tape_uuid": "active-tape"},
+            integrity_hash=asset_hash,
+            source=CopySource.INGEST,
+            health=CopyHealth.OK,
+            storage_metadata=_metadata(Representation.RAW_BYTES),
+        )
+        write_targets = target_pools(s, "o-archive", {backend_id: backend})
+        status = replication_status(s, asset_hash, "o-archive", {backend_id: backend})
+
+    assert [target.pool_id for _, target in write_targets] == ["active-pool"]
+    assert {target.pool_id for target in status["want"]} == {"active-pool", "fenced-pool"}
+    assert {target.pool_id for target in status["missing"]} == {"fenced-pool"}
 
 
 def test_pool_sealing_rejects_hdcache_key_epoch(

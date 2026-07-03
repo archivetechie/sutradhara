@@ -18,6 +18,7 @@ from sutradhara.archive_restore import RestoreRejectedAsset, RestoreSuspectAsset
 from sutradhara.artifactclass_policy import (
     ArtifactClassPolicy,
     BundlingPolicy,
+    DurabilityPolicy,
     PlacementPolicy,
     apply_artifactclass_policy,
     get_artifactclass_policy,
@@ -386,6 +387,7 @@ def _install_policy(session: Session, artifactclass: str) -> int:
             bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
             restore_preference=(pool_id,),
             expect="compliant",
+            durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
         ),
     )
     return backend.id

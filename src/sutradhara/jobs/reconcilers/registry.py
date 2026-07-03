@@ -12,6 +12,8 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
+from sutradhara.jobs.models import ReconciliationCondition
+
 
 @dataclass(frozen=True)
 class TargetObservation:
@@ -29,6 +31,7 @@ class Reconciler:
     enumerate_targets: Callable[[Session, int | None, int], Iterable[TargetObservation]]
     observe: Callable[[Session, str], TargetObservation]
     reconcile_target: Callable[[Session, str], None]
+    classify_condition: Callable[[Session, str, ReconciliationCondition], None] | None = None
 
 
 class ReconcilerNotRegistered(Exception):

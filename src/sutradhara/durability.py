@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, TypedDict
 
 from sqlalchemy import and_, false, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.backend.port import BackendLocator, ByteRange, StorageBackend, VerifyResult
 from sutradhara.catalog.models import (
@@ -66,6 +66,36 @@ class PlacementStatus(TypedDict):
 
 
 BundlePlacementCounts = dict[str, dict[tuple[int, str], int]]
+
+
+class DurabilityMediaIdentityError(ValueError):
+    """A copy lacks the media identity required for its implementation family."""
+
+
+@dataclass(frozen=True)
+class CopyMediaIdentity:
+    """Per-family media identity used for durability diversity checks."""
+
+    family: str
+    media_id: str
+
+
+@dataclass(frozen=True)
+class BundleCopyAggregate:
+    """Healthy bundle-copy facts grouped for one bundle."""
+
+    counts: dict[tuple[int, str], int]
+    family_by_key: dict[tuple[int, str], str]
+    media_identity_by_key: dict[tuple[int, str], CopyMediaIdentity]
+    media_errors: tuple[str, ...]
+
+    @property
+    def duplicate_keys(self) -> tuple[tuple[int, str, int], ...]:
+        return tuple(
+            (backend_id, pool_id, count)
+            for (backend_id, pool_id), count in sorted(self.counts.items())
+            if count > 1
+        )
 
 
 class _TargetBackend(StorageBackend):
@@ -240,6 +270,101 @@ def bundle_copy_counts_by_pool(
     return counts
 
 
+def bundle_copy_aggregates_by_bundle(
+    session: Session,
+    bundle_ids: list[str] | tuple[str, ...],
+    *,
+    require_verified: bool = False,
+) -> dict[str, BundleCopyAggregate]:
+    """Return per-bundle placement counts, families, and media identities."""
+
+    aggregates = {
+        bundle_id: BundleCopyAggregate({}, {}, {}, ())
+        for bundle_id in bundle_ids
+    }
+    if not bundle_ids:
+        return {}
+    mutable_errors: dict[str, list[str]] = {bundle_id: [] for bundle_id in bundle_ids}
+    query = (
+        select(Copy)
+        .options(joinedload(Copy.backend))
+        .where(
+            Copy.bundle_id.in_(bundle_ids),
+            Copy.health == CopyHealth.OK,
+            Copy.deleted_at.is_(None),
+            Copy.pool_id.is_not(None),
+        )
+        .order_by(Copy.bundle_id, Copy.backend_id, Copy.pool_id, Copy.id)
+    )
+    if require_verified:
+        query = query.where(Copy.last_verified_at.is_not(None))
+    for copy in session.scalars(query):
+        if copy.bundle_id is None or copy.pool_id is None:
+            continue
+        aggregate = aggregates[str(copy.bundle_id)]
+        key = (copy.backend_id, copy.pool_id)
+        aggregate.counts[key] = aggregate.counts.get(key, 0) + 1
+        aggregate.family_by_key.setdefault(key, _copy_implementation_family(copy))
+        if key in aggregate.media_identity_by_key:
+            continue
+        try:
+            identity = copy_media_identity(copy)
+        except DurabilityMediaIdentityError as exc:
+            mutable_errors[str(copy.bundle_id)].append(str(exc))
+            continue
+        if identity is not None:
+            aggregate.media_identity_by_key[key] = identity
+
+    return {
+        bundle_id: BundleCopyAggregate(
+            counts=aggregate.counts,
+            family_by_key=aggregate.family_by_key,
+            media_identity_by_key=aggregate.media_identity_by_key,
+            media_errors=tuple(mutable_errors[bundle_id]),
+        )
+        for bundle_id, aggregate in aggregates.items()
+    }
+
+
+def copy_media_identity(copy: Copy) -> CopyMediaIdentity | None:
+    """Return the per-family media identity for one copy, or None when exempt."""
+
+    family = _copy_implementation_family(copy)
+    if family == "memory":
+        return None
+    if family == "tape":
+        value = copy.native_locator.get("tape_uuid")
+        if isinstance(value, str) and value:
+            return CopyMediaIdentity(family=family, media_id=value)
+        raise DurabilityMediaIdentityError(
+            f"copy id={copy.id} on backend_id={copy.backend_id} is missing tape_uuid"
+        )
+    if family == "d2tape":
+        value = copy.native_locator.get("volume_uuid")
+        if isinstance(value, str) and value:
+            return CopyMediaIdentity(family=family, media_id=value)
+        value = copy.native_locator.get("barcode")
+        if isinstance(value, str) and value:
+            return CopyMediaIdentity(family=family, media_id=value)
+        raise DurabilityMediaIdentityError(
+            f"copy id={copy.id} on backend_id={copy.backend_id} is missing volume_uuid/barcode"
+        )
+    if family in {"disk", "cloud"}:
+        return CopyMediaIdentity(family=family, media_id=f"backend:{copy.backend_id}")
+    raise DurabilityMediaIdentityError(
+        f"copy id={copy.id} uses unsupported implementation_family={family!r}"
+    )
+
+
+def copy_media_id(copy: Copy) -> str | None:
+    """Return a stable string media id for compatibility with replication status."""
+
+    identity = copy_media_identity(copy)
+    if identity is None:
+        return f"memory:exempt:{copy.id}"
+    return f"{identity.family}:{identity.media_id}"
+
+
 def asset_has_artifactclass_membership(
     session: Session,
     asset_hash: bytes,
@@ -334,7 +459,7 @@ def _policy_targets(session: Session, artifactclass: str) -> list[tuple[StorageB
         )
     ):
         backend_rows[int(backend_id)] = _TargetBackend(str(backend_name))
-    return target_pools(session, artifactclass, backend_rows)
+    return target_pools(session, artifactclass, backend_rows, write_eligible_only=False)
 
 
 def _placement_entry(target: PoolTarget, duplicate_count: int) -> PlacementTarget:
@@ -364,3 +489,12 @@ def _dedupe_by_copy_id(copies: list[Copy]) -> list[Copy]:
         seen.add(copy.id)
         result.append(copy)
     return result
+
+
+def _copy_implementation_family(copy: Copy) -> str:
+    family = copy.backend.implementation_family
+    if isinstance(family, str) and family:
+        return family
+    from sutradhara.catalog.types import implementation_family_for_kind
+
+    return implementation_family_for_kind(copy.backend.kind)

@@ -449,7 +449,15 @@ def _policy_targets(session: Session, artifactclass: str) -> list[PoolTarget]:
         )
     ):
         backend_rows[int(backend_id)] = _PolicyBackend(str(backend_name))
-    return [target for _, target in target_pools(session, artifactclass, backend_rows)]
+    return [
+        target
+        for _, target in target_pools(
+            session,
+            artifactclass,
+            backend_rows,
+            write_eligible_only=False,
+        )
+    ]
 
 
 def _cloud_blob_copies(session: Session, intake_id: str) -> list[Copy]:

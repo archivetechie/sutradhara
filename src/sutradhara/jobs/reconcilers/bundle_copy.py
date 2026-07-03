@@ -8,27 +8,36 @@ whole bundle-copy convergence state.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from sutradhara.catalog.models import ArtifactClassPool, Bundle, Pool
-from sutradhara.durability import bundle_copy_counts_by_pool
+from sutradhara.catalog.models import ArtifactClassPolicyRecord, ArtifactClassPool, Backend, Bundle, Pool
+from sutradhara.durability import BundleCopyAggregate, bundle_copy_aggregates_by_bundle
 from sutradhara.jobs.engine import submit
-from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, OBSERVED_PRESENT
+from sutradhara.jobs.models import ReconciliationCondition
+from sutradhara.jobs.reconcilers.conditions import (
+    CONDITION_BLOCKED,
+    OBSERVED_MISSING,
+    OBSERVED_PRESENT,
+    record_condition,
+    record_observation,
+)
 from sutradhara.jobs.reconcilers.registry import Reconciler, TargetObservation, register_reconciler
 from sutradhara.replication import PoolTarget
 
 DOMAIN = "bundle_copy"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class DurabilityFloor:
-    """Declared bundle durability floor; absent fields mean no floor yet."""
+    """Declared bundle durability floor for one artifactclass."""
 
-    min_copies: int | None = None
-    min_impl_families: int | None = None
+    min_copies: int = 3
+    min_impl_families: int = 2
 
 
 def enumerate_targets(
@@ -45,7 +54,7 @@ def enumerate_targets(
     classes = {artifactclass for _bundle_id, artifactclass in rows}
     desired_by_class = _desired_targets_by_class(session, classes)
     floors_by_class = _floors_for_classes(session, classes)
-    placement_counts = bundle_copy_counts_by_pool(session, bundle_ids)
+    placement_aggregates = bundle_copy_aggregates_by_bundle(session, bundle_ids)
 
     observations: list[TargetObservation] = []
     for bundle_id, artifactclass in rows:
@@ -56,7 +65,7 @@ def enumerate_targets(
             _observation_for_bundle(
                 bundle_id=bundle_id,
                 desired_targets=desired_targets,
-                counts=placement_counts.get(bundle_id, {}),
+                aggregate=placement_aggregates[bundle_id],
                 floor=floors_by_class[artifactclass],
             )
         )
@@ -83,13 +92,56 @@ def observe(session: Session, target_key: str) -> TargetObservation:
             desired=False,
             observed_state=OBSERVED_MISSING,
         )
-    counts = bundle_copy_counts_by_pool(session, [bundle.id]).get(bundle.id, {})
+    aggregate = bundle_copy_aggregates_by_bundle(session, [bundle.id])[bundle.id]
     return _observation_for_bundle(
         bundle_id=bundle.id,
         desired_targets=desired_targets,
-        counts=counts,
+        aggregate=aggregate,
         floor=_floor_for_class(session, bundle.artifactclass),
     )
+
+
+def refresh_condition(session: Session, target_key: str) -> ReconciliationCondition:
+    """Observe and classify one bundle-copy condition row in the caller's transaction."""
+
+    observation = observe(session, target_key)
+    condition = record_observation(
+        session,
+        domain=DOMAIN,
+        target_key=target_key,
+        desired=observation.desired,
+        observed_state=observation.observed_state,
+        reason="durability-unverified"
+        if observation.desired and observation.observed_state == OBSERVED_MISSING
+        else None,
+    )
+    classify_condition(session, target_key, condition)
+    return condition
+
+
+def blocked_projection_for_bundle(session: Session, bundle_id: str) -> tuple[str, str] | None:
+    """Return a blocked-condition reason/message for non-repairable bundle states."""
+
+    bundle = session.get(Bundle, bundle_id)
+    if bundle is None or bundle.status != "sealed":
+        return None
+    aggregate = bundle_copy_aggregates_by_bundle(session, [bundle.id])[bundle.id]
+    duplicate_message = _duplicate_message(bundle.id, aggregate)
+    if duplicate_message is not None:
+        return "duplicate-copy", duplicate_message
+    desired_targets = _desired_targets_by_class(session, {bundle.artifactclass}).get(
+        bundle.artifactclass,
+        {},
+    )
+    structural_message = _structural_floor_message(
+        session,
+        desired_targets=desired_targets,
+        floor=_floor_for_class(session, bundle.artifactclass),
+        aggregate=aggregate,
+    )
+    if structural_message is None:
+        return None
+    return "durability-floor-unsatisfiable", structural_message
 
 
 def reconcile_target(session: Session, target_key: str) -> None:
@@ -140,7 +192,7 @@ def _desired_targets_by_class(
             .where(
                 ArtifactClassPool.artifactclass.in_(artifactclasses),
                 ArtifactClassPool.active.is_(True),
-                # M3/D3 accepts_writes: add ArtifactClassPool.accepts_writes here.
+                ArtifactClassPool.pool.has(Pool.accepts_writes.is_(True)),
             )
             .order_by(ArtifactClassPool.artifactclass, ArtifactClassPool.sort_order)
         )
@@ -176,28 +228,33 @@ def _floors_for_classes(
 
 
 def _floor_for_class(session: Session, artifactclass: str) -> DurabilityFloor:
-    _ = (session, artifactclass)
-    # M3/D2 floor: read declared [durability] min_copies/min_impl_families here.
-    return DurabilityFloor()
+    record = session.get(ArtifactClassPolicyRecord, artifactclass)
+    if record is None:
+        return DurabilityFloor()
+    return DurabilityFloor(
+        min_copies=record.min_copies,
+        min_impl_families=record.min_impl_families,
+    )
 
 
 def _observation_for_bundle(
     *,
     bundle_id: str,
     desired_targets: dict[tuple[int, str], PoolTarget],
-    counts: dict[tuple[int, str], int],
+    aggregate: BundleCopyAggregate,
     floor: DurabilityFloor,
 ) -> TargetObservation:
     placement_complete = set(desired_targets).issubset(
-        {key for key, count in counts.items() if count > 0}
+        {key for key, count in aggregate.counts.items() if count > 0}
     )
-    floor_satisfied = _floor_satisfied(floor, counts)
+    floor_satisfied = _floor_satisfied(floor, aggregate)
+    no_persistent_duplicates = not aggregate.duplicate_keys
     return TargetObservation(
         target_key=bundle_id,
         desired=True,
         observed_state=(
             OBSERVED_PRESENT
-            if placement_complete and floor_satisfied
+            if placement_complete and floor_satisfied and no_persistent_duplicates
             else OBSERVED_MISSING
         ),
     )
@@ -205,15 +262,175 @@ def _observation_for_bundle(
 
 def _floor_satisfied(
     floor: DurabilityFloor,
-    counts: dict[tuple[int, str], int],
+    aggregate: BundleCopyAggregate,
 ) -> bool:
-    if floor.min_copies is None and floor.min_impl_families is None:
-        return True
-    realized_copies = sum(1 for count in counts.values() if count > 0)
-    if floor.min_copies is not None and realized_copies < floor.min_copies:
+    realized_keys = {key for key, count in aggregate.counts.items() if count > 0}
+    realized_copies = len(realized_keys)
+    if realized_copies < floor.min_copies:
         return False
-    # M3/D2 floor: compute implementation families from pool/backend family maps.
+    families = {aggregate.family_by_key[key] for key in realized_keys}
+    if len(families) < floor.min_impl_families:
+        return False
+    if aggregate.media_errors:
+        return False
+    return _media_identities_are_distinct(aggregate, realized_keys)
+
+
+def classify_condition(
+    session: Session,
+    target_key: str,
+    condition: ReconciliationCondition,
+) -> None:
+    """Project structural bundle-copy deficiencies into blocked conditions."""
+
+    bundle = session.get(Bundle, target_key)
+    if bundle is None or bundle.status != "sealed":
+        return
+    desired_targets = _desired_targets_by_class(session, {bundle.artifactclass}).get(
+        bundle.artifactclass,
+        {},
+    )
+    floor = _floor_for_class(session, bundle.artifactclass)
+    aggregate = bundle_copy_aggregates_by_bundle(session, [bundle.id])[bundle.id]
+    duplicate_message = _duplicate_message(bundle.id, aggregate)
+    if duplicate_message is not None:
+        _record_blocked_alarm(
+            session,
+            condition,
+            target_key=target_key,
+            reason="duplicate-copy",
+            message=duplicate_message,
+        )
+        return
+    structural_message = _structural_floor_message(
+        session,
+        desired_targets=desired_targets,
+        floor=floor,
+        aggregate=aggregate,
+    )
+    if structural_message is not None:
+        _record_blocked_alarm(
+            session,
+            condition,
+            target_key=target_key,
+            reason="durability-floor-unsatisfiable",
+            message=structural_message,
+        )
+
+
+def _media_identities_are_distinct(
+    aggregate: BundleCopyAggregate,
+    realized_keys: set[tuple[int, str]],
+) -> bool:
+    seen: dict[tuple[str, str], tuple[int, str]] = {}
+    for key in sorted(realized_keys):
+        family = aggregate.family_by_key[key]
+        if family == "memory":
+            continue
+        identity = aggregate.media_identity_by_key.get(key)
+        if identity is None:
+            return False
+        media_key = (identity.family, identity.media_id)
+        if media_key in seen:
+            return False
+        seen[media_key] = key
     return True
+
+
+def _structural_floor_message(
+    session: Session,
+    *,
+    desired_targets: dict[tuple[int, str], PoolTarget],
+    floor: DurabilityFloor,
+    aggregate: BundleCopyAggregate,
+) -> str | None:
+    desired_families = _desired_families(session, desired_targets)
+    defects: list[str] = []
+    if len(desired_targets) < floor.min_copies:
+        defects.append(f"write-eligible pools {len(desired_targets)} < min_copies {floor.min_copies}")
+    if len(set(desired_families.values())) < floor.min_impl_families:
+        defects.append(
+            "implementation families "
+            f"{len(set(desired_families.values()))} < min_impl_families {floor.min_impl_families}"
+        )
+    media_conflicts = _realized_media_conflicts(aggregate)
+    defects.extend(media_conflicts)
+    if aggregate.media_errors:
+        defects.extend(aggregate.media_errors)
+    if not defects:
+        return None
+    return "bundle-copy durability floor cannot be satisfied: " + "; ".join(defects)
+
+
+def _desired_families(
+    session: Session,
+    desired_targets: dict[tuple[int, str], PoolTarget],
+) -> dict[tuple[int, str], str]:
+    if not desired_targets:
+        return {}
+    pool_ids = [pool_id for _backend_id, pool_id in desired_targets]
+    rows = session.execute(
+        select(Pool.backend_id, Pool.id, Backend.implementation_family)
+        .join(Backend, Pool.backend_id == Backend.id)
+        .where(Pool.id.in_(pool_ids))
+    )
+    return {
+        (int(backend_id), str(pool_id)): str(family)
+        for backend_id, pool_id, family in rows
+    }
+
+
+def _realized_media_conflicts(aggregate: BundleCopyAggregate) -> list[str]:
+    seen: dict[tuple[str, str], tuple[int, str]] = {}
+    conflicts: list[str] = []
+    for key, identity in sorted(aggregate.media_identity_by_key.items()):
+        media_key = (identity.family, identity.media_id)
+        other = seen.get(media_key)
+        if other is not None and other != key:
+            conflicts.append(
+                "media identity reused by "
+                f"{other[0]}/{other[1]} and {key[0]}/{key[1]}: "
+                f"{identity.family}:{identity.media_id}"
+            )
+        seen[media_key] = key
+    return conflicts
+
+
+def _duplicate_message(
+    bundle_id: str,
+    aggregate: BundleCopyAggregate,
+) -> str | None:
+    if not aggregate.duplicate_keys:
+        return None
+    detail = ", ".join(
+        f"backend_id={backend_id}/pool={pool_id} count={count}"
+        for backend_id, pool_id, count in aggregate.duplicate_keys
+    )
+    return f"bundle {bundle_id} has persistent duplicate bundle copies: {detail}"
+
+
+def _record_blocked_alarm(
+    session: Session,
+    condition: ReconciliationCondition,
+    *,
+    target_key: str,
+    reason: str,
+    message: str,
+) -> None:
+    already_blocked = condition.condition == CONDITION_BLOCKED and condition.reason == reason
+    if not already_blocked:
+        LOGGER.error(
+            "bundle_copy_condition_blocked",
+            extra={"target_key": target_key, "reason": reason, "detail": message},
+        )
+    record_condition(
+        session,
+        domain=DOMAIN,
+        target_key=target_key,
+        condition=CONDITION_BLOCKED,
+        reason=reason,
+        message=message,
+    )
 
 
 register_reconciler(DOMAIN)(
@@ -221,5 +438,6 @@ register_reconciler(DOMAIN)(
         enumerate_targets=enumerate_targets,
         observe=observe,
         reconcile_target=reconcile_target,
+        classify_condition=classify_condition,
     )
 )

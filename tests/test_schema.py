@@ -61,7 +61,25 @@ def _table_sql(db_path: Path, table: str) -> str:
     return str(row[0])
 
 
+def _foreign_key_delete_actions(db_path: Path, table: str) -> dict[tuple[str, str], str]:
+    with sqlite3.connect(db_path) as conn:
+        return {
+            (str(row[3]), str(row[2])): str(row[6])
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})")
+        }
+
+
 def _assert_archive_invariants(db_path: Path) -> None:
+    backend_sql = _table_sql(db_path, "backend")
+    pool_sql = _table_sql(db_path, "pool")
+    policy_sql = _table_sql(db_path, "artifactclass_policy")
+    assert "implementation_family" in backend_sql
+    assert "implementation_family VARCHAR(64) NOT NULL" in backend_sql
+    assert "accepts_writes" in pool_sql
+    assert "retired" in pool_sql
+    assert "media_generation" in pool_sql
+    assert "min_copies" in policy_sql
+    assert "min_impl_families" in policy_sql
     assert "member_path VARCHAR(2048)" in _table_sql(db_path, "bundle_member")
     assert "member_path VARCHAR(2048)" in _table_sql(db_path, "asset_locator")
     assert (
@@ -69,7 +87,17 @@ def _assert_archive_invariants(db_path: Path) -> None:
         "logical_asset_hash",
         "member_path",
     ) in _unique_index_columns(db_path, "asset_locator")
+    assert (
+        "copy_id",
+        "root_path",
+    ) in _unique_index_columns(db_path, "blob_root")
     assert "ck_copy_asset_xor_bundle" in _table_sql(db_path, "copy")
+    assert ("backend_id", "native_locator_key") in _unique_index_columns(db_path, "copy")
+    assert (
+        _foreign_key_delete_actions(db_path, "asset_locator")[("pool_id", "pool")]
+        == "RESTRICT"
+    )
+    assert _foreign_key_delete_actions(db_path, "blob_root")[("pool_id", "pool")] == "RESTRICT"
     assert (
         "bundle_member_id",
         "step_order",
@@ -417,3 +445,72 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     _assert_retention_invariants(db_path)
     _assert_grpc_relay_invariants(db_path)
     _assert_hdcache_invariants(db_path)
+
+
+def test_copygrain_m3_migration_backfills_and_preserves_constraints(tmp_path: Path) -> None:
+    db_path = tmp_path / "m3-backfill.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "7c2d4e9f0a1b"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        for index, kind in enumerate(
+            (
+                "rem_tape",
+                "d2_tape",
+                "rem_disk",
+                "plain_disk",
+                "ssh_disk",
+                "s3",
+                "gcs",
+                "azure_blob",
+                "memory",
+            ),
+            start=1,
+        ):
+            conn.execute(
+                "INSERT INTO backend (id, name, kind, config, tier, added_at) "
+                "VALUES (?, ?, ?, NULL, 'self_describing', '2026-01-01 00:00:00')",
+                (index, f"backend-{kind}", kind),
+            )
+        conn.execute(
+            "INSERT INTO artifactclass_policy "
+            "(artifactclass, ruleset, expect, target_bytes, max_age_seconds, "
+            "restore_preference, staging_config, hdcache_config, policy_source, "
+            "policy_sha256, updated_at) "
+            "VALUES ('existing', 'rules', 'messy', 1, 60, '[]', '{}', '{}', NULL, NULL, "
+            "'2026-01-01 00:00:00')"
+        )
+        conn.commit()
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        families = dict(conn.execute("SELECT kind, implementation_family FROM backend"))
+        assert families == {
+            "rem_tape": "tape",
+            "d2_tape": "d2tape",
+            "rem_disk": "disk",
+            "plain_disk": "disk",
+            "ssh_disk": "disk",
+            "s3": "cloud",
+            "gcs": "cloud",
+            "azure_blob": "cloud",
+            "memory": "memory",
+        }
+        assert conn.execute(
+            "SELECT min_copies, min_impl_families FROM artifactclass_policy "
+            "WHERE artifactclass='existing'"
+        ).fetchone() == (3, 2)
+    _assert_archive_invariants(db_path)

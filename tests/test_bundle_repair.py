@@ -23,6 +23,7 @@ from sutradhara.archive_restore import read_member_bytes
 from sutradhara.artifactclass_policy import (
     ArtifactClassPolicy,
     BundlingPolicy,
+    DurabilityPolicy,
     PlacementPolicy,
     apply_artifactclass_policy,
 )
@@ -33,8 +34,10 @@ from sutradhara.backend.port import (
     CopyRecord,
     VerifyResult,
 )
+from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import (
     AssetLocator,
+    ArtifactClassPolicyRecord,
     Backend,
     BlobRoot,
     Bundle,
@@ -44,14 +47,19 @@ from sutradhara.catalog.models import (
     Pool,
 )
 from sutradhara.catalog.session import create_all, make_engine, session_scope
-from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, content_hash
+from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
 from sutradhara.durability import bundle_replication_status
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register bundle-repair
 from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.handlers import bundle_repair
-from sutradhara.jobs.models import Job, JobStatus
+from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers import bundle_copy
-from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, OBSERVED_PRESENT
+from sutradhara.jobs.reconcilers.conditions import (
+    CONDITION_BLOCKED,
+    CONDITION_SATISFIED,
+    OBSERVED_MISSING,
+    OBSERVED_PRESENT,
+)
 from sutradhara.sealing.port import Representation
 
 
@@ -316,6 +324,85 @@ def test_bundle_copy_reconciler_observes_placement_complete_without_default_floo
         assert job.recon_target_key == bundle_id
 
 
+def test_flush_bundle_outbox_fast_path_resolves_condition(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    backend = _Backend()
+    bundle_id, _backend_id, _assets = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
+
+    with session_scope(engine) as s:
+        condition = s.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "bundle_copy",
+                ReconciliationCondition.target_key == bundle_id,
+            )
+        ).one()
+        assert condition.condition == CONDITION_SATISFIED
+        assert condition.observed_state == OBSERVED_PRESENT
+        assert condition.reason is None
+
+
+def test_bundle_copy_structural_floor_blocks_without_duplicate_write(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    backend = _Backend()
+    bundle_id, _backend_id, _assets = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
+
+    with session_scope(engine) as s:
+        policy = s.get(ArtifactClassPolicyRecord, "class-a")
+        assert policy is not None
+        policy.min_impl_families = 2
+        before = len(list(s.scalars(select(Copy).where(Copy.bundle_id == bundle_id))))
+
+        condition = bundle_copy.refresh_condition(s, bundle_id)
+
+        after = len(list(s.scalars(select(Copy).where(Copy.bundle_id == bundle_id))))
+        assert after == before
+        assert condition.condition == CONDITION_BLOCKED
+        assert condition.reason == "durability-floor-unsatisfiable"
+
+
+def test_bundle_copy_duplicate_alarm_logs_once(
+    engine: Engine,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    backend = _Backend()
+    bundle_id, backend_id, _assets = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
+
+    with session_scope(engine) as s:
+        existing = s.scalars(select(Copy).where(Copy.bundle_id == bundle_id, Copy.pool_id == "p1")).one()
+        add_bundle_copy(
+            s,
+            bundle_id=bundle_id,
+            backend_id=backend_id,
+            pool_id="p1",
+            native_locator={
+                "pool_id": "p1",
+                "object_id": "duplicate",
+                "tape_uuid": "f" * 32,
+            },
+            integrity_hash=existing.integrity_hash,
+            source=CopySource.INGEST,
+            health=CopyHealth.OK,
+            storage_metadata=existing.storage_metadata,
+        )
+        s.flush()
+        caplog.set_level("ERROR", logger="sutradhara.jobs.reconcilers.bundle_copy")
+
+        first = bundle_copy.refresh_condition(s, bundle_id)
+        second = bundle_copy.refresh_condition(s, bundle_id)
+
+        assert first.condition == CONDITION_BLOCKED
+        assert second.condition == CONDITION_BLOCKED
+        assert second.reason == "duplicate-copy"
+        assert sum(
+            1 for record in caplog.records if record.message == "bundle_copy_condition_blocked"
+        ) == 1
+
+
 def _flushed_bundle(
     engine: Engine,
     tmp_path: Path,
@@ -348,6 +435,10 @@ def _flushed_bundle(
                 bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
                 restore_preference=pool_ids,
                 expect="messy",
+                durability=DurabilityPolicy(
+                    min_copies=len(pool_ids),
+                    min_impl_families=1,
+                ),
             ),
         )
         bundle = Bundle(id="bundle-a", artifactclass="class-a", status="open")
