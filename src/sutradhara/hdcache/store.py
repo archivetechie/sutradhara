@@ -424,6 +424,23 @@ def probe_disk_liveness_with_deadline(
     )
 
 
+def run_disk_io_with_deadline(
+    disk_id: str,
+    operation: Callable[[], Any],
+    *,
+    deadline_monotonic: float,
+    timeout_message: str,
+) -> Any:
+    """Run arbitrary disk-local walker/rebuild I/O through the per-disk actor."""
+
+    return _run_disk_actor_operation(
+        disk_id,
+        operation,
+        deadline_monotonic=deadline_monotonic,
+        timeout_message=timeout_message,
+    )
+
+
 def write_entry(
     mount: Path,
     content_sha256: bytes,

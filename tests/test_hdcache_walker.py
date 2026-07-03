@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -249,7 +250,112 @@ def test_read_only_walk_verification_alarms_without_promotion_or_lost(
         assert result.entries_promoted == 0
         assert session.get(CacheEntry, digest).state == "present"
         assert session.get(CacheEntry, digest).trusted is False
-        assert [event.code for event in events] == ["walker-untrusted-verify-failed"]
+    assert [event.code for event in events] == ["walker-untrusted-verify-failed"]
+
+
+def test_mid_walk_unmount_aborts_before_lost_mark(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    secret = b"walker-secret"
+    mount = _mount_with_identity(tmp_path, secret=secret)
+    with session_scope(engine) as session:
+        disk = _disk(session, mount)
+        digest = _seed_archived_asset(session, data=b"missing")
+        _entry(session, disk, digest, b"missing", write_file=False)
+
+        result = walk_disk(
+            session,
+            disk,
+            config=HdcacheWalkerConfig(
+                hmac_secret=secret,
+                identity_probe=FlappingProbe(),
+                enqueue_repopulation=False,
+            ),
+        )
+
+        assert result.halted is True
+        assert result.entries_lost == 0
+        assert session.get(CacheEntry, digest).state == "present"
+        assert session.get(CacheDisk, "d001").state == "absent"
+
+
+def test_rebuild_skips_hung_disk_and_continues(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = b"walker-secret"
+    mount1 = tmp_path / "a901"
+    mount1.mkdir()
+    write_disk_sentinel(
+        mount1,
+        ExpectedDiskIdentity("a901", "SER901", "fs-901"),
+        hmac_secret=secret,
+    )
+    mount2 = tmp_path / "d002"
+    mount2.mkdir()
+    write_disk_sentinel(
+        mount2,
+        ExpectedDiskIdentity("d002", "SER002", "fs-002"),
+        hmac_secret=secret,
+    )
+    unblock = threading.Event()
+    original_enumerate = __import__(
+        "sutradhara.hdcache.walker",
+        fromlist=["enumerate_entries"],
+    ).enumerate_entries
+
+    def fake_enumerate(mount: Path):
+        if mount == mount1:
+            unblock.wait()
+            return []
+        return original_enumerate(mount)
+
+    monkeypatch.setattr("sutradhara.hdcache.walker.enumerate_entries", fake_enumerate)
+
+    try:
+        with session_scope(engine) as session:
+            disk1 = CacheDisk(
+                disk_id="a901",
+                serial="SER901",
+                fs_uuid="fs-901",
+                mount=str(mount1),
+                state="active",
+                capacity_bytes=1000,
+                filled_bytes=0,
+            )
+            session.add(disk1)
+            disk2 = CacheDisk(
+                disk_id="d002",
+                serial="SER002",
+                fs_uuid="fs-002",
+                mount=str(mount2),
+                state="active",
+                capacity_bytes=1000,
+                filled_bytes=0,
+            )
+            session.add(disk2)
+            digest = _seed_archived_asset(session, data=b"rebuild d2")
+            write_entry(mount2, digest, b"rebuild d2", representation=RAW_REPRESENTATION)
+
+            result = rebuild_hdcache(
+                session,
+                config=HdcacheWalkerConfig(
+                    hmac_secret=secret,
+                    identity_probe=MultiDiskProbe(),
+                    disk_io_deadline_seconds=0.05,
+                ),
+            )
+
+            assert result.disks[0].disk_id == disk1.disk_id
+            assert result.disks[0].rejected is True
+            assert session.get(CacheDisk, "a901").state == "absent"
+            assert result.disks[1].disk_id == "d002"
+            assert result.disks[1].entries == 1
+            assert session.get(CacheEntry, digest).disk_id == "d002"
+    finally:
+        unblock.set()
 
 
 def test_rebuild_rejects_spoofed_sentinel_without_rows(
@@ -425,3 +531,23 @@ class FakeProbe:
 
     def observe(self, _mount: Path) -> ObservedBlockIdentity:
         return ObservedBlockIdentity(True, serial=self.serial, fs_uuid="fs-001")
+
+
+class FlappingProbe:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def observe(self, _mount: Path) -> ObservedBlockIdentity:
+        self.calls += 1
+        if self.calls == 1:
+            return ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001")
+        return ObservedBlockIdentity(False)
+
+
+class MultiDiskProbe:
+    def observe(self, mount: Path) -> ObservedBlockIdentity:
+        if mount.name == "d002":
+            return ObservedBlockIdentity(True, serial="SER002", fs_uuid="fs-002")
+        if mount.name == "a901":
+            return ObservedBlockIdentity(True, serial="SER901", fs_uuid="fs-901")
+        return ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001")

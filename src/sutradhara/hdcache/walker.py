@@ -40,12 +40,14 @@ from sutradhara.hdcache.store import (
     EnumeratedEntry,
     ExpectedDiskIdentity,
     StoreError,
+    StoreReadTimeout,
     entries_root,
     entry_path,
     enumerate_entries,
     enumerate_rejected_entry_files,
+    run_disk_io_with_deadline,
     tmp_root,
-    verify_disk_identity,
+    verify_disk_identity_with_deadline,
 )
 from sutradhara.jobs.models import Job, LIVE_JOB_STATUS_VALUES
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
@@ -56,6 +58,8 @@ from sutradhara.sealing.rao import RaoCliOpener
 DEFAULT_UNKNOWN_FILE_TRIPWIRE = 100
 DEFAULT_TMP_GC_AGE_SECONDS = 6 * 60 * 60
 DEFAULT_FILLING_YOUNG_SECONDS = 6 * 60 * 60
+DEFAULT_WALKER_DISK_IO_DEADLINE_SECONDS = 70.0
+DEFAULT_WALKER_IDENTITY_DEADLINE_SECONDS = 2.0
 SHA_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -103,6 +107,8 @@ class HdcacheWalkerConfig:
     opener: Opener | None = None
     scratch_root: Path = Path("/var/lib/replica/hdcache-walker-scratch")
     metadata_refresher: Any | None = None
+    disk_io_deadline_seconds: float = DEFAULT_WALKER_DISK_IO_DEADLINE_SECONDS
+    identity_probe_deadline_seconds: float = DEFAULT_WALKER_IDENTITY_DEADLINE_SECONDS
 
     def __post_init__(self) -> None:
         if not self.hmac_secret:
@@ -115,6 +121,10 @@ class HdcacheWalkerConfig:
             raise ValueError("filling_young_seconds must be non-negative")
         if self.sampled_rehash_count < 0:
             raise ValueError("sampled_rehash_count must be non-negative")
+        if self.disk_io_deadline_seconds <= 0:
+            raise ValueError("disk_io_deadline_seconds must be positive")
+        if self.identity_probe_deadline_seconds <= 0:
+            raise ValueError("identity_probe_deadline_seconds must be positive")
         object.__setattr__(self, "scratch_root", Path(self.scratch_root))
 
     def registry(self) -> KeyRegistry:
@@ -189,7 +199,12 @@ def walk_disk(
         _emit(config, "walker-disk-absent", "info", disk.disk_id, detail="disk state is absent")
         return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False)
 
-    identity = _verify_identity(disk, config)
+    try:
+        identity = _verify_identity(disk, config)
+    except (DiskWalkAborted, StoreReadTimeout) as exc:
+        if isinstance(exc, StoreReadTimeout):
+            _mark_disk_absent(session, disk, config=config, detail=str(exc))
+        return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False, halted=True)
     destructive = destructive and identity.ok
     if not identity.ok:
         _emit(
@@ -199,6 +214,13 @@ def walk_disk(
             disk.disk_id,
             detail=f"{identity.status}: {identity.detail}",
         )
+        if identity.status == "not_mounted":
+            _mark_disk_absent(
+                session,
+                disk,
+                config=config,
+                detail=f"{identity.status}: {identity.detail}",
+            )
         return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False)
 
     mount = Path(disk.mount)
@@ -211,7 +233,17 @@ def walk_disk(
         )
     )
     known_paths = {_entry_final_path(mount, entry) for entry in db_entries}
-    unknown = _unknown_files(root, known_paths)
+    try:
+        unknown = _disk_io(
+            disk,
+            config,
+            lambda: _unknown_files(root, known_paths),
+            "walker unknown-file enumeration deadline exceeded",
+        )
+    except (DiskWalkAborted, StoreReadTimeout) as exc:
+        if isinstance(exc, StoreReadTimeout):
+            _mark_disk_absent(session, disk, config=config, detail=str(exc))
+        return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False, halted=True)
     if len(unknown) > config.unknown_file_tripwire:
         _emit(
             config,
@@ -230,32 +262,67 @@ def walk_disk(
             unknown_files=len(unknown),
         )
 
-    unknown_deleted = _delete_unknown_files(unknown, config, disk.disk_id) if destructive else 0
-    tmp_deleted = _gc_tmp_files(session, mount, config=config, disk_id=disk.disk_id) if destructive else 0
+    try:
+        unknown_deleted = _delete_unknown_files(session, unknown, config, disk) if destructive else 0
+        tmp_deleted = _gc_tmp_files(session, disk, mount, config=config) if destructive else 0
+    except (DiskWalkAborted, StoreReadTimeout) as exc:
+        if isinstance(exc, StoreReadTimeout):
+            _mark_disk_absent(session, disk, config=config, detail=str(exc))
+        return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False, halted=True)
 
     lost = 0
     present = 0
     promoted = 0
-    for entry in db_entries:
-        changed = _walk_entry(session, disk, entry, config=config, destructive=destructive)
-        lost += changed == "lost"
-        present += changed == "present"
-        promoted += changed == "promoted"
+    try:
+        for entry in db_entries:
+            changed = _walk_entry(session, disk, entry, config=config, destructive=destructive)
+            lost += changed == "lost"
+            present += changed == "present"
+            promoted += changed == "promoted"
+    except (DiskWalkAborted, StoreReadTimeout) as exc:
+        if isinstance(exc, StoreReadTimeout):
+            _mark_disk_absent(session, disk, config=config, detail=str(exc))
+        return HdcacheWalkResult(
+            disk_id=disk.disk_id,
+            destructive=False,
+            halted=True,
+            unknown_files=len(unknown),
+            unknown_deleted=unknown_deleted,
+            tmp_deleted=tmp_deleted,
+            entries_lost=lost,
+            entries_present=present,
+            entries_promoted=promoted,
+        )
 
     if config.sampled_rehash_count:
-        for entry in db_entries[: config.sampled_rehash_count]:
-            if entry.state == "present":
-                should_promote = not entry.trusted
-                verified = _verify_entry(
-                    session,
-                    disk,
-                    entry,
-                    config=config,
-                    promote=should_promote,
-                    destructive=destructive,
-                )
-                if destructive and should_promote and verified:
-                    promoted += 1
+        try:
+            for entry in db_entries[: config.sampled_rehash_count]:
+                if entry.state == "present":
+                    should_promote = not entry.trusted
+                    verified = _verify_entry(
+                        session,
+                        disk,
+                        entry,
+                        config=config,
+                        promote=should_promote,
+                        destructive=destructive,
+                    )
+                    if destructive and should_promote and verified:
+                        promoted += 1
+        except (DiskWalkAborted, StoreReadTimeout) as exc:
+            if isinstance(exc, StoreReadTimeout):
+                _mark_disk_absent(session, disk, config=config, detail=str(exc))
+            return HdcacheWalkResult(
+                disk_id=disk.disk_id,
+                destructive=False,
+                halted=True,
+                unknown_files=len(unknown),
+                unknown_deleted=unknown_deleted,
+                tmp_deleted=tmp_deleted,
+                entries_lost=lost,
+                entries_present=present,
+                entries_promoted=promoted,
+            )
 
     if config.enqueue_repopulation and lost:
         top_up_lost_entries(session)
@@ -307,10 +374,28 @@ def rebuild_hdcache(
     results: list[HdcacheRebuildDiskResult] = []
     for index, disk in enumerate(disks, start=1):
         started = time.monotonic()
-        identity = _verify_identity(disk, config)
+        try:
+            identity = _verify_identity(disk, config)
+        except StoreReadTimeout as exc:
+            detail = str(exc)
+            _mark_disk_absent(session, disk, config=config, detail=detail)
+            results.append(
+                HdcacheRebuildDiskResult(
+                    disk_id=disk.disk_id,
+                    index=index,
+                    total=total,
+                    entries=0,
+                    elapsed_seconds=time.monotonic() - started,
+                    rejected=True,
+                    detail=detail,
+                )
+            )
+            continue
         if not identity.ok:
             detail = f"{identity.status}: {identity.detail}"
             _emit(config, "disk-identity-mismatch", "alarm", disk.disk_id, detail=detail)
+            if identity.status == "not_mounted":
+                _mark_disk_absent(session, disk, config=config, detail=detail)
             results.append(
                 HdcacheRebuildDiskResult(
                     disk_id=disk.disk_id,
@@ -325,7 +410,34 @@ def rebuild_hdcache(
             continue
 
         mount = Path(disk.mount)
-        entries = enumerate_entries(mount)
+        try:
+            entries = _disk_io(
+                disk,
+                config,
+                lambda: enumerate_entries(mount),
+                "rebuild entry enumeration deadline exceeded",
+            )
+            rejected_entries = _disk_io(
+                disk,
+                config,
+                lambda: enumerate_rejected_entry_files(mount),
+                "rebuild rejected-entry enumeration deadline exceeded",
+            )
+        except StoreReadTimeout as exc:
+            detail = str(exc)
+            _mark_disk_absent(session, disk, config=config, detail=detail)
+            results.append(
+                HdcacheRebuildDiskResult(
+                    disk_id=disk.disk_id,
+                    index=index,
+                    total=total,
+                    entries=0,
+                    elapsed_seconds=time.monotonic() - started,
+                    rejected=True,
+                    detail=detail,
+                )
+            )
+            continue
         inserted = 0
         failures = [
             RebuildFailure(
@@ -336,25 +448,44 @@ def rebuild_hdcache(
                     None if rejected.content_sha256 is None else rejected.content_sha256.hex()
                 ),
             )
-            for rejected in enumerate_rejected_entry_files(mount)
+            for rejected in rejected_entries
         ]
         for observed in entries:
             try:
-                if _rebuild_observed_entry(session, disk, observed):
+                if _rebuild_observed_entry(session, disk, observed, config=config):
                     inserted += 1
             except RebuildFailureError as exc:
                 failures.append(exc.failure)
-        _correct_filled_bytes(session, disk)
-        results.append(
-            HdcacheRebuildDiskResult(
-                disk_id=disk.disk_id,
-                index=index,
-                total=total,
-                entries=inserted,
-                elapsed_seconds=time.monotonic() - started,
-                failures=failures,
+            except StoreReadTimeout as exc:
+                detail = str(exc)
+                _mark_disk_absent(session, disk, config=config, detail=detail)
+                results.append(
+                    HdcacheRebuildDiskResult(
+                        disk_id=disk.disk_id,
+                        index=index,
+                        total=total,
+                        entries=inserted,
+                        elapsed_seconds=time.monotonic() - started,
+                        rejected=True,
+                        detail=detail,
+                        failures=failures,
+                    )
+                )
+                break
+        else:
+            _correct_filled_bytes(session, disk)
+            results.append(
+                HdcacheRebuildDiskResult(
+                    disk_id=disk.disk_id,
+                    index=index,
+                    total=total,
+                    entries=inserted,
+                    elapsed_seconds=time.monotonic() - started,
+                    failures=failures,
+                )
             )
-        )
+            continue
+        continue
     return HdcacheRebuildResult(results)
 
 
@@ -362,6 +493,10 @@ class RebuildFailureError(RuntimeError):
     def __init__(self, failure: RebuildFailure) -> None:
         self.failure = failure
         super().__init__(failure.reason)
+
+
+class DiskWalkAborted(RuntimeError):
+    """Raised when disk liveness changes during a destructive walk."""
 
 
 def _walk_entry(
@@ -373,23 +508,23 @@ def _walk_entry(
     destructive: bool,
 ) -> str | None:
     final_path = _entry_final_path(Path(disk.mount), entry)
-    exists = final_path.is_file()
+    exists, size_bytes = _entry_file_status(disk, final_path, config=config)
     if entry.state == "filling":
         if exists:
-            if final_path.stat().st_size == entry.size_bytes:
+            if size_bytes == entry.size_bytes:
                 if destructive:
                     entry.state = "present"
                     entry.trusted = True
                     session.flush([entry])
                 return "present"
             if destructive:
-                mark_entry_lost_and_delete(session, entry)
+                _mark_entry_lost_after_identity_proof(session, disk, entry, config=config)
                 return "lost"
             return None
         if _filling_is_live_or_young(session, entry, disk, config=config):
             return None
         if destructive:
-            mark_entry_lost_and_delete(session, entry)
+            _mark_entry_lost_after_identity_proof(session, disk, entry, config=config)
             return "lost"
         return None
 
@@ -397,12 +532,12 @@ def _walk_entry(
         return None
     if not exists:
         if destructive:
-            mark_entry_lost_and_delete(session, entry)
+            _mark_entry_lost_after_identity_proof(session, disk, entry, config=config)
             return "lost"
         return None
-    if final_path.stat().st_size != entry.size_bytes:
+    if size_bytes != entry.size_bytes:
         if destructive:
-            mark_entry_lost_and_delete(session, entry)
+            _mark_entry_lost_after_identity_proof(session, disk, entry, config=config)
             return "lost"
         return None
     if config.verify_untrusted and not entry.trusted:
@@ -433,7 +568,12 @@ def _verify_entry(
         if entry.representation == RAW_REPRESENTATION:
             from sutradhara.hdcache.store import read_entry_verified
 
-            read_entry_verified(Path(disk.mount), entry.content_sha256)
+            read_entry_verified(
+                Path(disk.mount),
+                entry.content_sha256,
+                deadline_monotonic=_deadline(config.disk_io_deadline_seconds),
+                disk_id=disk.disk_id,
+            )
         elif entry.representation == AEAD_REPRESENTATION:
             _verify_aead_entry(disk, entry, config=config)
         else:
@@ -448,7 +588,7 @@ def _verify_entry(
             detail=str(exc),
         )
         if destructive:
-            mark_entry_lost_and_delete(session, entry)
+            _mark_entry_lost_after_identity_proof(session, disk, entry, config=config)
         return False
     if promote and destructive:
         entry.trusted = True
@@ -474,6 +614,8 @@ def _verify_aead_entry(disk: CacheDisk, entry: CacheEntry, *, config: HdcacheWal
                 key_epoch=entry.key_epoch,
                 expected_stream_sha256=entry.stored_digest,
                 output=output,
+                deadline_monotonic=_deadline(config.disk_io_deadline_seconds),
+                disk_id=disk.disk_id,
             )
         opener = config.opener or RaoCliOpener(config.registry(), work_dir=config.scratch_root)
         with opener.open(
@@ -491,6 +633,8 @@ def _rebuild_observed_entry(
     session: Session,
     disk: CacheDisk,
     observed: EnumeratedEntry,
+    *,
+    config: HdcacheWalkerConfig,
 ) -> bool:
     target = desired_target_for_asset(session, observed.content_sha256)
     asset = session.get(LogicalAsset, observed.content_sha256)
@@ -509,7 +653,16 @@ def _rebuild_observed_entry(
     existing = session.get(CacheEntry, observed.content_sha256)
     if existing is not None and existing.state == "present" and existing.disk_id != disk.disk_id:
         raise _rebuild_failure(disk, observed, "duplicate-present-entry")
-    stored_digest = _file_sha256(observed.path) if observed.representation == AEAD_REPRESENTATION else None
+    stored_digest = (
+        _disk_io(
+            disk,
+            config,
+            lambda: _file_sha256(observed.path),
+            "rebuild AEAD digest deadline exceeded",
+        )
+        if observed.representation == AEAD_REPRESENTATION
+        else None
+    )
     if existing is None:
         existing = CacheEntry(content_sha256=observed.content_sha256)
         session.add(existing)
@@ -540,7 +693,7 @@ def _rebuild_failure(disk: CacheDisk, observed: EnumeratedEntry, reason: str) ->
 
 
 def _verify_identity(disk: CacheDisk, config: HdcacheWalkerConfig):
-    return verify_disk_identity(
+    return verify_disk_identity_with_deadline(
         Path(disk.mount),
         ExpectedDiskIdentity(
             disk_id=disk.disk_id,
@@ -549,8 +702,86 @@ def _verify_identity(disk: CacheDisk, config: HdcacheWalkerConfig):
             wwn=disk.wwn,
         ),
         hmac_secret=config.hmac_secret,
+        disk_id=disk.disk_id,
         probe=config.identity_probe,
+        deadline_monotonic=_deadline(config.identity_probe_deadline_seconds),
     )
+
+
+def _mark_entry_lost_after_identity_proof(
+    session: Session,
+    disk: CacheDisk,
+    entry: CacheEntry,
+    *,
+    config: HdcacheWalkerConfig,
+) -> None:
+    try:
+        identity = _verify_identity(disk, config)
+    except StoreReadTimeout as exc:
+        _mark_disk_absent(session, disk, config=config, detail=str(exc))
+        raise DiskWalkAborted(str(exc)) from exc
+    if not identity.ok:
+        detail = f"{identity.status}: {identity.detail}"
+        if identity.status == "not_mounted":
+            _mark_disk_absent(session, disk, config=config, detail=detail)
+        _emit(
+            config,
+            "walker-lost-mark-aborted",
+            "alarm",
+            disk.disk_id,
+            content_sha256=entry.content_sha256.hex(),
+            detail=f"{detail} before lost mark",
+        )
+        raise DiskWalkAborted(detail)
+    mark_entry_lost_and_delete(session, entry)
+
+
+def _entry_file_status(
+    disk: CacheDisk,
+    path: Path,
+    *,
+    config: HdcacheWalkerConfig,
+) -> tuple[bool, int | None]:
+    def operation() -> tuple[bool, int | None]:
+        exists = path.is_file()
+        return exists, path.stat().st_size if exists else None
+
+    return _disk_io(
+        disk,
+        config,
+        operation,
+        "walker entry stat deadline exceeded",
+    )
+
+
+def _disk_io(
+    disk: CacheDisk,
+    config: HdcacheWalkerConfig,
+    operation: Callable[[], Any],
+    timeout_message: str,
+) -> Any:
+    return run_disk_io_with_deadline(
+        disk.disk_id,
+        operation,
+        deadline_monotonic=_deadline(config.disk_io_deadline_seconds),
+        timeout_message=timeout_message,
+    )
+
+
+def _mark_disk_absent(
+    session: Session,
+    disk: CacheDisk,
+    *,
+    config: HdcacheWalkerConfig,
+    detail: str,
+) -> None:
+    disk.state = "absent"
+    session.flush([disk])
+    _emit(config, "walker-disk-absent", "alarm", disk.disk_id, detail=detail)
+
+
+def _deadline(seconds: float) -> float:
+    return time.monotonic() + seconds
 
 
 def _unknown_files(root: Path, known_paths: set[Path]) -> list[Path]:
@@ -572,28 +803,63 @@ def _unknown_files(root: Path, known_paths: set[Path]) -> list[Path]:
     return unknown
 
 
-def _delete_unknown_files(paths: Iterable[Path], config: HdcacheWalkerConfig, disk_id: str) -> int:
+def _delete_unknown_files(
+    session: Session,
+    paths: Iterable[Path],
+    config: HdcacheWalkerConfig,
+    disk: CacheDisk,
+) -> int:
     deleted = 0
     for path in paths:
         try:
-            path.unlink()
+            _disk_io(
+                disk,
+                config,
+                path.unlink,
+                "walker unknown-file delete deadline exceeded",
+            )
             deleted += 1
         except OSError as exc:
-            _emit(config, "walker-delete-failed", "alarm", disk_id, detail=str(exc))
+            _emit(config, "walker-delete-failed", "alarm", disk.disk_id, detail=str(exc))
+        except StoreReadTimeout as exc:
+            _mark_disk_absent(session, disk, config=config, detail=str(exc))
+            raise DiskWalkAborted(str(exc)) from exc
     return deleted
 
 
-def _gc_tmp_files(session: Session, mount: Path, *, config: HdcacheWalkerConfig, disk_id: str) -> int:
+def _gc_tmp_files(session: Session, disk: CacheDisk, mount: Path, *, config: HdcacheWalkerConfig) -> int:
     tmp = tmp_root(mount)
-    if not tmp.exists():
+    if not _disk_io(
+        disk,
+        config,
+        tmp.exists,
+        "walker tmp-exists deadline exceeded",
+    ):
         return 0
     deleted = 0
     now = time.time()
-    for path in sorted(tmp.iterdir()):
-        if not path.is_file() and not path.is_symlink():
+    paths = _disk_io(
+        disk,
+        config,
+        lambda: sorted(tmp.iterdir()),
+        "walker tmp enumeration deadline exceeded",
+    )
+    for path in paths:
+        is_stale_file = _disk_io(
+            disk,
+            config,
+            lambda path=path: path.is_file() or path.is_symlink(),
+            "walker tmp file-status deadline exceeded",
+        )
+        if not is_stale_file:
             continue
         try:
-            age = now - path.stat().st_mtime
+            age = now - _disk_io(
+                disk,
+                config,
+                lambda path=path: path.stat().st_mtime,
+                "walker tmp stat deadline exceeded",
+            )
         except OSError:
             continue
         if age < config.tmp_gc_age_seconds:
@@ -601,10 +867,10 @@ def _gc_tmp_files(session: Session, mount: Path, *, config: HdcacheWalkerConfig,
         if _tmp_job_live(session, path):
             continue
         try:
-            path.unlink()
+            _disk_io(disk, config, path.unlink, "walker tmp delete deadline exceeded")
             deleted += 1
         except OSError as exc:
-            _emit(config, "walker-delete-failed", "alarm", disk_id, detail=str(exc))
+            _emit(config, "walker-delete-failed", "alarm", disk.disk_id, detail=str(exc))
     return deleted
 
 
@@ -634,10 +900,26 @@ def _filling_is_live_or_young(
     if (_utcnow() - placed_at).total_seconds() < config.filling_young_seconds:
         return True
     tmp = tmp_root(Path(disk.mount))
-    if tmp.exists():
+    if _disk_io(disk, config, tmp.exists, "walker filling tmp-exists deadline exceeded"):
         now = time.time()
         with contextlib.suppress(OSError):
-            return any(now - path.stat().st_mtime < config.tmp_gc_age_seconds for path in tmp.iterdir())
+            paths = _disk_io(
+                disk,
+                config,
+                lambda: list(tmp.iterdir()),
+                "walker filling tmp enumeration deadline exceeded",
+            )
+            return any(
+                now
+                - _disk_io(
+                    disk,
+                    config,
+                    lambda path=path: path.stat().st_mtime,
+                    "walker filling tmp stat deadline exceeded",
+                )
+                < config.tmp_gc_age_seconds
+                for path in paths
+            )
     return False
 
 
