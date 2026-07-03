@@ -13,11 +13,14 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 
 from sutradhara.catalog.session import session_scope
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
+from sutradhara.jobs.attempts import record_attempt
 from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.engine import (
+    _record_reconciler_condition,
     apply_retry_policy,
     claim_job_by_id,
     pending_candidates,
@@ -26,6 +29,7 @@ from sutradhara.jobs.engine import (
 )
 from sutradhara.jobs.leases import LeaseManager, normalize_required_resources
 from sutradhara.jobs.models import Job, JobStatus
+from sutradhara.jobs.reconcilers.conditions import CONDITION_BACKOFF
 from sutradhara.jobs.registry import JobResult
 
 
@@ -60,7 +64,8 @@ class JobWorker:
         futures: dict[Future[WorkerJobOutcome], dict[str, int]] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             while True:
-                claimed = self._claim_available()
+                free_slots = max_workers - len(futures)
+                claimed = self._claim_available(max_new=free_slots) if free_slots > 0 else []
                 for job_id, granted in claimed:
                     future = executor.submit(
                         _execute_job,
@@ -81,16 +86,26 @@ class JobWorker:
                         self.leases.release(granted)
         return outcomes
 
-    def _claim_available(self) -> list[tuple[int, dict[str, int]]]:
+    def _claim_available(self, *, max_new: int) -> list[tuple[int, dict[str, int]]]:
+        if max_new <= 0:
+            return []
+        return self._claim_available_bounded(max_new=max_new)
+
+    def _claim_available_bounded(self, *, max_new: int) -> list[tuple[int, dict[str, int]]]:
         claimed: list[tuple[int, dict[str, int]]] = []
         with session_scope(self.engine) as session:
-            while True:
+            while len(claimed) < max_new:
                 job = None
                 granted: dict[str, int] | None = None
                 for candidate in pending_candidates(session):
                     required = normalize_required_resources(candidate.required_resources)
                     if not self.leases.can_ever_fit(required):
-                        _mark_never_fits(candidate, required, self.config.capacities)
+                        _mark_never_fits(
+                            session,
+                            candidate,
+                            required,
+                            self.config.capacities,
+                        )
                         self._blocked_scans.pop(candidate.id, None)
                         session.flush()
                         continue
@@ -112,10 +127,27 @@ class JobWorker:
         return claimed
 
 
-def _mark_never_fits(job: Job, required: dict[str, int], capacities: dict[str, int]) -> None:
+def _mark_never_fits(
+    session: Session,
+    job: Job,
+    required: dict[str, int],
+    capacities: dict[str, int],
+) -> None:
+    now = dt.datetime.now(dt.UTC)
+    job.attempts += 1
+    job.started_at = now
     job.status = JobStatus.FAILED
-    job.finished_at = dt.datetime.now(dt.UTC)
+    job.finished_at = now
     job.last_error = f"required resources {required!r} exceed worker capacities {capacities!r}"
+    attempt = record_attempt(session, job, granted_leases={})
+    _record_reconciler_condition(
+        session,
+        job,
+        attempt,
+        condition=CONDITION_BACKOFF,
+        reason="never-fit",
+        message=job.last_error,
+    )
 
 
 def _execute_job(

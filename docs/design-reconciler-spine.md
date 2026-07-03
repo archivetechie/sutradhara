@@ -1,6 +1,6 @@
 # Design — the reconciler spine (P0.3): the condition table + the reconcile loop
 
-> Status: **implemented (2026-06-25; commit 31e82f8) — §4.1 version-gated reopen NOT yet implemented, see `prompt-jobs-safety-rails`**.
+> Status: **implemented (2026-06-25; commit 31e82f8) — §4.1 version-gated reopen implemented 2026-07 via `reopen_version_bumped`**.
 > Original implementation item **P0.3** in `implementation-plan-ingest-v2.md`. This is the **concrete, buildable**
 > form of `design-reconciliation-model.md` Phase 3 — that doc defines *the model*
 > (intent as desired-state, jobs as attempts, level-triggered convergence); this doc
@@ -136,7 +136,7 @@ reconciliation_condition
   message              text nullable         # human text
   attempt_count        int  not null default 0
   next_eligible_at     tz datetime nullable  # backoff/due gate; also the poke handle for "re-run now"
-  blocked_tool_name    str  nullable         # version-gated re-open (derivation-like domains; unused by copy)
+  blocked_tool_name    str  nullable         # version-gated re-open implemented 2026-07 via reopen_version_bumped
   blocked_tool_version str  nullable
   last_attempt_id      FK job_attempt.id nullable ON DELETE SET NULL   # link into the P0.2 transcript
   last_attempt_at      tz datetime nullable
@@ -621,6 +621,14 @@ On scenario Q specifically — the spine is **purely additive**: the existing sy
 and untouched** (it must stay so until the real copy write port lands — §2.2). Scenario Q stays
 green *because* P0.3 does not reroute placement through the stub `copy` handler; the spine's own
 convergence is proven by its new tests (memory-backend copy handler), not by scenario Q.
+
+### 9.1 Forward migration — copy write port
+
+Every `copy` target that the current `NotImplementedError` stub drove to
+`blocked(not-implemented)` stays blocked when the real write handler lands. The stub never wrote
+`blocked_tool_*`, so version-gated reopen cannot rescue that backlog. The future copy-write-handler
+prompt must include `sutra reconcile copy --reopen-blocked --reason not-implemented` as an explicit
+post-deploy step to drain those stranded targets.
 
 ## 10. Deferred: the three-table pipeline (`domain_event` + `reconciliation_wakeup`)
 

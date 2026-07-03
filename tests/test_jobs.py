@@ -15,6 +15,7 @@ from click.testing import CliRunner, Result
 from sqlalchemy import Engine, select
 from sqlalchemy.exc import IntegrityError
 
+import sutradhara.jobs.engine as job_engine
 from sutradhara.api.identity import parse_identity
 from sutradhara.backend import factory as backend_factory
 from sutradhara.backend.memory import MemoryBackend
@@ -51,7 +52,12 @@ from sutradhara.jobs.engine import (
     run_pending,
     submit,
 )
-from sutradhara.jobs.models import Job, JobStatus
+from sutradhara.jobs.models import Job, JobAttempt, JobStatus, ReconciliationCondition
+from sutradhara.jobs.reconcilers.conditions import (
+    CONDITION_BACKOFF,
+    OBSERVED_MISSING,
+    record_observation,
+)
 from sutradhara.jobs.registry import (
     JobContext,
     JobResult,
@@ -203,6 +209,30 @@ def test_live_dedupe_key_unique_index_blocks_direct_duplicate_insert(
 
     with pytest.raises(IntegrityError):
         insert_duplicate_live_job()
+
+
+def test_submit_dedupe_integrity_error_returns_existing_job(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with session_scope(engine) as s:
+        first = submit(s, "verify", {"copy_id": 1}, dedupe_key="verify:race-requery")
+        real_lookup = job_engine._live_job_for_dedupe
+        calls = {"count": 0}
+
+        def stale_fast_path(session: object, dedupe_key: str) -> Job | None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return None
+            return real_lookup(session, dedupe_key)
+
+        monkeypatch.setattr(job_engine, "_live_job_for_dedupe", stale_fast_path)
+
+        second = submit(s, "verify", {"copy_id": 2}, dedupe_key="verify:race-requery")
+
+        assert second.id == first.id
+        assert second.params == {"copy_id": 1}
+        assert calls["count"] >= 2
 
 
 def test_run_unknown_kind_marks_failed(engine: Engine) -> None:
@@ -411,6 +441,84 @@ def test_worker_enforces_cpu_and_io_lease_caps(tmp_path: Path) -> None:
         _r._HANDLERS.pop("_test_lease_sleep", None)
 
 
+def test_worker_claim_available_is_bounded_by_free_slot_budget(tmp_path: Path) -> None:
+    @register_handler("_test_claim_bound")
+    def _claim_bound(_ctx: JobContext) -> JobResult:
+        return JobResult(ok=True)
+
+    try:
+        eng = _worker_engine(tmp_path)
+        with session_scope(eng) as s:
+            for _index in range(5):
+                submit(s, "_test_claim_bound", {})
+
+        worker = JobWorker(
+            eng,
+            config=WorkerConfig(
+                capacities={"cpu": 4, "io": 2, "tape_drive": 0, "gpu": 0},
+                executor_workers=2,
+            ),
+        )
+        claimed = worker._claim_available(max_new=2)
+
+        assert len(claimed) == 2
+        with session_scope(eng) as s:
+            assert len(list(s.scalars(select(Job).where(Job.status == JobStatus.RUNNING)))) == 2
+            assert len(list(s.scalars(select(Job).where(Job.status == JobStatus.PENDING)))) == 3
+        eng.dispose()
+    finally:
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_claim_bound", None)
+
+
+def test_worker_never_fit_records_attempt_and_reconciler_condition(tmp_path: Path) -> None:
+    eng = _worker_engine(tmp_path)
+    target_key = "asset:" + "f" * 64 + ":pool-a"
+    with session_scope(eng) as s:
+        record_observation(
+            s,
+            domain="copy",
+            target_key=target_key,
+            desired=True,
+            observed_state=OBSERVED_MISSING,
+        )
+        job = submit(
+            s,
+            "missing_handler_never_runs",
+            {},
+            required_resources=[{"pool": "gpu", "count": 1}],
+            recon_domain="copy",
+            recon_target_key=target_key,
+        )
+
+    worker = JobWorker(
+        eng,
+        config=WorkerConfig(
+            capacities={"cpu": 4, "io": 2, "tape_drive": 0, "gpu": 0},
+            executor_workers=2,
+        ),
+    )
+    assert worker._claim_available(max_new=1) == []
+
+    with session_scope(eng) as s:
+        row = s.get(Job, job.id)
+        assert row is not None
+        assert row.status == JobStatus.FAILED
+        assert row.attempts == 1
+        assert "exceed worker capacities" in (row.last_error or "")
+
+        attempt = s.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
+        assert attempt.outcome == JobStatus.FAILED
+        assert attempt.started_at == attempt.finished_at
+
+        condition = s.scalars(select(ReconciliationCondition)).one()
+        assert condition.condition == CONDITION_BACKOFF
+        assert condition.reason == "never-fit"
+        assert condition.last_attempt_id == attempt.id
+    eng.dispose()
+
+
 def test_worker_is_work_conserving_but_aging_blocks_starvation(tmp_path: Path) -> None:
     order: list[str] = []
     lock = threading.Lock()
@@ -504,6 +612,16 @@ def test_worker_retries_with_backoff_then_fails(tmp_path: Path) -> None:
         from sutradhara.jobs import registry as _r
 
         _r._HANDLERS.pop("_test_retry_fails", None)
+
+
+def test_retry_policy_delay_has_jitter_and_clamp_bounds() -> None:
+    retry = RetryPolicy(max_attempts=5, backoff_seconds=100)
+    base = 400
+    samples = [retry.delay_seconds(3, max_seconds=450) for _ in range(50)]
+
+    assert all(base * 0.8 <= sample <= 450 for sample in samples)
+    assert all(sample <= 450 for sample in samples)
+    assert retry.delay_seconds(0, max_seconds=450) == 0
 
 
 def test_worker_startup_resets_orphaned_running_jobs(engine: Engine) -> None:

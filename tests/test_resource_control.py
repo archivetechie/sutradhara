@@ -16,6 +16,7 @@ from sutradhara import resource_control as rc
 @pytest.fixture(autouse=True)
 def _clean_capability_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SUTRADHARA_RESOURCE_CONTROL", raising=False)
+    monkeypatch.delenv("SUTRADHARA_RESOURCE_CONTROL_REQUIRE", raising=False)
     monkeypatch.delenv("SUTRADHARA_RESOURCE_CONTROL_SYSTEMD", raising=False)
     rc.clear_capability_cache()
 
@@ -127,7 +128,7 @@ def test_child_output_is_preserved_on_systemd_and_degraded_paths(
             reason="forced test fallback",
         ),
     )
-    caplog.set_level(logging.WARNING, logger="sutradhara.resource_control")
+    caplog.set_level(logging.ERROR, logger="sutradhara.resource_control")
     result = rc.run_managed(
         [
             sys.executable,
@@ -143,6 +144,55 @@ def test_child_output_is_preserved_on_systemd_and_degraded_paths(
     assert result.stdout == "plain-out\n"
     assert result.stderr == "plain-err\n"
     assert "resource enforcement degraded" in caplog.text
+
+
+def test_degraded_mode_logs_error_once_and_require_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setitem(
+        rc.RESOURCE_PROFILES,
+        "plain",
+        rc.ResourceProfile(cpu_weight=100, io_weight=100, nice=0, ionice=None),
+    )
+    monkeypatch.setattr(
+        rc,
+        "capability",
+        lambda: rc.ResourceCapability(
+            mode="degraded",
+            manager="user",
+            properties=frozenset(),
+            reason="forced test fallback",
+        ),
+    )
+
+    caplog.set_level(logging.ERROR, logger="sutradhara.resource_control")
+    for _index in range(2):
+        result = rc.run_managed(
+            [sys.executable, "-c", "print('ran')"],
+            role="plain",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0
+
+    degraded_logs = [
+        record for record in caplog.records if "resource enforcement degraded" in record.message
+    ]
+    assert len(degraded_logs) == 1
+    assert degraded_logs[0].levelno == logging.ERROR
+
+    rc.clear_capability_cache()
+    monkeypatch.setenv("SUTRADHARA_RESOURCE_CONTROL_REQUIRE", "1")
+    with pytest.raises(rc.ResourceControlUnavailable, match="forced test fallback"):
+        rc.run_managed(
+            [sys.executable, "-c", "print('ran')"],
+            role="plain",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 def test_capability_drops_rejected_quota_and_child_still_runs(

@@ -13,6 +13,7 @@ from sutradhara.catalog.models import IngestItem, LogicalAsset
 from sutradhara.catalog.types import AssetValidity, MediaKind
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
+from sutradhara.jobs.tool_versions import current_tool_version
 from sutradhara.rem_archive_cli import sha256_file
 from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job, run_managed
 
@@ -83,7 +84,7 @@ def handle_transcode(ctx: JobContext) -> JobResult:
                 condition=CONDITION_BLOCKED,
                 reason="unsupported-source",
                 message=str(result["detail"]),
-                blocked_tool=("ffmpeg", _tool_version("ffmpeg")),
+                blocked_tool=("ffmpeg", current_tool_version("ffmpeg")),
             ),
         )
     if result["kind"] == "no_proxy":
@@ -267,26 +268,6 @@ def _stderr_is_decode_error(stderr: str) -> bool:
 
 def _granted_cpu_threads(ctx: JobContext) -> int:
     return cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources) or 1
-
-
-def _tool_version(tool: str) -> str:
-    path = shutil.which(tool)
-    if path is None:
-        return "unknown"
-    try:
-        completed = run_managed(
-            [path, "-version"],
-            role="medium",
-            cpu_lease=1,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "unknown"
-    lines = (completed.stdout or completed.stderr or "").splitlines()
-    return lines[0][:128] if lines else "unknown"
 
 
 def _read_prefix(path: Path, size: int) -> bytes:

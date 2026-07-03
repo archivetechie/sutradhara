@@ -15,10 +15,13 @@ from sqlalchemy.orm import Session
 from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
+    CONDITION_BLOCKED,
     CONDITION_OPEN,
     record_observation,
+    reopen_condition,
 )
 from sutradhara.jobs.reconcilers.registry import get_reconciler
+from sutradhara.jobs.tool_versions import current_tool_version
 
 
 def discover(
@@ -85,9 +88,43 @@ def reconcile(
 ) -> tuple[int, int]:
     """Run one bounded discover pass followed by one bounded process pass."""
 
+    reopen_version_bumped(session, domain)
     discovered = discover(session, domain, batch=batch, cursor=cursor)
     processed = process(session, domain, limit=limit)
     return discovered, processed
+
+
+def reopen_version_bumped(session: Session, domain: str) -> int:
+    """Reopen blocked conditions whose recorded tool version has changed."""
+
+    reopened = 0
+    rows = list(
+        session.scalars(
+            select(ReconciliationCondition)
+            .where(
+                ReconciliationCondition.domain == domain,
+                ReconciliationCondition.condition == CONDITION_BLOCKED,
+                ReconciliationCondition.blocked_tool_name.is_not(None),
+            )
+            .order_by(ReconciliationCondition.id)
+        )
+    )
+    for row in rows:
+        tool = row.blocked_tool_name
+        if tool is None:
+            continue
+        current = current_tool_version(tool)
+        if current == "unknown" or current == row.blocked_tool_version:
+            continue
+        previous = row.blocked_tool_version or "unknown"
+        reopen_condition(
+            session,
+            row,
+            actor="version-bump",
+            note=f"{tool} version changed from {previous} to {current}",
+        )
+        reopened += 1
+    return reopened
 
 
 def due_workable(

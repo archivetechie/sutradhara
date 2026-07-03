@@ -50,6 +50,10 @@ class ResourceCapability:
     reason: str | None = None
 
 
+class ResourceControlUnavailable(RuntimeError):
+    """Raised when resource-control enforcement is required but unavailable."""
+
+
 RESOURCE_PROFILES: dict[str, ResourceProfile] = {
     "high": ResourceProfile(
         cpu_weight=1000,
@@ -100,6 +104,7 @@ _SYSTEMD_SETUP_PATTERNS = (
 )
 _CAPABILITY_LOCK = threading.Lock()
 _CAPABILITY_CACHE: ResourceCapability | None = None
+_DEGRADED_LOGGED = False
 _UNIT_COUNTER = itertools.count(1)
 _SAFE_UNIT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -107,9 +112,10 @@ _SAFE_UNIT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 def clear_capability_cache() -> None:
     """Clear the cached probe result; intended for tests and config reloads."""
 
-    global _CAPABILITY_CACHE
+    global _CAPABILITY_CACHE, _DEGRADED_LOGGED
     with _CAPABILITY_LOCK:
         _CAPABILITY_CACHE = None
+        _DEGRADED_LOGGED = False
 
 
 def resource_role_for_job(kind: str, params: Mapping[str, Any] | None = None) -> str:
@@ -187,13 +193,9 @@ def run_managed(
         except OSError as exc:
             if not _is_systemd_launcher_error(exc):
                 raise
-            LOGGER.warning("systemd scope launch failed; degrading resource enforcement: %s", exc)
-    LOGGER.warning(
-        "resource enforcement degraded for role=%s cpu_lease=%s: %s",
-        role,
-        cpu_lease,
-        cap.reason or "systemd scope unavailable",
-    )
+            cap = _degrade_or_raise(cap, reason=f"systemd scope launch failed: {exc}")
+    else:
+        cap = _degrade_or_raise(cap)
     return _run_degraded(args, profile=profile, timeout=timeout, popen_kw=dict(popen_kw))
 
 
@@ -316,8 +318,9 @@ def _run_systemd(
         raise
 
     if completed.returncode != 0 and _looks_like_setup_failure(completed):
-        LOGGER.warning(
-            "systemd scope setup failed; retrying without cgroup: %s", _stderr(completed)
+        _degrade_or_raise(
+            cap,
+            reason=f"systemd scope setup failed: {_stderr(completed)}",
         )
         return _run_degraded(
             args, profile=profile, timeout=timeout, popen_kw={**popen_kw, "check": check}
@@ -500,6 +503,37 @@ def _manager_args(manager: ManagerMode) -> list[str]:
 def _resource_control_disabled() -> bool:
     raw = os.environ.get("SUTRADHARA_RESOURCE_CONTROL", "auto").strip().lower()
     return raw in {"0", "off", "false", "disabled", "degraded"}
+
+
+def _resource_control_required() -> bool:
+    raw = os.environ.get("SUTRADHARA_RESOURCE_CONTROL_REQUIRE", "").strip().lower()
+    return raw in {"1", "on", "true", "yes", "require", "required"}
+
+
+def _degrade_or_raise(
+    cap: ResourceCapability,
+    *,
+    reason: str | None = None,
+) -> ResourceCapability:
+    degraded = ResourceCapability(
+        mode="degraded",
+        manager=cap.manager,
+        properties=frozenset(),
+        reason=reason or cap.reason or "systemd scope unavailable",
+    )
+    if _resource_control_required():
+        raise ResourceControlUnavailable(degraded.reason)
+    _log_degraded_once(degraded.reason)
+    return degraded
+
+
+def _log_degraded_once(reason: str | None) -> None:
+    global _DEGRADED_LOGGED
+    with _CAPABILITY_LOCK:
+        if _DEGRADED_LOGGED:
+            return
+        LOGGER.error("resource enforcement degraded: %s", reason or "systemd scope unavailable")
+        _DEGRADED_LOGGED = True
 
 
 def _probe_timeout_seconds() -> float:

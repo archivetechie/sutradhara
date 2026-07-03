@@ -8,6 +8,7 @@ the actual granted leases through ``JobContext``.
 from __future__ import annotations
 
 import os
+import random
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_IO_CAPACITY = 2
+DEFAULT_MAX_BACKOFF_SECONDS = 3600
 DEFAULT_DERIVATION_CACHE_ROOT = Path("/var/lib/replica/cache")
 _DERIVATION_CACHE_ROOT_OVERRIDE: ContextVar[Path | None] = ContextVar(
     "derivation_cache_root_override",
@@ -30,11 +32,16 @@ class RetryPolicy:
     max_attempts: int = 1
     backoff_seconds: int = 30
 
-    def delay_seconds(self, attempts: int) -> int:
+    def delay_seconds(
+        self,
+        attempts: int,
+        *,
+        max_seconds: int = DEFAULT_MAX_BACKOFF_SECONDS,
+    ) -> float:
         if attempts <= 0:
-            return 0
+            return 0.0
         multiplier = 1 << max(0, attempts - 1)
-        return self.backoff_seconds * multiplier
+        return jittered_backoff_seconds(self.backoff_seconds * multiplier, max_seconds=max_seconds)
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,7 @@ class WorkerConfig:
     per_kind_retry: dict[str, RetryPolicy] = field(default_factory=dict)
     aging_threshold_scans: int = 3
     executor_workers: int | None = None
+    max_backoff_seconds: int = DEFAULT_MAX_BACKOFF_SECONDS
 
     @classmethod
     def defaults(cls) -> WorkerConfig:
@@ -71,6 +79,7 @@ class WorkerConfig:
             per_kind_retry=dict(self.per_kind_retry),
             aging_threshold_scans=self.aging_threshold_scans,
             executor_workers=executor_workers,
+            max_backoff_seconds=self.max_backoff_seconds,
         )
 
     def retry_for_kind(self, kind: str) -> RetryPolicy:
@@ -107,6 +116,15 @@ def config_from_json(raw: dict[str, Any] | None = None) -> WorkerConfig:
         config = config.with_pool_overrides(
             {str(pool): int(count) for pool, count in capacities.items()}
         )
+    if "max_backoff_seconds" in raw:
+        config = WorkerConfig(
+            capacities=dict(config.capacities),
+            retry=config.retry,
+            per_kind_retry=dict(config.per_kind_retry),
+            aging_threshold_scans=config.aging_threshold_scans,
+            executor_workers=config.executor_workers,
+            max_backoff_seconds=int(raw.get("max_backoff_seconds", config.max_backoff_seconds)),
+        )
     retry_raw = raw.get("retry")
     if isinstance(retry_raw, dict):
         config = WorkerConfig(
@@ -120,8 +138,29 @@ def config_from_json(raw: dict[str, Any] | None = None) -> WorkerConfig:
                 raw.get("aging_threshold_scans", config.aging_threshold_scans)
             ),
             executor_workers=config.executor_workers,
+            max_backoff_seconds=int(
+                raw.get("max_backoff_seconds", config.max_backoff_seconds)
+            ),
         )
     return config
+
+
+def jittered_backoff_seconds(
+    base_seconds: int | float,
+    *,
+    max_seconds: int | float = DEFAULT_MAX_BACKOFF_SECONDS,
+) -> float:
+    """Return an exponential-backoff delay with ±20% jitter and an upper clamp."""
+
+    base = float(base_seconds)
+    if base <= 0:
+        return 0.0
+    clamp = max(0.0, float(max_seconds))
+    lower = base * 0.8
+    upper = min(base * 1.2, clamp)
+    if lower > upper:
+        return clamp
+    return random.uniform(lower, upper)
 
 
 def derivation_cache_root() -> Path:

@@ -14,6 +14,7 @@ from sutradhara.catalog.models import IngestItem, LogicalAsset
 from sutradhara.catalog.types import AssetValidity
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
+from sutradhara.jobs.tool_versions import current_tool_version
 from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job, run_managed
 
 
@@ -64,7 +65,7 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
                     condition=CONDITION_BLOCKED,
                     reason="unsupported-source",
                     message=str(probe_result["detail"]),
-                    blocked_tool=("ffprobe", _tool_version("ffprobe")),
+                    blocked_tool=("ffprobe", current_tool_version("ffprobe")),
                 ),
             )
         if probe_result["kind"] == "no_index":
@@ -162,22 +163,3 @@ def _source_path(item: IngestItem) -> Path:
         raise ValueError(f"ingest_item id={item.id} has no metadata.source_path")
     return Path(raw)
 
-
-def _tool_version(tool: str) -> str:
-    path = shutil.which(tool)
-    if path is None:
-        return "unknown"
-    try:
-        completed = run_managed(
-            [path, "-version"],
-            role="medium",
-            cpu_lease=1,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "unknown"
-    lines = (completed.stdout or completed.stderr or "").splitlines()
-    return lines[0][:128] if lines else "unknown"

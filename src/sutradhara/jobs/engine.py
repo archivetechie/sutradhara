@@ -13,6 +13,7 @@ from typing import Any, cast
 
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sutradhara.jobs.attempts import record_attempt
@@ -61,15 +62,7 @@ def submit(
     Caller is responsible for `session.commit()`.
     """
     if dedupe_key is not None:
-        existing = session.scalars(
-            select(Job)
-            .where(
-                Job.dedupe_key == dedupe_key,
-                Job.status.in_(LIVE_JOB_STATUS_VALUES),
-            )
-            .order_by(Job.id)
-            .limit(1)
-        ).one_or_none()
+        existing = _live_job_for_dedupe(session, dedupe_key)
         if existing is not None:
             return existing
     now = _utcnow()
@@ -86,8 +79,19 @@ def submit(
         recon_domain=recon_domain,
         recon_target_key=recon_target_key,
     )
-    session.add(job)
-    session.flush()  # so caller can read job.id
+    if dedupe_key is None:
+        session.add(job)
+        session.flush()  # so caller can read job.id
+        return job
+    try:
+        with session.begin_nested():
+            session.add(job)
+            session.flush()  # so caller can read job.id
+    except IntegrityError:
+        existing = _live_job_for_dedupe(session, dedupe_key)
+        if existing is None:
+            raise
+        return existing
     return job
 
 
@@ -314,7 +318,9 @@ def apply_retry_policy(
         return
     base = now or _utcnow()
     job.status = JobStatus.PENDING
-    job.not_before = base + dt.timedelta(seconds=retry.delay_seconds(job.attempts))
+    job.not_before = base + dt.timedelta(
+        seconds=retry.delay_seconds(job.attempts, max_seconds=config.max_backoff_seconds)
+    )
     job.started_at = None
     job.finished_at = None
     session.flush()
@@ -332,6 +338,18 @@ def _pending_candidates(session: Session, *, now: dt.datetime) -> list[Job]:
         )
     )
     return [job for job in rows if _prerequisites_succeeded(session, job)]
+
+
+def _live_job_for_dedupe(session: Session, dedupe_key: str) -> Job | None:
+    return session.scalars(
+        select(Job)
+        .where(
+            Job.dedupe_key == dedupe_key,
+            Job.status.in_(LIVE_JOB_STATUS_VALUES),
+        )
+        .order_by(Job.id)
+        .limit(1)
+    ).one_or_none()
 
 
 def _prerequisites_succeeded(session: Session, job: Job) -> bool:

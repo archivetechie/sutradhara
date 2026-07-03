@@ -12,20 +12,27 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 from sqlalchemy import Engine, func, select, text
 
 from sutradhara.catalog.session import create_all, make_engine, make_session_factory, session_scope
+from sutradhara.cli.main import cli
 from sutradhara.jobs.config import RetryPolicy, WorkerConfig
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
+    CONDITION_BLOCKED,
+    CONDITION_OPEN,
     CONDITION_SATISFIED,
     OBSERVED_MISSING,
     ReconciliationInvariantError,
+    _default_backoff_due,
     record_condition,
     record_observation,
 )
+from sutradhara.jobs.reconcilers.spine import reopen_version_bumped
+from sutradhara.jobs.tool_versions import register_tool_version, unregister_tool_version
 from sutradhara.jobs.worker import JobWorker
 
 
@@ -105,6 +112,22 @@ def test_due_backoff_observation_preserves_attempt_count(engine: Engine) -> None
         assert observed.reason == "drive-error"
 
 
+def test_condition_default_backoff_has_jitter_and_clamp_bounds() -> None:
+    now = dt.datetime.now(dt.UTC)
+    base = 120
+    samples = [
+        (_default_backoff_due(now, 2) - now).total_seconds()
+        for _index in range(50)
+    ]
+
+    assert all(base * 0.8 <= sample <= base * 1.2 for sample in samples)
+    clamped = [
+        (_default_backoff_due(now, 7) - now).total_seconds()
+        for _index in range(50)
+    ]
+    assert all(sample <= 3600 for sample in clamped)
+
+
 def test_observation_clears_stale_diagnostics_on_satisfied(engine: Engine) -> None:
     target_key = "asset:" + "d" * 64 + ":pool-a"
     with session_scope(engine) as session:
@@ -135,6 +158,115 @@ def test_observation_clears_stale_diagnostics_on_satisfied(engine: Engine) -> No
         assert satisfied.message is None
         assert satisfied.next_eligible_at is None
         assert satisfied.attempt_count == 0
+
+
+def test_reconcile_cli_lists_and_reopens_blocked_conditions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_url = f"sqlite:///{tmp_path / 'reconcile-cli.db'}"
+    monkeypatch.setenv("SUTRADHARA_DB_URL", db_url)
+    engine = make_engine(db_url)
+    create_all(engine)
+    try:
+        with session_scope(engine) as session:
+            _add_blocked_condition(
+                session,
+                target_key="asset:" + "1" * 64 + ":pool-a",
+                reason="not-implemented",
+                tool_name="ffmpeg",
+                tool_version="old",
+            )
+            _add_blocked_condition(
+                session,
+                target_key="asset:" + "2" * 64 + ":pool-a",
+                reason="drive-error",
+            )
+
+        runner = CliRunner()
+        listed = runner.invoke(cli, ["reconcile", "copy", "--list-blocked"])
+        assert listed.exit_code == 0, listed.output
+        assert "asset:" + "1" * 64 + ":pool-a" in listed.output
+        assert "reason=not-implemented" in listed.output
+        assert "blocked_tool_name=ffmpeg" in listed.output
+        assert "blocked_tool_version=old" in listed.output
+        assert "since=" in listed.output
+
+        reopened = runner.invoke(
+            cli,
+            ["reconcile", "copy", "--reopen-blocked", "--reason", "not-implemented"],
+        )
+        assert reopened.exit_code == 0, reopened.output
+        assert "reopened 1 blocked condition(s)" in reopened.output
+        assert "observed" not in reopened.output
+
+        with session_scope(engine) as session:
+            rows = {
+                row.target_key: row
+                for row in session.scalars(select(ReconciliationCondition).order_by(
+                    ReconciliationCondition.target_key
+                ))
+            }
+            reopened_row = rows["asset:" + "1" * 64 + ":pool-a"]
+            held_row = rows["asset:" + "2" * 64 + ":pool-a"]
+            assert reopened_row.condition == CONDITION_OPEN
+            assert reopened_row.reason is None
+            assert reopened_row.blocked_tool_name is None
+            assert reopened_row.blocked_tool_version is None
+            assert reopened_row.attempt_count == 0
+            assert reopened_row.next_eligible_at is not None
+            assert "reopened by" in (reopened_row.message or "")
+            assert held_row.condition == CONDITION_BLOCKED
+            assert held_row.reason == "drive-error"
+    finally:
+        engine.dispose()
+
+
+def test_version_bump_reopens_only_changed_known_tool_versions(engine: Engine) -> None:
+    register_tool_version("fake-diff", lambda: "2.0")
+    register_tool_version("fake-same", lambda: "1.0")
+    register_tool_version("fake-unknown", lambda: "unknown")
+    try:
+        with session_scope(engine) as session:
+            _add_blocked_condition(
+                session,
+                target_key="diff",
+                reason="unsupported-source",
+                tool_name="fake-diff",
+                tool_version="1.0",
+            )
+            _add_blocked_condition(
+                session,
+                target_key="same",
+                reason="unsupported-source",
+                tool_name="fake-same",
+                tool_version="1.0",
+            )
+            _add_blocked_condition(
+                session,
+                target_key="unknown",
+                reason="unsupported-source",
+                tool_name="fake-unknown",
+                tool_version="1.0",
+            )
+
+            assert reopen_version_bumped(session, "copy") == 1
+
+            rows = {
+                row.target_key: row
+                for row in session.scalars(select(ReconciliationCondition))
+            }
+            assert rows["diff"].condition == CONDITION_OPEN
+            assert rows["diff"].reason is None
+            assert rows["diff"].blocked_tool_name is None
+            assert rows["diff"].next_eligible_at is not None
+            assert "version changed from 1.0 to 2.0" in (rows["diff"].message or "")
+            assert rows["same"].condition == CONDITION_BLOCKED
+            assert rows["unknown"].condition == CONDITION_BLOCKED
+    finally:
+        unregister_tool_version("fake-diff")
+        unregister_tool_version("fake-same")
+        unregister_tool_version("fake-unknown")
 
 
 def test_process_worklist_query_uses_condition_index(engine: Engine) -> None:
@@ -193,3 +325,28 @@ def test_worker_skips_job_retry_for_reconciler_jobs(tmp_path: Path) -> None:
         assert imperative.status == JobStatus.PENDING
         assert condition.condition == CONDITION_BACKOFF
     engine.dispose()
+
+
+def _add_blocked_condition(
+    session: object,
+    *,
+    target_key: str,
+    reason: str,
+    tool_name: str | None = None,
+    tool_version: str | None = None,
+) -> None:
+    session.add(
+        ReconciliationCondition(
+            domain="copy",
+            target_key=target_key,
+            observed_state=OBSERVED_MISSING,
+            condition=CONDITION_BLOCKED,
+            reason=reason,
+            message="blocked",
+            attempt_count=3,
+            next_eligible_at=None,
+            blocked_tool_name=tool_name,
+            blocked_tool_version=tool_version,
+            updated_at=dt.datetime.now(dt.UTC),
+        )
+    )

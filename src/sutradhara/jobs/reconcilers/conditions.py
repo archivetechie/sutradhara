@@ -13,6 +13,7 @@ import datetime as dt
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from sutradhara.jobs.config import DEFAULT_MAX_BACKOFF_SECONDS, jittered_backoff_seconds
 from sutradhara.jobs.models import JobAttempt, JobStatus, ReconciliationCondition
 
 CONDITION_OPEN = "open"
@@ -29,6 +30,7 @@ HELD_CONDITIONS = (CONDITION_BACKOFF, CONDITION_BLOCKED, CONDITION_SUPPRESSED)
 
 DEFAULT_BACKOFF_SECONDS = 60
 DEFAULT_BACKOFF_GIVE_UP_ATTEMPTS = 3
+DEFAULT_CONDITION_MAX_BACKOFF_SECONDS = DEFAULT_MAX_BACKOFF_SECONDS
 
 
 class ReconciliationInvariantError(RuntimeError):
@@ -155,6 +157,29 @@ def record_condition(
     raise ValueError(f"Axis-B condition must be 'backoff', 'blocked', or None; got {condition!r}")
 
 
+def reopen_condition(
+    session: Session,
+    row: ReconciliationCondition,
+    *,
+    actor: str,
+    note: str,
+) -> ReconciliationCondition:
+    """Reopen a blocked condition and make it immediately workable."""
+
+    now = _utcnow()
+    old_reason = row.reason or "unspecified"
+    row.condition = CONDITION_OPEN
+    row.reason = None
+    row.message = f"reopened by {actor} at {now.isoformat()} (was blocked: {old_reason}); {note}"
+    row.blocked_tool_name = None
+    row.blocked_tool_version = None
+    row.attempt_count = 0
+    row.next_eligible_at = now
+    row.updated_at = now
+    session.flush([row])
+    return row
+
+
 def _get_condition(
     session: Session,
     domain: str,
@@ -210,7 +235,12 @@ def _set_blocked_tool(
 
 def _default_backoff_due(now: dt.datetime, attempt_count: int) -> dt.datetime:
     delay = DEFAULT_BACKOFF_SECONDS * (2 ** max(attempt_count - 1, 0))
-    return now + dt.timedelta(seconds=delay)
+    return now + dt.timedelta(
+        seconds=jittered_backoff_seconds(
+            delay,
+            max_seconds=DEFAULT_CONDITION_MAX_BACKOFF_SECONDS,
+        )
+    )
 
 
 def _utcnow() -> dt.datetime:
