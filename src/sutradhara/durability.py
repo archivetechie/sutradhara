@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
-from sqlalchemy import and_, false, or_, select
+from sqlalchemy import and_, false, func, or_, select
 from sqlalchemy.orm import Session
 
 from sutradhara.backend.port import BackendLocator, ByteRange, StorageBackend, VerifyResult
@@ -63,6 +63,9 @@ class PlacementStatus(TypedDict):
     have: set[PlacementTarget]
     want: set[PlacementTarget]
     missing: set[PlacementTarget]
+
+
+BundlePlacementCounts = dict[str, dict[tuple[int, str], int]]
 
 
 class _TargetBackend(StorageBackend):
@@ -164,17 +167,20 @@ def placement_status(session: Session, target: Target) -> PlacementStatus:
     """
     artifactclass = _artifactclass_for_target(session, target)
     targets = [target for _, target in _policy_targets(session, artifactclass)]
-    counts_by_key: dict[tuple[int, str], int] = {}
-    for copy in durable_placements(
-        session,
-        target,
-        require_verified=False,
-        artifactclass=artifactclass,
-    ):
-        if copy.pool_id is None:
-            continue
-        key = (copy.backend_id, copy.pool_id)
-        counts_by_key[key] = counts_by_key.get(key, 0) + 1
+    if isinstance(target, BundleTarget):
+        counts_by_key = bundle_copy_counts_by_pool(session, [target.bundle_id])[target.bundle_id]
+    else:
+        counts_by_key: dict[tuple[int, str], int] = {}
+        for copy in durable_placements(
+            session,
+            target,
+            require_verified=False,
+            artifactclass=artifactclass,
+        ):
+            if copy.pool_id is None:
+                continue
+            key = (copy.backend_id, copy.pool_id)
+            counts_by_key[key] = counts_by_key.get(key, 0) + 1
 
     want: set[PlacementTarget] = set()
     have: set[PlacementTarget] = set()
@@ -198,6 +204,40 @@ def placement_status(session: Session, target: Target) -> PlacementStatus:
 def bundle_replication_status(session: Session, bundle_id: str) -> PlacementStatus:
     """Return replication-style status for one sealed bundle target."""
     return placement_status(session, BundleTarget(bundle_id))
+
+
+def bundle_copy_counts_by_pool(
+    session: Session,
+    bundle_ids: list[str] | tuple[str, ...],
+    *,
+    require_verified: bool = False,
+) -> BundlePlacementCounts:
+    """Return healthy bundle-copy counts grouped by bundle/backend/pool.
+
+    The predicate intentionally matches ``durable_placements(BundleTarget)`` so
+    batch observers can avoid N+1 scans while using the same durability view.
+    """
+
+    if not bundle_ids:
+        return {}
+    query = (
+        select(Copy.bundle_id, Copy.backend_id, Copy.pool_id, func.count(Copy.id))
+        .where(
+            Copy.bundle_id.in_(bundle_ids),
+            Copy.health == CopyHealth.OK,
+            Copy.deleted_at.is_(None),
+            Copy.pool_id.is_not(None),
+        )
+        .group_by(Copy.bundle_id, Copy.backend_id, Copy.pool_id)
+    )
+    if require_verified:
+        query = query.where(Copy.last_verified_at.is_not(None))
+    counts: BundlePlacementCounts = {bundle_id: {} for bundle_id in bundle_ids}
+    for bundle_id, backend_id, pool_id, count in session.execute(query):
+        if bundle_id is None or pool_id is None:
+            continue
+        counts[str(bundle_id)][(int(backend_id), str(pool_id))] = int(count)
+    return counts
 
 
 def asset_has_artifactclass_membership(

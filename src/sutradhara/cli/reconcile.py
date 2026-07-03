@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.jobs.config import override_derivation_cache_root
 from sutradhara.jobs.models import ReconciliationCondition
+from sutradhara.jobs.reconcilers import bundle_copy as _bundle_copy_reconciler  # noqa: F401
 from sutradhara.jobs.reconcilers import copy as _copy_reconciler  # noqa: F401 -- register copy
 from sutradhara.jobs.reconcilers import (
     derivation as _derivation_reconciler,  # noqa: F401 -- register derivation

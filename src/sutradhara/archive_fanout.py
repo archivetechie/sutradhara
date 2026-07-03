@@ -34,7 +34,7 @@ from sutradhara.archive_bundle import (
 from sutradhara.archive_restore import ArchiveRestoreError, read_member_bytes
 from sutradhara.backend.port import ByteRange
 from sutradhara.catalog.copies import add_bundle_copy
-from sutradhara.catalog.models import Bundle, BundleMember
+from sutradhara.catalog.models import Bundle, BundleMember, Copy
 from sutradhara.catalog.types import CopyHealth, CopySource
 from sutradhara.hdcache.fill import enqueue_post_flush_hdcache_fills
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry, assert_key_epoch_domain
@@ -238,6 +238,9 @@ class FanoutResult:
     bundle_id: str
     copy_ids: tuple[int, ...]
     manifest_path: str | None
+
+
+ArtifactObserver = Callable[[BuildArtifact], None]
 
 
 class LocalArchiveBuilder:
@@ -535,54 +538,29 @@ def flush_bundle(
             # The DB transaction closes after all targets are written. A process
             # crash here leaves physical orphan objects for scrub/reconcile,
             # but not partial catalog rows.
-            artifact = _build_for_target(
+            built: list[BuildArtifact] = []
+            copy = build_bundle_copy_for_pool(
+                session,
                 bundle=bundle,
-                members=members,
                 target=target,
+                member_sources=members,
                 builder=builder,
+                backend=backend,
                 key_epoch=key_epoch,
                 work_dir=work_dir,
                 map_path=resolved_map_path,
                 source_root=resolved_source_root,
                 map_sha256=map_sha256,
+                artifact_validator=artifact_validator,
+                artifact_observer=built.append,
             )
-            if artifact_validator is not None:
-                artifact_validator(target, artifact)
-            record = backend.write_object_to_pool(artifact.artifact_path, target.pool_id)
-            storage_metadata = _copy_storage_metadata(
-                target.representation,
-                key_epoch=target.key_epoch,
-                stored_size_bytes=record.size_bytes,
-            )
-            copy, _ = add_bundle_copy(
-                session,
-                bundle_id=bundle.id,
-                backend_id=target.backend_id,
-                pool_id=target.pool_id,
-                native_locator=record.native_locator,
-                integrity_hash=artifact.stored_digest,
-                source=CopySource.INGEST,
-                health=CopyHealth.OK,
-                storage_metadata=storage_metadata,
-            )
+            [artifact] = built
             copy_ids.append(copy.id)
-            _record_build_outputs(
+            _record_build_exclusions(
                 session,
                 bundle=bundle,
-                target=target,
-                copy_id=copy.id,
                 artifact=artifact,
             )
-            _verify_members_from_copy(
-                backend=backend,
-                copy_locator=copy.native_locator,
-                members=artifact.members,
-                representation=Representation(target.representation),
-                storage_metadata=storage_metadata,
-                builder=builder,
-                work_dir=work_dir,
-            )
-            copy.last_verified_at = dt.datetime.now(dt.UTC)
             if (
                 deliverables_dir is not None
                 and artifact.manifest_path is not None
@@ -603,6 +581,87 @@ def flush_bundle(
     close_bundle(session, bundle)
     enqueue_post_flush_hdcache_fills(session, bundle.id)
     return FanoutResult(bundle.id, tuple(copy_ids), manifest_receipt)
+
+
+def build_bundle_copy_for_pool(
+    session: Session,
+    *,
+    bundle: Bundle,
+    target: PoolTarget,
+    member_sources: Sequence[MemberInput],
+    builder: ArchiveBuilder,
+    backend: WritableStorageBackend,
+    key_epoch: str | None,
+    work_dir: Path,
+    map_path: Path | None = None,
+    source_root: Path | None = None,
+    map_sha256: str | None = None,
+    artifact_validator: Callable[[PoolTarget, BuildArtifact], None] | None = None,
+    artifact_observer: ArtifactObserver | None = None,
+) -> Copy:
+    """Build, write, verify, and record one pool's bundle copy.
+
+    This primitive records the bundle ``Copy`` plus its ``AssetLocator`` and
+    ``BlobRoot`` rows only. Bundle lifecycle, conformance gates, customer
+    manifests, and ``ExclusionRecord`` rows stay with ``flush_bundle``.
+    Optional map/validator/observer arguments exist so ``flush_bundle`` can use
+    the same write path without changing its current behavior.
+    """
+
+    artifact = _build_for_target(
+        bundle=bundle,
+        members=member_sources,
+        target=target,
+        builder=builder,
+        key_epoch=key_epoch,
+        work_dir=work_dir,
+        map_path=map_path,
+        source_root=source_root,
+        map_sha256=map_sha256,
+    )
+    if artifact_validator is not None:
+        artifact_validator(target, artifact)
+    record = backend.write_object_to_pool(artifact.artifact_path, target.pool_id)
+    storage_metadata = _copy_storage_metadata(
+        target.representation,
+        key_epoch=target.key_epoch,
+        stored_size_bytes=record.size_bytes,
+    )
+    copy, _ = add_bundle_copy(
+        session,
+        bundle_id=bundle.id,
+        backend_id=target.backend_id,
+        pool_id=target.pool_id,
+        native_locator=record.native_locator,
+        integrity_hash=artifact.stored_digest,
+        source=CopySource.INGEST,
+        health=CopyHealth.OK,
+        storage_metadata=storage_metadata,
+    )
+    _record_build_locators_and_roots(
+        session,
+        bundle=bundle,
+        target=target,
+        copy_id=copy.id,
+        artifact=artifact,
+    )
+    try:
+        _verify_members_from_copy(
+            backend=backend,
+            copy_locator=copy.native_locator,
+            members=artifact.members,
+            representation=Representation(target.representation),
+            storage_metadata=storage_metadata,
+            builder=builder,
+            work_dir=work_dir,
+        )
+    except Exception:
+        copy.health = CopyHealth.SUSPECT
+        raise
+    copy.last_verified_at = dt.datetime.now(dt.UTC)
+    if artifact_observer is not None:
+        artifact_observer(artifact)
+    return copy
 
 
 def emit_customer_manifest(
@@ -770,7 +829,7 @@ def _build_d2_tar(
     )
 
 
-def _record_build_outputs(
+def _record_build_locators_and_roots(
     session: Session,
     *,
     bundle: Bundle,
@@ -799,6 +858,14 @@ def _record_build_outputs(
             native_locator=root.native_locator,
             archive_id=bundle.archive_id,
         )
+
+
+def _record_build_exclusions(
+    session: Session,
+    *,
+    bundle: Bundle,
+    artifact: BuildArtifact,
+) -> None:
     for exclusion in artifact.exclusions:
         record_exclusion(
             session,

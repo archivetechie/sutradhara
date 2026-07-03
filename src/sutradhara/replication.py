@@ -15,17 +15,17 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, TypedDict, TypeVar
+from typing import Any, Literal, Protocol, TypedDict, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from sutradhara.backend.port import CopyRecord, StorageBackend
+from sutradhara.backend.port import BackendError, CopyRecord, StorageBackend
 from sutradhara.catalog.copies import add_copy
-from sutradhara.catalog.models import ArtifactClassPool, Copy, Pool
+from sutradhara.catalog.models import ArtifactClassPool, Bundle, Copy, Pool
 from sutradhara.catalog.types import BackendKind, CopyHealth, CopySource
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
-from sutradhara.restore import RestoreError, restore_copy
+from sutradhara.restore import RestoreError, RestoreIntegrityError, restore_copy
 from sutradhara.sealing.port import Opener, Representation, Sealer, SealResult
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliOpener, RaoCliSealer
 
@@ -275,6 +275,8 @@ def self_heal(
     chooser: Callable[[Sequence[Copy]], Copy] | None = None,
 ) -> list[Copy]:
     """Rebuild missing pool copies from a surviving healthy copy."""
+    from sutradhara.durability import AssetTarget
+
     status = replication_status(
         session,
         asset_hash,
@@ -285,54 +287,76 @@ def self_heal(
     if not status["missing"]:
         return []
 
-    source = select_restore_source(session, asset_hash, chooser=chooser)
-    if source is None:
+    candidates = select_source_candidates(
+        session,
+        AssetTarget(asset_hash, artifactclass),
+        purpose="self_heal",
+    )
+    if chooser is not None:
+        healthy = [copy for copy in candidates if copy.health == CopyHealth.OK]
+        selected = chooser(healthy)
+        if selected not in healthy:
+            raise ReplicationInvariantError("restore chooser returned a non-candidate copy")
+        candidates = [selected, *[copy for copy in candidates if copy.id != selected.id]]
+    if not candidates:
         raise SelfHealUnavailable(f"cannot self-heal {asset_hash.hex()}: no healthy source copy")
 
-    source_backend = backends.get(source.backend_id)
-    if source_backend is None:
-        raise SelfHealUnavailable(
-            f"cannot self-heal {asset_hash.hex()}: source copy id={source.id} "
-            f"uses backend_id={source.backend_id}, which is not available"
-        )
-
-    source_target = _pool_for_copy(
-        session,
-        source,
-        artifactclass,
-        backends,
-        key_epoch=key_epoch,
-    )
-    if source_target is None:
-        raise SelfHealUnavailable(
-            f"cannot self-heal {asset_hash.hex()}: source copy id={source.id} "
-            "does not belong to an active target pool"
-        )
-
     opener = opener or RaoCliOpener(KeyRegistry())
-    _assert_copy_matches_pool(source, source_target)
-    try:
-        restored = restore_copy(session, source, backend=source_backend, opener=opener)
-        with restored as result:
-            if result.sha256 != asset_hash:
-                raise ReplicationInvariantError(
-                    "self-heal source plaintext hash differs from requested asset "
-                    f"for copy id={source.id}: {result.sha256.hex()} != "
-                    f"{asset_hash.hex()}"
-                )
-            return repair(
-                session,
-                asset_hash,
-                result.path,
-                artifactclass,
-                backends=backends,
-                sealer=sealer,
-                key_epoch=key_epoch,
+    errors: list[str] = []
+    for source in candidates:
+        if source.health != CopyHealth.OK:
+            errors.append(f"copy id={source.id}: health={source.health.value}")
+            continue
+        source_backend = backends.get(source.backend_id)
+        if source_backend is None:
+            errors.append(
+                f"copy id={source.id}: backend_id={source.backend_id} is not available"
             )
-    except RestoreError as exc:
-        raise ReplicationInvariantError(
-            f"self-heal source plaintext hash/integrity failure for copy id={source.id}: {exc}"
-        ) from exc
+            continue
+
+        source_target = _pool_for_copy(
+            session,
+            source,
+            artifactclass,
+            backends,
+            key_epoch=key_epoch,
+        )
+        if source_target is None:
+            errors.append(f"copy id={source.id}: not in an active target pool")
+            continue
+
+        _assert_copy_matches_pool(source, source_target)
+        try:
+            restored = restore_copy(session, source, backend=source_backend, opener=opener)
+            with restored as result:
+                if result.sha256 != asset_hash:
+                    _mark_copy_suspect(source)
+                    errors.append(
+                        "copy id="
+                        f"{source.id}: source plaintext hash differs from requested asset "
+                        f"{result.sha256.hex()} != {asset_hash.hex()}"
+                    )
+                    continue
+                return repair(
+                    session,
+                    asset_hash,
+                    result.path,
+                    artifactclass,
+                    backends=backends,
+                    sealer=sealer,
+                    key_epoch=key_epoch,
+                )
+        except RestoreIntegrityError as exc:
+            if _is_proven_digest_mismatch(exc):
+                _mark_copy_suspect(source)
+            errors.append(f"copy id={source.id}: {exc}")
+            continue
+        except (RestoreError, BackendError, OSError) as exc:
+            errors.append(f"copy id={source.id}: {exc}")
+            continue
+
+    detail = "; ".join(errors) if errors else "no healthy source copy"
+    raise SelfHealUnavailable(f"cannot self-heal {asset_hash.hex()}: {detail}")
 
 
 def replication_status(
@@ -397,6 +421,45 @@ def select_restore_source(
     return selected
 
 
+SourcePurpose = Literal["user_restore", "self_heal"]
+
+
+def select_source(
+    session: Session,
+    target: Any,
+    *,
+    purpose: SourcePurpose,
+) -> Copy | None:
+    """Select a source copy for a target and purpose.
+
+    ``user_restore`` follows artifactclass restore preference. ``self_heal``
+    uses trust-first ordering and is deterministic across equal-cost copies.
+    """
+
+    candidates = select_source_candidates(session, target, purpose=purpose)
+    if purpose == "self_heal":
+        for candidate in candidates:
+            if candidate.health == CopyHealth.OK:
+                return candidate
+        return None
+    return candidates[0] if candidates else None
+
+
+def select_source_candidates(
+    session: Session,
+    target: Any,
+    *,
+    purpose: SourcePurpose,
+) -> list[Copy]:
+    """Return ordered source candidates for restore or healing fallback."""
+
+    if purpose == "user_restore":
+        return _user_restore_candidates(session, target)
+    if purpose == "self_heal":
+        return _self_heal_candidates(session, target)
+    raise ValueError(f"unsupported source-selection purpose {purpose!r}")
+
+
 def _healthy_copies_by_pool(
     session: Session,
     asset_hash: bytes,
@@ -419,6 +482,113 @@ def _healthy_copies(session: Session, asset_hash: bytes) -> list[Copy]:
     from sutradhara.durability import direct_copies
 
     return direct_copies(session, asset_hash)
+
+
+def _user_restore_candidates(session: Session, target: Any) -> list[Copy]:
+    from sutradhara.archive_restore import _restore_pool_order
+    from sutradhara.artifactclass_policy import get_artifactclass_policy
+    from sutradhara.durability import AssetTarget, BundleTarget, durable_placements
+
+    if isinstance(target, AssetTarget):
+        artifactclass = target.artifactclass
+        copies = durable_placements(
+            session,
+            target,
+            require_verified=False,
+            artifactclass=artifactclass,
+        )
+    elif isinstance(target, BundleTarget):
+        bundle = session.get(Bundle, target.bundle_id)
+        if bundle is None:
+            return []
+        artifactclass = bundle.artifactclass
+        copies = durable_placements(
+            session,
+            target,
+            require_verified=False,
+            artifactclass=artifactclass,
+        )
+    else:
+        raise TypeError(f"unsupported source target {target!r}")
+
+    policy = get_artifactclass_policy(session, artifactclass)
+    pool_order = _restore_pool_order(session, artifactclass, policy.restore_preference)
+    order_by_pool = {pool_id: index for index, pool_id in enumerate(pool_order)}
+    return sorted(
+        copies,
+        key=lambda copy: (
+            order_by_pool.get(copy.pool_id or "", len(order_by_pool)),
+            copy.id,
+        ),
+    )
+
+
+def _self_heal_candidates(session: Session, target: Any) -> list[Copy]:
+    from sutradhara.durability import AssetTarget, BundleTarget
+
+    if isinstance(target, AssetTarget):
+        query = select(Copy).where(Copy.logical_asset_hash == target.asset_hash)
+    elif isinstance(target, BundleTarget):
+        query = select(Copy).where(Copy.bundle_id == target.bundle_id)
+    else:
+        raise TypeError(f"unsupported source target {target!r}")
+
+    copies = list(
+        session.scalars(
+            query.options(joinedload(Copy.backend), joinedload(Copy.pool))
+            .where(
+                Copy.deleted_at.is_(None),
+                Copy.health.in_((CopyHealth.OK, CopyHealth.SUSPECT)),
+            )
+            .order_by(Copy.id)
+        )
+    )
+    return sorted(copies, key=_self_heal_sort_key)
+
+
+def _self_heal_sort_key(copy: Copy) -> tuple[int, float, int, int, int]:
+    verified = _timestamp_sort_value(copy.last_verified_at)
+    return (
+        0 if copy.health == CopyHealth.OK else 1,
+        -verified,
+        _representation_cost(copy),
+        _location_cost(copy),
+        copy.id,
+    )
+
+
+def _timestamp_sort_value(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return float(value.timestamp())
+    except (AttributeError, OSError, ValueError):
+        return 0.0
+
+
+def _representation_cost(copy: Copy) -> int:
+    representation = copy.storage_metadata.get("representation")
+    if representation == Representation.RAO_PLAIN_V1.value:
+        return 0
+    if representation == Representation.RAO_AEAD_V1.value:
+        return 1
+    return 2
+
+
+def _location_cost(copy: Copy) -> int:
+    pool = copy.pool
+    if pool is not None and pool.offsite_gate:
+        return 1
+    return 0
+
+
+def _mark_copy_suspect(copy: Copy) -> None:
+    copy.health = CopyHealth.SUSPECT
+
+
+def _is_proven_digest_mismatch(exc: RestoreIntegrityError) -> bool:
+    message = str(exc)
+    return message.startswith(("stored-corrupt:", "content-corrupt:"))
 
 
 def _pool_key(target: PoolTarget) -> tuple[int, str]:

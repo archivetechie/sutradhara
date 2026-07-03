@@ -377,6 +377,7 @@ def restore_asset(
                         _locator_transforms(session, locator),
                     )
                     if restored.sha256 != asset_hash:
+                        copy.health = CopyHealth.SUSPECT
                         integrity_errors.append(
                             f"copy id={copy.id} pool={pool_id}: "
                             f"{restored.sha256.hex()} != {asset_hash.hex()}"

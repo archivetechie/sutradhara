@@ -10,6 +10,7 @@ original bytes.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import hashlib
 import tempfile
 from collections.abc import Iterator
@@ -19,6 +20,7 @@ import pytest
 from sqlalchemy import Engine, select
 
 from sutradhara.backend.port import (
+    BackendError,
     BackendLocator,
     ByteRange,
     CopyRecord,
@@ -37,7 +39,6 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.keys import KeyEpoch, KeyRegistry
 from sutradhara.replication import (
-    ReplicationInvariantError,
     SelfHealUnavailable,
     replicate_asset,
     replication_status,
@@ -67,6 +68,7 @@ class _ReadableTaggedWriteBackend:
         self._objects: dict[str, bytes] = {}
         self._records: list[CopyRecord] = []
         self.writes: list[str] = []
+        self.read_failures: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -102,6 +104,8 @@ class _ReadableTaggedWriteBackend:
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         object_id = str(locator["object_id"])
+        if object_id in self.read_failures:
+            raise BackendError(f"transport unavailable for {object_id}")
         data = self._objects[object_id]
         if byte_range.is_whole_object:
             return data
@@ -427,7 +431,7 @@ def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
     assert sealer.calls == [(Representation.RAO_PLAIN_V1, None)]
 
 
-def test_self_heal_rejects_source_that_opens_to_wrong_plaintext(
+def test_self_heal_marks_bad_source_suspect_on_candidate_exhaustion(
     engine: Engine,
 ) -> None:
     data = b"original"
@@ -449,7 +453,7 @@ def test_self_heal_rejects_source_that_opens_to_wrong_plaintext(
             storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
         )
 
-        with pytest.raises(ReplicationInvariantError, match="source plaintext hash"):
+        with pytest.raises(SelfHealUnavailable, match="content-corrupt"):
             self_heal(
                 s,
                 asset_hash,
@@ -459,6 +463,142 @@ def test_self_heal_rejects_source_that_opens_to_wrong_plaintext(
                 opener=_FakeOpener(),
                 sealer=_FakeSealer(),
             )
+        copy = s.scalars(select(Copy)).one()
+        assert copy.health == CopyHealth.SUSPECT
+
+
+def test_self_heal_falls_back_after_proven_bad_source(
+    engine: Engine,
+) -> None:
+    data = b"original fallback"
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
+    backend = _backend()
+    bad_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::tampered")
+    good_record = backend.put_object("o-copy-2-pool", b"rao-aead-v1:" + b"1" * 32 + b":" + data)
+
+    with session_scope(engine) as s:
+        s.add(
+            Pool(
+                id="o-copy-3-pool",
+                backend_id=backend_id,
+                representation=Representation.RAO_PLAIN_V1.value,
+            )
+        )
+        s.add(
+            ArtifactClassPool(
+                artifactclass="o-archive",
+                pool_id="o-copy-3-pool",
+                sort_order=3,
+            )
+        )
+        s.flush()
+        bad_copy, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=bad_record.native_locator,
+            integrity_hash=bad_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-1-pool",
+            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            last_verified_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+        )
+        good_copy, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=good_record.native_locator,
+            integrity_hash=good_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-2-pool",
+            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch="1" * 32),
+            last_verified_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        )
+
+        repaired = self_heal(
+            s,
+            asset_hash,
+            "o-archive",
+            backends={backend_id: backend},
+            key_epoch="1" * 32,
+            opener=_FakeOpener(),
+            sealer=_FakeSealer(),
+        )
+
+        assert bad_copy.health == CopyHealth.SUSPECT
+        assert good_copy.health == CopyHealth.OK
+        assert {copy.pool_id for copy in repaired} == {"o-copy-1-pool", "o-copy-3-pool"}
+
+
+def test_self_heal_transport_error_falls_back_without_suspect_latch(
+    engine: Engine,
+) -> None:
+    data = b"transport fallback"
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
+    backend = _backend()
+    first_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::" + data)
+    second_record = backend.put_object(
+        "o-copy-2-pool",
+        b"rao-aead-v1:" + b"1" * 32 + b":" + data,
+    )
+
+    with session_scope(engine) as s:
+        s.add(
+            Pool(
+                id="o-copy-3-pool",
+                backend_id=backend_id,
+                representation=Representation.RAO_PLAIN_V1.value,
+            )
+        )
+        s.add(
+            ArtifactClassPool(
+                artifactclass="o-archive",
+                pool_id="o-copy-3-pool",
+                sort_order=3,
+            )
+        )
+        s.flush()
+        first_copy, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=first_record.native_locator,
+            integrity_hash=first_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-1-pool",
+            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            last_verified_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+        )
+        second_copy, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=second_record.native_locator,
+            integrity_hash=second_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-2-pool",
+            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch="1" * 32),
+            last_verified_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        )
+        backend.read_failures.add(str(first_record.native_locator["object_id"]))
+
+        repaired = self_heal(
+            s,
+            asset_hash,
+            "o-archive",
+            backends={backend_id: backend},
+            key_epoch="1" * 32,
+            opener=_FakeOpener(),
+            sealer=_FakeSealer(),
+        )
+
+        assert first_copy.health == CopyHealth.OK
+        assert second_copy.health == CopyHealth.OK
+        assert {copy.pool_id for copy in repaired} == {"o-copy-3-pool"}
 
 
 def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(

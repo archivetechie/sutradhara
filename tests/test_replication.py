@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import hashlib
 from collections.abc import Iterator
 from pathlib import Path
@@ -33,9 +34,11 @@ from sutradhara.replication import (
     repair,
     replicate_asset,
     replication_status,
+    select_source,
     select_restore_source,
     target_pools,
 )
+from sutradhara.durability import AssetTarget
 from sutradhara.sealing.port import Representation, SealResult
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 
@@ -949,3 +952,61 @@ def test_select_restore_source_picks_first_healthy_copy(
     assert selected.id == first.id
     assert selected_by_custom is not None
     assert selected_by_custom.id == second.id
+
+
+def test_select_source_self_heal_prefers_fresh_aead_over_stale_plain(
+    engine: Engine,
+) -> None:
+    data = b"source order"
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    with session_scope(engine) as s:
+        s.add_all(
+            [
+                Pool(
+                    id="plain-pool",
+                    backend_id=backend_id,
+                    representation=Representation.RAO_PLAIN_V1.value,
+                    offsite_gate=False,
+                ),
+                Pool(
+                    id="aead-pool",
+                    backend_id=backend_id,
+                    representation=Representation.RAO_AEAD_V1.value,
+                    offsite_gate=False,
+                ),
+            ]
+        )
+        s.flush()
+        stale_plain, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            pool_id="plain-pool",
+            native_locator={"pool_id": "plain-pool", "tape_uuid": "1" * 32},
+            integrity_hash=asset_hash,
+            source=CopySource.INGEST,
+            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            last_verified_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        )
+        fresh_aead, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            pool_id="aead-pool",
+            native_locator={"pool_id": "aead-pool", "tape_uuid": "2" * 32},
+            integrity_hash=asset_hash,
+            source=CopySource.INGEST,
+            storage_metadata=_metadata(Representation.RAO_AEAD_V1),
+            last_verified_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+        )
+
+        selected = select_source(
+            s,
+            AssetTarget(asset_hash, "o-archive"),
+            purpose="self_heal",
+        )
+
+    assert stale_plain.id < fresh_aead.id
+    assert selected is not None
+    assert selected.id == fresh_aead.id

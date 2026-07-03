@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -51,6 +52,8 @@ class ScrubReport:
     copies_added: int = 0
     copies_updated: int = 0
     copies_marked_missing: int = 0
+    unknown_objects: int = 0
+    unknown_object_locators: list[str] = field(default_factory=list)
     integrity_warnings: list[str] = field(default_factory=list)
 
     @property
@@ -132,6 +135,11 @@ def _ingest_record(
     # plaintext logical asset and avoids inserting a stored-digest pseudo asset.
     asset = session.get(LogicalAsset, record.logical_id)
     if asset is None:
+        if _is_recognizable_bundle_container(record):
+            report.unknown_objects += 1
+            if len(report.unknown_object_locators) < 20:
+                report.unknown_object_locators.append(key)
+            return
         asset = LogicalAsset(
             content_sha256=record.logical_id,
             size_bytes=record.size_bytes,
@@ -177,10 +185,6 @@ def _update_existing_copy(
             )
         _assert_copy_representation_matches_pool(existing, pool)
     existing.last_verified_at = now
-    if existing.health == CopyHealth.MISSING:
-        existing.health = record_health
-    elif record_health == CopyHealth.SUSPECT:
-        existing.health = CopyHealth.SUSPECT
     if existing.integrity_hash != record.integrity_hash:
         existing.health = CopyHealth.SUSPECT
         report.integrity_warnings.append(
@@ -188,6 +192,12 @@ def _update_existing_copy(
             f"recorded integrity_hash={existing.integrity_hash.hex()[:12]}… "
             f"but enumerate returned {record.integrity_hash.hex()[:12]}…"
         )
+    elif existing.health == CopyHealth.MISSING:
+        existing.health = record_health
+    elif record_health == CopyHealth.SUSPECT:
+        existing.health = CopyHealth.SUSPECT
+    elif existing.health == CopyHealth.SUSPECT and record_health == CopyHealth.OK:
+        existing.health = CopyHealth.OK
     report.copies_updated += 1
 
 
@@ -249,6 +259,49 @@ def _storage_metadata_for_record(
     if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
         metadata.setdefault("chunk_size", RAO_CHUNK_SIZE)
     return metadata
+
+
+def _is_recognizable_bundle_container(record: CopyRecord) -> bool:
+    body_format = _record_string(record, "body_format")
+    if body_format is not None and _is_archive_body_format(body_format):
+        return True
+
+    for key in ("caller_object_id", "key", "artifact_name", "object_id", "path"):
+        value = _record_string(record, key)
+        if value is not None and _looks_like_bundle_container_name(value):
+            return True
+    return False
+
+
+def _record_string(record: CopyRecord, key: str) -> str | None:
+    value = record.metadata.get(key)
+    if value is None:
+        value = record.native_locator.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _is_archive_body_format(value: str) -> bool:
+    normalized = value.lower()
+    return normalized in {
+        "sutradhara-local-archive-v1",
+        "sutradhara-archive-bundle-v1",
+        "rem-archive-v1",
+        "rao-archive-v1",
+    } or normalized.startswith(("rem-archive-", "rao-archive-"))
+
+
+def _looks_like_bundle_container_name(value: str) -> bool:
+    name = PurePosixPath(value).name
+    return name.endswith(
+        (
+            "-rao-plain-v1.rao",
+            "-rao-aead-v1.rao",
+            "-d2tar-raw.tar",
+            "-rao-plain-v1.sra",
+            "-rao-aead-v1.sra",
+            "-d2tar-raw.sra",
+        )
+    )
 
 
 def _assert_copy_representation_matches_pool(copy: Copy, pool: Pool) -> None:

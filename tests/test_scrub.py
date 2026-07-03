@@ -143,6 +143,131 @@ def test_scrub_keeps_existing_hash_conflict_suspect(engine: Engine) -> None:
         assert copy.health == CopyHealth.SUSPECT
 
 
+def test_scrub_verified_good_clears_suspect_copy(engine: Engine) -> None:
+    data_hash = _hash(b"recoverable copy")
+    locator = {"hash_hex": data_hash.hex()}
+    now = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    class _GoodBackend:
+        @property
+        def name(self) -> str:
+            return "good"
+
+        def enumerate(self) -> Iterator[CopyRecord]:
+            yield CopyRecord(
+                logical_id=data_hash,
+                native_locator=locator,
+                integrity_hash=data_hash,
+                size_bytes=16,
+            )
+
+        def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+            raise AssertionError("read_range is not used by scrub")
+
+        def verify(self, locator: BackendLocator) -> VerifyResult:
+            raise AssertionError("verify is not used by scrub")
+
+    with session_scope(engine) as s:
+        row = Backend(name="good", kind=BackendKind.MEMORY, tier=BackendTier.SELF_DESCRIBING)
+        s.add(row)
+        s.add(LogicalAsset(content_sha256=data_hash, size_bytes=16))
+        s.flush()
+        copy, _ = add_copy(
+            s,
+            logical_asset_hash=data_hash,
+            backend_id=row.id,
+            native_locator=locator,
+            integrity_hash=data_hash,
+            source=CopySource.INGEST,
+            health=CopyHealth.SUSPECT,
+        )
+
+        report = scrub_backend(s, row, _GoodBackend(), now=now)
+
+        assert report.copies_updated == 1
+        assert copy.health == CopyHealth.OK
+
+
+def test_scrub_quarantines_recognizable_bundle_container_unknown(engine: Engine) -> None:
+    stored_digest = _hash(b"bundle container")
+    now = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    class _BundleObjectBackend:
+        @property
+        def name(self) -> str:
+            return "bundle-object"
+
+        def enumerate(self) -> Iterator[CopyRecord]:
+            yield CopyRecord(
+                logical_id=stored_digest,
+                native_locator={
+                    "caller_object_id": "bundle-a-rao-plain-v1.rao",
+                    "content_sha256": stored_digest.hex(),
+                },
+                integrity_hash=stored_digest,
+                size_bytes=99,
+                metadata={"body_format": "rem-archive-v1"},
+            )
+
+        def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+            raise AssertionError("read_range is not used by scrub")
+
+        def verify(self, locator: BackendLocator) -> VerifyResult:
+            raise AssertionError("verify is not used by scrub")
+
+    with session_scope(engine) as s:
+        row = Backend(
+            name="bundle-object",
+            kind=BackendKind.REM_TAPE,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        s.add(row)
+        s.flush()
+
+        report = scrub_backend(s, row, _BundleObjectBackend(), now=now)
+
+        assert report.unknown_objects == 1
+        assert report.unknown_object_locators
+        assert s.get(LogicalAsset, stored_digest) is None
+        assert list(s.scalars(select(Copy))) == []
+
+
+def test_scrub_still_adopts_unknown_non_container_object(engine: Engine) -> None:
+    logical_id = _hash(b"ordinary unknown")
+    now = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    class _OrdinaryBackend:
+        @property
+        def name(self) -> str:
+            return "ordinary"
+
+        def enumerate(self) -> Iterator[CopyRecord]:
+            yield CopyRecord(
+                logical_id=logical_id,
+                native_locator={"hash_hex": logical_id.hex()},
+                integrity_hash=logical_id,
+                size_bytes=15,
+            )
+
+        def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+            raise AssertionError("read_range is not used by scrub")
+
+        def verify(self, locator: BackendLocator) -> VerifyResult:
+            raise AssertionError("verify is not used by scrub")
+
+    with session_scope(engine) as s:
+        row = Backend(name="ordinary", kind=BackendKind.MEMORY, tier=BackendTier.SELF_DESCRIBING)
+        s.add(row)
+        s.flush()
+
+        report = scrub_backend(s, row, _OrdinaryBackend(), now=now)
+
+        assert report.assets_added == 1
+        assert report.copies_added == 1
+        assert report.unknown_objects == 0
+        assert s.get(LogicalAsset, logical_id) is not None
+
+
 def test_scrub_existing_rao_copy_does_not_create_stored_digest_asset(
     engine: Engine,
 ) -> None:

@@ -16,6 +16,8 @@ from sqlalchemy import Engine, select
 from sutradhara.archive_bundle import bundle_due, enqueue_artifact
 from sutradhara.archive_fanout import (
     ArchiveFanoutError,
+    BuiltBlobRoot,
+    BuiltExclusion,
     BuildArtifact,
     BundleHeld,
     BundleOversize,
@@ -24,6 +26,8 @@ from sutradhara.archive_fanout import (
     HmacManifestSigner,
     LocalArchiveBuilder,
     ManifestSigningError,
+    MemberInput,
+    build_bundle_copy_for_pool,
     flush_bundle,
 )
 from sutradhara.archive_restore import (
@@ -51,8 +55,10 @@ from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import (
     AssetLocator,
     Backend,
+    BlobRoot,
     Bundle,
     Copy,
+    ExclusionRecord,
     LogicalAsset,
     Pool,
     StagingTransform,
@@ -69,6 +75,7 @@ from sutradhara.catalog.types import (
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 from sutradhara.staging import stage_and_enqueue_artifact
+from sutradhara.replication import target_pools
 
 
 @pytest.fixture
@@ -167,6 +174,21 @@ class _BadLocatorBuilder(LocalArchiveBuilder):
             },
         )
         return replace(artifact, members=(bad_first, *rest))
+
+
+class _OutputsBuilder(LocalArchiveBuilder):
+    def build(self, **kwargs: Any) -> BuildArtifact:
+        artifact = super().build(**kwargs)
+        return replace(
+            artifact,
+            blob_roots=(
+                BuiltBlobRoot(
+                    root_path="blob-root",
+                    native_locator={"member_path": "blob-root", "offset": 0},
+                ),
+            ),
+            exclusions=(BuiltExclusion(path="ignored.tmp", reason="test-exclusion"),),
+        )
 
 
 class _FakeKeyRegistry:
@@ -390,6 +412,58 @@ def test_enqueue_due_and_flush_fans_out_bundle_copies(
         assert len(list(s.scalars(select(AssetLocator)))) == 4
         assert rem_backend.writes == ["o-copy-1-pool"]
         assert d2_backend.writes == ["d2-shelf-pool"]
+
+
+def test_build_bundle_copy_for_pool_records_copy_locators_blob_roots_but_no_exclusions(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_bundle(engine, tmp_path)
+    rem_backend = _ArchiveWriteBackend("rem")
+
+    with session_scope(engine) as s:
+        bundle = s.get(Bundle, setup.bundle_id)
+        assert bundle is not None
+        targets = target_pools(
+            s,
+            "o-archive",
+            {
+                setup.rem_backend_id: rem_backend,
+                setup.d2_backend_id: _ArchiveWriteBackend("d2"),
+            },
+        )
+        backend, target = next(item for item in targets if item[1].pool_id == "o-copy-1-pool")
+        members = [
+            MemberInput(
+                logical_asset_hash=member.logical_asset_hash,
+                member_path=member.member_path,
+                source_path=Path(str(member.source_path)),
+                size_bytes=member.size_bytes,
+                file_sha256=member.file_sha256,
+            )
+            for member in bundle.members
+        ]
+        work_dir = tmp_path / "primitive-work"
+        work_dir.mkdir()
+
+        copy = build_bundle_copy_for_pool(
+            s,
+            bundle=bundle,
+            target=target,
+            member_sources=members,
+            builder=_OutputsBuilder(),
+            backend=backend,
+            key_epoch=None,
+            work_dir=work_dir,
+        )
+
+        assert copy.bundle_id == bundle.id
+        assert copy.pool_id == "o-copy-1-pool"
+        assert copy.last_verified_at is not None
+        assert bundle.status == "open"
+        assert len(list(s.scalars(select(AssetLocator).where(AssetLocator.copy_id == copy.id)))) == 2
+        assert len(list(s.scalars(select(BlobRoot).where(BlobRoot.copy_id == copy.id)))) == 1
+        assert list(s.scalars(select(ExclusionRecord))) == []
 
 
 def test_local_archive_builder_aead_offsets_verify_without_builder_fallback(
@@ -955,6 +1029,53 @@ def test_restore_surfaces_unavailable_and_integrity_failures(
                     setup.d2_backend_id: d2_backend,
                 },
             )
+
+
+def test_restore_asset_marks_digest_mismatch_copy_suspect_and_falls_through(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_bundle(engine, tmp_path)
+    rem_backend = _ArchiveWriteBackend("rem")
+    d2_backend = _ArchiveWriteBackend("d2")
+    [asset_hash] = list(setup.assets)[:1]
+
+    with session_scope(engine) as s:
+        flush_bundle(
+            s,
+            bundle_id=setup.bundle_id,
+            backends={
+                setup.rem_backend_id: rem_backend,
+                setup.d2_backend_id: d2_backend,
+            },
+            builder=LocalArchiveBuilder(),
+        )
+        locator = s.scalars(
+            select(AssetLocator).where(
+                AssetLocator.pool_id == "o-copy-1-pool",
+                AssetLocator.logical_asset_hash == asset_hash,
+            )
+        ).one()
+        locator.native_locator = {
+            **locator.native_locator,
+            "offset": int(locator.native_locator["offset"]) + 1,
+        }
+        primary_copy = locator.copy
+        assert primary_copy is not None
+
+        restored = restore_asset(
+            s,
+            asset_hash=asset_hash,
+            artifactclass="o-archive",
+            destination=tmp_path / "fallback.bin",
+            backends={
+                setup.rem_backend_id: rem_backend,
+                setup.d2_backend_id: d2_backend,
+            },
+        )
+
+        assert restored.pool_id == "d2-shelf-pool"
+        assert primary_copy.health == CopyHealth.SUSPECT
 
 
 def test_encrypted_restore_plumbing_uses_key_epoch_and_rao_range_args(
