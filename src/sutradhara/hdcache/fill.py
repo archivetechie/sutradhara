@@ -479,9 +479,7 @@ def observe_target(
         return True, OBSERVED_MISSING
     disk = session.get(CacheDisk, entry.disk_id)
     if disk is None or disk.state != "active":
-        if mutate:
-            _release_entry_accounting(session, entry)
-        return True, OBSERVED_MISSING
+        return True, OBSERVED_PRESENT
     if entry_policy_conformant(session, entry, key_registry=key_registry):
         return True, OBSERVED_PRESENT
     if mutate:
@@ -522,11 +520,12 @@ def fill_target(
     existing = session.get(CacheEntry, target.content_sha256)
     if existing is not None and existing.state == "present":
         disk = session.get(CacheDisk, existing.disk_id)
-        if (
-            disk is not None
-            and disk.state == "active"
-            and entry_policy_conformant(session, existing, key_registry=registry)
-        ):
+        if disk is None or disk.state != "active":
+            raise HdcacheFillBlocked(
+                "disk-unavailable",
+                f"cache entry {target.sha_hex} is present on unavailable disk {existing.disk_id!r}",
+            )
+        if entry_policy_conformant(session, existing, key_registry=registry):
             return HdcacheFillResult(
                 content_sha256=target.content_sha256,
                 disk_id=existing.disk_id,

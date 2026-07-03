@@ -175,6 +175,9 @@ def test_rebuild_inserts_untrusted_rows_and_walker_promotes(
         foreign_path = entry_path(mount, foreign)
         foreign_path.parent.mkdir(parents=True, exist_ok=True)
         foreign_path.write_bytes(b"foreign")
+        malformed = mount / "hdcache" / "v1" / "aa" / "not-a-cache-entry"
+        malformed.parent.mkdir(parents=True, exist_ok=True)
+        malformed.write_bytes(b"malformed")
 
         result = rebuild_hdcache(
             session,
@@ -182,10 +185,16 @@ def test_rebuild_inserts_untrusted_rows_and_walker_promotes(
         )
 
         assert result.entries == 1
-        assert [(failure.content_sha256, failure.reason) for failure in result.failures] == [
-            (foreign.hex(), "not-cacheable-or-unknown")
+        assert [(failure.relpath, failure.content_sha256, failure.reason) for failure in result.failures] == [
+            ("aa/not-a-cache-entry", None, "malformed-name"),
+            (
+                str(foreign_path.relative_to(mount / "hdcache" / "v1")),
+                foreign.hex(),
+                "not-cacheable-or-unknown",
+            ),
         ]
         assert foreign_path.exists()
+        assert malformed.exists()
         row = session.get(CacheEntry, digest)
         assert row is not None
         assert row.trusted is False
@@ -205,6 +214,42 @@ def test_rebuild_inserts_untrusted_rows_and_walker_promotes(
 
         assert walk.entries_promoted == 1
         assert session.get(CacheEntry, digest).trusted is True
+
+
+def test_read_only_walk_verification_alarms_without_promotion_or_lost(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    secret = b"walker-secret"
+    mount = _mount_with_identity(tmp_path, secret=secret)
+    events: list[HdcacheWalkerEvent] = []
+    with session_scope(engine) as session:
+        disk = _disk(session, mount)
+        digest = _seed_archived_asset(session, data=b"good")
+        entry = _entry(session, disk, digest, b"good")
+        entry.trusted = False
+        entry_path(mount, digest).write_bytes(b"badd")
+        session.flush([entry])
+
+        result = walk_disk(
+            session,
+            disk,
+            config=HdcacheWalkerConfig(
+                hmac_secret=secret,
+                identity_probe=FakeProbe(),
+                verify_untrusted=True,
+                event_sink=events.append,
+                enqueue_repopulation=False,
+            ),
+            destructive=False,
+        )
+
+        assert result.destructive is False
+        assert result.entries_lost == 0
+        assert result.entries_promoted == 0
+        assert session.get(CacheEntry, digest).state == "present"
+        assert session.get(CacheEntry, digest).trusted is False
+        assert [event.code for event in events] == ["walker-untrusted-verify-failed"]
 
 
 def test_rebuild_rejects_spoofed_sentinel_without_rows(

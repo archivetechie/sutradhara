@@ -55,9 +55,13 @@ from sutradhara.hdcache.models import CacheDisk, CacheEntry, RestoreRequest, Res
 from sutradhara.hdcache.store import (
     AEAD_REPRESENTATION,
     RAW_REPRESENTATION,
-    SENTINEL_NAME,
+    DiskIdentityProbe,
+    DiskIdentityResult,
+    ExpectedDiskIdentity,
     StoreError,
+    read_hmac_secret,
     read_entry_verified,
+    verify_disk_identity,
 )
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import atomic_write_verified_file, sha256_file
@@ -257,6 +261,8 @@ class RestoreConfig:
     read_deadline_seconds: float = DEFAULT_READ_DEADLINE_SECONDS
     breaker: DiskCircuitBreaker = field(default_factory=DiskCircuitBreaker)
     worker_session_factory: SessionFactory | None = None
+    hmac_secret: bytes | None = None
+    identity_probe: DiskIdentityProbe | None = None
 
     def __post_init__(self) -> None:
         if self.stream_pool_size <= 0:
@@ -265,6 +271,8 @@ class RestoreConfig:
             raise ValueError("aead_stream_cap must be positive")
         if self.wake_window_size is not None and self.wake_window_size <= 0:
             raise ValueError("wake_window_size must be positive")
+        if self.hmac_secret is not None and not self.hmac_secret:
+            raise ValueError("hmac_secret must not be empty")
 
     def capability_map(self) -> CapabilityMap:
         return (
@@ -275,6 +283,9 @@ class RestoreConfig:
 
     def registry(self) -> KeyRegistry:
         return self.key_registry or KeyRegistry()
+
+    def disk_hmac_secret(self) -> bytes:
+        return self.hmac_secret if self.hmac_secret is not None else read_hmac_secret()
 
     def wake_window(self) -> int:
         if not self.wake_ahead:
@@ -560,7 +571,7 @@ def _serve_restore_request_parallel(
 
     def submit_next(executor: ThreadPoolExecutor) -> None:
         nonlocal submitted
-        while submitted < len(pending) and len(futures) < config.stream_pool_size:
+        while submitted < len(pending) and len(futures) < window:
             item_id = pending[submitted].id
             if item_id is None:
                 raise RestoreManagerError("restore request item must be flushed before parallel serve")
@@ -575,7 +586,7 @@ def _serve_restore_request_parallel(
             ] = item_id
             submitted += 1
 
-    with ThreadPoolExecutor(max_workers=config.stream_pool_size) as executor:
+    with ThreadPoolExecutor(max_workers=window) as executor:
         submit_next(executor)
         while futures:
             done, _not_done = wait(futures, return_when=FIRST_COMPLETED)
@@ -613,8 +624,7 @@ def _serve_restore_item_in_worker_session(
         item = session.get(RestoreRequestItem, item_id)
         if item is None:
             raise RestoreManagerError(f"restore request item id={item_id} disappeared")
-        with _optional_semaphore_slot(runtime.stream_slots):
-            result = serve_restore_item(session, item, config=config, _runtime=runtime)
+        result = serve_restore_item(session, item, config=config, _runtime=runtime)
         session.commit()
         return result
     except Exception:
@@ -669,6 +679,7 @@ def serve_restore_item(
         _set_item_state(item, ITEM_FAILED, _sanitize_detail(str(exc)))
         return ServeResult(item.id, "tape", destination or Path(item.content_sha256.hex()), 0)
 
+    fell_back_to_tape = False
     if plan.source == "cache" and plan.cache_entry is not None:
         try:
             _set_item_state(item, ITEM_STREAMING, None)
@@ -723,13 +734,19 @@ def serve_restore_item(
                     breaker_already_open=breaker_open,
                 )
             _set_item_state(item, ITEM_FELL_BACK_TO_TAPE, "tape mount pending")
+            _update_request_state(item.request)
+            session.flush([item.request, item])
+            if _runtime is not None and _runtime.commit_state_transitions:
+                session.commit()
+            fell_back_to_tape = True
 
     try:
-        _set_item_state(item, ITEM_STREAMING, None)
-        _update_request_state(item.request)
-        session.flush([item.request, item])
-        if _runtime is not None and _runtime.commit_state_transitions:
-            session.commit()
+        if not fell_back_to_tape:
+            _set_item_state(item, ITEM_STREAMING, None)
+            _update_request_state(item.request)
+            session.flush([item.request, item])
+            if _runtime is not None and _runtime.commit_state_transitions:
+                session.commit()
         tape_result = _serve_from_tape(
             session,
             item.content_sha256,
@@ -790,6 +807,8 @@ def restore_to_path(
         read_deadline_seconds=final_config.read_deadline_seconds,
         breaker=final_config.breaker,
         worker_session_factory=final_config.worker_session_factory,
+        hmac_secret=final_config.hmac_secret,
+        identity_probe=final_config.identity_probe,
     )
     plan = resolve_read_source(
         session,
@@ -936,21 +955,23 @@ def _serve_from_cache(
         raise CacheServeFailed("disk-inactive", "cache disk is not active", mark_lost=False)
     if config.breaker.is_open(disk.disk_id):
         raise CacheServeFailed("disk-circuit-open", "cache disk circuit breaker is open", mark_lost=False)
-    live = _cache_disk_live(disk)
-    if not live:
-        disk.state = "absent"
-        session.flush([disk])
+    identity = _verify_cache_disk_identity(disk, config)
+    if not identity.ok:
         _emit(
             config,
             RestoreEvent(
-                code="disk-absent",
+                code="disk-identity-unverified",
                 severity="alarm",
                 content_sha256=entry.content_sha256.hex(),
                 artifactclass=entry.artifactclass,
-                detail=f"cache disk {disk.disk_id} failed liveness check",
+                detail=_identity_failure_detail(disk, identity),
             ),
         )
-        raise CacheServeFailed("disk-absent", "cache disk is absent", mark_lost=False)
+        raise CacheServeFailed(
+            "disk-identity-unverified",
+            _identity_failure_detail(disk, identity),
+            mark_lost=False,
+        )
     if not entry_policy_conformant(session, entry, key_registry=config.registry()):
         raise CacheServeFailed(
             "representation-mismatch",
@@ -1013,7 +1034,10 @@ def _serve_from_cache(
                     atomic_write_verified_file(plaintext, destination)
             else:
                 raise StoreError(f"unsupported cache representation {entry.representation!r}")
-    except (OSError, StoreError, RuntimeError, ValueError, KeyError) as exc:
+    except StoreError as exc:
+        reason = "read-deadline" if "deadline exceeded" in str(exc) else "read-failed"
+        raise CacheServeFailed(reason, str(exc), mark_lost=True) from exc
+    except (OSError, RuntimeError, ValueError, KeyError) as exc:
         raise CacheServeFailed("read-failed", str(exc), mark_lost=True) from exc
 
     entry.last_read_at = _utcnow()
@@ -1030,11 +1054,13 @@ def _serve_from_cache_controlled(
     config: RestoreConfig,
     runtime: _ServeRuntime | None,
 ) -> ServeResult:
+    stream_slots = None if runtime is None else runtime.stream_slots
     aead_slots = None if runtime is None else runtime.aead_slots
-    if entry.representation == AEAD_REPRESENTATION and aead_slots is not None:
-        with _semaphore_slot(aead_slots):
-            return _serve_from_cache(session, entry, destination, config)
-    return _serve_from_cache(session, entry, destination, config)
+    with _optional_semaphore_slot(stream_slots):
+        if entry.representation == AEAD_REPRESENTATION and aead_slots is not None:
+            with _semaphore_slot(aead_slots):
+                return _serve_from_cache(session, entry, destination, config)
+        return _serve_from_cache(session, entry, destination, config)
 
 
 def _serve_from_tape(
@@ -1093,17 +1119,16 @@ def _try_mark_entry_lost_for_cache_fallback(
             ),
         )
         return
-    if not _cache_disk_live(disk):
-        disk.state = "absent"
-        session.flush([disk])
+    identity = _verify_cache_disk_identity(disk, config)
+    if not identity.ok:
         _emit(
             config,
             RestoreEvent(
-                code="disk-absent",
+                code="disk-identity-unverified",
                 severity="alarm",
                 content_sha256=content_sha256.hex(),
                 artifactclass=artifactclass,
-                detail=f"cache disk {disk.disk_id} failed liveness check before lost mark",
+                detail=f"{_identity_failure_detail(disk, identity)} before lost mark",
                 request_id=request_id,
                 item_id=item_id,
                 destination_id=destination_id,
@@ -1327,15 +1352,29 @@ def _wake_items(
     session.flush([request, *items])
 
 
-def _cache_disk_live(disk: CacheDisk) -> bool:
-    mount = Path(disk.mount)
-    if not mount.exists() or not mount.is_dir():
-        return False
+def _verify_cache_disk_identity(disk: CacheDisk, config: RestoreConfig) -> DiskIdentityResult:
     try:
-        os.statvfs(mount)
-    except OSError:
-        return False
-    return (mount / SENTINEL_NAME).is_file()
+        return verify_disk_identity(
+            Path(disk.mount),
+            ExpectedDiskIdentity(
+                disk_id=disk.disk_id,
+                serial=disk.serial,
+                fs_uuid=disk.fs_uuid,
+                wwn=disk.wwn,
+            ),
+            hmac_secret=config.disk_hmac_secret(),
+            probe=config.identity_probe,
+        )
+    except Exception as exc:
+        return DiskIdentityResult(
+            False,
+            "identity_unavailable",
+            f"disk identity verifier unavailable: {exc}",
+        )
+
+
+def _identity_failure_detail(disk: CacheDisk, result: DiskIdentityResult) -> str:
+    return f"cache disk {disk.disk_id} identity unverified ({result.status}: {result.detail})"
 
 
 @contextmanager

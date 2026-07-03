@@ -15,10 +15,12 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -71,6 +73,16 @@ class EnumeratedEntry:
     path: Path
     relpath: str
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class RejectedEntryFile:
+    """Cache-layout file rejected by rebuild parsing and left on disk."""
+
+    path: Path
+    relpath: str
+    reason: str
+    content_sha256: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -348,14 +360,28 @@ def read_entry_verified(
         representation,
         expected_stream_sha256,
     )
+    if deadline_monotonic is not None:
+        return _read_entry_verified_with_deadline(
+            path,
+            expected,
+            output=output,
+            deadline_monotonic=deadline_monotonic,
+        )
+    return _read_entry_verified_direct(path, expected, output=output)
+
+
+def _read_entry_verified_direct(
+    path: Path,
+    expected: bytes,
+    *,
+    output: BinaryIO | None,
+) -> EntryReadResult:
     _require_regular_file(path, "cache entry")
     digest = hashlib.sha256()
     size = 0
     chunks: list[bytes] | None = [] if output is None else None
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(BUFFER_SIZE), b""):
-            if deadline_monotonic is not None and time.monotonic() > deadline_monotonic:
-                raise StoreError("cache read deadline exceeded")
             digest.update(chunk)
             size += len(chunk)
             if output is not None:
@@ -363,6 +389,83 @@ def read_entry_verified(
             else:
                 assert chunks is not None
                 chunks.append(chunk)
+    stream_digest = digest.digest()
+    if stream_digest != expected:
+        raise StoreError(
+            f"stored stream digest mismatch: expected {expected.hex()}, actual {stream_digest.hex()}"
+        )
+    return EntryReadResult(
+        path=path,
+        size_bytes=size,
+        stream_digest=stream_digest,
+        data=b"".join(chunks) if chunks is not None else None,
+    )
+
+
+def _read_entry_verified_with_deadline(
+    path: Path,
+    expected: bytes,
+    *,
+    output: BinaryIO | None,
+    deadline_monotonic: float,
+) -> EntryReadResult:
+    items: queue.Queue[bytes | Exception | None] = queue.Queue(maxsize=1)
+    stop = threading.Event()
+
+    def offer(item: bytes | Exception | None) -> None:
+        while not stop.is_set():
+            try:
+                items.put(item, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    def read_worker() -> None:
+        try:
+            _require_regular_file(path, "cache entry")
+            with path.open("rb") as handle:
+                while not stop.is_set():
+                    chunk = handle.read(BUFFER_SIZE)
+                    if not chunk:
+                        offer(None)
+                        return
+                    offer(bytes(chunk))
+        except Exception as exc:
+            offer(exc)
+
+    worker = threading.Thread(
+        target=read_worker,
+        name=f"hdcache-read-{path.name[:12]}",
+        daemon=True,
+    )
+    worker.start()
+
+    digest = hashlib.sha256()
+    size = 0
+    chunks: list[bytes] | None = [] if output is None else None
+    try:
+        while True:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise StoreError("cache read deadline exceeded")
+            try:
+                item = items.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise StoreError("cache read deadline exceeded") from exc
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            digest.update(item)
+            size += len(item)
+            if output is not None:
+                output.write(item)
+            else:
+                assert chunks is not None
+                chunks.append(item)
+    except Exception:
+        stop.set()
+        raise
     stream_digest = digest.digest()
     if stream_digest != expected:
         raise StoreError(
@@ -431,6 +534,41 @@ def enumerate_entries(mount: Path) -> list[EnumeratedEntry]:
                 )
             )
     return entries
+
+
+def enumerate_rejected_entry_files(mount: Path) -> list[RejectedEntryFile]:
+    """Enumerate malformed hdcache entry files that rebuild must report."""
+
+    root = entries_root(mount)
+    if not root.exists():
+        return []
+    rejected: list[RejectedEntryFile] = []
+    for prefix_dir in sorted(root.iterdir()):
+        if not prefix_dir.is_dir() or prefix_dir.name == TMP_DIR:
+            continue
+        prefix_valid = len(prefix_dir.name) == 2
+        for path in sorted(prefix_dir.iterdir()):
+            if not _is_regular_file(path):
+                continue
+            relpath = str(path.relative_to(layout_root(mount)))
+            if not prefix_valid:
+                rejected.append(RejectedEntryFile(path, relpath, "malformed-prefix"))
+                continue
+            parsed = _parse_entry_filename(path.name)
+            if parsed is None:
+                rejected.append(RejectedEntryFile(path, relpath, "malformed-name"))
+                continue
+            content_sha256, _representation, _key_epoch = parsed
+            if content_sha256.hex()[:2] != prefix_dir.name:
+                rejected.append(
+                    RejectedEntryFile(
+                        path,
+                        relpath,
+                        "prefix-mismatch",
+                        content_sha256=content_sha256,
+                    )
+                )
+    return rejected
 
 
 def entry_path(

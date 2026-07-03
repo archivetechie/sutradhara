@@ -32,11 +32,13 @@ from sutradhara.hdcache.fill import (
     DOMAIN,
     JOB_KIND,
     HdcacheFillConfig,
+    HdcacheFillBlocked,
     HdcacheFillTarget,
     count_live_hdcache_jobs,
     dedupe_key,
     fill_target,
     mark_entry_lost_and_delete,
+    observe_target,
 )
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.store import (
@@ -51,6 +53,7 @@ from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BLOCKED,
     OBSERVED_MISSING,
+    OBSERVED_PRESENT,
     record_observation,
 )
 from sutradhara.jobs.reconcilers.spine import reconcile
@@ -379,6 +382,34 @@ def test_mark_entry_lost_releases_accounting_when_deleted_or_absent(
         assert session.get(CacheDisk, "d001").filled_bytes == 0
         assert session.get(CacheEntry, digest).state == "lost"
         assert not path.exists()
+
+
+def test_present_entry_on_absent_disk_is_not_lost_or_replaced(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    data = b"absent cache bytes"
+    with session_scope(engine) as session:
+        target = _seed_archived_asset(session, data=data)
+        entry = _seed_present_cache_entry(session, tmp_path / "d001", target.content_sha256, len(data))
+        disk = session.get(CacheDisk, "d001")
+        disk.state = "absent"
+        session.flush([disk])
+
+        desired, observed = observe_target(session, target.sha_hex, mutate=True)
+
+        assert desired is True
+        assert observed == OBSERVED_PRESENT
+        assert session.get(CacheEntry, target.content_sha256).state == "present"
+        assert session.get(CacheDisk, "d001").filled_bytes == len(data)
+
+        with pytest.raises(HdcacheFillBlocked) as excinfo:
+            fill_target(session, target, config=_config(tmp_path))
+
+        assert excinfo.value.reason == "disk-unavailable"
+        assert session.get(CacheEntry, target.content_sha256).state == "present"
+        assert session.get(CacheEntry, target.content_sha256).disk_id == entry.disk_id
+        assert session.get(CacheDisk, "d001").filled_bytes == len(data)
 
 
 def test_hdcache_fill_handler_projects_blocked_condition(

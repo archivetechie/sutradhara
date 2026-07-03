@@ -43,6 +43,7 @@ from sutradhara.hdcache.store import (
     entries_root,
     entry_path,
     enumerate_entries,
+    enumerate_rejected_entry_files,
     tmp_root,
     verify_disk_identity,
 )
@@ -244,7 +245,17 @@ def walk_disk(
     if config.sampled_rehash_count:
         for entry in db_entries[: config.sampled_rehash_count]:
             if entry.state == "present":
-                promoted += _verify_entry(session, disk, entry, config=config, promote=not entry.trusted)
+                should_promote = not entry.trusted
+                verified = _verify_entry(
+                    session,
+                    disk,
+                    entry,
+                    config=config,
+                    promote=should_promote,
+                    destructive=destructive,
+                )
+                if destructive and should_promote and verified:
+                    promoted += 1
 
     if config.enqueue_repopulation and lost:
         top_up_lost_entries(session)
@@ -313,9 +324,20 @@ def rebuild_hdcache(
             )
             continue
 
-        entries = enumerate_entries(Path(disk.mount))
+        mount = Path(disk.mount)
+        entries = enumerate_entries(mount)
         inserted = 0
-        failures: list[RebuildFailure] = []
+        failures = [
+            RebuildFailure(
+                disk_id=disk.disk_id,
+                relpath=rejected.relpath,
+                reason=rejected.reason,
+                content_sha256=(
+                    None if rejected.content_sha256 is None else rejected.content_sha256.hex()
+                ),
+            )
+            for rejected in enumerate_rejected_entry_files(mount)
+        ]
         for observed in entries:
             try:
                 if _rebuild_observed_entry(session, disk, observed):
@@ -384,7 +406,17 @@ def _walk_entry(
             return "lost"
         return None
     if config.verify_untrusted and not entry.trusted:
-        return "promoted" if _verify_entry(session, disk, entry, config=config, promote=True) else "lost"
+        verified = _verify_entry(
+            session,
+            disk,
+            entry,
+            config=config,
+            promote=True,
+            destructive=destructive,
+        )
+        if not destructive:
+            return None
+        return "promoted" if verified else "lost"
     return None
 
 
@@ -395,6 +427,7 @@ def _verify_entry(
     *,
     config: HdcacheWalkerConfig,
     promote: bool,
+    destructive: bool,
 ) -> bool:
     try:
         if entry.representation == RAW_REPRESENTATION:
@@ -414,9 +447,10 @@ def _verify_entry(
             content_sha256=entry.content_sha256.hex(),
             detail=str(exc),
         )
-        mark_entry_lost_and_delete(session, entry)
+        if destructive:
+            mark_entry_lost_and_delete(session, entry)
         return False
-    if promote:
+    if promote and destructive:
         entry.trusted = True
         session.flush([entry])
     return True
