@@ -130,17 +130,24 @@ New `sutradhara/durability.py`:
     copy scan at 100k bundles.
   - `reconcile_target`: enqueue a `bundle-repair` job (source via D4
     `self_heal` purpose, with fallback + suspect-marking).
-- **Scrub adoption fix (verify r2 correction — NO bundle auto-adoption):**
+- **Scrub adoption fix (verify r2 + prompt-cut refinement):**
   `CopyRecord.logical_id` is a stored-content sha256, not an archive id, so
   matching enumerated objects to `Bundle.archive_id` is type-unsound and is
-  dropped. Final rule: an enumerated object whose `logical_id` matches a
-  `LogicalAsset` → `add_copy` (asset grain, existing behavior); anything else
-  → an **`unknown_object` quarantine entry in the scrub report** (counted;
-  persistent count feeds the D6 alarm), never an invented row. Crash-orphan
-  bundle objects are therefore NOT adopted: the bundle's condition stays open,
-  the next `bundle-repair` writes and records a fresh copy, and the orphan
-  remains a scrub-visible unknown object (tape-space waste accepted — same
-  stance as D6 duplicates; the alarm keeps it rare and visible).
+  dropped. Prompt-cut found the v2.2 blanket-quarantine rule would ALSO have
+  killed scrub's adopt-unknown-asset path — which is the spec §7 tier-1
+  "rebuild the catalog from self-describing media" property and is
+  load-bearing (scrub.py:133-142 + tests). Final rule, three-way:
+  (a) `logical_id` matches a `LogicalAsset` → `add_copy` — unchanged;
+  (b) record is **recognizably a bundle container** (rem archive
+  `body_format` / the flush path's container naming) → an `unknown_object`
+  **quarantine entry** in the scrub report (counted; feeds the D6 alarm),
+  never an invented LogicalAsset — a container hash is not an asset;
+  (c) anything else → the existing spec §7 adopt-unknown behavior, unchanged.
+  Known residual: a bundle container the enumeration metadata cannot
+  distinguish would still be adopted-as-asset — a pre-existing hazard, not a
+  regression; documented, not solved here. Crash-orphan bundle objects are
+  never adopted as bundle copies: the condition stays open, the next
+  `bundle-repair` records a fresh copy, the orphan stays scrub-visible.
 
 ### D2 — Declared durability floor, enforced where it can be
 
