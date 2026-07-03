@@ -9,6 +9,7 @@ the future restore console API.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import logging
@@ -58,7 +59,10 @@ from sutradhara.hdcache.store import (
     DiskIdentityProbe,
     DiskIdentityResult,
     ExpectedDiskIdentity,
+    StoreContentMismatch,
     StoreError,
+    StoreReadTimeout,
+    probe_disk_liveness_with_deadline,
     read_hmac_secret,
     read_entry_verified,
     verify_disk_identity,
@@ -76,6 +80,7 @@ DEFAULT_STREAM_POOL_SIZE = 24
 DEFAULT_AEAD_STREAM_CAP = 4
 DEFAULT_WAKE_WINDOW_MULTIPLIER = 2
 DEFAULT_READ_DEADLINE_SECONDS = 70.0
+DEFAULT_LIVENESS_PROBE_DEADLINE_SECONDS = 2.0
 
 REQUEST_PENDING = "pending"
 REQUEST_ACTIVE = "active"
@@ -125,20 +130,23 @@ class InvalidRestoreDestination(RestoreManagerError):
 class CacheServeFailed(RestoreManagerError):
     """A cache hit could not be served and should fall back to tape."""
 
-    def __init__(self, reason: str, detail: str, *, mark_lost: bool) -> None:
+    def __init__(
+        self,
+        reason: str,
+        detail: str,
+        *,
+        mark_lost: bool,
+        count_breaker: bool = False,
+    ) -> None:
         self.reason = reason
         self.detail = detail
         self.mark_lost = mark_lost
+        self.count_breaker = count_breaker
         super().__init__(detail)
 
 
 class DiskCircuitBreaker:
-    """In-memory per-disk failure breaker for cache serve storms.
-
-    The breaker is intentionally process-local M5 state. It stops one restore
-    worker wave from turning a flapping disk into thousands of lost-mark
-    updates; durable alarm wiring belongs to M6.
-    """
+    """Process-local per-disk failure breaker for cache serve storms."""
 
     def __init__(
         self,
@@ -259,6 +267,7 @@ class RestoreConfig:
     wake_ahead: bool = True
     wake_window_size: int | None = None
     read_deadline_seconds: float = DEFAULT_READ_DEADLINE_SECONDS
+    liveness_probe_deadline_seconds: float = DEFAULT_LIVENESS_PROBE_DEADLINE_SECONDS
     breaker: DiskCircuitBreaker = field(default_factory=DiskCircuitBreaker)
     worker_session_factory: SessionFactory | None = None
     hmac_secret: bytes | None = None
@@ -271,6 +280,8 @@ class RestoreConfig:
             raise ValueError("aead_stream_cap must be positive")
         if self.wake_window_size is not None and self.wake_window_size <= 0:
             raise ValueError("wake_window_size must be positive")
+        if self.liveness_probe_deadline_seconds <= 0:
+            raise ValueError("liveness_probe_deadline_seconds must be positive")
         if self.hmac_secret is not None and not self.hmac_secret:
             raise ValueError("hmac_secret must not be empty")
 
@@ -310,6 +321,16 @@ class _ServeRuntime:
     commit_state_transitions: bool = False
 
 
+@dataclass(frozen=True)
+class _ServeSlotContext:
+    stream_slots: threading.BoundedSemaphore | None = None
+    aead_slots: threading.BoundedSemaphore | None = None
+    aead_slot_held: bool = False
+
+
+_SERVE_SLOT_CONTEXT = threading.local()
+
+
 def restore_config_from_env() -> RestoreConfig:
     """Build hdcache restore config from environment variables."""
 
@@ -324,6 +345,10 @@ def restore_config_from_env() -> RestoreConfig:
         read_deadline_seconds=_env_float(
             "SUTRADHARA_HDCACHE_READ_DEADLINE_SECONDS",
             DEFAULT_READ_DEADLINE_SECONDS,
+        ),
+        liveness_probe_deadline_seconds=_env_float(
+            "SUTRADHARA_HDCACHE_LIVENESS_PROBE_DEADLINE_SECONDS",
+            DEFAULT_LIVENESS_PROBE_DEADLINE_SECONDS,
         ),
     )
 
@@ -399,7 +424,7 @@ def resolve_read_source(
         destination,
         overwrite=final_config.overwrite,
     )
-    entry = _select_cache_entry(session, asset_hash)
+    entry = _select_cache_entry(session, asset_hash, config=final_config)
     if entry is None:
         return ResolvedReadSource(
             asset_hash=asset_hash,
@@ -654,7 +679,7 @@ def serve_restore_item(
     try:
         admission = validate_restore_item_admission(session, item, config=final_config)
         destination = destination_for_request_item(final_config, item.request.destination_id, item)
-        entry = _select_cache_entry(session, item.content_sha256)
+        entry = _select_cache_entry(session, item.content_sha256, config=final_config)
         plan = ResolvedReadSource(
             asset_hash=item.content_sha256,
             artifactclass=item.artifactclass,
@@ -805,6 +830,7 @@ def restore_to_path(
         wake_ahead=final_config.wake_ahead,
         wake_window_size=final_config.wake_window_size,
         read_deadline_seconds=final_config.read_deadline_seconds,
+        liveness_probe_deadline_seconds=final_config.liveness_probe_deadline_seconds,
         breaker=final_config.breaker,
         worker_session_factory=final_config.worker_session_factory,
         hmac_secret=final_config.hmac_secret,
@@ -982,7 +1008,8 @@ def _serve_from_cache(
         raise CacheServeFailed(
             "read-deadline",
             "cache read deadline exceeded before stream start",
-            mark_lost=True,
+            mark_lost=False,
+            count_breaker=True,
         )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1001,8 +1028,10 @@ def _serve_from_cache(
                         representation=RAW_REPRESENTATION,
                         output=output,
                         deadline_monotonic=deadline,
+                        disk_id=disk.disk_id,
                     )
-                atomic_write_verified_file(plaintext, destination)
+                with _optional_semaphore_slot(_current_stream_slots()):
+                    _publish_cache_plaintext(plaintext, destination)
                 size_bytes = read_result.size_bytes
             elif entry.representation == AEAD_REPRESENTATION:
                 sealed = temp_dir / "sealed"
@@ -1015,30 +1044,51 @@ def _serve_from_cache(
                         expected_stream_sha256=entry.stored_digest,
                         output=output,
                         deadline_monotonic=deadline,
+                        disk_id=disk.disk_id,
                     )
                 opener = config.opener or RaoCliOpener(config.registry(), work_dir=config.scratch_root)
                 key_epoch = _cache_key_epoch(entry)
-                with opener.open(
-                    sealed,
-                    Representation.RAO_AEAD_V1,
-                    key_epoch=key_epoch,
-                    work_dir=config.scratch_root,
-                ) as plaintext:
-                    digest = sha256_file(plaintext)
-                    if digest != entry.content_sha256:
-                        raise StoreError(
-                            "opened cache plaintext digest mismatch: "
-                            f"{digest.hex()} != {entry.content_sha256.hex()}"
-                        )
-                    size_bytes = plaintext.stat().st_size
-                    atomic_write_verified_file(plaintext, destination)
+                with _optional_unheld_aead_slot():
+                    with opener.open(
+                        sealed,
+                        Representation.RAO_AEAD_V1,
+                        key_epoch=key_epoch,
+                        work_dir=config.scratch_root,
+                    ) as plaintext:
+                        digest = sha256_file(plaintext)
+                        if digest != entry.content_sha256:
+                            raise StoreContentMismatch(
+                                "opened cache plaintext digest mismatch: "
+                                f"{digest.hex()} != {entry.content_sha256.hex()}"
+                            )
+                        size_bytes = plaintext.stat().st_size
+                        with _optional_semaphore_slot(_current_stream_slots()):
+                            _publish_cache_plaintext(plaintext, destination)
             else:
                 raise StoreError(f"unsupported cache representation {entry.representation!r}")
-    except StoreError as exc:
-        reason = "read-deadline" if "deadline exceeded" in str(exc) else "read-failed"
-        raise CacheServeFailed(reason, str(exc), mark_lost=True) from exc
-    except (OSError, RuntimeError, ValueError, KeyError) as exc:
+    except StoreReadTimeout as exc:
+        raise CacheServeFailed(
+            "read-deadline",
+            str(exc),
+            mark_lost=False,
+            count_breaker=True,
+        ) from exc
+    except StoreContentMismatch as exc:
         raise CacheServeFailed("read-failed", str(exc), mark_lost=True) from exc
+    except StoreError as exc:
+        raise CacheServeFailed(
+            "read-failed",
+            str(exc),
+            mark_lost=False,
+            count_breaker=True,
+        ) from exc
+    except (OSError, RuntimeError, ValueError, KeyError) as exc:
+        raise CacheServeFailed(
+            "read-failed",
+            str(exc),
+            mark_lost=False,
+            count_breaker=True,
+        ) from exc
 
     entry.last_read_at = _utcnow()
     if not entry.trusted:
@@ -1056,10 +1106,11 @@ def _serve_from_cache_controlled(
 ) -> ServeResult:
     stream_slots = None if runtime is None else runtime.stream_slots
     aead_slots = None if runtime is None else runtime.aead_slots
-    with _optional_semaphore_slot(stream_slots):
-        if entry.representation == AEAD_REPRESENTATION and aead_slots is not None:
-            with _semaphore_slot(aead_slots):
+    if entry.representation == AEAD_REPRESENTATION and aead_slots is not None:
+        with _semaphore_slot(aead_slots):
+            with _serve_slot_context(stream_slots, aead_slots, aead_slot_held=True):
                 return _serve_from_cache(session, entry, destination, config)
+    with _serve_slot_context(stream_slots, aead_slots, aead_slot_held=False):
         return _serve_from_cache(session, entry, destination, config)
 
 
@@ -1165,15 +1216,18 @@ def _record_cache_failure(
     item_id: int | None = None,
     destination_id: str | None = None,
 ) -> bool:
-    if entry is None or not exc.mark_lost:
+    if entry is None:
         return False
     disk = session.get(CacheDisk, entry.disk_id)
     if disk is None:
         return False
-    if exc.reason not in {"read-failed", "read-deadline", "representation-mismatch"}:
+    if not exc.count_breaker:
         return config.breaker.is_open(disk.disk_id)
     tripped = config.breaker.record_failure(disk.disk_id)
-    if tripped:
+    breaker_open = config.breaker.is_open(disk.disk_id)
+    if tripped or (breaker_open and disk.state != "absent"):
+        disk.state = "absent"
+        session.flush([disk])
         _emit(
             config,
             RestoreEvent(
@@ -1181,13 +1235,16 @@ def _record_cache_failure(
                 severity="alarm",
                 content_sha256=content_sha256.hex(),
                 artifactclass=artifactclass,
-                detail=f"cache disk {disk.disk_id} exceeded cache failure threshold",
+                detail=(
+                    f"cache disk {disk.disk_id} exceeded cache failure threshold; "
+                    "state set absent"
+                ),
                 request_id=request_id,
                 item_id=item_id,
                 destination_id=destination_id,
             ),
         )
-    return config.breaker.is_open(disk.disk_id)
+    return breaker_open
 
 
 def _admission_inputs_for_item(item: RestoreRequestItem) -> RestoreAdmissionInputs:
@@ -1319,14 +1376,89 @@ def _check_privacy_gate(
     raise RestoreDenied(required)
 
 
-def _select_cache_entry(session: Session, asset_hash: bytes) -> CacheEntry | None:
+def _select_cache_entry(
+    session: Session,
+    asset_hash: bytes,
+    *,
+    config: RestoreConfig | None = None,
+    allow_recovery_probe: bool = True,
+) -> CacheEntry | None:
     entry = session.get(CacheEntry, asset_hash)
     if entry is None or entry.state != "present":
         return None
     disk = session.get(CacheDisk, entry.disk_id)
-    if disk is None or disk.state != "active":
+    if disk is None:
+        return None
+    if disk.state != "active" or (config is not None and config.breaker.is_open(disk.disk_id)):
+        if (
+            config is None
+            or not allow_recovery_probe
+            or not _probe_cache_disk_recovery(session, disk, config)
+        ):
+            return None
+    if disk.state != "active":
         return None
     return entry
+
+
+def _probe_cache_disk_recovery(session: Session, disk: CacheDisk, config: RestoreConfig) -> bool:
+    deadline = time.monotonic() + config.liveness_probe_deadline_seconds
+    try:
+        result = probe_disk_liveness_with_deadline(
+            Path(disk.mount),
+            ExpectedDiskIdentity(
+                disk_id=disk.disk_id,
+                serial=disk.serial,
+                fs_uuid=disk.fs_uuid,
+                wwn=disk.wwn,
+            ),
+            hmac_secret=config.disk_hmac_secret(),
+            disk_id=disk.disk_id,
+            probe=config.identity_probe,
+            deadline_monotonic=deadline,
+        )
+    except StoreReadTimeout as exc:
+        _emit(
+            config,
+            RestoreEvent(
+                code="disk-recovery-probe-timeout",
+                severity="alarm",
+                detail=f"cache disk {disk.disk_id} recovery probe timed out: {exc}",
+            ),
+        )
+        return False
+    except Exception as exc:
+        _emit(
+            config,
+            RestoreEvent(
+                code="disk-recovery-probe-failed",
+                severity="alarm",
+                detail=f"cache disk {disk.disk_id} recovery probe failed: {_sanitize_detail(str(exc))}",
+            ),
+        )
+        return False
+    if not result.ok:
+        _emit(
+            config,
+            RestoreEvent(
+                code="disk-recovery-probe-failed",
+                severity="alarm",
+                detail=_identity_failure_detail(disk, result),
+            ),
+        )
+        return False
+    disk.state = "active"
+    config.breaker.reset(disk.disk_id)
+    session.flush([disk])
+    _emit(
+        config,
+        RestoreEvent(
+            code="disk-circuit-closed",
+            severity="info",
+            detail=f"cache disk {disk.disk_id} liveness probe succeeded",
+        ),
+    )
+    return True
 
 
 def _wake_items(
@@ -1341,7 +1473,12 @@ def _wake_items(
     for item in items:
         if item.state != ITEM_QUEUED:
             continue
-        entry = _select_cache_entry(session, item.content_sha256)
+        entry = _select_cache_entry(
+            session,
+            item.content_sha256,
+            config=config,
+            allow_recovery_probe=False,
+        )
         if entry is None:
             continue
         disk = session.get(CacheDisk, entry.disk_id)
@@ -1378,6 +1515,44 @@ def _identity_failure_detail(disk: CacheDisk, result: DiskIdentityResult) -> str
 
 
 @contextmanager
+def _serve_slot_context(
+    stream_slots: threading.BoundedSemaphore | None,
+    aead_slots: threading.BoundedSemaphore | None,
+    *,
+    aead_slot_held: bool,
+) -> Iterable[None]:
+    previous = getattr(_SERVE_SLOT_CONTEXT, "value", None)
+    _SERVE_SLOT_CONTEXT.value = _ServeSlotContext(
+        stream_slots=stream_slots,
+        aead_slots=aead_slots,
+        aead_slot_held=aead_slot_held,
+    )
+    try:
+        yield
+    finally:
+        if previous is None:
+            with contextlib.suppress(AttributeError):
+                delattr(_SERVE_SLOT_CONTEXT, "value")
+        else:
+            _SERVE_SLOT_CONTEXT.value = previous
+
+
+def _current_stream_slots() -> threading.BoundedSemaphore | None:
+    context = getattr(_SERVE_SLOT_CONTEXT, "value", None)
+    return None if context is None else context.stream_slots
+
+
+def _current_aead_slots() -> threading.BoundedSemaphore | None:
+    context = getattr(_SERVE_SLOT_CONTEXT, "value", None)
+    return None if context is None else context.aead_slots
+
+
+def _current_aead_slot_held() -> bool:
+    context = getattr(_SERVE_SLOT_CONTEXT, "value", None)
+    return bool(context is not None and context.aead_slot_held)
+
+
+@contextmanager
 def _semaphore_slot(semaphore: threading.BoundedSemaphore) -> Iterable[None]:
     semaphore.acquire()
     try:
@@ -1395,6 +1570,19 @@ def _optional_semaphore_slot(
         return
     with _semaphore_slot(semaphore):
         yield
+
+
+@contextmanager
+def _optional_unheld_aead_slot() -> Iterable[None]:
+    if _current_aead_slot_held():
+        yield
+        return
+    with _optional_semaphore_slot(_current_aead_slots()):
+        yield
+
+
+def _publish_cache_plaintext(source: Path, destination: Path) -> None:
+    atomic_write_verified_file(source, destination)
 
 
 def _cache_key_epoch(entry: CacheEntry) -> KeyEpoch:

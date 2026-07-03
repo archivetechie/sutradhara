@@ -763,7 +763,7 @@ def test_wake_window_marks_only_rolling_cache_items(
     assert any(states[4] == ITEM_WAKING_DISK for states in observed[1:])
 
 
-def test_parallel_serve_respects_stream_pool_and_aead_subcap(
+def test_parallel_serve_respects_publish_stream_pool(
     engine: Engine,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -772,40 +772,41 @@ def test_parallel_serve_respects_stream_pool_and_aead_subcap(
     root.mkdir()
     lock = threading.Lock()
     active = 0
-    active_aead = 0
     max_active = 0
-    max_aead = 0
 
-    def fake_cache(_session, entry, destination, _config):
-        nonlocal active, active_aead, max_active, max_aead
+    def fake_identity(_disk, _config):
+        return restore_manager.DiskIdentityResult(True, "ok", "test identity")
+
+    def fake_publish(source: Path, destination: Path) -> None:
+        nonlocal active, max_active
         with lock:
             active += 1
-            if entry.representation == AEAD_REPRESENTATION:
-                active_aead += 1
             max_active = max(max_active, active)
-            max_aead = max(max_aead, active_aead)
         time.sleep(0.02)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(entry.content_sha256)
+        destination.write_bytes(source.read_bytes())
         with lock:
-            if entry.representation == AEAD_REPRESENTATION:
-                active_aead -= 1
             active -= 1
-        return restore_manager.ServeResult(None, "cache", destination, len(entry.content_sha256))
 
-    monkeypatch.setattr(restore_manager, "_serve_from_cache", fake_cache)
+    monkeypatch.setattr(restore_manager, "_verify_cache_disk_identity", fake_identity)
+    monkeypatch.setattr(restore_manager, "_publish_cache_plaintext", fake_publish)
     with session_scope(engine) as session:
         digests = []
-        for index in range(50):
+        for index in range(30):
             digest, _backend_id, _memory = _seed_archived_asset(
                 session,
                 data=f"parallel-{index}".encode(),
             )
-            entry = _seed_cache_entry(session, tmp_path / "d001", digest, f"parallel-{index}".encode())
-            if index < 20:
-                entry.representation = AEAD_REPRESENTATION
-                entry.key_epoch = "hdcache-test-epoch"
-                entry.stored_digest = b"0" * 32
+            disk_id = f"d{index:03d}"
+            _seed_cache_entry(
+                session,
+                tmp_path / disk_id,
+                digest,
+                f"parallel-{index}".encode(),
+                disk_id=disk_id,
+                serial=f"SER{index:03d}",
+                fs_uuid=f"fs-{index:03d}",
+            )
             digests.append(digest)
         request = admit_restore_request(
             session,
@@ -833,6 +834,78 @@ def test_parallel_serve_respects_stream_pool_and_aead_subcap(
         )
 
     assert 1 < max_active <= 6
+    with session_scope(engine) as session:
+        assert set(session.scalars(select(RestoreRequestItem.state))) == {ITEM_DONE}
+
+
+def test_parallel_serve_respects_aead_subcap(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    lock = threading.Lock()
+    active_aead = 0
+    max_aead = 0
+
+    def fake_cache(_session, entry, destination, _config):
+        nonlocal active_aead, max_aead
+        with lock:
+            if entry.representation == AEAD_REPRESENTATION:
+                active_aead += 1
+            max_aead = max(max_aead, active_aead)
+        time.sleep(0.02)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(entry.content_sha256)
+        with lock:
+            if entry.representation == AEAD_REPRESENTATION:
+                active_aead -= 1
+        return restore_manager.ServeResult(None, "cache", destination, len(entry.content_sha256))
+
+    monkeypatch.setattr(restore_manager, "_serve_from_cache", fake_cache)
+    with session_scope(engine) as session:
+        digests = []
+        for index in range(20):
+            digest, _backend_id, _memory = _seed_archived_asset(
+                session,
+                data=f"aead-parallel-{index}".encode(),
+            )
+            entry = _seed_cache_entry(
+                session,
+                tmp_path / "d001",
+                digest,
+                f"aead-parallel-{index}".encode(),
+            )
+            entry.representation = AEAD_REPRESENTATION
+            entry.key_epoch = "hdcache-test-epoch"
+            entry.stored_digest = b"0" * 32
+            digests.append(digest)
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters") for digest in digests],
+            config=_config(root),
+        )
+        request_id = request.id
+
+    factory = make_session_factory(engine)
+    with session_scope(engine) as session:
+        request = session.get(RestoreRequest, request_id)
+        assert request is not None
+        serve_restore_request(
+            session,
+            request,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=RestoreConfig(
+                destinations=_config(root).destinations,
+                stream_pool_size=6,
+                aead_stream_cap=2,
+                worker_session_factory=factory,
+            ),
+        )
+
     assert 1 < max_aead <= 2
     with session_scope(engine) as session:
         assert set(session.scalars(select(RestoreRequestItem.state))) == {ITEM_DONE}
@@ -894,6 +967,7 @@ def test_deadline_fallback_trips_breaker_without_lost_marking(
         assert (root / digest.hex()).read_bytes() == b"tape truth"
         assert session.get(CacheEntry, digest).state == "present"
         assert session.get(CacheDisk, entry.disk_id).filled_bytes == len(b"tape truth")
+        assert session.get(CacheDisk, entry.disk_id).state == "absent"
         assert read_started.is_set()
         assert elapsed < 0.5
     unblock_read.set()
@@ -901,8 +975,219 @@ def test_deadline_fallback_trips_breaker_without_lost_marking(
     assert [event.code for event in events] == [
         "cache-fallback:read-deadline",
         "disk-circuit-open",
-        "cache-fallback:lost-mark-skipped-breaker",
     ]
+
+
+def test_repeated_hung_disk_restore_does_not_spawn_another_reader(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    read_started = threading.Event()
+    disk_id = "dhung"
+
+    class PermanentlyBlockingReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            read_started.set()
+            threading.Event().wait()
+            return b""
+
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"tape truth")
+        _seed_cache_entry(
+            session,
+            tmp_path / disk_id,
+            digest,
+            b"tape truth",
+            disk_id=disk_id,
+            serial="SERHUNG",
+            fs_uuid="fs-hung",
+        )
+        blocked_path = entry_path(tmp_path / disk_id, digest, representation=RAW_REPRESENTATION)
+        original_open = Path.open
+
+        def open_maybe_blocking(path: Path, mode: str = "r", *args, **kwargs):
+            if path == blocked_path and "r" in mode and "b" in mode:
+                return PermanentlyBlockingReader()
+            return original_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", open_maybe_blocking)
+        breaker = DiskCircuitBreaker(failure_threshold=1, window_seconds=60)
+        config = _config(
+            root,
+            restore_backends={backend_id: memory},
+            read_deadline_seconds=0.05,
+            liveness_probe_deadline_seconds=0.05,
+            breaker=breaker,
+            identity_probe=FakeDiskIdentityProbe(serial="SERHUNG", fs_uuid="fs-hung"),
+        )
+
+        _request, first = _request_item(session, digest, root)
+        first_result = serve_restore_item(
+            session,
+            first,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=config,
+        )
+        assert first_result.source == "tape"
+        assert read_started.is_set()
+        assert _reader_thread_count(disk_id) == 1
+        assert session.get(CacheDisk, disk_id).state == "absent"
+
+        (root / digest.hex()).unlink()
+        _request, second = _request_item(session, digest, root, request_id="r-hung-second")
+        second_result = serve_restore_item(
+            session,
+            second,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=config,
+        )
+
+        assert second_result.source == "tape"
+        assert _reader_thread_count(disk_id) == 1
+        assert session.get(CacheEntry, digest).state == "present"
+
+
+def test_half_open_probe_reactivates_disk_and_resets_breaker(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    disk_id = "drecover"
+    events: list[RestoreEvent] = []
+    breaker = DiskCircuitBreaker(failure_threshold=1, window_seconds=60)
+    breaker.record_failure(disk_id)
+
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=b"cache truth")
+        _seed_cache_entry(
+            session,
+            tmp_path / disk_id,
+            digest,
+            b"cache truth",
+            disk_id=disk_id,
+            serial="SERREC",
+            fs_uuid="fs-rec",
+        )
+        disk = session.get(CacheDisk, disk_id)
+        assert disk is not None
+        disk.state = "absent"
+        session.flush([disk])
+
+        plan = resolve_read_source(
+            session,
+            asset_hash=digest,
+            artifactclass="s-masters",
+            destination=root / digest.hex(),
+            identity_or_override=_identity("sutradhara-operator"),
+            config=_config(
+                root,
+                events=events,
+                breaker=breaker,
+                liveness_probe_deadline_seconds=0.5,
+                identity_probe=FakeDiskIdentityProbe(serial="SERREC", fs_uuid="fs-rec"),
+            ),
+        )
+
+        assert plan.source == "cache"
+        assert session.get(CacheDisk, disk_id).state == "active"
+        assert not breaker.is_open(disk_id)
+
+    assert [event.code for event in events] == ["disk-circuit-closed"]
+
+
+def test_hung_disk_read_does_not_consume_stream_slot(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    disk_id = "dslot"
+    read_started = threading.Event()
+    failures: list[BaseException] = []
+
+    class BlockingReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            read_started.set()
+            threading.Event().wait()
+            return b""
+
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=b"cache truth")
+        _seed_cache_entry(
+            session,
+            tmp_path / disk_id,
+            digest,
+            b"cache truth",
+            disk_id=disk_id,
+            serial="SERSLOT",
+            fs_uuid="fs-slot",
+        )
+        blocked_path = entry_path(tmp_path / disk_id, digest, representation=RAW_REPRESENTATION)
+
+    original_open = Path.open
+
+    def open_maybe_blocking(path: Path, mode: str = "r", *args, **kwargs):
+        if path == blocked_path and "r" in mode and "b" in mode:
+            return BlockingReader()
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_maybe_blocking)
+    runtime = restore_manager._ServeRuntime(
+        stream_slots=threading.BoundedSemaphore(1),
+        aead_slots=threading.BoundedSemaphore(1),
+    )
+    factory = make_session_factory(engine)
+
+    def serve_in_worker() -> None:
+        worker_session = factory()
+        try:
+            entry = worker_session.get(CacheEntry, digest)
+            assert entry is not None
+            restore_manager._serve_from_cache_controlled(
+                worker_session,
+                entry,
+                root / digest.hex(),
+                _config(
+                    root,
+                    read_deadline_seconds=0.2,
+                    identity_probe=FakeDiskIdentityProbe(serial="SERSLOT", fs_uuid="fs-slot"),
+                ),
+                runtime,
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            worker_session.close()
+
+    worker = threading.Thread(target=serve_in_worker)
+    worker.start()
+    assert read_started.wait(1)
+    assert runtime.stream_slots is not None
+    assert runtime.stream_slots.acquire(blocking=False)
+    runtime.stream_slots.release()
+    worker.join(1)
+
+    assert len(failures) == 1
+    assert isinstance(failures[0], restore_manager.CacheServeFailed)
+    assert failures[0].reason == "read-deadline"
+    assert _reader_thread_count(disk_id) == 1
 
 
 def test_untrusted_cache_hit_promotes_after_verified_serve(
@@ -929,11 +1214,9 @@ def test_untrusted_cache_hit_promotes_after_verified_serve(
         assert entry.last_read_at is not None
 
 
-@pytest.mark.parametrize("file_present", [True, False])
-def test_cache_failure_falls_back_to_tape_with_audit_and_lost_marking(
+def test_cache_content_mismatch_falls_back_to_tape_with_audit_and_lost_marking(
     engine: Engine,
     tmp_path: Path,
-    file_present: bool,
 ) -> None:
     root = tmp_path / "restore-root"
     root.mkdir()
@@ -942,10 +1225,7 @@ def test_cache_failure_falls_back_to_tape_with_audit_and_lost_marking(
         digest, backend_id, memory = _seed_archived_asset(session, data=b"tape truth")
         entry = _seed_cache_entry(session, tmp_path / "d001", digest, b"tape truth")
         path = tmp_path / "d001" / "hdcache" / "v1" / digest.hex()[:2] / digest.hex()
-        if file_present:
-            path.write_bytes(b"corrupt")
-        else:
-            path.unlink()
+        path.write_bytes(b"corrupt")
         _request, item = _request_item(session, digest, root)
         result = serve_restore_item(
             session,
@@ -959,6 +1239,45 @@ def test_cache_failure_falls_back_to_tape_with_audit_and_lost_marking(
         assert session.get(CacheEntry, digest).state == "lost"
         assert session.get(CacheDisk, entry.disk_id).filled_bytes == 0
     assert [event.code for event in events] == ["cache-fallback:read-failed"]
+
+
+def test_cache_entry_enoent_falls_back_without_lost_marking(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    events: list[RestoreEvent] = []
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"tape truth")
+        entry = _seed_cache_entry(session, tmp_path / "d001", digest, b"tape truth")
+        path = tmp_path / "d001" / "hdcache" / "v1" / digest.hex()[:2] / digest.hex()
+        path.unlink()
+        _request, item = _request_item(session, digest, root)
+
+        result = serve_restore_item(
+            session,
+            item,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=_config(
+                root,
+                restore_backends={backend_id: memory},
+                events=events,
+                breaker=DiskCircuitBreaker(failure_threshold=1, window_seconds=60),
+            ),
+        )
+
+        assert result.source == "tape"
+        assert (root / digest.hex()).read_bytes() == b"tape truth"
+        assert item.state == ITEM_DONE
+        assert session.get(CacheEntry, digest).state == "present"
+        assert session.get(CacheDisk, entry.disk_id).filled_bytes == len(b"tape truth")
+        assert session.get(CacheDisk, entry.disk_id).state == "absent"
+
+    assert [event.code for event in events] == [
+        "cache-fallback:read-failed",
+        "disk-circuit-open",
+    ]
 
 
 def test_unverified_cache_disk_identity_falls_back_without_lost_or_delete(
@@ -1255,6 +1574,9 @@ def _config(
     restore_backends: dict[int, MemoryBackend] | None = None,
     events: list[RestoreEvent] | None = None,
     read_deadline_seconds: float = restore_manager.DEFAULT_READ_DEADLINE_SECONDS,
+    liveness_probe_deadline_seconds: float = (
+        restore_manager.DEFAULT_LIVENESS_PROBE_DEADLINE_SECONDS
+    ),
     breaker: DiskCircuitBreaker | None = None,
     identity_probe: "FakeDiskIdentityProbe | None" = None,
 ) -> RestoreConfig:
@@ -1269,6 +1591,7 @@ def _config(
         restore_backends=restore_backends,
         event_sink=None if events is None else events.append,
         read_deadline_seconds=read_deadline_seconds,
+        liveness_probe_deadline_seconds=liveness_probe_deadline_seconds,
         breaker=breaker or DiskCircuitBreaker(),
         hmac_secret=TEST_HDCACHE_HMAC_SECRET,
         identity_probe=identity_probe or FakeDiskIdentityProbe(),
@@ -1423,19 +1746,22 @@ def _seed_cache_entry(
     data: bytes,
     *,
     trusted: bool = True,
+    disk_id: str = "d001",
+    serial: str = "SER001",
+    fs_uuid: str = "fs-001",
 ) -> CacheEntry:
     mount.mkdir(parents=True, exist_ok=True)
     write_disk_sentinel(
         mount,
-        ExpectedDiskIdentity("d001", "SER001", "fs-001"),
+        ExpectedDiskIdentity(disk_id, serial, fs_uuid),
         hmac_secret=TEST_HDCACHE_HMAC_SECRET,
     )
-    disk = session.get(CacheDisk, "d001")
+    disk = session.get(CacheDisk, disk_id)
     if disk is None:
         disk = CacheDisk(
-            disk_id="d001",
-            serial="SER001",
-            fs_uuid="fs-001",
+            disk_id=disk_id,
+            serial=serial,
+            fs_uuid=fs_uuid,
             mount=str(mount),
             state="active",
             capacity_bytes=1000,
@@ -1473,9 +1799,11 @@ def _request_item(
     session,
     digest: bytes,
     root: Path,
+    *,
+    request_id: str | None = None,
 ) -> tuple[RestoreRequest, RestoreRequestItem]:
     request = RestoreRequest(
-        id=f"r-{digest.hex()[:8]}",
+        id=request_id or f"r-{digest.hex()[:8]}",
         identity="owner",
         destination_id="media-server",
         state="active",
@@ -1494,3 +1822,9 @@ def _request_item(
     session.add(request)
     session.flush()
     return request, item
+
+
+def _reader_thread_count(disk_id: str) -> int:
+    return sum(
+        1 for thread in threading.enumerate() if thread.name == f"hdcache-reader-{disk_id}"
+    )

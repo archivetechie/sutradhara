@@ -22,7 +22,8 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import Future, TimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
@@ -40,6 +41,14 @@ KEY_EPOCH_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 class StoreError(RuntimeError):
     """Raised when a cache-disk store operation fails safely."""
+
+
+class StoreReadTimeout(StoreError):
+    """Raised when a deadline-covered cache disk operation does not finish."""
+
+
+class StoreContentMismatch(StoreError):
+    """Raised when bytes read from or written to cache fail content verification."""
 
 
 @dataclass(frozen=True)
@@ -155,6 +164,46 @@ class LocalDiskIdentityProbe:
             wwn=_nonempty(block.get("wwn")),
             fs_uuid=_nonempty(block.get("uuid")),
         )
+
+
+@dataclass(frozen=True)
+class _DiskReaderRequest:
+    future: Future[Any]
+    operation: Callable[[], Any]
+
+
+class _DiskReaderActor:
+    """One daemon worker serializing all deadline-covered operations for one disk."""
+
+    def __init__(self, disk_id: str) -> None:
+        self._queue: queue.Queue[_DiskReaderRequest] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"hdcache-reader-{_thread_token(disk_id)}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, operation: Callable[[], Any]) -> Future[Any]:
+        future: Future[Any] = Future()
+        self._queue.put(_DiskReaderRequest(future=future, operation=operation))
+        return future
+
+    def _run(self) -> None:
+        while True:
+            request = self._queue.get()
+            if not request.future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = request.operation()
+            except Exception as exc:
+                request.future.set_exception(exc)
+            else:
+                request.future.set_result(result)
+
+
+_DISK_READERS: dict[str, _DiskReaderActor] = {}
+_DISK_READERS_LOCK = threading.Lock()
 
 
 def read_hmac_secret(path: Path = DEFAULT_HMAC_KEY_PATH) -> bytes:
@@ -275,6 +324,34 @@ def verify_disk_identity(
     return DiskIdentityResult(True, "ok", "disk identity verified", observed)
 
 
+def probe_disk_liveness_with_deadline(
+    mount: Path,
+    expected: ExpectedDiskIdentity,
+    *,
+    hmac_secret: bytes,
+    disk_id: str,
+    probe: DiskIdentityProbe | None = None,
+    deadline_monotonic: float,
+) -> DiskIdentityResult:
+    """Run a statfs + sentinel identity probe through the disk's bounded reader."""
+
+    def operation() -> DiskIdentityResult:
+        os.statvfs(mount)
+        return verify_disk_identity(
+            mount,
+            expected,
+            hmac_secret=hmac_secret,
+            probe=probe,
+        )
+
+    return _run_disk_actor_operation(
+        disk_id,
+        operation,
+        deadline_monotonic=deadline_monotonic,
+        timeout_message="cache disk liveness probe deadline exceeded",
+    )
+
+
 def write_entry(
     mount: Path,
     content_sha256: bytes,
@@ -315,7 +392,7 @@ def write_entry(
             os.fsync(handle.fileno())
         stream_digest = digest.digest()
         if stream_digest != expected:
-            raise StoreError(
+            raise StoreContentMismatch(
                 f"stream digest mismatch: expected {expected.hex()}, actual {stream_digest.hex()}"
             )
         if before_rename is not None:
@@ -346,6 +423,7 @@ def read_entry_verified(
     expected_stream_sha256: bytes | None = None,
     output: BinaryIO | None = None,
     deadline_monotonic: float | None = None,
+    disk_id: str | None = None,
 ) -> EntryReadResult:
     """Read one entry while verifying the stored stream digest."""
 
@@ -366,6 +444,7 @@ def read_entry_verified(
             expected,
             output=output,
             deadline_monotonic=deadline_monotonic,
+            disk_id=disk_id or os.fspath(mount),
         )
     return _read_entry_verified_direct(path, expected, output=output)
 
@@ -391,7 +470,7 @@ def _read_entry_verified_direct(
                 chunks.append(chunk)
     stream_digest = digest.digest()
     if stream_digest != expected:
-        raise StoreError(
+        raise StoreContentMismatch(
             f"stored stream digest mismatch: expected {expected.hex()}, actual {stream_digest.hex()}"
         )
     return EntryReadResult(
@@ -408,74 +487,13 @@ def _read_entry_verified_with_deadline(
     *,
     output: BinaryIO | None,
     deadline_monotonic: float,
+    disk_id: str,
 ) -> EntryReadResult:
-    items: queue.Queue[bytes | Exception | None] = queue.Queue(maxsize=1)
-    stop = threading.Event()
-
-    def offer(item: bytes | Exception | None) -> None:
-        while not stop.is_set():
-            try:
-                items.put(item, timeout=0.05)
-                return
-            except queue.Full:
-                continue
-
-    def read_worker() -> None:
-        try:
-            _require_regular_file(path, "cache entry")
-            with path.open("rb") as handle:
-                while not stop.is_set():
-                    chunk = handle.read(BUFFER_SIZE)
-                    if not chunk:
-                        offer(None)
-                        return
-                    offer(bytes(chunk))
-        except Exception as exc:
-            offer(exc)
-
-    worker = threading.Thread(
-        target=read_worker,
-        name=f"hdcache-read-{path.name[:12]}",
-        daemon=True,
-    )
-    worker.start()
-
-    digest = hashlib.sha256()
-    size = 0
-    chunks: list[bytes] | None = [] if output is None else None
-    try:
-        while True:
-            remaining = deadline_monotonic - time.monotonic()
-            if remaining <= 0:
-                raise StoreError("cache read deadline exceeded")
-            try:
-                item = items.get(timeout=remaining)
-            except queue.Empty as exc:
-                raise StoreError("cache read deadline exceeded") from exc
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                raise item
-            digest.update(item)
-            size += len(item)
-            if output is not None:
-                output.write(item)
-            else:
-                assert chunks is not None
-                chunks.append(item)
-    except Exception:
-        stop.set()
-        raise
-    stream_digest = digest.digest()
-    if stream_digest != expected:
-        raise StoreError(
-            f"stored stream digest mismatch: expected {expected.hex()}, actual {stream_digest.hex()}"
-        )
-    return EntryReadResult(
-        path=path,
-        size_bytes=size,
-        stream_digest=stream_digest,
-        data=b"".join(chunks) if chunks is not None else None,
+    return _run_disk_actor_operation(
+        disk_id,
+        lambda: _read_entry_verified_direct(path, expected, output=output),
+        deadline_monotonic=deadline_monotonic,
+        timeout_message="cache read deadline exceeded",
     )
 
 
@@ -601,6 +619,38 @@ def entries_root(mount: Path) -> Path:
 
 def tmp_root(mount: Path) -> Path:
     return layout_root(mount) / TMP_DIR
+
+
+def _run_disk_actor_operation(
+    disk_id: str,
+    operation: Callable[[], Any],
+    *,
+    deadline_monotonic: float,
+    timeout_message: str,
+) -> Any:
+    remaining = deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        raise StoreReadTimeout(timeout_message)
+    future = _reader_for_disk(disk_id).submit(operation)
+    try:
+        return future.result(timeout=remaining)
+    except TimeoutError as exc:
+        future.cancel()
+        raise StoreReadTimeout(timeout_message) from exc
+
+
+def _reader_for_disk(disk_id: str) -> _DiskReaderActor:
+    with _DISK_READERS_LOCK:
+        actor = _DISK_READERS.get(disk_id)
+        if actor is None:
+            actor = _DiskReaderActor(disk_id)
+            _DISK_READERS[disk_id] = actor
+        return actor
+
+
+def _thread_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_")
+    return (token or "unknown")[:48]
 
 
 def _entry_filename(
