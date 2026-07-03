@@ -36,7 +36,8 @@ from sutradhara.backend.port import ByteRange
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Bundle, BundleMember
 from sutradhara.catalog.types import CopyHealth, CopySource
-from sutradhara.keys import KeyRegistry
+from sutradhara.hdcache.fill import enqueue_post_flush_hdcache_fills
+from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.rem_archive_cli import (
     resolve_rem_bin,
     run_rem_archive_build,
@@ -365,6 +366,14 @@ class RemArchiveBuilder:
         if representation is Representation.RAO_AEAD_V1:
             if key_epoch is None:
                 raise ArchiveFanoutError("encrypted RAO archive build requires key_epoch")
+            try:
+                assert_key_epoch_domain(
+                    key_epoch,
+                    KEY_DOMAIN_ARCHIVE,
+                    context=f"pool sealing for bundle {bundle.id}",
+                )
+            except ValueError as exc:
+                raise ArchiveFanoutError(str(exc)) from exc
             with KeyRegistry().materialized_root_key(key_epoch) as key_file:
                 result = run_rem_archive_build(
                     inputs=rem_inputs,
@@ -592,6 +601,7 @@ def flush_bundle(
                 bundle.customer_manifest_path = manifest_receipt
 
     close_bundle(session, bundle)
+    enqueue_post_flush_hdcache_fills(session, bundle.id)
     return FanoutResult(bundle.id, tuple(copy_ids), manifest_receipt)
 
 

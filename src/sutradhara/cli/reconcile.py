@@ -13,6 +13,7 @@ from sutradhara.jobs.reconcilers import copy as _copy_reconciler  # noqa: F401 -
 from sutradhara.jobs.reconcilers import (
     derivation as _derivation_reconciler,  # noqa: F401 -- register derivation
 )
+from sutradhara.jobs.reconcilers import hdcache as _hdcache_reconciler  # noqa: F401
 from sutradhara.jobs.reconcilers.registry import ReconcilerNotRegistered
 from sutradhara.jobs.reconcilers.spine import reconcile
 

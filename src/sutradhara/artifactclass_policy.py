@@ -8,6 +8,8 @@ whether incoming material is expected to be compliant or messy.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import tomllib
 import warnings
@@ -99,6 +101,18 @@ class StagingPolicy:
 
 
 @dataclass(frozen=True)
+class HdcachePolicy:
+    enabled: bool = False
+    privacy_level: str = "none"
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "privacy_level": self.privacy_level,
+        }
+
+
+@dataclass(frozen=True)
 class ArtifactClassPolicy:
     ruleset: str
     placements: tuple[PlacementPolicy, ...]
@@ -106,6 +120,7 @@ class ArtifactClassPolicy:
     restore_preference: tuple[str, ...]
     expect: str
     staging: StagingPolicy = StagingPolicy()
+    hdcache: HdcachePolicy = HdcachePolicy()
 
 
 _DURATION_RE = re.compile(r"^(?P<value>[1-9][0-9]*)(?P<unit>s|m|h|d)$")
@@ -137,6 +152,37 @@ def staging_policy_from_json(raw: object) -> StagingPolicy:
     return _parse_staging(raw, "staging_config")
 
 
+def hdcache_policy_from_json(raw: object) -> HdcachePolicy:
+    """Hydrate a persisted normalized hdcache policy JSON document."""
+    return _parse_hdcache(raw, "hdcache_config")
+
+
+def hdcache_privacy_capability_map_from_env() -> dict[str, str]:
+    """Load the fail-closed hdcache privacy-level capability map."""
+
+    raw = os.environ.get("SUTRADHARA_HDCACHE_PRIVACY_CAPABILITIES")
+    if raw is None or raw == "":
+        return {"p2": "can_restore_p2", "p3": "can_restore_p3"}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ArtifactClassPolicyError(
+            "SUTRADHARA_HDCACHE_PRIVACY_CAPABILITIES must be a JSON object"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ArtifactClassPolicyError(
+            "SUTRADHARA_HDCACHE_PRIVACY_CAPABILITIES must be a JSON object"
+        )
+    result: dict[str, str] = {}
+    for level, capability in parsed.items():
+        if not isinstance(level, str) or not level:
+            raise ArtifactClassPolicyError("hdcache privacy capability levels must be strings")
+        if not isinstance(capability, str) or not capability:
+            raise ArtifactClassPolicyError("hdcache privacy capabilities must be strings")
+        result[level] = capability
+    return result
+
+
 def parse_artifactclass_policy(
     text: str,
     *,
@@ -155,7 +201,7 @@ def parse_artifactclass_policy(
     )
     _reject_keys(
         raw,
-        {"ruleset", "placements", "bundling", "restore", "expect", "staging"},
+        {"ruleset", "placements", "bundling", "restore", "expect", "staging", "hdcache"},
         source,
     )
 
@@ -198,6 +244,7 @@ def parse_artifactclass_policy(
         raise ArtifactClassPolicyError(f"{source}: restore.preference must not be empty")
 
     staging = _parse_staging(raw.get("staging"), f"{source}: staging")
+    hdcache = _parse_hdcache(raw.get("hdcache"), f"{source}: hdcache")
 
     return ArtifactClassPolicy(
         ruleset=ruleset,
@@ -206,6 +253,7 @@ def parse_artifactclass_policy(
         restore_preference=restore_preference,
         expect=expect,
         staging=staging,
+        hdcache=hdcache,
     )
 
 
@@ -230,6 +278,7 @@ def apply_artifactclass_policy(
         raise UnknownPolicyPool(
             f"artifactclass {artifactclass!r} references unknown pools: " + ", ".join(missing)
         )
+    _validate_hdcache_privacy_mapping(policy)
     _warn_if_appledouble_ruleset_preservation_is_unproven(policy)
 
     existing = {
@@ -265,6 +314,7 @@ def apply_artifactclass_policy(
     record.max_age_seconds = policy.bundling.max_age_seconds
     record.restore_preference = list(policy.restore_preference)
     record.staging_config = policy.staging.to_json()
+    record.hdcache_config = policy.hdcache.to_json()
     record.policy_source = source
     record.policy_sha256 = (
         hashlib.sha256(source_text.encode("utf-8")).hexdigest() if source_text is not None else None
@@ -328,6 +378,31 @@ def _parse_staging(raw: object, label: str) -> StagingPolicy:
         appledouble=_parse_appledouble(table.get("appledouble"), f"{label}.appledouble"),
         compression=_parse_compression(table.get("compression"), f"{label}.compression"),
     )
+
+
+def _parse_hdcache(raw: object, label: str) -> HdcachePolicy:
+    if raw is None:
+        return HdcachePolicy()
+    table = _required_table(raw, label)
+    _reject_keys(table, {"enabled", "privacy_level"}, label)
+    enabled = table.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ArtifactClassPolicyError(f"{label}.enabled must be a boolean")
+    privacy_level = _optional_str(table.get("privacy_level"), f"{label}.privacy_level", default="none")
+    if privacy_level != "none" and re.fullmatch(r"p[1-9][0-9]*", privacy_level) is None:
+        raise ArtifactClassPolicyError(f"{label}.privacy_level must be 'none' or a p<N> level")
+    return HdcachePolicy(enabled=enabled, privacy_level=privacy_level)
+
+
+def _validate_hdcache_privacy_mapping(policy: ArtifactClassPolicy) -> None:
+    privacy_level = policy.hdcache.privacy_level
+    if privacy_level == "none":
+        return
+    mapping = hdcache_privacy_capability_map_from_env()
+    if privacy_level not in mapping:
+        raise ArtifactClassPolicyError(
+            f"hdcache privacy_level {privacy_level!r} has no configured restore capability"
+        )
 
 
 def _parse_appledouble(raw: object, label: str) -> AppleDoubleStagingPolicy:

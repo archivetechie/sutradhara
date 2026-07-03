@@ -48,6 +48,7 @@ class Sealer(Protocol):
         representation: Representation,
         *,
         key_epoch: KeyEpoch | None = None,
+        work_dir: Path | str | None = None,
     ) -> AbstractContextManager[SealResult]:
         """Yield a sealed local file, cleaning temporary files on exit."""
         ...
@@ -62,6 +63,7 @@ class Opener(Protocol):
         representation: Representation,
         *,
         key_epoch: KeyEpoch | None = None,
+        work_dir: Path | str | None = None,
     ) -> AbstractContextManager[Path]:
         """Yield a local plaintext file, cleaning temporary files on exit."""
         ...

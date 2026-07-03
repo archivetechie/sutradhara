@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Any
 
 _DEFAULT_REGISTRY_DIR = Path("/var/lib/replica/sutradhara-key-registry")
+KEY_DOMAIN_ARCHIVE = "archive"
+KEY_DOMAIN_HDCACHE = "hdcache"
+KEY_DOMAINS = frozenset({KEY_DOMAIN_ARCHIVE, KEY_DOMAIN_HDCACHE})
 _TEST_SEED = bytes.fromhex(
     "73797374656d2d6861726e6573733a737574726164686172612d6b65792d7365"
     "616d3a616d6265722d616561642d6465763a7631"
@@ -51,10 +54,18 @@ class KeyRegistry:
         """Directory containing key state and root-key files."""
         return self._registry_dir
 
-    def create_epoch(self) -> KeyEpoch:
-        """Create or reactivate the deterministic development epoch."""
+    def create_epoch(
+        self,
+        domain: str = KEY_DOMAIN_ARCHIVE,
+        *,
+        purpose: str | None = None,
+    ) -> KeyEpoch:
+        """Create or reactivate the deterministic development epoch for a key domain."""
+        if purpose is not None:
+            domain = purpose
+        domain = _validate_domain(domain)
         self._ensure_registry_dir()
-        key_id, root_key = _derive_test_epoch()
+        key_id, root_key = _derive_test_epoch(domain)
         root_path = self._root_key_path(key_id)
         state_path = self._state_path(key_id)
 
@@ -67,6 +78,7 @@ class KeyRegistry:
         created_at = str(state.get("created_at") or datetime.now(UTC).isoformat())
         state = {
             "key_id": key_id,
+            "domain": domain,
             "created_at": created_at,
             "active": True,
             "backend": "local-registry",
@@ -180,28 +192,79 @@ class KeyRegistry:
         return self._registry_dir / f"{key_id}.json"
 
 
-def _derive_test_epoch() -> tuple[str, bytes]:
-    key_id = hashlib.sha256(_TEST_SEED + b":key-id").digest()[:16].hex()
-    root_key = hashlib.sha256(_TEST_SEED + b":root-key").digest()
-    if key_id == "0" * 32:
+def _derive_test_epoch_for_domain(domain: str) -> tuple[str, bytes]:
+    if domain == KEY_DOMAIN_ARCHIVE:
+        key_id = hashlib.sha256(_TEST_SEED + b":key-id").digest()[:16].hex()
+        root_key = hashlib.sha256(_TEST_SEED + b":root-key").digest()
+    else:
+        domain_bytes = domain.encode("ascii")
+        key_suffix = hashlib.sha256(_TEST_SEED + b":" + domain_bytes + b":key-id")
+        key_id = f"{domain}-{key_suffix.digest()[:16].hex()}"
+        root_key = hashlib.sha256(_TEST_SEED + b":" + domain_bytes + b":root-key").digest()
+    if key_id == "0" * 32 or key_id.endswith("-" + "0" * 32):
         raise RuntimeError("deterministic dev key_id must not be all zero")
     return key_id, root_key
+
+
+def _derive_test_epoch(domain: str = KEY_DOMAIN_ARCHIVE) -> tuple[str, bytes]:
+    domain = _validate_domain(domain)
+    return _derive_test_epoch_for_domain(domain)
+
+
+def key_domain(key_id: str) -> str:
+    """Return the key domain encoded in a registry key id."""
+    key_id = _validate_key_id(key_id)
+    if key_id.startswith(f"{KEY_DOMAIN_HDCACHE}-"):
+        return KEY_DOMAIN_HDCACHE
+    return KEY_DOMAIN_ARCHIVE
+
+
+def assert_key_epoch_domain(
+    epoch: KeyEpoch | str,
+    expected_domain: str,
+    *,
+    context: str,
+) -> None:
+    """Fail closed when a seal/open path receives a key from the wrong domain."""
+    expected_domain = _validate_domain(expected_domain)
+    key_id = epoch.key_id if isinstance(epoch, KeyEpoch) else epoch
+    actual_domain = key_domain(key_id)
+    if actual_domain != expected_domain:
+        raise ValueError(
+            f"{context} requires {expected_domain} key epochs; got {actual_domain} epoch {key_id!r}"
+        )
+
+
+def _validate_domain(domain: str) -> str:
+    if domain not in KEY_DOMAINS:
+        raise ValueError(f"key domain must be one of {sorted(KEY_DOMAINS)!r}; got {domain!r}")
+    return domain
 
 
 def _validate_key_id(key_id: str) -> str:
     if not isinstance(key_id, str):
         raise TypeError(f"key_id must be str, got {type(key_id).__name__}")
+    if key_id.startswith(f"{KEY_DOMAIN_HDCACHE}-"):
+        suffix = key_id.removeprefix(f"{KEY_DOMAIN_HDCACHE}-")
+        if len(suffix) != 32:
+            raise ValueError(f"hdcache key_id suffix must be 32 hex characters, got {key_id!r}")
+        _validate_hex_id(suffix, key_id)
+        return key_id
     if len(key_id) != 32:
-        raise ValueError(f"key_id must be 32 hex characters, got {key_id!r}")
-    try:
-        bytes.fromhex(key_id)
-    except ValueError as exc:
-        raise ValueError(f"key_id must be lowercase hex, got {key_id!r}") from exc
-    if key_id != key_id.lower():
-        raise ValueError(f"key_id must be lowercase hex, got {key_id!r}")
-    if key_id == "0" * 32:
-        raise ValueError("key_id must not be all zero")
+        raise ValueError(f"key_id must be 32 hex characters or hdcache-*; got {key_id!r}")
+    _validate_hex_id(key_id, key_id)
     return key_id
+
+
+def _validate_hex_id(hex_id: str, original: str) -> None:
+    try:
+        bytes.fromhex(hex_id)
+    except ValueError as exc:
+        raise ValueError(f"key_id must be lowercase hex, got {original!r}") from exc
+    if hex_id != hex_id.lower():
+        raise ValueError(f"key_id must be lowercase hex, got {original!r}")
+    if hex_id == "0" * 32:
+        raise ValueError("key_id must not be all zero")
 
 
 def _secure_temp_dir() -> Path:

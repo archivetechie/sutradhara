@@ -810,6 +810,7 @@ class ArtifactClassPolicyRecord(Base):
     max_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     restore_preference: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     staging_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    hdcache_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     policy_source: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     policy_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(

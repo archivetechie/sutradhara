@@ -281,6 +281,39 @@ def test_target_pools_reads_active_memberships_and_representations(
     assert [target.key_epoch for _, target in targets] == [None, "1" * 32]
 
 
+def test_pool_sealing_rejects_hdcache_key_epoch(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    data = b"private pool asset"
+    source = tmp_path / "asset.bin"
+    source.write_bytes(data)
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="private-pool",
+        artifactclass="video-priv",
+        representation=Representation.RAO_AEAD_V1,
+    )
+    backend = _PoolWriteBackend("rem")
+
+    with session_scope(engine) as s, pytest.raises(
+        ReplicationInvariantError,
+        match="requires archive key epochs",
+    ):
+        replicate_asset(
+            s,
+            asset_hash,
+            source,
+            "video-priv",
+            backends={backend_id: backend},
+            sealer=_FakeSealer(tmp_path),
+            key_epoch="hdcache-" + "1" * 32,
+        )
+
+
 def test_replicate_asset_fans_out_and_records_each_pool_copy(
     engine: Engine,
     tmp_path: Path,

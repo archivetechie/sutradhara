@@ -80,6 +80,7 @@ def _assert_archive_invariants(db_path: Path) -> None:
         "step_order",
     ) in _unique_index_columns(db_path, "staging_transform")
     assert "staging_config" in _table_sql(db_path, "artifactclass_policy")
+    assert "hdcache_config" in _table_sql(db_path, "artifactclass_policy")
 
 
 def _assert_worker_lease_invariants(db_path: Path) -> None:

@@ -8,8 +8,15 @@ from pathlib import Path
 from typing import Any
 
 import click
+from sqlalchemy import Engine
 
-from sutradhara.catalog.session import make_engine
+from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.hdcache.fill import (
+    HdcacheFillPlan,
+    enqueue_requested_fill,
+    fill_config_from_env,
+    top_up_lost_entries,
+)
 from sutradhara.hdcache.lifecycle import (
     BlockDeviceCandidate,
     HdcacheLifecycleManager,
@@ -25,6 +32,7 @@ from sutradhara.hdcache.store import StoreError
 ManagerFactory = Callable[[], HdcacheLifecycleManager]
 _MANAGER_FACTORY: ManagerFactory | None = None
 CLI_ERRORS = (LifecycleError, OSError, StoreError)
+DEFAULT_FILL_CONFIRM_THRESHOLD_BYTES = 100 * 1024**3
 
 
 @click.group("hdcache")
@@ -214,6 +222,46 @@ def hdcache_status_cmd(show_disks: bool, disk_id: str | None, as_json: bool) -> 
         click.echo(f"{row['disk_id']} {row['state']} smart={row['smart_status'] or '-'}")
 
 
+@hdcache_group.command("fill")
+@click.argument("selector")
+@click.option("--dry-run", is_flag=True, default=False, help="Only print count and bytes.")
+@click.option("--yes", is_flag=True, default=False, help="Confirm large class fill requests.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.option(
+    "--confirm-threshold-bytes",
+    type=int,
+    default=DEFAULT_FILL_CONFIRM_THRESHOLD_BYTES,
+    show_default=True,
+    help="Require --yes above this planned byte count.",
+)
+def hdcache_fill_cmd(
+    selector: str,
+    dry_run: bool,
+    yes: bool,
+    as_json: bool,
+    confirm_threshold_bytes: int,
+) -> None:
+    """Schedule hdcache fills for one sha256 or artifactclass."""
+
+    engine = make_engine()
+    config = fill_config_from_env()
+    try:
+        with session_scope(engine) as session:
+            dry = enqueue_requested_fill(session, selector, config=config, dry_run=True)
+            if dry_run:
+                _emit_fill_plan(dry, selector=selector, dry_run=True, as_json=as_json)
+                return
+            if dry.bytes_total > confirm_threshold_bytes and not yes:
+                raise click.ClickException(
+                    f"{selector}: would fill {dry.count} asset(s), {dry.bytes_total} bytes; "
+                    "pass --yes or use --dry-run"
+                )
+            plan = enqueue_requested_fill(session, selector, config=config, dry_run=False)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    _emit_fill_plan(plan, selector=selector, dry_run=False, as_json=as_json)
+
+
 def set_manager_factory(factory: ManagerFactory | None) -> None:
     """Install a test-only manager factory."""
 
@@ -225,13 +273,45 @@ def _manager() -> HdcacheLifecycleManager:
     if _MANAGER_FACTORY is not None:
         return _MANAGER_FACTORY()
     try:
+        engine = make_engine()
         return HdcacheLifecycleManager(
-            make_engine(),
+            engine,
             mount_root=Path("/srv/hdcache"),
             hmac_secret=load_hmac_secret_from_env(),
+            on_entries_lost=lambda _disk_id, _count: _top_up_lost_entries(engine),
         )
     except (OSError, StoreError) as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+def _top_up_lost_entries(engine: Engine) -> None:
+    with session_scope(engine) as session:
+        top_up_lost_entries(session, config=fill_config_from_env())
+
+
+def _emit_fill_plan(
+    plan: HdcacheFillPlan,
+    *,
+    selector: str,
+    dry_run: bool,
+    as_json: bool,
+) -> None:
+    payload = {
+        "selector": selector,
+        "count": plan.count,
+        "bytes": plan.bytes_total,
+        "scheduled": plan.scheduled,
+        "dry_run": dry_run,
+        "live_job_cap": fill_config_from_env().live_job_cap,
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    prefix = "would fill" if dry_run else "scheduled"
+    click.echo(
+        f"{selector}: {prefix} {payload['scheduled'] if not dry_run else payload['count']} "
+        f"of {payload['count']} asset(s), bytes={payload['bytes']}"
+    )
 
 
 def _emit_scan(candidates: list[BlockDeviceCandidate], *, as_json: bool) -> None:

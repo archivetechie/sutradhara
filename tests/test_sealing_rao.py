@@ -164,6 +164,23 @@ def test_rao_cli_sealer_plain_round_trip_with_fake_cli(
     assert not sealed_parent.exists()
 
 
+def test_rao_cli_sealer_uses_configured_work_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_rem_bin(tmp_path, monkeypatch)
+    source = tmp_path / "asset.bin"
+    source.write_bytes(b"work dir")
+    work_dir = tmp_path / "scratch"
+    sealer = RaoCliSealer(KeyRegistry(tmp_path / "keys"), work_dir=work_dir)
+
+    with sealer.seal(source, Representation.RAO_PLAIN_V1) as result:
+        assert result.sealed_path.is_relative_to(work_dir)
+        assert result.sealed_path.exists()
+
+    assert work_dir.is_dir()
+
+
 def test_rao_cli_sealer_encrypted_round_trip_and_key_id_with_fake_cli(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

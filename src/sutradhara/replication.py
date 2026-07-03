@@ -24,7 +24,7 @@ from sutradhara.backend.port import CopyRecord, StorageBackend
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import ArtifactClassPool, Copy, Pool
 from sutradhara.catalog.types import BackendKind, CopyHealth, CopySource
-from sutradhara.keys import KeyEpoch, KeyRegistry
+from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import RestoreError, restore_copy
 from sutradhara.sealing.port import Opener, Representation, Sealer, SealResult
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliOpener, RaoCliSealer
@@ -476,6 +476,14 @@ def _epoch_for(
         raise ReplicationInvariantError(
             f"encrypted pool requires key_epoch for {target.backend_name}/{target.pool_id}"
         )
+    try:
+        assert_key_epoch_domain(
+            target.key_epoch,
+            KEY_DOMAIN_ARCHIVE,
+            context=f"pool sealing for {target.backend_name}/{target.pool_id}",
+        )
+    except ValueError as exc:
+        raise ReplicationInvariantError(str(exc)) from exc
     return KeyEpoch(key_id=target.key_epoch, created_at="", active=True)
 
 

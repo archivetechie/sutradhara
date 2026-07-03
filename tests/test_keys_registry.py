@@ -6,7 +6,15 @@ import hashlib
 import stat
 from pathlib import Path
 
-from sutradhara.keys import KeyRegistry
+import pytest
+
+from sutradhara.keys import (
+    KEY_DOMAIN_ARCHIVE,
+    KEY_DOMAIN_HDCACHE,
+    KeyRegistry,
+    assert_key_epoch_domain,
+    key_domain,
+)
 
 _TEST_SEED = bytes.fromhex(
     "73797374656d2d6861726e6573733a737574726164686172612d6b65792d7365"
@@ -58,3 +66,30 @@ def test_key_registry_create_epoch_is_idempotent(tmp_path: Path) -> None:
     second = registry.create_epoch()
 
     assert second == first
+
+
+def test_key_registry_hdcache_domain_is_namespaced_and_separate(tmp_path: Path) -> None:
+    registry = KeyRegistry(tmp_path / "keys")
+
+    archive = registry.create_epoch()
+    hdcache = registry.create_epoch(domain=KEY_DOMAIN_HDCACHE)
+
+    assert key_domain(archive.key_id) == KEY_DOMAIN_ARCHIVE
+    assert key_domain(hdcache.key_id) == KEY_DOMAIN_HDCACHE
+    assert hdcache.key_id.startswith("hdcache-")
+    assert hdcache.key_id != archive.key_id
+    assert (registry.registry_dir / f"{hdcache.key_id}.root").is_file()
+    assert registry.get_epoch(hdcache.key_id).active is True
+
+
+def test_key_domain_assertion_rejects_cross_domain_use(tmp_path: Path) -> None:
+    registry = KeyRegistry(tmp_path / "keys")
+    archive = registry.create_epoch()
+    hdcache = registry.create_epoch(domain=KEY_DOMAIN_HDCACHE)
+
+    assert_key_epoch_domain(hdcache, KEY_DOMAIN_HDCACHE, context="hdcache fill")
+    assert_key_epoch_domain(archive, KEY_DOMAIN_ARCHIVE, context="pool sealing")
+    with pytest.raises(ValueError, match="requires archive key epochs"):
+        assert_key_epoch_domain(hdcache, KEY_DOMAIN_ARCHIVE, context="pool sealing")
+    with pytest.raises(ValueError, match="requires hdcache key epochs"):
+        assert_key_epoch_domain(archive, KEY_DOMAIN_HDCACHE, context="hdcache fill")

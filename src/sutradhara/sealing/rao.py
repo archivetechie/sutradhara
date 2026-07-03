@@ -57,8 +57,9 @@ class RaoInspection:
 class RaoCliSealer:
     """Seal local files by shelling out to Remanence's RAO CLI."""
 
-    def __init__(self, keys: KeyRegistry | None = None) -> None:
+    def __init__(self, keys: KeyRegistry | None = None, *, work_dir: Path | str | None = None) -> None:
         self._keys = keys or KeyRegistry()
+        self._work_dir = None if work_dir is None else Path(work_dir)
 
     @contextlib.contextmanager
     def seal(
@@ -67,6 +68,7 @@ class RaoCliSealer:
         representation: Representation,
         *,
         key_epoch: KeyEpoch | None = None,
+        work_dir: Path | str | None = None,
     ) -> Iterator[SealResult]:
         """Yield a local sealed representation, removing temp files on exit."""
         source = Path(source_path)
@@ -81,7 +83,10 @@ class RaoCliSealer:
             )
             return
 
-        with tempfile.TemporaryDirectory(prefix="sutradhara-rao-") as temp_dir_raw:
+        with tempfile.TemporaryDirectory(
+            prefix="sutradhara-rao-",
+            dir=_scratch_dir(work_dir, self._work_dir),
+        ) as temp_dir_raw:
             temp_dir = Path(temp_dir_raw)
             os.chmod(temp_dir, 0o700)
             sealed_path = temp_dir / "sealed.rao"
@@ -133,8 +138,9 @@ class RaoCliSealer:
 class RaoCliOpener:
     """Open local Remanence RAO objects back to plaintext via the CLI."""
 
-    def __init__(self, keys: KeyRegistry | None = None) -> None:
+    def __init__(self, keys: KeyRegistry | None = None, *, work_dir: Path | str | None = None) -> None:
         self._keys = keys or KeyRegistry()
+        self._work_dir = None if work_dir is None else Path(work_dir)
 
     @contextlib.contextmanager
     def open(
@@ -143,6 +149,7 @@ class RaoCliOpener:
         representation: Representation,
         *,
         key_epoch: KeyEpoch | None = None,
+        work_dir: Path | str | None = None,
     ) -> Iterator[Path]:
         """Yield a local plaintext file for one stored representation."""
         source = Path(source_path)
@@ -151,7 +158,10 @@ class RaoCliOpener:
             yield source
             return
 
-        with tempfile.TemporaryDirectory(prefix="sutradhara-rao-open-") as temp_dir_raw:
+        with tempfile.TemporaryDirectory(
+            prefix="sutradhara-rao-open-",
+            dir=_scratch_dir(work_dir, self._work_dir),
+        ) as temp_dir_raw:
             temp_dir = Path(temp_dir_raw)
             os.chmod(temp_dir, 0o700)
             if representation is Representation.RAO_PLAIN_V1:
@@ -202,6 +212,15 @@ def inspect_rao(path: Path | str) -> RaoInspection:
 def resolve_rem_bin() -> str:
     """Resolve the Remanence CLI path used by Sutradhara."""
     return _resolve_rem_bin()
+
+
+def _scratch_dir(call_work_dir: Path | str | None, default_work_dir: Path | None) -> str | None:
+    selected = Path(call_work_dir) if call_work_dir is not None else default_work_dir
+    if selected is None:
+        return None
+    selected.mkdir(parents=True, exist_ok=True)
+    os.chmod(selected, 0o700)
+    return str(selected)
 
 
 def _build_rao(
