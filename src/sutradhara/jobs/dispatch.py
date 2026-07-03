@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from sutradhara.catalog.models import Backend, LogicalAsset
 from sutradhara.catalog.types import BackendKind, is_content_hash
+from sutradhara.hdcache.manager import RestoreAdmissionInvalid, validate_restore_item_admission
 from sutradhara.hdcache.models import RestoreRequestItem
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job
@@ -120,6 +121,10 @@ def dispatch_restore(
         raise RestoreRequestItemNotRunnable(
             f"restore request item id={restore_request_item_id} is state={item.state!r}"
         )
+    try:
+        validate_restore_item_admission(item)
+    except RestoreAdmissionInvalid as exc:
+        raise RestoreRequestItemNotRunnable(str(exc)) from exc
 
     job: Job = submit(
         session,

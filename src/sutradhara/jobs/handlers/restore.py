@@ -11,8 +11,11 @@ from __future__ import annotations
 
 from sutradhara.hdcache.manager import (
     ITEM_DONE,
+    ITEM_FAILED,
+    RestoreAdmissionInvalid,
     restore_config_from_env,
     serve_restore_item,
+    validate_restore_item_admission,
 )
 from sutradhara.hdcache.models import RestoreRequestItem
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
@@ -40,6 +43,12 @@ def handle_restore(ctx: JobContext) -> JobResult:
             "not-queued",
             f"restore request item id={item_id} is state={item.state!r}",
         )
+    try:
+        validate_restore_item_admission(item)
+    except RestoreAdmissionInvalid as exc:
+        item.state = ITEM_FAILED
+        item.detail = str(exc)
+        return _failure("not-admitted", str(exc))
     try:
         result = serve_restore_item(
             ctx.session,

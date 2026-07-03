@@ -15,6 +15,7 @@ from click.testing import CliRunner, Result
 from sqlalchemy import Engine, select
 from sqlalchemy.exc import IntegrityError
 
+from sutradhara.api.identity import parse_identity
 from sutradhara.backend import factory as backend_factory
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.backend.port import StorageBackend
@@ -33,6 +34,12 @@ from sutradhara.catalog.types import (
     CopySource,
 )
 from sutradhara.cli.main import cli
+from sutradhara.hdcache.manager import (
+    RestoreConfig,
+    RestoreDestination,
+    RestoreItemSpec,
+    admit_restore_request,
+)
 from sutradhara.hdcache.models import RestoreRequest, RestoreRequestItem
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
 from sutradhara.jobs.config import RetryPolicy, WorkerConfig
@@ -1274,12 +1281,38 @@ def _register_restore_request_item(
     *,
     content: bytes = b"restore-me",
     state: str = "queued",
+    admitted: bool = True,
 ) -> int:
-    """Register one gated restore request item and return its id."""
+    """Register one restore request item and return its id."""
     asset_hash = hashlib.sha256(content).digest()
     with session_scope(engine) as s:
         if s.get(LogicalAsset, asset_hash) is None:
             s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(content)))
+        if admitted:
+            request = admit_restore_request(
+                s,
+                identity=parse_identity(
+                    {
+                        "X-Authentik-Username": "owner",
+                        "X-Authentik-Groups": "sutradhara-operator",
+                    }
+                ),
+                destination_id="media-server",
+                items=[RestoreItemSpec(asset_hash, "s-masters")],
+                config=RestoreConfig(
+                    destinations={
+                        "media-server": RestoreDestination(
+                            id="media-server",
+                            root=Path("/tmp/sutradhara-restore-root"),
+                            label="media-server",
+                        )
+                    }
+                ),
+            )
+            item = request.items[0]
+            item.state = state
+            s.flush([item])
+            return item.id
         request = RestoreRequest(
             id=f"restore-{asset_hash.hex()[:12]}",
             identity="owner",
@@ -1333,6 +1366,18 @@ def test_dispatch_restore_rejects_nonqueued_item(engine: Engine) -> None:
         dispatch_restore(s, item_id)
 
 
+def test_dispatch_restore_rejects_queued_item_without_admission_proof(engine: Engine) -> None:
+    from sutradhara.jobs.dispatch import RestoreRequestItemNotRunnable, dispatch_restore
+
+    item_id = _register_restore_request_item(engine, admitted=False)
+
+    with session_scope(engine) as s, pytest.raises(
+        RestoreRequestItemNotRunnable,
+        match="missing admission proof",
+    ):
+        dispatch_restore(s, item_id)
+
+
 def test_jobs_submit_refuses_public_restore_kind(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SUTRADHARA_DB_URL", "sqlite:///:memory:")
     runner = CliRunner()
@@ -1358,13 +1403,27 @@ def test_restore_handler_fails_cleanly_does_not_fake_success(
         assert "rejects raw copy_id/dest_path" in job.last_error
 
 
+def test_restore_handler_refuses_queued_item_without_admission_proof(engine: Engine) -> None:
+    item_id = _register_restore_request_item(engine, admitted=False)
+
+    with session_scope(engine) as s:
+        job = submit(s, "restore", {"restore_request_item_id": item_id})
+        result = run_one(s, job.id)
+
+        assert not result.ok
+        assert job.status == JobStatus.FAILED
+        assert job.last_error is not None
+        assert "missing admission proof" in job.last_error
+        assert s.get(RestoreRequestItem, item_id).state == "failed"
+
+
 def test_restore_handler_runs_gated_request_item(
     engine: Engine,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from sutradhara.hdcache.manager import ITEM_DONE, RestoreConfig, ServeResult
     import sutradhara.jobs.handlers.restore as restore_handler
+    from sutradhara.hdcache.manager import ITEM_DONE, RestoreConfig, ServeResult
 
     item_id = _register_restore_request_item(engine)
     output = tmp_path / "restored.bin"

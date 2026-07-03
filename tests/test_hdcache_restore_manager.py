@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -11,8 +12,9 @@ import pytest
 from click.testing import CliRunner
 from sqlalchemy import Engine, select
 
+import sutradhara.hdcache.manager as restore_manager
 from sutradhara.api.identity import parse_identity
-from sutradhara.archive_restore import RestoreRejectedAsset, RestoreSuspectAsset
+from sutradhara.archive_restore import RestoreRejectedAsset, RestoreResult, RestoreSuspectAsset
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
@@ -38,8 +40,12 @@ from sutradhara.hdcache.manager import (
     ITEM_DENIED,
     ITEM_DONE,
     ITEM_QUEUED,
+    ITEM_STREAMING,
+    REQUEST_ACTIVE,
+    REQUEST_COMPLETED,
     REQUEST_COMPLETED_WITH_ERRORS,
     REQUEST_PENDING,
+    RESTORE_DESTINATIONS_ENV,
     InvalidRestoreDestination,
     RestoreConfig,
     RestoreDenied,
@@ -49,6 +55,7 @@ from sutradhara.hdcache.manager import (
     UnknownRestoreDestination,
     admit_restore_request,
     canonicalize_restore_destination,
+    configured_destinations,
     destination_for_request_item,
     resolve_read_source,
     restore_to_path,
@@ -272,6 +279,50 @@ def test_validity_gate_applies_to_cache_and_tape_branches(
         assert (tmp_path / "cache.mov").read_bytes() == data
 
 
+@pytest.mark.parametrize(
+    ("state", "flag_text", "note"),
+    [
+        ("suspect", "--force", "decode warning"),
+        ("rejected", "--force-rejected", "bad take"),
+    ],
+)
+def test_admission_validity_denial_details_are_api_safe(
+    engine: Engine,
+    tmp_path: Path,
+    state: str,
+    flag_text: str,
+    note: str,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=f"{state} bytes".encode())
+        asset = session.get(LogicalAsset, digest)
+        assert asset is not None
+        if state == "suspect":
+            asset.validity = AssetValidity.SUSPECT
+            asset.validity_note = note
+        else:
+            asset.rejected_at = dt.datetime.now(dt.UTC)
+            asset.rejected_by = "operator"
+            asset.rejection_reason = note
+
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters")],
+            config=_config(root),
+        )
+
+        item = request.items[0]
+        assert item.state == ITEM_DENIED
+        assert item.detail is not None
+        assert note in item.detail
+        assert flag_text not in item.detail
+        assert "restore anyway" not in item.detail
+
+
 def test_destination_confinement_rejects_escape_overwrite_and_unknown_id(
     engine: Engine,
     tmp_path: Path,
@@ -307,6 +358,33 @@ def test_destination_confinement_rejects_escape_overwrite_and_unknown_id(
             destination_for_request_item(RestoreConfig(destinations={}), "unknown", request.items[0])
 
 
+def test_configured_destinations_do_not_expose_raw_root_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first-root"
+    second_root = tmp_path / "second-root"
+    monkeypatch.setenv(
+        RESTORE_DESTINATIONS_ENV,
+        json.dumps(
+            {
+                "media-server": str(first_root),
+                "review-station": {"root": str(second_root), "writable": True},
+            }
+        ),
+    )
+
+    payload = configured_destinations()
+
+    assert payload == [
+        {"id": "media-server", "label": "media-server", "writable": True},
+        {"id": "review-station", "label": "review-station", "writable": True},
+    ]
+    encoded = json.dumps(payload)
+    assert str(first_root) not in encoded
+    assert str(second_root) not in encoded
+
+
 def test_request_admission_and_sequential_serve_persist_contract_states(
     engine: Engine,
     tmp_path: Path,
@@ -333,7 +411,7 @@ def test_request_admission_and_sequential_serve_persist_contract_states(
             ],
             config=config,
         )
-        assert request.state != REQUEST_PENDING
+        assert request.state == REQUEST_PENDING
         states = {item.content_sha256: item.state for item in request.items}
         assert states[public_digest] == ITEM_QUEUED
         assert states[private_digest] == ITEM_DENIED
@@ -353,6 +431,63 @@ def test_request_admission_and_sequential_serve_persist_contract_states(
             public_digest: ITEM_DONE,
             private_digest: ITEM_DENIED,
         }
+
+
+def test_request_state_is_active_only_while_item_is_serving(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    observed: list[tuple[str, str]] = []
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=b"public bytes")
+        config = _config(root)
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters")],
+            config=config,
+        )
+        item = request.items[0]
+        assert request.state == REQUEST_PENDING
+
+        def fake_serve_from_tape(
+            _session,
+            asset_hash,
+            _artifactclass,
+            destination,
+            _config,
+            *,
+            force_suspect,
+            force_rejected,
+        ):
+            assert force_suspect is False
+            assert force_rejected is False
+            observed.append((request.state, item.state))
+            destination.write_bytes(b"public bytes")
+            return RestoreResult(
+                asset_hash=asset_hash,
+                pool_id="mem-pool",
+                copy_id=1,
+                output_path=destination,
+                size_bytes=len(b"public bytes"),
+            )
+
+        monkeypatch.setattr(restore_manager, "_serve_from_tape", fake_serve_from_tape)
+
+        serve_restore_request(
+            session,
+            request,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=config,
+        )
+
+        assert observed == [(REQUEST_ACTIVE, ITEM_STREAMING)]
+        assert request.state == REQUEST_COMPLETED
+        assert item.state == ITEM_DONE
 
 
 def test_untrusted_cache_hit_promotes_after_verified_serve(
@@ -409,6 +544,45 @@ def test_cache_failure_falls_back_to_tape_with_audit_and_lost_marking(
         assert session.get(CacheEntry, digest).state == "lost"
         assert session.get(CacheDisk, entry.disk_id).filled_bytes == 0
     assert [event.code for event in events] == ["cache-fallback:read-failed"]
+
+
+def test_cache_lost_mark_failure_audits_and_still_falls_back_to_tape(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    events: list[RestoreEvent] = []
+
+    def fail_lost_mark(_session, _entry) -> None:
+        raise OSError("delete failed")
+
+    monkeypatch.setattr(restore_manager, "mark_entry_lost_and_delete", fail_lost_mark)
+
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"tape truth")
+        entry = _seed_cache_entry(session, tmp_path / "d001", digest, b"tape truth")
+        path = tmp_path / "d001" / "hdcache" / "v1" / digest.hex()[:2] / digest.hex()
+        path.write_bytes(b"corrupt")
+        _request, item = _request_item(session, digest, root)
+
+        result = serve_restore_item(
+            session,
+            item,
+            identity_or_override=_identity("sutradhara-operator"),
+            config=_config(root, restore_backends={backend_id: memory}, events=events),
+        )
+
+        assert result.source == "tape"
+        assert (root / digest.hex()).read_bytes() == b"tape truth"
+        assert item.state == ITEM_DONE
+        assert session.get(CacheEntry, digest).state == "present"
+        assert session.get(CacheDisk, entry.disk_id).filled_bytes == len(b"tape truth")
+    assert [event.code for event in events] == [
+        "cache-fallback:read-failed",
+        "cache-fallback:lost-mark-failed",
+    ]
 
 
 def test_absent_disk_falls_back_without_lost_marking_or_accounting_release(
@@ -468,7 +642,15 @@ def test_gated_request_item_tape_serve_uses_admission_validity(
         assert asset is not None
         asset.validity = AssetValidity.SUSPECT
         asset.validity_note = "forced at admission"
-        _request, item = _request_item(session, digest, root)
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-operator"),
+            destination_id="media-server",
+            items=[RestoreItemSpec(digest, "s-masters")],
+            force_suspect=True,
+            config=_config(root),
+        )
+        item = request.items[0]
 
         result = serve_restore_item(
             session,

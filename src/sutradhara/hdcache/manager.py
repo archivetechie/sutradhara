@@ -17,8 +17,8 @@ import tempfile
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Literal
+from pathlib import Path, PureWindowsPath
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -40,7 +40,7 @@ from sutradhara.artifactclass_policy import (
 )
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
-from sutradhara.catalog.models import ArtifactClassPool, Backend, Pool
+from sutradhara.catalog.models import ArtifactClassPool, Backend, LogicalAsset, Pool
 from sutradhara.catalog.types import is_content_hash
 from sutradhara.hdcache.fill import (
     effective_privacy_level,
@@ -71,11 +71,13 @@ REQUEST_COMPLETED = "completed"
 REQUEST_COMPLETED_WITH_ERRORS = "completed_with_errors"
 
 ITEM_QUEUED = "queued"
+ITEM_WAKING_DISK = "waking_disk"
 ITEM_STREAMING = "streaming"
 ITEM_DONE = "done"
 ITEM_FELL_BACK_TO_TAPE = "fell_back_to_tape"
 ITEM_DENIED = "denied"
 ITEM_FAILED = "failed"
+RESTORE_ADMISSION_PROOF_VERSION = 1
 
 CapabilityMap = Mapping[str, str]
 RestoreBackendResolver = Callable[[Session, str], dict[int, StorageBackend]]
@@ -98,6 +100,10 @@ class RestoreDenied(RestoreManagerError):
 
 class UnknownRestoreDestination(RestoreManagerError):
     """The requested opaque restore destination id is not configured."""
+
+
+class RestoreAdmissionInvalid(RestoreManagerError):
+    """A queued restore item lacks the persisted proof created by admission."""
 
 
 class InvalidRestoreDestination(RestoreManagerError):
@@ -166,6 +172,14 @@ class RestoreItemSpec:
 
 
 @dataclass(frozen=True)
+class RestoreAdmissionProof:
+    """Validated admission metadata needed by worker-side restore serving."""
+
+    force_suspect: bool
+    force_rejected: bool
+
+
+@dataclass(frozen=True)
 class RestoreConfig:
     """Runtime knobs for M4 restore admission and single-stream serve."""
 
@@ -219,6 +233,54 @@ def configured_destinations(config: RestoreConfig | None = None) -> list[dict[st
         {"id": dest.id, "label": dest.label, "writable": dest.writable}
         for dest in final_config.destinations.values()
     ]
+
+
+def validate_restore_item_admission(item: RestoreRequestItem) -> RestoreAdmissionProof:
+    """Validate that a queued item was created by the gated admission path."""
+
+    proof = item.admission_proof
+    if not isinstance(proof, dict):
+        raise RestoreAdmissionInvalid(
+            f"restore request item id={item.id} is missing admission proof"
+        )
+    if proof.get("kind") != "hdcache-restore-admission":
+        raise RestoreAdmissionInvalid(
+            f"restore request item id={item.id} has invalid admission proof kind"
+        )
+    if proof.get("version") != RESTORE_ADMISSION_PROOF_VERSION:
+        raise RestoreAdmissionInvalid(
+            f"restore request item id={item.id} has unsupported admission proof version"
+        )
+    if proof.get("request_id") != item.request_id:
+        raise RestoreAdmissionInvalid(
+            f"restore request item id={item.id} admission proof request mismatch"
+        )
+    if proof.get("content_sha256") != item.content_sha256.hex():
+        raise RestoreAdmissionInvalid(
+            f"restore request item id={item.id} admission proof asset mismatch"
+        )
+    if proof.get("artifactclass") != item.artifactclass:
+        raise RestoreAdmissionInvalid(
+            f"restore request item id={item.id} admission proof artifactclass mismatch"
+        )
+    if item.request is None:
+        raise RestoreAdmissionInvalid(
+            f"restore request item id={item.id} is not attached to a request"
+        )
+    if proof.get("destination_id") != item.request.destination_id:
+        raise RestoreAdmissionInvalid(
+            f"restore request item id={item.id} admission proof destination mismatch"
+        )
+    force_suspect = proof.get("force_suspect")
+    force_rejected = proof.get("force_rejected")
+    if not isinstance(force_suspect, bool) or not isinstance(force_rejected, bool):
+        raise RestoreAdmissionInvalid(
+            f"restore request item id={item.id} admission proof force flags invalid"
+        )
+    return RestoreAdmissionProof(
+        force_suspect=force_suspect,
+        force_rejected=force_rejected,
+    )
 
 
 def resolve_read_source(
@@ -300,6 +362,7 @@ def admit_restore_request(
             artifactclass=spec.artifactclass,
             state=ITEM_QUEUED,
             detail=None,
+            admission_proof=None,
         )
         try:
             _check_privacy_gate(
@@ -317,12 +380,21 @@ def admit_restore_request(
                 force_suspect=force_suspect,
                 force_rejected=force_rejected,
             )
+            item.admission_proof = _build_restore_admission_proof(
+                request_id=request.id,
+                destination_id=destination.id,
+                content_sha256=spec.content_sha256,
+                artifactclass=spec.artifactclass,
+                identity=identity.operator_username,
+                force_suspect=force_suspect,
+                force_rejected=force_rejected,
+            )
         except RestoreDenied as exc:
             item.state = ITEM_DENIED
             item.detail = exc.detail
         except (RestoreSuspectAsset, RestoreRejectedAsset) as exc:
             item.state = ITEM_DENIED
-            item.detail = _sanitize_detail(str(exc))
+            item.detail = _validity_denial_detail(session, spec.content_sha256, exc)
         session.add(item)
     session.flush()
     _update_request_state(request)
@@ -380,7 +452,13 @@ def serve_restore_item(
     if item.request is None:
         raise RestoreManagerError("restore request item is not attached to a request")
     destination = destination_for_request_item(final_config, item.request.destination_id, item)
+    admission: RestoreAdmissionProof | None = None
     if gates_already_admitted:
+        try:
+            admission = validate_restore_item_admission(item)
+        except RestoreAdmissionInvalid as exc:
+            _set_item_state(item, ITEM_FAILED, _sanitize_detail(str(exc)))
+            raise
         entry = _select_cache_entry(session, item.content_sha256)
         plan = ResolvedReadSource(
             asset_hash=item.content_sha256,
@@ -405,7 +483,7 @@ def serve_restore_item(
             _set_item_state(item, ITEM_DENIED, exc.detail)
             return ServeResult(item.id, "tape", destination, 0)
         except (RestoreSuspectAsset, RestoreRejectedAsset) as exc:
-            _set_item_state(item, ITEM_DENIED, _sanitize_detail(str(exc)))
+            _set_item_state(item, ITEM_DENIED, _validity_denial_detail(session, item.content_sha256, exc))
             return ServeResult(item.id, "tape", destination, 0)
         except Exception as exc:
             _set_item_state(item, ITEM_FAILED, _sanitize_detail(str(exc)))
@@ -432,9 +510,20 @@ def serve_restore_item(
                 ),
             )
             if exc.mark_lost and plan.cache_entry is not None:
-                mark_entry_lost_and_delete(session, plan.cache_entry)
+                _try_mark_entry_lost_for_cache_fallback(
+                    session,
+                    plan.cache_entry,
+                    final_config,
+                    content_sha256=item.content_sha256,
+                    artifactclass=item.artifactclass,
+                    request_id=item.request_id,
+                    item_id=item.id,
+                    destination_id=item.request.destination_id,
+                )
             _set_item_state(item, ITEM_FELL_BACK_TO_TAPE, "tape mount pending")
 
+    tape_force_suspect = admission.force_suspect if admission is not None else force_suspect
+    tape_force_rejected = admission.force_rejected if admission is not None else force_rejected
     try:
         _set_item_state(item, ITEM_STREAMING, None)
         tape_result = _serve_from_tape(
@@ -443,9 +532,12 @@ def serve_restore_item(
             item.artifactclass,
             plan.destination,
             final_config,
-            force_suspect=force_suspect or gates_already_admitted,
-            force_rejected=force_rejected or gates_already_admitted,
+            force_suspect=tape_force_suspect,
+            force_rejected=tape_force_rejected,
         )
+    except (RestoreSuspectAsset, RestoreRejectedAsset) as exc:
+        _set_item_state(item, ITEM_DENIED, _validity_denial_detail(session, item.content_sha256, exc))
+        return ServeResult(item.id, "tape", plan.destination, 0)
     except ArchiveRestoreError as exc:
         _set_item_state(item, ITEM_FAILED, _sanitize_detail(str(exc)))
         return ServeResult(item.id, "tape", plan.destination, 0)
@@ -510,7 +602,13 @@ def restore_to_path(
                 ),
             )
             if exc.mark_lost and plan.cache_entry is not None:
-                mark_entry_lost_and_delete(session, plan.cache_entry)
+                _try_mark_entry_lost_for_cache_fallback(
+                    session,
+                    plan.cache_entry,
+                    final_config,
+                    content_sha256=asset_hash,
+                    artifactclass=artifactclass,
+                )
     tape_result = _serve_from_tape(
         session,
         asset_hash,
@@ -700,6 +798,75 @@ def _serve_from_tape(
     )
 
 
+def _try_mark_entry_lost_for_cache_fallback(
+    session: Session,
+    entry: CacheEntry,
+    config: RestoreConfig,
+    *,
+    content_sha256: bytes,
+    artifactclass: str,
+    request_id: str | None = None,
+    item_id: int | None = None,
+    destination_id: str | None = None,
+) -> None:
+    try:
+        mark_entry_lost_and_delete(session, entry)
+    except Exception as exc:
+        _emit(
+            config,
+            RestoreEvent(
+                code="cache-fallback:lost-mark-failed",
+                severity="alarm",
+                content_sha256=content_sha256.hex(),
+                artifactclass=artifactclass,
+                detail=_sanitize_detail(str(exc)),
+                request_id=request_id,
+                item_id=item_id,
+                destination_id=destination_id,
+            ),
+        )
+
+
+def _build_restore_admission_proof(
+    *,
+    request_id: str,
+    destination_id: str,
+    content_sha256: bytes,
+    artifactclass: str,
+    identity: str,
+    force_suspect: bool,
+    force_rejected: bool,
+) -> dict[str, object]:
+    return {
+        "kind": "hdcache-restore-admission",
+        "version": RESTORE_ADMISSION_PROOF_VERSION,
+        "request_id": request_id,
+        "destination_id": destination_id,
+        "content_sha256": content_sha256.hex(),
+        "artifactclass": artifactclass,
+        "identity": identity,
+        "force_suspect": bool(force_suspect),
+        "force_rejected": bool(force_rejected),
+    }
+
+
+def _validity_denial_detail(
+    session: Session,
+    asset_hash: bytes,
+    exc: RestoreSuspectAsset | RestoreRejectedAsset,
+) -> str:
+    asset = session.get(LogicalAsset, asset_hash)
+    if isinstance(exc, RestoreSuspectAsset):
+        detail = f"asset {asset_hash.hex()} is flagged suspect"
+        note = None if asset is None else asset.validity_note
+    else:
+        detail = f"asset {asset_hash.hex()} is rejected"
+        note = None if asset is None else asset.rejection_reason
+    if note:
+        detail = f"{detail}: {note}"
+    return _sanitize_detail(detail)
+
+
 def _check_privacy_gate(
     session: Session,
     asset_hash: bytes,
@@ -791,17 +958,24 @@ def _destinations_from_env() -> dict[str, RestoreDestination]:
             raise ArtifactClassPolicyError("restore destination ids must be non-empty strings")
         if isinstance(value, str):
             root = Path(value)
-            label = value
+            label = dest_id
             writable = True
         elif isinstance(value, dict):
             root_raw = value.get("root")
             if not isinstance(root_raw, str) or not root_raw:
                 raise ArtifactClassPolicyError(f"restore destination {dest_id!r} needs root")
             root = Path(root_raw)
-            label_raw = value.get("label", root_raw)
-            if not isinstance(label_raw, str) or not label_raw:
+            label_raw = value.get("label")
+            if label_raw is None:
+                label = dest_id
+            elif not isinstance(label_raw, str) or not label_raw.strip():
                 raise ArtifactClassPolicyError(f"restore destination {dest_id!r} label must be a string")
-            label = label_raw
+            elif _looks_like_raw_path_label(label_raw.strip(), root_raw):
+                raise ArtifactClassPolicyError(
+                    f"restore destination {dest_id!r} label must not be a raw path"
+                )
+            else:
+                label = label_raw.strip()
             writable = bool(value.get("writable", True))
         else:
             raise ArtifactClassPolicyError(
@@ -814,6 +988,20 @@ def _destinations_from_env() -> dict[str, RestoreDestination]:
             writable=writable,
         )
     return destinations
+
+
+def _looks_like_raw_path_label(label: str, root_raw: str) -> bool:
+    if label == root_raw or label.startswith("~"):
+        return True
+    try:
+        if Path(label).expanduser().is_absolute():
+            return True
+    except (OSError, ValueError):
+        return True
+    try:
+        return bool(PureWindowsPath(label).drive)
+    except ValueError:
+        return True
 
 
 def _destination_by_id(config: RestoreConfig, destination_id: str) -> RestoreDestination:
@@ -849,8 +1037,11 @@ def _update_request_state(request: RestoreRequest) -> None:
     if not states:
         request.state = REQUEST_COMPLETED
         return
-    if any(state in {ITEM_QUEUED, ITEM_STREAMING, ITEM_FELL_BACK_TO_TAPE} for state in states):
+    if any(state in {ITEM_WAKING_DISK, ITEM_STREAMING, ITEM_FELL_BACK_TO_TAPE} for state in states):
         request.state = REQUEST_ACTIVE
+        return
+    if ITEM_QUEUED in states:
+        request.state = REQUEST_PENDING
         return
     if all(state == ITEM_DONE for state in states):
         request.state = REQUEST_COMPLETED
