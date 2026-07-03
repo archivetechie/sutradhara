@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, func, select
 
 import sutradhara.jobs.handlers as _handlers  # noqa: F401
+import sutradhara.jobs.reconcilers.hdcache as _hdcache_reconciler  # noqa: F401
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
@@ -29,24 +30,28 @@ from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
 from sutradhara.hdcache.fill import (
     DOMAIN,
-    HDCACHE_FILL_PRIORITY,
     JOB_KIND,
     HdcacheFillConfig,
     HdcacheFillTarget,
+    count_live_hdcache_jobs,
     dedupe_key,
-    enqueue_targets,
     fill_target,
-    observe_target,
 )
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
-from sutradhara.hdcache.store import AEAD_REPRESENTATION, RAW_REPRESENTATION, write_entry
+from sutradhara.hdcache.store import (
+    AEAD_REPRESENTATION,
+    RAW_REPRESENTATION,
+    entry_path,
+    write_entry,
+)
 from sutradhara.jobs.engine import run_one, submit
-from sutradhara.jobs.models import Job, ReconciliationCondition
+from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BLOCKED,
     OBSERVED_MISSING,
     record_observation,
 )
+from sutradhara.jobs.reconcilers.spine import reconcile
 from sutradhara.keys import KeyEpoch, KeyRegistry
 from sutradhara.sealing.port import Representation, SealResult
 
@@ -131,6 +136,9 @@ def test_hdcache_aead_fill_records_hdcache_epoch_and_stored_digest(
         assert entry.key_epoch is not None
         assert entry.key_epoch.startswith("hdcache-")
         assert entry.stored_digest == hashlib.sha256(b"sealed:" + source.read_bytes()).digest()
+        assert session.get(CacheDisk, result.disk_id).filled_bytes == len(
+            b"sealed:" + source.read_bytes()
+        )
 
 
 def test_hdcache_fill_adopts_lost_row_and_replaces_dead_disk(
@@ -191,63 +199,57 @@ def test_hdcache_fill_enospc_flags_disk_and_replaces(
         assert result.disk_id in {"d001", "d002"}
         overfull = session.scalar(select(CacheDisk).where(CacheDisk.smart_status == "over-reserve"))
         assert overfull is not None
+        assert overfull.disk_id != result.disk_id
+        assert overfull.filled_bytes == overfull.capacity_bytes
+        assert session.get(CacheDisk, result.disk_id).filled_bytes == target.size_bytes
         assert session.get(CacheEntry, target.content_sha256).state == "present"
         assert calls == 2
 
 
-def test_hdcache_enqueue_honors_live_cap_dedupe_and_blocked_targets(
+def test_hdcache_reconciler_honors_live_cap_and_tops_up_archived_backlog(
     engine: Engine,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = HdcacheFillConfig(live_job_cap=7, scratch_root=tmp_path / "scratch")
-    targets = [
-        HdcacheFillTarget(
-            content_sha256=index.to_bytes(32, "big"),
-            artifactclass="s-masters",
-            size_bytes=1,
-        )
-        for index in range(10_000)
-    ]
+    cap = 7
+    backlog = 10_000
+    monkeypatch.setenv("SUTRADHARA_HDCACHE_LIVE_JOB_CAP", str(cap))
+    monkeypatch.setenv("SUTRADHARA_HDCACHE_SCRATCH_ROOT", str(tmp_path / "scratch"))
 
     with session_scope(engine) as session:
-        record_observation(
-            session,
-            domain=DOMAIN,
-            target_key=targets[0].sha_hex,
-            desired=True,
-            observed_state=OBSERVED_MISSING,
-        )
-        row = session.scalar(
-            select(ReconciliationCondition).where(
-                ReconciliationCondition.domain == DOMAIN,
-                ReconciliationCondition.target_key == targets[0].sha_hex,
-            )
-        )
-        row.condition = CONDITION_BLOCKED
-        row.next_eligible_at = None
+        _add_disk(session, "d001", tmp_path / "d001")
+        _seed_archived_backlog(session, tmp_path, count=backlog)
 
-        plan = enqueue_targets(session, targets, config=config)
-        duplicate = submit(
-            session,
-            JOB_KIND,
-            {"content_sha256": targets[1].sha_hex, "artifactclass": "s-masters"},
-            dedupe_key=dedupe_key(targets[1].content_sha256),
-            priority=HDCACHE_FILL_PRIORITY,
-        )
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == backlog
+        discovered, processed = reconcile(session, DOMAIN, batch=cap * 3, limit=cap * 3)
+        assert discovered == cap * 3
+        assert processed == cap * 3
+        assert count_live_hdcache_jobs(session) == cap
+        _assert_live_cap(session, cap)
 
-        jobs = list(session.scalars(select(Job).where(Job.kind == JOB_KIND).order_by(Job.id)))
-        assert plan.count == 10_000
-        assert plan.scheduled == 7
-        assert len(jobs) == 7
-        assert duplicate.id == jobs[0].id
-        assert all(job.recon_target_key != targets[0].sha_hex for job in jobs)
+        initial_jobs = _hdcache_jobs(session, status=JobStatus.PENDING)
+        assert len(initial_jobs) == cap
+        for job in initial_jobs[:3]:
+            result = run_one(session, job.id)
+            assert result.ok, result.detail
+            _assert_live_cap(session, cap)
+
+        assert count_live_hdcache_jobs(session) == cap - 3
+        reconcile(session, DOMAIN, batch=cap * 3, limit=cap * 3)
+        assert count_live_hdcache_jobs(session) == cap
+        _assert_live_cap(session, cap)
+        assert len(_hdcache_jobs(session, status=JobStatus.SUCCEEDED)) == 3
 
 
 def test_hdcache_convergence_marks_privacy_raise_and_retired_epoch_lost(
     engine: Engine,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = KeyRegistry(tmp_path / "keys")
+    monkeypatch.setenv("SUTRADHARA_KEY_REGISTRY_DIR", str(registry.registry_dir))
+    monkeypatch.setenv("SUTRADHARA_HDCACHE_SCRATCH_ROOT", str(tmp_path / "scratch"))
+    monkeypatch.setattr("sutradhara.hdcache.fill.RaoCliSealer", FakeSealer)
     raw_source = tmp_path / "raw.mov"
     raw_source.write_bytes(b"raw")
     private_source = tmp_path / "private.mov"
@@ -277,24 +279,50 @@ def test_hdcache_convergence_marks_privacy_raise_and_retired_epoch_lost(
             key_registry=registry,
             sealer=FakeSealer(),
         )
+        raw_entry = session.get(CacheEntry, raw_target.content_sha256)
+        raw_disk = session.get(CacheDisk, raw_entry.disk_id)
+        raw_path = entry_path(
+            Path(raw_disk.mount),
+            raw_entry.content_sha256,
+            representation=RAW_REPRESENTATION,
+        )
+        assert raw_path.is_file()
         raw_policy = session.get(ArtifactClassPolicyRecord, "raise")
         raw_policy.hdcache_config = {"enabled": True, "privacy_level": "p2"}
         private_entry = session.get(CacheEntry, private_target.content_sha256)
-        registry.retire_epoch(private_entry.key_epoch)
+        retired_epoch = private_entry.key_epoch
+        registry.retire_epoch(retired_epoch)
 
-        assert observe_target(session, raw_target.sha_hex, mutate=True, key_registry=registry) == (
-            True,
-            OBSERVED_MISSING,
-        )
-        assert observe_target(
-            session,
+        reconcile(session, DOMAIN, batch=10, limit=10)
+        jobs = _hdcache_jobs(session, status=JobStatus.PENDING)
+        assert {job.recon_target_key for job in jobs} == {
+            raw_target.sha_hex,
             private_target.sha_hex,
-            mutate=True,
-            key_registry=registry,
-        ) == (True, OBSERVED_MISSING)
+        }
+        assert not raw_path.exists()
 
         assert session.get(CacheEntry, raw_target.content_sha256).state == "lost"
         assert session.get(CacheEntry, private_target.content_sha256).state == "lost"
+
+        for job in jobs:
+            result = run_one(session, job.id)
+            assert result.ok, result.detail
+
+        raw_entry = session.get(CacheEntry, raw_target.content_sha256)
+        private_entry = session.get(CacheEntry, private_target.content_sha256)
+        assert raw_entry.state == "present"
+        assert raw_entry.representation == AEAD_REPRESENTATION
+        assert raw_entry.key_epoch is not None
+        assert raw_entry.key_epoch.startswith("hdcache-")
+        assert raw_entry.stored_digest == hashlib.sha256(b"sealed:" + raw_source.read_bytes()).digest()
+        assert private_entry.state == "present"
+        assert private_entry.representation == AEAD_REPRESENTATION
+        assert private_entry.key_epoch is not None
+        assert private_entry.key_epoch.startswith("hdcache-")
+        assert private_entry.key_epoch != retired_epoch
+        assert private_entry.stored_digest == hashlib.sha256(
+            b"sealed:" + private_source.read_bytes()
+        ).digest()
 
 
 def test_hdcache_fill_handler_projects_blocked_condition(
@@ -334,6 +362,9 @@ def test_hdcache_fill_handler_projects_blocked_condition(
 
 
 class FakeSealer:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
     @contextlib.contextmanager
     def seal(
         self,
@@ -356,6 +387,17 @@ class FakeSealer:
             plaintext_digest=hashlib.sha256(source.read_bytes()).digest(),
             representation=Representation.RAO_AEAD_V1,
         )
+
+
+def _assert_live_cap(session: Any, cap: int) -> None:
+    assert count_live_hdcache_jobs(session) <= cap
+
+
+def _hdcache_jobs(session: Any, *, status: JobStatus | None = None) -> list[Job]:
+    query = select(Job).where(Job.kind == JOB_KIND)
+    if status is not None:
+        query = query.where(Job.status == status)
+    return list(session.scalars(query.order_by(Job.id)))
 
 
 def _config(tmp_path: Path) -> HdcacheFillConfig:
@@ -381,6 +423,136 @@ def _add_disk(
             filled_bytes=0,
         )
     )
+
+
+def _seed_archived_backlog(
+    session: Any,
+    tmp_path: Path,
+    *,
+    count: int,
+    artifactclass: str = "s-masters",
+) -> list[HdcacheFillTarget]:
+    source_root = tmp_path / "backlog-sources"
+    source_root.mkdir(parents=True, exist_ok=True)
+    backend = session.scalar(select(Backend).where(Backend.name == "mem"))
+    if backend is None:
+        backend = Backend(
+            name="mem",
+            kind=BackendKind.MEMORY,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        session.add(backend)
+        session.flush()
+    pool = session.get(Pool, "mem-pool")
+    if pool is None:
+        pool = Pool(
+            id="mem-pool",
+            backend_id=backend.id,
+            representation=Representation.RAW_BYTES.value,
+        )
+        session.add(pool)
+    if session.get(ArtifactClassPolicyRecord, artifactclass) is None:
+        session.add(
+            ArtifactClassPolicyRecord(
+                artifactclass=artifactclass,
+                ruleset="test.rules",
+                expect="messy",
+                target_bytes=1024,
+                max_age_seconds=3600,
+                restore_preference=["mem-pool"],
+                staging_config={},
+                hdcache_config={"enabled": True, "privacy_level": "none"},
+            )
+        )
+    if (
+        session.scalar(
+            select(ArtifactClassPool).where(
+                ArtifactClassPool.artifactclass == artifactclass,
+                ArtifactClassPool.pool_id == "mem-pool",
+            )
+        )
+        is None
+    ):
+        session.add(
+            ArtifactClassPool(
+                artifactclass=artifactclass,
+                pool_id="mem-pool",
+                active=True,
+                sort_order=0,
+            )
+        )
+    session.flush()
+
+    copies: list[tuple[Copy, bytes, str, int]] = []
+    targets: list[HdcacheFillTarget] = []
+    for index in range(count):
+        data = f"asset-{index}".encode("ascii")
+        digest = hashlib.sha256(data).digest()
+        source_path = source_root / f"{index}.mov"
+        source_path.write_bytes(data)
+        bundle_id = f"bundle-backlog-{index}"
+        session.add(LogicalAsset(content_sha256=digest, size_bytes=len(data)))
+        session.add(
+            Bundle(
+                id=bundle_id,
+                artifactclass=artifactclass,
+                status="sealed",
+                target_bytes=1024,
+                max_age_seconds=3600,
+            )
+        )
+        session.add(
+            BundleMember(
+                bundle_id=bundle_id,
+                logical_asset_hash=digest,
+                member_path=f"{digest.hex()}.mov",
+                source_path=str(source_path),
+                size_bytes=len(data),
+                file_sha256=digest,
+            )
+        )
+        copy = Copy(
+            bundle_id=bundle_id,
+            backend_id=backend.id,
+            pool_id="mem-pool",
+            native_locator={"hash_hex": digest.hex()},
+            native_locator_key=f'{{"hash_hex":"{digest.hex()}"}}',
+            storage_metadata={"representation": Representation.RAW_BYTES.value},
+            integrity_hash=digest,
+            health=CopyHealth.OK,
+            source=CopySource.INGEST,
+        )
+        session.add(copy)
+        copies.append((copy, digest, bundle_id, len(data)))
+        targets.append(
+            HdcacheFillTarget(
+                content_sha256=digest,
+                artifactclass=artifactclass,
+                size_bytes=len(data),
+                bundle_key=bundle_id,
+                group_key=f"{artifactclass}:test",
+                source_path=str(source_path),
+            )
+        )
+    session.flush()
+    for copy, digest, bundle_id, size_bytes in copies:
+        session.add(
+            AssetLocator(
+                logical_asset_hash=digest,
+                pool_id="mem-pool",
+                copy_id=copy.id,
+                bundle_id=bundle_id,
+                native_locator={
+                    "member_path": f"{digest.hex()}.mov",
+                    "offset": 0,
+                    "size_bytes": size_bytes,
+                },
+                member_path=f"{digest.hex()}.mov",
+                representation=Representation.RAW_BYTES.value,
+            )
+        )
+    session.flush()
+    return targets
 
 
 def _seed_archived_asset(

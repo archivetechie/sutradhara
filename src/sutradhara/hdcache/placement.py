@@ -77,10 +77,9 @@ class DiskState:
     def committed_bytes(self) -> int:
         """Bytes that placement must treat as already committed.
 
-        ``filled_bytes`` is the disk-row accounting. ``filling_bytes`` is an
-        additional reservation for live entries not already reflected there,
-        which lets catalog helpers count in-flight writes without double
-        counting if the disk row has already been reserved.
+        Catalog placement trusts ``cache_disk.filled_bytes``. Fill code updates
+        that disk-row counter at reservation time, so ``filling_bytes`` is only
+        an in-memory policy input used by direct policy callers/tests.
         """
 
         return max(0, self.filled_bytes) + max(0, self.filling_bytes)
@@ -273,16 +272,8 @@ def build_placement_context(
 
 
 def disk_states_from_catalog(session: Session) -> list[DiskState]:
-    """Return hdcache disk state with live entry bytes counted without double-counting."""
+    """Return hdcache disk state using the disk-row committed-byte counter."""
 
-    live_entry_bytes = {
-        str(disk_id): int(total or 0)
-        for disk_id, total in session.execute(
-            select(CacheEntry.disk_id, func.coalesce(func.sum(CacheEntry.size_bytes), 0))
-            .where(CacheEntry.state.in_(LIVE_ENTRY_STATES))
-            .group_by(CacheEntry.disk_id)
-        )
-    }
     rows = session.scalars(select(CacheDisk).order_by(CacheDisk.disk_id))
     return [
         DiskState(
@@ -290,7 +281,6 @@ def disk_states_from_catalog(session: Session) -> list[DiskState]:
             state=row.state,
             capacity_bytes=row.capacity_bytes,
             filled_bytes=row.filled_bytes,
-            filling_bytes=max(0, live_entry_bytes.get(row.disk_id, 0) - row.filled_bytes),
             enclosure=row.enclosure,
             slot=row.slot,
         )

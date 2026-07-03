@@ -66,6 +66,7 @@ HDCACHE_FILL_PRIORITY = 50
 MIGRATION_PRIORITY = 100
 DEFAULT_LIVE_JOB_CAP = 500
 DEFAULT_SCRATCH_ROOT = Path("/var/lib/replica/hdcache-scratch")
+ACCOUNTED_ENTRY_STATES = frozenset({"filling", "present"})
 
 
 class HdcacheFillError(RuntimeError):
@@ -479,8 +480,7 @@ def observe_target(
     disk = session.get(CacheDisk, entry.disk_id)
     if disk is None or disk.state != "active":
         if mutate:
-            entry.state = "lost"
-            session.flush([entry])
+            _release_entry_accounting(session, entry)
         return True, OBSERVED_MISSING
     if entry_policy_conformant(session, entry, key_registry=key_registry):
         return True, OBSERVED_PRESENT
@@ -572,13 +572,18 @@ def fill_target(
                 )
                 source_kind = source.kind
             entry.relpath = write_result.relpath
+            reserved_size = entry.size_bytes
             entry.size_bytes = write_result.size_bytes
             entry.state = "present"
             entry.representation = representation
             entry.key_epoch = None if epoch is None else epoch.key_id
             entry.stored_digest = write_result.stored_digest
             entry.trusted = True
-            disk.filled_bytes += write_result.size_bytes
+            _adjust_disk_committed_bytes(
+                session,
+                disk.disk_id,
+                write_result.size_bytes - reserved_size,
+            )
             session.flush([entry, disk])
             return HdcacheFillResult(
                 content_sha256=target.content_sha256,
@@ -592,12 +597,16 @@ def fill_target(
             )
         except OSError as exc:
             if not _is_enospc(exc):
+                _release_entry_accounting(session, entry)
                 raise
             last_enospc = exc
+            _release_entry_accounting(session, entry)
             _flag_disk_over_reserve(session, disk)
-            entry.state = "lost"
             session.flush([entry, disk])
             continue
+        except Exception:
+            _release_entry_accounting(session, entry)
+            raise
 
     detail = f"cache disk write ran out of space for {target.sha_hex}: {last_enospc}"
     raise HdcacheFillError(detail)
@@ -637,17 +646,15 @@ def mark_entry_lost_and_delete(session: Session, entry: CacheEntry) -> None:
     """Delete a nonconforming cache file and mark the row lost."""
 
     disk = session.get(CacheDisk, entry.disk_id)
-    deleted = False
     if disk is not None:
         with contextlib.suppress(OSError, StoreError):
-            deleted = delete_entry(
+            delete_entry(
                 Path(disk.mount),
                 entry.content_sha256,
                 representation=entry.representation,
                 key_epoch=entry.key_epoch,
             )
-    if deleted and disk is not None:
-        disk.filled_bytes = max(0, disk.filled_bytes - max(0, entry.size_bytes))
+    _release_entry_accounting(session, entry)
     entry.state = "lost"
     session.flush([obj for obj in (entry, disk) if obj is not None])
 
@@ -708,6 +715,9 @@ def _prepare_filling_entry(
     key_epoch: str | None,
 ) -> CacheEntry:
     existing = session.get(CacheEntry, target.content_sha256)
+    old_disk_id = None if existing is None else existing.disk_id
+    old_state = None if existing is None else existing.state
+    old_size = 0 if existing is None else existing.size_bytes
     disk_id = _usable_existing_disk(session, existing)
     if disk_id is None:
         try:
@@ -749,8 +759,70 @@ def _prepare_filling_entry(
         existing.key_epoch = key_epoch
         existing.stored_digest = None
         existing.trusted = True
+    _adjust_entry_accounting(
+        session,
+        old_disk_id=old_disk_id,
+        old_state=old_state,
+        old_size=old_size,
+        new_disk_id=disk_id,
+        new_state="filling",
+        new_size=stored_size_hint,
+    )
     session.flush([existing])
     return existing
+
+
+def _adjust_entry_accounting(
+    session: Session,
+    *,
+    old_disk_id: str | None,
+    old_state: str | None,
+    old_size: int,
+    new_disk_id: str | None,
+    new_state: str | None,
+    new_size: int,
+) -> None:
+    old_bytes = _accounted_entry_bytes(old_state, old_size)
+    new_bytes = _accounted_entry_bytes(new_state, new_size)
+    if old_disk_id == new_disk_id:
+        if old_disk_id is not None:
+            _adjust_disk_committed_bytes(session, old_disk_id, new_bytes - old_bytes)
+        return
+    if old_disk_id is not None and old_bytes:
+        _adjust_disk_committed_bytes(session, old_disk_id, -old_bytes)
+    if new_disk_id is not None and new_bytes:
+        _adjust_disk_committed_bytes(session, new_disk_id, new_bytes)
+
+
+def _release_entry_accounting(session: Session, entry: CacheEntry) -> None:
+    _adjust_entry_accounting(
+        session,
+        old_disk_id=entry.disk_id,
+        old_state=entry.state,
+        old_size=entry.size_bytes,
+        new_disk_id=entry.disk_id,
+        new_state="lost",
+        new_size=entry.size_bytes,
+    )
+    entry.state = "lost"
+    session.flush([entry])
+
+
+def _accounted_entry_bytes(state: str | None, size_bytes: int) -> int:
+    if state not in ACCOUNTED_ENTRY_STATES:
+        return 0
+    return max(0, size_bytes)
+
+
+def _adjust_disk_committed_bytes(session: Session, disk_id: str, delta: int) -> CacheDisk | None:
+    if delta == 0:
+        return session.get(CacheDisk, disk_id)
+    disk = session.get(CacheDisk, disk_id)
+    if disk is None:
+        return None
+    disk.filled_bytes = max(0, disk.filled_bytes + delta)
+    session.flush([disk])
+    return disk
 
 
 def _usable_existing_disk(session: Session, entry: CacheEntry | None) -> str | None:

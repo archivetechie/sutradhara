@@ -338,7 +338,7 @@ def test_enclosure_spread_is_optional_and_off_by_default() -> None:
     )
 
 
-def test_disk_states_from_catalog_counts_filling_bytes(engine: Engine) -> None:
+def test_disk_states_from_catalog_trusts_cache_disk_filled_bytes(engine: Engine) -> None:
     with session_scope(engine) as session:
         _seed_disks(session, 2, capacity_bytes=1000, filled_bytes=100)
         _record_entry(
@@ -358,8 +358,8 @@ def test_disk_states_from_catalog_counts_filling_bytes(engine: Engine) -> None:
         states = {state.disk_id: state for state in disk_states_from_catalog(session)}
 
     assert states["d001"].filled_bytes == 100
-    assert states["d001"].filling_bytes == 200
-    assert states["d001"].free_bytes == 700
+    assert states["d001"].filling_bytes == 0
+    assert states["d001"].free_bytes == 900
     assert states["d002"].free_bytes == 900
 
 

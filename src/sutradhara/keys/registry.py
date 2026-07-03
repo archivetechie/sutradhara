@@ -60,12 +60,17 @@ class KeyRegistry:
         *,
         purpose: str | None = None,
     ) -> KeyEpoch:
-        """Create or reactivate the deterministic development epoch for a key domain."""
+        """Create or return the active deterministic development epoch for a key domain."""
         if purpose is not None:
             domain = purpose
         domain = _validate_domain(domain)
         self._ensure_registry_dir()
-        key_id, root_key = _derive_test_epoch(domain)
+        existing = self._active_epoch_for_domain(domain)
+        if existing is not None:
+            return existing
+
+        generation = self._next_generation(domain)
+        key_id, root_key = _derive_test_epoch(domain, generation=generation)
         root_path = self._root_key_path(key_id)
         state_path = self._state_path(key_id)
 
@@ -79,6 +84,7 @@ class KeyRegistry:
         state = {
             "key_id": key_id,
             "domain": domain,
+            "generation": generation,
             "created_at": created_at,
             "active": True,
             "backend": "local-registry",
@@ -185,6 +191,36 @@ class KeyRegistry:
                 f"cannot protect key registry directory {self._registry_dir}"
             ) from exc
 
+    def _active_epoch_for_domain(self, domain: str) -> KeyEpoch | None:
+        for key_id, state in self._states_for_domain(domain):
+            if not bool(state.get("active", False)):
+                continue
+            if not self._root_key_path(key_id).exists():
+                continue
+            return KeyEpoch(
+                key_id=key_id,
+                created_at=str(state.get("created_at") or ""),
+                active=True,
+            )
+        return None
+
+    def _next_generation(self, domain: str) -> int:
+        generations = [
+            _state_generation(state)
+            for _key_id, state in self._states_for_domain(domain)
+        ]
+        return max(generations, default=-1) + 1
+
+    def _states_for_domain(self, domain: str) -> list[tuple[str, dict[str, Any]]]:
+        states: list[tuple[str, dict[str, Any]]] = []
+        for path in sorted(self._registry_dir.glob("*.json")):
+            key_id = path.stem
+            with contextlib.suppress(Exception):
+                state = self._read_state(key_id)
+                if state.get("domain") == domain:
+                    states.append((key_id, state))
+        return states
+
     def _root_key_path(self, key_id: str) -> Path:
         return self._registry_dir / f"{key_id}.root"
 
@@ -192,23 +228,48 @@ class KeyRegistry:
         return self._registry_dir / f"{key_id}.json"
 
 
-def _derive_test_epoch_for_domain(domain: str) -> tuple[str, bytes]:
+def _derive_test_epoch_for_domain(domain: str, *, generation: int = 0) -> tuple[str, bytes]:
+    if generation < 0:
+        raise ValueError("generation must be non-negative")
     if domain == KEY_DOMAIN_ARCHIVE:
-        key_id = hashlib.sha256(_TEST_SEED + b":key-id").digest()[:16].hex()
-        root_key = hashlib.sha256(_TEST_SEED + b":root-key").digest()
+        if generation == 0:
+            key_seed = _TEST_SEED + b":key-id"
+            root_seed = _TEST_SEED + b":root-key"
+        else:
+            generation_bytes = str(generation).encode("ascii")
+            key_seed = _TEST_SEED + b":archive:" + generation_bytes + b":key-id"
+            root_seed = _TEST_SEED + b":archive:" + generation_bytes + b":root-key"
+        key_id = hashlib.sha256(key_seed).digest()[:16].hex()
+        root_key = hashlib.sha256(root_seed).digest()
     else:
         domain_bytes = domain.encode("ascii")
-        key_suffix = hashlib.sha256(_TEST_SEED + b":" + domain_bytes + b":key-id")
+        generation_part = b"" if generation == 0 else b":" + str(generation).encode("ascii")
+        key_suffix = hashlib.sha256(
+            _TEST_SEED + b":" + domain_bytes + generation_part + b":key-id"
+        )
         key_id = f"{domain}-{key_suffix.digest()[:16].hex()}"
-        root_key = hashlib.sha256(_TEST_SEED + b":" + domain_bytes + b":root-key").digest()
+        root_key = hashlib.sha256(
+            _TEST_SEED + b":" + domain_bytes + generation_part + b":root-key"
+        ).digest()
     if key_id == "0" * 32 or key_id.endswith("-" + "0" * 32):
         raise RuntimeError("deterministic dev key_id must not be all zero")
     return key_id, root_key
 
 
-def _derive_test_epoch(domain: str = KEY_DOMAIN_ARCHIVE) -> tuple[str, bytes]:
+def _derive_test_epoch(
+    domain: str = KEY_DOMAIN_ARCHIVE,
+    *,
+    generation: int = 0,
+) -> tuple[str, bytes]:
     domain = _validate_domain(domain)
-    return _derive_test_epoch_for_domain(domain)
+    return _derive_test_epoch_for_domain(domain, generation=generation)
+
+
+def _state_generation(state: dict[str, Any]) -> int:
+    raw = state.get("generation", 0)
+    if isinstance(raw, int) and raw >= 0:
+        return raw
+    return 0
 
 
 def key_domain(key_id: str) -> str:
