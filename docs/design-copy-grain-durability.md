@@ -1,6 +1,6 @@
 # Design — copy-grain unification + durability enforcement (v2, panel-folded)
 
-**Status:** design, folded after panel — verify round pending (2026-07-03).
+**Status:** design, panel-folded + verify-r1 findings folded — verify r2 pending (2026-07-03).
 v1 was panel-reviewed same day per `~/system/docs/process-panel-review.md`:
 4 blind lenses (migration/compat, failure/durability, simplicity/cost — Opus;
 contract/code-reality — codex xhigh), ~36 findings, 8 blockers. All folded here;
@@ -65,15 +65,22 @@ representation, unvalidated `restore_preference`, hardcoded class names).
 
 New `sutradhara/durability.py`:
 
-- `qualifying_copies(session, target, pool_id, *, require_verified: bool,
-  artifactclass: str | None)` where `target = AssetTarget(hash) |
-  BundleTarget(bundle_id)`. This is a NEW target-typed predicate — not a lift
-  of retention's (which is asset-hash-shaped and verified-only) and not of
-  replication's (asset-only, unverified). The **`require_verified` axis is
-  explicit and semantics-preserving**: `replication_status`/fan-out
-  completeness pass `False` (a fresh unscubbed copy still counts — no
-  behavioral drift in J/N/O/Q), the retention delete-gate passes `True`
-  (deletion still demands ever-verified), per `design-deletion-gate.md`.
+- Two views with an explicit **grain axis** (verify r1: `require_verified`
+  alone does not encode the current grain split — retention counts asset
+  Copies PLUS bundle copies via `AssetLocator`, while
+  `select_restore_source`/`restore_copy` operate on asset-grain Copy rows only
+  and `restore_copy` rejects bundle copies):
+  - `durable_placements(session, target, *, require_verified: bool,
+    artifactclass: str | None)` — the durability-accounting view: for an
+    `AssetTarget`, asset-scoped Copies UNION bundle copies reachable via
+    `AssetLocator`; for a `BundleTarget`, bundle copies. Used by
+    `replication_status` (require_verified=False — a fresh unscubbed copy
+    still counts, no J/N/O/Q drift), retention (True), floor checks.
+  - `direct_copies(session, asset_hash)` — asset-grain Copy rows only: what
+    today's `restore_copy`/self-heal can physically operate on. Self-heal
+    keeps this view (bundle healing is M2's `bundle-repair`, not `self_heal`).
+  The `require_verified` axis is semantics-preserving per caller, per
+  `design-deletion-gate.md`.
 - `placement_status(session, target)` — want (via `target_pools`) vs have
   (via the predicate), returning `PoolTarget`-shaped entries (the harness seam
   getattr-maps `.pool_id/.backend_name/...`; shape is a compat invariant).
@@ -93,15 +100,20 @@ New `sutradhara/durability.py`:
   member_sources) -> Copy` that builds, verifies, and records ONE pool's
   bundle copy — including the per-pool `AssetLocator` + `BlobRoot` rows flush
   creates — with **no bundle lifecycle mutation, no conformance gate, no
-  customer-manifest emission**. `flush_bundle` refuses non-open bundles and
-  owns lifecycle; repair must not go through it.
+  customer-manifest emission, and NO `ExclusionRecord` writes** (verify r1:
+  the natural extraction point `_record_build_outputs` also records
+  exclusions — split that; exclusion recording stays in `flush_bundle` only,
+  or every repair would replay exclusion rows). `flush_bundle` refuses
+  non-open bundles and owns lifecycle; repair must not go through it.
 - **Member sources = stored member bytes extracted from a healthy copy** into
   scratch. NEVER `member.source_path` (retention purges staging at ~30 days —
   v1's wording made self-heal silently work for only the first month) and
   NEVER re-staging from logical bytes (AppleDouble merge is irreversible;
   zstd output is compressor-version-dependent). All pools store the same
   staged member bytes in different containers/sealing, so extraction from any
-  healthy copy reproduces them exactly.
+  healthy copy reproduces them exactly. Scratch layout (verify r1): each
+  member extracts to `scratch/<member.member_path>` so the builder's
+  `MemberInput` root derivation works unchanged.
 - New reconciler domain `bundle_copy` (P0.3's named next domain):
   - `discover`: sealed bundles × the class's write-eligible pools.
   - `observe`: **placement complete AND durability floor satisfied** —
@@ -109,12 +121,20 @@ New `sutradhara/durability.py`:
     (D2). This makes drain-below-floor and family-collapse — states with no
     missing pool copy — visible as open conditions, without inventing a third
     sweep mechanism.
+  - **Batched, not N+1** (verify r1): per cursor batch, prefetch class floors
+    + pool→family maps once and aggregate realized copies with a single
+    GROUP-BY-bundle query; observe consumes the batch aggregate. No per-bundle
+    copy scan at 100k bundles.
   - `reconcile_target`: enqueue a `bundle-repair` job (source via D4
     `self_heal` purpose, with fallback + suspect-marking).
 - **Scrub adoption fix:** `scrub_backend`'s unknown-object insert classifies:
   enumerated logical id matches a `Bundle.archive_id` → `add_bundle_copy`;
   matches a `LogicalAsset` → `add_copy` (asset grain remains legal); matches
   neither → a quarantine entry in the scrub report, never an invented row.
+  Prerequisites (verify r1): a **partial unique index on non-null
+  `Bundle.archive_id`** and a seal-time assertion that sealed bundles carry a
+  non-null `archive_id` (backfill any sealed rows missing it in the same
+  migration) — today the column is nullable, unindexed, and unenforced.
 
 ### D2 — Declared durability floor, enforced where it can be
 
@@ -133,20 +153,25 @@ New `sutradhara/durability.py`:
   write-fence change (D3's drain guard): flipping `accepts_writes=False` is
   REFUSED (or `--force`d with a loud alarm) if it would drop any active class
   below its floor without a complete replacement pool.
-- **EP2 — write time, post-commit, classified:** after the fan-out
-  transaction commits (the assertion cannot live inside it — `session_scope`
-  rolls back and would un-record real copies), a separate transaction checks
-  the realized copies: distinct media via a **per-family identity extractor**
-  (tape → `tape_uuid`, d2 → `volume_uuid`/barcode, ssh_disk → host+fs
-  identity, s3 → bucket, memory → exempt) — v1's plan to reuse
-  `_assert_distinct_media` verbatim would have made every non-tape pool
-  (including the LAN backup) unwritable — plus realized family count vs the
-  floor. Deficiency is routed through the condition vocabulary, not a bare
-  raise: transient backend failure → `backoff` condition (bounded retry);
-  structural floor violation → `blocked` condition + operator alarm, **no
-  hot-retry** (a structurally failing target must not manufacture duplicate
-  copies each attempt). Ongoing floor drift is caught level-triggered by
-  M2's observe.
+- **EP2 — write time, crash-safe via the condition machinery:** the fan-out
+  transaction itself writes/updates the target's `bundle_copy` condition row
+  (open, reason `durability-unverified`) **in the same transaction as the
+  copies** — a durable outbox (verify r1: a check scheduled only after commit
+  is lost if the process dies between commit and check). The immediate
+  post-commit check is the fast path that resolves the condition right away;
+  if it never runs, M2's level-triggered observe performs the identical check
+  on the next sweep. The check: distinct media via a **per-family identity
+  extractor** — tape → locator `tape_uuid`, d2 → `volume_uuid`/barcode;
+  disk/cloud families (ssh_disk, s3, …) identify by **backend row** (the
+  backend IS the host/filesystem/bucket; locators carry no media fields today
+  and need none — two copies on one ssh_disk backend = same media);
+  memory → exempt. v1's plan to reuse `_assert_distinct_media` verbatim would
+  have made every non-tape pool (including the LAN backup) unwritable. Plus
+  realized family count vs the floor. Deficiency classifies through the
+  condition vocabulary, not a bare raise: transient backend failure →
+  `backoff` (bounded retry); structural floor violation → `blocked` +
+  operator alarm, **no hot-retry** (a structurally failing target must not
+  manufacture duplicate copies each attempt).
 
 ### D3 — Pool lifecycle (slim)
 
@@ -221,7 +246,9 @@ future janitor, explicitly out of scope here.
 `pool.accepts_writes` (bool, default true), `pool.retired` (bool, default
 false, guarded), `pool.media_generation` (nullable); FK RESTRICT ×2 (batch
 recreate, constraints re-declared); `artifactclass_policy` durability columns
-+ `[durability]` in the strict parser. NO Copy/XOR changes. NO backfill.
++ `[durability]` in the strict parser; **partial unique index on non-null
+`bundle.archive_id`** + seal-time non-null assertion (+ backfill of any
+sealed rows missing it). NO Copy/XOR changes. NO grain backfill.
 
 ## 4. Verification members (scenario-or-cover; failure legs are the point)
 
