@@ -13,14 +13,17 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import re
 import tempfile
 import threading
 from functools import partial
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import UUID
 
 import anyio
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -44,6 +47,8 @@ from sutradhara.grpc.status import intake_status
 
 router = APIRouter()
 LOG = logging.getLogger(__name__)
+BUNDLE_FORMAT = "sutra-enroll-bundle-v1"
+DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 class DeviceReceiveRequest(BaseModel):
@@ -345,7 +350,112 @@ def get_intake_status(intake_id: str, request: Request) -> dict[str, object]:
 def post_enroll_token(request: Request, body: EnrollTokenRequest) -> dict[str, str]:
     """Mint a one-time operator-scoped, device-bound enrollment token."""
 
+    token, expires = mint_enroll_token(request, body)
+    return {"token": token, "deviceId": body.device_id, "expiresAt": expires.isoformat()}
+
+
+@router.post("/api/enroll/bundle")
+def post_enroll_bundle(request: Request, body: EnrollTokenRequest) -> Response:
+    """Mint and package a downloadable enrollment bundle."""
+
     identity = _require_receive(parse_identity(request.headers))
+    config = _agent_bundle_config_or_503(request)
+    token, expires = mint_enroll_token(request, body, identity=identity)
+    bundle: dict[str, object] = {
+        "format": BUNDLE_FORMAT,
+        "device_id": body.device_id,
+        "enroll_url": config.enroll_url,
+        "enroll_ca_pem": config.enroll_ca_pem,
+        "token": token,
+        "expires_at": expires.isoformat(),
+        "endpoints": [
+            {
+                "address": endpoint.address,
+                **(
+                    {"server_name": endpoint.server_name}
+                    if endpoint.server_name is not None
+                    else {}
+                ),
+            }
+            for endpoint in config.endpoints
+        ],
+    }
+    if config.console_url is not None:
+        bundle["console_url"] = config.console_url
+    response = Response(content=json.dumps(bundle), media_type="application/json; charset=utf-8")
+    response.headers["Content-Disposition"] = f'attachment; filename="{body.device_id}.sutra-enroll"'
+    response.headers["Cache-Control"] = "no-store, private"
+    return response
+
+
+@router.post("/api/enroll/csr")
+def post_enroll_csr(request: Request, body: EnrollCsrRequest) -> dict[str, str]:
+    """Redeem a token from a helper and return a signed device certificate."""
+
+    client = request.client.host if request.client else "unknown"
+    if not request.app.state.enroll_csr_limiter.allow(client):
+        _raise(429, "rate_limited", "too many enrollment attempts")
+
+    pki_dir = Path(request.app.state.grpc_pki_dir)
+    with tempfile.TemporaryDirectory(prefix="sutra-enroll-") as temp:
+        root = Path(temp)
+        csr_path = root / "device.csr"
+        cert_path = root / "device.crt"
+        csr_path.write_text(body.csr_pem, encoding="utf-8")
+        try:
+            signed = grpc_ca.sign_device_csr(
+                request.app.state.engine,
+                pki_dir=pki_dir,
+                csr_path=csr_path,
+                token=body.token,
+                cert_path=cert_path,
+            )
+        except grpc_ca.DeviceOwnershipCertificateError as exc:
+            _raise(409, "device_other_operator", str(exc))
+        except grpc_ca.DeviceRotationProofCertificateError as exc:
+            _raise(409, "old_key_proof_required", str(exc))
+        except grpc_ca.CertificateError as exc:
+            _raise(400, "bad_enrollment", str(exc))
+        except ValueError as exc:
+            _raise(400, "bad_enrollment", str(exc))
+        evicted = _registry(request).evict(
+            signed.device_id,
+            reason=StreamClosed("device certificate rotated"),
+        )
+        if evicted:
+            LOG.info("evicted live device stream after certificate rotation: %s", signed.device_id)
+        ca_pem = (pki_dir / grpc_ca.CA_CERT_NAME).read_text(encoding="utf-8")
+        cert_pem = signed.cert_path.read_text(encoding="utf-8")
+    return {"cert_pem": cert_pem, "ca_pem": ca_pem}
+
+
+def install_default_state(app: object) -> None:
+    """Install swappable operator-console relay dependencies."""
+
+    app.state.registry = getattr(app.state, "registry", ConnectedDeviceRegistry())
+    app.state.command_ack_timeout = 5.0
+    app.state.directory_listing_timeout = 5.0
+    app.state.enroll_token_ttl = dt.timedelta(hours=24)
+    app.state.enroll_csr_limiter = SimpleRateLimiter()
+    app.state.grpc_pki_dir = getattr(app.state, "grpc_pki_dir", grpc_ca.DEFAULT_PKI_DIR)
+    app.state.agent_bundle = getattr(app.state, "agent_bundle", None)
+
+
+def _registry(request: Request) -> ConnectedDeviceRegistry:
+    return request.app.state.registry
+
+
+def mint_enroll_token(
+    request: Request,
+    body: EnrollTokenRequest,
+    *,
+    identity: Identity | None = None,
+) -> tuple[str, dt.datetime]:
+    """Apply the shared enroll-token mint guard and return ``(token, expires_at)``."""
+
+    if identity is None:
+        identity = _require_receive(parse_identity(request.headers))
+    _validate_device_id(body.device_id)
     factory = make_session_factory(request.app.state.engine)
     ttl = request.app.state.enroll_token_ttl
     with factory.begin() as session:
@@ -411,63 +521,7 @@ def post_enroll_token(request: Request, body: EnrollTokenRequest) -> dict[str, s
             rotation_fingerprint=rotation_fingerprint,
         )
     expires = dt.datetime.now(dt.UTC) + ttl
-    return {"token": token, "deviceId": body.device_id, "expiresAt": expires.isoformat()}
-
-
-@router.post("/api/enroll/csr")
-def post_enroll_csr(request: Request, body: EnrollCsrRequest) -> dict[str, str]:
-    """Redeem a token from a helper and return a signed device certificate."""
-
-    client = request.client.host if request.client else "unknown"
-    if not request.app.state.enroll_csr_limiter.allow(client):
-        _raise(429, "rate_limited", "too many enrollment attempts")
-
-    pki_dir = Path(request.app.state.grpc_pki_dir)
-    with tempfile.TemporaryDirectory(prefix="sutra-enroll-") as temp:
-        root = Path(temp)
-        csr_path = root / "device.csr"
-        cert_path = root / "device.crt"
-        csr_path.write_text(body.csr_pem, encoding="utf-8")
-        try:
-            signed = grpc_ca.sign_device_csr(
-                request.app.state.engine,
-                pki_dir=pki_dir,
-                csr_path=csr_path,
-                token=body.token,
-                cert_path=cert_path,
-            )
-        except grpc_ca.DeviceOwnershipCertificateError as exc:
-            _raise(409, "device_other_operator", str(exc))
-        except grpc_ca.DeviceRotationProofCertificateError as exc:
-            _raise(409, "old_key_proof_required", str(exc))
-        except grpc_ca.CertificateError as exc:
-            _raise(400, "bad_enrollment", str(exc))
-        except ValueError as exc:
-            _raise(400, "bad_enrollment", str(exc))
-        evicted = _registry(request).evict(
-            signed.device_id,
-            reason=StreamClosed("device certificate rotated"),
-        )
-        if evicted:
-            LOG.info("evicted live device stream after certificate rotation: %s", signed.device_id)
-        ca_pem = (pki_dir / grpc_ca.CA_CERT_NAME).read_text(encoding="utf-8")
-        cert_pem = signed.cert_path.read_text(encoding="utf-8")
-    return {"cert_pem": cert_pem, "ca_pem": ca_pem}
-
-
-def install_default_state(app: object) -> None:
-    """Install swappable operator-console relay dependencies."""
-
-    app.state.registry = getattr(app.state, "registry", ConnectedDeviceRegistry())
-    app.state.command_ack_timeout = 5.0
-    app.state.directory_listing_timeout = 5.0
-    app.state.enroll_token_ttl = dt.timedelta(hours=24)
-    app.state.enroll_csr_limiter = SimpleRateLimiter()
-    app.state.grpc_pki_dir = getattr(app.state, "grpc_pki_dir", grpc_ca.DEFAULT_PKI_DIR)
-
-
-def _registry(request: Request) -> ConnectedDeviceRegistry:
-    return request.app.state.registry
+    return token, expires
 
 
 def _require_view(identity: Identity) -> Identity:
@@ -488,6 +542,97 @@ def _require_admin(identity: Identity) -> Identity:
     if not identity.has_capability("can_admin"):
         _raise(403, "forbidden", "your group doesn't permit this")
     return identity
+
+
+def _validate_device_id(device_id: str) -> None:
+    if not DEVICE_ID_PATTERN.fullmatch(device_id) or device_id in {".", ".."}:
+        _raise(
+            400,
+            "invalid_device_id",
+            "device_id must match ^[A-Za-z0-9._-]{1,128}$",
+        )
+
+
+class _AgentBundleEndpoint(BaseModel):
+    address: str
+    server_name: str | None = None
+
+
+class _AgentBundleConfig(BaseModel):
+    endpoints: list[_AgentBundleEndpoint]
+    enroll_url: str
+    enroll_ca_pem: str
+    console_url: str | None = None
+
+
+def _agent_bundle_config_or_503(request: Request) -> _AgentBundleConfig:
+    raw = getattr(request.app.state, "agent_bundle", None)
+    if raw is None:
+        _raise(503, "bundle_not_configured", "enrollment bundle config is incomplete")
+    try:
+        endpoints = _agent_bundle_endpoints(raw)
+        enroll_url = _agent_bundle_https_url(raw, "enroll_url")
+        enroll_ca_path = _agent_bundle_path(raw, "enroll_ca_path")
+        console_url = _agent_bundle_text(raw, "console_url")
+    except (KeyError, TypeError, ValueError):
+        _raise(503, "bundle_not_configured", "enrollment bundle config is incomplete")
+    if not endpoints or enroll_url is None or enroll_ca_path is None:
+        _raise(503, "bundle_not_configured", "enrollment bundle config is incomplete")
+    try:
+        enroll_ca_pem = enroll_ca_path.read_text(encoding="utf-8")
+        return _AgentBundleConfig(
+            endpoints=endpoints,
+            enroll_url=enroll_url,
+            enroll_ca_pem=enroll_ca_pem,
+            console_url=console_url,
+        )
+    except (OSError, ValueError):
+        _raise(503, "bundle_not_configured", "enrollment bundle config is incomplete")
+
+
+def _agent_bundle_endpoints(raw: object) -> list[_AgentBundleEndpoint]:
+    endpoints_raw = _agent_bundle_value(raw, "endpoints")
+    if not isinstance(endpoints_raw, list):
+        raise TypeError("endpoints must be a list")
+    endpoints: list[_AgentBundleEndpoint] = []
+    for item in endpoints_raw:
+        address = _agent_bundle_text(item, "address")
+        if address is None:
+            raise ValueError("endpoint address missing")
+        server_name = _agent_bundle_text(item, "server_name")
+        endpoints.append(_AgentBundleEndpoint(address=address, server_name=server_name))
+    return endpoints
+
+
+def _agent_bundle_path(raw: object, key: str) -> Path | None:
+    value = _agent_bundle_value(raw, key)
+    if value is None:
+        return None
+    return Path(str(value))
+
+
+def _agent_bundle_https_url(raw: object, key: str) -> str | None:
+    text = _agent_bundle_text(raw, key)
+    if text is None:
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError(f"{key} must be an absolute https URL")
+    return text
+
+
+def _agent_bundle_text(raw: object, key: str) -> str | None:
+    value = _agent_bundle_value(raw, key)
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _agent_bundle_value(raw: object, key: str) -> object | None:
+    if isinstance(raw, dict):
+        return raw.get(key)
+    return getattr(raw, key, None)
 
 
 def _validate_receive_start(

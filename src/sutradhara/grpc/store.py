@@ -264,6 +264,15 @@ def issue_enroll_token(
     normalized_rotation_fingerprint = (
         normalize_fingerprint(rotation_fingerprint) if rotation_fingerprint is not None else None
     )
+    prior_tokens = session.scalars(
+        select(GrpcEnrollToken).where(
+            GrpcEnrollToken.operator == operator,
+            GrpcEnrollToken.device_id == device_id,
+            GrpcEnrollToken.used_at.is_(None),
+        )
+    )
+    for prior_token in prior_tokens:
+        prior_token.used_at = now
     session.add(
         GrpcEnrollToken(
             token=token,
