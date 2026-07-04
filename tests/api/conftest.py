@@ -23,6 +23,11 @@ def api_engine(tmp_path: Path) -> Iterator[Engine]:
     engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def clear_agent_bundle_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SUTRA_AGENT_BUNDLE_CONFIG", raising=False)
+
+
 def make_api_app(engine: Engine):
     app = create_app(engine, ensure_schema=False)
     app.state.idempotency_wait_seconds = 2.0

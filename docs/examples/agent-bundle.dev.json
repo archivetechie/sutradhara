@@ -1,0 +1,10 @@
+{
+  "endpoints": [
+    {
+      "address": "https://127.0.0.1:50051"
+    }
+  ],
+  "enroll_url": "https://system-ui.dvarapala.internal/api/enroll/csr",
+  "enroll_ca_path": "/home/user/dvarapala/enroll-ca.crt",
+  "console_url": "https://system-ui.dvarapala.internal/"
+}

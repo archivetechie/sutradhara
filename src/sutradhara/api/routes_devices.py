@@ -383,7 +383,9 @@ def post_enroll_bundle(request: Request, body: EnrollTokenRequest) -> Response:
     if config.console_url is not None:
         bundle["console_url"] = config.console_url
     response = Response(content=json.dumps(bundle), media_type="application/json; charset=utf-8")
-    response.headers["Content-Disposition"] = f'attachment; filename="{body.device_id}.sutra-enroll"'
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="{body.device_id}.sutra-enroll"'
+    )
     response.headers["Cache-Control"] = "no-store, private"
     return response
 
@@ -565,28 +567,41 @@ class _AgentBundleConfig(BaseModel):
     console_url: str | None = None
 
 
-def _agent_bundle_config_or_503(request: Request) -> _AgentBundleConfig:
-    raw = getattr(request.app.state, "agent_bundle", None)
+class AgentBundleConfigError(ValueError):
+    """The configured enrollment bundle source is incomplete or invalid."""
+
+
+def parse_agent_bundle_config(raw: object) -> _AgentBundleConfig:
+    """Validate an enrollment bundle config and read the configured enrollment CA."""
+
     if raw is None:
-        _raise(503, "bundle_not_configured", "enrollment bundle config is incomplete")
+        raise AgentBundleConfigError("agent bundle config is missing")
     try:
         endpoints = _agent_bundle_endpoints(raw)
         enroll_url = _agent_bundle_https_url(raw, "enroll_url")
         enroll_ca_path = _agent_bundle_path(raw, "enroll_ca_path")
         console_url = _agent_bundle_text(raw, "console_url")
-    except (KeyError, TypeError, ValueError):
-        _raise(503, "bundle_not_configured", "enrollment bundle config is incomplete")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AgentBundleConfigError("agent bundle config is incomplete") from exc
     if not endpoints or enroll_url is None or enroll_ca_path is None:
-        _raise(503, "bundle_not_configured", "enrollment bundle config is incomplete")
+        raise AgentBundleConfigError("agent bundle config is incomplete")
     try:
         enroll_ca_pem = enroll_ca_path.read_text(encoding="utf-8")
-        return _AgentBundleConfig(
-            endpoints=endpoints,
-            enroll_url=enroll_url,
-            enroll_ca_pem=enroll_ca_pem,
-            console_url=console_url,
-        )
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        raise AgentBundleConfigError(f"enroll_ca_path is unreadable: {enroll_ca_path}") from exc
+    return _AgentBundleConfig(
+        endpoints=endpoints,
+        enroll_url=enroll_url,
+        enroll_ca_pem=enroll_ca_pem,
+        console_url=console_url,
+    )
+
+
+def _agent_bundle_config_or_503(request: Request) -> _AgentBundleConfig:
+    raw = getattr(request.app.state, "agent_bundle", None)
+    try:
+        return parse_agent_bundle_config(raw)
+    except AgentBundleConfigError:
         _raise(503, "bundle_not_configured", "enrollment bundle config is incomplete")
 
 
@@ -702,7 +717,9 @@ def _device_payload(device: object) -> dict[str, object]:
     }
 
 
-def _receive_payloads_for_operator(engine: object, operator_username: str) -> list[dict[str, str | None]]:
+def _receive_payloads_for_operator(
+    engine: object, operator_username: str
+) -> list[dict[str, str | None]]:
     factory = make_session_factory(engine)
     with factory() as session:
         rows = list(

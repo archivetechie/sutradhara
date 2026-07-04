@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -14,7 +15,6 @@ from sutradhara.grpc import ca, store
 from sutradhara.grpc.registry import ConnectedDeviceRegistry
 from sutradhara.grpc.store import DeviceIdentity
 from tests.api.conftest import make_api_app, post_headers
-
 
 ENROLL_URL = "https://system-ui.dvarapala.internal/api/enroll/csr"
 CONSOLE_URL = "https://system-ui.dvarapala.internal/"
@@ -47,6 +47,12 @@ def _configure_agent_bundle(app: object, tmp_path: Path, **overrides: object) ->
     app.state.grpc_pki_dir = pki_dir
     app.state.agent_bundle = _agent_bundle_config(ca_cert, **overrides)
     return ca_cert
+
+
+def _write_agent_bundle_config(config_path: Path, ca_cert: Path, **overrides: object) -> None:
+    config = _agent_bundle_config(ca_cert, **overrides)
+    config["enroll_ca_path"] = str(config["enroll_ca_path"])
+    config_path.write_text(json.dumps(config), encoding="utf-8")
 
 
 def _enroll_token_count(engine: Engine) -> int:
@@ -311,6 +317,35 @@ def test_enroll_bundle_returns_downloadable_bundle_and_redeemable_token(
     assert "BEGIN CERTIFICATE" in signed.json()["cert_pem"]
 
 
+def test_enroll_bundle_loads_agent_bundle_from_env(
+    api_engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ca_cert, _ = ca.ensure_ca(tmp_path / "pki")
+    config_path = tmp_path / "agent-bundle.json"
+    _write_agent_bundle_config(config_path, ca_cert)
+    monkeypatch.setenv("SUTRA_AGENT_BUNDLE_CONFIG", str(config_path))
+    client = TestClient(make_api_app(api_engine), base_url="https://testserver")
+
+    response = client.post(
+        "/api/enroll/bundle",
+        headers=post_headers("operator"),
+        json={"device_id": "mac-1"},
+    )
+
+    assert response.status_code == 200
+    bundle = response.json()
+    assert bundle["enroll_url"] == ENROLL_URL
+    assert bundle["enroll_ca_pem"] == ca_cert.read_text(encoding="utf-8")
+    assert bundle["endpoints"] == [
+        {
+            "address": "https://sutradhara.archive.lan:50051",
+            "server_name": "sutradhara.archive.lan",
+        }
+    ]
+
+
 def test_enroll_bundle_returns_503_when_unconfigured(api_engine: Engine) -> None:
     client = TestClient(make_api_app(api_engine), base_url="https://testserver")
 
@@ -323,6 +358,52 @@ def test_enroll_bundle_returns_503_when_unconfigured(api_engine: Engine) -> None
     assert response.status_code == 503
     assert response.json()["error"] == "bundle_not_configured"
     assert _enroll_token_count(api_engine) == 0
+
+
+def test_enroll_bundle_invalid_json_env_config_raises_at_startup(
+    api_engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "agent-bundle.json"
+    config_path.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setenv("SUTRA_AGENT_BUNDLE_CONFIG", str(config_path))
+
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        make_api_app(api_engine)
+
+
+def test_enroll_bundle_malformed_env_config_raises_at_startup(
+    api_engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ca_cert, _ = ca.ensure_ca(tmp_path / "pki")
+    config_path = tmp_path / "agent-bundle.json"
+    _write_agent_bundle_config(
+        config_path,
+        ca_cert,
+        enroll_url="http://system-ui.dvarapala.internal/api/enroll/csr",
+    )
+    monkeypatch.setenv("SUTRA_AGENT_BUNDLE_CONFIG", str(config_path))
+
+    with pytest.raises(RuntimeError, match="invalid SUTRA_AGENT_BUNDLE_CONFIG"):
+        make_api_app(api_engine)
+
+
+def test_enroll_bundle_unreadable_env_ca_path_raises_at_startup(
+    api_engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ca_cert, _ = ca.ensure_ca(tmp_path / "pki")
+    config_path = tmp_path / "agent-bundle.json"
+    unreadable_ca = ca_cert.parent
+    _write_agent_bundle_config(config_path, ca_cert, enroll_ca_path=unreadable_ca)
+    monkeypatch.setenv("SUTRA_AGENT_BUNDLE_CONFIG", str(config_path))
+
+    with pytest.raises(RuntimeError, match="enroll_ca_path is unreadable"):
+        make_api_app(api_engine)
 
 
 @pytest.mark.parametrize(
@@ -682,11 +763,14 @@ def test_enroll_csr_with_old_key_proof_rotates_and_evicts_live_stream(
     with session_scope(api_engine) as session:
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="AA" * 32)
-        assert store.resolve_device(
-            session,
-            device_id="mac-1",
-            cert_fingerprint=new_fingerprint,
-        ).operator == "owner"
+        assert (
+            store.resolve_device(
+                session,
+                device_id="mac-1",
+                cert_fingerprint=new_fingerprint,
+            ).operator
+            == "owner"
+        )
 
 
 def test_revoke_device_can_evict_live_registry_stream(api_engine: Engine) -> None:

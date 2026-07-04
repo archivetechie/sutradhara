@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
@@ -10,6 +14,7 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import Engine
 
 from sutradhara.api.routes_activity import router as activity_router
+from sutradhara.api.routes_devices import AgentBundleConfigError, parse_agent_bundle_config
 from sutradhara.api.routes_devices import install_default_state as install_device_state
 from sutradhara.api.routes_devices import router as devices_router
 from sutradhara.api.routes_intake_archive import router as intake_archive_router
@@ -21,8 +26,10 @@ from sutradhara.api.routes_restore import router as restore_router
 from sutradhara.api.routes_session import router as session_router
 from sutradhara.catalog.session import create_all, make_engine
 
+AGENT_BUNDLE_CONFIG_ENV = "SUTRA_AGENT_BUNDLE_CONFIG"
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 ORIGIN_GUARD_EXEMPT_PATHS = {"/api/enroll/csr"}
+LOG = logging.getLogger(__name__)
 
 
 def create_app(
@@ -43,6 +50,9 @@ def create_app(
         app.state.registry = registry
     if grpc_pki_dir is not None:
         app.state.grpc_pki_dir = grpc_pki_dir
+    agent_bundle = _load_agent_bundle_config_from_env()
+    if agent_bundle is not None:
+        app.state.agent_bundle = agent_bundle
     install_default_state(app)
     install_device_state(app)
 
@@ -96,6 +106,46 @@ def create_app(
     app.include_router(intake_archive_router)
     app.include_router(library_router)
     return app
+
+
+def _load_agent_bundle_config_from_env() -> dict[str, object] | None:
+    """Load and validate the optional enrollment-bundle deployment config."""
+
+    config_path_text = os.environ.get(AGENT_BUNDLE_CONFIG_ENV)
+    if not config_path_text:
+        LOG.warning(
+            "%s is unset; POST /api/enroll/bundle will return bundle_not_configured",
+            AGENT_BUNDLE_CONFIG_ENV,
+        )
+        return None
+    config_path = Path(config_path_text).expanduser()
+    if not config_path.exists():
+        LOG.warning(
+            "%s points to missing file %s; POST /api/enroll/bundle will return "
+            "bundle_not_configured",
+            AGENT_BUNDLE_CONFIG_ENV,
+            config_path,
+        )
+        return None
+    if not config_path.is_file():
+        raise RuntimeError(f"{AGENT_BUNDLE_CONFIG_ENV} path is not a file: {config_path}")
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"invalid JSON in {AGENT_BUNDLE_CONFIG_ENV} {config_path}: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not read {AGENT_BUNDLE_CONFIG_ENV} {config_path}: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"{AGENT_BUNDLE_CONFIG_ENV} {config_path} must contain a JSON object")
+    try:
+        parse_agent_bundle_config(raw)
+    except AgentBundleConfigError as exc:
+        raise RuntimeError(f"invalid {AGENT_BUNDLE_CONFIG_ENV} {config_path}: {exc}") from exc
+    return raw
 
 
 def _same_origin(origin: str, host: str) -> bool:
