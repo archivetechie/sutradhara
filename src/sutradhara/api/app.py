@@ -12,6 +12,7 @@ from sqlalchemy import Engine
 from sutradhara.api.routes_activity import router as activity_router
 from sutradhara.api.routes_devices import install_default_state as install_device_state
 from sutradhara.api.routes_devices import router as devices_router
+from sutradhara.api.routes_intake_archive import router as intake_archive_router
 from sutradhara.api.routes_jobs import router as jobs_router
 from sutradhara.api.routes_receive import install_default_state
 from sutradhara.api.routes_receive import router as receive_router
@@ -65,12 +66,7 @@ def create_app(
     async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
         detail = exc.detail
         if (
-            (
-                request.url.path.startswith("/api/ui/restore")
-                or request.url.path == "/api/ui/reconciliation"
-                or request.url.path.startswith("/api/ui/jobs")
-                or request.url.path == "/api/ui/resources"
-            )
+            _uses_nested_ui_envelope(request.url.path)
             and isinstance(detail, dict)
             and {"error", "detail"} <= set(detail)
         ):
@@ -96,6 +92,7 @@ def create_app(
     app.include_router(activity_router)
     app.include_router(restore_router)
     app.include_router(jobs_router)
+    app.include_router(intake_archive_router)
     return app
 
 
@@ -104,6 +101,18 @@ def _same_origin(origin: str, host: str) -> bool:
     if parsed.scheme not in {"http", "https"}:
         return False
     return parsed.netloc.lower() == host.lower()
+
+
+def _uses_nested_ui_envelope(path: str) -> bool:
+    return (
+        path.startswith("/api/ui/restore")
+        or path == "/api/ui/reconciliation"
+        or path.startswith("/api/ui/jobs")
+        or path == "/api/ui/resources"
+        or path.startswith("/api/ui/intakes")
+        or path.startswith("/api/ui/archive")
+        or path == "/api/ui/catalog/assets"
+    )
 
 
 def _error_response(
