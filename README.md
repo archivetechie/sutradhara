@@ -61,7 +61,7 @@ still proposed. `docs/roadmap.md` and
 ## Layout
 
 ```
-sutradhara/repo/
+sutradhara/
 ├── README.md
 ├── LICENSE
 ├── packages/
