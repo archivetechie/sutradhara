@@ -261,21 +261,23 @@ class Library(_message.Message):
     def __init__(self, library_serial: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., product_revision: _Optional[str] = ..., library_uuid: _Optional[bytes] = ...) -> None: ...
 
 class LibraryState(_message.Message):
-    __slots__ = ("library", "drives", "slots", "import_export_ports", "last_inventory_at")
+    __slots__ = ("library", "drives", "slots", "import_export_ports", "last_inventory_at", "managed")
     LIBRARY_FIELD_NUMBER: _ClassVar[int]
     DRIVES_FIELD_NUMBER: _ClassVar[int]
     SLOTS_FIELD_NUMBER: _ClassVar[int]
     IMPORT_EXPORT_PORTS_FIELD_NUMBER: _ClassVar[int]
     LAST_INVENTORY_AT_FIELD_NUMBER: _ClassVar[int]
+    MANAGED_FIELD_NUMBER: _ClassVar[int]
     library: Library
     drives: _containers.RepeatedCompositeFieldContainer[Drive]
     slots: _containers.RepeatedCompositeFieldContainer[Slot]
     import_export_ports: _containers.RepeatedCompositeFieldContainer[PortalSlot]
     last_inventory_at: _timestamp_pb2.Timestamp
-    def __init__(self, library: _Optional[_Union[Library, _Mapping]] = ..., drives: _Optional[_Iterable[_Union[Drive, _Mapping]]] = ..., slots: _Optional[_Iterable[_Union[Slot, _Mapping]]] = ..., import_export_ports: _Optional[_Iterable[_Union[PortalSlot, _Mapping]]] = ..., last_inventory_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    managed: str
+    def __init__(self, library: _Optional[_Union[Library, _Mapping]] = ..., drives: _Optional[_Iterable[_Union[Drive, _Mapping]]] = ..., slots: _Optional[_Iterable[_Union[Slot, _Mapping]]] = ..., import_export_ports: _Optional[_Iterable[_Union[PortalSlot, _Mapping]]] = ..., last_inventory_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., managed: _Optional[str] = ...) -> None: ...
 
 class Drive(_message.Message):
-    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status")
+    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status", "drive_uuid", "cleaning_due", "fenced", "lifetime_read_bytes", "lifetime_write_bytes", "counter_epoch", "session_id", "active_alert_names")
     class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         DRIVE_STATUS_UNSPECIFIED: _ClassVar[Drive.Status]
@@ -283,11 +285,15 @@ class Drive(_message.Message):
         DRIVE_STATUS_LOADED: _ClassVar[Drive.Status]
         DRIVE_STATUS_BUSY: _ClassVar[Drive.Status]
         DRIVE_STATUS_UNREACHABLE: _ClassVar[Drive.Status]
+        DRIVE_STATUS_CLEANING: _ClassVar[Drive.Status]
+        DRIVE_STATUS_FENCED: _ClassVar[Drive.Status]
     DRIVE_STATUS_UNSPECIFIED: Drive.Status
     DRIVE_STATUS_IDLE: Drive.Status
     DRIVE_STATUS_LOADED: Drive.Status
     DRIVE_STATUS_BUSY: Drive.Status
     DRIVE_STATUS_UNREACHABLE: Drive.Status
+    DRIVE_STATUS_CLEANING: Drive.Status
+    DRIVE_STATUS_FENCED: Drive.Status
     ELEMENT_ADDRESS_FIELD_NUMBER: _ClassVar[int]
     DRIVE_SERIAL_FIELD_NUMBER: _ClassVar[int]
     HOST_DEVICE_PATH_FIELD_NUMBER: _ClassVar[int]
@@ -295,6 +301,14 @@ class Drive(_message.Message):
     PRODUCT_FIELD_NUMBER: _ClassVar[int]
     LOADED_TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    CLEANING_DUE_FIELD_NUMBER: _ClassVar[int]
+    FENCED_FIELD_NUMBER: _ClassVar[int]
+    LIFETIME_READ_BYTES_FIELD_NUMBER: _ClassVar[int]
+    LIFETIME_WRITE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    COUNTER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_ALERT_NAMES_FIELD_NUMBER: _ClassVar[int]
     element_address: int
     drive_serial: str
     host_device_path: str
@@ -302,7 +316,313 @@ class Drive(_message.Message):
     product: str
     loaded_tape_uuid: bytes
     status: Drive.Status
-    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ...) -> None: ...
+    drive_uuid: bytes
+    cleaning_due: str
+    fenced: bool
+    lifetime_read_bytes: int
+    lifetime_write_bytes: int
+    counter_epoch: int
+    session_id: bytes
+    active_alert_names: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ..., drive_uuid: _Optional[bytes] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., lifetime_read_bytes: _Optional[int] = ..., lifetime_write_bytes: _Optional[int] = ..., counter_epoch: _Optional[int] = ..., session_id: _Optional[bytes] = ..., active_alert_names: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class DriveCatalogEntry(_message.Message):
+    __slots__ = ("drive_uuid", "serial", "identity_source", "actionable", "vendor", "product", "firmware_rev", "managed", "state", "cleaning_due", "fenced", "first_seen_utc", "last_seen_utc", "last_library_serial", "last_element_address", "purchase_date", "warranty_until", "cost", "notes", "retired_at_utc", "retire_reason", "correlation_rollups")
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    SERIAL_FIELD_NUMBER: _ClassVar[int]
+    IDENTITY_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    ACTIONABLE_FIELD_NUMBER: _ClassVar[int]
+    VENDOR_FIELD_NUMBER: _ClassVar[int]
+    PRODUCT_FIELD_NUMBER: _ClassVar[int]
+    FIRMWARE_REV_FIELD_NUMBER: _ClassVar[int]
+    MANAGED_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    CLEANING_DUE_FIELD_NUMBER: _ClassVar[int]
+    FENCED_FIELD_NUMBER: _ClassVar[int]
+    FIRST_SEEN_UTC_FIELD_NUMBER: _ClassVar[int]
+    LAST_SEEN_UTC_FIELD_NUMBER: _ClassVar[int]
+    LAST_LIBRARY_SERIAL_FIELD_NUMBER: _ClassVar[int]
+    LAST_ELEMENT_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    PURCHASE_DATE_FIELD_NUMBER: _ClassVar[int]
+    WARRANTY_UNTIL_FIELD_NUMBER: _ClassVar[int]
+    COST_FIELD_NUMBER: _ClassVar[int]
+    NOTES_FIELD_NUMBER: _ClassVar[int]
+    RETIRED_AT_UTC_FIELD_NUMBER: _ClassVar[int]
+    RETIRE_REASON_FIELD_NUMBER: _ClassVar[int]
+    CORRELATION_ROLLUPS_FIELD_NUMBER: _ClassVar[int]
+    drive_uuid: bytes
+    serial: str
+    identity_source: str
+    actionable: bool
+    vendor: str
+    product: str
+    firmware_rev: str
+    managed: str
+    state: str
+    cleaning_due: str
+    fenced: bool
+    first_seen_utc: _timestamp_pb2.Timestamp
+    last_seen_utc: _timestamp_pb2.Timestamp
+    last_library_serial: str
+    last_element_address: int
+    purchase_date: str
+    warranty_until: str
+    cost: str
+    notes: str
+    retired_at_utc: _timestamp_pb2.Timestamp
+    retire_reason: str
+    correlation_rollups: _containers.RepeatedCompositeFieldContainer[DriveCorrelationRollup]
+    def __init__(self, drive_uuid: _Optional[bytes] = ..., serial: _Optional[str] = ..., identity_source: _Optional[str] = ..., actionable: _Optional[bool] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., firmware_rev: _Optional[str] = ..., managed: _Optional[str] = ..., state: _Optional[str] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., first_seen_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., last_seen_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., last_library_serial: _Optional[str] = ..., last_element_address: _Optional[int] = ..., purchase_date: _Optional[str] = ..., warranty_until: _Optional[str] = ..., cost: _Optional[str] = ..., notes: _Optional[str] = ..., retired_at_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., retire_reason: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ...) -> None: ...
+
+class DriveCorrelationRollup(_message.Message):
+    __slots__ = ("tape_uuid", "voltag", "drive_uuid", "drive_serial", "session_count", "snapshot_count", "write_errors_corrected", "write_errors_uncorrected", "read_errors_corrected", "read_errors_uncorrected", "first_session_utc", "last_session_utc")
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    VOLTAG_FIELD_NUMBER: _ClassVar[int]
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    DRIVE_SERIAL_FIELD_NUMBER: _ClassVar[int]
+    SESSION_COUNT_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_COUNT_FIELD_NUMBER: _ClassVar[int]
+    WRITE_ERRORS_CORRECTED_FIELD_NUMBER: _ClassVar[int]
+    WRITE_ERRORS_UNCORRECTED_FIELD_NUMBER: _ClassVar[int]
+    READ_ERRORS_CORRECTED_FIELD_NUMBER: _ClassVar[int]
+    READ_ERRORS_UNCORRECTED_FIELD_NUMBER: _ClassVar[int]
+    FIRST_SESSION_UTC_FIELD_NUMBER: _ClassVar[int]
+    LAST_SESSION_UTC_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    voltag: str
+    drive_uuid: bytes
+    drive_serial: str
+    session_count: int
+    snapshot_count: int
+    write_errors_corrected: int
+    write_errors_uncorrected: int
+    read_errors_corrected: int
+    read_errors_uncorrected: int
+    first_session_utc: _timestamp_pb2.Timestamp
+    last_session_utc: _timestamp_pb2.Timestamp
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., drive_uuid: _Optional[bytes] = ..., drive_serial: _Optional[str] = ..., session_count: _Optional[int] = ..., snapshot_count: _Optional[int] = ..., write_errors_corrected: _Optional[int] = ..., write_errors_uncorrected: _Optional[int] = ..., read_errors_corrected: _Optional[int] = ..., read_errors_uncorrected: _Optional[int] = ..., first_session_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., last_session_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class DriveHistoryEvent(_message.Message):
+    __slots__ = ("event_id", "drive_uuid", "event_kind", "at_utc", "library_serial", "element_address", "tape_uuid", "detail")
+    EVENT_ID_FIELD_NUMBER: _ClassVar[int]
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    EVENT_KIND_FIELD_NUMBER: _ClassVar[int]
+    AT_UTC_FIELD_NUMBER: _ClassVar[int]
+    LIBRARY_SERIAL_FIELD_NUMBER: _ClassVar[int]
+    ELEMENT_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    event_id: int
+    drive_uuid: bytes
+    event_kind: str
+    at_utc: _timestamp_pb2.Timestamp
+    library_serial: str
+    element_address: int
+    tape_uuid: bytes
+    detail: str
+    def __init__(self, event_id: _Optional[int] = ..., drive_uuid: _Optional[bytes] = ..., event_kind: _Optional[str] = ..., at_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., library_serial: _Optional[str] = ..., element_address: _Optional[int] = ..., tape_uuid: _Optional[bytes] = ..., detail: _Optional[str] = ...) -> None: ...
+
+class DriveHealthSnapshot(_message.Message):
+    __slots__ = ("snapshot_id", "drive_uuid", "at_utc", "trigger", "session_id", "tape_alert_flags", "write_errors_corrected", "write_errors_uncorrected", "read_errors_corrected", "read_errors_uncorrected", "raw_pages")
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    AT_UTC_FIELD_NUMBER: _ClassVar[int]
+    TRIGGER_FIELD_NUMBER: _ClassVar[int]
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    TAPE_ALERT_FLAGS_FIELD_NUMBER: _ClassVar[int]
+    WRITE_ERRORS_CORRECTED_FIELD_NUMBER: _ClassVar[int]
+    WRITE_ERRORS_UNCORRECTED_FIELD_NUMBER: _ClassVar[int]
+    READ_ERRORS_CORRECTED_FIELD_NUMBER: _ClassVar[int]
+    READ_ERRORS_UNCORRECTED_FIELD_NUMBER: _ClassVar[int]
+    RAW_PAGES_FIELD_NUMBER: _ClassVar[int]
+    snapshot_id: int
+    drive_uuid: bytes
+    at_utc: _timestamp_pb2.Timestamp
+    trigger: str
+    session_id: str
+    tape_alert_flags: str
+    write_errors_corrected: int
+    write_errors_uncorrected: int
+    read_errors_corrected: int
+    read_errors_uncorrected: int
+    raw_pages: str
+    def __init__(self, snapshot_id: _Optional[int] = ..., drive_uuid: _Optional[bytes] = ..., at_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., trigger: _Optional[str] = ..., session_id: _Optional[str] = ..., tape_alert_flags: _Optional[str] = ..., write_errors_corrected: _Optional[int] = ..., write_errors_uncorrected: _Optional[int] = ..., read_errors_corrected: _Optional[int] = ..., read_errors_uncorrected: _Optional[int] = ..., raw_pages: _Optional[str] = ...) -> None: ...
+
+class Alarm(_message.Message):
+    __slots__ = ("alarm_id", "condition_key", "kind", "severity", "state", "first_seen_utc", "last_seen_utc", "acked_by", "acked_at_utc", "detail")
+    ALARM_ID_FIELD_NUMBER: _ClassVar[int]
+    CONDITION_KEY_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    SEVERITY_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    FIRST_SEEN_UTC_FIELD_NUMBER: _ClassVar[int]
+    LAST_SEEN_UTC_FIELD_NUMBER: _ClassVar[int]
+    ACKED_BY_FIELD_NUMBER: _ClassVar[int]
+    ACKED_AT_UTC_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    alarm_id: int
+    condition_key: str
+    kind: str
+    severity: str
+    state: str
+    first_seen_utc: _timestamp_pb2.Timestamp
+    last_seen_utc: _timestamp_pb2.Timestamp
+    acked_by: str
+    acked_at_utc: _timestamp_pb2.Timestamp
+    detail: str
+    def __init__(self, alarm_id: _Optional[int] = ..., condition_key: _Optional[str] = ..., kind: _Optional[str] = ..., severity: _Optional[str] = ..., state: _Optional[str] = ..., first_seen_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., last_seen_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., acked_by: _Optional[str] = ..., acked_at_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., detail: _Optional[str] = ...) -> None: ...
+
+class ListDrivesRequest(_message.Message):
+    __slots__ = ("include_foreign", "include_retired", "page_token", "page_size")
+    INCLUDE_FOREIGN_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_RETIRED_FIELD_NUMBER: _ClassVar[int]
+    PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    include_foreign: bool
+    include_retired: bool
+    page_token: PageToken
+    page_size: int
+    def __init__(self, include_foreign: _Optional[bool] = ..., include_retired: _Optional[bool] = ..., page_token: _Optional[_Union[PageToken, _Mapping]] = ..., page_size: _Optional[int] = ...) -> None: ...
+
+class ListDrivesResponse(_message.Message):
+    __slots__ = ("drives", "next_page_token")
+    DRIVES_FIELD_NUMBER: _ClassVar[int]
+    NEXT_PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    drives: _containers.RepeatedCompositeFieldContainer[DriveCatalogEntry]
+    next_page_token: PageToken
+    def __init__(self, drives: _Optional[_Iterable[_Union[DriveCatalogEntry, _Mapping]]] = ..., next_page_token: _Optional[_Union[PageToken, _Mapping]] = ...) -> None: ...
+
+class GetDriveRequest(_message.Message):
+    __slots__ = ("drive",)
+    DRIVE_FIELD_NUMBER: _ClassVar[int]
+    drive: str
+    def __init__(self, drive: _Optional[str] = ...) -> None: ...
+
+class GetDriveHistoryRequest(_message.Message):
+    __slots__ = ("drive", "include_events", "include_snapshots", "page_token", "page_size")
+    DRIVE_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_SNAPSHOTS_FIELD_NUMBER: _ClassVar[int]
+    PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    drive: str
+    include_events: bool
+    include_snapshots: bool
+    page_token: PageToken
+    page_size: int
+    def __init__(self, drive: _Optional[str] = ..., include_events: _Optional[bool] = ..., include_snapshots: _Optional[bool] = ..., page_token: _Optional[_Union[PageToken, _Mapping]] = ..., page_size: _Optional[int] = ...) -> None: ...
+
+class GetDriveHistoryResponse(_message.Message):
+    __slots__ = ("drive", "events", "snapshots", "next_page_token")
+    DRIVE_FIELD_NUMBER: _ClassVar[int]
+    EVENTS_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOTS_FIELD_NUMBER: _ClassVar[int]
+    NEXT_PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    drive: DriveCatalogEntry
+    events: _containers.RepeatedCompositeFieldContainer[DriveHistoryEvent]
+    snapshots: _containers.RepeatedCompositeFieldContainer[DriveHealthSnapshot]
+    next_page_token: PageToken
+    def __init__(self, drive: _Optional[_Union[DriveCatalogEntry, _Mapping]] = ..., events: _Optional[_Iterable[_Union[DriveHistoryEvent, _Mapping]]] = ..., snapshots: _Optional[_Iterable[_Union[DriveHealthSnapshot, _Mapping]]] = ..., next_page_token: _Optional[_Union[PageToken, _Mapping]] = ...) -> None: ...
+
+class AnnotateDriveRequest(_message.Message):
+    __slots__ = ("drive_uuid", "purchase_date", "warranty_until", "cost", "note", "notes_set", "allow_derived_identity")
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    PURCHASE_DATE_FIELD_NUMBER: _ClassVar[int]
+    WARRANTY_UNTIL_FIELD_NUMBER: _ClassVar[int]
+    COST_FIELD_NUMBER: _ClassVar[int]
+    NOTE_FIELD_NUMBER: _ClassVar[int]
+    NOTES_SET_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_DERIVED_IDENTITY_FIELD_NUMBER: _ClassVar[int]
+    drive_uuid: bytes
+    purchase_date: str
+    warranty_until: str
+    cost: str
+    note: str
+    notes_set: str
+    allow_derived_identity: bool
+    def __init__(self, drive_uuid: _Optional[bytes] = ..., purchase_date: _Optional[str] = ..., warranty_until: _Optional[str] = ..., cost: _Optional[str] = ..., note: _Optional[str] = ..., notes_set: _Optional[str] = ..., allow_derived_identity: _Optional[bool] = ...) -> None: ...
+
+class RetireDriveRequest(_message.Message):
+    __slots__ = ("drive_uuid", "reason", "i_understand_fleet_removal_is_permanent", "allow_derived_identity")
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    I_UNDERSTAND_FLEET_REMOVAL_IS_PERMANENT_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_DERIVED_IDENTITY_FIELD_NUMBER: _ClassVar[int]
+    drive_uuid: bytes
+    reason: str
+    i_understand_fleet_removal_is_permanent: bool
+    allow_derived_identity: bool
+    def __init__(self, drive_uuid: _Optional[bytes] = ..., reason: _Optional[str] = ..., i_understand_fleet_removal_is_permanent: _Optional[bool] = ..., allow_derived_identity: _Optional[bool] = ...) -> None: ...
+
+class RetireDriveResponse(_message.Message):
+    __slots__ = ("drive", "newly_retired")
+    DRIVE_FIELD_NUMBER: _ClassVar[int]
+    NEWLY_RETIRED_FIELD_NUMBER: _ClassVar[int]
+    drive: DriveCatalogEntry
+    newly_retired: bool
+    def __init__(self, drive: _Optional[_Union[DriveCatalogEntry, _Mapping]] = ..., newly_retired: _Optional[bool] = ...) -> None: ...
+
+class PollDriveRequest(_message.Message):
+    __slots__ = ("drive", "allow_derived_identity")
+    DRIVE_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_DERIVED_IDENTITY_FIELD_NUMBER: _ClassVar[int]
+    drive: str
+    allow_derived_identity: bool
+    def __init__(self, drive: _Optional[str] = ..., allow_derived_identity: _Optional[bool] = ...) -> None: ...
+
+class CleanDriveRequest(_message.Message):
+    __slots__ = ("drive_uuid", "allow_derived_identity", "idempotency_key")
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_DERIVED_IDENTITY_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    drive_uuid: bytes
+    allow_derived_identity: bool
+    idempotency_key: IdempotencyKey
+    def __init__(self, drive_uuid: _Optional[bytes] = ..., allow_derived_identity: _Optional[bool] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ...) -> None: ...
+
+class ListAlarmsRequest(_message.Message):
+    __slots__ = ("include_cleared", "page_token", "page_size")
+    INCLUDE_CLEARED_FIELD_NUMBER: _ClassVar[int]
+    PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    include_cleared: bool
+    page_token: PageToken
+    page_size: int
+    def __init__(self, include_cleared: _Optional[bool] = ..., page_token: _Optional[_Union[PageToken, _Mapping]] = ..., page_size: _Optional[int] = ...) -> None: ...
+
+class ListAlarmsResponse(_message.Message):
+    __slots__ = ("alarms", "next_page_token")
+    ALARMS_FIELD_NUMBER: _ClassVar[int]
+    NEXT_PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    alarms: _containers.RepeatedCompositeFieldContainer[Alarm]
+    next_page_token: PageToken
+    def __init__(self, alarms: _Optional[_Iterable[_Union[Alarm, _Mapping]]] = ..., next_page_token: _Optional[_Union[PageToken, _Mapping]] = ...) -> None: ...
+
+class AckAlarmRequest(_message.Message):
+    __slots__ = ("condition_key", "idempotency_key")
+    CONDITION_KEY_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    condition_key: str
+    idempotency_key: IdempotencyKey
+    def __init__(self, condition_key: _Optional[str] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ...) -> None: ...
+
+class GetLiveStatusRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class GetLiveStatusResponse(_message.Message):
+    __slots__ = ("libraries", "operations", "alarms", "snapshot_at_utc", "daemon_epoch")
+    LIBRARIES_FIELD_NUMBER: _ClassVar[int]
+    OPERATIONS_FIELD_NUMBER: _ClassVar[int]
+    ALARMS_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_AT_UTC_FIELD_NUMBER: _ClassVar[int]
+    DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    libraries: _containers.RepeatedCompositeFieldContainer[LibraryState]
+    operations: _containers.RepeatedCompositeFieldContainer[OperationRef]
+    alarms: _containers.RepeatedCompositeFieldContainer[Alarm]
+    snapshot_at_utc: str
+    daemon_epoch: int
+    def __init__(self, libraries: _Optional[_Iterable[_Union[LibraryState, _Mapping]]] = ..., operations: _Optional[_Iterable[_Union[OperationRef, _Mapping]]] = ..., alarms: _Optional[_Iterable[_Union[Alarm, _Mapping]]] = ..., snapshot_at_utc: _Optional[str] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
 
 class Slot(_message.Message):
     __slots__ = ("element_address", "voltag", "tape_uuid")
@@ -454,7 +774,7 @@ class LibraryEvent(_message.Message):
     def __init__(self, at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., kind: _Optional[_Union[LibraryEvent.Kind, str]] = ..., detail: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class Tape(_message.Message):
-    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id")
+    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id", "correlation_rollups")
     class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         TAPE_STATE_UNSPECIFIED: _ClassVar[Tape.State]
@@ -462,11 +782,13 @@ class Tape(_message.Message):
         TAPE_STATE_READY: _ClassVar[Tape.State]
         TAPE_STATE_DEGRADED: _ClassVar[Tape.State]
         TAPE_STATE_FAILED: _ClassVar[Tape.State]
+        TAPE_STATE_SEALED: _ClassVar[Tape.State]
     TAPE_STATE_UNSPECIFIED: Tape.State
     TAPE_STATE_INVENTORIED: Tape.State
     TAPE_STATE_READY: Tape.State
     TAPE_STATE_DEGRADED: Tape.State
     TAPE_STATE_FAILED: Tape.State
+    TAPE_STATE_SEALED: Tape.State
     TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
     VOLTAG_FIELD_NUMBER: _ClassVar[int]
     BODY_FORMAT_FIELD_NUMBER: _ClassVar[int]
@@ -478,6 +800,7 @@ class Tape(_message.Message):
     STATE_FIELD_NUMBER: _ClassVar[int]
     UPDATED_AT_FIELD_NUMBER: _ClassVar[int]
     POOL_ID_FIELD_NUMBER: _ClassVar[int]
+    CORRELATION_ROLLUPS_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     voltag: str
     body_format: str
@@ -489,7 +812,8 @@ class Tape(_message.Message):
     state: Tape.State
     updated_at: _timestamp_pb2.Timestamp
     pool_id: str
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ...) -> None: ...
+    correlation_rollups: _containers.RepeatedCompositeFieldContainer[DriveCorrelationRollup]
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ...) -> None: ...
 
 class TapePool(_message.Message):
     __slots__ = ("pool_id", "display_name", "copy_class", "content_class")

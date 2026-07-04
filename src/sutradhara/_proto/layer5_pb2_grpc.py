@@ -357,6 +357,56 @@ class LibraryServiceStub:
                 request_serializer=layer5__pb2.RefreshInventoryRequest.SerializeToString,
                 response_deserializer=layer5__pb2.OperationRef.FromString,
                 _registered_method=True)
+        self.ListDrives = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/ListDrives',
+                request_serializer=layer5__pb2.ListDrivesRequest.SerializeToString,
+                response_deserializer=layer5__pb2.ListDrivesResponse.FromString,
+                _registered_method=True)
+        self.GetDrive = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/GetDrive',
+                request_serializer=layer5__pb2.GetDriveRequest.SerializeToString,
+                response_deserializer=layer5__pb2.DriveCatalogEntry.FromString,
+                _registered_method=True)
+        self.GetDriveHistory = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/GetDriveHistory',
+                request_serializer=layer5__pb2.GetDriveHistoryRequest.SerializeToString,
+                response_deserializer=layer5__pb2.GetDriveHistoryResponse.FromString,
+                _registered_method=True)
+        self.AnnotateDrive = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/AnnotateDrive',
+                request_serializer=layer5__pb2.AnnotateDriveRequest.SerializeToString,
+                response_deserializer=layer5__pb2.DriveCatalogEntry.FromString,
+                _registered_method=True)
+        self.RetireDrive = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/RetireDrive',
+                request_serializer=layer5__pb2.RetireDriveRequest.SerializeToString,
+                response_deserializer=layer5__pb2.RetireDriveResponse.FromString,
+                _registered_method=True)
+        self.PollDrive = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/PollDrive',
+                request_serializer=layer5__pb2.PollDriveRequest.SerializeToString,
+                response_deserializer=layer5__pb2.DriveHealthSnapshot.FromString,
+                _registered_method=True)
+        self.CleanDrive = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/CleanDrive',
+                request_serializer=layer5__pb2.CleanDriveRequest.SerializeToString,
+                response_deserializer=layer5__pb2.OperationRef.FromString,
+                _registered_method=True)
+        self.ListAlarms = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/ListAlarms',
+                request_serializer=layer5__pb2.ListAlarmsRequest.SerializeToString,
+                response_deserializer=layer5__pb2.ListAlarmsResponse.FromString,
+                _registered_method=True)
+        self.AckAlarm = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/AckAlarm',
+                request_serializer=layer5__pb2.AckAlarmRequest.SerializeToString,
+                response_deserializer=layer5__pb2.Alarm.FromString,
+                _registered_method=True)
+        self.GetLiveStatus = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/GetLiveStatus',
+                request_serializer=layer5__pb2.GetLiveStatusRequest.SerializeToString,
+                response_deserializer=layer5__pb2.GetLiveStatusResponse.FromString,
+                _registered_method=True)
         self.MoveMedium = channel.unary_unary(
                 '/remanence.api.v1.LibraryService/MoveMedium',
                 request_serializer=layer5__pb2.MoveMediumRequest.SerializeToString,
@@ -409,6 +459,66 @@ class LibraryServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def RefreshInventory(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListDrives(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetDrive(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetDriveHistory(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AnnotateDrive(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RetireDrive(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PollDrive(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CleanDrive(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListAlarms(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AckAlarm(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetLiveStatus(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -471,6 +581,56 @@ def add_LibraryServiceServicer_to_server(servicer, server):
                     servicer.RefreshInventory,
                     request_deserializer=layer5__pb2.RefreshInventoryRequest.FromString,
                     response_serializer=layer5__pb2.OperationRef.SerializeToString,
+            ),
+            'ListDrives': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListDrives,
+                    request_deserializer=layer5__pb2.ListDrivesRequest.FromString,
+                    response_serializer=layer5__pb2.ListDrivesResponse.SerializeToString,
+            ),
+            'GetDrive': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetDrive,
+                    request_deserializer=layer5__pb2.GetDriveRequest.FromString,
+                    response_serializer=layer5__pb2.DriveCatalogEntry.SerializeToString,
+            ),
+            'GetDriveHistory': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetDriveHistory,
+                    request_deserializer=layer5__pb2.GetDriveHistoryRequest.FromString,
+                    response_serializer=layer5__pb2.GetDriveHistoryResponse.SerializeToString,
+            ),
+            'AnnotateDrive': grpc.unary_unary_rpc_method_handler(
+                    servicer.AnnotateDrive,
+                    request_deserializer=layer5__pb2.AnnotateDriveRequest.FromString,
+                    response_serializer=layer5__pb2.DriveCatalogEntry.SerializeToString,
+            ),
+            'RetireDrive': grpc.unary_unary_rpc_method_handler(
+                    servicer.RetireDrive,
+                    request_deserializer=layer5__pb2.RetireDriveRequest.FromString,
+                    response_serializer=layer5__pb2.RetireDriveResponse.SerializeToString,
+            ),
+            'PollDrive': grpc.unary_unary_rpc_method_handler(
+                    servicer.PollDrive,
+                    request_deserializer=layer5__pb2.PollDriveRequest.FromString,
+                    response_serializer=layer5__pb2.DriveHealthSnapshot.SerializeToString,
+            ),
+            'CleanDrive': grpc.unary_unary_rpc_method_handler(
+                    servicer.CleanDrive,
+                    request_deserializer=layer5__pb2.CleanDriveRequest.FromString,
+                    response_serializer=layer5__pb2.OperationRef.SerializeToString,
+            ),
+            'ListAlarms': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListAlarms,
+                    request_deserializer=layer5__pb2.ListAlarmsRequest.FromString,
+                    response_serializer=layer5__pb2.ListAlarmsResponse.SerializeToString,
+            ),
+            'AckAlarm': grpc.unary_unary_rpc_method_handler(
+                    servicer.AckAlarm,
+                    request_deserializer=layer5__pb2.AckAlarmRequest.FromString,
+                    response_serializer=layer5__pb2.Alarm.SerializeToString,
+            ),
+            'GetLiveStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetLiveStatus,
+                    request_deserializer=layer5__pb2.GetLiveStatusRequest.FromString,
+                    response_serializer=layer5__pb2.GetLiveStatusResponse.SerializeToString,
             ),
             'MoveMedium': grpc.unary_unary_rpc_method_handler(
                     servicer.MoveMedium,
@@ -588,6 +748,276 @@ class LibraryService:
             '/remanence.api.v1.LibraryService/RefreshInventory',
             layer5__pb2.RefreshInventoryRequest.SerializeToString,
             layer5__pb2.OperationRef.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListDrives(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/ListDrives',
+            layer5__pb2.ListDrivesRequest.SerializeToString,
+            layer5__pb2.ListDrivesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetDrive(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/GetDrive',
+            layer5__pb2.GetDriveRequest.SerializeToString,
+            layer5__pb2.DriveCatalogEntry.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetDriveHistory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/GetDriveHistory',
+            layer5__pb2.GetDriveHistoryRequest.SerializeToString,
+            layer5__pb2.GetDriveHistoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AnnotateDrive(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/AnnotateDrive',
+            layer5__pb2.AnnotateDriveRequest.SerializeToString,
+            layer5__pb2.DriveCatalogEntry.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RetireDrive(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/RetireDrive',
+            layer5__pb2.RetireDriveRequest.SerializeToString,
+            layer5__pb2.RetireDriveResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PollDrive(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/PollDrive',
+            layer5__pb2.PollDriveRequest.SerializeToString,
+            layer5__pb2.DriveHealthSnapshot.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CleanDrive(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/CleanDrive',
+            layer5__pb2.CleanDriveRequest.SerializeToString,
+            layer5__pb2.OperationRef.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListAlarms(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/ListAlarms',
+            layer5__pb2.ListAlarmsRequest.SerializeToString,
+            layer5__pb2.ListAlarmsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AckAlarm(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/AckAlarm',
+            layer5__pb2.AckAlarmRequest.SerializeToString,
+            layer5__pb2.Alarm.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetLiveStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/GetLiveStatus',
+            layer5__pb2.GetLiveStatusRequest.SerializeToString,
+            layer5__pb2.GetLiveStatusResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1826,9 +2256,12 @@ class ReadSessionServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ReadObjectRange(self, request, context):
-        """Read a whole object or a byte range within a single file in the object.
-        The reader resolves (object_id + file_id + byte_range) to BodyLba ranges
-        via the catalog and issues LOCATE + read.
+        """Read a whole object payload or a byte range from it.
+        Empty file_id resolves the object's sole payload member and treats
+        [start_byte, end_byte) as object/payload-relative offsets over opaque
+        stored bytes. Non-empty file_id resolves that catalog member and treats the
+        range as member-relative. The daemon does not decrypt or interpret payload
+        bytes; both-zero range reads the whole payload/member.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

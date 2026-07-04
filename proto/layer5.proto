@@ -1,6 +1,6 @@
 // Remanence Layer 5 — gRPC API surface (DRAFT v0.1).
 //
-// Status: design draft. No generated code, no wire-stability promise. Shape only.
+// Status: design draft. Generated into remanence-api; no wire-stability promise.
 // Authoritative reference for terminology and contracts: docs/spec-v0.4.md.
 //
 // Transport: HTTPS/2 with mTLS authentication (mutual cert auth at the channel
@@ -16,9 +16,9 @@
 //   - "Object" identity is by Remanence-assigned object UUID. The orchestrator's
 //     own identifier rides as `caller_object_id` (an opaque string) and is
 //     stored on tape alongside the data per docs/spec-v0.4.md §4.2.
-//   - Idempotency: state-changing RPCs that may be retried by the caller accept
-//     an `idempotency_key`; the server records the (actor_fingerprint,
-//     idempotency_key) pair per docs/spec-v0.4.md §10.8.
+//   - Idempotency: fields are reserved on state-changing RPCs. Until per-RPC
+//     replay is implemented, non-empty keys fail fast with UNIMPLEMENTED rather
+//     than being silently accepted.
 //   - Pagination: list RPCs return a `next_page_token`; opaque to clients.
 //   - Cancellation: long-running operations return an `operation_id`; cancel
 //     via Daemon.CancelOperation.
@@ -28,7 +28,8 @@
 //   - Detailed write-format-specific options (rem-tar-v1 vs future formats).
 //   - Multi-library naming and routing details.
 //   - Subscription/notification streams (operation updates, library events).
-//   - Authorization scopes / role model.
+//   - Per-RPC authorization is enforced by the server using the role model in
+//     docs/spec-v0.4.md §11.6; certificate subject encoding is deployment policy.
 
 syntax = "proto3";
 
@@ -158,6 +159,16 @@ service LibraryService {
   rpc ListLibraries     (google.protobuf.Empty)       returns (ListLibrariesResponse);
   rpc GetLibrary        (GetLibraryRequest)           returns (LibraryState);
   rpc RefreshInventory  (RefreshInventoryRequest)     returns (OperationRef);
+  rpc ListDrives        (ListDrivesRequest)           returns (ListDrivesResponse);
+  rpc GetDrive          (GetDriveRequest)             returns (DriveCatalogEntry);
+  rpc GetDriveHistory   (GetDriveHistoryRequest)      returns (GetDriveHistoryResponse);
+  rpc AnnotateDrive     (AnnotateDriveRequest)        returns (DriveCatalogEntry);
+  rpc RetireDrive       (RetireDriveRequest)          returns (RetireDriveResponse);
+  rpc PollDrive         (PollDriveRequest)            returns (DriveHealthSnapshot);
+  rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
+  rpc ListAlarms        (ListAlarmsRequest)           returns (ListAlarmsResponse);
+  rpc AckAlarm          (AckAlarmRequest)             returns (Alarm);
+  rpc GetLiveStatus     (GetLiveStatusRequest)        returns (GetLiveStatusResponse);
 
   // State-changing ops. All return OperationRef; observe via Daemon.GetOperation
   // or Daemon.WatchOperation.
@@ -188,6 +199,7 @@ message LibraryState {
   repeated Slot  slots     = 3;
   repeated PortalSlot import_export_ports = 4;
   google.protobuf.Timestamp last_inventory_at = 5;
+  string managed           = 6; // "rem" or "foreign" for drive-stewardship views.
 }
 
 message Drive {
@@ -204,8 +216,186 @@ message Drive {
     DRIVE_STATUS_LOADED        = 2;
     DRIVE_STATUS_BUSY          = 3;
     DRIVE_STATUS_UNREACHABLE   = 4;
+    DRIVE_STATUS_CLEANING      = 5;
+    DRIVE_STATUS_FENCED        = 6;
   }
   Status status           = 7;
+  bytes  drive_uuid       = 8;
+  string cleaning_due     = 9;
+  bool   fenced           = 10;
+  uint64 lifetime_read_bytes = 11;
+  uint64 lifetime_write_bytes = 12;
+  uint64 counter_epoch    = 13;
+  bytes  session_id       = 14;
+  repeated string active_alert_names = 15;
+}
+
+message DriveCatalogEntry {
+  bytes drive_uuid = 1;
+  string serial = 2;
+  string identity_source = 3;
+  bool actionable = 4;
+  string vendor = 5;
+  string product = 6;
+  string firmware_rev = 7;
+  string managed = 8;
+  string state = 9;
+  string cleaning_due = 10;
+  bool fenced = 11;
+  google.protobuf.Timestamp first_seen_utc = 12;
+  google.protobuf.Timestamp last_seen_utc = 13;
+  string last_library_serial = 14;
+  uint32 last_element_address = 15;
+  string purchase_date = 16;
+  string warranty_until = 17;
+  string cost = 18;
+  string notes = 19;
+  google.protobuf.Timestamp retired_at_utc = 20;
+  string retire_reason = 21;
+  repeated DriveCorrelationRollup correlation_rollups = 22;
+}
+
+message DriveCorrelationRollup {
+  bytes tape_uuid = 1;
+  string voltag = 2;
+  bytes drive_uuid = 3;
+  string drive_serial = 4;
+  uint64 session_count = 5;
+  uint64 snapshot_count = 6;
+  uint64 write_errors_corrected = 7;
+  uint64 write_errors_uncorrected = 8;
+  uint64 read_errors_corrected = 9;
+  uint64 read_errors_uncorrected = 10;
+  google.protobuf.Timestamp first_session_utc = 11;
+  google.protobuf.Timestamp last_session_utc = 12;
+}
+
+message DriveHistoryEvent {
+  uint64 event_id = 1;
+  bytes drive_uuid = 2;
+  string event_kind = 3;
+  google.protobuf.Timestamp at_utc = 4;
+  string library_serial = 5;
+  uint32 element_address = 6;
+  bytes tape_uuid = 7;
+  string detail = 8;
+}
+
+message DriveHealthSnapshot {
+  uint64 snapshot_id = 1;
+  bytes drive_uuid = 2;
+  google.protobuf.Timestamp at_utc = 3;
+  string trigger = 4;
+  string session_id = 5;
+  string tape_alert_flags = 6;
+  uint64 write_errors_corrected = 7;
+  uint64 write_errors_uncorrected = 8;
+  uint64 read_errors_corrected = 9;
+  uint64 read_errors_uncorrected = 10;
+  string raw_pages = 11;
+}
+
+message Alarm {
+  uint64 alarm_id = 1;
+  string condition_key = 2;
+  string kind = 3;
+  string severity = 4;
+  string state = 5;
+  google.protobuf.Timestamp first_seen_utc = 6;
+  google.protobuf.Timestamp last_seen_utc = 7;
+  string acked_by = 8;
+  google.protobuf.Timestamp acked_at_utc = 9;
+  string detail = 10;
+}
+
+message ListDrivesRequest {
+  bool include_foreign = 1;
+  bool include_retired = 2;
+  PageToken page_token = 3;
+  uint32 page_size = 4;
+}
+
+message ListDrivesResponse {
+  repeated DriveCatalogEntry drives = 1;
+  PageToken next_page_token = 2;
+}
+
+message GetDriveRequest {
+  string drive = 1; // drive UUID text or device-reported serial.
+}
+
+message GetDriveHistoryRequest {
+  string drive = 1; // drive UUID text or device-reported serial.
+  bool include_events = 2;
+  bool include_snapshots = 3;
+  PageToken page_token = 4;
+  uint32 page_size = 5;
+}
+
+message GetDriveHistoryResponse {
+  DriveCatalogEntry drive = 1;
+  repeated DriveHistoryEvent events = 2;
+  repeated DriveHealthSnapshot snapshots = 3;
+  PageToken next_page_token = 4;
+}
+
+message AnnotateDriveRequest {
+  bytes drive_uuid = 1;
+  string purchase_date = 2;
+  string warranty_until = 3;
+  string cost = 4;
+  string note = 5;
+  string notes_set = 6;
+  bool allow_derived_identity = 7;
+}
+
+message RetireDriveRequest {
+  bytes drive_uuid = 1;
+  string reason = 2;
+  bool i_understand_fleet_removal_is_permanent = 3;
+  bool allow_derived_identity = 4;
+}
+
+message RetireDriveResponse {
+  DriveCatalogEntry drive = 1;
+  bool newly_retired = 2;
+}
+
+message PollDriveRequest {
+  string drive = 1; // drive UUID text or device-reported serial.
+  bool allow_derived_identity = 2;
+}
+
+message CleanDriveRequest {
+  bytes drive_uuid = 1;
+  bool allow_derived_identity = 2;
+  IdempotencyKey idempotency_key = 3;
+}
+
+message ListAlarmsRequest {
+  bool include_cleared = 1;
+  PageToken page_token = 2;
+  uint32 page_size = 3;
+}
+
+message ListAlarmsResponse {
+  repeated Alarm alarms = 1;
+  PageToken next_page_token = 2;
+}
+
+message AckAlarmRequest {
+  string condition_key = 1;
+  IdempotencyKey idempotency_key = 2;
+}
+
+message GetLiveStatusRequest {}
+
+message GetLiveStatusResponse {
+  repeated LibraryState libraries = 1;
+  repeated OperationRef operations = 2;
+  repeated Alarm alarms = 3;
+  string snapshot_at_utc = 4;
+  uint64 daemon_epoch = 5;
 }
 
 message Slot {
@@ -360,11 +550,13 @@ message Tape {
     TAPE_STATE_READY       = 2;
     TAPE_STATE_DEGRADED    = 3;
     TAPE_STATE_FAILED      = 4;
+    TAPE_STATE_SEALED      = 5;
   }
   State state                  = 9;
   google.protobuf.Timestamp updated_at = 10;
   // Current operator/orchestrator pool assignment. Empty means unassigned.
   string pool_id               = 11;
+  repeated DriveCorrelationRollup correlation_rollups = 12;
 }
 
 // A daemon-local tape eligibility group. Sutradhara decides the policy that maps
@@ -820,9 +1012,12 @@ service ReadSessionService {
   rpc CloseReadSession (CloseReadSessionRequest) returns (ReadSession);
   rpc GetReadSession   (GetReadSessionRequest)   returns (ReadSession);
 
-  // Read a whole object or a byte range within a single file in the object.
-  // The reader resolves (object_id + file_id + byte_range) to BodyLba ranges
-  // via the catalog and issues LOCATE + read.
+  // Read a whole object payload or a byte range from it.
+  // Empty file_id resolves the object's sole payload member and treats
+  // [start_byte, end_byte) as object/payload-relative offsets over opaque
+  // stored bytes. Non-empty file_id resolves that catalog member and treats the
+  // range as member-relative. The daemon does not decrypt or interpret payload
+  // bytes; both-zero range reads the whole payload/member.
   rpc ReadObjectRange  (ReadObjectRangeRequest)  returns (stream BytesChunk);
 
   // Read an entire file from an object.
@@ -861,9 +1056,11 @@ message GetReadSessionRequest { bytes session_id = 1; }
 message ReadObjectRangeRequest {
   bytes session_id   = 1;
   bytes object_id    = 2;
+  // Empty = object/payload-relative range over the sole payload member.
+  // Non-empty = member-relative range resolved via the object file catalog.
   bytes file_id      = 3;
-  // Half-open byte range within the file: [start_byte, end_byte).
-  // If both zero, reads the whole file.
+  // Half-open byte range [start_byte, end_byte). If both zero, reads the whole
+  // payload/member. Bytes are opaque; clients perform any decryption.
   uint64 start_byte  = 4;
   uint64 end_byte    = 5;
   // Suggested chunk size for stream framing (server may use a different
