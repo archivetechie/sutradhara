@@ -24,6 +24,7 @@ from sutradhara.catalog.models import (
     LogicalAsset,
     Pool,
     Submission,
+    SubmissionMember,
 )
 from sutradhara.catalog.session import locator_key, session_scope
 from sutradhara.catalog.types import (
@@ -188,6 +189,152 @@ def test_intake_contract_detail_uses_virtual_paths_and_cross_intake_derivations(
     assert "as_received_path" not in payload_text
     assert "/mnt/card" not in payload_text
     assert "/var/lib/replica" not in payload_text
+
+
+def test_intakes_stage_filters_registered_archive_evidence(api_engine: Engine) -> None:
+    base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
+    bundle_hash = _digest("stage-bundle-evidence")
+    submission_hash = _digest("stage-submission-evidence")
+    unarchived_hash = _digest("stage-no-evidence")
+    with session_scope(api_engine) as session:
+        _add_asset(session, bundle_hash, size=10)
+        _add_asset(session, submission_hash, size=20)
+        _add_asset(session, unarchived_hash, size=30)
+
+        _add_intake(
+            session,
+            "registered-bundle",
+            artifactclass="s-masters",
+            created_at=base + dt.timedelta(minutes=1),
+        )
+        _add_item(
+            session,
+            intake_id="registered-bundle",
+            digest=bundle_hash,
+            artifactclass="s-masters",
+            virtual_path="bundle/clip.mov",
+            as_received_path="/card/bundle/clip.mov",
+            created_at=base + dt.timedelta(minutes=1),
+        )
+        _add_intake(
+            session,
+            "registered-submission",
+            artifactclass="s-masters",
+            created_at=base + dt.timedelta(minutes=2),
+        )
+        submission_item = _add_item(
+            session,
+            intake_id="registered-submission",
+            digest=submission_hash,
+            artifactclass="s-masters",
+            virtual_path="submitted/clip.mov",
+            as_received_path="/card/submitted/clip.mov",
+            created_at=base + dt.timedelta(minutes=2),
+        )
+        _add_archived_submission_member(
+            session,
+            item=submission_item,
+            submission_id="stage-submission",
+            artifactclass="s-masters",
+            created_at=base + dt.timedelta(minutes=3),
+        )
+        _add_intake(
+            session,
+            "registered-unarchived",
+            artifactclass="s-masters",
+            created_at=base + dt.timedelta(minutes=4),
+        )
+        _add_item(
+            session,
+            intake_id="registered-unarchived",
+            digest=unarchived_hash,
+            artifactclass="s-masters",
+            virtual_path="plain/clip.mov",
+            as_received_path="/card/plain/clip.mov",
+            created_at=base + dt.timedelta(minutes=4),
+        )
+        _add_intake(
+            session,
+            "quarantined-stage",
+            artifactclass="s-masters",
+            created_at=base + dt.timedelta(minutes=5),
+            status=IntakeStatus.QUARANTINED,
+        )
+        _add_intake(
+            session,
+            "verifying-with-evidence",
+            artifactclass="s-masters",
+            created_at=base + dt.timedelta(minutes=6),
+            status=IntakeStatus.VERIFYING,
+        )
+        _add_item(
+            session,
+            intake_id="verifying-with-evidence",
+            digest=bundle_hash,
+            artifactclass="s-masters",
+            virtual_path="verifying/clip.mov",
+            as_received_path="/card/verifying/clip.mov",
+            created_at=base + dt.timedelta(minutes=6),
+        )
+        bundle = _add_bundle(
+            session,
+            "stage-sealed-bundle",
+            artifactclass="s-masters",
+            status="sealed",
+            total_bytes=10,
+            member_count=1,
+            opened_at=base + dt.timedelta(minutes=7),
+            sealed_at=base + dt.timedelta(minutes=8),
+        )
+        _add_bundle_member(session, bundle, bundle_hash, size=10)
+    client = TestClient(make_api_app(api_engine))
+
+    archived = client.get("/api/ui/intakes?stage=archived&limit=10", headers=auth_headers("viewer"))
+    unarchived = client.get(
+        "/api/ui/intakes?stage=registered_unarchived&limit=10",
+        headers=auth_headers("viewer"),
+    )
+    quarantined = client.get(
+        "/api/ui/intakes?status=quarantined&limit=10",
+        headers=auth_headers("viewer"),
+    )
+    verifying = client.get(
+        "/api/ui/intakes?status=verifying&limit=10",
+        headers=auth_headers("viewer"),
+    )
+    contradictory = client.get(
+        "/api/ui/intakes?status=quarantined&stage=archived&limit=10",
+        headers=auth_headers("viewer"),
+    )
+    bad_stage = client.get("/api/ui/intakes?stage=done", headers=auth_headers("viewer"))
+
+    assert archived.status_code == 200
+    archived_body = archived.json()
+    assert archived_body["total"] == 2
+    assert archived_body["truncated"] is False
+    assert [row["intake_id"] for row in archived_body["intakes"]] == [
+        "registered-submission",
+        "registered-bundle",
+    ]
+    assert all(row["status"] == "registered" for row in archived_body["intakes"])
+
+    assert unarchived.status_code == 200
+    assert unarchived.json()["total"] == 1
+    assert unarchived.json()["truncated"] is False
+    assert [row["intake_id"] for row in unarchived.json()["intakes"]] == [
+        "registered-unarchived"
+    ]
+
+    assert quarantined.status_code == 200
+    assert quarantined.json()["total"] == 1
+    assert quarantined.json()["intakes"][0]["intake_id"] == "quarantined-stage"
+    assert verifying.status_code == 200
+    assert verifying.json()["total"] == 1
+    assert verifying.json()["intakes"][0]["intake_id"] == "verifying-with-evidence"
+    assert contradictory.status_code == 200
+    assert contradictory.json() == {"total": 0, "truncated": False, "intakes": []}
+    assert bad_stage.status_code == 400
+    assert bad_stage.json()["detail"]["error"] == "bad_request"
 
 
 def test_archive_bundle_and_submission_contracts_and_status_vocabularies(
@@ -476,6 +623,7 @@ def test_p4_read_models_require_can_view(api_engine: Engine) -> None:
 
     for path in (
         "/api/ui/intakes",
+        "/api/ui/intakes?stage=archived",
         "/api/ui/intakes/any",
         "/api/ui/archive/bundles",
         "/api/ui/archive/submissions",
@@ -679,6 +827,55 @@ def _add_bundle_copy(
     session.add(copy)
     session.flush([copy])
     return copy
+
+
+def _add_archived_submission_member(
+    session: Any,
+    *,
+    item: IngestItem,
+    submission_id: str,
+    artifactclass: str,
+    created_at: dt.datetime,
+) -> Submission:
+    arrangement = Arrangement(
+        label=f"Arrangement {submission_id}",
+        intake_id=item.intake_id,
+        artifactclass=artifactclass,
+        status=ArrangementStatus.SUBMITTED,
+        created_at=created_at,
+        updated_at=created_at,
+        submitted_at=created_at,
+    )
+    session.add(arrangement)
+    session.flush([arrangement])
+    submission = Submission(
+        id=submission_id,
+        arrangement_id=arrangement.id,
+        artifactclass=artifactclass,
+        source_map_path=f"/var/lib/replica/submissions/{submission_id}/source-map.tsv",
+        manifest_digest="b" * 64,
+        member_count=1,
+        status=SubmissionStatus.ARCHIVED,
+        submitted_by="owner",
+        submitted_at=created_at,
+        archived_at=created_at,
+    )
+    session.add(submission)
+    session.flush([submission])
+    session.add(
+        SubmissionMember(
+            submission_id=submission_id,
+            ingest_item_id=item.id,
+            archive_path=item.virtual_path,
+            source_path=str(item.item_metadata["source_path"]),
+            sha256=item.logical_asset_hash,
+            size_bytes=item.size_bytes,
+            ord=0,
+        )
+    )
+    arrangement.submission_id = submission_id
+    session.flush()
+    return submission
 
 
 def _add_submission_fixture(

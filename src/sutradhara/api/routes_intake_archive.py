@@ -36,6 +36,7 @@ from sutradhara.catalog.models import (
     Intake,
     LogicalAsset,
     Submission,
+    SubmissionMember,
 )
 from sutradhara.catalog.session import session_scope
 from sutradhara.catalog.types import (
@@ -51,6 +52,7 @@ router = APIRouter()
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
 INTAKE_STATUSES = frozenset(status.value for status in IntakeStatus)
+INTAKE_STAGES = frozenset({"archived", "registered_unarchived"})
 BUNDLE_STATUSES = frozenset({"open", "flushing", "sealed", "held", "aborted"})
 SUBMISSION_STATUSES = frozenset(status.value for status in SubmissionStatus)
 HEALTH_PRIORITY = {
@@ -87,6 +89,7 @@ class _CopyRollup:
 def get_intakes(
     request: Request,
     status: str | None = None,
+    stage: str | None = None,
     days: str | None = None,
     limit: str | None = None,
 ) -> dict[str, object]:
@@ -94,6 +97,7 @@ def get_intakes(
 
     require_view(parse_identity(request.headers))
     status_filter = _optional_enum(status, INTAKE_STATUSES, field="status")
+    stage_filter = _optional_enum(stage, INTAKE_STAGES, field="stage")
     days_filter = _optional_days(days)
     page_limit = _parse_limit(limit)
     with session_scope(request.app.state.engine) as session:
@@ -111,6 +115,13 @@ def get_intakes(
         )
         if status_filter is not None:
             query = query.where(Intake.status == status_filter)
+        if stage_filter is not None:
+            archive_evidence = _intake_archive_evidence_exists()
+            query = query.where(Intake.status == IntakeStatus.REGISTERED.value)
+            if stage_filter == "archived":
+                query = query.where(archive_evidence)
+            elif stage_filter == "registered_unarchived":
+                query = query.where(~archive_evidence)
         if days_filter is not None:
             query = query.where(Intake.created_at >= days_filter)
         rows = list(session.execute(query))
@@ -306,6 +317,34 @@ def _intake_aggregates_subquery() -> Any:
         .group_by(IngestItem.intake_id)
         .subquery()
     )
+
+
+def _intake_archive_evidence_exists() -> Any:
+    """Return the normative archived-stage evidence predicate for one intake."""
+
+    sealed_bundle_evidence = (
+        select(1)
+        .select_from(IngestItem)
+        .join(BundleMember, BundleMember.logical_asset_hash == IngestItem.logical_asset_hash)
+        .join(Bundle, Bundle.id == BundleMember.bundle_id)
+        .where(
+            IngestItem.intake_id == Intake.intake_id,
+            Bundle.status == "sealed",
+        )
+        .exists()
+    )
+    archived_submission_evidence = (
+        select(1)
+        .select_from(IngestItem)
+        .join(SubmissionMember, SubmissionMember.ingest_item_id == IngestItem.id)
+        .join(Submission, Submission.id == SubmissionMember.submission_id)
+        .where(
+            IngestItem.intake_id == Intake.intake_id,
+            Submission.status == SubmissionStatus.ARCHIVED.value,
+        )
+        .exists()
+    )
+    return or_(sealed_bundle_evidence, archived_submission_evidence)
 
 
 def _intake_row(session: Any, intake_id: str) -> tuple[Intake, int, int] | None:
