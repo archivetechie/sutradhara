@@ -209,7 +209,7 @@ def test_unmapped_privacy_denies_and_emits_alarm(engine: Engine, tmp_path: Path)
                 asset_hash=digest,
                 artifactclass="private",
                 destination=tmp_path / "out.mov",
-                identity_or_override=_identity("sutradhara-operator|sutradhara-restore-p3"),
+                identity_or_override=_identity("sutradhara-ingest|sutradhara-restore-p3"),
                 config=config,
             )
     assert excinfo.value.detail == "privacy level p4 unmapped (config error)"
@@ -232,7 +232,7 @@ def test_strictest_privacy_wins_across_classes(engine: Engine, tmp_path: Path) -
                 asset_hash=digest,
                 artifactclass="public",
                 destination=tmp_path / "out.mov",
-                identity_or_override=_identity("sutradhara-operator|sutradhara-restore-p2"),
+                identity_or_override=_identity("sutradhara-ingest|sutradhara-restore-p2"),
             )
     assert excinfo.value.detail == "requires sutradhara-restore-p3"
 
@@ -270,14 +270,14 @@ def test_validity_gate_applies_to_cache_and_tape_branches(
                 asset_hash=digest,
                 artifactclass="s-masters",
                 destination=tmp_path / "tape.mov",
-                identity_or_override=_identity("sutradhara-operator"),
+                identity_or_override=_identity("sutradhara-ingest"),
             )
         tape_plan = resolve_read_source(
             session,
             asset_hash=digest,
             artifactclass="s-masters",
             destination=tmp_path / "tape.mov",
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             **force_kwargs,
         )
         assert tape_plan.source == "tape"
@@ -289,14 +289,14 @@ def test_validity_gate_applies_to_cache_and_tape_branches(
                 asset_hash=digest,
                 artifactclass="s-masters",
                 destination=tmp_path / "cache.mov",
-                identity_or_override=_identity("sutradhara-operator"),
+                identity_or_override=_identity("sutradhara-ingest"),
             )
         restored = restore_to_path(
             session,
             asset_hash=digest,
             artifactclass="s-masters",
             destination=tmp_path / "cache.mov",
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             backends={backend_id: memory},
             config=_config(tmp_path),
             **force_kwargs,
@@ -335,7 +335,7 @@ def test_admission_validity_denial_details_are_api_safe(
 
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters")],
             config=_config(root),
@@ -459,7 +459,7 @@ def test_request_admission_and_sequential_serve_persist_contract_states(
         config = _config(root, restore_backends={backend_id: memory})
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[
                 RestoreItemSpec(public_digest, "s-masters"),
@@ -487,7 +487,7 @@ def test_request_admission_and_sequential_serve_persist_contract_states(
         serve_restore_request(
             session,
             request,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=config,
         )
         session.flush()
@@ -531,7 +531,7 @@ def test_forged_queued_row_without_admission_inputs_is_refused(
             serve_restore_item(
                 session,
                 item,
-                identity_or_override=_identity("sutradhara-operator"),
+                identity_or_override=_identity("sutradhara-ingest"),
                 force_suspect=True,
                 force_rejected=True,
                 config=_config(root),
@@ -556,7 +556,7 @@ def test_admitted_force_flags_are_used_at_serve_when_caller_differs(
         asset.validity_note = "operator accepted warning"
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters")],
             force_suspect=True,
@@ -566,7 +566,7 @@ def test_admitted_force_flags_are_used_at_serve_when_caller_differs(
         serve_restore_request(
             session,
             request,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             force_suspect=False,
             force_rejected=True,
             config=_config(root, restore_backends={backend_id: memory}),
@@ -589,7 +589,7 @@ def test_force_flags_requested_while_asset_ok_do_not_waive_later_rejection(
         digest, backend_id, memory = _seed_archived_asset(session, data=b"later rejected")
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters")],
             force_suspect=True,
@@ -608,7 +608,7 @@ def test_force_flags_requested_while_asset_ok_do_not_waive_later_rejection(
         serve_restore_request(
             session,
             request,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             force_rejected=True,
             config=_config(root, restore_backends={backend_id: memory}),
         )
@@ -635,7 +635,7 @@ def test_suspect_waiver_at_admission_does_not_waive_later_rejection(
         asset.validity_note = "decode warning"
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters")],
             force_suspect=True,
@@ -652,7 +652,7 @@ def test_suspect_waiver_at_admission_does_not_waive_later_rejection(
         serve_restore_request(
             session,
             request,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(root, restore_backends={backend_id: memory}),
         )
 
@@ -677,7 +677,7 @@ def test_request_state_is_active_only_while_item_is_serving(
         config = _config(root)
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters")],
             config=config,
@@ -712,7 +712,7 @@ def test_request_state_is_active_only_while_item_is_serving(
         serve_restore_request(
             session,
             request,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=config,
         )
 
@@ -733,7 +733,7 @@ def test_terminal_item_transition_updates_parent_request_state(
         config = _config(root)
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters")],
             config=config,
@@ -797,7 +797,7 @@ def test_restore_item_progress_advances_while_cache_stream_publishes(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(root),
         )
 
@@ -836,7 +836,7 @@ def test_restore_item_progress_advances_while_tape_stream_publishes(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(root, restore_backends={backend_id: memory}),
         )
 
@@ -875,7 +875,7 @@ def test_wake_window_marks_only_rolling_cache_items(
             digests.append(digest)
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters") for digest in digests],
             config=_config(root),
@@ -884,7 +884,7 @@ def test_wake_window_marks_only_rolling_cache_items(
         serve_restore_request(
             session,
             request,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=RestoreConfig(
                 destinations=_config(root).destinations,
                 stream_pool_size=2,
@@ -949,7 +949,7 @@ def test_parallel_serve_respects_publish_stream_pool(
             digests.append(digest)
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters") for digest in digests],
             config=_config(root),
@@ -963,7 +963,7 @@ def test_parallel_serve_respects_publish_stream_pool(
         serve_restore_request(
             session,
             request,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=RestoreConfig(
                 destinations=_config(root).destinations,
                 stream_pool_size=6,
@@ -1022,7 +1022,7 @@ def test_parallel_serve_respects_aead_subcap(
             digests.append(digest)
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters") for digest in digests],
             config=_config(root),
@@ -1036,7 +1036,7 @@ def test_parallel_serve_respects_aead_subcap(
         serve_restore_request(
             session,
             request,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=RestoreConfig(
                 destinations=_config(root).destinations,
                 stream_pool_size=6,
@@ -1097,7 +1097,7 @@ def test_deadline_fallback_trips_breaker_without_lost_marking(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(
                 root,
                 restore_backends={backend_id: memory},
@@ -1162,7 +1162,7 @@ def test_hung_identity_check_falls_back_with_breaker_without_lost_marking(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(
                 root,
                 restore_backends={backend_id: memory},
@@ -1247,7 +1247,7 @@ def test_repeated_hung_disk_restore_uses_one_recovery_generation(
         first_result = serve_restore_item(
             session,
             first,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=config,
         )
         assert first_result.source == "tape"
@@ -1260,7 +1260,7 @@ def test_repeated_hung_disk_restore_uses_one_recovery_generation(
         second_result = serve_restore_item(
             session,
             second,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=config,
         )
 
@@ -1309,7 +1309,7 @@ def test_half_open_probe_reactivates_disk_and_resets_breaker(
             asset_hash=digest,
             artifactclass="s-masters",
             destination=root / digest.hex(),
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(
                 root,
                 events=events,
@@ -1365,7 +1365,7 @@ def test_recovery_probe_refuses_retiring_and_dead_disks_without_touching_disk(
                 asset_hash=digest,
                 artifactclass="s-masters",
                 destination=root / digest.hex(),
-                identity_or_override=_identity("sutradhara-operator"),
+                identity_or_override=_identity("sutradhara-ingest"),
                 config=_config(
                     root,
                     breaker=breaker,
@@ -1475,7 +1475,7 @@ def test_untrusted_cache_hit_promotes_after_verified_serve(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(root),
         )
         assert result.source == "cache"
@@ -1502,7 +1502,7 @@ def test_cache_content_mismatch_falls_back_to_tape_with_audit_and_lost_marking(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(root, restore_backends={backend_id: memory}, events=events),
         )
         assert result.source == "tape"
@@ -1530,7 +1530,7 @@ def test_cache_entry_enoent_falls_back_without_lost_marking(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(
                 root,
                 restore_backends={backend_id: memory},
@@ -1570,7 +1570,7 @@ def test_unverified_cache_disk_identity_falls_back_without_lost_or_delete(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(root, restore_backends={backend_id: memory}, events=events),
         )
 
@@ -1629,7 +1629,7 @@ def test_cache_fallback_state_is_observable_before_tape_work(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(root),
         )
 
@@ -1662,7 +1662,7 @@ def test_cache_lost_mark_failure_audits_and_still_falls_back_to_tape(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(root, restore_backends={backend_id: memory}, events=events),
         )
 
@@ -1713,7 +1713,7 @@ def test_absent_disk_falls_back_without_lost_marking_or_accounting_release(
         result = serve_restore_item(
             session,
             item,
-            identity_or_override=_identity("sutradhara-operator"),
+            identity_or_override=_identity("sutradhara-ingest"),
             config=_config(root, restore_backends={backend_id: memory}),
         )
         assert result.source == "tape"
@@ -1736,7 +1736,7 @@ def test_gated_request_item_tape_serve_uses_admission_validity(
         asset.validity_note = "forced at admission"
         request = admit_restore_request(
             session,
-            identity=_identity("sutradhara-operator"),
+            identity=_identity("sutradhara-ingest"),
             destination_id="media-server",
             items=[RestoreItemSpec(digest, "s-masters")],
             force_suspect=True,

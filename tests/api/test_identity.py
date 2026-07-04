@@ -16,8 +16,6 @@ from sutradhara.api.identity import parse_identity
         ("sutradhara-admin", "admin", ("can_view", "can_admin")),
         ("sutradhara-restore-p2", None, ("can_restore_p2",)),
         ("sutradhara-restore-p3", None, ("can_restore_p2", "can_restore_p3")),
-        ("sutradhara-operator", "ingest", ("can_view", "can_receive")),
-        ("sutradhara-viewer", "oversight", ("can_view",)),
     ],
 )
 def test_parse_identity_single_group_capabilities(
@@ -101,29 +99,21 @@ def test_parse_identity_display_role_uses_precedence_not_gates() -> None:
     )
 
 
-def test_parse_identity_old_aliases_resolve_to_new_group_capabilities() -> None:
-    ingest = parse_identity({"X-Authentik-Groups": "sutradhara-ingest"})
-    operator = parse_identity({"X-Authentik-Groups": "sutradhara-operator"})
-    ingest_p3 = parse_identity(
-        {"X-Authentik-Groups": "sutradhara-ingest|sutradhara-restore-p3"}
-    )
-    operator_p3 = parse_identity(
+@pytest.mark.parametrize("group", ["sutradhara-operator", "sutradhara-viewer"])
+def test_parse_identity_old_group_names_grant_no_capabilities(group: str) -> None:
+    identity = parse_identity({"X-Authentik-Groups": group})
+
+    assert identity.role is None
+    assert identity.capabilities == ()
+
+
+def test_parse_identity_old_group_name_in_union_grants_nothing_itself() -> None:
+    identity = parse_identity(
         {"X-Authentik-Groups": "sutradhara-operator|sutradhara-restore-p3"}
     )
-    oversight = parse_identity({"X-Authentik-Groups": "sutradhara-oversight"})
-    viewer = parse_identity({"X-Authentik-Groups": "sutradhara-viewer"})
 
-    assert operator.role == ingest.role == "ingest"
-    assert operator.capabilities == ingest.capabilities == ("can_view", "can_receive")
-    assert operator_p3.role == ingest_p3.role == "ingest"
-    assert operator_p3.capabilities == ingest_p3.capabilities == (
-        "can_view",
-        "can_receive",
-        "can_restore_p2",
-        "can_restore_p3",
-    )
-    assert viewer.role == oversight.role == "oversight"
-    assert viewer.capabilities == oversight.capabilities == ("can_view",)
+    assert identity.role is None
+    assert identity.capabilities == ("can_restore_p2", "can_restore_p3")
 
 
 def test_parse_identity_admin_does_not_imply_receive_or_restore() -> None:

@@ -66,4 +66,8 @@ def post_headers(role: str = "operator") -> dict[str, str]:
 def _group_header_value(role: str) -> str:
     if role.startswith("sutradhara-") or "|" in role:
         return role
+    if role == "operator":
+        return "sutradhara-ingest"
+    if role == "viewer":
+        return "sutradhara-oversight"
     return f"sutradhara-{role}"

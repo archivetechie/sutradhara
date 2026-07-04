@@ -16,10 +16,7 @@ dvarapala and system-ui land separately. Status: implemented (2026-07-04; diff g
      `-p2`/`-p3` = the privacy cap **only** (no view/restore alone — §7-N); p3 ⊇ p2 preserved.
    - New capability `can_restore`. `role` becomes a **display-only** precedence label
      (admin > restore > ingest > oversight); nothing gates on `role`.
-   - **Old group names must keep working during migration**: accept `sutradhara-operator` as
-     alias for `-ingest` and `sutradhara-viewer` for `-oversight` (marked deprecated in the
-     map), so a not-yet-migrated member is not stranded (§6-P1 lockout rule). Emit no alias in
-     `/api/session` output — capabilities only, as today.
+   - **Post-migration amendment:** aliases removed post-migration @this commit; `sutradhara-operator`/`sutradhara-viewer` now grant no role or capabilities.
 2. **Tighten `POST /api/ui/restores` from `can_view` to `can_restore`** (§7-C): new
    `_require_restore` in `routes_restore.py` (mirror `_require_view`/`_require_admin`
    pattern at `routes_restore.py:223`). Per-item p2/p3 admission gates unchanged.
@@ -27,12 +24,12 @@ dvarapala and system-ui land separately. Status: implemented (2026-07-04; diff g
    (record as design decision §7-C), and note the **additive** future `/api/ui/reconciliation`
    extension (design B4) as a planned amendment — do not implement the extension in P1.
 4. **Tests** (extend the existing identity/API test modules):
-   - each single group → exact capability set (all six groups incl. aliases);
+   - each single group → exact capability set (all six new groups);
    - unions: Ingest+Restore, Admin+Ingest, Restore+p3, Restore+p2;
    - negatives: admin alone has no receive/restore; `-p2`/`-p3` alone → cap only (no
      view/restore); unknown group (`sutradhara-admin-extra`) → nothing; empty groups → no caps;
    - POST /api/ui/restores: 403 for `can_view`-only session, 2xx path for `can_restore`;
-   - old-name alias resolves to the same capabilities as the new name.
+   - old group names grant no capabilities.
 
 ## Constraints
 - Do NOT rename or add gates on any other endpoint in P1 (the §2.4 table's other **fix** rows

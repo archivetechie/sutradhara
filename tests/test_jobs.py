@@ -1412,7 +1412,7 @@ def _register_restore_request_item(
                 identity=parse_identity(
                     {
                         "X-Authentik-Username": "owner",
-                        "X-Authentik-Groups": "sutradhara-operator",
+                        "X-Authentik-Groups": "sutradhara-ingest",
                     }
                 ),
                 destination_id="media-server",

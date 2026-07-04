@@ -11,17 +11,11 @@ OVERSIGHT_GROUP = "sutradhara-oversight"
 ADMIN_GROUP = "sutradhara-admin"
 RESTORE_P2_GROUP = "sutradhara-restore-p2"
 RESTORE_P3_GROUP = "sutradhara-restore-p3"
-VIEWER_GROUP = "sutradhara-viewer"
-OPERATOR_GROUP = "sutradhara-operator"
 
 GROUP_CAPABILITIES: dict[str, tuple[str, ...]] = {
     INGEST_GROUP: ("can_view", "can_receive"),
-    # Deprecated migration alias for sutradhara-ingest.
-    OPERATOR_GROUP: ("can_view", "can_receive"),
     RESTORE_GROUP: ("can_view", "can_restore"),
     OVERSIGHT_GROUP: ("can_view",),
-    # Deprecated migration alias for sutradhara-oversight.
-    VIEWER_GROUP: ("can_view",),
     ADMIN_GROUP: ("can_view", "can_admin"),
     RESTORE_P2_GROUP: ("can_restore_p2",),
     RESTORE_P3_GROUP: ("can_restore_p2", "can_restore_p3"),
@@ -30,8 +24,8 @@ GROUP_CAPABILITIES: dict[str, tuple[str, ...]] = {
 _DISPLAY_ROLE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("admin", (ADMIN_GROUP,)),
     ("restore", (RESTORE_GROUP,)),
-    ("ingest", (INGEST_GROUP, OPERATOR_GROUP)),
-    ("oversight", (OVERSIGHT_GROUP, VIEWER_GROUP)),
+    ("ingest", (INGEST_GROUP,)),
+    ("oversight", (OVERSIGHT_GROUP,)),
 )
 
 
