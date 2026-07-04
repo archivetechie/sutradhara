@@ -3,7 +3,7 @@
 **Repo:** `~/sutradhara/repo` (work here only). **Single source (normative):**
 `~/system-ui/docs/design-console-excellence.md` — read §2 (whole), §6-P1, §7-N/§7-B/§7-C/§7-F
 before writing code. This prompt implements the *server* member of the atomic three-repo P1;
-dvarapala and system-ui land separately. Status: pending.
+dvarapala and system-ui land separately. Status: implemented (2026-07-04; diff gate PASS; P1 browser-QA PASS).
 
 ## Tasks
 1. **Refactor `src/sutradhara/api/identity.py` to a flat `GROUP_CAPABILITIES` map +
