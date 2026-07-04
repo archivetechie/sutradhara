@@ -187,6 +187,13 @@ def test_library_tapes_grouping_opacity_admin_shaping_and_offsite_match(
                 confirmed_at=verified,
             )
         )
+        session.add(
+            OffsiteConfirmation(
+                media_id="D2T001L7",
+                confirmed_by="ops",
+                confirmed_at=verified,
+            )
+        )
     app = make_api_app(api_engine)
     app.state.remanence_tape_catalog = [
         {"tape_uuid": tape_uuid, "media_id": "VOL001", "library": "mainlib"},
@@ -217,6 +224,7 @@ def test_library_tapes_grouping_opacity_admin_shaping_and_offsite_match(
     assert rem_row["library"] == "mainlib"
     assert rem_row["last_verified_at"] == (verified + dt.timedelta(minutes=5)).isoformat()
     assert rem_row["offsite_confirmed"] is True
+    assert admin_by_media["D2T001L7"]["offsite_confirmed"] is False
     assert rem_row["tape_key"].startswith("tape_")
     assert "VOL001" not in rem_row["tape_key"]
     viewer_keys = {row["backend_name"]: row["tape_key"] for row in viewer_body["tapes"]}

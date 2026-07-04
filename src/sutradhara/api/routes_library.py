@@ -359,7 +359,13 @@ def _tape_key(group: _TapeGroup) -> str:
 
 
 def _is_offsite_confirmed(media_id: str, confirmed_media_ids: set[str]) -> bool:
-    return media_id in confirmed_media_ids or f"tape:{media_id}" in confirmed_media_ids
+    return _canonical_offsite_media_id(media_id) in confirmed_media_ids
+
+
+def _canonical_offsite_media_id(media_id: str) -> str:
+    """Return the OffsiteConfirmation.media_id form written by offsite confirm."""
+
+    return f"tape:{media_id}"
 
 
 def _health_rollup(health_by_copy: dict[int, str]) -> str:
