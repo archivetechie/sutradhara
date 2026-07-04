@@ -4,7 +4,7 @@
 `~/system-ui/docs/design-console-excellence.md` §4.4 (shapes verbatim incl. every note),
 §4 conventions, §6-P5, §7-E/§7-H — read before writing. Reuse the shared console helpers
 (`api/console.py`) and the admin-shaping pattern from P3/P4.
-Status: pending.
+Status: implemented (2026-07-04; diff gate PASS; offsite canonical byte-match fix @b44c757).
 
 ## Tasks
 1. **Contract doc `docs/contract-library-readmodel.md`** (copy §4.4 shapes + notes; register
