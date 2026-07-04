@@ -18,13 +18,14 @@ def test_session_returns_identity_without_raw_groups(api_engine: Engine) -> None
     assert body == {
         "operatorUsername": "owner",
         "displayName": "Ada Operator",
-        "role": "operator",
+        "role": "ingest",
         "capabilities": ["can_view", "can_receive"],
     }
     assert "groups" not in body
+    assert "sutradhara-operator" not in str(body)
 
 
-def test_session_missing_groups_is_forbidden(api_engine: Engine) -> None:
+def test_session_missing_groups_reports_no_capabilities(api_engine: Engine) -> None:
     client = TestClient(make_api_app(api_engine))
 
     response = client.get(
@@ -32,5 +33,10 @@ def test_session_missing_groups_is_forbidden(api_engine: Engine) -> None:
         headers={"X-Authentik-Username": "owner", "X-Authentik-Name": "Ada Operator"},
     )
 
-    assert response.status_code == 403
-    assert response.json()["error"] == "forbidden"
+    assert response.status_code == 200
+    assert response.json() == {
+        "operatorUsername": "owner",
+        "displayName": "Ada Operator",
+        "role": None,
+        "capabilities": [],
+    }

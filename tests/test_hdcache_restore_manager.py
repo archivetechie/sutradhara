@@ -99,16 +99,16 @@ def engine(tmp_path: Path) -> Iterator[Engine]:
 
 
 def test_identity_restore_grants_are_additive_and_admin_not_implicit() -> None:
-    p3_operator = parse_identity(
+    p3_restore = parse_identity(
         {
             "X-Authentik-Username": "owner",
-            "X-Authentik-Groups": "sutradhara-operator|sutradhara-restore-p3",
+            "X-Authentik-Groups": "sutradhara-restore|sutradhara-restore-p3",
         }
     )
-    assert p3_operator.role == "operator"
-    assert p3_operator.capabilities == (
+    assert p3_restore.role == "restore"
+    assert p3_restore.capabilities == (
         "can_view",
-        "can_receive",
+        "can_restore",
         "can_restore_p2",
         "can_restore_p3",
     )
@@ -119,34 +119,36 @@ def test_identity_restore_grants_are_additive_and_admin_not_implicit() -> None:
             "X-Authentik-Groups": "sutradhara-admin",
         }
     )
-    assert admin.capabilities == ("can_view", "can_receive", "can_admin")
+    assert admin.capabilities == ("can_view", "can_admin")
+    assert not admin.has_capability("can_receive")
+    assert not admin.has_capability("can_restore")
 
 
 @pytest.mark.parametrize(
     ("privacy", "groups", "allowed", "detail"),
     [
-        ("p2", "sutradhara-operator", False, "requires sutradhara-restore-p2"),
+        ("p2", "sutradhara-restore", False, "requires sutradhara-restore-p2"),
         (
             "p2",
-            "sutradhara-operator|sutradhara-restore-p2",
+            "sutradhara-restore|sutradhara-restore-p2",
             True,
             None,
         ),
         (
             "p2",
-            "sutradhara-operator|sutradhara-restore-p3",
+            "sutradhara-restore|sutradhara-restore-p3",
             True,
             None,
         ),
         (
             "p3",
-            "sutradhara-operator|sutradhara-restore-p2",
+            "sutradhara-restore|sutradhara-restore-p2",
             False,
             "requires sutradhara-restore-p3",
         ),
         (
             "p3",
-            "sutradhara-operator|sutradhara-restore-p3",
+            "sutradhara-restore|sutradhara-restore-p3",
             True,
             None,
         ),

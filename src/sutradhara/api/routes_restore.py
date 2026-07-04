@@ -73,7 +73,7 @@ def get_restore_destinations(request: Request) -> dict[str, object]:
 def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
     """Create a restore request; inadmissible cart items become denied rows."""
 
-    identity = _require_view(parse_identity(request.headers))
+    identity = _require_restore(parse_identity(request.headers))
     destination_id = payload.get("destination_id")
     if not isinstance(destination_id, str) or not destination_id:
         _raise(400, "bad_request", "destination_id is required")
@@ -223,6 +223,13 @@ def _with_app_alarm_sink(config: RestoreConfig, engine: Engine) -> RestoreConfig
 def _require_view(identity: Identity) -> Identity:
     if not identity.has_capability("can_view"):
         _raise(403, "forbidden", "operator has no sutradhara role")
+    return identity
+
+
+def _require_restore(identity: Identity) -> Identity:
+    _require_view(identity)
+    if not identity.has_capability("can_restore"):
+        _raise(403, "forbidden", "your group doesn't permit this")
     return identity
 
 

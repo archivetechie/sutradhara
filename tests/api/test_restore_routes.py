@@ -55,6 +55,48 @@ def test_restore_destinations_contract_shape(api_engine: Engine, tmp_path: Path)
     }
 
 
+def test_restore_post_requires_can_restore(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    digest = hashlib.sha256(b"allowed").hexdigest()
+    _seed_asset(api_engine, bytes.fromhex(digest), privacy="none")
+    app = make_api_app(api_engine)
+    app.state.restore_config = RestoreConfig(
+        destinations={
+            "media-server": RestoreDestination(
+                id="media-server",
+                root=root,
+                label="Media server restore",
+                writable=True,
+            )
+        }
+    )
+    client = TestClient(app)
+    payload = {
+        "destination_id": "media-server",
+        "items": [{"content_sha256": digest, "artifactclass": "s-masters"}],
+    }
+
+    can_view_only = client.post(
+        "/api/ui/restores",
+        headers=post_headers("viewer"),
+        json=payload,
+    )
+    can_restore = client.post(
+        "/api/ui/restores",
+        headers=post_headers("restore"),
+        json=payload,
+    )
+
+    assert can_view_only.status_code == 403
+    assert can_view_only.json()["detail"]["error"] == "forbidden"
+    assert can_restore.status_code == 201
+    assert can_restore.json()["request_id"]
+
+
 def test_restore_post_mixed_cart_and_request_status_shapes(
     api_engine: Engine,
     tmp_path: Path,
@@ -80,7 +122,7 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
 
     response = client.post(
         "/api/ui/restores",
-        headers=post_headers("viewer"),
+        headers=post_headers("restore"),
         json={
             "destination_id": "media-server",
             "items": [
@@ -168,7 +210,7 @@ def test_restore_post_unknown_destination_and_malformed_payload(
 
     unknown = client.post(
         "/api/ui/restores",
-        headers=post_headers("viewer"),
+        headers=post_headers("restore"),
         json={
             "destination_id": "unknown",
             "items": [{"content_sha256": digest, "artifactclass": "s-masters"}],
@@ -176,7 +218,7 @@ def test_restore_post_unknown_destination_and_malformed_payload(
     )
     malformed = client.post(
         "/api/ui/restores",
-        headers=post_headers("viewer"),
+        headers=post_headers("restore"),
         json={"destination_id": "media-server", "items": []},
     )
 
@@ -214,11 +256,11 @@ def test_restore_post_idempotency_replays_same_request_and_rejects_different_bod
         "items": [{"content_sha256": digest, "artifactclass": "s-masters"}],
     }
 
-    first = client.post("/api/ui/restores", headers=post_headers("viewer"), json=payload)
-    replay = client.post("/api/ui/restores", headers=post_headers("viewer"), json=payload)
+    first = client.post("/api/ui/restores", headers=post_headers("restore"), json=payload)
+    replay = client.post("/api/ui/restores", headers=post_headers("restore"), json=payload)
     conflict = client.post(
         "/api/ui/restores",
-        headers=post_headers("viewer"),
+        headers=post_headers("restore"),
         json={
             **payload,
             "items": [{"content_sha256": other, "artifactclass": "s-masters"}],
@@ -265,7 +307,7 @@ def test_restore_post_manager_error_returns_sanitized_4xx(
 
     response = client.post(
         "/api/ui/restores",
-        headers=post_headers("viewer"),
+        headers=post_headers("restore"),
         json={
             "destination_id": "media-server",
             "items": [{"content_sha256": digest, "artifactclass": "s-masters"}],
@@ -402,7 +444,7 @@ def test_restore_post_unmapped_privacy_projects_alarm_via_app_config(
 
     created = client.post(
         "/api/ui/restores",
-        headers=post_headers("viewer"),
+        headers=post_headers("restore"),
         json={
             "destination_id": "media-server",
             "items": [{"content_sha256": digest, "artifactclass": "private"}],

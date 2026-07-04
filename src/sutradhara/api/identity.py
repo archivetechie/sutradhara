@@ -1,30 +1,37 @@
-"""Authentik header parsing and role/capability mapping for the HTTP API."""
+"""Authentik header parsing and group/capability mapping for the HTTP API."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-VIEWER_GROUP = "sutradhara-viewer"
-OPERATOR_GROUP = "sutradhara-operator"
+INGEST_GROUP = "sutradhara-ingest"
+RESTORE_GROUP = "sutradhara-restore"
+OVERSIGHT_GROUP = "sutradhara-oversight"
 ADMIN_GROUP = "sutradhara-admin"
 RESTORE_P2_GROUP = "sutradhara-restore-p2"
 RESTORE_P3_GROUP = "sutradhara-restore-p3"
+VIEWER_GROUP = "sutradhara-viewer"
+OPERATOR_GROUP = "sutradhara-operator"
 
-ROLE_CAPABILITIES: dict[str, tuple[str, ...]] = {
-    "viewer": ("can_view",),
-    "operator": ("can_view", "can_receive"),
-    "admin": ("can_view", "can_receive", "can_admin"),
-}
-RESTORE_GROUP_CAPABILITIES: dict[str, tuple[str, ...]] = {
+GROUP_CAPABILITIES: dict[str, tuple[str, ...]] = {
+    INGEST_GROUP: ("can_view", "can_receive"),
+    # Deprecated migration alias for sutradhara-ingest.
+    OPERATOR_GROUP: ("can_view", "can_receive"),
+    RESTORE_GROUP: ("can_view", "can_restore"),
+    OVERSIGHT_GROUP: ("can_view",),
+    # Deprecated migration alias for sutradhara-oversight.
+    VIEWER_GROUP: ("can_view",),
+    ADMIN_GROUP: ("can_view", "can_admin"),
     RESTORE_P2_GROUP: ("can_restore_p2",),
     RESTORE_P3_GROUP: ("can_restore_p2", "can_restore_p3"),
 }
 
-_ROLE_GROUPS: tuple[tuple[str, str], ...] = (
-    ("admin", ADMIN_GROUP),
-    ("operator", OPERATOR_GROUP),
-    ("viewer", VIEWER_GROUP),
+_DISPLAY_ROLE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("admin", (ADMIN_GROUP,)),
+    ("restore", (RESTORE_GROUP,)),
+    ("ingest", (INGEST_GROUP, OPERATOR_GROUP)),
+    ("oversight", (OVERSIGHT_GROUP, VIEWER_GROUP)),
 )
 
 
@@ -46,7 +53,7 @@ class Identity:
 def parse_identity(headers: Mapping[str, str] | Sequence[tuple[str, str]]) -> Identity:
     """Parse Authentik headers using exact pipe-delimited group matching.
 
-    Missing or empty groups deliberately produce no role/capabilities; callers
+    Missing or empty groups deliberately produce no capabilities; callers
     must fail closed for API access. Raw groups are kept inside the server only.
     """
 
@@ -55,8 +62,8 @@ def parse_identity(headers: Mapping[str, str] | Sequence[tuple[str, str]]) -> Id
     display_name = _nonempty(normalized.get("x-authentik-name")) or username
     email = _nonempty(normalized.get("x-authentik-email"))
     groups = _parse_groups(normalized.get("x-authentik-groups"))
-    role = _highest_role(groups)
-    capabilities = _capabilities_for(groups, role)
+    role = _display_role(groups)
+    capabilities = _capabilities_for(groups)
     return Identity(
         operator_username=username,
         display_name=display_name,
@@ -79,19 +86,19 @@ def _parse_groups(raw: str | None) -> tuple[str, ...]:
     return tuple(group.strip() for group in raw.split("|") if group.strip())
 
 
-def _highest_role(groups: tuple[str, ...]) -> str | None:
+def _display_role(groups: tuple[str, ...]) -> str | None:
     group_set = set(groups)
-    for role, group in _ROLE_GROUPS:
-        if group in group_set:
+    for role, role_groups in _DISPLAY_ROLE_GROUPS:
+        if group_set.intersection(role_groups):
             return role
     return None
 
 
-def _capabilities_for(groups: tuple[str, ...], role: str | None) -> tuple[str, ...]:
-    capabilities: list[str] = list(ROLE_CAPABILITIES.get(role, ()))
-    seen = set(capabilities)
+def _capabilities_for(groups: tuple[str, ...]) -> tuple[str, ...]:
+    capabilities: list[str] = []
+    seen: set[str] = set()
     group_set = set(groups)
-    for group, grants in RESTORE_GROUP_CAPABILITIES.items():
+    for group, grants in GROUP_CAPABILITIES.items():
         if group not in group_set:
             continue
         for grant in grants:

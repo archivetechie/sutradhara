@@ -149,7 +149,7 @@ def test_enroll_token_allows_admin_confirmed_rotation_without_live_stream(
 
     response = client.post(
         "/api/enroll/token",
-        headers=post_headers("admin"),
+        headers=post_headers("sutradhara-admin|sutradhara-ingest"),
         json={"device_id": "mac-1", "reenroll": True},
     )
 

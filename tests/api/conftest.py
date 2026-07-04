@@ -50,7 +50,7 @@ def auth_headers(role: str = "operator") -> dict[str, str]:
         "X-Authentik-Username": "owner",
         "X-Authentik-Name": "Ada Operator",
         "X-Authentik-Email": "owner@example.test",
-        "X-Authentik-Groups": f"sutradhara-{role}",
+        "X-Authentik-Groups": _group_header_value(role),
     }
 
 
@@ -61,3 +61,9 @@ def post_headers(role: str = "operator") -> dict[str, str]:
         "Host": "testserver",
         "Content-Type": "application/json",
     }
+
+
+def _group_header_value(role: str) -> str:
+    if role.startswith("sutradhara-") or "|" in role:
+        return role
+    return f"sutradhara-{role}"
