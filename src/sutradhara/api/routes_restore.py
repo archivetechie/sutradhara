@@ -5,22 +5,27 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
-import re
 from dataclasses import replace
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import Engine, select
 from sqlalchemy.exc import IntegrityError
 
+from sutradhara.api.console import (
+    iso_utc,
+    raise_console_error,
+    require_view,
+    sanitize_text,
+)
 from sutradhara.api.identity import Identity, parse_identity
 from sutradhara.catalog.session import session_scope
 from sutradhara.catalog.types import is_content_hash
 from sutradhara.hdcache.alarms import (
     ALARM_DOMAIN,
+    ALARM_OWNER,
     RestoreEventAlarmSink,
-    alarm_condition_payload,
     evaluate_hdcache_alarm_conditions,
     restore_event_alarm_sink,
 )
@@ -56,9 +61,6 @@ REQUEST_STATES = {
 }
 MAX_RESTORE_REQUEST_LIMIT = 200
 INVALID_RESTORE_DESTINATION_DETAIL = "restore destination is invalid"
-_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![\w.-])(?:[A-Za-z]:[\\/][^\s'\"<>\]\[{}(),;]*|/(?!/)[^\s'\"<>\]\[{}(),;]*)"
-)
 
 
 @router.get("/api/ui/restore-destinations")
@@ -190,7 +192,8 @@ def get_restore_request(request: Request, request_id: str) -> dict[str, object]:
 def get_reconciliation(request: Request) -> dict[str, object]:
     """Return active reconciliation/gap-board conditions."""
 
-    _require_view(parse_identity(request.headers))
+    identity = _require_view(parse_identity(request.headers))
+    is_admin = identity.has_capability("can_admin")
     with session_scope(request.app.state.engine) as session:
         evaluate_hdcache_alarm_conditions(session)
         rows = list(
@@ -200,7 +203,7 @@ def get_reconciliation(request: Request) -> dict[str, object]:
                 .order_by(ReconciliationCondition.domain, ReconciliationCondition.target_key)
             )
         )
-        return {"conditions": [_condition_payload(row) for row in rows]}
+        return {"conditions": [_condition_payload(row, is_admin=is_admin) for row in rows]}
 
 
 def _restore_config(request: Request) -> RestoreConfig:
@@ -221,9 +224,7 @@ def _with_app_alarm_sink(config: RestoreConfig, engine: Engine) -> RestoreConfig
 
 
 def _require_view(identity: Identity) -> Identity:
-    if not identity.has_capability("can_view"):
-        _raise(403, "forbidden", "operator has no sutradhara role")
-    return identity
+    return require_view(identity)
 
 
 def _require_restore(identity: Identity) -> Identity:
@@ -334,31 +335,100 @@ def _item_payload(item: RestoreRequestItem) -> dict[str, object]:
     }
 
 
-def _condition_payload(row: ReconciliationCondition) -> dict[str, object]:
-    if row.domain == ALARM_DOMAIN:
-        return alarm_condition_payload(row)
-    return {
-        "domain": row.domain,
-        "target_key": row.target_key,
-        "condition": row.condition,
-        "reason": row.reason,
-        "message": row.message,
-        "owner": None,
+def _condition_payload(row: ReconciliationCondition, *, is_admin: bool) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "domain": _sanitize_detail(row.domain),
+        "target_key": _sanitize_detail(row.target_key),
+        "condition": _sanitize_detail(row.condition),
+        "reason": None if row.reason is None else _sanitize_detail(row.reason),
+        "cause": _condition_cause(row),
+        "blocked_tool_name": (
+            None if row.blocked_tool_name is None else _sanitize_detail(row.blocked_tool_name)
+        ),
+        "blocked_tool_version": (
+            None
+            if row.blocked_tool_version is None
+            else _sanitize_detail(row.blocked_tool_version)
+        ),
+        "attempt_count": row.attempt_count,
+        "owner": ALARM_OWNER if row.domain == ALARM_DOMAIN else None,
         "updated_at": _iso(row.updated_at),
     }
+    if is_admin:
+        payload["message"] = None if row.message is None else _sanitize_detail(row.message)
+    return payload
+
+
+def _condition_cause(row: ReconciliationCondition) -> str:
+    reason = row.reason or row.condition
+    target = _sanitize_detail(row.target_key)
+    disk_id = _target_suffix(target)
+    if reason == "smart-degradation":
+        return (
+            f"SMART degradation detected on disk {disk_id}"
+            if disk_id
+            else "SMART degradation detected"
+        )
+    if reason == "capacity-over-reserve":
+        return (
+            f"Cache disk {disk_id} is over reserve capacity"
+            if disk_id
+            else "Cache disk is over reserve capacity"
+        )
+    if reason == "reserve-breach":
+        return (
+            f"Cache disk {disk_id} is below configured reserve"
+            if disk_id
+            else "Cache disk is below configured reserve"
+        )
+    if reason == "disk-unreachable":
+        return (
+            f"Cache disk {disk_id} is absent or unreachable"
+            if disk_id and disk_id != "restore"
+            else "Cache disk is absent or unreachable"
+        )
+    if reason == "walker-tripwire":
+        return (
+            f"Cache walker tripwire triggered on disk {disk_id}"
+            if disk_id
+            else "Cache walker tripwire triggered"
+        )
+    if reason == "lost-backlog":
+        return "Lost cache entries exceed the configured threshold"
+    if reason == "lost-backlog-growth":
+        return "Lost cache entry backlog is growing"
+    if reason == "fill-queue-stalled":
+        return "Hdcache fill queue is stalled"
+    if reason == "fallback-reason-spike":
+        return "Cache fallback activity increased"
+    if reason == "unmapped-privacy-level":
+        return "A privacy level is not mapped to a restore capability"
+    if reason == "handler-not-registered":
+        return "Required job handler is not registered"
+    if reason == "never-fit":
+        return "Required resources exceed worker capacity"
+    if row.blocked_tool_name:
+        return f"{_sanitize_detail(row.blocked_tool_name)} is blocking reconciliation"
+    phrase = _sanitize_detail(reason).replace("_", " ").replace("-", " ").strip()
+    return phrase[:1].upper() + phrase[1:] if phrase else "Reconciliation requires attention"
+
+
+def _target_suffix(target_key: str) -> str | None:
+    if ":" not in target_key:
+        return None
+    suffix = target_key.rsplit(":", 1)[1].strip()
+    return suffix or None
 
 
 def _iso(value: dt.datetime) -> str:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=dt.UTC)
-    return value.astimezone(dt.UTC).isoformat()
+    return iso_utc(value)
 
 
 def _raise(status_code: int, error: str, detail: str) -> None:
-    raise HTTPException(status_code=status_code, detail={"error": error, "detail": detail})
+    raise_console_error(status_code, error, detail)
 
 
 def _sanitize_detail(detail: str) -> str:
     """Remove host-local absolute paths from public restore API error details."""
 
-    return _ABSOLUTE_PATH_RE.sub("<path>", detail)
+    return sanitize_text(detail)

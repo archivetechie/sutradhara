@@ -25,7 +25,7 @@ from sutradhara.hdcache.manager import (
 from sutradhara.hdcache.models import RestoreRequest, RestoreRequestItem
 from sutradhara.hdcache.walker import HdcacheWalkerEvent
 from sutradhara.jobs.models import Job, ReconciliationCondition
-from sutradhara.jobs.reconcilers.conditions import CONDITION_OPEN
+from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED, CONDITION_OPEN
 from tests.api.conftest import auth_headers, make_api_app, post_headers
 
 
@@ -463,7 +463,7 @@ def test_restore_post_unmapped_privacy_projects_alarm_via_app_config(
     assert conditions["unmapped-privacy-level"]["reason"] == "unmapped-privacy-level"
 
 
-def test_reconciliation_endpoint_includes_hdcache_alarm_owner(
+def test_reconciliation_endpoint_shapes_message_by_admin_and_carries_blocked_fields(
     api_engine: Engine,
 ) -> None:
     with api_engine.begin() as conn:
@@ -480,22 +480,53 @@ def test_reconciliation_endpoint_includes_hdcache_alarm_owner(
                 "updated_at": dt.datetime(2026, 7, 3, tzinfo=dt.UTC),
             },
         )
+        conn.execute(
+            ReconciliationCondition.__table__.insert(),
+            {
+                "domain": "bundle_copy",
+                "target_key": "bundle:bundle-1",
+                "observed_state": "missing",
+                "condition": CONDITION_BLOCKED,
+                "reason": "not-implemented",
+                "message": "bundle repair requires /var/lib/replica/private/tool",
+                "attempt_count": 2,
+                "blocked_tool_name": "rem-debug",
+                "blocked_tool_version": "1.2.3",
+                "updated_at": dt.datetime(2026, 7, 3, tzinfo=dt.UTC),
+            },
+        )
     client = TestClient(make_api_app(api_engine))
 
-    response = client.get("/api/ui/reconciliation", headers=auth_headers("viewer"))
+    viewer = client.get("/api/ui/reconciliation", headers=auth_headers("viewer"))
+    admin = client.get("/api/ui/reconciliation", headers=auth_headers("admin"))
 
-    assert response.status_code == 200
-    assert response.json()["conditions"] == [
-        {
-            "domain": ALARM_DOMAIN,
-            "target_key": "unmapped-privacy-level",
-            "condition": "open",
-            "reason": "unmapped-privacy-level",
-            "message": "privacy level p4 unmapped",
-            "owner": "archive operator",
-            "updated_at": response.json()["conditions"][0]["updated_at"],
-        }
-    ]
+    assert viewer.status_code == 200
+    viewer_conditions = {row["target_key"]: row for row in viewer.json()["conditions"]}
+    alarm = viewer_conditions["unmapped-privacy-level"]
+    assert "message" not in alarm
+    assert alarm == {
+        "domain": ALARM_DOMAIN,
+        "target_key": "unmapped-privacy-level",
+        "condition": "open",
+        "reason": "unmapped-privacy-level",
+        "cause": "A privacy level is not mapped to a restore capability",
+        "blocked_tool_name": None,
+        "blocked_tool_version": None,
+        "attempt_count": 0,
+        "owner": "archive operator",
+        "updated_at": alarm["updated_at"],
+    }
+    blocked = viewer_conditions["bundle:bundle-1"]
+    assert "message" not in blocked
+    assert blocked["cause"] == "rem-debug is blocking reconciliation"
+    assert blocked["blocked_tool_name"] == "rem-debug"
+    assert blocked["blocked_tool_version"] == "1.2.3"
+    assert blocked["attempt_count"] == 2
+
+    assert admin.status_code == 200
+    admin_conditions = {row["target_key"]: row for row in admin.json()["conditions"]}
+    assert admin_conditions["unmapped-privacy-level"]["message"] == "privacy level p4 unmapped"
+    assert admin_conditions["bundle:bundle-1"]["message"] == "bundle repair requires <path>"
 
 
 def _seed_asset(engine: Engine, digest: bytes, *, privacy: str) -> None:

@@ -12,6 +12,7 @@ from sqlalchemy import Engine
 from sutradhara.api.routes_activity import router as activity_router
 from sutradhara.api.routes_devices import install_default_state as install_device_state
 from sutradhara.api.routes_devices import router as devices_router
+from sutradhara.api.routes_jobs import router as jobs_router
 from sutradhara.api.routes_receive import install_default_state
 from sutradhara.api.routes_receive import router as receive_router
 from sutradhara.api.routes_restore import router as restore_router
@@ -67,6 +68,8 @@ def create_app(
             (
                 request.url.path.startswith("/api/ui/restore")
                 or request.url.path == "/api/ui/reconciliation"
+                or request.url.path.startswith("/api/ui/jobs")
+                or request.url.path == "/api/ui/resources"
             )
             and isinstance(detail, dict)
             and {"error", "detail"} <= set(detail)
@@ -92,6 +95,7 @@ def create_app(
     app.include_router(devices_router)
     app.include_router(activity_router)
     app.include_router(restore_router)
+    app.include_router(jobs_router)
     return app
 
 

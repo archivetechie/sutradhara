@@ -3,7 +3,7 @@
 **Repo:** `~/sutradhara/repo` (work here only). **Normative source:**
 `~/system-ui/docs/design-console-excellence.md` §4.1 (shapes are normative — field lists
 verbatim), §4 conventions (envelope/sanitization/caps), §2.4 (gates), §6-P3 — read before
-writing. Status: pending.
+writing. Status: implemented 2026-07-04.
 
 ## Tasks
 1. **New contract doc `docs/contract-jobs-readmodel.md`** (single-sourced; copy the §4.1
