@@ -43,6 +43,18 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
             cert_fingerprint="AA" * 32,
             operator="owner",
         )
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="mac-offline",
+            cert_fingerprint="CC" * 32,
+            operator="owner",
+        )
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="other-offline",
+            cert_fingerprint="DD" * 32,
+            operator="other",
+        )
         grpc_store.insert_intake(
             session,
             intake_id="intake-1",
@@ -72,7 +84,25 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
 
     assert response.status_code == 200
     body = response.json()
+    assert body["registeredDevices"] == [
+        {
+            "deviceId": "mac-1",
+            "enrolledAs": "owner",
+            "enrollmentStatus": "active",
+            "online": True,
+            "lastSeenAt": body["devices"][0]["lastSeenAt"],
+        },
+        {
+            "deviceId": "mac-offline",
+            "enrolledAs": "owner",
+            "enrollmentStatus": "active",
+            "online": False,
+            "lastSeenAt": None,
+        },
+    ]
     assert [device["deviceId"] for device in body["devices"]] == ["mac-1"]
+    assert body["devices"][0]["enrolledAs"] == "owner"
+    assert body["devices"][0]["online"] is True
     assert body["devices"][0]["capabilities"] == ["browse"]
     assert body["devices"][0]["cards"][0]["cardId"] == "card-1"
     assert body["receives"] == [

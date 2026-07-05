@@ -101,17 +101,24 @@ class SimpleRateLimiter:
 
 @router.get("/api/devices")
 async def get_devices(request: Request) -> dict[str, object]:
-    """Return online devices and durable in-flight receives for the operator."""
+    """Return durable registrations, online devices, and in-flight receives."""
 
     identity = _require_view(parse_identity(request.headers))
     registry = _registry(request)
     devices = await anyio.to_thread.run_sync(registry.devices_for, identity.operator_username)
+    registered_devices = await anyio.to_thread.run_sync(
+        _registered_device_payloads_for_operator,
+        request.app.state.engine,
+        identity.operator_username,
+        devices,
+    )
     receives = await anyio.to_thread.run_sync(
         _receive_payloads_for_operator,
         request.app.state.engine,
         identity.operator_username,
     )
     return {
+        "registeredDevices": registered_devices,
         "devices": [_device_payload(device) for device in devices],
         "receives": receives,
     }
@@ -703,6 +710,9 @@ def _rotation_authorization(
 def _device_payload(device: object) -> dict[str, object]:
     return {
         "deviceId": device.device_id,
+        "enrolledAs": device.operator,
+        "online": True,
+        "lastSeenAt": _datetime_payload(device.last_seen),
         "capabilities": list(device.capabilities),
         "cards": [
             {
@@ -715,6 +725,27 @@ def _device_payload(device: object) -> dict[str, object]:
             for card in device.cards
         ],
     }
+
+
+def _registered_device_payloads_for_operator(
+    engine: object, operator_username: str, online_devices: list[object]
+) -> list[dict[str, object]]:
+    factory = make_session_factory(engine)
+    with factory() as session:
+        registered = grpc_store.registered_devices_for_operator(session, operator_username)
+    online_by_id = {device.device_id: device for device in online_devices}
+    return [
+        {
+            "deviceId": device.device_id,
+            "enrolledAs": device.operator,
+            "enrollmentStatus": "active",
+            "online": device.device_id in online_by_id,
+            "lastSeenAt": _datetime_payload(online_by_id[device.device_id].last_seen)
+            if device.device_id in online_by_id
+            else None,
+        }
+        for device in registered
+    ]
 
 
 def _receive_payloads_for_operator(
@@ -758,6 +789,10 @@ def _device_receive_hash(device_id: str, body: DeviceReceiveRequest, *, source_r
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _datetime_payload(value: dt.datetime) -> str:
+    return value.astimezone(dt.UTC).isoformat()
 
 
 async def _await_ack(future: object, *, timeout: float) -> CommandAck:

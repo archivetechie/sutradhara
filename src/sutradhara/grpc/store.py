@@ -114,6 +114,15 @@ class EnrollTokenGrant:
     rotation_fingerprint: str | None = None
 
 
+@dataclass(frozen=True)
+class RegisteredDevice:
+    """Durable active enrollment summary for one operator-owned device."""
+
+    device_id: str
+    operator: str
+    created_at: dt.datetime
+
+
 class DeviceOwnershipError(PermissionError):
     """Raised when an enrollment would cross an active device owner boundary."""
 
@@ -204,6 +213,39 @@ def operator_for_device(session: Session, device_id: str) -> str | None:
     if len(operators) > 1:
         raise PermissionError("device has conflicting active operator enrollments")
     return next(iter(operators))
+
+
+def registered_devices_for_operator(session: Session, operator: str) -> list[RegisteredDevice]:
+    """Return active, durable device registrations for one operator.
+
+    A device may have historical or rotated fingerprints; the API projection is
+    one row per active device id, using the newest active enrollment timestamp.
+    """
+
+    rows = list(
+        session.scalars(
+            select(GrpcDeviceEnrollment)
+            .where(
+                GrpcDeviceEnrollment.operator == operator,
+                GrpcDeviceEnrollment.revoked.is_(False),
+            )
+            .order_by(GrpcDeviceEnrollment.device_id, GrpcDeviceEnrollment.created_at.desc())
+        )
+    )
+    seen: set[str] = set()
+    registered: list[RegisteredDevice] = []
+    for row in rows:
+        if row.device_id in seen:
+            continue
+        seen.add(row.device_id)
+        registered.append(
+            RegisteredDevice(
+                device_id=row.device_id,
+                operator=row.operator,
+                created_at=_aware(row.created_at),
+            )
+        )
+    return registered
 
 
 def compare_and_set_state(
