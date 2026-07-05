@@ -237,11 +237,11 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
 
     def GetIntakeStatus(self, request: Any, context: Any) -> Any:
         row = self._owned_row(request.intake_id, context)
-        status, errors = intake_status(row)
+        view = intake_status(row)
         return intake_pb2.IntakeStatusResponse(
             intake_id=row.intake_id,
-            status=status,
-            errors=errors,
+            status=view.status,
+            errors=view.errors,
         )
 
     def AbortIntake(self, request: Any, context: Any) -> Any:
@@ -341,8 +341,7 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             grpc_store.set_state(session, intake_id, "streaming")
 
     def _live_status(self, row: grpc_store.GrpcIntake) -> str:
-        status, _errors = intake_status(row)
-        return status
+        return intake_status(row).status
 
     def _validate_start_request(self, request: Any, context: Any) -> None:
         if not request.idempotency_key:

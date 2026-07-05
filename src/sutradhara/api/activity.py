@@ -106,8 +106,8 @@ def _activity_row(row: grpc_store.GrpcIntake) -> dict[str, object]:
 
 
 def _status_for(row: grpc_store.GrpcIntake) -> tuple[str, list[str]]:
-    status, errors = intake_status(row)
-    return status, errors
+    view = intake_status(row)
+    return view.status, view.errors
 
 
 def _source_label(row: grpc_store.GrpcIntake) -> str:

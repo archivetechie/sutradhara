@@ -111,8 +111,75 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
             "deviceId": "mac-1",
             "cardId": "card-1",
             "status": "streaming",
+            "releaseSafe": False,
         }
     ]
+
+
+def test_status_and_devices_mark_committed_card_receive_release_safe(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    registry = ConnectedDeviceRegistry()
+    stream = registry.register(
+        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+    )
+    stream.update_cards(
+        [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="busy")]
+    )
+    with session_scope(api_engine) as session:
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+        grpc_store.insert_intake(
+            session,
+            intake_id="intake-committed",
+            operator="owner",
+            device_id="mac-1",
+            idempotency_key="key-1",
+            source_plan_digest="a" * 64,
+            artifactclass="s-masters",
+            source_kind="card",
+            source_ref="card-1",
+            label="Card 1",
+            landing_root=str(tmp_path),
+        )
+        grpc_store.set_card_id(
+            session,
+            intake_id="intake-committed",
+            operator="owner",
+            device_id="mac-1",
+            card_id="card-1",
+        )
+        grpc_store.set_committed_digest(session, "intake-committed", "b" * 64)
+
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+
+    devices = client.get("/api/devices", headers=post_headers("operator"))
+    status = client.get("/api/intake/intake-committed/status", headers=post_headers("operator"))
+
+    assert devices.status_code == 200
+    assert devices.json()["receives"] == [
+        {
+            "intakeId": "intake-committed",
+            "deviceId": "mac-1",
+            "cardId": "card-1",
+            "status": "verifying",
+            "releaseSafe": True,
+        }
+    ]
+    assert status.status_code == 200
+    assert status.json() == {
+        "intakeId": "intake-committed",
+        "status": "verifying",
+        "errors": [],
+        "releaseSafe": True,
+    }
 
 
 def test_get_device_browse_returns_listing_for_browse_capable_helper(api_engine: Engine) -> None:
@@ -535,7 +602,12 @@ def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path
     response = client.get("/api/intake/intake-1/status", headers=post_headers("operator"))
 
     assert response.status_code == 200
-    assert response.json() == {"intakeId": "intake-1", "status": "verified", "errors": []}
+    assert response.json() == {
+        "intakeId": "intake-1",
+        "status": "verified",
+        "errors": [],
+        "releaseSafe": True,
+    }
 
 
 def test_post_device_receive_rejects_cross_operator_device(api_engine: Engine) -> None:

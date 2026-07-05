@@ -7,21 +7,47 @@ the landing registrar has finished verification.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from pathlib import Path
 
 from sutradhara.grpc import store as grpc_store
 
 
-def intake_status(row: grpc_store.GrpcIntake) -> tuple[str, list[str]]:
+@dataclass(frozen=True)
+class IntakeStatusView:
+    """Externally visible intake verification state for an online receive."""
+
+    status: str
+    errors: list[str]
+    release_safe: bool
+
+
+def intake_status(row: grpc_store.GrpcIntake) -> IntakeStatusView:
     """Return the externally visible status and marker errors for an intake row."""
 
     status, errors = marker_status(Path(row.landing_root) / row.intake_id)
     if status is not None:
-        return status, errors
+        return IntakeStatusView(
+            status=status,
+            errors=errors,
+            release_safe=release_safe_for_status(row, status),
+        )
     if row.state == "committed":
-        return "verifying", []
-    return row.state, []
+        status = "verifying"
+    else:
+        status = row.state
+    return IntakeStatusView(
+        status=status,
+        errors=[],
+        release_safe=release_safe_for_status(row, status),
+    )
+
+
+def release_safe_for_status(row: grpc_store.GrpcIntake, status: str) -> bool:
+    """Return whether an online-card source may be released for this status."""
+
+    return row.source_kind == "card" and status in {"committed", "verifying", "verified"}
 
 
 def marker_status(intake_dir: Path) -> tuple[str | None, list[str]]:

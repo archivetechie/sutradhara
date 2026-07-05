@@ -349,8 +349,13 @@ def get_intake_status(intake_id: str, request: Request) -> dict[str, object]:
         if row.operator != identity.operator_username:
             _raise(403, "forbidden", "intake owner mismatch")
         session.expunge(row)
-    status, errors = intake_status(row)
-    return {"intakeId": row.intake_id, "status": status, "errors": errors}
+    view = intake_status(row)
+    return {
+        "intakeId": row.intake_id,
+        "status": view.status,
+        "errors": view.errors,
+        "releaseSafe": view.release_safe,
+    }
 
 
 @router.post("/api/enroll/token")
@@ -750,7 +755,7 @@ def _registered_device_payloads_for_operator(
 
 def _receive_payloads_for_operator(
     engine: object, operator_username: str
-) -> list[dict[str, str | None]]:
+) -> list[dict[str, str | None | bool]]:
     factory = make_session_factory(engine)
     with factory() as session:
         rows = list(
@@ -765,15 +770,16 @@ def _receive_payloads_for_operator(
         )
         for row in rows:
             session.expunge(row)
-    payloads: list[dict[str, str | None]] = []
+    payloads: list[dict[str, str | None | bool]] = []
     for row in rows:
-        status, _errors = intake_status(row)
+        view = intake_status(row)
         payloads.append(
             {
                 "intakeId": row.intake_id,
                 "deviceId": row.device_id,
                 "cardId": row.card_id,
-                "status": status,
+                "status": view.status,
+                "releaseSafe": view.release_safe,
             }
         )
     return payloads
