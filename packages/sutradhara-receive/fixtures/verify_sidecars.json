@@ -1,0 +1,43 @@
+{
+  "cases": [
+    {
+      "full": {
+        "checked_at": "<CHECKED-AT>",
+        "mismatches": [],
+        "stage": "full"
+      },
+      "name": "staged-to-full",
+      "transfer": {
+        "checked_at": "<CHECKED-AT>",
+        "mismatches": [],
+        "stage": "transfer"
+      }
+    },
+    {
+      "name": "failed",
+      "result_stage": "failed",
+      "sidecar": {
+        "checked_at": "<CHECKED-AT>",
+        "mismatches": [
+          {
+            "actual": "11d510e067d2cdcd7559bd86d27a2f4c20babd43670346b97af99b522c1f0075",
+            "expected": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc",
+            "path": "clip.mov"
+          }
+        ],
+        "stage": "failed"
+      }
+    },
+    {
+      "name": "absent-legacy",
+      "pending_checked_count": 1,
+      "pending_failed_count": 0,
+      "sidecar": {
+        "checked_at": "<CHECKED-AT>",
+        "mismatches": [],
+        "stage": "full"
+      }
+    }
+  ],
+  "schema_version": 1
+}

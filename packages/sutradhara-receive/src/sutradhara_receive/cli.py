@@ -16,17 +16,22 @@ import datetime as dt
 import json
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
 from sutradhara_receive.core import (
     ConfirmationResult,
+    DestinationVerificationError,
     OrphanSweepResult,
     ReceiveError,
     ReceiveResult,
+    VerifyPendingResult,
+    VerifyResult,
     receive_source,
     sweep_orphans,
+    verify_destination,
+    verify_pending,
     wait_for_server_confirmation,
 )
 
@@ -39,6 +44,10 @@ class ReceiveCliUsageError(ValueError):
 
 class ReceiveCliRuntimeError(RuntimeError):
     """A receive command failed while reading, writing, verifying, or polling."""
+
+
+class ReceiveCliVerificationError(RuntimeError):
+    """A receive command completed transfer but failed destination verification."""
 
 
 def default_operator() -> str:
@@ -58,9 +67,11 @@ def run_receive_command(
     label: str | None = None,
     resume: str | None = None,
     fake_source: Path | None = None,
+    verify: str = "staged",
     confirm_timeout: float | None = None,
     confirm_interval: float = 1.0,
-) -> tuple[ReceiveResult, ConfirmationResult | None]:
+    release_callback: Callable[[ReceiveResult], None] | None = None,
+) -> tuple[ReceiveResult, ConfirmationResult | None, VerifyResult | None]:
     """Run one receive operation and optional server-confirmation poll."""
 
     if fake_source is not None and source is not None:
@@ -79,7 +90,19 @@ def run_receive_command(
             artifactclass=artifactclass,
             label=label,
             resume=resume,
+            verify=verify,
         )
+        verify_result: VerifyResult | None = None
+        if verify == "staged":
+            if release_callback is not None:
+                release_callback(result)
+            verify_result = verify_destination(result.intake_dir)
+            if not verify_result.verified:
+                raise ReceiveCliVerificationError(
+                    f"destination verification failed: {_verification_mismatches(verify_result)}"
+                )
+        elif verify == "blocking" and release_callback is not None:
+            release_callback(result)
         confirmation = (
             wait_for_server_confirmation(
                 result.intake_dir,
@@ -89,9 +112,11 @@ def run_receive_command(
             if confirm_timeout is not None
             else None
         )
+    except DestinationVerificationError as exc:
+        raise ReceiveCliVerificationError(str(exc)) from exc
     except (FileNotFoundError, ReceiveError, ValueError) as exc:
         raise ReceiveCliRuntimeError(str(exc)) from exc
-    return result, confirmation
+    return result, confirmation, verify_result
 
 
 def run_sweep_command(
@@ -105,6 +130,12 @@ def run_sweep_command(
         landing,
         older_than=dt.timedelta(hours=older_than_hours),
     )
+
+
+def run_verify_pending_command(landings: Sequence[Path]) -> VerifyPendingResult:
+    """Run pending destination verification across landing roots."""
+
+    return verify_pending(landings)
 
 
 def receive_result_payload(
@@ -185,6 +216,27 @@ def sweep_text_lines(result: OrphanSweepResult) -> list[str]:
     return [f"removed {path}" for path in result.removed]
 
 
+def verify_pending_result_payload(result: VerifyPendingResult) -> dict[str, Any]:
+    """Return the stable JSON payload for a pending verification sweep."""
+
+    return {
+        "checked": [str(path) for path in result.checked],
+        "failed": [str(path) for path in result.failed],
+    }
+
+
+def verify_pending_text_lines(result: VerifyPendingResult) -> tuple[list[str], list[str]]:
+    """Return human-readable stdout/stderr lines for a pending verification sweep."""
+
+    stdout = (
+        ["(no pending verifies)"]
+        if not result.checked
+        else [f"verified {path}" for path in result.checked]
+    )
+    stderr = [f"destination verification failed: {path}" for path in result.failed]
+    return stdout, stderr
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the standalone `sutra-receive` argument parser."""
 
@@ -245,6 +297,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Seconds between server confirmation polls. Defaults to %(default)s.",
     )
+    run_parser.add_argument(
+        "--verify",
+        choices=("staged", "blocking"),
+        default="staged",
+        help="Destination verification mode. Defaults to %(default)s.",
+    )
     run_parser.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON.")
     run_parser.set_defaults(handler=_handle_receive)
 
@@ -269,6 +327,21 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_parser.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON.")
     sweep_parser.set_defaults(handler=_handle_sweep)
 
+    verify_parser = subparsers.add_parser(
+        "verify-pending",
+        help="verify completed bags with absent, transfer, or failed sidecars",
+        description="Verify completed bags with absent, transfer, or failed sidecars.",
+    )
+    verify_parser.add_argument(
+        "--landing",
+        required=True,
+        action="append",
+        type=Path,
+        help="Landing share to scan. Repeat for multiple roots.",
+    )
+    verify_parser.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON.")
+    verify_parser.set_defaults(handler=_handle_verify_pending)
+
     return parser
 
 
@@ -290,6 +363,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ReceiveCliRuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except ReceiveCliVerificationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
     except KeyboardInterrupt:
         print("error: interrupted", file=sys.stderr)
         return 130
@@ -298,14 +374,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _normalize_argv(argv: list[str]) -> list[str]:
     if not argv:
         return ["run"]
-    commands = {"run", "sweep", "sweep-orphans"}
+    commands = {"run", "sweep", "sweep-orphans", "verify-pending"}
     if argv[0] in commands or argv[0] in {"--help", "-h"}:
         return argv
     return ["run", *argv]
 
 
 def _handle_receive(args: argparse.Namespace) -> int:
-    result, confirmation = run_receive_command(
+    release_stream = sys.stderr if args.as_json else sys.stdout
+    result, confirmation, _verify_result = run_receive_command(
         args.source,
         landing=args.landing,
         source_kind=args.source_kind,
@@ -315,8 +392,15 @@ def _handle_receive(args: argparse.Namespace) -> int:
         label=args.label,
         resume=args.resume,
         fake_source=args.fake_source,
+        verify=args.verify,
         confirm_timeout=args.confirm_timeout,
         confirm_interval=args.confirm_interval,
+        release_callback=lambda _result: print(
+            "CARD SAFE TO REMOVE — deep verify continuing"
+            if args.verify == "staged"
+            else "CARD SAFE TO REMOVE — deep verify complete",
+            file=release_stream,
+        ),
     )
     if args.as_json:
         _write_json(receive_result_payload(result, confirmation), stream=sys.stdout)
@@ -336,6 +420,31 @@ def _handle_sweep(args: argparse.Namespace) -> int:
     else:
         _write_lines(sweep_text_lines(result), stream=sys.stdout)
     return 0
+
+
+def _handle_verify_pending(args: argparse.Namespace) -> int:
+    result = run_verify_pending_command(tuple(args.landing))
+    if args.as_json:
+        _write_json(verify_pending_result_payload(result), stream=sys.stdout)
+        _write_lines(
+            [f"destination verification failed: {path}" for path in result.failed],
+            stream=sys.stderr,
+        )
+    else:
+        stdout_lines, stderr_lines = verify_pending_text_lines(result)
+        _write_lines(stdout_lines, stream=sys.stdout)
+        _write_lines(stderr_lines, stream=sys.stderr)
+    return 0 if not result.failed else 4
+
+
+def _verification_mismatches(result: VerifyResult) -> str:
+    return json.dumps(
+        [
+            {"path": item.path, "expected": item.expected, "actual": item.actual}
+            for item in result.mismatches
+        ],
+        sort_keys=True,
+    )
 
 
 def _write_json(payload: dict[str, Any], *, stream: TextIO) -> None:

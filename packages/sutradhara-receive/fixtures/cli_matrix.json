@@ -14,7 +14,7 @@
       ],
       "exit_code": 0,
       "name": "bare-fake-source-json",
-      "stderr": "",
+      "stderr": "CARD SAFE TO REMOVE \u2014 deep verify continuing\n",
       "stdout": "{\n  \"bag_info_path\": \"<LANDING>/<INTAKE-ID>/bag-info.txt\",\n  \"bag_profile\": \"bagit-1.0\",\n  \"file_count\": 1,\n  \"intake_dir\": \"<LANDING>/<INTAKE-ID>\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"manifest_path\": \"<LANDING>/<INTAKE-ID>/manifest-sha256.txt\",\n  \"sentinel_path\": \"<LANDING>/<INTAKE-ID>/intake.json\",\n  \"skipped_count\": 0,\n  \"tagmanifest_path\": \"<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt\",\n  \"total_bytes\": 5\n}\n",
       "stdout_json": {
         "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
@@ -44,7 +44,7 @@
       ],
       "exit_code": 0,
       "name": "explicit-run-json",
-      "stderr": "",
+      "stderr": "CARD SAFE TO REMOVE \u2014 deep verify continuing\n",
       "stdout": "{\n  \"bag_info_path\": \"<LANDING>/<INTAKE-ID>/bag-info.txt\",\n  \"bag_profile\": \"bagit-1.0\",\n  \"file_count\": 1,\n  \"intake_dir\": \"<LANDING>/<INTAKE-ID>\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"manifest_path\": \"<LANDING>/<INTAKE-ID>/manifest-sha256.txt\",\n  \"sentinel_path\": \"<LANDING>/<INTAKE-ID>/intake.json\",\n  \"skipped_count\": 0,\n  \"tagmanifest_path\": \"<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt\",\n  \"total_bytes\": 5\n}\n",
       "stdout_json": {
         "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
@@ -75,7 +75,7 @@
       ],
       "exit_code": 3,
       "name": "confirm-timeout-exit-3",
-      "stderr": "",
+      "stderr": "CARD SAFE TO REMOVE \u2014 deep verify continuing\n",
       "stdout": "{\n  \"bag_info_path\": \"<LANDING>/<INTAKE-ID>/bag-info.txt\",\n  \"bag_profile\": \"bagit-1.0\",\n  \"confirmation\": {\n    \"detail\": null,\n    \"marker_path\": null,\n    \"release_ok\": false,\n    \"status\": \"timeout\"\n  },\n  \"file_count\": 1,\n  \"intake_dir\": \"<LANDING>/<INTAKE-ID>\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"manifest_path\": \"<LANDING>/<INTAKE-ID>/manifest-sha256.txt\",\n  \"sentinel_path\": \"<LANDING>/<INTAKE-ID>/intake.json\",\n  \"skipped_count\": 0,\n  \"tagmanifest_path\": \"<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt\",\n  \"total_bytes\": 5\n}\n",
       "stdout_json": {
         "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
@@ -129,7 +129,7 @@
       ],
       "exit_code": 0,
       "name": "resume-json",
-      "stderr": "",
+      "stderr": "CARD SAFE TO REMOVE \u2014 deep verify continuing\n",
       "stdout": "{\n  \"bag_info_path\": \"<LANDING>/<INTAKE-ID>/bag-info.txt\",\n  \"bag_profile\": \"bagit-1.0\",\n  \"file_count\": 1,\n  \"intake_dir\": \"<LANDING>/<INTAKE-ID>\",\n  \"intake_id\": \"<INTAKE-ID>\",\n  \"manifest_path\": \"<LANDING>/<INTAKE-ID>/manifest-sha256.txt\",\n  \"sentinel_path\": \"<LANDING>/<INTAKE-ID>/intake.json\",\n  \"skipped_count\": 0,\n  \"tagmanifest_path\": \"<LANDING>/<INTAKE-ID>/tagmanifest-sha256.txt\",\n  \"total_bytes\": 5\n}\n",
       "stdout_json": {
         "bag_info_path": "<LANDING>/<INTAKE-ID>/bag-info.txt",
@@ -179,6 +179,44 @@
       "stdout_json": {
         "removed": [
           "<LANDING>/stale"
+        ]
+      }
+    },
+    {
+      "argv": [
+        "verify-pending",
+        "--landing",
+        "<LANDING>",
+        "--json"
+      ],
+      "exit_code": 0,
+      "name": "verify-pending-clean-json",
+      "stderr": "",
+      "stdout": "{\n  \"checked\": [\n    \"<LANDING>/<INTAKE-ID>\"\n  ],\n  \"failed\": []\n}\n",
+      "stdout_json": {
+        "checked": [
+          "<LANDING>/<INTAKE-ID>"
+        ],
+        "failed": []
+      }
+    },
+    {
+      "argv": [
+        "verify-pending",
+        "--landing",
+        "<LANDING>",
+        "--json"
+      ],
+      "exit_code": 4,
+      "name": "verify-pending-failed-exit-4",
+      "stderr": "destination verification failed: <LANDING>/<INTAKE-ID>\n",
+      "stdout": "{\n  \"checked\": [\n    \"<LANDING>/<INTAKE-ID>\"\n  ],\n  \"failed\": [\n    \"<LANDING>/<INTAKE-ID>\"\n  ]\n}\n",
+      "stdout_json": {
+        "checked": [
+          "<LANDING>/<INTAKE-ID>"
+        ],
+        "failed": [
+          "<LANDING>/<INTAKE-ID>"
         ]
       }
     }

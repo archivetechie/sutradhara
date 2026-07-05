@@ -13,13 +13,13 @@ use std::time::{Duration, SystemTime};
 use sutradhara_receive::{
     BAG_PROFILE, BAGIT_TEXT, CANONICALIZATION_VERSION, PACKAGE_GLOBS, PACKAGE_PROFILE_HASH,
     PACKAGE_PROFILE_VERSION, PackageIndexPackage, RECEIVE_PACKAGE, RECEIVE_VERSION, ReceiveOptions,
-    SourcePlanDigestEntry, bag_info_text, bagit_manifest_text, build_package_index,
+    SourcePlanDigestEntry, VerifyMode, bag_info_text, bagit_manifest_text, build_package_index,
     build_package_tar, canonical_device_rel_path, canonicalize_manifest_path,
     canonicalize_raw_path_components, derive_card_id, escape_member_name, hash_payload_tree,
     hash_payload_tree_with_policy, manifest_digest, manifest_mismatch, plan_payload_units,
     read_manifest_sha256, receive_source, resume_receive_source, sha256_file, source_plan_digest,
-    sweep_orphans, tagmanifest_text, unescape_member_name, validate_bag,
-    write_bagit_files_with_observer,
+    sweep_orphans, tagmanifest_text, unescape_member_name, validate_bag, verify_destination,
+    verify_pending, write_bagit_files_with_observer,
 };
 
 #[test]
@@ -516,6 +516,8 @@ fn cli_matrix_fixtures_match_rust_binary() {
                 | "confirm-timeout-exit-3"
                 | "source-and-fake-source-usage"
                 | "resume-json"
+                | "verify-pending-clean-json"
+                | "verify-pending-failed-exit-4"
         ) {
             fs::create_dir_all(&source).unwrap();
             fs::write(source.join("clip.mov"), b"video").unwrap();
@@ -526,6 +528,17 @@ fn cli_matrix_fixtures_match_rust_binary() {
         if matches!(name, "sweep-json" | "sweep-orphans-json") {
             write_sweep_fixture(&landing);
         }
+        if matches!(
+            name,
+            "verify-pending-clean-json" | "verify-pending-failed-exit-4"
+        ) {
+            let mut options = receive_options(name);
+            options.intake_id = format!("fixture-{name}");
+            let result = receive_source(&source, &landing, &options).unwrap();
+            if name == "verify-pending-failed-exit-4" {
+                fs::write(result.intake_dir.join("data").join("clip.mov"), b"corrupt").unwrap();
+            }
+        }
 
         let argv = argv_from_fixture(case, temp.path(), &source, &landing);
         let output = Command::new(env!("CARGO_BIN_EXE_sutra-receive"))
@@ -534,7 +547,16 @@ fn cli_matrix_fixtures_match_rust_binary() {
             .unwrap();
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
-        let intake_id = json_intake_id(&stdout);
+        let intake_id = json_intake_id(&stdout).or_else(|| {
+            if matches!(
+                name,
+                "verify-pending-clean-json" | "verify-pending-failed-exit-4"
+            ) {
+                Some(format!("fixture-{name}"))
+            } else {
+                None
+            }
+        });
 
         assert_eq!(
             output.status.code().unwrap(),
@@ -614,6 +636,44 @@ fn validate_mismatch_fixtures_match_python_contract() {
 
         assert_eq!(validation_snapshot(name, &validate_bag(&bag)), *case);
     }
+}
+
+#[test]
+fn verify_sidecar_fixtures_match_contract() {
+    let fixture = read_fixture("verify_sidecars.json");
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let landing = temp.path().join("landing");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("clip.mov"), b"video").unwrap();
+
+    let result = receive_source(&source, &landing, &receive_options("verify")).unwrap();
+    let transfer = normalized_sidecar(&result.intake_dir.join("verify.json"));
+    let full = verify_destination(&result.intake_dir).unwrap();
+
+    assert_eq!(transfer, fixture["cases"][0]["transfer"]);
+    assert_eq!(
+        normalized_sidecar(&full.sidecar_path),
+        fixture["cases"][0]["full"]
+    );
+
+    fs::write(result.intake_dir.join("data").join("clip.mov"), b"corrupt").unwrap();
+    let failed = verify_destination(&result.intake_dir).unwrap();
+    assert_eq!(failed.stage, "failed");
+    assert_eq!(
+        normalized_sidecar(&failed.sidecar_path),
+        fixture["cases"][1]["sidecar"]
+    );
+
+    fs::remove_file(result.intake_dir.join("verify.json")).unwrap();
+    fs::write(result.intake_dir.join("data").join("clip.mov"), b"video").unwrap();
+    let pending = verify_pending(&[landing.clone()]).unwrap();
+    assert_eq!(pending.checked, vec![result.intake_dir.clone()]);
+    assert!(pending.failed.is_empty());
+    assert_eq!(
+        normalized_sidecar(&result.intake_dir.join("verify.json")),
+        fixture["cases"][2]["sidecar"]
+    );
 }
 
 #[test]
@@ -755,6 +815,12 @@ fn validation_snapshot(name: &str, validation: &sutradhara_receive::BagValidatio
     })
 }
 
+fn normalized_sidecar(path: &Path) -> Value {
+    let mut payload: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    payload["checked_at"] = json!("<CHECKED-AT>");
+    payload
+}
+
 #[cfg(unix)]
 fn argv_from_fixture(case: &Value, root: &Path, source: &Path, landing: &Path) -> Vec<String> {
     case["argv"]
@@ -874,6 +940,7 @@ fn receive_options(name: &str) -> ReceiveOptions {
         source_ref: Some("SRC".to_string()),
         artifactclass: "camera-original".to_string(),
         label: Some("fixture".to_string()),
+        verify: VerifyMode::Staged,
     }
 }
 
@@ -904,7 +971,7 @@ fn snapshot_bag_files(intake_dir: &Path) -> Value {
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        if relpath == "receive.log" {
+        if matches!(relpath.as_str(), "receive.log" | "verify.json") {
             continue;
         }
         if matches!(

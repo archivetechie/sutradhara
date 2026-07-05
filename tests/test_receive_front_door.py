@@ -31,6 +31,7 @@ from sutradhara_receive import (
     PACKAGE_PROFILE_VERSION,
     RECEIVE_PACKAGE,
     RECEIVE_VERSION,
+    VERIFY_SIDECAR_NAME,
     AtomicWriteObserver,
     CollisionError,
     DestinationVerificationError,
@@ -44,6 +45,8 @@ from sutradhara_receive import (
     safe_payload_path,
     sweep_orphans,
     validate_bag,
+    verify_destination,
+    verify_pending,
     wait_for_server_confirmation,
     write_bagit_files,
 )
@@ -277,7 +280,7 @@ def test_receive_escapes_invalid_source_bytes(tmp_path: Path) -> None:
     }
 
 
-def test_receive_detects_corrupt_landed_destination_before_sentinel(tmp_path: Path) -> None:
+def test_blocking_receive_detects_corrupt_landed_destination_before_return(tmp_path: Path) -> None:
     source = tmp_path / "source"
     landing = tmp_path / "landing"
     source.mkdir()
@@ -292,12 +295,38 @@ def test_receive_detects_corrupt_landed_destination_before_sentinel(tmp_path: Pa
             landing=landing,
             source_kind="card",
             operator="op",
+            verify="blocking",
             after_copy_hook=corrupt_payload,
         )
 
     failed = next(landing.iterdir())
-    assert not (failed / "intake.json").exists()
-    assert (failed / ".receiving.json").exists()
+    assert (failed / "intake.json").exists()
+    sidecar = json.loads((failed / VERIFY_SIDECAR_NAME).read_text(encoding="utf-8"))
+    assert sidecar["stage"] == "failed"
+
+
+def test_staged_receive_returns_at_transfer_and_verify_destination_writes_sidecar(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+
+    result = receive_source(source, landing=landing, source_kind="card", operator="op")
+
+    transfer = json.loads((result.intake_dir / VERIFY_SIDECAR_NAME).read_text(encoding="utf-8"))
+    assert transfer["stage"] == "transfer"
+    assert transfer["mismatches"] == []
+    full = verify_destination(result.intake_dir)
+    assert full.verified is True
+    sidecar = json.loads((result.intake_dir / VERIFY_SIDECAR_NAME).read_text(encoding="utf-8"))
+    assert sidecar["stage"] == "full"
+    assert sidecar["mismatches"] == []
+    log = (result.intake_dir / "receive.log").read_text(encoding="utf-8")
+    assert re.search(r' copy \{"relpath":"clip\.mov","bytes":5,"copy_wall_ns":\d+\}', log)
+    assert re.search(r' release \{"release_offset_ns":\d+\}', log)
+    assert re.search(r' verify \{"stage2_wall_ns":\d+\}', log)
 
 
 def test_receive_detects_source_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -702,6 +731,29 @@ def test_sweep_orphans_uses_native_core(
     assert complete.exists()
 
 
+def test_verify_pending_rechecks_absent_transfer_and_failed_sidecars(tmp_path: Path) -> None:
+    landing = tmp_path / "landing"
+    clean_source = tmp_path / "clean-source"
+    bad_source = tmp_path / "bad-source"
+    clean_source.mkdir()
+    bad_source.mkdir()
+    (clean_source / "clip.mov").write_bytes(b"video")
+    (bad_source / "clip.mov").write_bytes(b"video")
+    clean = receive_source(clean_source, landing=landing, source_kind="card", operator="op")
+    bad = receive_source(bad_source, landing=landing, source_kind="card", operator="op")
+    (clean.intake_dir / VERIFY_SIDECAR_NAME).unlink()
+    (bad.intake_dir / "data" / "clip.mov").write_bytes(b"corrupt")
+    failed_first = verify_destination(bad.intake_dir)
+    assert failed_first.verified is False
+
+    result = verify_pending([landing])
+
+    assert set(result.checked) == {clean.intake_dir, bad.intake_dir}
+    assert result.failed == (bad.intake_dir,)
+    assert json.loads((clean.intake_dir / VERIFY_SIDECAR_NAME).read_text())["stage"] == "full"
+    assert json.loads((bad.intake_dir / VERIFY_SIDECAR_NAME).read_text())["stage"] == "failed"
+
+
 def test_confirmation_is_fail_safe_for_verified_quarantine_and_timeout(tmp_path: Path) -> None:
     verified = tmp_path / "verified"
     quarantined = tmp_path / "quarantined"
@@ -955,7 +1007,8 @@ def test_cli_receive_fake_source_and_confirm_timeout(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 3
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
+    assert "CARD SAFE TO REMOVE — deep verify continuing" in result.stderr
     assert payload["bag_profile"] == BAG_PROFILE
     assert payload["file_count"] == 1
     assert payload["confirmation"]["status"] == "timeout"
@@ -988,7 +1041,7 @@ def test_standalone_receive_cli_fake_source_json(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert exit_code == 0
-    assert captured.err == ""
+    assert captured.err == "CARD SAFE TO REMOVE — deep verify continuing\n"
     assert payload["bag_profile"] == BAG_PROFILE
     assert payload["file_count"] == 1
     assert payload["total_bytes"] == len(b"video")
@@ -1023,7 +1076,7 @@ def test_standalone_receive_cli_confirm_timeout_exits_3(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert exit_code == 3
-    assert captured.err == ""
+    assert captured.err == "CARD SAFE TO REMOVE — deep verify continuing\n"
     assert payload["confirmation"]["status"] == "timeout"
     assert payload["confirmation"]["release_ok"] is False
 
@@ -1092,6 +1145,26 @@ def test_standalone_receive_cli_sweep_json(
     assert not stale.exists()
     assert fresh.exists()
     assert complete.exists()
+
+
+def test_standalone_receive_cli_verify_pending_exit_4(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+    result = receive_source(source, landing=landing, source_kind="card", operator="op")
+    (result.intake_dir / "data" / "clip.mov").write_bytes(b"corrupt")
+
+    exit_code = receive_cli_main(["verify-pending", "--landing", str(landing), "--json"])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 4
+    assert payload == {"checked": [str(result.intake_dir)], "failed": [str(result.intake_dir)]}
+    assert f"destination verification failed: {result.intake_dir}" in captured.err
 
 
 @pytest.mark.parametrize("source_kind", ["card", "drive", "upload"])

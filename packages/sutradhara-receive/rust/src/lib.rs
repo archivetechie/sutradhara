@@ -18,7 +18,9 @@ use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::mpsc::sync_channel;
+use std::thread;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 
 pub const RECEIVE_VERSION: &str = "receive-v2";
@@ -33,6 +35,7 @@ pub const PACKAGE_GLOBS: &[&str] = &["*.fcpbundle", "*.photoslibrary", "*.imovie
 pub const BAG_PROFILE: &str = "bagit-1.0";
 pub const BAGIT_TEXT: &str = "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n";
 pub const DATA_DIR_NAME: &str = "data";
+pub const VERIFY_SIDECAR_NAME: &str = "verify.json";
 pub const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 pub const PACKAGE_FILE_MODE: u32 = 0o644;
 pub const PACKAGE_DIR_MODE: u32 = 0o755;
@@ -104,6 +107,39 @@ pub struct ReceiveOptions {
     pub source_ref: Option<String>,
     pub artifactclass: String,
     pub label: Option<String>,
+    pub verify: VerifyMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyMode {
+    Staged,
+    Blocking,
+}
+
+impl VerifyMode {
+    pub fn parse(value: &str) -> ReceiveResult<Self> {
+        match value {
+            "staged" => Ok(Self::Staged),
+            "blocking" => Ok(Self::Blocking),
+            _ => Err(ReceiveError::new(format!(
+                "verify must be 'staged' or 'blocking', got {value:?}"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Blocking => "blocking",
+        }
+    }
+}
+
+impl Default for VerifyMode {
+    fn default() -> Self {
+        Self::Staged
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -123,6 +159,35 @@ pub struct ReceiveSourceResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OrphanSweepResult {
     pub removed: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifyMismatch {
+    pub path: String,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifyResult {
+    #[serde(skip_serializing)]
+    pub bag_path: PathBuf,
+    pub sidecar_path: PathBuf,
+    pub stage: String,
+    pub checked_at: String,
+    pub mismatches: Vec<VerifyMismatch>,
+}
+
+impl VerifyResult {
+    pub fn verified(&self) -> bool {
+        self.stage == "full" && self.mismatches.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifyPendingResult {
+    pub checked: Vec<PathBuf>,
+    pub failed: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -728,6 +793,7 @@ pub fn build_package_tar(
         writer.write_all(&[0_u8; TAR_BLOCK_BYTES as usize])?;
     }
     writer.flush()?;
+    writer.sync_all()?;
     let size_bytes = writer.position();
     let digest = writer.hexdigest();
     Ok(PackageTarResult {
@@ -789,6 +855,7 @@ where
     O: FnMut(&Path, &Path) -> ReceiveResult<()>,
     A: FnMut(&Path, &[FileReceipt]) -> ReceiveResult<()>,
 {
+    let receive_started = Instant::now();
     let source_root = fs::canonicalize(source)?;
     validate_source_root(&source_root)?;
     fs::create_dir_all(landing)?;
@@ -827,6 +894,7 @@ where
             options,
             resume: false,
             events,
+            receive_started,
         },
         observer,
         after_copy,
@@ -854,6 +922,7 @@ where
     O: FnMut(&Path, &Path) -> ReceiveResult<()>,
     A: FnMut(&Path, &[FileReceipt]) -> ReceiveResult<()>,
 {
+    let receive_started = Instant::now();
     fs::create_dir_all(landing)?;
     let landing_root = fs::canonicalize(landing)?;
     let intake_dir = landing_root.join(intake_id);
@@ -885,6 +954,7 @@ where
         artifactclass: optional_json_string(&receiving, "artifactclass")
             .unwrap_or_else(|| options.artifactclass.clone()),
         label: optional_json_string(&receiving, "label").or_else(|| options.label.clone()),
+        verify: options.verify,
     };
     finish_receive(
         FinishReceiveContext {
@@ -894,6 +964,7 @@ where
             options: &resume_options,
             resume: true,
             events,
+            receive_started,
         },
         observer,
         after_copy,
@@ -907,6 +978,7 @@ struct FinishReceiveContext<'a> {
     options: &'a ReceiveOptions,
     resume: bool,
     events: Vec<String>,
+    receive_started: Instant,
 }
 
 fn finish_receive<O, A>(
@@ -925,6 +997,7 @@ where
         options,
         resume,
         events,
+        receive_started,
     } = context;
     let mut events = events;
     let (entries, rejected) = scan_source(source_root)?;
@@ -941,12 +1014,18 @@ where
 
     let mut receipts = Vec::new();
     for entry in &entries {
-        receipts.push(copy_or_package_entry_with_observer(
-            entry, &data_root, observer,
-        )?);
+        let copy_started = Instant::now();
+        let receipt = copy_or_package_entry_with_observer(entry, &data_root, observer)?;
+        let copy_wall_ns = copy_started.elapsed().as_nanos();
+        events.push(format!(
+            "copy {{\"relpath\":{},\"bytes\":{},\"copy_wall_ns\":{copy_wall_ns}}}",
+            python_json_string(&receipt.relpath),
+            receipt.size_bytes
+        ));
+        receipts.push(receipt);
     }
     after_copy(&data_root, &receipts)?;
-    verify_destination_files(&receipts)?;
+    fsync_payload_files(&receipts)?;
 
     let manifest_entries: BTreeMap<String, String> = receipts
         .iter()
@@ -974,7 +1053,7 @@ where
         events.push(format!("skipped {}: {}", item.relpath, item.reason));
     }
     events.push(format!(
-        "verified {} file(s), {total_bytes} byte(s), {} skipped",
+        "received {} file(s), {total_bytes} byte(s), {} skipped",
         receipts.len(),
         rejected.len()
     ));
@@ -1001,6 +1080,25 @@ where
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
+    }
+    fsync_dir_best_effort(intake_dir);
+
+    let release_offset_ns = receive_started.elapsed().as_nanos();
+    events.push(format!(
+        "release {{\"release_offset_ns\":{release_offset_ns}}}"
+    ));
+    write_receive_log(&intake_dir.join("receive.log"), &events)?;
+
+    match options.verify {
+        VerifyMode::Staged => {
+            write_transfer_verify_sidecar(intake_dir)?;
+        }
+        VerifyMode::Blocking => {
+            let verify_result = verify_destination(intake_dir)?;
+            if !verify_result.verified() {
+                return Err(destination_verification_error(&verify_result.mismatches));
+            }
+        }
     }
 
     Ok(ReceiveSourceResult {
@@ -1109,6 +1207,64 @@ pub fn sweep_orphans(
         }
     }
     Ok(OrphanSweepResult { removed })
+}
+
+pub fn verify_destination(bag_path: &Path) -> ReceiveResult<VerifyResult> {
+    let stage2_started = Instant::now();
+    let mismatches = destination_mismatches(bag_path)?;
+    let stage = if mismatches.is_empty() {
+        "full".to_string()
+    } else {
+        "failed".to_string()
+    };
+    let result = VerifyResult {
+        bag_path: bag_path.to_path_buf(),
+        sidecar_path: bag_path.join(VERIFY_SIDECAR_NAME),
+        stage,
+        checked_at: timestamp_now_utc(),
+        mismatches,
+    };
+    write_verify_sidecar(&result)?;
+    append_receive_log_event(
+        &bag_path.join("receive.log"),
+        &format!(
+            "verify {{\"stage2_wall_ns\":{}}}",
+            stage2_started.elapsed().as_nanos()
+        ),
+    )?;
+    Ok(result)
+}
+
+pub fn verify_pending(landing_roots: &[PathBuf]) -> ReceiveResult<VerifyPendingResult> {
+    let mut checked = Vec::new();
+    let mut failed = Vec::new();
+    for landing in landing_roots {
+        if !landing.exists() {
+            continue;
+        }
+        let mut children = Vec::new();
+        for entry in fs::read_dir(landing)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                children.push(path);
+            }
+        }
+        children.sort();
+        for child in children {
+            if !child.join("intake.json").exists() || child.join(".receiving.json").exists() {
+                continue;
+            }
+            if !verify_sidecar_is_pending(&child)? {
+                continue;
+            }
+            let result = verify_destination(&child)?;
+            checked.push(child.clone());
+            if !result.verified() {
+                failed.push(child);
+            }
+        }
+    }
+    Ok(VerifyPendingResult { checked, failed })
 }
 
 pub fn hash_payload_tree(payload_root: &Path) -> ReceiveResult<Vec<HashReceipt>> {
@@ -1825,26 +1981,13 @@ where
     F: FnMut(&Path, &Path) -> ReceiveResult<()>,
 {
     let before = source_stat_snapshot(source)?;
-    let mut raw_in = File::open(source)?;
     let temp_path = temp_path_for(destination)?;
-    let mut raw_out = OpenOptions::new()
+    let raw_out = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let result = (|| {
-        loop {
-            let read = raw_in.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            digest.update(&buffer[..read]);
-            raw_out.write_all(&buffer[..read])?;
-        }
-        raw_out.flush()?;
-        raw_out.sync_all()?;
-        drop(raw_out);
+        let (digest, _bytes) = pipelined_copy_with_digest(source, raw_out)?;
         let after = source_stat_snapshot(source)?;
         raise_if_source_mutated(source, &before, &after)?;
         observer(&temp_path, destination)?;
@@ -1852,12 +1995,63 @@ where
         if let Some(parent) = destination.parent() {
             fsync_dir_best_effort(parent);
         }
-        Ok((hex_lower(&digest.finalize()), after))
+        Ok((digest, after))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+fn pipelined_copy_with_digest(source: &Path, mut output: File) -> ReceiveResult<(String, u64)> {
+    let (empty_tx, empty_rx) = sync_channel::<Vec<u8>>(2);
+    let (filled_tx, filled_rx) = sync_channel::<(Vec<u8>, usize)>(2);
+    empty_tx
+        .send(vec![0_u8; COPY_BUFFER_BYTES])
+        .map_err(|_| ReceiveError::new("copy pipeline failed before start"))?;
+    empty_tx
+        .send(vec![0_u8; COPY_BUFFER_BYTES])
+        .map_err(|_| ReceiveError::new("copy pipeline failed before start"))?;
+
+    let source_path = source.to_path_buf();
+    let reader = thread::spawn(move || -> ReceiveResult<(String, u64)> {
+        let mut input = File::open(source_path)?;
+        let mut digest = Sha256::new();
+        let mut total = 0_u64;
+        while let Ok(mut buffer) = empty_rx.recv() {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+            total += read as u64;
+            if filled_tx.send((buffer, read)).is_err() {
+                return Err(ReceiveError::new("copy writer stopped before source EOF"));
+            }
+        }
+        Ok((hex_lower(&digest.finalize()), total))
+    });
+
+    let writer = thread::spawn(move || -> ReceiveResult<()> {
+        for (buffer, read) in filled_rx {
+            output.write_all(&buffer[..read])?;
+            if empty_tx.send(buffer).is_err() {
+                break;
+            }
+        }
+        output.flush()?;
+        Ok(())
+    });
+
+    let read_result = join_copy_thread(reader)?;
+    join_copy_thread(writer)?;
+    Ok(read_result)
+}
+
+fn join_copy_thread<T>(handle: thread::JoinHandle<ReceiveResult<T>>) -> ReceiveResult<T> {
+    handle
+        .join()
+        .map_err(|_| ReceiveError::new("copy pipeline thread panicked"))?
 }
 
 fn source_stat_snapshot(path: &Path) -> ReceiveResult<SourceStatSnapshot> {
@@ -1908,24 +2102,92 @@ fn metadata_device(_metadata: &fs::Metadata) -> Option<u64> {
     None
 }
 
-fn verify_destination_files(receipts: &[FileReceipt]) -> ReceiveResult<()> {
-    let mut mismatches = Vec::new();
+fn fsync_payload_files(receipts: &[FileReceipt]) -> ReceiveResult<()> {
     for receipt in receipts {
-        let actual = sha256_file(&receipt.destination_path)?;
-        if actual != receipt.sha256_hex {
-            mismatches.push(format!(
-                "{} expected {} actual {}",
-                receipt.relpath, receipt.sha256_hex, actual
-            ));
-        }
+        let handle = OpenOptions::new()
+            .read(true)
+            .open(&receipt.destination_path)?;
+        handle.sync_all()?;
     }
-    if mismatches.is_empty() {
-        Ok(())
-    } else {
-        Err(ReceiveError::new(format!(
-            "destination verification failed: {mismatches:?}"
-        )))
+    Ok(())
+}
+
+fn destination_mismatches(bag_path: &Path) -> ReceiveResult<Vec<VerifyMismatch>> {
+    let manifest = read_manifest_sha256(&bag_path.join("manifest-sha256.txt"))?;
+    let actual_records = hash_payload_tree_with_policy(&bag_path.join(DATA_DIR_NAME), true)?;
+    let actual: BTreeMap<String, String> = actual_records
+        .iter()
+        .map(|record| (record.relpath.clone(), record.sha256_hex.clone()))
+        .collect();
+    let mismatch = manifest_mismatch(&actual, &manifest)?;
+    let mut mismatches = Vec::new();
+    for path in json_string_array(&mismatch["missing"]) {
+        mismatches.push(VerifyMismatch {
+            expected: manifest.get(&path).cloned(),
+            actual: None,
+            path,
+        });
     }
+    for path in json_string_array(&mismatch["extra"]) {
+        mismatches.push(VerifyMismatch {
+            expected: None,
+            actual: actual.get(&path).cloned(),
+            path,
+        });
+    }
+    for item in json_manifest_mismatches(&mismatch["mismatched"]) {
+        mismatches.push(VerifyMismatch {
+            path: item.path,
+            expected: Some(item.expected),
+            actual: Some(item.actual),
+        });
+    }
+    Ok(mismatches)
+}
+
+fn write_transfer_verify_sidecar(bag_path: &Path) -> ReceiveResult<()> {
+    let result = VerifyResult {
+        bag_path: bag_path.to_path_buf(),
+        sidecar_path: bag_path.join(VERIFY_SIDECAR_NAME),
+        stage: "transfer".to_string(),
+        checked_at: timestamp_now_utc(),
+        mismatches: Vec::new(),
+    };
+    write_verify_sidecar(&result)
+}
+
+fn write_verify_sidecar(result: &VerifyResult) -> ReceiveResult<()> {
+    let mut noop = |_temp_path: &Path, _final_path: &Path| Ok(());
+    write_json_file_with_observer(
+        &result.sidecar_path,
+        &json!({
+            "checked_at": result.checked_at,
+            "mismatches": result.mismatches,
+            "stage": result.stage,
+        }),
+        &mut noop,
+    )
+}
+
+fn verify_sidecar_is_pending(bag_path: &Path) -> ReceiveResult<bool> {
+    let sidecar = bag_path.join(VERIFY_SIDECAR_NAME);
+    let payload = match fs::read_to_string(&sidecar) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    let value: Value = serde_json::from_str(&payload)?;
+    Ok(matches!(
+        value.get("stage").and_then(Value::as_str),
+        None | Some("transfer" | "failed")
+    ))
+}
+
+fn destination_verification_error(mismatches: &[VerifyMismatch]) -> ReceiveError {
+    ReceiveError::new(format!(
+        "destination verification failed: {}",
+        serde_json::to_string(mismatches).unwrap_or_else(|_| "[]".to_string())
+    ))
 }
 
 fn package_index_payload_from_receipts(receipts: &[FileReceipt]) -> ReceiveResult<Option<Value>> {
@@ -2027,7 +2289,7 @@ where
 {
     let mut text = String::new();
     for event in events {
-        text.push_str(&receive_log_timestamp());
+        text.push_str(&timestamp_now_utc());
         text.push(' ');
         text.push_str(event);
         text.push('\n');
@@ -2035,7 +2297,26 @@ where
     atomic_write_text(path, &text, observer)
 }
 
-fn receive_log_timestamp() -> String {
+fn write_receive_log(path: &Path, events: &[String]) -> ReceiveResult<()> {
+    let mut noop = |_temp_path: &Path, _final_path: &Path| Ok(());
+    write_receive_log_with_observer(path, events, &mut noop)
+}
+
+fn append_receive_log_event(path: &Path, event: &str) -> ReceiveResult<()> {
+    let mut text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    text.push_str(&timestamp_now_utc());
+    text.push(' ');
+    text.push_str(event);
+    text.push('\n');
+    let mut noop = |_temp_path: &Path, _final_path: &Path| Ok(());
+    atomic_write_text(path, &text, &mut noop)
+}
+
+fn timestamp_now_utc() -> String {
     let now = time::OffsetDateTime::now_utc();
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
@@ -2774,6 +3055,12 @@ impl<W: Write> TarHashingWriter<W> {
 
     fn hexdigest(self) -> String {
         hex_lower(&self.digest.finalize())
+    }
+}
+
+impl TarHashingWriter<File> {
+    fn sync_all(&self) -> io::Result<()> {
+        self.inner.sync_all()
     }
 }
 

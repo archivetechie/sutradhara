@@ -13,8 +13,8 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use sutradhara_receive::{
-    BAG_PROFILE, ReceiveOptions, ReceiveSourceResult, resume_receive_source, slug_operator,
-    sweep_orphans,
+    BAG_PROFILE, ReceiveOptions, ReceiveSourceResult, VerifyMode, resume_receive_source,
+    slug_operator, sweep_orphans, verify_destination, verify_pending,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -35,6 +35,7 @@ fn run(args: Vec<String>) -> Result<u8, String> {
     match normalized.first().map(String::as_str) {
         Some("run") => run_receive(&normalized[1..]),
         Some("sweep") | Some("sweep-orphans") => run_sweep(&normalized[1..]),
+        Some("verify-pending") => run_verify_pending(&normalized[1..]),
         Some("-h" | "--help") => {
             print_help();
             Ok(0)
@@ -51,7 +52,7 @@ fn normalize_argv(args: Vec<String>) -> Vec<String> {
         return vec!["run".to_string()];
     }
     match args[0].as_str() {
-        "run" | "sweep" | "sweep-orphans" | "-h" | "--help" => args,
+        "run" | "sweep" | "sweep-orphans" | "verify-pending" | "-h" | "--help" => args,
         _ => {
             let mut normalized = Vec::with_capacity(args.len() + 1);
             normalized.push("run".to_string());
@@ -73,6 +74,7 @@ fn run_receive(args: &[String]) -> Result<u8, String> {
     let mut resume: Option<String> = None;
     let mut confirm_timeout: Option<f64> = None;
     let mut confirm_interval = 1.0_f64;
+    let mut verify = VerifyMode::Staged;
     let mut as_json = false;
 
     let mut index = 0;
@@ -118,6 +120,10 @@ fn run_receive(args: &[String]) -> Result<u8, String> {
                     .parse::<f64>()
                     .map_err(|_| "--confirm-interval must be a number".to_string())?;
             }
+            "--verify" => {
+                verify = VerifyMode::parse(&require_value(args, &mut index, "--verify")?)
+                    .map_err(|error| error.to_string())?;
+            }
             "--json" => {
                 as_json = true;
             }
@@ -159,6 +165,7 @@ fn run_receive(args: &[String]) -> Result<u8, String> {
         source_ref,
         artifactclass,
         label,
+        verify,
     };
     let result = if let Some(resume) = resume {
         resume_receive_source(&landing, &resume, &options).map_err(|error| error.to_string())?
@@ -167,6 +174,27 @@ fn run_receive(args: &[String]) -> Result<u8, String> {
         sutradhara_receive::receive_source(&selected_source, &landing, &options)
             .map_err(|error| error.to_string())?
     };
+    if verify == VerifyMode::Staged {
+        if as_json {
+            eprintln!("CARD SAFE TO REMOVE — deep verify continuing");
+        } else {
+            println!("CARD SAFE TO REMOVE — deep verify continuing");
+        }
+        let verify_result =
+            verify_destination(&result.intake_dir).map_err(|error| error.to_string())?;
+        if !verify_result.verified() {
+            eprintln!(
+                "destination verification failed: {}",
+                serde_json::to_string(&verify_result.mismatches)
+                    .map_err(|error| error.to_string())?
+            );
+            return Ok(4);
+        }
+    } else if !as_json {
+        println!("CARD SAFE TO REMOVE — deep verify complete");
+    } else {
+        eprintln!("CARD SAFE TO REMOVE — deep verify complete");
+    }
     let confirmation = confirm_timeout.map(|timeout| {
         wait_for_confirmation(
             &result.intake_dir,
@@ -231,6 +259,47 @@ fn run_sweep(args: &[String]) -> Result<u8, String> {
         }
     }
     Ok(0)
+}
+
+fn run_verify_pending(args: &[String]) -> Result<u8, String> {
+    let mut landings: Vec<PathBuf> = Vec::new();
+    let mut as_json = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--landing" => {
+                landings.push(PathBuf::from(require_value(args, &mut index, "--landing")?));
+            }
+            "--json" => as_json = true,
+            value => return usage_error(format!("unrecognized argument: {value}")),
+        }
+        index += 1;
+    }
+    if landings.is_empty() {
+        return usage_error("--landing is required");
+    }
+    let result = verify_pending(&landings).map_err(|error| error.to_string())?;
+    if as_json {
+        print_json(&json!({
+            "checked": result.checked.iter().map(|path| path_to_string(path)).collect::<Vec<_>>(),
+            "failed": result.failed.iter().map(|path| path_to_string(path)).collect::<Vec<_>>(),
+        }))?;
+    } else if result.checked.is_empty() {
+        println!("(no pending verifies)");
+    } else {
+        for path in &result.checked {
+            println!("verified {}", path.display());
+        }
+    }
+    for path in &result.failed {
+        eprintln!("destination verification failed: {}", path.display());
+    }
+    if result.failed.is_empty() {
+        Ok(0)
+    } else {
+        Ok(4)
+    }
 }
 
 fn require_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
@@ -398,4 +467,5 @@ fn path_to_string(path: &Path) -> String {
 fn print_help() {
     eprintln!("usage: sutra-receive [run] [SOURCE] --landing LANDING --source-kind KIND [--json]");
     eprintln!("       sutra-receive sweep --landing LANDING [--json]");
+    eprintln!("       sutra-receive verify-pending --landing LANDING [--json]");
 }

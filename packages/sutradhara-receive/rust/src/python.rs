@@ -232,6 +232,7 @@ fn py_plan_payload_units_json(source: &Bound<'_, PyAny>) -> PyResult<String> {
     source_ref = None,
     artifactclass = "default",
     label = None,
+    verify = "staged",
     resume = None,
     observer = None,
     after_copy_hook = None
@@ -249,11 +250,13 @@ fn py_receive_source_json(
     source_ref: Option<String>,
     artifactclass: &str,
     label: Option<String>,
+    verify: &str,
     resume: Option<String>,
     observer: Option<Py<PyAny>>,
     after_copy_hook: Option<Py<PyAny>>,
 ) -> PyResult<String> {
     let landing = py_path_to_pathbuf(landing)?;
+    let verify = crate::VerifyMode::parse(verify).map_err(py_value_error)?;
     let options = crate::ReceiveOptions {
         intake_id: intake_id.to_string(),
         created_at: created_at.to_string(),
@@ -263,6 +266,7 @@ fn py_receive_source_json(
         source_ref,
         artifactclass: artifactclass.to_string(),
         label,
+        verify,
     };
     let mut observer_callback = |temp_path: &Path, final_path: &Path| {
         call_atomic_observer(py, observer.as_ref(), temp_path, final_path)
@@ -303,6 +307,23 @@ fn py_receive_source_json(
     }
     .map_err(py_runtime_error)?;
     serde_json::to_string(&receive_result_json(&result)).map_err(py_runtime_error)
+}
+
+#[pyfunction(name = "verify_destination_json")]
+fn py_verify_destination_json(bag_path: &Bound<'_, PyAny>) -> PyResult<String> {
+    let bag_path = py_path_to_pathbuf(bag_path)?;
+    let result = crate::verify_destination(&bag_path).map_err(py_runtime_error)?;
+    serde_json::to_string(&verify_result_json(&result)).map_err(py_runtime_error)
+}
+
+#[pyfunction(name = "verify_pending_json")]
+fn py_verify_pending_json(landing_roots: Vec<String>) -> PyResult<String> {
+    let landing_roots = landing_roots
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let result = crate::verify_pending(&landing_roots).map_err(py_runtime_error)?;
+    serde_json::to_string(&verify_pending_result_json(&result)).map_err(py_runtime_error)
 }
 
 fn source_plan_entries(entries: Vec<(String, u64, u64)>) -> Vec<crate::SourcePlanDigestEntry> {
@@ -383,6 +404,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_sweep_orphans_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_plan_payload_units_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_receive_source_json, m)?)?;
+    m.add_function(wrap_pyfunction!(py_verify_destination_json, m)?)?;
+    m.add_function(wrap_pyfunction!(py_verify_pending_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_hash_payload_tree_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_validate_bag_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_slug_operator, m)?)?;
@@ -559,6 +582,23 @@ fn receive_result_json(result: &crate::ReceiveSourceResult) -> Value {
         "total_bytes": result.total_bytes,
         "skipped_count": result.skipped_count,
         "bag_profile": result.bag_profile,
+    })
+}
+
+fn verify_result_json(result: &crate::VerifyResult) -> Value {
+    json!({
+        "bag_path": path_payload(&result.bag_path),
+        "sidecar_path": path_payload(&result.sidecar_path),
+        "stage": result.stage,
+        "checked_at": result.checked_at,
+        "mismatches": result.mismatches,
+    })
+}
+
+fn verify_pending_result_json(result: &crate::VerifyPendingResult) -> Value {
+    json!({
+        "checked": result.checked.iter().map(|path| path_payload(path)).collect::<Vec<_>>(),
+        "failed": result.failed.iter().map(|path| path_payload(path)).collect::<Vec<_>>(),
     })
 }
 

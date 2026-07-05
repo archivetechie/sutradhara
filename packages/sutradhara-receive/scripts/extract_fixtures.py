@@ -46,6 +46,8 @@ from sutradhara_receive import (
     read_package_index,
     receive_source,
     validate_bag,
+    verify_destination,
+    verify_pending,
     write_bagit_files,
 )
 from sutradhara_receive import cli as receive_cli
@@ -63,6 +65,7 @@ TEXT_BAG_FILES = {
     "package-index.json",
     "intake.json",
 }
+FIXTURE_EXCLUDED_FILES = {"receive.log", "verify.json"}
 
 
 def build_corpus(work_root: Path) -> dict[str, Any]:
@@ -77,6 +80,7 @@ def build_corpus(work_root: Path) -> dict[str, Any]:
         "receive_bags": receive_bag_fixtures(work_root / "bags"),
         "validate_mismatch": validate_mismatch_fixtures(work_root / "validate"),
         "cli_matrix": cli_matrix_fixtures(work_root / "cli"),
+        "verify_sidecars": verify_sidecar_fixtures(work_root / "verify-sidecars"),
     }
 
 
@@ -158,6 +162,7 @@ def public_api_snapshot() -> dict[str, Any]:
             ],
             "confirmation_keys": ["detail", "marker_path", "release_ok", "status"],
             "sweep_required_keys": ["removed"],
+            "verify_pending_required_keys": ["checked", "failed"],
         },
     }
 
@@ -220,7 +225,9 @@ def string_fixtures(work_root: Path) -> dict[str, Any]:
         "canonicalize_manifest_rejections": [
             {
                 "raw": raw,
-                "error": _raises_message(lambda raw=raw: receive_core.canonicalize_manifest_path(raw)),
+                "error": _raises_message(
+                    lambda raw=raw: receive_core.canonicalize_manifest_path(raw)
+                ),
             }
             for raw in manifest_rejections
         ],
@@ -500,6 +507,75 @@ def validate_mismatch_fixtures(work_root: Path) -> dict[str, Any]:
     }
 
 
+def verify_sidecar_fixtures(work_root: Path) -> dict[str, Any]:
+    """Build sidecar lifecycle fixtures for staged destination verification."""
+
+    staged_source = work_root / "staged-source"
+    staged_source.mkdir(parents=True, exist_ok=True)
+    (staged_source / "clip.mov").write_bytes(b"video")
+    staged = receive_source(
+        staged_source,
+        landing=work_root / "staged-landing",
+        source_kind="card",
+        operator="op",
+        now=FIXED_NOW,
+        verify="staged",
+    )
+    transfer = _normalized_sidecar(staged.intake_dir / "verify.json")
+    full_result = verify_destination(staged.intake_dir)
+    full = _normalized_sidecar(full_result.sidecar_path)
+
+    failed_source = work_root / "failed-source"
+    failed_source.mkdir(parents=True, exist_ok=True)
+    (failed_source / "clip.mov").write_bytes(b"video")
+    failed_receive = receive_source(
+        failed_source,
+        landing=work_root / "failed-landing",
+        source_kind="card",
+        operator="op",
+        now=FIXED_NOW,
+        verify="staged",
+    )
+    (failed_receive.intake_dir / "data" / "clip.mov").write_bytes(b"corrupt")
+    failed_result = verify_destination(failed_receive.intake_dir)
+
+    legacy_source = work_root / "legacy-source"
+    legacy_source.mkdir(parents=True, exist_ok=True)
+    (legacy_source / "clip.mov").write_bytes(b"video")
+    legacy = receive_source(
+        legacy_source,
+        landing=work_root / "legacy-landing",
+        source_kind="card",
+        operator="op",
+        now=FIXED_NOW,
+        verify="staged",
+    )
+    (legacy.intake_dir / "verify.json").unlink()
+    pending = verify_pending([legacy.intake_dir.parent])
+
+    return {
+        "schema_version": 1,
+        "cases": [
+            {
+                "name": "staged-to-full",
+                "transfer": transfer,
+                "full": full,
+            },
+            {
+                "name": "failed",
+                "result_stage": failed_result.stage,
+                "sidecar": _normalized_sidecar(failed_result.sidecar_path),
+            },
+            {
+                "name": "absent-legacy",
+                "pending_checked_count": len(pending.checked),
+                "pending_failed_count": len(pending.failed),
+                "sidecar": _normalized_sidecar(legacy.intake_dir / "verify.json"),
+            },
+        ],
+    }
+
+
 def cli_matrix_fixtures(work_root: Path) -> dict[str, Any]:
     """Build CLI behavior fixtures with normalized paths and intake ids."""
 
@@ -511,6 +587,8 @@ def cli_matrix_fixtures(work_root: Path) -> dict[str, Any]:
         _cli_case(work_root, "resume-json", "resume"),
         _cli_case(work_root, "sweep-json", "sweep"),
         _cli_case(work_root, "sweep-orphans-json", "sweep-orphans"),
+        _cli_case(work_root, "verify-pending-clean-json", "verify-pending-clean"),
+        _cli_case(work_root, "verify-pending-failed-exit-4", "verify-pending-failed"),
     ]
     return {
         "schema_version": 1,
@@ -572,7 +650,16 @@ def _cli_case(work_root: Path, name: str, kind: str) -> dict[str, Any]:
     case_root = work_root / name
     source = case_root / "source"
     landing = case_root / "landing"
-    if kind in {"receive", "run", "timeout", "usage", "resume"}:
+    precreated_intake_id: str | None = None
+    if kind in {
+        "receive",
+        "run",
+        "timeout",
+        "usage",
+        "resume",
+        "verify-pending-clean",
+        "verify-pending-failed",
+    }:
         source.mkdir(parents=True, exist_ok=True)
         (source / "clip.mov").write_bytes(b"video")
 
@@ -676,6 +763,25 @@ def _cli_case(work_root: Path, name: str, kind: str) -> dict[str, Any]:
             "24",
             "--json",
         ]
+    elif kind in {"verify-pending-clean", "verify-pending-failed"}:
+        with _fixed_minted_intake_id(f"fixture-{name}"):
+            result = receive_source(
+                source,
+                landing=landing,
+                source_kind="card",
+                operator="Op",
+                now=FIXED_NOW,
+                verify="staged",
+            )
+        precreated_intake_id = result.intake_id
+        if kind == "verify-pending-failed":
+            (result.intake_dir / "data" / "clip.mov").write_bytes(b"corrupt")
+        argv = [
+            "verify-pending",
+            "--landing",
+            str(landing),
+            "--json",
+        ]
     else:
         raise AssertionError(kind)
 
@@ -684,7 +790,7 @@ def _cli_case(work_root: Path, name: str, kind: str) -> dict[str, Any]:
     intake_id = (
         str(stdout_payload["intake_id"])
         if isinstance(stdout_payload, dict) and "intake_id" in stdout_payload
-        else None
+        else precreated_intake_id
     )
     return {
         "name": name,
@@ -734,7 +840,9 @@ def _confirmation_rendering_cases(work_root: Path) -> list[dict[str, Any]]:
         bag_profile=BAG_PROFILE,
     )
     confirmations = [
-        receive_core.ConfirmationResult(True, "verified", work_root / "verified.json", {"ok": True}),
+        receive_core.ConfirmationResult(
+            True, "verified", work_root / "verified.json", {"ok": True}
+        ),
         receive_core.ConfirmationResult(False, "pending", work_root / "verified.json", None),
         receive_core.ConfirmationResult(
             False,
@@ -794,7 +902,7 @@ def _snapshot_bag_files(
     records = []
     for path in sorted(item for item in intake_dir.rglob("*") if item.is_file()):
         relpath = path.relative_to(intake_dir).as_posix()
-        if relpath == "receive.log":
+        if relpath in FIXTURE_EXCLUDED_FILES:
             continue
         if relpath in TEXT_BAG_FILES:
             records.append(
@@ -862,6 +970,12 @@ def _validation_result_payload(validation: Any) -> dict[str, Any]:
         "errors": validation.errors,
         "details": validation.details(),
     }
+
+
+def _normalized_sidecar(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["checked_at"] = "<CHECKED-AT>"
+    return payload
 
 
 def _write_mixed_source(source: Path) -> None:

@@ -22,6 +22,7 @@ CORPUS_KEYS = [
     "receive_bags",
     "validate_mismatch",
     "cli_matrix",
+    "verify_sidecars",
 ]
 
 

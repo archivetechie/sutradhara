@@ -65,6 +65,7 @@ BAG_INFO_NAME = "bag-info.txt"
 BAGIT_NAME = "bagit.txt"
 TAGMANIFEST_NAME = "tagmanifest-sha256.txt"
 PACKAGE_INDEX_NAME = "package-index.json"
+VERIFY_SIDECAR_NAME = "verify.json"
 MAX_DEVICE_REL_PATH = 1024
 _DEVICE_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _BAG_TAG_FILES = (BAGIT_NAME, BAG_INFO_NAME, MANIFEST_NAME)
@@ -310,6 +311,40 @@ class OrphanSweepResult:
 
 
 @dataclass(frozen=True)
+class VerifyMismatch:
+    """One payload-vs-manifest mismatch recorded by destination verification."""
+
+    path: str
+    expected: str | None
+    actual: str | None
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    """Outcome of a post-release destination re-read."""
+
+    bag_path: Path
+    sidecar_path: Path
+    stage: str
+    checked_at: str
+    mismatches: tuple[VerifyMismatch, ...] = ()
+
+    @property
+    def verified(self) -> bool:
+        """True when the destination re-read completed without mismatches."""
+
+        return self.stage == "full" and not self.mismatches
+
+
+@dataclass(frozen=True)
+class VerifyPendingResult:
+    """Summary of landing bags swept by `verify-pending`."""
+
+    checked: tuple[Path, ...]
+    failed: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
 class ConfirmationResult:
     """Fail-safe server confirmation result for removable-source release."""
 
@@ -363,6 +398,7 @@ def receive_source(
     label: str | None = None,
     resume: str | None = None,
     now: dt.datetime | None = None,
+    verify: str = "staged",
     atomic_observer: AtomicWriteObserver | None = None,
     after_copy_hook: Callable[[Path, tuple[FileReceipt, ...]], None] | None = None,
 ) -> ReceiveResult:
@@ -374,6 +410,8 @@ def receive_source(
     each regular file is stat-guarded before and after the read.
     """
 
+    verify = _normalize_verify_mode(verify)
+    receive_started_ns = time.monotonic_ns()
     if _native is not None and _stat_snapshot is globals().get("_ORIGINAL_STAT_SNAPSHOT"):
         return _receive_source_native(
             source,
@@ -385,6 +423,7 @@ def receive_source(
             label=label,
             resume=resume,
             now=now,
+            verify=verify,
             atomic_observer=atomic_observer,
             after_copy_hook=after_copy_hook,
         )
@@ -454,7 +493,7 @@ def receive_source(
         )
         if after_copy_hook is not None:
             after_copy_hook(data_root, receipts)
-        _verify_destination_files(receipts)
+        _fsync_payload_files(receipts)
         entries = {receipt.relpath: receipt.sha256_hex for receipt in receipts}
         package_index = _package_index_payload(receipts)
         extra_tag_files: tuple[str, ...] = ()
@@ -506,6 +545,16 @@ def receive_source(
         with suppress(FileNotFoundError):
             (intake_dir / ".receiving.json").unlink()
         _fsync_dir(intake_dir)
+        events.append(f'release {{"release_offset_ns":{time.monotonic_ns() - receive_started_ns}}}')
+        _write_receive_log(intake_dir / "receive.log", events, observer=None)
+        if verify == "staged":
+            _write_transfer_verify_sidecar(intake_dir)
+        else:
+            verify_result = verify_destination(intake_dir)
+            if not verify_result.verified:
+                raise DestinationVerificationError(
+                    f"destination verification failed: {_mismatch_payload(verify_result.mismatches)}"
+                )
         return ReceiveResult(
             intake_id=intake_id,
             intake_dir=intake_dir,
@@ -536,6 +585,7 @@ def _receive_source_native(
     label: str | None,
     resume: str | None,
     now: dt.datetime | None,
+    verify: str,
     atomic_observer: AtomicWriteObserver | None,
     after_copy_hook: Callable[[Path, tuple[FileReceipt, ...]], None] | None,
 ) -> ReceiveResult:
@@ -566,6 +616,7 @@ def _receive_source_native(
                     source_ref,
                     artifactclass,
                     label,
+                    verify,
                     resume,
                     atomic_observer,
                     after_copy_hook,
@@ -783,6 +834,90 @@ def sweep_orphans(
 def _orphan_sweep_from_native(payload: Mapping[str, Any]) -> OrphanSweepResult:
     return OrphanSweepResult(
         removed=tuple(_path_from_native_payload(item) for item in payload.get("removed", ()))
+    )
+
+
+def verify_destination(bag_path: Path | str) -> VerifyResult:
+    """Re-read a completed bag payload against its manifest and write `verify.json`."""
+
+    bag = Path(bag_path)
+    if _native is not None:
+        try:
+            return _verify_result_from_native(
+                cast(dict[str, Any], json.loads(_native.verify_destination_json(bag)))
+            )
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
+    stage2_started_ns = time.monotonic_ns()
+    mismatches = tuple(_destination_mismatches(bag))
+    result = VerifyResult(
+        bag_path=bag,
+        sidecar_path=bag / VERIFY_SIDECAR_NAME,
+        stage="full" if not mismatches else "failed",
+        checked_at=_utcnow().isoformat(),
+        mismatches=mismatches,
+    )
+    _atomic_write_json(result.sidecar_path, _verify_sidecar_payload(result), observer=None)
+    _append_receive_log_event(
+        bag / "receive.log",
+        f'verify {{"stage2_wall_ns":{time.monotonic_ns() - stage2_started_ns}}}',
+    )
+    return result
+
+
+def verify_pending(landing_roots: Iterable[Path | str]) -> VerifyPendingResult:
+    """Verify completed landing bags whose sidecar is absent, transfer, or failed."""
+
+    roots = tuple(Path(root) for root in landing_roots)
+    if _native is not None:
+        try:
+            return _verify_pending_result_from_native(
+                cast(
+                    dict[str, Any],
+                    json.loads(_native.verify_pending_json([str(root) for root in roots])),
+                )
+            )
+        except RuntimeError as exc:
+            raise ReceiveError(str(exc)) from exc
+    checked: list[Path] = []
+    failed: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for bag in sorted(path for path in root.iterdir() if path.is_dir()):
+            if not (bag / "intake.json").exists() or (bag / ".receiving.json").exists():
+                continue
+            if not _verify_sidecar_is_pending(bag):
+                continue
+            result = verify_destination(bag)
+            checked.append(bag)
+            if not result.verified:
+                failed.append(bag)
+    return VerifyPendingResult(checked=tuple(checked), failed=tuple(failed))
+
+
+def _verify_result_from_native(payload: Mapping[str, Any]) -> VerifyResult:
+    return VerifyResult(
+        bag_path=_path_from_native_payload(payload["bag_path"]),
+        sidecar_path=_path_from_native_payload(payload["sidecar_path"]),
+        stage=str(payload["stage"]),
+        checked_at=str(payload["checked_at"]),
+        mismatches=tuple(_verify_mismatch_from_native(item) for item in payload["mismatches"]),
+    )
+
+
+def _verify_pending_result_from_native(payload: Mapping[str, Any]) -> VerifyPendingResult:
+    return VerifyPendingResult(
+        checked=tuple(_path_from_native_payload(item) for item in payload.get("checked", ())),
+        failed=tuple(_path_from_native_payload(item) for item in payload.get("failed", ())),
+    )
+
+
+def _verify_mismatch_from_native(payload: Mapping[str, Any]) -> VerifyMismatch:
+    return VerifyMismatch(
+        path=str(payload["path"]),
+        expected=_optional_str(payload.get("expected")),
+        actual=_optional_str(payload.get("actual")),
     )
 
 
@@ -1829,7 +1964,9 @@ def _package_tree_snapshot(package_root: Path) -> tuple[tuple[str, str, int, int
             elif stat.S_ISDIR(stat_result.st_mode):
                 entries.append((relpath, "directory", 0, stat_result.st_mtime_ns))
             else:
-                raise ReceiveError(f"package contains unsupported {_special_file_reason(stat_result.st_mode)}: {relpath}")
+                raise ReceiveError(
+                    f"package contains unsupported {_special_file_reason(stat_result.st_mode)}: {relpath}"
+                )
         for filename in sorted(
             files,
             key=lambda name: canonicalize_filesystem_path(root / name, package_root),
@@ -1842,7 +1979,9 @@ def _package_tree_snapshot(package_root: Path) -> tuple[tuple[str, str, int, int
             elif stat.S_ISLNK(stat_result.st_mode):
                 entries.append((relpath, "symlink", 0, stat_result.st_mtime_ns))
             else:
-                raise ReceiveError(f"package contains unsupported {_special_file_reason(stat_result.st_mode)}: {relpath}")
+                raise ReceiveError(
+                    f"package contains unsupported {_special_file_reason(stat_result.st_mode)}: {relpath}"
+                )
     return tuple(sorted(entries))
 
 
@@ -1868,24 +2007,33 @@ def _copy_or_verify_entries(
 ) -> tuple[FileReceipt, ...]:
     receipts: list[FileReceipt] = []
     for entry in entries:
+        copy_started_ns = time.monotonic_ns()
         if entry.entry_type == "package":
-            receipts.append(
-                _copy_or_verify_package_entry(
-                    entry,
-                    payload_root=payload_root,
-                    observer=observer,
-                    events=events,
-                )
+            receipt = _copy_or_verify_package_entry(
+                entry,
+                payload_root=payload_root,
+                observer=observer,
+                events=events,
             )
         else:
-            receipts.append(
-                _copy_or_verify_file_entry(
-                    entry,
-                    payload_root=payload_root,
-                    observer=observer,
-                    events=events,
-                )
+            receipt = _copy_or_verify_file_entry(
+                entry,
+                payload_root=payload_root,
+                observer=observer,
+                events=events,
             )
+        events.append(
+            "copy "
+            + json.dumps(
+                {
+                    "relpath": receipt.relpath,
+                    "bytes": receipt.size_bytes,
+                    "copy_wall_ns": time.monotonic_ns() - copy_started_ns,
+                },
+                separators=(",", ":"),
+            )
+        )
+        receipts.append(receipt)
     return tuple(receipts)
 
 
@@ -2275,7 +2423,9 @@ class _HashingWriter:
 class _QueueTarWriter:
     """Minimal binary writer that streams tar bytes through a queue."""
 
-    def __init__(self, output: queue.Queue[bytes | BaseException | None], *, chunk_bytes: int) -> None:
+    def __init__(
+        self, output: queue.Queue[bytes | BaseException | None], *, chunk_bytes: int
+    ) -> None:
         self._output = output
         self._chunk_bytes = chunk_bytes
         self._position = 0
@@ -2322,22 +2472,77 @@ def _hash_source_with_stat_guard(source: Path) -> tuple[str, _StatSnapshot]:
     return digest, after
 
 
-def _verify_destination_files(receipts: Iterable[FileReceipt]) -> None:
-    # V1 deliberately pays a second local read before exposing the sentinel so
-    # first-contact corruption is caught before the server sees the intake.
-    mismatches = []
+def _fsync_payload_files(receipts: Iterable[FileReceipt]) -> None:
     for receipt in receipts:
-        actual = sha256_file(receipt.destination_path)
-        if actual != receipt.sha256_hex:
-            mismatches.append(
-                {
-                    "path": receipt.relpath,
-                    "expected": receipt.sha256_hex,
-                    "actual": actual,
-                }
+        with receipt.destination_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+
+
+def _destination_mismatches(bag_path: Path) -> tuple[VerifyMismatch, ...]:
+    manifest = read_manifest_sha256(bag_path / MANIFEST_NAME)
+    actual = {
+        record.relpath: record.sha256_hex
+        for record in hash_payload_tree(bag_path / DATA_DIR_NAME, reject_native_packages=True)
+    }
+    mismatch = manifest_mismatch(actual, manifest)
+    mismatches: list[VerifyMismatch] = []
+    for path in mismatch.get("missing", []):
+        mismatches.append(
+            VerifyMismatch(path=str(path), expected=manifest.get(str(path)), actual=None)
+        )
+    for path in mismatch.get("extra", []):
+        mismatches.append(
+            VerifyMismatch(path=str(path), expected=None, actual=actual.get(str(path)))
+        )
+    for item in mismatch.get("mismatched", []):
+        mismatches.append(
+            VerifyMismatch(
+                path=str(item["path"]),
+                expected=str(item["expected"]),
+                actual=str(item["actual"]),
             )
-    if mismatches:
-        raise DestinationVerificationError(f"destination verification failed: {mismatches}")
+        )
+    return tuple(mismatches)
+
+
+def _write_transfer_verify_sidecar(bag_path: Path) -> None:
+    result = VerifyResult(
+        bag_path=bag_path,
+        sidecar_path=bag_path / VERIFY_SIDECAR_NAME,
+        stage="transfer",
+        checked_at=_utcnow().isoformat(),
+    )
+    _atomic_write_json(result.sidecar_path, _verify_sidecar_payload(result), observer=None)
+
+
+def _verify_sidecar_is_pending(bag_path: Path) -> bool:
+    sidecar = bag_path / VERIFY_SIDECAR_NAME
+    try:
+        payload = _read_json(sidecar)
+    except FileNotFoundError:
+        return True
+    return payload.get("stage") in {None, "transfer", "failed"}
+
+
+def _verify_sidecar_payload(result: VerifyResult) -> dict[str, Any]:
+    return {
+        "checked_at": result.checked_at,
+        "mismatches": _mismatch_payload(result.mismatches),
+        "stage": result.stage,
+    }
+
+
+def _mismatch_payload(mismatches: Iterable[VerifyMismatch]) -> list[dict[str, str | None]]:
+    return [
+        {"path": mismatch.path, "expected": mismatch.expected, "actual": mismatch.actual}
+        for mismatch in mismatches
+    ]
+
+
+def _normalize_verify_mode(value: str) -> str:
+    if value not in {"staged", "blocking"}:
+        raise ReceiveError(f"verify must be 'staged' or 'blocking', got {value!r}")
+    return value
 
 
 def _stat_snapshot(path: Path) -> _StatSnapshot:
@@ -2534,6 +2739,15 @@ def _write_receive_log(
 ) -> None:
     lines = [f"{_utcnow().isoformat()} {event}" for event in events]
     _atomic_write_text(path, "\n".join(lines) + "\n", observer=observer)
+
+
+def _append_receive_log_event(path: Path, event: str) -> None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    text += f"{_utcnow().isoformat()} {event}\n"
+    _atomic_write_text(path, text, observer=None)
 
 
 def _temp_path_for(path: Path) -> Path:
