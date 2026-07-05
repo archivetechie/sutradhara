@@ -45,6 +45,8 @@ def test_logs_route_contract_shape_and_non_admin_tier(api_engine: Engine) -> Non
     }
     assert row["ts"] == "2026-07-05T12:00:01.000000Z"
     assert row["attrs"]["path"] == "<path>"
+    assert "filename" not in row["attrs"]
+    assert "operator_note" not in row["attrs"]
     assert "raw" not in row
 
 
@@ -62,6 +64,8 @@ def test_logs_route_admin_with_logs_sees_raw_and_unsanitized_attrs(api_engine: E
     row = response.json()["rows"][0]
     assert row["raw"] == "raw /vault/private.mov"
     assert row["attrs"]["path"] == "/vault/private.mov"
+    assert row["attrs"]["filename"] == "private.mov"
+    assert row["attrs"]["operator_note"] == "private operator note"
 
 
 def test_logs_route_requires_can_logs_not_admin_or_plain_view(api_engine: Engine) -> None:
@@ -179,6 +183,18 @@ def test_logs_route_escapes_search_text_in_logsql(api_engine: Engine) -> None:
     assert 'attrs.*:*"x\\" | stats count() by (raw) {source=\\"bad\\"}"*' in row_query
 
 
+def test_logs_route_entity_filter_uses_entity_keys(api_engine: Engine) -> None:
+    fake = _FakeLogStore(rows=[_row(seq=1)])
+    app = make_api_app(api_engine)
+    app.state.log_store_client = fake
+    client = TestClient(app)
+
+    response = client.get("/api/ui/logs?entity=job:102", headers=auth_headers("troubleshoot"))
+
+    assert response.status_code == 200
+    assert any('entity_keys:~"(^|,)job:102(,|$)"' in query for query in fake.queries)
+
+
 def test_logs_route_invalid_regex_and_store_down_errors(api_engine: Engine) -> None:
     app = make_api_app(api_engine)
     app.state.log_store_client = _FakeLogStore(rows=[])
@@ -270,6 +286,9 @@ def _row(*, seq: int) -> dict[str, Any]:
         "level": "warn",
         "message": f"job retry scheduled {seq}",
         "attrs.path": "/vault/private.mov",
+        "attrs.filename": "private.mov",
+        "attrs.operator_note": "private operator note",
+        "attrs.redacted_fields": ["operator_note"],
         "attrs.job_id": "102",
         "entity_refs": '[{"kind":"job","id":"102","confidence":"high"}]',
         "raw": "raw /vault/private.mov",

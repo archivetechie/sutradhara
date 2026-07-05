@@ -61,6 +61,7 @@ STORE_INTERNAL_FIELDS = {
     "_stream_id",
     "_time",
     "dedup_key",
+    "entity_keys",
     "entity_refs",
     "ingest_ts",
     "raw",
@@ -89,6 +90,21 @@ INFRA_AUTH_SOURCE_PREFIXES = (
     "sshd",
     "systemd",
     "vector",
+)
+CONTENT_REVEALING_ATTR_KEYS = frozenset(
+    {
+        "asset_label",
+        "asset_labels",
+        "file_name",
+        "filename",
+        "filenames",
+        "logical_path",
+        "member_path",
+        "source_ref",
+        "stored_member_path",
+        "target_summary",
+        "virtual_path",
+    }
 )
 
 
@@ -194,7 +210,7 @@ def _build_query_plan(
     end = _parse_time_bound(to, field="to", now=now)
     if start is not None and end is not None and start > end:
         raise_console_error(400, "bad_request", "from must be before or equal to to")
-    _parse_entity(entity)
+    entity_value = _parse_entity(entity)
     page_limit = _parse_limit(limit)
     cursor_value = _parse_cursor(cursor)
     histogram_requested = _parse_histogram(histogram)
@@ -211,6 +227,9 @@ def _build_query_plan(
     search_filter = _search_filter(q, regex=_parse_bool(regex, field="regex"))
     if search_filter is not None:
         filters.append(search_filter)
+    entity_filter = _entity_filter(entity_value)
+    if entity_filter is not None:
+        filters.append(entity_filter)
     return _QueryPlan(
         base_query=" ".join(filters),
         start=start,
@@ -280,12 +299,14 @@ def _relative_delta(value: str, unit: str) -> dt.timedelta:
     return dt.timedelta(seconds=int(value) * RELATIVE_MULTIPLIERS[unit])
 
 
-def _parse_entity(raw: str | None) -> None:
+def _parse_entity(raw: str | None) -> str | None:
     if raw is None or not raw.strip():
-        return
-    match = ENTITY_RE.match(raw.strip())
+        return None
+    value = raw.strip()
+    match = ENTITY_RE.match(value)
     if match is None or match.group("kind") not in ENTITY_KINDS:
         raise_console_error(400, "bad_request", "entity must be kind:id")
+    return value
 
 
 def _parse_limit(raw: str | None) -> int:
@@ -405,6 +426,12 @@ def _search_filter(raw: str | None, *, regex: bool) -> str | None:
     return f"(message:*{quoted}* OR _msg:*{quoted}* OR attrs.*:*{quoted}*)"
 
 
+def _entity_filter(entity: str | None) -> str | None:
+    if entity is None:
+        return None
+    return f"entity_keys:~{_quote(f'(^|,){re.escape(entity)}(,|$)')}"
+
+
 def _quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -491,6 +518,7 @@ def _bucket_seconds(start: dt.datetime, end: dt.datetime) -> int:
 def _record_payload(row: dict[str, Any], *, is_admin: bool) -> dict[str, object]:
     attrs = _attrs_payload(row)
     if not is_admin:
+        attrs = _omit_content_attrs(attrs)
         attrs = sanitize_json(attrs)
     source = _text(row.get("source"))
     payload: dict[str, object] = {
@@ -549,6 +577,36 @@ def _attrs_payload(row: dict[str, Any]) -> dict[str, Any]:
         elif key not in STORE_INTERNAL_FIELDS and not key.startswith("_"):
             attrs.setdefault(key, value)
     return attrs
+
+
+def _omit_content_attrs(attrs: dict[str, Any]) -> dict[str, Any]:
+    redacted_fields = attrs.get("redacted_fields", [])
+    if not isinstance(redacted_fields, list):
+        redacted_fields = []
+    explicit = {
+        _normalize_attr_key(item)
+        for item in redacted_fields
+        if isinstance(item, str) and item.strip()
+    }
+    return _omit_content_value(attrs, explicit)
+
+
+def _omit_content_value(value: Any, explicit: set[str]) -> Any:
+    if isinstance(value, dict):
+        shaped: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = _normalize_attr_key(key)
+            if normalized in CONTENT_REVEALING_ATTR_KEYS or normalized in explicit:
+                continue
+            shaped[key] = _omit_content_value(item, explicit)
+        return shaped
+    if isinstance(value, list):
+        return [_omit_content_value(item, explicit) for item in value]
+    return value
+
+
+def _normalize_attr_key(key: object) -> str:
+    return str(key).strip().lower().replace("-", "_")
 
 
 def _assign_attr(attrs: dict[str, Any], key: str, value: Any) -> None:

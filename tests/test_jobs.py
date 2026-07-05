@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import io
 import json
 import threading
 import time
@@ -65,6 +66,7 @@ from sutradhara.jobs.registry import (
     registered_kinds,
 )
 from sutradhara.jobs.worker import JobWorker
+from sutradhara.structured_logs import configure_structured_stdout_logging
 
 
 @pytest.fixture
@@ -359,6 +361,39 @@ def _worker_engine(tmp_path: Path) -> Engine:
     eng = make_engine(f"sqlite:///{db_path}")
     create_all(eng)
     return eng
+
+
+def test_worker_emits_structured_job_entity_logs(tmp_path: Path) -> None:
+    @register_handler("_test_structured_log")
+    def _structured_log(ctx: JobContext) -> JobResult:
+        assert ctx.job.kind == "_test_structured_log"
+        return JobResult(ok=True)
+
+    try:
+        stream = io.StringIO()
+        configure_structured_stdout_logging(stream)
+        eng = _worker_engine(tmp_path)
+        with session_scope(eng) as s:
+            job = submit(s, "_test_structured_log", {}, required_resources=[])
+            job_id = job.id
+
+        JobWorker(eng).drain()
+
+        events = [json.loads(line) for line in stream.getvalue().splitlines()]
+        started = next(event for event in events if event["event"] == "sutradhara.job.started")
+        finished = next(event for event in events if event["event"] == "sutradhara.job.finished")
+        expected_ref = {"kind": "job", "id": str(job_id), "confidence": "high"}
+        assert started["job_id"] == job_id
+        assert started["job_kind"] == "_test_structured_log"
+        assert started["entity_refs"] == [expected_ref]
+        assert finished["job_status"] == "succeeded"
+        assert finished["outcome"] == "ok"
+        assert finished["entity_refs"] == [expected_ref]
+        eng.dispose()
+    finally:
+        from sutradhara.jobs import registry as _r
+
+        _r._HANDLERS.pop("_test_structured_log", None)
 
 
 def test_worker_enforces_cpu_and_io_lease_caps(tmp_path: Path) -> None:

@@ -31,6 +31,7 @@ from sutradhara.jobs.leases import LeaseManager, normalize_required_resources
 from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BACKOFF
 from sutradhara.jobs.registry import JobResult
+from sutradhara.structured_logs import emit_structured_event
 
 
 @dataclass(frozen=True)
@@ -157,8 +158,25 @@ def _execute_job(
     config: WorkerConfig,
 ) -> WorkerJobOutcome:
     with session_scope(engine) as session:
+        job = session.get(Job, job_id)
+        emit_structured_event(
+            "sutradhara.job.started",
+            job_id=job_id,
+            job_kind=None if job is None else job.kind,
+            entity_refs=[{"kind": "job", "id": str(job_id), "confidence": "high"}],
+            granted_leases=dict(granted),
+        )
         result = run_one(session, job_id, granted_leases=granted)
         job = session.get(Job, job_id)
+        emit_structured_event(
+            "sutradhara.job.finished",
+            job_id=job_id,
+            job_kind=None if job is None else job.kind,
+            job_status=None if job is None else job.status,
+            outcome="ok" if result.ok else "failed",
+            entity_refs=[{"kind": "job", "id": str(job_id), "confidence": "high"}],
+            granted_leases=dict(granted),
+        )
         if job is not None and job.recon_domain is None:
             apply_retry_policy(session, job, config=config)
         return WorkerJobOutcome(

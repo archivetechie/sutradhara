@@ -9,6 +9,7 @@ from sutradhara.jobs.config import WorkerConfig, parse_pool_overrides
 from sutradhara.jobs.worker import JobWorker
 from sutradhara.jobs.worker_lock import WorkerAlreadyRunning, worker_lock
 from sutradhara.resource_control import capability
+from sutradhara.structured_logs import configure_structured_stdout_logging
 
 
 @click.command("worker")
@@ -20,6 +21,7 @@ from sutradhara.resource_control import capability
 )
 def worker_cmd(once: bool, pools: tuple[str, ...]) -> None:
     """Run the single-node lease-aware job worker."""
+    configure_structured_stdout_logging()
     try:
         config = WorkerConfig.defaults().with_pool_overrides(parse_pool_overrides(pools))
     except ValueError as exc:
