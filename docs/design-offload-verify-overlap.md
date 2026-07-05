@@ -1,94 +1,140 @@
 # Design — offload verify overlap (single-read card path, staged verification)
 
-**Repo:** `~/sutradhara` (receive core + server) + `~/sutra-agent` (relay client).
-**Status:** draft 2026-07-05 — panel pending. **Driver:** operational hard constraint
-(memory `card-offload-verify-must-overlap`, the owner 2026-07-05): cameramen queue for
-empty cards; SilverStack's serial verify doubled offload wall-clock and operators
-disabled verification outright. A verify design that costs a second pass on the
-card-holding path is a verify design that gets turned off.
-
-**Audit basis (codex, 2026-07-05, file:line evidence on record):** BOTH paths
-violate the constraint today:
-- **Online relay:** agent runs a full sha256 pre-pass per file (`hash_file()`)
-  then re-reads the same file to stream chunks — **two complete source reads**
-  while holding the card lease. Server-side hashing already overlaps its writes;
-  the watcher's later `validate_bag()` re-read does NOT hold the card lease (fine).
-- **Road mode:** `finish_receive()` runs a mandatory serial
-  `verify_destination_files()` full re-read after the copy, before BagIt/sentinel;
-  no disable knob. Wall-clock = transfer + full destination re-read.
+**Repo:** `~/sutradhara` (receive core) + `~/sutra-agent` (relay client).
+**Status:** folded 2026-07-06 — verify round pending.
+**Panel 2026-07-05/06:** 3 blind lenses — failure-modes (codex), contract/conformance
+(Opus), feasibility/cost/operator (Opus). ~30 findings; the fold REVERSED two of the
+draft's own mechanisms (road-mode second hasher = tautological same-buffer hash,
+cut; bag-tag stage carrier = frozen-bag violation + fixture cascade, replaced by an
+out-of-bag sidecar) and adopted the honest wall-clock model (the road bottleneck is
+the unpipelined copy loop + per-file fsync, not only the verify pass).
+**Driver:** memory `card-offload-verify-must-overlap` — verification that costs a
+second pass on the card-holding path gets disabled by operators (SilverStack).
+**Audit + panel evidence:** file:line records in the session logs; audit verdicts:
+both paths VIOLATE today (agent pre-pass = second full source read; road mode =
+mandatory serial destination re-read).
 
 ## 1. Target semantics (the ruling)
 
-**The card-holding critical path contains exactly ONE read of each source byte.**
-sha256(source) is computed incrementally on that single read, and the destination
-side hashes bytes as they land (server already does; road mode gains it on the
-write stream). **Card release gates on transfer-hash agreement** (source in-flight
-hash == destination in-flight hash, all files) — never on a destination re-read.
+**The card-holding critical path contains exactly ONE read of each source byte**
+(exception: resume, §2.1). Card release gates on:
+- **online:** per-file receipt agreement (agent stream-hash == server in-flight
+  hash — two genuinely independent reads: card vs wire) **AND a successful
+  CommitIntake ack** (panel blocker: receipts alone can release before any
+  watch-visible durable bag exists);
+- **road:** copy-loop completion + the full durable sentinel chain (BagIt,
+  `intake.json`, `.receiving.json` removal, directory fsync — all card-free,
+  milliseconds; panel blocker: releasing before the sentinel chain can strand a
+  watch-invisible bag after a crash while the card is already gone).
 
-Destination-media risk after release is owned by the pipeline, where it already
-lives: the watcher's `validate_bag()` re-read (online) and a new post-release
-verify stage (road mode), both against the frozen manifest, both off the card
-path. Archive-time verification against the manifest remains the durability
-backstop. This is strictly stronger than the field reality today (verification
-disabled entirely) and equal in transfer-error coverage to the two-pass design.
+Destination-media integrity is owned OFF the card path: watch's `validate_bag()`
+re-read (online) and the road **stage-2 verify** (§2.2), both against the frozen
+manifest; archive-time verification remains the durability backstop. Road mode has
+NO destination hash in stage 1 — a second hasher over the same RAM buffer proves
+nothing (panel; the draft's claim is retracted). Coverage in stage 1 = source-read
+integrity + (online) transport integrity; that is exactly what a released card
+needs, and strictly more than the field status quo (verification off).
 
 ## 2. Changes
 
-**2.1 Agent (online), `~/sutra-agent`:** delete the pre-pass. `stream_file()`
-computes sha256 over the chunks as it reads-and-sends (one reader, hash updated
-per chunk); the per-file hash is final when the last chunk is sent and goes into
-FileDone/receipt exactly as today. No proto change (receipts already carry the
-hash after bytes). Resume semantics: on resume, the already-sent prefix must be
-re-hashed to seed the hasher — a prefix re-read ONLY on the resume path (rare,
-recorded as acceptable; still strictly better than today's every-file pre-pass).
+### 2.1 Agent, online path (`~/sutra-agent`)
 
-**2.2 Receive core (road mode), `packages/sutradhara-receive` (conformance-corpus
-governed — crate discipline applies):**
-- Destination in-flight hash: the existing copy loop already hashes source-on-read;
-  extend `copy_file_with_digest*` to ALSO hash the bytes written to the
-  destination stream (same buffer, second hasher — CPU overlaps I/O; sha256 at
-  card speeds is not the bottleneck) and compare per file at copy end. Mismatch =
-  hard fail (transfer corruption caught immediately).
-- `verify_destination_files()` (the re-read) becomes **stage-2 verify**: runs
-  AFTER the receive is complete-and-releasable. Concretely: copy + in-flight
-  agreement → write BagIt + `intake.json` with a new manifest-tag field
-  `Verify-Stage: transfer` → **card releasable now** (CLI prints release status;
-  agent drops the card lease) → stage-2 re-read then flips the tag file entry to
-  `Verify-Stage: destination` (rewrites tagmanifest accordingly). A
-  `--verify=transfer|full-blocking` flag preserves the old serial behavior for
-  callers that want it (default: staged). Bag consumers (watch) treat both stages
-  as valid received bags; watch's own `validate_bag()` remains the authoritative
-  server-side check.
-- Package (tar) path gets the same treatment (hash the tar stream as written).
+- **Delete the `hash_file` pre-pass.** `send_file_chunks` computes sha256 over
+  chunks as it reads-and-sends (single reader, hash finalized at last chunk);
+  the manifest entry's `client_sha256` and the receipt comparison move
+  post-stream (the wire contract already carries hashes after bytes; no proto
+  change).
+- **Mutation guard (panel blocker):** one-pass hashing would bless a same-size
+  mid-stream source mutation. Port the receive-core stat/identity guard: stat
+  before + after each streamed file (size, mtime, file id where the platform
+  gives one); mismatch ⇒ fail that file loudly. Applies to package members too.
+- **Resume (whole-file-only, matching the code — the draft's prefix-seeding
+  worry was about a mid-file resume that does not exist):** on resume,
+  (a) recovery compares the CURRENT plan digest against the journal's saved
+  digest and aborts on drift (pairs with the server-side reject in the
+  relay-hardening followups — verify implemented, else re-flag); (b) the
+  resume-skip fast path (skip files whose server receipt already matches) now
+  requires a local rehash of exactly those candidate files — a resume-only,
+  skip-candidates-only single pass, accepted and documented.
+- Release = receipts agreement + CommitIntake ack (§1). `prepared.size_bytes`
+  sourcing moves from the deleted pre-pass to plan/stat.
 
-**2.3 Timing instrumentation (both paths, the audit's list):** per-file and
-aggregate stage durations (read/hash/send|write, verify stages, lease
-hold time) into the existing receipt/receive.log structures — enough for
-campaign E2-perf to assert overlap ratio ≈1x from evidence, permanently.
+### 2.2 Receive core, road path (`packages/sutradhara-receive` — crate
+discipline applies)
 
-**2.4 Explicitly NOT changing:** wire contract (proto untouched), plan digest,
-bag layout beyond the one tag field, watch's re-read, archive-time verification,
-eject-confirmation marker semantics.
+- **Stage 1 (card-holding):** copy loop keeps its existing source hash-on-read.
+  **Pipeline it** (double-buffered read/write on two threads) so wall-clock
+  approaches max(card-read, dest-write) instead of their sum; **defer per-file
+  `sync_all` to one batched fsync pass** at stage-1 end, before the sentinel
+  chain (durability before `intake.json` is preserved; the card is not touched
+  by fsync). Package/tar path: already single-read via `TarHashingWriter`
+  (unchanged), but **fsync tar temps before rename** (panel: durability parity).
+- **Release point:** after the sentinel chain (§1). The CLI prints an unmissable
+  `CARD SAFE TO REMOVE — deep verify continuing` line at that moment and stage 2
+  proceeds in the SAME foreground process (no daemon lifecycle; the terminal
+  keeps working while the cameraman takes the card; `--verify=blocking`
+  preserves old behavior of releasing only after stage 2).
+- **Stage 2 (post-release):** the relocated `verify_destination_files()`
+  re-read. Its outcome is recorded in an **atomic sidecar OUTSIDE the bag's tag
+  set** — `verify.json` beside `intake.json` (temp+rename; never inside
+  tagmanifest coverage; the bag's bytes NEVER change post-sentinel — this
+  resolves the frozen-bag violation and eliminates the entire fixture cascade
+  the draft's bag-info field caused). States: `{stage: "transfer"|"full"|
+  "failed", checked_at, mismatches:[...]}`; absent sidecar = legacy bag,
+  semantics "transfer" (compatibility matrix: old readers ignore the sidecar;
+  watch's own `validate_bag` remains authoritative and unchanged).
+- **`--verify=staged|blocking`** (default `staged`) on `ReceiveOptions`, the
+  CLI, and `receive_source(...)` — a deliberate Python wheel-surface change
+  (public_api.json regenerated; panel: the draft's "wire contract unchanged"
+  claim wrongly ignored the wheel surface).
+- **`sutra-receive verify-pending` is normative, not a risk note:** sweeps
+  landing roots for bags whose sidecar is absent/`transfer`/`failed`, runs
+  stage-2 idempotently, writes the sidecar, exits 0 clean / 4 mismatches-found
+  (new exit code, documented); corpus + cli_matrix + public_api entries added.
+  Stage-2 mismatch = sidecar `failed` + loud stderr + nonzero exit; the bag is
+  NOT quarantined locally (watch/server-side validation owns quarantine).
 
-## 3. Risks / panel charters
+### 2.3 Instrumentation (honest minimum, panel-trimmed)
 
-- **Conformance corpus:** 2.2 changes crate behavior — which fixtures/golden
-  outputs move (the new tag field!), and does the Python wheel surface change?
-  (`public_api.json` gate.) Contract lens must enumerate.
-- **Resume-path hash seeding** (2.1): correctness under kill/resume mid-file;
-  interaction with the in-flight journal.
-- **Two-hasher copy loop** (2.2): actual throughput on weak road laptops (CPU-
-  bound risk), buffer lifetimes.
-- **Stage-2 crash window:** machine dies after release, before stage-2 — bag says
-  `Verify-Stage: transfer` forever; watch still validates fully server-side when
-  it arrives; road bags that never reach a server need a documented `sutra
-  receive --verify-pending` sweep (include in design).
-- **Operator comms:** the CLI/tray must say clearly "card safe to remove — deep
-  verify continuing" so the released card isn't confused with completed verify.
+Per file: `{bytes, copy_wall_ns}` + stage-2 `{stage2_wall_ns}`; per receive:
+`release_offset_ns` (release timestamp − start). Written to `receive.log`
+(fixture-excluded) and the online receipt LOG lines — **never** to the pinned
+`FileReceipt` dataclass. This is exactly what the E2-perf gate consumes.
+
+### 2.4 Not changing (corrected list)
+
+Wire proto; plan digest; bag layout and BYTES (sidecar lives outside the tag
+set); watch `validate_bag`; eject-confirmation markers; `SUPPORTED_RECEIVE_
+PACKAGES` (no bump — compatibility stated in §2.2); archive-time verification.
+CHANGING and owned: `receive_source` signature + `public_api.json`, CLI matrix
+(+`verify-pending`, exit 4), corpus additions for staged/pending/failed sidecar
+lifecycles (bag-byte fixtures untouched by construction).
+
+## 3. Wall-clock model (honest)
+
+Online: card read once, hash rides the stream, release on commit ack ⇒
+lease-hold ≈ bytes/card-read + commit tail. Road: stage 1 ≈ bytes/max(card-read,
+dest-write) + batched-fsync + sentinel tail (pipelined); the old model was
+read+write serial + per-file fsync + full destination re-read. **E2-perf gate
+(campaign): release_offset ≤ ~1.2 × bytes/max(card-read, dest-write-bench)** —
+measured against the max, not raw card speed (panel: the 1.2×-of-card-read gate
+is unreachable when the destination is the bottleneck).
 
 ## 4. Verification
 
-Hermetic: single-read property test (instrument reader call counts), in-flight
-agreement mismatch injection, staged-tag lifecycle, resume re-seed, corpus
-updates. Live: campaign **E2-perf ratio** (the standing gate: ≤ ~1.2x raw
-transfer) + a road-mode timed run in the VM with a USB-attached source disk.
+Hermetic: reader-call-count property (one open/read pass per file, stage 1);
+stat-guard mutation injection (online + package members); release-ordering tests
+(kill between each sentinel-chain step ⇒ either no sentinel or complete bag,
+never released-card + watch-invisible bag); pipelined-loop equivalence (bytes +
+hash identical to serial reference); sidecar lifecycle (staged→full, failed,
+absent=legacy) + `verify-pending` idempotence + exit codes; resume rehash-skip
+and plan-digest drift abort; corpus/public_api regeneration per §2.4. Live: the
+campaign E2-perf ratio + a road-mode timed run (VM, USB source disk).
+
+## 5. Work split (prompt set)
+
+1. **receive-core (road):** §2.2 + §2.3 + corpus/api regeneration (conformance
+   discipline; single prompt — the changes interlock).
+2. **agent (online):** §2.1 (pre-pass deletion, stream hash, stat guard, resume
+   rehash + digest-drift abort, release-on-commit) + its §2.3 lines.
+3. Campaign E2-perf runs against both once landed (existing task #9 lane).
