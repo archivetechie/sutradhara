@@ -8,6 +8,7 @@ from dataclasses import dataclass
 INGEST_GROUP = "sutradhara-ingest"
 RESTORE_GROUP = "sutradhara-restore"
 OVERSIGHT_GROUP = "sutradhara-oversight"
+TROUBLESHOOT_GROUP = "sutradhara-troubleshoot"
 ADMIN_GROUP = "sutradhara-admin"
 RESTORE_P2_GROUP = "sutradhara-restore-p2"
 RESTORE_P3_GROUP = "sutradhara-restore-p3"
@@ -16,6 +17,7 @@ GROUP_CAPABILITIES: dict[str, tuple[str, ...]] = {
     INGEST_GROUP: ("can_view", "can_receive"),
     RESTORE_GROUP: ("can_view", "can_restore"),
     OVERSIGHT_GROUP: ("can_view",),
+    TROUBLESHOOT_GROUP: ("can_view", "can_logs"),
     ADMIN_GROUP: ("can_view", "can_admin"),
     RESTORE_P2_GROUP: ("can_restore_p2",),
     RESTORE_P3_GROUP: ("can_restore_p2", "can_restore_p3"),
@@ -26,6 +28,7 @@ _DISPLAY_ROLE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("restore", (RESTORE_GROUP,)),
     ("ingest", (INGEST_GROUP,)),
     ("oversight", (OVERSIGHT_GROUP,)),
+    ("troubleshoot", (TROUBLESHOOT_GROUP,)),
 )
 
 

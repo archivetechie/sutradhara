@@ -40,3 +40,17 @@ def test_session_missing_groups_reports_no_capabilities(api_engine: Engine) -> N
         "role": None,
         "capabilities": [],
     }
+
+
+def test_session_returns_logs_capability_for_troubleshoot_group(api_engine: Engine) -> None:
+    client = TestClient(make_api_app(api_engine))
+
+    response = client.get("/api/session", headers=auth_headers("troubleshoot"))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "operatorUsername": "owner",
+        "displayName": "Ada Operator",
+        "role": "troubleshoot",
+        "capabilities": ["can_view", "can_logs"],
+    }

@@ -13,6 +13,7 @@ from sutradhara.api.identity import parse_identity
         ("sutradhara-ingest", "ingest", ("can_view", "can_receive")),
         ("sutradhara-restore", "restore", ("can_view", "can_restore")),
         ("sutradhara-oversight", "oversight", ("can_view",)),
+        ("sutradhara-troubleshoot", "troubleshoot", ("can_view", "can_logs")),
         ("sutradhara-admin", "admin", ("can_view", "can_admin")),
         ("sutradhara-restore-p2", None, ("can_restore_p2",)),
         ("sutradhara-restore-p3", None, ("can_restore_p2", "can_restore_p3")),
@@ -50,6 +51,16 @@ def test_parse_identity_single_group_capabilities(
             "sutradhara-admin|sutradhara-ingest",
             "admin",
             ("can_view", "can_receive", "can_admin"),
+        ),
+        (
+            "sutradhara-admin|sutradhara-troubleshoot",
+            "admin",
+            ("can_view", "can_logs", "can_admin"),
+        ),
+        (
+            "sutradhara-oversight|sutradhara-troubleshoot",
+            "oversight",
+            ("can_view", "can_logs"),
         ),
         (
             "sutradhara-restore|sutradhara-restore-p3",
@@ -122,6 +133,7 @@ def test_parse_identity_admin_does_not_imply_receive_or_restore() -> None:
     assert identity.capabilities == ("can_view", "can_admin")
     assert not identity.has_capability("can_receive")
     assert not identity.has_capability("can_restore")
+    assert not identity.has_capability("can_logs")
 
 
 @pytest.mark.parametrize(
