@@ -1,6 +1,7 @@
 # Codex prompt — PFR wiring (sutradhara): real pfr-index handler + RaoObject + sutra pfr CLI
 
-Status: pending — **blocked on format-anatomy M6 landing** (prompt-pfr-core-m6-seams.md)
+Status: implemented — sutradhara PFR wiring is complete in this worktree; see
+`docs/report-pfr-wiring.md` for scope, deviations, and compile-only verification.
 Normative contract: **`docs/design-pfr-wiring-mxf.md` §3 + §4 in full — the authority.**
 Context: `~/format-anatomy/analysis/2026-07-05-sutradhara-wiring-survey.md` (file:line map
 of every surface), design-derivation-reconciler.md §3.4a, design-pfr-restore.md.

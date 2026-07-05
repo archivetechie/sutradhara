@@ -20,6 +20,7 @@ from sutradhara.jobs.engine import submit
 from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, OBSERVED_PRESENT
 from sutradhara.jobs.reconcilers.profiles import DerivationEntry, entries_for, entry_for_job
 from sutradhara.jobs.reconcilers.registry import Reconciler, TargetObservation, register_reconciler
+from sutradhara.pfr import pfr_sidecar_complete
 
 DOMAIN = "derivation"
 TARGET_PREFIX = "derivation"
@@ -192,7 +193,7 @@ def _source_has_derivations(session: Session, item_id: int, kinds: set[str]) -> 
 
 def _has_pfr_sidecar(item: IngestItem) -> bool:
     path = item.item_metadata.get("pfr_sidecar_path") if item.item_metadata else None
-    return isinstance(path, str) and Path(path).exists()
+    return isinstance(path, str) and pfr_sidecar_complete(Path(path))
 
 
 register_reconciler(DOMAIN)(

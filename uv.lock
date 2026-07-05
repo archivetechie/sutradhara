@@ -321,6 +321,18 @@ wheels = [
 ]
 
 [[package]]
+name = "format-anatomy"
+version = "0.1.0"
+source = { editable = "../format-anatomy" }
+
+[package.metadata]
+requires-dist = [
+    { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
+]
+provides-extras = ["dev"]
+
+[[package]]
 name = "greenlet"
 version = "3.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1214,6 +1226,7 @@ dependencies = [
     { name = "cbor2" },
     { name = "click" },
     { name = "fastapi" },
+    { name = "format-anatomy" },
     { name = "grpcio" },
     { name = "httpx2" },
     { name = "protobuf" },
@@ -1242,6 +1255,7 @@ requires-dist = [
     { name = "cbor2", specifier = ">=5.6" },
     { name = "click", specifier = ">=8.1" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "format-anatomy", editable = "../format-anatomy" },
     { name = "grpcio", specifier = ">=1.81.0" },
     { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.60" },
     { name = "httpx2", specifier = ">=0.28" },

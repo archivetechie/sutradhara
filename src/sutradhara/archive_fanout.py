@@ -32,7 +32,7 @@ from sutradhara.archive_bundle import (
     record_blob_root,
     record_exclusion,
 )
-from sutradhara.archive_restore import ArchiveRestoreError, read_member_bytes
+from sutradhara.archive_restore import ArchiveRestoreError, member_byte_base, read_member_bytes
 from sutradhara.backend.port import BackendError, ByteRange
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Bundle, BundleMember, Copy
@@ -474,7 +474,7 @@ class RemArchiveBuilder:
             "--path",
             member.member_path,
             "--first-chunk-lba",
-            str(_first_chunk_lba(member.native_locator)),
+            str(_member_first_chunk_lba(member.native_locator)),
             "--file-size-bytes",
             str(member.size_bytes),
             "--range",
@@ -1279,14 +1279,11 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def _first_chunk_lba(locator: Mapping[str, Any]) -> int:
-    value = locator.get("first_chunk_lba")
-    if value is None:
-        raise ArchiveFanoutError("RAO locator requires first_chunk_lba")
-    result = int(value)
-    if result < 0:
-        raise ArchiveFanoutError(f"invalid first_chunk_lba {value!r}")
-    return result
+def _member_first_chunk_lba(locator: Mapping[str, Any]) -> int:
+    try:
+        return member_byte_base(locator) // RAO_CHUNK_SIZE
+    except ArchiveRestoreError as exc:
+        raise ArchiveFanoutError(str(exc)) from exc
 
 
 def _metadata_key_epoch(storage_metadata: Mapping[str, Any]) -> str:

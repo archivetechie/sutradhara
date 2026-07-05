@@ -22,6 +22,7 @@ import datetime as dt
 import hashlib
 import json
 from collections.abc import Iterator
+from types import TracebackType
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -86,6 +87,8 @@ class _CatalogClient(Protocol):
     def ListTapePools(
         self, request: layer5_pb2.ListTapePoolsRequest
     ) -> layer5_pb2.ListTapePoolsResponse: ...
+
+    def GetFile(self, request: layer5_pb2.GetFileRequest) -> layer5_pb2.FileRecord: ...
 
 
 class _WriteSessionClient(Protocol):
@@ -161,6 +164,12 @@ class RemanenceBackend:
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def has_live_catalog(self) -> bool:
+        """Return whether Catalog RPCs are available for live metadata checks."""
+
+        return self._catalog is not None
 
     # --- constructors ----------------------------------------------------
 
@@ -263,7 +272,8 @@ class RemanenceBackend:
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         if self._read_session is not None:
-            return self._read_range_grpc(locator, byte_range)
+            with self.open_read_session(locator) as reader:
+                return reader.read_range(byte_range)
         obj = self._object_for_locator(locator)
         if obj.content is None:
             raise BackendNotFoundError(
@@ -277,6 +287,62 @@ class RemanenceBackend:
                 f"byte range end {byte_range.end} exceeds object size {len(obj.content)}"
             )
         return obj.content[byte_range.start : byte_range.end]
+
+    def open_read_session(self, locator: BackendLocator) -> RemanenceReadSession:
+        """Open one reusable Remanence read session for a copy locator."""
+
+        if self._read_session is None:
+            return RemanenceReadSession.fixture(self, locator)
+        client = self._require_read_session()
+        tape_uuid = _uuid_bytes_from_locator(locator, "tape_uuid")
+        object_id = _uuid_bytes_from_locator(locator, "object_id")
+        try:
+            session = client.OpenReadSession(
+                layer5_pb2.OpenReadSessionRequest(
+                    tape_target=layer5_pb2.TapeTarget(
+                        tape_uuid=tape_uuid,
+                        mount_if_needed=True,
+                    )
+                )
+            )
+        except grpc.RpcError as e:
+            raise BackendUnavailableError(
+                f"Remanence OpenReadSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
+            ) from e
+        return RemanenceReadSession.live(
+            backend=self,
+            client=client,
+            session_id=session.session_id,
+            object_id=object_id,
+        )
+
+    def get_file(self, locator: BackendLocator, *, path: str) -> layer5_pb2.FileRecord:
+        """Return one Remanence file catalog row for a stored object path."""
+
+        object_id = _uuid_bytes_from_locator(locator, "object_id")
+        if self._catalog is not None:
+            try:
+                return self._catalog.GetFile(
+                    layer5_pb2.GetFileRequest(
+                        object_id=object_id,
+                        path=path,
+                    )
+                )
+            except grpc.RpcError as e:
+                raise BackendUnavailableError(
+                    f"Remanence Catalog.GetFile at {self._endpoint!r} failed: "
+                    f"{_rpc_error_text(e)}"
+                ) from e
+        obj = self._object_for_locator(locator)
+        if obj.content is None:
+            raise BackendNotFoundError("fixture object has no bytes for file size cross-check")
+        return layer5_pb2.FileRecord(
+            object_id=obj.object_id,
+            path=path,
+            size_bytes=len(obj.content),
+            first_chunk_body_lba=0,
+            chunk_count=0,
+        )
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
         if self._read_session is not None:
@@ -371,48 +437,6 @@ class RemanenceBackend:
             )
         return self._read_session
 
-    def _read_range_grpc(
-        self,
-        locator: BackendLocator,
-        byte_range: ByteRange,
-    ) -> bytes:
-        client = self._require_read_session()
-        tape_uuid = _uuid_bytes_from_locator(locator, "tape_uuid")
-        object_id = _uuid_bytes_from_locator(locator, "object_id")
-        try:
-            session = client.OpenReadSession(
-                layer5_pb2.OpenReadSessionRequest(
-                    tape_target=layer5_pb2.TapeTarget(
-                        tape_uuid=tape_uuid,
-                        mount_if_needed=True,
-                    )
-                )
-            )
-        except grpc.RpcError as e:
-            raise BackendUnavailableError(
-                f"Remanence OpenReadSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
-            ) from e
-
-        try:
-            stream = client.ReadObjectRange(
-                layer5_pb2.ReadObjectRangeRequest(
-                    session_id=session.session_id,
-                    object_id=object_id,
-                    start_byte=byte_range.start,
-                    end_byte=byte_range.end,
-                )
-            )
-            data = b"".join(chunk.data for chunk in stream)
-            client.CloseReadSession(
-                layer5_pb2.CloseReadSessionRequest(session_id=session.session_id)
-            )
-        except grpc.RpcError as e:
-            self._safe_close_read(client, session.session_id)
-            raise BackendUnavailableError(
-                f"Remanence ReadObjectRange at {self._endpoint!r} failed: {_rpc_error_text(e)}"
-            ) from e
-        return data
-
     def _safe_close_read(
         self,
         client: _ReadSessionClient,
@@ -486,6 +510,109 @@ class RemanenceBackend:
             raise BackendNotFoundError(
                 f"no object at tape {tape_uuid.hex()[:12]}…, file {tape_file_number}"
             ) from e
+
+
+class RemanenceReadSession:
+    """Reusable read-session wrapper for several ranges from one Remanence object."""
+
+    def __init__(
+        self,
+        *,
+        backend: RemanenceBackend,
+        client: _ReadSessionClient | None,
+        session_id: bytes | None,
+        object_id: bytes | None,
+        fixture_locator: BackendLocator | None = None,
+    ) -> None:
+        self._backend = backend
+        self._client = client
+        self._session_id = session_id
+        self._object_id = object_id
+        self._fixture_locator = fixture_locator
+        self._closed = False
+
+    @classmethod
+    def live(
+        cls,
+        *,
+        backend: RemanenceBackend,
+        client: _ReadSessionClient,
+        session_id: bytes,
+        object_id: bytes,
+    ) -> RemanenceReadSession:
+        return cls(
+            backend=backend,
+            client=client,
+            session_id=session_id,
+            object_id=object_id,
+        )
+
+    @classmethod
+    def fixture(cls, backend: RemanenceBackend, locator: BackendLocator) -> RemanenceReadSession:
+        return cls(
+            backend=backend,
+            client=None,
+            session_id=None,
+            object_id=None,
+            fixture_locator=dict(locator),
+        )
+
+    def __enter__(self) -> RemanenceReadSession:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def read_range(self, byte_range: ByteRange) -> bytes:
+        if self._closed:
+            raise BackendUnavailableError("Remanence read session is already closed")
+        if self._client is None:
+            if self._fixture_locator is None:
+                raise BackendUnavailableError("fixture read session has no locator")
+            obj = self._backend._object_for_locator(self._fixture_locator)
+            if obj.content is None:
+                raise BackendNotFoundError(
+                    "RemanenceBackend fixture mode has no bytes for this object; "
+                    "fixture is missing 'content_b64' / 'content_hex'"
+                )
+            if byte_range.is_whole_object:
+                return obj.content
+            if byte_range.end > len(obj.content):
+                raise ValueError(
+                    f"byte range end {byte_range.end} exceeds object size {len(obj.content)}"
+                )
+            return obj.content[byte_range.start : byte_range.end]
+
+        assert self._session_id is not None
+        assert self._object_id is not None
+        try:
+            stream = self._client.ReadObjectRange(
+                layer5_pb2.ReadObjectRangeRequest(
+                    session_id=self._session_id,
+                    object_id=self._object_id,
+                    start_byte=byte_range.start,
+                    end_byte=byte_range.end,
+                )
+            )
+            return b"".join(chunk.data for chunk in stream)
+        except grpc.RpcError as e:
+            raise BackendUnavailableError(
+                f"Remanence ReadObjectRange at {self._backend._endpoint!r} failed: "
+                f"{_rpc_error_text(e)}"
+            ) from e
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._client is None or self._session_id is None:
+            return
+        self._backend._safe_close_read(self._client, self._session_id)
 
 
 # --- fixture decoding ----------------------------------------------------

@@ -14,7 +14,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
@@ -216,6 +216,7 @@ def read_member_to_path(
     *,
     rem_bin: str | Path | None = None,
     keys: KeyRegistry | None = None,
+    work_dir: Path | None = None,
 ) -> int:
     """Write one archive member's stored bytes to ``dest``.
 
@@ -250,7 +251,7 @@ def read_member_to_path(
         return size
 
     if representation is Representation.RAO_PLAIN_V1:
-        start = _first_chunk_lba(native_locator) * RAO_CHUNK_SIZE
+        start = member_byte_base(native_locator)
         _copy_backend_range_to_path(
             backend,
             dict(copy.native_locator),
@@ -275,6 +276,7 @@ def read_member_to_path(
             destination=dest,
             rem_bin=rem_bin,
             keys=keys or KeyRegistry(),
+            work_dir=work_dir,
         )
         return size
 
@@ -303,6 +305,7 @@ def read_member_bytes(
             dest=member_path,
             rem_bin=rem_bin,
             keys=keys,
+            work_dir=work_dir,
         )
         return member_path.read_bytes()
 
@@ -868,8 +871,9 @@ def _extract_rao_with_rem_to_path(
     destination: Path,
     rem_bin: str | Path,
     keys: KeyRegistry,
+    work_dir: Path | None = None,
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix="sutradhara-restore-") as raw:
+    with tempfile.TemporaryDirectory(prefix="sutradhara-restore-", dir=work_dir) as raw:
         temp_dir = Path(raw)
         object_path = temp_dir / "bundle.rao"
         _materialize_copy_to_path(backend, copy, object_path)
@@ -966,7 +970,13 @@ def _member_path(locator: dict[str, Any]) -> str:
     return value
 
 
-def _first_chunk_lba(locator: dict[str, Any]) -> int:
+def member_byte_base(locator: dict[str, Any] | Mapping[str, Any]) -> int:
+    """Return the object-relative byte offset where one RAO member begins."""
+
+    return _first_chunk_lba(locator) * RAO_CHUNK_SIZE
+
+
+def _first_chunk_lba(locator: dict[str, Any] | Mapping[str, Any]) -> int:
     value = locator.get("first_chunk_lba")
     if value is None:
         raise ArchiveRestoreError("RAO asset locator is missing first_chunk_lba")

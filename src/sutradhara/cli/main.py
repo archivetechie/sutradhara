@@ -16,6 +16,7 @@ from sutradhara.cli.grpc import serve_grpc_cmd
 from sutradhara.cli.hdcache import hdcache_group
 from sutradhara.cli.intake import intake_group, prepare_cmd
 from sutradhara.cli.jobs import jobs_group
+from sutradhara.cli.pfr import pfr_group
 from sutradhara.cli.receive import receive_group
 from sutradhara.cli.reconcile import reconcile_cmd
 from sutradhara.cli.retention import offsite_group, retention_group
@@ -38,6 +39,7 @@ cli.add_command(scrub_cmd)
 cli.add_command(intake_group)
 cli.add_command(prepare_cmd)
 cli.add_command(jobs_group)
+cli.add_command(pfr_group)
 cli.add_command(receive_group)
 cli.add_command(reconcile_cmd)
 cli.add_command(offsite_group)

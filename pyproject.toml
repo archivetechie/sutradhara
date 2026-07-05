@@ -24,6 +24,7 @@ classifiers = [
 # for the committed stack and §12.3 for sequencing).
 dependencies = [
     "sutradhara-receive==0.1.0",
+    "format-anatomy",
     "cbor2>=5.6",
     "click>=8.1",
     "fastapi>=0.115",
@@ -64,6 +65,7 @@ where = ["src"]
 sutradhara = ["py.typed", "_proto/*.pyi"]
 
 [tool.uv.sources]
+format-anatomy = { path = "../format-anatomy", editable = true }
 sutradhara-receive = { workspace = true }
 
 [tool.uv.workspace]

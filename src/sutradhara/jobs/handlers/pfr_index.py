@@ -1,25 +1,34 @@
-"""`pfr-index` job: produce a sidecar index for a video master."""
+"""`pfr-index` job: produce a real pfr_core sidecar for a video master."""
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import subprocess
 from pathlib import Path
-from typing import Any
+
+from pfr_core.failure import ReasonId, ScrapeFailure
+from sqlalchemy import select
 
 from sutradhara.catalog.facts import record_index, record_validity
 from sutradhara.catalog.models import IngestItem, LogicalAsset
 from sutradhara.catalog.types import AssetValidity
-from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
+from sutradhara.jobs.models import ReconciliationCondition
+from sutradhara.jobs.reconcilers.conditions import CONDITION_BACKOFF, CONDITION_BLOCKED
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
-from sutradhara.jobs.tool_versions import current_tool_version
-from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job, run_managed
+from sutradhara.pfr import (
+    PFR_INDEX_KIND,
+    PFR_RECIPE_METADATA_KEY,
+    atomic_write_sidecar,
+    enforce_blob_lru,
+    pfr_core_version,
+    scrape_path_isolated_120,
+    sidecar_with_catalog_identity,
+)
+from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job
 
 
 @register_handler("pfr-index")
 def handle_pfr_index(ctx: JobContext) -> JobResult:
+    """Scrape an ingest source into a pfr_core sidecar and record its pointer."""
+
     params = ctx.job.params
     item_id = params.get("ingest_item_id")
     if not isinstance(item_id, int):
@@ -29,132 +38,148 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
         raise ValueError(f"no IngestItem with id={item_id}")
     source = _source_path(item)
     if not source.exists() or not source.is_file():
+        detail = f"read error: source path is unavailable: {source}"
         return JobResult(
             ok=False,
-            detail=f"read error: source path is unavailable: {source}",
+            detail=detail,
             step_state={"pfr_index": {"kind": "read_error", "path": str(source)}},
+            condition=ConditionProjection(
+                condition=CONDITION_BACKOFF,
+                reason="pfr_core:source_open:read_error",
+                message=detail,
+            ),
         )
 
     cache_root = Path(str(params.get("cache_root") or ".sutradhara-cache")).resolve()
     sidecar_dir = cache_root / "intakes" / item.intake_id / "pfr"
+    blob_dir = sidecar_dir / "blobs"
     sidecar_dir.mkdir(parents=True, exist_ok=True)
+    blob_dir.mkdir(parents=True, exist_ok=True)
     sidecar_path = sidecar_dir / f"{item.id}.pfr.json"
 
-    if os.environ.get("SUTRADHARA_FAKE_FFPROBE") == "1":
-        probe = {"mode": "fake", "path": str(source), "size_bytes": source.stat().st_size}
-    else:
-        probe_result = _run_ffprobe(
-            source,
-            role=resource_role_for_job(ctx.job.kind, ctx.job.params),
-            cpu_lease=cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources),
-        )
-        if probe_result["kind"] == "container_parse_error":
-            asset = ctx.session.get(LogicalAsset, item.logical_asset_hash)
-            if asset is not None:
-                record_validity(
-                    ctx.session,
-                    asset=asset,
-                    validity=AssetValidity.SUSPECT,
-                    note=str(probe_result["detail"]),
-                )
-            return JobResult(
-                ok=True,
-                detail=str(probe_result["detail"]),
-                step_state={"pfr_index": probe_result},
-                condition=ConditionProjection(
-                    condition=CONDITION_BLOCKED,
-                    reason="unsupported-source",
-                    message=str(probe_result["detail"]),
-                    blocked_tool=("ffprobe", current_tool_version("ffprobe")),
-                ),
-            )
-        if probe_result["kind"] == "no_index":
-            return JobResult(
-                ok=False,
-                detail=str(probe_result["detail"]),
-                step_state={"pfr_index": probe_result},
-            )
-        probe = probe_result["probe"]
+    scraped = scrape_path_isolated_120(
+        source,
+        blob_dir=blob_dir,
+        role=resource_role_for_job(ctx.job.kind, ctx.job.params),
+        cpu_lease=cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources),
+    )
+    if isinstance(scraped, ScrapeFailure):
+        return _failure_result(ctx, item, scraped)
 
-    sidecar = {
-        "kind": "pfr-index-v1",
-        "ingest_item_id": item.id,
-        "logical_asset_hash": item.logical_asset_hash.hex(),
-        "source_path": str(source),
-        "probe": probe,
-    }
-    sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    sidecar = sidecar_with_catalog_identity(scraped, item)
+    atomic_write_sidecar(sidecar, sidecar_path)
+    enforce_blob_lru(blob_dir)
     record_index(
         ctx.session,
         item=item,
-        index_kind="pfr-index-v1",
+        index_kind=PFR_INDEX_KIND,
         sidecar_path=sidecar_path,
     )
+    item.item_metadata = {
+        **(item.item_metadata or {}),
+        PFR_RECIPE_METADATA_KEY: sidecar.recipe_version,
+    }
+    kind = "fallback" if sidecar.grammar_id == "fallback" else "ok"
     return JobResult(
         ok=True,
-        detail="pfr sidecar written",
+        detail=f"pfr sidecar written ({sidecar.grammar_id})",
         step_state={
             "pfr_index": {
-                "kind": "ok",
+                "kind": kind,
                 "sidecar_path": str(sidecar_path),
+                "grammar_id": sidecar.grammar_id,
+                "recipe_version": sidecar.recipe_version,
             }
         },
     )
 
 
-def _run_ffprobe(source: Path, *, role: str, cpu_lease: int | None) -> dict[str, Any]:
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe is None:
-        return {
-            "kind": "no_index",
-            "reason": "ffprobe-unavailable",
-            "detail": "ffprobe is unavailable; no PFR sidecar produced",
-        }
-    cmd = [
-        ffprobe,
-        "-v",
-        "error",
-        "-print_format",
-        "json",
-        "-show_format",
-        "-show_streams",
-        str(source),
-    ]
-    try:
-        completed = run_managed(
-            cmd,
-            role=role,
-            cpu_lease=cpu_lease,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10 * 60,
+def _failure_result(ctx: JobContext, item: IngestItem, failure: ScrapeFailure) -> JobResult:
+    if _is_parse_determination(failure) and _previous_same_failure(ctx, failure):
+        _mark_suspect(ctx, item, failure)
+        detail = _failure_detail(failure)
+        return JobResult(
+            ok=True,
+            detail=detail,
+            step_state={"pfr_index": {"kind": "blocked", "failure": failure.to_dict()}},
+            condition=ConditionProjection(
+                condition=CONDITION_BLOCKED,
+                reason="unsupported-source",
+                message=detail,
+                blocked_tool=("pfr_core", pfr_core_version()),
+            ),
         )
-    except OSError as exc:
-        return {
-            "kind": "no_index",
-            "reason": "ffprobe-exec-error",
-            "detail": f"ffprobe could not be started: {exc}",
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "kind": "no_index",
-            "reason": "ffprobe-timeout",
-            "detail": "ffprobe timed out; no PFR sidecar produced",
-        }
-    if completed.returncode != 0:
-        return {
-            "kind": "container_parse_error",
-            "detail": f"ffprobe container parse error: {completed.stderr.strip()}",
-        }
-    try:
-        probe = json.loads(completed.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        return {
-            "kind": "container_parse_error",
-            "detail": f"ffprobe returned invalid JSON: {exc}",
-        }
-    return {"kind": "ok", "probe": probe}
+
+    if _is_retryable_failure(failure) or _is_parse_determination(failure):
+        detail = _failure_detail(failure)
+        return JobResult(
+            ok=False,
+            detail=detail,
+            step_state={"pfr_index": {"kind": "retryable", "failure": failure.to_dict()}},
+            condition=ConditionProjection(
+                condition=CONDITION_BACKOFF,
+                reason=_condition_reason(failure),
+                message=detail,
+            ),
+        )
+
+    raise RuntimeError(f"unmapped pfr_core ReasonId {failure.reason_id.value}: {failure.to_json()}")
+
+
+def _is_retryable_failure(failure: ScrapeFailure) -> bool:
+    if failure.reason_id in {
+        ReasonId.SOURCE_CHANGED,
+        ReasonId.BUDGET_EXCEEDED,
+        ReasonId.BUDGET_EXHAUSTED,
+    }:
+        return True
+    if failure.reason_id == ReasonId.EXCEPTION and not _is_parse_determination(failure):
+        return True
+    return False
+
+
+def _is_parse_determination(failure: ScrapeFailure) -> bool:
+    if failure.plugin != "mxf" or failure.stage != "scrape":
+        return False
+    if failure.reason_id == ReasonId.INDEX_UNAVAILABLE:
+        return True
+    return failure.reason_id == ReasonId.EXCEPTION and failure.exception_class == "MXFParseError"
+
+
+def _previous_same_failure(ctx: JobContext, failure: ScrapeFailure) -> bool:
+    if ctx.job.recon_domain is None or ctx.job.recon_target_key is None:
+        return False
+    row = ctx.session.scalars(
+        select(ReconciliationCondition).where(
+            ReconciliationCondition.domain == ctx.job.recon_domain,
+            ReconciliationCondition.target_key == ctx.job.recon_target_key,
+        )
+    ).one_or_none()
+    if row is None or row.attempt_count < 1:
+        return False
+    return row.reason == _condition_reason(failure)
+
+
+def _mark_suspect(ctx: JobContext, item: IngestItem, failure: ScrapeFailure) -> None:
+    asset = ctx.session.get(LogicalAsset, item.logical_asset_hash)
+    if asset is None:
+        return
+    record_validity(
+        ctx.session,
+        asset=asset,
+        validity=AssetValidity.SUSPECT,
+        note=_failure_detail(failure),
+    )
+
+
+def _condition_reason(failure: ScrapeFailure) -> str:
+    exc = failure.exception_class or ""
+    return f"pfr_core:{failure.stage}:{failure.reason_id.value}:{exc}"
+
+
+def _failure_detail(failure: ScrapeFailure) -> str:
+    message = failure.message or failure.reason_id.value
+    return f"pfr_core {failure.plugin}/{failure.stage} {failure.reason_id.value}: {message}"
 
 
 def _source_path(item: IngestItem) -> Path:
@@ -162,4 +187,3 @@ def _source_path(item: IngestItem) -> Path:
     if not isinstance(raw, str) or not raw:
         raise ValueError(f"ingest_item id={item.id} has no metadata.source_path")
     return Path(raw)
-
