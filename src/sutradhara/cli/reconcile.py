@@ -19,6 +19,7 @@ from sutradhara.jobs.reconcilers import (
     derivation as _derivation_reconciler,  # noqa: F401 -- register derivation
 )
 from sutradhara.jobs.reconcilers import hdcache as _hdcache_reconciler  # noqa: F401
+from sutradhara.jobs.reconcilers import log_pipeline as _log_pipeline_reconciler  # noqa: F401
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED, reopen_condition
 from sutradhara.jobs.reconcilers.registry import ReconcilerNotRegistered
 from sutradhara.jobs.reconcilers.spine import reconcile

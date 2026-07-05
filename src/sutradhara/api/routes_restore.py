@@ -351,7 +351,7 @@ def _condition_payload(row: ReconciliationCondition, *, is_admin: bool) -> dict[
             else _sanitize_detail(row.blocked_tool_version)
         ),
         "attempt_count": row.attempt_count,
-        "owner": ALARM_OWNER if row.domain == ALARM_DOMAIN else None,
+        "owner": ALARM_OWNER if row.domain in {ALARM_DOMAIN, "log_pipeline"} else None,
         "updated_at": _iso(row.updated_at),
     }
     if is_admin:
@@ -403,6 +403,18 @@ def _condition_cause(row: ReconciliationCondition) -> str:
         return "Cache fallback activity increased"
     if reason == "unmapped-privacy-level":
         return "A privacy level is not mapped to a restore capability"
+    if row.domain == "log_pipeline":
+        if reason == "heartbeat-stale":
+            return "The log pipeline heartbeat is stale"
+        if reason == "heartbeat-missing":
+            return "The log pipeline heartbeat is missing"
+        if reason == "newest-record-stale":
+            return "VictoriaLogs has no recent records"
+        if reason == "newest-record-missing":
+            return "VictoriaLogs has no records visible to the log pipeline"
+        if reason == "query-failed":
+            return "The log pipeline self-monitor query failed"
+        return "The log pipeline requires attention"
     if reason == "handler-not-registered":
         return "Required job handler is not registered"
     if reason == "never-fit":

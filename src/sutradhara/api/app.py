@@ -20,6 +20,7 @@ from sutradhara.api.routes_devices import router as devices_router
 from sutradhara.api.routes_intake_archive import router as intake_archive_router
 from sutradhara.api.routes_jobs import router as jobs_router
 from sutradhara.api.routes_library import router as library_router
+from sutradhara.api.routes_logs import router as logs_router
 from sutradhara.api.routes_receive import install_default_state
 from sutradhara.api.routes_receive import router as receive_router
 from sutradhara.api.routes_restore import router as restore_router
@@ -105,6 +106,7 @@ def create_app(
     app.include_router(jobs_router)
     app.include_router(intake_archive_router)
     app.include_router(library_router)
+    app.include_router(logs_router)
     return app
 
 
@@ -165,6 +167,7 @@ def _uses_nested_ui_envelope(path: str) -> bool:
         or path.startswith("/api/ui/archive")
         or path == "/api/ui/catalog/assets"
         or path.startswith("/api/ui/library")
+        or path == "/api/ui/logs"
     )
 
 
