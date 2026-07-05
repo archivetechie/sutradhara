@@ -43,6 +43,14 @@ prompt (~/system) — do NOT write scenarios here.
 
 ## Constraints
 
+**Concurrent-thread awareness**: another implementation thread (unified logs, P-L1b) may be
+working in this repo simultaneously (routes_logs.py, logs_store.py, reconcilers/log_pipeline.py,
+their tests). Do NOT touch those files; stage ONLY the files you created/modified (never
+`git add -A`/`git add .`); if `pyproject.toml` has uncommitted changes you didn't make, stop
+and report rather than committing over them. Pre-existing red tests from other threads are
+not yours to fix — success bar = no NEW failures.
+
+
 Follow the design where this prompt is silent; design wins on conflict — note conflicts in
 the report. No changes to pfr_core (M6 already provides every seam; if a seam is missing,
 STOP and report rather than patching around it). Report → docs/report-pfr-wiring.md.
