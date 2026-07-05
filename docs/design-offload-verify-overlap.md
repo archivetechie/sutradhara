@@ -1,7 +1,7 @@
 # Design — offload verify overlap (single-read card path, staged verification)
 
 **Repo:** `~/sutradhara` (receive core) + `~/sutra-agent` (relay client).
-**Status:** folded 2026-07-06 — verify round pending.
+**Status:** **frozen** 2026-07-06 (verify round: FAIL — 4 fold-introduced majors; fixed, narrow re-verify PASS).
 **Panel 2026-07-05/06:** 3 blind lenses — failure-modes (codex), contract/conformance
 (Opus), feasibility/cost/operator (Opus). ~30 findings; the fold REVERSED two of the
 draft's own mechanisms (road-mode second hasher = tautological same-buffer hash,
