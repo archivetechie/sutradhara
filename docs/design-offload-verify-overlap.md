@@ -55,7 +55,11 @@ needs, and strictly more than the field status quo (verification off).
   relay-hardening followups — verify implemented, else re-flag); (b) the
   resume-skip fast path (skip files whose server receipt already matches) now
   requires a local rehash of exactly those candidate files — a resume-only,
-  skip-candidates-only single pass, accepted and documented.
+  skip-candidates-only single pass, accepted and documented. The digest-drift
+  compare guards **both restart paths** — `recover()` AND the
+  `ClaimOutcome::Existing` re-claim — before any `start_intake`/stream spawn;
+  on drift: abort the server-side intake if one exists, then remove the journal
+  row deliberately (a drifted plan is a NEW receive, never a resume).
 - Release = receipts agreement + CommitIntake ack (§1). `prepared.size_bytes`
   sourcing moves from the deleted pre-pass to plan/stat.
 
@@ -65,9 +69,10 @@ discipline applies)
 - **Stage 1 (card-holding):** copy loop keeps its existing source hash-on-read.
   **Pipeline it** (double-buffered read/write on two threads) so wall-clock
   approaches max(card-read, dest-write) instead of their sum; **defer per-file
-  `sync_all` to one batched fsync pass** at stage-1 end, before the sentinel
-  chain (durability before `intake.json` is preserved; the card is not touched
-  by fsync). Package/tar path: already single-read via `TarHashingWriter`
+  `sync_all` to one batched fsync pass over the payload data files** at stage-1
+  end, before the sentinel chain (the sentinel chain's own atomic writes +
+  final directory fsync are unchanged; durability-before-`intake.json` is
+  preserved; fsync never touches the card). Package/tar path: already single-read via `TarHashingWriter`
   (unchanged), but **fsync tar temps before rename** (panel: durability parity).
 - **Release point:** after the sentinel chain (§1). The CLI prints an unmissable
   `CARD SAFE TO REMOVE — deep verify continuing` line at that moment and stage 2
@@ -75,14 +80,25 @@ discipline applies)
   keeps working while the cameraman takes the card; `--verify=blocking`
   preserves old behavior of releasing only after stage 2).
 - **Stage 2 (post-release):** the relocated `verify_destination_files()`
-  re-read. Its outcome is recorded in an **atomic sidecar OUTSIDE the bag's tag
-  set** — `verify.json` beside `intake.json` (temp+rename; never inside
-  tagmanifest coverage; the bag's bytes NEVER change post-sentinel — this
-  resolves the frozen-bag violation and eliminates the entire fixture cascade
-  the draft's bag-info field caused). States: `{stage: "transfer"|"full"|
-  "failed", checked_at, mismatches:[...]}`; absent sidecar = legacy bag,
-  semantics "transfer" (compatibility matrix: old readers ignore the sidecar;
-  watch's own `validate_bag` remains authoritative and unchanged).
+  re-read, exposed as its own public crate/API step (below). Outcome recorded in
+  an **atomic sidecar** `verify.json` beside `intake.json` (temp+rename; never
+  inside tagmanifest coverage). Precisely stated (verify round): **BagIt
+  payload/tag BYTES are unchanged; the LANDING layout gains one file**, and
+  `verify.json` joins `receive.log` in the fixture exclusion list — bag-byte
+  fixtures are untouched, landing-tree snapshots exclude it by rule. States:
+  `{stage: "transfer"|"full"|"failed", checked_at, mismatches:[...]}`; absent
+  sidecar = legacy, semantics "transfer"; old readers ignore it; watch's
+  `validate_bag` stays authoritative and unchanged.
+- **API split (verify round — no mid-receive callback exists and none is
+  added):** staged mode splits the public surface instead: `receive_source(...,
+  verify="staged")` performs stage 1 through the sentinel chain and RETURNS
+  (this return IS the release point — the CLI prints the release line, the
+  library never writes stdout); the new public `verify_destination(bag_path)`
+  performs stage 2 + sidecar write and is what the CLI then calls in the same
+  process (and what `verify-pending` reuses). `verify="blocking"` =
+  `receive_source` runs both internally and returns only after stage 2 — the
+  release line prints only after full verify in that mode (the two mode flows
+  are distinct; staged never blocks release on stage 2, blocking always does).
 - **`--verify=staged|blocking`** (default `staged`) on `ReceiveOptions`, the
   CLI, and `receive_source(...)` — a deliberate Python wheel-surface change
   (public_api.json regenerated; panel: the draft's "wire contract unchanged"
