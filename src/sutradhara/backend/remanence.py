@@ -555,18 +555,23 @@ def _decode_content(d: dict[str, Any]) -> bytes | None:
 
 def _copy_record_from_proto(obj: layer5_pb2.ObjectRecord, cp: layer5_pb2.ObjectCopy) -> CopyRecord:
     digest = content_hash(obj.content_sha256)
+    metadata: dict[str, Any] = {
+        "body_format": obj.body_format,
+        "caller_object_id": obj.caller_object_id,
+        "health": _copy_health(cp.health),
+        "last_verified_at": _timestamp_text(cp, "last_verified_at"),
+        **{f"caller_meta:{k}": v for k, v in obj.caller_metadata.items()},
+    }
+    if obj.HasField("append_commit_info"):
+        metadata["append_commit_info"] = _append_commit_info_from_proto(
+            obj.append_commit_info
+        )
     return CopyRecord(
         logical_id=digest,
         native_locator=_native_locator_from_proto(obj, cp),
         integrity_hash=digest,
         size_bytes=int(obj.logical_size_bytes),
-        metadata={
-            "body_format": obj.body_format,
-            "caller_object_id": obj.caller_object_id,
-            "health": _copy_health(cp.health),
-            "last_verified_at": _timestamp_text(cp, "last_verified_at"),
-            **{f"caller_meta:{k}": v for k, v in obj.caller_metadata.items()},
-        },
+        metadata=metadata,
     )
 
 
@@ -687,6 +692,40 @@ def _copy_health(value: int) -> str:
         int(layer5_pb2.ObjectCopy.OBJECT_COPY_HEALTH_LOST): "lost",
     }
     return labels.get(health, f"unknown:{health}")
+
+
+def _append_commit_info_from_proto(info: layer5_pb2.AppendCommitInfo) -> dict[str, Any]:
+    return {
+        "append_mode": _append_mode(info.append_mode),
+        "tape_uuid": _hex_bytes(info.tape_uuid, "append_commit_info.tape_uuid", length=16),
+        "voltag": info.voltag if info.HasField("voltag") else None,
+        "tape_file_number": int(info.tape_file_number),
+        "first_body_lba": int(info.first_body_lba),
+        "position_before_lba": _optional_u64(info, "position_before_lba"),
+        "position_after_lba": _optional_u64(info, "position_after_lba"),
+        "journal_record_ordinal": _optional_u64(info, "journal_record_ordinal"),
+        "estimated_remaining_bytes": _optional_u64(info, "estimated_remaining_bytes"),
+        "sealed_after_write": info.sealed_after_write
+        if info.HasField("sealed_after_write")
+        else None,
+    }
+
+
+def _append_mode(value: int) -> str:
+    labels: dict[int, str] = {
+        int(layer5_pb2.APPEND_MODE_UNSPECIFIED): "unspecified",
+        int(layer5_pb2.APPEND_MODE_FRESH): "fresh",
+        int(layer5_pb2.APPEND_MODE_APPEND): "append",
+        int(layer5_pb2.APPEND_MODE_RESUME_CONTROL): "resume_control",
+        int(layer5_pb2.APPEND_MODE_SEAL): "seal",
+    }
+    return labels.get(int(value), f"unknown:{int(value)}")
+
+
+def _optional_u64(message: Any, field: str) -> int | None:
+    if not message.HasField(field):
+        return None
+    return int(getattr(message, field))
 
 
 def _timestamp_text(message: Any, field: str) -> str:

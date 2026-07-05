@@ -220,6 +220,14 @@ def proto_object() -> layer5_pb2.ObjectRecord:
                 pool_id="scenario-a",
             )
         ],
+        append_commit_info=layer5_pb2.AppendCommitInfo(
+            append_mode=layer5_pb2.APPEND_MODE_FRESH,
+            tape_uuid=bytes.fromhex("b8f6123456784e90aabbccddeeff0011"),
+            voltag="RMA101L9",
+            tape_file_number=1,
+            first_body_lba=1,
+            position_after_lba=42,
+        ),
     )
 
 
@@ -306,6 +314,18 @@ def test_live_enumerate_maps_proto_records_to_copy_records(
     }
     assert record.metadata["health"] == "ok"
     assert record.metadata["caller_meta:campaign"] == "daemon-test"
+    assert record.metadata["append_commit_info"] == {
+        "append_mode": "fresh",
+        "tape_uuid": "b8f6123456784e90aabbccddeeff0011",
+        "voltag": "RMA101L9",
+        "tape_file_number": 1,
+        "first_body_lba": 1,
+        "position_before_lba": None,
+        "position_after_lba": 42,
+        "journal_record_ordinal": None,
+        "estimated_remaining_bytes": None,
+        "sealed_after_write": None,
+    }
 
 
 def test_proto_native_locator_matches_write_path_locator_key(
@@ -613,6 +633,8 @@ def test_write_object_to_pool_success(
     record = wb.write_object_to_pool(src, "scenario-a")
 
     assert isinstance(record, CopyRecord)
+    assert record.metadata["append_commit_info"]["append_mode"] == "fresh"
+    assert record.metadata["append_commit_info"]["tape_file_number"] == 1
     assert servicer.opened
     assert servicer.closed
     assert not servicer.aborted

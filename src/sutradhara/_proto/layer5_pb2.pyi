@@ -21,6 +21,14 @@ class OperationState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     OPERATION_STATE_CANCELLED: _ClassVar[OperationState]
     OPERATION_STATE_UNKNOWN: _ClassVar[OperationState]
 
+class AppendMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    APPEND_MODE_UNSPECIFIED: _ClassVar[AppendMode]
+    APPEND_MODE_FRESH: _ClassVar[AppendMode]
+    APPEND_MODE_APPEND: _ClassVar[AppendMode]
+    APPEND_MODE_RESUME_CONTROL: _ClassVar[AppendMode]
+    APPEND_MODE_SEAL: _ClassVar[AppendMode]
+
 class CatalogUnitOriginKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     CATALOG_UNIT_ORIGIN_KIND_UNSPECIFIED: _ClassVar[CatalogUnitOriginKind]
@@ -81,6 +89,11 @@ OPERATION_STATE_SUCCEEDED: OperationState
 OPERATION_STATE_FAILED: OperationState
 OPERATION_STATE_CANCELLED: OperationState
 OPERATION_STATE_UNKNOWN: OperationState
+APPEND_MODE_UNSPECIFIED: AppendMode
+APPEND_MODE_FRESH: AppendMode
+APPEND_MODE_APPEND: AppendMode
+APPEND_MODE_RESUME_CONTROL: AppendMode
+APPEND_MODE_SEAL: AppendMode
 CATALOG_UNIT_ORIGIN_KIND_UNSPECIFIED: CatalogUnitOriginKind
 CATALOG_UNIT_ORIGIN_KIND_NATIVE_OBJECT: CatalogUnitOriginKind
 CATALOG_UNIT_ORIGIN_KIND_FOREIGN_ARCHIVE: CatalogUnitOriginKind
@@ -841,8 +854,32 @@ class TapeFile(_message.Message):
     object_id: bytes
     def __init__(self, tape_uuid: _Optional[bytes] = ..., tape_file_number: _Optional[int] = ..., kind: _Optional[str] = ..., block_count: _Optional[int] = ..., object_id: _Optional[bytes] = ...) -> None: ...
 
+class AppendCommitInfo(_message.Message):
+    __slots__ = ("append_mode", "tape_uuid", "voltag", "tape_file_number", "first_body_lba", "position_before_lba", "position_after_lba", "journal_record_ordinal", "estimated_remaining_bytes", "sealed_after_write")
+    APPEND_MODE_FIELD_NUMBER: _ClassVar[int]
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    VOLTAG_FIELD_NUMBER: _ClassVar[int]
+    TAPE_FILE_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    FIRST_BODY_LBA_FIELD_NUMBER: _ClassVar[int]
+    POSITION_BEFORE_LBA_FIELD_NUMBER: _ClassVar[int]
+    POSITION_AFTER_LBA_FIELD_NUMBER: _ClassVar[int]
+    JOURNAL_RECORD_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    ESTIMATED_REMAINING_BYTES_FIELD_NUMBER: _ClassVar[int]
+    SEALED_AFTER_WRITE_FIELD_NUMBER: _ClassVar[int]
+    append_mode: AppendMode
+    tape_uuid: bytes
+    voltag: str
+    tape_file_number: int
+    first_body_lba: int
+    position_before_lba: int
+    position_after_lba: int
+    journal_record_ordinal: int
+    estimated_remaining_bytes: int
+    sealed_after_write: bool
+    def __init__(self, append_mode: _Optional[_Union[AppendMode, str]] = ..., tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., tape_file_number: _Optional[int] = ..., first_body_lba: _Optional[int] = ..., position_before_lba: _Optional[int] = ..., position_after_lba: _Optional[int] = ..., journal_record_ordinal: _Optional[int] = ..., estimated_remaining_bytes: _Optional[int] = ..., sealed_after_write: _Optional[bool] = ...) -> None: ...
+
 class ObjectRecord(_message.Message):
-    __slots__ = ("object_id", "caller_object_id", "content_sha256", "logical_size_bytes", "body_format", "caller_metadata", "created_at", "copies")
+    __slots__ = ("object_id", "caller_object_id", "content_sha256", "logical_size_bytes", "body_format", "caller_metadata", "created_at", "copies", "append_commit_info")
     class CallerMetadataEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -858,6 +895,7 @@ class ObjectRecord(_message.Message):
     CALLER_METADATA_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
     COPIES_FIELD_NUMBER: _ClassVar[int]
+    APPEND_COMMIT_INFO_FIELD_NUMBER: _ClassVar[int]
     object_id: bytes
     caller_object_id: str
     content_sha256: bytes
@@ -866,7 +904,8 @@ class ObjectRecord(_message.Message):
     caller_metadata: _containers.ScalarMap[str, str]
     created_at: _timestamp_pb2.Timestamp
     copies: _containers.RepeatedCompositeFieldContainer[ObjectCopy]
-    def __init__(self, object_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., content_sha256: _Optional[bytes] = ..., logical_size_bytes: _Optional[int] = ..., body_format: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., copies: _Optional[_Iterable[_Union[ObjectCopy, _Mapping]]] = ...) -> None: ...
+    append_commit_info: AppendCommitInfo
+    def __init__(self, object_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., content_sha256: _Optional[bytes] = ..., logical_size_bytes: _Optional[int] = ..., body_format: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., copies: _Optional[_Iterable[_Union[ObjectCopy, _Mapping]]] = ..., append_commit_info: _Optional[_Union[AppendCommitInfo, _Mapping]] = ...) -> None: ...
 
 class ObjectCopy(_message.Message):
     __slots__ = ("tape_uuid", "tape_file_number", "first_body_lba", "last_verified_at", "health", "pool_id")
