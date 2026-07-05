@@ -40,6 +40,12 @@ Boundaries: MXF grammar cuts only; `RAO_PLAIN` ranged path (AEAD → rung 3 hand
 5. **Serialization + synthesis**: `CutResult.to_dict()`/`RestorePlan.to_dict()`;
    `make_fallback_sidecar(source, failure)` exposed for handler-side use (registry only
    auto-falls-back on cap-exceed today).
+5b. **`registry.scrape_source(source, blob_dir)`** public seam (blob-dir-threaded,
+   in-process) — used by cut-time blob regeneration over a live `RaoObject` session, where
+   subprocess isolation can't inherit the gRPC session. Rationale recorded: cut is
+   operator-attended and reads our own archived bytes (bounded 8 MiB budget still applies);
+   the parent-brokered-range child is the noted hardening path if that posture changes.
+   M6 acceptance includes a regeneration test through this seam.
 6. M6 acceptance: cut_from_sidecar ≡ cut() on the real XAVC-I fixture (identical output
    hash); a **pre-verified generated fixture** — `ffmpeg … mxf_d10` D-10 file scraped and
    cut green via the CLI in M6's own tests; the same generation command is then reused by
@@ -70,15 +76,19 @@ enqueue/dedupe, worker rails. Swap the body:
 
 | Outcome | Reasons |
 |---|---|
-| retryable (backoff) | `source_changed`, IO/`exception` at read, timeout/RSS kill (once) |
-| **blocked(unsupported-source) + SUSPECT + blocked_tool=(pfr_core, version)** — §3.4a preserved: corrupt/unparseable keeps the version-bump reopen hook | parser crash; malformed structure; `index_unavailable` on a file that sniffed MXF but won't parse |
-| completed with **fallback sidecar** (handler-side `make_fallback_sidecar`; a fact, not an error) | `op_atom_unsupported`; non-MXF grammars; `cap_exceeded_fallback`; `budget_exceeded` |
+| retryable (backoff) | `source_changed`; IO/`exception` at read; timeout/RSS kill; `budget_exceeded` (wall-clock/RSS-shaped — transient contention, NOT structural) |
+| **blocked(unsupported-source) + SUSPECT + blocked_tool=(pfr_core, version)** — §3.4a preserved, and applied only on a **determination**, not a single event: two consecutive attempts failing at the same stage with a parse-level reason (`malformed` structure; `index_unavailable` on a file that sniffed MXF) after backoff retries exhaust. A one-off parser crash is retryable until it reproduces. | reproducible parse-unyielding sources only |
+| completed with **fallback sidecar** (handler-side `make_fallback_sidecar`; a fact, not an error) | `op_atom_unsupported`; non-MXF grammars; `cap_exceeded_fallback` (byte-budget structural — the ONLY budget reason that falls back) |
 | loud stop (job error) | anything unmapped — matrix is closed; new ReasonIds fail tests |
 
 - **Staleness (decided)**: no automatic re-derivation exists (target key has no version
   axis; reconciler is presence-only — verified). Stub→real and future grammar upgrades =
   **operator-triggered**: `sutra pfr reindex --grammar fallback|--all` ships in this arc
-  (runbook line in prompt). `recipe_version` is persisted in the fact metadata now, so the
+  (runbook line in prompt). **Force semantics defined**: reindex enqueues pfr-index jobs
+  DIRECTLY (not via the presence-gated reconciler) with dedupe key
+  `pfr-reindex:{item}:{recipe_version}`; the handler in force mode writes the new sidecar
+  temp+fsync+rename OVER the existing path (pointer unchanged, atomic replace — no window
+  with a missing sidecar) and re-runs `record_index` (idempotent). `recipe_version` is persisted in the fact metadata now, so the
   deferred reconciler §9(4) reopen-on-mismatch has data when built.
 - **No size/artifactclass gate on scrape** (deliberate, recorded): real scrape ≈ stub cost
   (≤8 MiB bounded reads, ~1.6 MB blobs ≈ 0.03% of item ingest I/O), and a wrong gate +
