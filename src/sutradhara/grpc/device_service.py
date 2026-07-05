@@ -68,6 +68,9 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
         )
         reader.start()
         try:
+            # Tonic completes this bidi call only after the first response; an
+            # empty command is the relay handshake and the Rust client no-ops it.
+            yield device_pb2.ServerCommand()
             while not stop.is_set():
                 if self._stream_expired(connected_at):
                     reason = PermissionError("device stream lifetime expired")

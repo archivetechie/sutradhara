@@ -241,15 +241,18 @@ def test_device_reenrollment_refuses_different_operator_without_mutation(engine:
 
 def test_expired_or_reused_enrollment_token_is_refused(engine: Engine) -> None:
     with session_scope(engine) as session:
+        # Distinct devices: minting supersedes prior unredeemed tokens for the
+        # SAME operator/device (contract-enroll-bundle 2026-07-04), so same-device
+        # tokens would invalidate each other before the assertions below.
         expired = store.issue_enroll_token(
             session,
             operator="owner",
-            device_id="mac-1",
+            device_id="mac-expired",
             ttl=dt.timedelta(seconds=-1),
         )
-        used = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
-        wrong_device = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
-        store.consume_enroll_token(session, used, device_id="mac-1")
+        used = store.issue_enroll_token(session, operator="owner", device_id="mac-used")
+        wrong_device = store.issue_enroll_token(session, operator="owner", device_id="mac-wrong")
+        store.consume_enroll_token(session, used, device_id="mac-used")
 
     with session_scope(engine) as session:
         with pytest.raises(ValueError, match="expired"):

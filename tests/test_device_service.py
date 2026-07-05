@@ -29,6 +29,86 @@ def engine(tmp_path: Path) -> Iterator[Engine]:
     eng.dispose()
 
 
+def test_device_service_connect_yields_handshake_before_queued_command(engine: Engine) -> None:
+    registry = ConnectedDeviceRegistry()
+    servicer = DeviceService(
+        DeviceServiceConfig(engine=engine, registry=registry, command_poll_seconds=0.01)
+    )
+    with session_scope(engine) as session:
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+
+    messages = _BlockingIterator()
+    responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
+    _assert_handshake(_next_response(responses))
+    messages.put(
+        device_pb2.DeviceMessage(
+            card_snapshot=device_pb2.CardSnapshot(
+                cards=[
+                    device_pb2.Card(
+                        card_id="card-1",
+                        label="Card 1",
+                        kind=device_pb2.CARD_KIND_CARD,
+                        size_bytes=10,
+                        status="available",
+                    )
+                ]
+            )
+        )
+    )
+    _eventually(lambda: registry.devices_for("owner")[0].cards[0].card_id == "card-1")
+
+    pending = registry.send_start_receive(
+        operator="owner",
+        device_id="mac-1",
+        card_id="card-1",
+        artifactclass="s-masters",
+        label="Card 1",
+        source_ref=None,
+        idempotency_key="key-1",
+    )
+    response = _next_response(responses)
+
+    assert response.start_receive.command_id == pending.command_id
+    messages.close()
+    responses.close()
+
+
+def test_device_service_idle_heartbeats_keep_stream_past_ttl(engine: Engine) -> None:
+    registry = ConnectedDeviceRegistry()
+    servicer = DeviceService(
+        DeviceServiceConfig(engine=engine, registry=registry, command_poll_seconds=0.01)
+    )
+    with session_scope(engine) as session:
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="owner",
+        )
+
+    messages = _BlockingIterator()
+    responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
+    _assert_handshake(_next_response(responses))
+    initial_seen = registry.devices_for("owner")[0].last_seen
+
+    messages.put(device_pb2.DeviceMessage(heartbeat=device_pb2.Heartbeat()))
+    _eventually(lambda: registry.devices_for("owner")[0].last_seen > initial_seen)
+    heartbeat_seen = registry.devices_for("owner")[0].last_seen
+    ttl = dt.timedelta(microseconds=1)
+    sweep_time = heartbeat_seen + ttl
+
+    assert sweep_time > initial_seen + ttl
+    assert registry.evict_stale(ttl=ttl, now=sweep_time) == []
+    assert registry.devices_for("owner")[0].device_id == "mac-1"
+    messages.close()
+    responses.close()
+
+
 def test_device_service_ack_correlates_card_id_and_completes_http_idempotency(
     engine: Engine,
     tmp_path: Path,
@@ -65,12 +145,7 @@ def test_device_service_ack_correlates_card_id_and_completes_http_idempotency(
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
-    next_response: queue.Queue[object] = queue.Queue()
-    thread = threading.Thread(
-        target=lambda: next_response.put(next(responses)),
-        daemon=True,
-    )
-    thread.start()
+    _assert_handshake(_next_response(responses))
     messages.put(
         device_pb2.DeviceMessage(
             card_snapshot=device_pb2.CardSnapshot(
@@ -96,7 +171,7 @@ def test_device_service_ack_correlates_card_id_and_completes_http_idempotency(
         source_ref=None,
         idempotency_key="key-1",
     )
-    response = next_response.get(timeout=2)
+    response = _next_response(responses)
     assert response.start_receive.command_id == pending.command_id
 
     messages.put(
@@ -154,8 +229,7 @@ def test_active_receives_rebuilds_card_correlation_after_restart(
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
-    thread = threading.Thread(target=lambda: _ignore_stop_iteration(responses), daemon=True)
-    thread.start()
+    _assert_handshake(_next_response(responses))
     messages.put(
         device_pb2.DeviceMessage(
             active_receives=device_pb2.ActiveReceives(
@@ -173,7 +247,7 @@ def test_active_receives_rebuilds_card_correlation_after_restart(
 
     _eventually(lambda: _stored_card_id(engine) == "card-1")
     messages.close()
-    thread.join(timeout=2)
+    responses.close()
 
 
 def test_device_service_dispatches_directory_listing_and_routes_reply(engine: Engine) -> None:
@@ -189,12 +263,7 @@ def test_device_service_dispatches_directory_listing_and_routes_reply(engine: En
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
-    next_response: queue.Queue[object] = queue.Queue()
-    thread = threading.Thread(
-        target=lambda: next_response.put(next(responses)),
-        daemon=True,
-    )
-    thread.start()
+    _assert_handshake(_next_response(responses))
     messages.put(
         device_pb2.DeviceMessage(
             card_snapshot=device_pb2.CardSnapshot(
@@ -218,7 +287,7 @@ def test_device_service_dispatches_directory_listing_and_routes_reply(engine: En
         card_id="card-1",
         rel_path="DCIM",
     )
-    response = next_response.get(timeout=2)
+    response = _next_response(responses)
     assert response.list_directory.request_id == pending.request_id
     assert response.list_directory.rel_path == "DCIM"
 
@@ -255,8 +324,7 @@ def test_device_service_revocation_evicts_on_next_heartbeat(engine: Engine) -> N
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
-    thread = threading.Thread(target=lambda: _ignore_stop_iteration(responses), daemon=True)
-    thread.start()
+    _assert_handshake(_next_response(responses))
     messages.put(
         device_pb2.DeviceMessage(
             card_snapshot=device_pb2.CardSnapshot(
@@ -280,7 +348,7 @@ def test_device_service_revocation_evicts_on_next_heartbeat(engine: Engine) -> N
 
     _eventually(lambda: registry.devices_for("owner") == [])
     messages.close()
-    thread.join(timeout=2)
+    responses.close()
 
 
 def test_device_service_max_stream_lifetime_evicts_stream(engine: Engine) -> None:
@@ -303,6 +371,7 @@ def test_device_service_max_stream_lifetime_evicts_stream(engine: Engine) -> Non
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
+    _assert_handshake(_next_response(responses))
     thread = threading.Thread(target=lambda: _ignore_stop_iteration(responses), daemon=True)
     thread.start()
 
@@ -333,12 +402,7 @@ def test_device_service_ack_does_not_complete_when_card_correlation_fails(
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
-    next_response: queue.Queue[object] = queue.Queue()
-    thread = threading.Thread(
-        target=lambda: next_response.put(next(responses)),
-        daemon=True,
-    )
-    thread.start()
+    _assert_handshake(_next_response(responses))
     messages.put(
         device_pb2.DeviceMessage(
             card_snapshot=device_pb2.CardSnapshot(
@@ -364,7 +428,7 @@ def test_device_service_ack_does_not_complete_when_card_correlation_fails(
         source_ref=None,
         idempotency_key="key-1",
     )
-    response = next_response.get(timeout=2)
+    response = _next_response(responses)
     assert response.start_receive.command_id == pending.command_id
 
     messages.put(
@@ -402,6 +466,29 @@ def _idempotency_status(engine: Engine) -> str | None:
 def _ignore_stop_iteration(iterator: Iterator[object]) -> None:
     with contextlib.suppress(StopIteration):
         next(iterator)
+
+
+def _next_response(iterator: Iterator[object], *, timeout: float = 2.0) -> object:
+    result: queue.Queue[object] = queue.Queue()
+
+    def read() -> None:
+        try:
+            result.put(next(iterator))
+        except Exception as exc:
+            result.put(exc)
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    item = result.get(timeout=timeout)
+    thread.join(timeout=0.1)
+    if isinstance(item, Exception):
+        raise item
+    return item
+
+
+def _assert_handshake(response: object) -> None:
+    assert isinstance(response, device_pb2.ServerCommand)
+    assert response.WhichOneof("payload") is None
 
 
 class _BlockingIterator:
