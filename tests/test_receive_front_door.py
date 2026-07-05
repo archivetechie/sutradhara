@@ -245,6 +245,88 @@ def test_receive_writes_slim_sentinel_last_and_bag_tags(tmp_path: Path) -> None:
     }
 
 
+def test_blocking_receive_verifies_before_sentinel_publication(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+
+    class BlockingObserver(AtomicWriteObserver):
+        saw_intake = False
+
+        def before_rename(self, _temp_path: Path, final_path: Path) -> None:
+            if final_path.name != "intake.json":
+                return
+            sidecar = json.loads((final_path.parent / VERIFY_SIDECAR_NAME).read_text())
+            assert sidecar["stage"] == "full"
+            assert (final_path.parent / ".receiving.json").exists()
+            assert " release " not in (final_path.parent / "receive.log").read_text()
+            self.saw_intake = True
+
+    observer = BlockingObserver()
+
+    result = receive_source(
+        source,
+        landing=landing,
+        source_kind="card",
+        operator="op",
+        verify="blocking",
+        atomic_observer=observer,
+    )
+
+    assert observer.saw_intake is True
+    assert result.sentinel_path.exists()
+    assert not (result.intake_dir / ".receiving.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("crash_name", "published_before_crash"),
+    [
+        ("bagit.txt", ()),
+        ("bag-info.txt", ("bagit.txt",)),
+        ("manifest-sha256.txt", ("bagit.txt", "bag-info.txt")),
+        ("tagmanifest-sha256.txt", ("bagit.txt", "bag-info.txt", "manifest-sha256.txt")),
+        (
+            "intake.json",
+            ("bagit.txt", "bag-info.txt", "manifest-sha256.txt", "tagmanifest-sha256.txt"),
+        ),
+    ],
+)
+def test_receive_finalization_kill_windows_do_not_publish_next_step(
+    tmp_path: Path,
+    crash_name: str,
+    published_before_crash: tuple[str, ...],
+) -> None:
+    source = tmp_path / "source"
+    landing = tmp_path / "landing"
+    source.mkdir()
+    (source / "clip.mov").write_bytes(b"video")
+
+    class CrashBeforeStep(AtomicWriteObserver):
+        def before_rename(self, _temp_path: Path, final_path: Path) -> None:
+            if final_path.name == crash_name:
+                raise ReceiveError(f"simulated crash before {crash_name}")
+
+    with pytest.raises(ReceiveError, match=f"simulated crash before {re.escape(crash_name)}"):
+        receive_source(
+            source,
+            landing=landing,
+            source_kind="card",
+            operator="op",
+            atomic_observer=CrashBeforeStep(),
+        )
+
+    failed = next(path for path in landing.iterdir() if path.is_dir())
+    assert (failed / ".receiving.json").exists()
+    assert not (failed / "intake.json").exists()
+    assert not (failed / VERIFY_SIDECAR_NAME).exists()
+    for name in published_before_crash:
+        assert (failed / name).exists()
+    assert not (failed / crash_name).exists()
+    if (failed / "receive.log").exists():
+        assert " release " not in (failed / "receive.log").read_text()
+
+
 def test_receive_rejects_nfc_and_case_collisions_before_payload_copy(tmp_path: Path) -> None:
     landing = tmp_path / "landing"
     for names in (("Café.mov", "Cafe\u0301.mov"), ("A.mov", "a.mov")):
@@ -300,9 +382,13 @@ def test_blocking_receive_detects_corrupt_landed_destination_before_return(tmp_p
         )
 
     failed = next(landing.iterdir())
-    assert (failed / "intake.json").exists()
+    assert not (failed / "intake.json").exists()
+    assert (failed / ".receiving.json").exists()
     sidecar = json.loads((failed / VERIFY_SIDECAR_NAME).read_text(encoding="utf-8"))
     assert sidecar["stage"] == "failed"
+    log = (failed / "receive.log").read_text(encoding="utf-8")
+    assert re.search(r' verify \{"stage2_wall_ns":\d+\}', log)
+    assert " release " not in log
 
 
 def test_staged_receive_returns_at_transfer_and_verify_destination_writes_sidecar(
@@ -353,6 +439,47 @@ def test_receive_detects_source_mutation(tmp_path: Path, monkeypatch: pytest.Mon
 
     failed = next(landing.iterdir())
     assert not (failed / "intake.json").exists()
+
+
+def test_native_pipelined_receive_matches_python_serial_on_corpus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    nested = source / "DCIM" / "A001"
+    nested.mkdir(parents=True)
+    payload = bytes(index % 251 for index in range(2 * 1024 * 1024 + 17))
+    (nested / "clip.mov").write_bytes(payload)
+    (source / "Cafe\u0301.txt").write_text("cafe\n", encoding="utf-8")
+    (source / "notes" / "scene.txt").parent.mkdir()
+    (source / "notes" / "scene.txt").write_text("wide shot\n", encoding="utf-8")
+
+    native = receive_source(
+        source,
+        landing=tmp_path / "native-landing",
+        source_kind="card",
+        operator="op",
+        now=dt.datetime(2026, 6, 18, tzinfo=dt.UTC),
+    )
+    native_manifest = read_manifest_sha256(native.manifest_path)
+    native_payloads = {
+        relpath: (native.intake_dir / "data" / relpath).read_bytes() for relpath in native_manifest
+    }
+
+    monkeypatch.setattr(receive_core, "_native", None)
+    serial = receive_core.receive_source(
+        source,
+        landing=tmp_path / "serial-landing",
+        source_kind="card",
+        operator="op",
+        now=dt.datetime(2026, 6, 18, tzinfo=dt.UTC),
+    )
+
+    assert receive_core.read_manifest_sha256(serial.manifest_path) == native_manifest
+    assert receive_core.validate_bag(serial.intake_dir).valid is True
+    assert validate_bag(native.intake_dir).valid is True
+    for relpath, contents in native_payloads.items():
+        assert (serial.intake_dir / "data" / relpath).read_bytes() == contents
 
 
 def test_receive_records_skipped_symlink_and_fifo(tmp_path: Path) -> None:
@@ -752,6 +879,74 @@ def test_verify_pending_rechecks_absent_transfer_and_failed_sidecars(tmp_path: P
     assert result.failed == (bad.intake_dir,)
     assert json.loads((clean.intake_dir / VERIFY_SIDECAR_NAME).read_text())["stage"] == "full"
     assert json.loads((bad.intake_dir / VERIFY_SIDECAR_NAME).read_text())["stage"] == "failed"
+
+
+def test_verify_pending_skips_symlink_children_and_keeps_sweeping_after_bag_errors(
+    tmp_path: Path,
+) -> None:
+    landing = tmp_path / "landing"
+    clean_source = tmp_path / "clean-source"
+    bad_source = tmp_path / "bad-source"
+    outside_source = tmp_path / "outside-source"
+    for source in (clean_source, bad_source, outside_source):
+        source.mkdir()
+        (source / "clip.mov").write_bytes(b"video")
+    clean = receive_source(clean_source, landing=landing, source_kind="card", operator="op")
+    bad = receive_source(bad_source, landing=landing, source_kind="card", operator="op")
+    outside = receive_source(
+        outside_source,
+        landing=tmp_path / "outside-landing",
+        source_kind="card",
+        operator="op",
+    )
+    try:
+        (landing / "linked-outside").symlink_to(outside.intake_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    (clean.intake_dir / VERIFY_SIDECAR_NAME).unlink()
+    (bad.intake_dir / VERIFY_SIDECAR_NAME).unlink()
+    bad.manifest_path.write_text("not a checksum manifest\n", encoding="utf-8")
+
+    result = verify_pending([landing])
+
+    assert set(result.checked) == {clean.intake_dir, bad.intake_dir}
+    assert result.failed == (bad.intake_dir,)
+    assert json.loads((clean.intake_dir / VERIFY_SIDECAR_NAME).read_text())["stage"] == "full"
+    assert landing / "linked-outside" not in result.checked
+    assert outside.intake_dir not in result.checked
+
+
+def test_python_verify_pending_mirror_fails_bad_bag_without_aborting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(receive_core, "_native", None)
+    landing = tmp_path / "landing"
+    clean_source = tmp_path / "clean-source"
+    bad_source = tmp_path / "bad-source"
+    for source in (clean_source, bad_source):
+        source.mkdir()
+        (source / "clip.mov").write_bytes(b"video")
+    clean = receive_core.receive_source(
+        clean_source,
+        landing=landing,
+        source_kind="card",
+        operator="op",
+    )
+    bad = receive_core.receive_source(
+        bad_source,
+        landing=landing,
+        source_kind="card",
+        operator="op",
+    )
+    (clean.intake_dir / VERIFY_SIDECAR_NAME).unlink()
+    (bad.intake_dir / VERIFY_SIDECAR_NAME).unlink()
+    bad.manifest_path.write_text("not a checksum manifest\n", encoding="utf-8")
+
+    result = receive_core.verify_pending([landing])
+
+    assert set(result.checked) == {clean.intake_dir, bad.intake_dir}
+    assert result.failed == (bad.intake_dir,)
 
 
 def test_confirmation_is_fail_safe_for_verified_quarantine_and_timeout(tmp_path: Path) -> None:

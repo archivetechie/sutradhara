@@ -676,6 +676,47 @@ fn verify_sidecar_fixtures_match_contract() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn verify_pending_skips_symlink_children_and_keeps_sweeping_after_bag_errors() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let landing = temp.path().join("landing");
+    let outside_landing = temp.path().join("outside-landing");
+    let clean_source = temp.path().join("clean-source");
+    let bad_source = temp.path().join("bad-source");
+    let outside_source = temp.path().join("outside-source");
+    for source in [&clean_source, &bad_source, &outside_source] {
+        fs::create_dir_all(source).unwrap();
+        fs::write(source.join("clip.mov"), b"video").unwrap();
+    }
+    let clean = receive_source(&clean_source, &landing, &receive_options("clean")).unwrap();
+    let bad = receive_source(&bad_source, &landing, &receive_options("bad")).unwrap();
+    let outside = receive_source(
+        &outside_source,
+        &outside_landing,
+        &receive_options("outside"),
+    )
+    .unwrap();
+    symlink(&outside.intake_dir, landing.join("linked-outside")).unwrap();
+    fs::remove_file(clean.intake_dir.join("verify.json")).unwrap();
+    fs::remove_file(bad.intake_dir.join("verify.json")).unwrap();
+    fs::write(bad.manifest_path, "not a checksum manifest\n").unwrap();
+
+    let pending = verify_pending(&[landing.clone()]).unwrap();
+
+    let mut checked = pending.checked;
+    checked.sort();
+    assert_eq!(
+        checked,
+        vec![bad.intake_dir.clone(), clean.intake_dir.clone()]
+    );
+    assert_eq!(pending.failed, vec![bad.intake_dir]);
+    assert!(!checked.contains(&landing.join("linked-outside")));
+    assert!(!checked.contains(&outside.intake_dir));
+}
+
 #[test]
 fn manifest_reader_rejects_non_ascii_digest_without_panic() {
     let temp = tempfile::tempdir().unwrap();

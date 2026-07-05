@@ -1066,6 +1066,12 @@ where
         &extra_tag_files,
         observer,
     )?;
+    if matches!(options.verify, VerifyMode::Blocking) {
+        let verify_result = verify_destination(intake_dir)?;
+        if !verify_result.verified() {
+            return Err(destination_verification_error(&verify_result.mismatches));
+        }
+    }
     write_json_file_with_observer(
         &intake_dir.join("intake.json"),
         &json!({
@@ -1093,12 +1099,7 @@ where
         VerifyMode::Staged => {
             write_transfer_verify_sidecar(intake_dir)?;
         }
-        VerifyMode::Blocking => {
-            let verify_result = verify_destination(intake_dir)?;
-            if !verify_result.verified() {
-                return Err(destination_verification_error(&verify_result.mismatches));
-            }
-        }
+        VerifyMode::Blocking => {}
     }
 
     Ok(ReceiveSourceResult {
@@ -1239,32 +1240,75 @@ pub fn verify_pending(landing_roots: &[PathBuf]) -> ReceiveResult<VerifyPendingR
     let mut checked = Vec::new();
     let mut failed = Vec::new();
     for landing in landing_roots {
-        if !landing.exists() {
+        let landing = match fs::canonicalize(landing) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !fs::symlink_metadata(&landing)?.is_dir() {
             continue;
         }
         let mut children = Vec::new();
-        for entry in fs::read_dir(landing)? {
-            let path = entry?.path();
-            if path.is_dir() {
+        for entry in fs::read_dir(&landing)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
                 children.push(path);
             }
         }
         children.sort();
         for child in children {
-            if !child.join("intake.json").exists() || child.join(".receiving.json").exists() {
+            if !child.starts_with(&landing) {
                 continue;
             }
-            if !verify_sidecar_is_pending(&child)? {
+            if !safe_complete_bag_candidate(&child)? {
                 continue;
             }
-            let result = verify_destination(&child)?;
-            checked.push(child.clone());
-            if !result.verified() {
-                failed.push(child);
+            match verify_sidecar_is_pending(&child) {
+                Ok(false) => continue,
+                Ok(true) => {
+                    checked.push(child.clone());
+                    match verify_destination(&child) {
+                        Ok(result) if result.verified() => {}
+                        Ok(_) | Err(_) => failed.push(child),
+                    }
+                }
+                Err(_) => {
+                    checked.push(child.clone());
+                    failed.push(child);
+                }
             }
         }
     }
     Ok(VerifyPendingResult { checked, failed })
+}
+
+fn safe_complete_bag_candidate(path: &Path) -> ReceiveResult<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(false);
+    }
+    if path_exists_no_follow(&path.join(".receiving.json"))? {
+        return Ok(false);
+    }
+    regular_file_no_follow(&path.join("intake.json"))
+}
+
+fn path_exists_no_follow(path: &Path) -> ReceiveResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn regular_file_no_follow(path: &Path) -> ReceiveResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(!metadata.file_type().is_symlink() && metadata.is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn hash_payload_tree(payload_root: &Path) -> ReceiveResult<Vec<HashReceipt>> {
@@ -2040,18 +2084,43 @@ fn pipelined_copy_with_digest(source: &Path, mut output: File) -> ReceiveResult<
             }
         }
         output.flush()?;
+        drop(output);
         Ok(())
     });
 
-    let read_result = join_copy_thread(reader)?;
-    join_copy_thread(writer)?;
-    Ok(read_result)
+    let read_result = join_copy_thread("reader", reader);
+    let write_result = join_copy_thread("writer", writer);
+    match (read_result, write_result) {
+        (Ok(read_result), Ok(())) => Ok(read_result),
+        (Err(read_error), Ok(())) => Err(copy_pipeline_error(Some(read_error), None)),
+        (Ok(_), Err(write_error)) => Err(copy_pipeline_error(None, Some(write_error))),
+        (Err(read_error), Err(write_error)) => {
+            Err(copy_pipeline_error(Some(read_error), Some(write_error)))
+        }
+    }
 }
 
-fn join_copy_thread<T>(handle: thread::JoinHandle<ReceiveResult<T>>) -> ReceiveResult<T> {
+fn join_copy_thread<T>(
+    name: &'static str,
+    handle: thread::JoinHandle<ReceiveResult<T>>,
+) -> ReceiveResult<T> {
     handle
         .join()
-        .map_err(|_| ReceiveError::new("copy pipeline thread panicked"))?
+        .map_err(|_| ReceiveError::new(format!("{name} thread panicked")))?
+}
+
+fn copy_pipeline_error(
+    read_error: Option<ReceiveError>,
+    write_error: Option<ReceiveError>,
+) -> ReceiveError {
+    let mut parts = Vec::new();
+    if let Some(error) = read_error {
+        parts.push(format!("reader: {error}"));
+    }
+    if let Some(error) = write_error {
+        parts.push(format!("writer: {error}"));
+    }
+    ReceiveError::new(format!("copy pipeline failed ({})", parts.join("; ")))
 }
 
 fn source_stat_snapshot(path: &Path) -> ReceiveResult<SourceStatSnapshot> {
@@ -2171,11 +2240,18 @@ fn write_verify_sidecar(result: &VerifyResult) -> ReceiveResult<()> {
 
 fn verify_sidecar_is_pending(bag_path: &Path) -> ReceiveResult<bool> {
     let sidecar = bag_path.join(VERIFY_SIDECAR_NAME);
-    let payload = match fs::read_to_string(&sidecar) {
-        Ok(payload) => payload,
+    let metadata = match fs::symlink_metadata(&sidecar) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error.into()),
     };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ReceiveError::new(format!(
+            "verify sidecar is not a regular file: {}",
+            sidecar.display()
+        )));
+    }
+    let payload = fs::read_to_string(&sidecar)?;
     let value: Value = serde_json::from_str(&payload)?;
     Ok(matches!(
         value.get("stage").and_then(Value::as_str),
@@ -3344,6 +3420,42 @@ mod tests {
         );
         assert_eq!(snapshot.size, 5);
         assert_eq!(std::fs::read(destination).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn pipelined_copy_reports_reader_failure_and_closes_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("missing.mov");
+        let output_path = temp.path().join("out.tmp");
+        let output = File::create(&output_path).unwrap();
+
+        let error = pipelined_copy_with_digest(&source, output)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.starts_with("copy pipeline failed (reader:"));
+        assert!(!error.contains("writer:"));
+        std::fs::remove_file(output_path).unwrap();
+    }
+
+    #[test]
+    fn pipelined_copy_reports_reader_and_writer_failures_deterministically() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.mov");
+        let output_path = temp.path().join("read-only-output.tmp");
+        let payload = vec![7_u8; COPY_BUFFER_BYTES * 4 + 1];
+        std::fs::write(&source, payload).unwrap();
+        std::fs::write(&output_path, b"existing").unwrap();
+        let output = OpenOptions::new().read(true).open(&output_path).unwrap();
+
+        let error = pipelined_copy_with_digest(&source, output)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.starts_with("copy pipeline failed (reader:"));
+        assert!(error.contains("copy writer stopped before source EOF"));
+        assert!(error.contains("; writer:"));
+        std::fs::remove_file(output_path).unwrap();
     }
 
     #[test]

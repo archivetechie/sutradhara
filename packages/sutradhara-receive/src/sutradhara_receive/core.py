@@ -534,6 +534,12 @@ def receive_source(
             extra_tag_files=extra_tag_files,
             observer=atomic_observer,
         )
+        if verify == "blocking":
+            verify_result = verify_destination(intake_dir)
+            if not verify_result.verified:
+                raise DestinationVerificationError(
+                    f"destination verification failed: {_mismatch_payload(verify_result.mismatches)}"
+                )
         sentinel = {
             "intake_id": intake_id,
             "status": "complete",
@@ -549,12 +555,6 @@ def receive_source(
         _write_receive_log(intake_dir / "receive.log", events, observer=None)
         if verify == "staged":
             _write_transfer_verify_sidecar(intake_dir)
-        else:
-            verify_result = verify_destination(intake_dir)
-            if not verify_result.verified:
-                raise DestinationVerificationError(
-                    f"destination verification failed: {_mismatch_payload(verify_result.mismatches)}"
-                )
         return ReceiveResult(
             intake_id=intake_id,
             intake_dir=intake_dir,
@@ -882,18 +882,65 @@ def verify_pending(landing_roots: Iterable[Path | str]) -> VerifyPendingResult:
     checked: list[Path] = []
     failed: list[Path] = []
     for root in roots:
-        if not root.exists():
+        try:
+            landing = root.resolve(strict=True)
+        except FileNotFoundError:
             continue
-        for bag in sorted(path for path in root.iterdir() if path.is_dir()):
-            if not (bag / "intake.json").exists() or (bag / ".receiving.json").exists():
+        if not landing.is_dir():
+            continue
+        for bag in sorted(
+            path for path in landing.iterdir() if _is_safe_landing_child(landing, path)
+        ):
+            if not _is_complete_bag_candidate(bag):
                 continue
-            if not _verify_sidecar_is_pending(bag):
+            try:
+                pending = _verify_sidecar_is_pending(bag)
+            except (OSError, ReceiveError, ValueError, json.JSONDecodeError):
+                checked.append(bag)
+                failed.append(bag)
                 continue
-            result = verify_destination(bag)
+            if not pending:
+                continue
             checked.append(bag)
+            try:
+                result = verify_destination(bag)
+            except (OSError, ReceiveError, ValueError):
+                failed.append(bag)
+                continue
             if not result.verified:
                 failed.append(bag)
     return VerifyPendingResult(checked=tuple(checked), failed=tuple(failed))
+
+
+def _is_safe_landing_child(landing: Path, path: Path) -> bool:
+    try:
+        path.relative_to(landing)
+        stat_result = path.lstat()
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISDIR(stat_result.st_mode) and not stat.S_ISLNK(stat_result.st_mode)
+
+
+def _is_complete_bag_candidate(path: Path) -> bool:
+    try:
+        path_stat = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISDIR(path_stat.st_mode):
+        return False
+    try:
+        (path / ".receiving.json").lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    else:
+        return False
+    try:
+        intake_stat = (path / "intake.json").lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(intake_stat.st_mode) and not stat.S_ISLNK(intake_stat.st_mode)
 
 
 def _verify_result_from_native(payload: Mapping[str, Any]) -> VerifyResult:
@@ -2517,6 +2564,12 @@ def _write_transfer_verify_sidecar(bag_path: Path) -> None:
 
 def _verify_sidecar_is_pending(bag_path: Path) -> bool:
     sidecar = bag_path / VERIFY_SIDECAR_NAME
+    try:
+        sidecar_stat = sidecar.lstat()
+    except FileNotFoundError:
+        return True
+    if stat.S_ISLNK(sidecar_stat.st_mode) or not stat.S_ISREG(sidecar_stat.st_mode):
+        raise ReceiveError(f"verify sidecar is not a regular file: {sidecar}")
     try:
         payload = _read_json(sidecar)
     except FileNotFoundError:
