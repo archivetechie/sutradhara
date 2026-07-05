@@ -1,6 +1,6 @@
 # Design — PFR wiring, MXF end-to-end (sutradhara ⇄ format-anatomy ⇄ rem)
 
-Date: 2026-07-05 · Status: **panel-folded** (verify round pending)
+Date: 2026-07-05 · Status: **frozen** (panel 3 lenses → fold → verify (1 blocker found) → micro-fold → re-verify PASS, 2026-07-05)
 Panel 2026-07-05: 3 blind lenses (failure/codex, contract/opus, cost/opus ×2 passes);
 ~35 findings (3 convergent blockers, ~20 majors); folded in one pass. Core discoveries:
 the draft assumed pfr_core entry points that don't exist (scrape-free cut, composed
