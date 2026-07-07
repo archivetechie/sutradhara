@@ -27,7 +27,7 @@ data-loss event.
 - Not a vendor product like Miria — it is first-party software designed to
   outlive its dependencies.
 
-<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 69add7b -->
 ## Status
 
 Beyond the v0.1 anchor spec (see [`docs/spec-v0.1.md`](docs/spec-v0.1.md) for
