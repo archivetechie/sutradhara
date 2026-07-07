@@ -1,8 +1,8 @@
 # Sutradhara
 
 Orchestrator above [Remanence](https://github.com/archivetechie/remanence) — a
-content-addressed media archive catalog and job engine, built for the archive
-Foundation video archive.
+content-addressed media archive catalog and job engine, built for a production
+video archive.
 
 <!-- code-anchor: none -->
 ## What this is
@@ -183,8 +183,8 @@ redundantly on the row.
 
 ## Maintainer
 
-Built and maintained by Ada Operator and the archive archives team. Small-team
-/ sysadmin-led software; design favors simplicity, robustness, minimal
+Built and maintained by Ada Operator with a small archive operations team.
+Sysadmin-led software; design favors simplicity, robustness, minimal
 moving parts, and a 30-year horizon.
 
 ## License

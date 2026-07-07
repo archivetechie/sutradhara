@@ -151,7 +151,7 @@ def test_same_asset_can_have_copies_on_two_backends(engine: Engine) -> None:
     primary = _add_backend(engine, name="primary-tape")
     secondary = _add_backend(engine, name="cloud-mirror")
     loc1 = {"tape_uuid": "tape-1", "tape_file_number": 3}
-    loc2 = {"bucket": "archive-archive", "key": "assets/ab/cd/abcd/object.bin"}
+    loc2 = {"bucket": "archive-primary", "key": "assets/ab/cd/abcd/object.bin"}
 
     with session_scope(engine) as s:
         s.add(LogicalAsset(content_sha256=h, size_bytes=42))
