@@ -205,6 +205,7 @@ def _record_projection_condition(
         message=projection.message,
         next_eligible_at=projection.next_eligible_at,
         blocked_tool=projection.blocked_tool,
+        auto_block=projection.auto_block,
     )
 
 
@@ -218,6 +219,7 @@ def _record_reconciler_condition(
     message: str | None = None,
     next_eligible_at: dt.datetime | None = None,
     blocked_tool: tuple[str, str] | None = None,
+    auto_block: bool = True,
 ) -> None:
     if job.recon_domain is None:
         return
@@ -233,6 +235,7 @@ def _record_reconciler_condition(
         attempt=attempt,
         next_eligible_at=next_eligible_at,
         blocked_tool=blocked_tool,
+        auto_block=auto_block,
     )
 
 

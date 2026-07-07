@@ -147,3 +147,11 @@ class BackendNotFoundError(BackendError):
 
 class BackendUnavailableError(BackendError):
     """The backend itself is unreachable (network, mount, etc.)."""
+
+
+class BackendTransientError(BackendUnavailableError):
+    """A backend operation failed with a retryable transport condition."""
+
+
+class BackendSessionInvalidatedError(BackendError):
+    """A session-scoped backend read was invalidated before bytes were returned."""

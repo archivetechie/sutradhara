@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import json
 from pathlib import Path
 
@@ -14,8 +16,11 @@ from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
 from sutradhara.catalog.models import ArtifactClassPool, Backend, IngestItem, Pool
 from sutradhara.catalog.session import make_engine, session_scope
-from sutradhara.jobs.config import derivation_cache_root
+from sutradhara.jobs.config import WorkerConfig, derivation_cache_root
 from sutradhara.jobs.engine import submit
+from sutradhara.jobs.leases import LeaseError, LeaseManager
+from sutradhara.jobs.reconcilers import derivation as derivation_reconciler
+from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, record_observation
 from sutradhara.pfr import (
     PFRUnavailable,
     current_pfr_recipe_version,
@@ -96,17 +101,18 @@ def cut_cmd(
             else Path(f"{asset_hash.hex()}-{from_time:g}-{to_time:g}.mxf")
         )
         try:
-            result = cut_pfr_asset(
-                session,
-                asset_hash=asset_hash,
-                artifactclass=artifactclass,
-                destination=destination,
-                backends=_restore_backends(session, artifactclass),
-                t_in=from_time,
-                t_out=to_time,
-                rem_bin=rem_bin,
-            )
-        except (PFRUnavailable, ValueError) as exc:
+            with _inline_io_lease():
+                result = cut_pfr_asset(
+                    session,
+                    asset_hash=asset_hash,
+                    artifactclass=artifactclass,
+                    destination=destination,
+                    backends=_restore_backends(session, artifactclass),
+                    t_in=from_time,
+                    t_out=to_time,
+                    rem_bin=rem_bin,
+                )
+        except (LeaseError, PFRUnavailable, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
     if as_json:
         click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -146,6 +152,16 @@ def reindex_cmd(
         )
         jobs = []
         for item in _reindex_items(session, asset_hash=asset_hash, grammar=grammar):
+            target_key = derivation_reconciler.make_target_key(item.id, "pfr-index")
+            record_observation(
+                session,
+                domain=derivation_reconciler.DOMAIN,
+                target_key=target_key,
+                desired=True,
+                observed_state=OBSERVED_MISSING,
+                reason="pfr-reindex",
+                message="forced PFR reindex requested",
+            )
             job = submit(
                 session,
                 "pfr-index",
@@ -158,6 +174,8 @@ def reindex_cmd(
                 },
                 required_resources=[{"pool": "io", "count": 1}, {"pool": "cpu", "count": 1}],
                 dedupe_key=f"pfr-reindex:{item.id}:{recipe_version}",
+                recon_domain=derivation_reconciler.DOMAIN,
+                recon_target_key=target_key,
             )
             jobs.append(job.id)
     payload = {"recipe_version": recipe_version, "jobs": jobs, "count": len(jobs)}
@@ -208,6 +226,16 @@ def _restore_backends(session: Session, artifactclass: str) -> dict[int, Storage
         session.scalars(select(Backend).join(Backend.pools).where(Pool.id.in_(active_pool_ids)))
     )
     return {row.id: backend_from_row(row) for row in rows}
+
+
+@contextmanager
+def _inline_io_lease() -> Iterator[dict[str, int]]:
+    manager = LeaseManager(WorkerConfig.defaults().capacities)
+    granted = manager.reserve({"io": 1})
+    try:
+        yield granted
+    finally:
+        manager.release(granted)
 
 
 def _reindex_items(

@@ -35,6 +35,8 @@ from sutradhara.backend.port import (
     BackendError,
     BackendLocator,
     BackendNotFoundError,
+    BackendSessionInvalidatedError,
+    BackendTransientError,
     BackendUnavailableError,
     ByteRange,
     CopyRecord,
@@ -601,10 +603,7 @@ class RemanenceReadSession:
             )
             return b"".join(chunk.data for chunk in stream)
         except grpc.RpcError as e:
-            raise BackendUnavailableError(
-                f"Remanence ReadObjectRange at {self._backend._endpoint!r} failed: "
-                f"{_rpc_error_text(e)}"
-            ) from e
+            raise _read_object_range_error(self._backend._endpoint, e) from e
 
     def close(self) -> None:
         if self._closed:
@@ -876,6 +875,28 @@ def _grpc_channel_options(endpoint: str) -> tuple[tuple[str, str], ...]:
         # sends the socket path as :authority, which the daemon rejects.
         return (("grpc.default_authority", "127.0.0.1:50051"),)
     return ()
+
+
+def _read_object_range_error(endpoint: str | None, error: grpc.RpcError) -> BackendError:
+    text = (
+        f"Remanence ReadObjectRange at {endpoint!r} failed: "
+        f"{_rpc_error_text(error)}"
+    )
+    code = error.code()
+    if code in {
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.DATA_LOSS,
+    }:
+        return BackendTransientError(text)
+    if code in {
+        grpc.StatusCode.NOT_FOUND,
+        grpc.StatusCode.FAILED_PRECONDITION,
+        grpc.StatusCode.ABORTED,
+        grpc.StatusCode.INVALID_ARGUMENT,
+    }:
+        return BackendSessionInvalidatedError(text)
+    return BackendUnavailableError(text)
 
 
 def _rpc_error_text(error: grpc.RpcError) -> str:

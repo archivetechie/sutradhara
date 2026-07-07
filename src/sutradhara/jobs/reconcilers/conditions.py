@@ -106,6 +106,7 @@ def record_condition(
     attempt: JobAttempt | None = None,
     next_eligible_at: dt.datetime | None = None,
     blocked_tool: tuple[str, str] | None = None,
+    auto_block: bool = True,
 ) -> ReconciliationCondition:
     """Record Axis-B attempt outcome for one existing condition row.
 
@@ -133,7 +134,7 @@ def record_condition(
     if condition == CONDITION_BACKOFF:
         next_count = row.attempt_count + 1
         row.attempt_count = next_count
-        if next_count >= DEFAULT_BACKOFF_GIVE_UP_ATTEMPTS:
+        if auto_block and next_count >= DEFAULT_BACKOFF_GIVE_UP_ATTEMPTS:
             row.condition = CONDITION_BLOCKED
             row.reason = reason or "give-up"
             row.message = message

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pfr_core import PFRSidecar, make_fallback_sidecar
 from pfr_core.failure import ReasonId, ScrapeFailure
+from pfr_core.source import LocalFile
 from sqlalchemy import select
 
 from sutradhara.catalog.facts import record_index, record_validity
@@ -20,6 +22,7 @@ from sutradhara.pfr import (
     enforce_blob_lru,
     pfr_core_version,
     scrape_path_isolated_120,
+    sidecar_blobs_complete,
     sidecar_with_catalog_identity,
 )
 from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job
@@ -47,6 +50,7 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
                 condition=CONDITION_BACKOFF,
                 reason="pfr_core:source_open:read_error",
                 message=detail,
+                auto_block=False,
             ),
         )
 
@@ -64,21 +68,17 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
         cpu_lease=cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources),
     )
     if isinstance(scraped, ScrapeFailure):
-        return _failure_result(ctx, item, scraped)
+        return _failure_result(
+            ctx,
+            item,
+            source=source,
+            sidecar_path=sidecar_path,
+            blob_dir=blob_dir,
+            failure=scraped,
+        )
 
     sidecar = sidecar_with_catalog_identity(scraped, item)
-    atomic_write_sidecar(sidecar, sidecar_path)
-    enforce_blob_lru(blob_dir)
-    record_index(
-        ctx.session,
-        item=item,
-        index_kind=PFR_INDEX_KIND,
-        sidecar_path=sidecar_path,
-    )
-    item.item_metadata = {
-        **(item.item_metadata or {}),
-        PFR_RECIPE_METADATA_KEY: sidecar.recipe_version,
-    }
+    _publish_sidecar(ctx, item, sidecar=sidecar, sidecar_path=sidecar_path, blob_dir=blob_dir)
     kind = "fallback" if sidecar.grammar_id == "fallback" else "ok"
     return JobResult(
         ok=True,
@@ -94,7 +94,69 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
     )
 
 
-def _failure_result(ctx: JobContext, item: IngestItem, failure: ScrapeFailure) -> JobResult:
+_RETRYABLE_REASON_IDS = frozenset(
+    {
+        ReasonId.SOURCE_CHANGED,
+        ReasonId.BUDGET_EXCEEDED,
+        ReasonId.BUDGET_EXHAUSTED,
+        ReasonId.EXCEPTION,
+    }
+)
+_FALLBACK_REASON_IDS = frozenset(
+    {
+        ReasonId.CAP_EXCEEDED_FALLBACK,
+        ReasonId.OP_ATOM_UNSUPPORTED,
+        ReasonId.PLUGIN_MISSING,
+        ReasonId.FALLBACK,
+    }
+)
+_PARSE_DETERMINATION_REASON_IDS = frozenset({ReasonId.INDEX_UNAVAILABLE})
+_LOUD_STOP_REASON_IDS = frozenset(
+    {
+        ReasonId.BUNDLE_NOT_ADDRESSABLE,
+        ReasonId.REWRAP_NOT_DEPLOYED,
+        ReasonId.UNSUPPORTED_TIME_BASIS,
+        ReasonId.RIP_MISMATCH,
+        ReasonId.GOP_REWRAP_UNSUPPORTED,
+        ReasonId.SIDECAR_SOURCE_MISMATCH,
+    }
+)
+
+
+def _failure_result(
+    ctx: JobContext,
+    item: IngestItem,
+    *,
+    source: Path,
+    sidecar_path: Path,
+    blob_dir: Path,
+    failure: ScrapeFailure,
+) -> JobResult:
+    _assert_reason_matrix_closed()
+
+    if failure.reason_id in _FALLBACK_REASON_IDS:
+        fallback = make_fallback_sidecar(LocalFile(source), failure)
+        if isinstance(fallback, ScrapeFailure):
+            raise RuntimeError(
+                "pfr_core fallback sidecar creation failed: "
+                f"{fallback.reason_id.value}: {fallback.message}"
+            )
+        sidecar = sidecar_with_catalog_identity(fallback, item)
+        _publish_sidecar(ctx, item, sidecar=sidecar, sidecar_path=sidecar_path, blob_dir=blob_dir)
+        return JobResult(
+            ok=True,
+            detail=f"pfr fallback sidecar written ({failure.reason_id.value})",
+            step_state={
+                "pfr_index": {
+                    "kind": "fallback",
+                    "sidecar_path": str(sidecar_path),
+                    "grammar_id": sidecar.grammar_id,
+                    "recipe_version": sidecar.recipe_version,
+                    "failure": failure.to_dict(),
+                }
+            },
+        )
+
     if _is_parse_determination(failure) and _previous_same_failure(ctx, failure):
         _mark_suspect(ctx, item, failure)
         detail = _failure_detail(failure)
@@ -120,6 +182,7 @@ def _failure_result(ctx: JobContext, item: IngestItem, failure: ScrapeFailure) -
                 condition=CONDITION_BACKOFF,
                 reason=_condition_reason(failure),
                 message=detail,
+                auto_block=False,
             ),
         )
 
@@ -127,13 +190,9 @@ def _failure_result(ctx: JobContext, item: IngestItem, failure: ScrapeFailure) -
 
 
 def _is_retryable_failure(failure: ScrapeFailure) -> bool:
-    if failure.reason_id in {
-        ReasonId.SOURCE_CHANGED,
-        ReasonId.BUDGET_EXCEEDED,
-        ReasonId.BUDGET_EXHAUSTED,
-    }:
-        return True
-    if failure.reason_id == ReasonId.EXCEPTION and not _is_parse_determination(failure):
+    if failure.reason_id in _PARSE_DETERMINATION_REASON_IDS:
+        return False
+    if failure.reason_id in _RETRYABLE_REASON_IDS and not _is_parse_determination(failure):
         return True
     return False
 
@@ -141,7 +200,7 @@ def _is_retryable_failure(failure: ScrapeFailure) -> bool:
 def _is_parse_determination(failure: ScrapeFailure) -> bool:
     if failure.plugin != "mxf" or failure.stage != "scrape":
         return False
-    if failure.reason_id == ReasonId.INDEX_UNAVAILABLE:
+    if failure.reason_id in _PARSE_DETERMINATION_REASON_IDS:
         return True
     return failure.reason_id == ReasonId.EXCEPTION and failure.exception_class == "MXFParseError"
 
@@ -180,6 +239,45 @@ def _condition_reason(failure: ScrapeFailure) -> str:
 def _failure_detail(failure: ScrapeFailure) -> str:
     message = failure.message or failure.reason_id.value
     return f"pfr_core {failure.plugin}/{failure.stage} {failure.reason_id.value}: {message}"
+
+
+def _publish_sidecar(
+    ctx: JobContext,
+    item: IngestItem,
+    *,
+    sidecar_path: Path,
+    blob_dir: Path,
+    sidecar: PFRSidecar,
+) -> None:
+    atomic_write_sidecar(sidecar, sidecar_path)
+    enforce_blob_lru(blob_dir, protect_sidecar=sidecar)
+    if not sidecar_blobs_complete(sidecar, blob_dir=blob_dir):
+        raise RuntimeError("pfr blob cache trim removed blobs required by the published sidecar")
+    record_index(
+        ctx.session,
+        item=item,
+        index_kind=PFR_INDEX_KIND,
+        sidecar_path=sidecar_path,
+    )
+    item.item_metadata = {
+        **(item.item_metadata or {}),
+        PFR_RECIPE_METADATA_KEY: sidecar.recipe_version,
+    }
+
+
+def _assert_reason_matrix_closed() -> None:
+    covered = (
+        _RETRYABLE_REASON_IDS
+        | _FALLBACK_REASON_IDS
+        | _PARSE_DETERMINATION_REASON_IDS
+        | _LOUD_STOP_REASON_IDS
+    )
+    missing = set(ReasonId) - covered
+    if missing:
+        raise RuntimeError(
+            "pfr-index failure matrix does not classify ReasonId(s): "
+            + ", ".join(sorted(reason.value for reason in missing))
+        )
 
 
 def _source_path(item: IngestItem) -> Path:

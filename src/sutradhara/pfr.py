@@ -17,6 +17,7 @@ import subprocess
 import shutil
 import sys
 import tempfile
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -42,7 +43,13 @@ from sutradhara.archive_restore import (
     read_member_to_path,
 )
 from sutradhara.artifactclass_policy import get_artifactclass_policy
-from sutradhara.backend.port import BackendError, ByteRange, StorageBackend
+from sutradhara.backend.port import (
+    BackendError,
+    BackendSessionInvalidatedError,
+    BackendTransientError,
+    ByteRange,
+    StorageBackend,
+)
 from sutradhara.catalog.models import AssetLocator, Bundle, Copy, IngestItem
 from sutradhara.catalog.types import CopyHealth, is_content_hash
 from sutradhara.durability import locator_artifactclass_filter
@@ -67,6 +74,17 @@ class PFRBusy(PFRUnavailable):
 
 class PFRSourceDrift(PFRUnavailable):
     """The sidecar/source or locator/rem member table no longer agrees."""
+
+
+class PFRCutRefused(PFRUnavailable):
+    """A deterministic PFR plan/rewrap refusal from pfr_core."""
+
+    def __init__(self, refusal: CutRefusal) -> None:
+        self.failure = refusal.failure
+        super().__init__(
+            f"{refusal.failure.reason_id.value}: "
+            f"{refusal.failure.message or 'cut refused'}"
+        )
 
 
 class _ReadSession(Protocol):
@@ -170,7 +188,18 @@ class RaoObject(ByteRangeSource):
         if resolved >= self._size or length == 0:
             return b""
         end = min(self._size, resolved + length)
-        data = self._reader.read_range(ByteRange(self._base + resolved, self._base + end))
+        try:
+            data = self._reader.read_range(ByteRange(self._base + resolved, self._base + end))
+        except BackendSessionInvalidatedError as exc:
+            raise SourceChanged(
+                self._identity,
+                {
+                    **self._identity,
+                    "source": "remanence_read_session",
+                    "error_class": exc.__class__.__name__,
+                    "message": str(exc),
+                },
+            ) from exc
         expected = end - resolved
         if len(data) != expected:
             raise SourceChanged(
@@ -432,7 +461,7 @@ def pfr_sidecar_complete(path: Path) -> bool:
 
 
 def sidecar_blobs_complete(sidecar: PFRSidecar, *, blob_dir: Path) -> bool:
-    """Verify every sidecar blob path/content-address is present and intact."""
+    """Verify every sidecar blob path/content-address is present and access-touched."""
 
     for blob in sidecar.blobs:
         path = _resolve_blob_path(blob.sha256, explicit_path=blob.path, blob_dir=blob_dir)
@@ -446,24 +475,32 @@ def sidecar_blobs_complete(sidecar: PFRSidecar, *, blob_dir: Path) -> bool:
             return False
         if _sha256_file(path) != blob.sha256:
             return False
+        _touch_blob_access(path, stat)
     return True
 
 
-def enforce_blob_lru(blob_dir: Path, *, max_bytes: int | None = None) -> None:
+def enforce_blob_lru(
+    blob_dir: Path,
+    *,
+    max_bytes: int | None = None,
+    protect_sidecar: PFRSidecar | None = None,
+) -> None:
     """Trim a content-addressed blob directory to the configured LRU budget."""
 
     budget = pfr_blob_cache_bytes() if max_bytes is None else max_bytes
     if budget <= 0 or not blob_dir.exists():
         return
-    files = [
+    protected = _protected_blob_paths(protect_sidecar, blob_dir=blob_dir)
+    all_files = [
         path
         for path in blob_dir.rglob("*")
         if path.is_file() and not path.name.endswith(".tmp")
     ]
-    total = sum(path.stat().st_size for path in files)
+    files = [path for path in all_files if path.resolve() not in protected]
+    total = sum(path.stat().st_size for path in all_files)
     if total <= budget:
         return
-    for path in sorted(files, key=lambda item: item.stat().st_mtime):
+    for path in sorted(files, key=lambda item: item.stat().st_atime_ns):
         try:
             size = path.stat().st_size
             path.unlink()
@@ -616,7 +653,12 @@ def cut_pfr_asset(
                         cut_result=result,
                     )
                 except PFRUnavailable as exc:
-                    attempts.append(PFRRungAttempt(1, "fallback", exc.__class__.__name__, str(exc)))
+                    reason = (
+                        exc.failure.reason_id.value
+                        if isinstance(exc, PFRCutRefused)
+                        else exc.__class__.__name__
+                    )
+                    attempts.append(PFRRungAttempt(1, "fallback", reason, str(exc)))
             else:
                 attempts.append(PFRRungAttempt(1, "skipped", "no-rao-plain-locator"))
         elif sidecar is None:
@@ -649,6 +691,7 @@ def cut_pfr_asset(
                 attempts=tuple(attempts),
                 sidecar_path=sidecar.path if sidecar else None,
             )
+        attempts.append(PFRRungAttempt(2, "skipped", "no-restorable-non-aead-locator"))
 
         aead = _first_supported_locator(
             locators,
@@ -756,7 +799,11 @@ def _cut_ranged_rao(
                         raise PFRUnavailable(
                             "blob regeneration did not recreate the sidecar blob references"
                         )
-                    enforce_blob_lru(blob_dir)
+                    enforce_blob_lru(blob_dir, protect_sidecar=sidecar.sidecar)
+                    if not sidecar_blobs_complete(sidecar.sidecar, blob_dir=blob_dir):
+                        raise PFRUnavailable(
+                            "blob regeneration references were evicted during cache trim"
+                        )
                 return _cut_to_temp_then_publish(
                     sidecar=sidecar.sidecar,
                     source=source,
@@ -765,12 +812,18 @@ def _cut_ranged_rao(
                     t_out=t_out,
                     blob_dir=blob_dir,
                 )
-        except (BackendError, SourceChanged, CutRefusal) as exc:
+        except BackendTransientError as exc:
             last_error = exc
             continue
+        except CutRefusal as exc:
+            raise PFRCutRefused(exc) from exc
+        except SourceChanged as exc:
+            raise PFRSourceDrift(str(exc)) from exc
+        except BackendError as exc:
+            raise PFRUnavailable(str(exc)) from exc
         except RuntimeError as exc:
             raise PFRUnavailable(str(exc)) from exc
-    raise PFRSourceDrift(str(last_error or "RAO source changed during cut"))
+    raise PFRUnavailable(str(last_error or "RAO read failed after retry"))
 
 
 def _cut_to_temp_then_publish(
@@ -974,6 +1027,26 @@ def _resolve_blob_path(
             return path
     candidate = blob_dir / sha256[:2] / sha256
     return candidate if candidate.exists() else None
+
+
+def _protected_blob_paths(sidecar: PFRSidecar | None, *, blob_dir: Path) -> set[Path]:
+    if sidecar is None:
+        return set()
+    paths: set[Path] = set()
+    for blob in sidecar.blobs:
+        path = _resolve_blob_path(blob.sha256, explicit_path=blob.path, blob_dir=blob_dir)
+        if path is not None:
+            paths.add(path.resolve())
+    return paths
+
+
+def _touch_blob_access(path: Path, stat: os.stat_result | None = None) -> None:
+    try:
+        current = stat or path.stat()
+        now_ns = time.time_ns()
+        os.utime(path, ns=(now_ns, current.st_mtime_ns))
+    except OSError:
+        return
 
 
 def _sha256_file(path: Path) -> str:

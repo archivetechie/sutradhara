@@ -43,6 +43,7 @@ class ConditionProjection:
     message: str | None = None
     next_eligible_at: dt.datetime | None = None
     blocked_tool: tuple[str, str] | None = None
+    auto_block: bool = True
 
 
 @dataclass
