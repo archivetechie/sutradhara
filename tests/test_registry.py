@@ -23,17 +23,17 @@ from sutradhara.grpc.store import DeviceIdentity
 def test_registry_isolates_operator_devices_and_delivers_command() -> None:
     registry = ConnectedDeviceRegistry()
     stream = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
     stream.update_cards(
         [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")]
     )
 
-    assert [device.device_id for device in registry.devices_for("owner")] == ["mac-1"]
+    assert [device.device_id for device in registry.devices_for("ada")] == ["mac-1"]
     assert registry.devices_for("other") == []
 
     pending = registry.send_start_receive(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         artifactclass="s-masters",
@@ -64,14 +64,14 @@ def test_duplicate_register_replaces_stream_and_fails_pending_ack() -> None:
         old_closed = True
 
     old = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32),
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32),
         close_stream=close_old,
     )
     old.update_cards(
         [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")]
     )
     pending = registry.send_start_receive(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         artifactclass="s-masters",
@@ -81,7 +81,7 @@ def test_duplicate_register_replaces_stream_and_fails_pending_ack() -> None:
     )
 
     new = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
 
     assert old_closed
@@ -95,13 +95,13 @@ def test_duplicate_register_replaces_stream_and_fails_pending_ack() -> None:
 def test_ttl_eviction_removes_device_and_fails_commands() -> None:
     registry = ConnectedDeviceRegistry()
     stream = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
     stream.update_cards(
         [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")]
     )
     pending = registry.send_start_receive(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         artifactclass="s-masters",
@@ -120,7 +120,7 @@ def test_ttl_eviction_removes_device_and_fails_commands() -> None:
         pending.future.result(timeout=0)
     with pytest.raises(DeviceOffline):
         registry.send_start_receive(
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             card_id="card-1",
             artifactclass="s-masters",
@@ -133,7 +133,7 @@ def test_ttl_eviction_removes_device_and_fails_commands() -> None:
 def test_registry_directory_listing_resolves_matching_future() -> None:
     registry = ConnectedDeviceRegistry()
     stream = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
     stream.update_cards(
         [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")],
@@ -141,7 +141,7 @@ def test_registry_directory_listing_resolves_matching_future() -> None:
     )
 
     pending = registry.request_directory_listing(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         rel_path="DCIM",
@@ -162,13 +162,13 @@ def test_registry_directory_listing_resolves_matching_future() -> None:
 def test_registry_drops_stale_or_timed_out_directory_listing() -> None:
     registry = ConnectedDeviceRegistry()
     old = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
     old.update_cards(
         [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")]
     )
     pending = registry.request_directory_listing(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         rel_path="DCIM",
@@ -192,13 +192,13 @@ def test_registry_drops_stale_or_timed_out_directory_listing() -> None:
 def test_registry_close_fails_pending_commands_and_listings() -> None:
     registry = ConnectedDeviceRegistry()
     stream = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
     stream.update_cards(
         [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")]
     )
     command = registry.send_start_receive(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         artifactclass="s-masters",
@@ -207,7 +207,7 @@ def test_registry_close_fails_pending_commands_and_listings() -> None:
         idempotency_key="key-1",
     )
     listing = registry.request_directory_listing(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         rel_path="",
@@ -223,7 +223,7 @@ def test_registry_close_fails_pending_commands_and_listings() -> None:
 
 def test_sweep_registry_once_evicts_stale_registry_stream() -> None:
     registry = ConnectedDeviceRegistry()
-    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+    registry.register(DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32))
 
     evicted = sweep_registry_once(
         registry=registry,
@@ -232,12 +232,12 @@ def test_sweep_registry_once_evicts_stale_registry_stream() -> None:
     )
 
     assert evicted == ["mac-1"]
-    assert registry.devices_for("owner") == []
+    assert registry.devices_for("ada") == []
 
 
 def test_registry_sweep_loop_uses_fast_liveness_tick() -> None:
     registry = ConnectedDeviceRegistry()
-    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+    registry.register(DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32))
 
     stop, thread = start_registry_sweep_loop(
         registry,
@@ -245,7 +245,7 @@ def test_registry_sweep_loop_uses_fast_liveness_tick() -> None:
         heartbeat_ttl=dt.timedelta(seconds=0),
     )
     try:
-        _eventually(lambda: registry.devices_for("owner") == [])
+        _eventually(lambda: registry.devices_for("ada") == [])
     finally:
         stop.set()
         thread.join(timeout=1)

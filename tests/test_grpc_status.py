@@ -83,7 +83,7 @@ def _row(
     now = dt.datetime.now(dt.UTC)
     return GrpcIntake(
         intake_id="intake-1",
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         state=state,
         manifest_digest="a" * 64 if state == "committed" else None,

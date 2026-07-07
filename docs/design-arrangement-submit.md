@@ -1,6 +1,6 @@
 # Design — P2.3a: arrangement model + submit + the frozen source-map
 
-> Status: **implemented design** (the owner + Claude, 2026-06-26). Implementation item **P2.3a** — the
+> Status: **implemented design** (the maintainer + Claude, 2026-06-26). Implementation item **P2.3a** — the
 > first slice of plan item **P2.3** (decomposed: P2.3a model+submit+source-map / P2.3b projection /
 > P2.3c watcher). Sources: `design-arrangement-arc.md` §2.4, §3.5–3.9. Depends: P1.1 (registered
 > masters), P1.2 (proxies exist — for the *later* projection slice, not this one).

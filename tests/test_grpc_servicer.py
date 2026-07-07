@@ -38,7 +38,7 @@ def test_servicer_start_upload_commit_watch_and_owner_check(engine: Engine, tmp_
             session,
             device_id="mac-1",
             cert_fingerprint=fingerprint,
-            operator="owner",
+            operator="ada",
         )
         store.record_device_enrollment(
             session,
@@ -190,7 +190,7 @@ def test_servicer_rejects_leading_data_relpath_and_abort_after_commit(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     servicer = IntakeServicer(
         GrpcIntakeConfig(engine=engine, landing_root=tmp_path / "landing", validate_artifactclass=False)

@@ -687,7 +687,7 @@ def _add_intake(
 ) -> Intake:
     intake = Intake(
         intake_id=intake_id,
-        operator="owner",
+        operator="ada",
         source_kind=IntakeSourceKind.CARD,
         source_ref="card-1",
         artifactclass=artifactclass,
@@ -856,7 +856,7 @@ def _add_archived_submission_member(
         manifest_digest="b" * 64,
         member_count=1,
         status=SubmissionStatus.ARCHIVED,
-        submitted_by="owner",
+        submitted_by="ada",
         submitted_at=created_at,
         archived_at=created_at,
     )
@@ -907,7 +907,7 @@ def _add_submission_fixture(
         manifest_digest="a" * 64,
         member_count=1,
         status=status,
-        submitted_by="owner",
+        submitted_by="ada",
         submitted_at=created_at,
         archived_at=None if status == SubmissionStatus.PENDING_ARCHIVE else created_at,
     )

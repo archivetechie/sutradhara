@@ -9,7 +9,7 @@ description = "Dependency-light receive filesystem contract for Sutradhara."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"
-authors = [{ name = "Ada Operator" }]
+authors = [{ name = "ArchiveTech contributors" }]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Operating System :: MacOS",

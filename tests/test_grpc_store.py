@@ -26,7 +26,7 @@ def test_grpc_store_round_trip_state_digest_and_owner(engine: Engine) -> None:
         row = store.insert_intake(
             session,
             intake_id="intake-1",
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             idempotency_key="key",
             source_plan_digest="a" * 64,
@@ -56,7 +56,7 @@ def test_grpc_store_round_trip_state_digest_and_owner(engine: Engine) -> None:
     with session_scope(engine) as session:
         row = store.get_intake(session, "intake-1")
         assert row is not None
-        assert row.operator == "owner"
+        assert row.operator == "ada"
         assert row.device_id == "mac-1"
         assert row.state == "committed"
         assert row.manifest_digest == "b" * 64
@@ -69,17 +69,17 @@ def test_device_enrollment_token_revoke_and_schema(engine: Engine) -> None:
     with session_scope(engine) as session:
         token = store.issue_enroll_token(
             session,
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             ttl=dt.timedelta(seconds=1),
         )
         grant = store.consume_enroll_token(session, token, device_id="mac-1")
-        assert grant.operator == "owner"
+        assert grant.operator == "ada"
         store.record_device_enrollment(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
 
     with session_scope(engine) as session:
@@ -88,7 +88,7 @@ def test_device_enrollment_token_revoke_and_schema(engine: Engine) -> None:
             device_id="mac-1",
             cert_fingerprint="aa" * 32,
         )
-        assert identity.operator == "owner"
+        assert identity.operator == "ada"
         assert store.revoke_device(session, "mac-1") == 1
 
     with session_scope(engine) as session, pytest.raises(PermissionError):
@@ -105,23 +105,23 @@ def test_device_reenrollment_requires_rotation_proof(engine: Engine) -> None:
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         with pytest.raises(store.DeviceRotationProofError):
             store.record_device_enrollment(
                 session,
                 device_id="mac-1",
                 cert_fingerprint="BB" * 32,
-                operator="owner",
+                operator="ada",
             )
 
     with session_scope(engine) as session:
-        assert store.operator_for_device(session, "mac-1") == "owner"
+        assert store.operator_for_device(session, "mac-1") == "ada"
         assert store.resolve_device(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-        ).operator == "owner"
+        ).operator == "ada"
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="BB" * 32)
         assert _active_enrollment_count(session, "mac-1") == 1
@@ -133,14 +133,14 @@ def test_device_reenrollment_allows_old_key_proof(engine: Engine, caplog) -> Non
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         with caplog.at_level(logging.INFO, logger=store.__name__):
             store.record_device_enrollment(
                 session,
                 device_id="mac-1",
                 cert_fingerprint="BB" * 32,
-                operator="owner",
+                operator="ada",
                 rotation_authority="self",
                 rotation_fingerprint="AA" * 32,
             )
@@ -154,7 +154,7 @@ def test_device_reenrollment_allows_old_key_proof(engine: Engine, caplog) -> Non
             device_id="mac-1",
             cert_fingerprint="BB" * 32,
         )
-        assert identity.operator == "owner"
+        assert identity.operator == "ada"
         assert _active_enrollment_count(session, "mac-1") == 1
 
 
@@ -164,13 +164,13 @@ def test_device_reenrollment_allows_admin_rotation(engine: Engine) -> None:
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         store.record_device_enrollment(
             session,
             device_id="mac-1",
             cert_fingerprint="BB" * 32,
-            operator="owner",
+            operator="ada",
             rotation_authority="admin",
         )
 
@@ -181,7 +181,7 @@ def test_device_reenrollment_allows_admin_rotation(engine: Engine) -> None:
             session,
             device_id="mac-1",
             cert_fingerprint="BB" * 32,
-        ).operator == "owner"
+        ).operator == "ada"
 
 
 def test_device_reenrollment_same_fingerprint_is_idempotent(engine: Engine) -> None:
@@ -190,13 +190,13 @@ def test_device_reenrollment_same_fingerprint_is_idempotent(engine: Engine) -> N
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         second = store.record_device_enrollment(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         assert first.id == second.id
 
@@ -207,7 +207,7 @@ def test_device_reenrollment_same_fingerprint_is_idempotent(engine: Engine) -> N
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
         )
-        assert identity.operator == "owner"
+        assert identity.operator == "ada"
 
 
 def test_device_reenrollment_refuses_different_operator_without_mutation(engine: Engine) -> None:
@@ -216,7 +216,7 @@ def test_device_reenrollment_refuses_different_operator_without_mutation(engine:
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
 
     with session_scope(engine) as session:
@@ -234,7 +234,7 @@ def test_device_reenrollment_refuses_different_operator_without_mutation(engine:
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-        ).operator == "owner"
+        ).operator == "ada"
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="CC" * 32)
 
@@ -246,12 +246,12 @@ def test_expired_or_reused_enrollment_token_is_refused(engine: Engine) -> None:
         # tokens would invalidate each other before the assertions below.
         expired = store.issue_enroll_token(
             session,
-            operator="owner",
+            operator="ada",
             device_id="mac-expired",
             ttl=dt.timedelta(seconds=-1),
         )
-        used = store.issue_enroll_token(session, operator="owner", device_id="mac-used")
-        wrong_device = store.issue_enroll_token(session, operator="owner", device_id="mac-wrong")
+        used = store.issue_enroll_token(session, operator="ada", device_id="mac-used")
+        wrong_device = store.issue_enroll_token(session, operator="ada", device_id="mac-wrong")
         store.consume_enroll_token(session, used, device_id="mac-used")
 
     with session_scope(engine) as session:

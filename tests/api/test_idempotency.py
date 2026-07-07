@@ -88,7 +88,7 @@ def test_recent_in_progress_idempotency_is_not_reclaimed(api_engine: Engine) -> 
     with session_scope(api_engine) as session:
         session.add(
             store.IdempotencyRecord(
-                operator_username="owner",
+                operator_username="ada",
                 endpoint=store.RECEIVE_ENDPOINT,
                 idempotency_key=key,
                 request_hash="abc",
@@ -101,7 +101,7 @@ def test_recent_in_progress_idempotency_is_not_reclaimed(api_engine: Engine) -> 
 
     decision = store.begin_idempotency(
         api_engine,
-        operator_username="owner",
+        operator_username="ada",
         endpoint=store.RECEIVE_ENDPOINT,
         idempotency_key=key,
         request_hash="abc",
@@ -117,7 +117,7 @@ def test_stale_in_progress_idempotency_is_reclaimable(api_engine: Engine) -> Non
     with session_scope(api_engine) as session:
         session.add(
             store.IdempotencyRecord(
-                operator_username="owner",
+                operator_username="ada",
                 endpoint=store.RECEIVE_ENDPOINT,
                 idempotency_key=key,
                 request_hash="abc",
@@ -130,7 +130,7 @@ def test_stale_in_progress_idempotency_is_reclaimable(api_engine: Engine) -> Non
 
     decision = store.begin_idempotency(
         api_engine,
-        operator_username="owner",
+        operator_username="ada",
         endpoint=store.RECEIVE_ENDPOINT,
         idempotency_key=key,
         request_hash="abc",

@@ -3359,7 +3359,7 @@ mod tests {
     #[test]
     fn slug_operator_matches_python_shape() {
         assert_eq!(slug_operator("Op Name"), "op-name");
-        assert_eq!(slug_operator("Śwami / Camera 1"), "owner-camera-1");
+        assert_eq!(slug_operator("Śiva / Camera 1"), "siva-camera-1");
         assert_eq!(slug_operator("..."), "operator");
     }
 

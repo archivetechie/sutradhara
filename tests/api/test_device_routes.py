@@ -24,7 +24,7 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
 ) -> None:
     registry = ConnectedDeviceRegistry()
     stream = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
     stream.update_cards(
         [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")],
@@ -41,13 +41,13 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         grpc_store.record_device_enrollment(
             session,
             device_id="mac-offline",
             cert_fingerprint="CC" * 32,
-            operator="owner",
+            operator="ada",
         )
         grpc_store.record_device_enrollment(
             session,
@@ -58,7 +58,7 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
         grpc_store.insert_intake(
             session,
             intake_id="intake-1",
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             idempotency_key="key-1",
             source_plan_digest="a" * 64,
@@ -71,7 +71,7 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
         grpc_store.set_card_id(
             session,
             intake_id="intake-1",
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             card_id="card-1",
         )
@@ -87,21 +87,21 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
     assert body["registeredDevices"] == [
         {
             "deviceId": "mac-1",
-            "enrolledAs": "owner",
+            "enrolledAs": "ada",
             "enrollmentStatus": "active",
             "online": True,
             "lastSeenAt": body["devices"][0]["lastSeenAt"],
         },
         {
             "deviceId": "mac-offline",
-            "enrolledAs": "owner",
+            "enrolledAs": "ada",
             "enrollmentStatus": "active",
             "online": False,
             "lastSeenAt": None,
         },
     ]
     assert [device["deviceId"] for device in body["devices"]] == ["mac-1"]
-    assert body["devices"][0]["enrolledAs"] == "owner"
+    assert body["devices"][0]["enrolledAs"] == "ada"
     assert body["devices"][0]["online"] is True
     assert body["devices"][0]["capabilities"] == ["browse"]
     assert body["devices"][0]["cards"][0]["cardId"] == "card-1"
@@ -122,7 +122,7 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
 ) -> None:
     registry = ConnectedDeviceRegistry()
     stream = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
     stream.update_cards(
         [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="busy")]
@@ -132,12 +132,12 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         grpc_store.insert_intake(
             session,
             intake_id="intake-committed",
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             idempotency_key="key-1",
             source_plan_digest="a" * 64,
@@ -150,7 +150,7 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
         grpc_store.set_card_id(
             session,
             intake_id="intake-committed",
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             card_id="card-1",
         )
@@ -350,7 +350,7 @@ def test_post_device_receive_early_ack_completes_idempotency_and_replays(
             grpc_store.insert_intake(
                 session,
                 intake_id="intake-1",
-                operator="owner",
+                operator="ada",
                 device_id="mac-1",
                 idempotency_key=kwargs["idempotency_key"],
                 source_plan_digest="a" * 64,
@@ -454,7 +454,7 @@ def test_post_device_receive_canonicalizes_source_ref_before_idempotency(
             grpc_store.insert_intake(
                 session,
                 intake_id="intake-1",
-                operator="owner",
+                operator="ada",
                 device_id="mac-1",
                 idempotency_key=kwargs["idempotency_key"],
                 source_plan_digest="a" * 64,
@@ -579,12 +579,12 @@ def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         grpc_store.insert_intake(
             session,
             intake_id="intake-1",
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             idempotency_key="key-1",
             source_plan_digest="a" * 64,
@@ -645,7 +645,7 @@ def test_post_device_receive_rejects_cross_operator_device(api_engine: Engine) -
 def _online_registry(engine: Engine, *, capabilities: list[str] | None = None) -> ConnectedDeviceRegistry:
     registry = ConnectedDeviceRegistry()
     stream = registry.register(
-        DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32)
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
     stream.update_cards(
         [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")],
@@ -656,6 +656,6 @@ def _online_registry(engine: Engine, *, capabilities: list[str] | None = None) -
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     return registry

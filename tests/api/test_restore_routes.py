@@ -150,7 +150,7 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
         "items",
     }
     assert body["id"] == request_id
-    assert body["identity"] == "owner"
+    assert body["identity"] == "ada"
     assert body["destination_id"] == "media-server"
     assert body["state"] == "pending"
     assert body["bytes_total"] == 2
@@ -329,7 +329,7 @@ def test_restore_get_sanitizes_persisted_item_detail(api_engine: Engine) -> None
             RestoreRequest.__table__.insert(),
             {
                 "id": request_id,
-                "identity": "owner",
+                "identity": "ada",
                 "destination_id": "media-server",
                 "state": "completed_with_errors",
                 "created_at": dt.datetime(2026, 7, 3, tzinfo=dt.UTC),

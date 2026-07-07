@@ -1,6 +1,6 @@
 # Codex prompt — Ingest v2 (sutradhara): bundler, intake, lifecycle, VS
 
-> Design by Claude + the owner; implementation by codex. **Repo: `~/sutradhara/repo`.**
+> Design by Claude + the maintainer; implementation by codex. **Repo: `~/sutradhara/repo`.**
 > Companions: `~/system/docs/prompt-ingest-v2-harness.md` (scenarios R/S/T/U) and
 > `~/system/docs/prompt-torana-offload-client.md` (Mac client). All three share the
 > **Shared contract** below verbatim. Master design:

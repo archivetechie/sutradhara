@@ -16,7 +16,7 @@ def test_session_returns_identity_without_raw_groups(api_engine: Engine) -> None
     assert response.status_code == 200
     body = response.json()
     assert body == {
-        "operatorUsername": "owner",
+        "operatorUsername": "ada",
         "displayName": "Ada Operator",
         "role": "ingest",
         "capabilities": ["can_view", "can_receive"],
@@ -30,12 +30,12 @@ def test_session_missing_groups_reports_no_capabilities(api_engine: Engine) -> N
 
     response = client.get(
         "/api/session",
-        headers={"X-Authentik-Username": "owner", "X-Authentik-Name": "Ada Operator"},
+        headers={"X-Authentik-Username": "ada", "X-Authentik-Name": "Ada Operator"},
     )
 
     assert response.status_code == 200
     assert response.json() == {
-        "operatorUsername": "owner",
+        "operatorUsername": "ada",
         "displayName": "Ada Operator",
         "role": None,
         "capabilities": [],
@@ -49,7 +49,7 @@ def test_session_returns_logs_capability_for_troubleshoot_group(api_engine: Engi
 
     assert response.status_code == 200
     assert response.json() == {
-        "operatorUsername": "owner",
+        "operatorUsername": "ada",
         "displayName": "Ada Operator",
         "role": "troubleshoot",
         "capabilities": ["can_view", "can_logs"],

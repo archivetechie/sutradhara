@@ -1,6 +1,6 @@
 # Design — P3.2: Lifecycle / deletion gate (retention engine)
 
-> Design by Claude + the owner (2026-06-27), for review then implementation. **Repo: sutradhara (+ a
+> Design by Claude + the maintainer (2026-06-27), for review then implementation. **Repo: sutradhara (+ a
 > `~/system` scenario).** Plan item **P3.2** (`docs/implementation-plan-ingest-v2.md`), Phase U of
 > `docs/prompt-ingest-v2-sutradhara.md`. Depends: copies (**P2.5**) + cloud-temp (**P1.3**). The signals
 > it reads come from P2.5 (`submission.archived`), P3.1 (`LogicalAsset.rejected_at`), and the copy model.

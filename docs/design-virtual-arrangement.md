@@ -1,6 +1,6 @@
 # Design — P3.1: Virtual arrangement (post-archive organize-forever)
 
-> Design by Claude + the owner (2026-06-27), for review then implementation. **Repo: sutradhara (+ a
+> Design by Claude + the maintainer (2026-06-27), for review then implementation. **Repo: sutradhara (+ a
 > `~/system` scenario).** Plan item **P3.1** (`docs/implementation-plan-ingest-v2.md`), arc §3.10/§4.8/§2.4.
 > Depends: **P2.2** (member-aware restore) + archive done (**P2.5**). Renames the plan's "virtual
 > segregation (VS)" — *segregation* was internal jargon; this is the **virtual mirror of `arrangement`**.

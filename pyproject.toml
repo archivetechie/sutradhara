@@ -9,7 +9,7 @@ description = "Orchestrator above Remanence — content-addressed media archive 
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
-authors = [{ name = "Ada Operator" }]
+authors = [{ name = "ArchiveTech contributors" }]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",

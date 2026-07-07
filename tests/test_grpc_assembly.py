@@ -40,7 +40,7 @@ def test_assembly_writes_valid_non_package_bag_from_stored_intent(tmp_path) -> N
     validation = validate_bag(intake_dir)
     assert validation.valid
     metadata = read_bag_info(intake_dir / "bag-info.txt")
-    assert metadata["Operator"] == "owner"
+    assert metadata["Operator"] == "ada"
     assert metadata["Artifactclass"] == "video-master"
     assert metadata["Package-Profile-Version"] == PACKAGE_PROFILE_VERSION
     assert metadata["Canonicalization-Version"] == CANONICALIZATION_VERSION
@@ -94,7 +94,7 @@ def test_assembly_writes_single_package_index_with_null_non_file_members(tmp_pat
 def _row(tmp_path, intake_dir):
     return SimpleNamespace(
         intake_id=intake_dir.name,
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         state="streaming",
         manifest_digest=None,

@@ -1,6 +1,6 @@
 # Design — P2.5: Archive an arrangement from its frozen source-map
 
-> Design by Claude + the owner + codex (2026-06-26), for review then implementation. **Repo: sutradhara
+> Design by Claude + the maintainer + codex (2026-06-26), for review then implementation. **Repo: sutradhara
 > (+ a `~/system` scenario).** Plan item **P2.5** (`docs/implementation-plan-ingest-v2.md`), arc §3.9/§7.5.
 > Depends: **P2.3a** (the frozen `submission`/source-map, shipped) + **P2.4** (`rem archive build --map`,
 > shipped). Consumes the round-trip P2.4 built.

@@ -22,7 +22,7 @@ pytest before every commit. Policy compat (o/n archive shims) must keep
 Scenario J/N/O/Q green.
 
 ## Pattern + hygiene
-the owner brainstorms with Claude → design/prompt docs in `docs/` → codex (or
+The maintainer brainstorms with Claude → design/prompt docs in `docs/` → codex (or
 Claude) implements → harness scenarios verify. Background `gardener` auto-
-commits idle work, pushes, prunes merged branches — never ask the owner to do
+commits idle work, pushes, prunes merged branches — never ask the maintainer to do
 repo hygiene. Docs lifecycle: `docs/INDEX.md` + `docs/archive/`.

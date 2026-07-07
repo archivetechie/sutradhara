@@ -259,7 +259,7 @@ def test_serve_grpc_enrollment_admin_actions(cli_env: dict[str, str], tmp_path: 
             "serve-grpc",
             "--issue-enroll-token",
             "--operator",
-            "owner",
+            "ada",
             "--device-id",
             "mac-1",
         ]
@@ -284,7 +284,7 @@ def test_serve_grpc_enrollment_admin_actions(cli_env: dict[str, str], tmp_path: 
             str(cert_path),
         ]
     )
-    assert "signed mac-1 for owner" in signed.output
+    assert "signed mac-1 for ada" in signed.output
     assert cert_path.is_file()
     revoked = _run(["serve-grpc", "--revoke-device", "mac-1"])
     assert "revoked 1 enrollment" in revoked.output

@@ -26,14 +26,14 @@ def test_parse_identity_single_group_capabilities(
 ) -> None:
     identity = parse_identity(
         {
-            "X-Authentik-Username": "owner",
+            "X-Authentik-Username": "ada",
             "X-Authentik-Name": "Ada Operator",
             "X-Authentik-Groups": group,
-            "X-Authentik-Email": "owner@example.test",
+            "X-Authentik-Email": "ada@example.test",
         }
     )
 
-    assert identity.operator_username == "owner"
+    assert identity.operator_username == "ada"
     assert identity.display_name == "Ada Operator"
     assert identity.role == role
     assert identity.capabilities == capabilities
@@ -81,7 +81,7 @@ def test_parse_identity_unions_capabilities_across_groups(
 ) -> None:
     identity = parse_identity(
         {
-            "X-Authentik-Username": "owner",
+            "X-Authentik-Username": "ada",
             "X-Authentik-Groups": groups,
         }
     )
@@ -93,7 +93,7 @@ def test_parse_identity_unions_capabilities_across_groups(
 def test_parse_identity_display_role_uses_precedence_not_gates() -> None:
     identity = parse_identity(
         {
-            "X-Authentik-Username": "owner",
+            "X-Authentik-Username": "ada",
             "X-Authentik-Groups": (
                 "sutradhara-oversight|sutradhara-ingest|"
                 "sutradhara-restore|sutradhara-admin"
@@ -158,7 +158,7 @@ def test_parse_identity_privacy_caps_do_not_grant_view_or_restore(
 def test_parse_identity_never_uses_substring_group_match() -> None:
     identity = parse_identity(
         {
-            "X-Authentik-Username": "owner",
+            "X-Authentik-Username": "ada",
             "X-Authentik-Groups": "sutradhara-admin-extra",
         }
     )
@@ -168,7 +168,7 @@ def test_parse_identity_never_uses_substring_group_match() -> None:
 
 
 def test_parse_identity_empty_groups_fail_closed() -> None:
-    identity = parse_identity({"X-Authentik-Username": "owner", "X-Authentik-Groups": ""})
+    identity = parse_identity({"X-Authentik-Username": "ada", "X-Authentik-Groups": ""})
 
     assert identity.role is None
     assert identity.capabilities == ()

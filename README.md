@@ -183,7 +183,7 @@ redundantly on the row.
 
 ## Maintainer
 
-Built and maintained by Ada Operator with a small archive operations team.
+Built and maintained by a small archive operations team.
 Sysadmin-led software; design favors simplicity, robustness, minimal
 moving parts, and a 30-year horizon.
 

@@ -146,7 +146,7 @@ def test_enroll_token_refuses_duplicate_without_reenroll(api_engine: Engine) -> 
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     client = TestClient(make_api_app(api_engine))
 
@@ -168,7 +168,7 @@ def test_enroll_token_refuses_same_operator_reenroll_without_old_key_proof(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     client = TestClient(make_api_app(api_engine))
 
@@ -186,13 +186,13 @@ def test_enroll_token_allows_same_operator_reenroll_with_live_old_key_proof(
     api_engine: Engine,
 ) -> None:
     registry = ConnectedDeviceRegistry()
-    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+    registry.register(DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32))
     with session_scope(api_engine) as session:
         store.record_device_enrollment(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     app = make_api_app(api_engine)
     app.state.registry = registry
@@ -216,13 +216,13 @@ def test_enroll_token_allows_same_operator_reenroll_with_live_old_key_proof(
 
 def test_enroll_token_refuses_stale_live_stream_proof(api_engine: Engine) -> None:
     registry = ConnectedDeviceRegistry()
-    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="BB" * 32))
+    registry.register(DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="BB" * 32))
     with session_scope(api_engine) as session:
         store.record_device_enrollment(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     app = make_api_app(api_engine)
     app.state.registry = registry
@@ -246,7 +246,7 @@ def test_enroll_token_allows_admin_confirmed_rotation_without_live_stream(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     client = TestClient(make_api_app(api_engine))
 
@@ -546,7 +546,7 @@ def test_enroll_bundle_does_not_log_bodies_or_tokens_on_failure_paths(
             session,
             device_id="mac-duplicate",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     app = make_api_app(api_engine)
     _configure_agent_bundle(app, tmp_path)
@@ -609,13 +609,13 @@ def test_enroll_bundle_reenroll_mints_with_rotation_authority(
     tmp_path: Path,
 ) -> None:
     registry = ConnectedDeviceRegistry()
-    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+    registry.register(DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32))
     with session_scope(api_engine) as session:
         store.record_device_enrollment(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     app = make_api_app(api_engine)
     app.state.registry = registry
@@ -706,7 +706,7 @@ def test_enroll_csr_maps_other_operator_refusal_to_conflict(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         token = store.issue_enroll_token(session, operator="other", device_id="mac-1")
     material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
@@ -730,13 +730,13 @@ def test_enroll_csr_with_old_key_proof_rotates_and_evicts_live_stream(
     tmp_path: Path,
 ) -> None:
     registry = ConnectedDeviceRegistry()
-    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+    registry.register(DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32))
     with session_scope(api_engine) as session:
         store.record_device_enrollment(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     app = make_api_app(api_engine)
     app.state.registry = registry
@@ -756,7 +756,7 @@ def test_enroll_csr_with_old_key_proof_rotates_and_evicts_live_stream(
     )
 
     assert response.status_code == 200
-    assert registry.devices_for("owner") == []
+    assert registry.devices_for("ada") == []
     cert_path = tmp_path / "signed.crt"
     cert_path.write_text(response.json()["cert_pem"], encoding="utf-8")
     new_fingerprint = ca.cert_fingerprint(cert_path)
@@ -769,19 +769,19 @@ def test_enroll_csr_with_old_key_proof_rotates_and_evicts_live_stream(
                 device_id="mac-1",
                 cert_fingerprint=new_fingerprint,
             ).operator
-            == "owner"
+            == "ada"
         )
 
 
 def test_revoke_device_can_evict_live_registry_stream(api_engine: Engine) -> None:
     registry = ConnectedDeviceRegistry()
-    registry.register(DeviceIdentity(operator="owner", device_id="mac-1", fingerprint="AA" * 32))
+    registry.register(DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32))
     with session_scope(api_engine) as session:
         store.record_device_enrollment(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     app = make_api_app(api_engine)
     app.state.registry = registry
@@ -795,4 +795,4 @@ def test_revoke_device_can_evict_live_registry_stream(api_engine: Engine) -> Non
         "revokedEnrollments": 1,
         "evicted": True,
     }
-    assert registry.devices_for("owner") == []
+    assert registry.devices_for("ada") == []

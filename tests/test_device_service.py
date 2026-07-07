@@ -39,7 +39,7 @@ def test_device_service_connect_yields_handshake_before_queued_command(engine: E
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
 
     messages = _BlockingIterator()
@@ -60,10 +60,10 @@ def test_device_service_connect_yields_handshake_before_queued_command(engine: E
             )
         )
     )
-    _eventually(lambda: registry.devices_for("owner")[0].cards[0].card_id == "card-1")
+    _eventually(lambda: registry.devices_for("ada")[0].cards[0].card_id == "card-1")
 
     pending = registry.send_start_receive(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         artifactclass="s-masters",
@@ -88,23 +88,23 @@ def test_device_service_idle_heartbeats_keep_stream_past_ttl(engine: Engine) -> 
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
     _assert_handshake(_next_response(responses))
-    initial_seen = registry.devices_for("owner")[0].last_seen
+    initial_seen = registry.devices_for("ada")[0].last_seen
 
     messages.put(device_pb2.DeviceMessage(heartbeat=device_pb2.Heartbeat()))
-    _eventually(lambda: registry.devices_for("owner")[0].last_seen > initial_seen)
-    heartbeat_seen = registry.devices_for("owner")[0].last_seen
+    _eventually(lambda: registry.devices_for("ada")[0].last_seen > initial_seen)
+    heartbeat_seen = registry.devices_for("ada")[0].last_seen
     ttl = dt.timedelta(microseconds=1)
     sweep_time = heartbeat_seen + ttl
 
     assert sweep_time > initial_seen + ttl
     assert registry.evict_stale(ttl=ttl, now=sweep_time) == []
-    assert registry.devices_for("owner")[0].device_id == "mac-1"
+    assert registry.devices_for("ada")[0].device_id == "mac-1"
     messages.close()
     responses.close()
 
@@ -120,12 +120,12 @@ def test_device_service_ack_correlates_card_id_and_completes_http_idempotency(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         grpc_store.insert_intake(
             session,
             intake_id="intake-1",
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             idempotency_key="key-1",
             source_plan_digest="a" * 64,
@@ -137,7 +137,7 @@ def test_device_service_ack_correlates_card_id_and_completes_http_idempotency(
         )
     api_store.begin_idempotency(
         engine,
-        operator_username="owner",
+        operator_username="ada",
         endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
         idempotency_key="key-1",
         request_hash="a" * 64,
@@ -161,9 +161,9 @@ def test_device_service_ack_correlates_card_id_and_completes_http_idempotency(
             )
         )
     )
-    _eventually(lambda: registry.devices_for("owner")[0].cards[0].card_id == "card-1")
+    _eventually(lambda: registry.devices_for("ada")[0].cards[0].card_id == "card-1")
     pending = registry.send_start_receive(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         artifactclass="s-masters",
@@ -204,12 +204,12 @@ def test_active_receives_rebuilds_card_correlation_after_restart(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         grpc_store.insert_intake(
             session,
             intake_id="intake-1",
-            operator="owner",
+            operator="ada",
             device_id="mac-1",
             idempotency_key="key-1",
             source_plan_digest="a" * 64,
@@ -221,7 +221,7 @@ def test_active_receives_rebuilds_card_correlation_after_restart(
         )
     api_store.begin_idempotency(
         engine,
-        operator_username="owner",
+        operator_username="ada",
         endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
         idempotency_key="key-1",
         request_hash="a" * 64,
@@ -258,7 +258,7 @@ def test_device_service_dispatches_directory_listing_and_routes_reply(engine: En
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
 
     messages = _BlockingIterator()
@@ -280,9 +280,9 @@ def test_device_service_dispatches_directory_listing_and_routes_reply(engine: En
             )
         )
     )
-    _eventually(lambda: registry.devices_for("owner")[0].capabilities == ("browse",))
+    _eventually(lambda: registry.devices_for("ada")[0].capabilities == ("browse",))
     pending = registry.request_directory_listing(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         rel_path="DCIM",
@@ -319,7 +319,7 @@ def test_device_service_revocation_evicts_on_next_heartbeat(engine: Engine) -> N
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
 
     messages = _BlockingIterator()
@@ -340,13 +340,13 @@ def test_device_service_revocation_evicts_on_next_heartbeat(engine: Engine) -> N
             )
         )
     )
-    _eventually(lambda: registry.devices_for("owner")[0].cards[0].card_id == "card-1")
+    _eventually(lambda: registry.devices_for("ada")[0].cards[0].card_id == "card-1")
     with session_scope(engine) as session:
         grpc_store.revoke_device(session, "mac-1")
 
     messages.put(device_pb2.DeviceMessage(heartbeat=device_pb2.Heartbeat()))
 
-    _eventually(lambda: registry.devices_for("owner") == [])
+    _eventually(lambda: registry.devices_for("ada") == [])
     messages.close()
     responses.close()
 
@@ -366,7 +366,7 @@ def test_device_service_max_stream_lifetime_evicts_stream(engine: Engine) -> Non
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
 
     messages = _BlockingIterator()
@@ -375,7 +375,7 @@ def test_device_service_max_stream_lifetime_evicts_stream(engine: Engine) -> Non
     thread = threading.Thread(target=lambda: _ignore_stop_iteration(responses), daemon=True)
     thread.start()
 
-    _eventually(lambda: registry.devices_for("owner") == [])
+    _eventually(lambda: registry.devices_for("ada") == [])
     messages.close()
     thread.join(timeout=2)
 
@@ -390,11 +390,11 @@ def test_device_service_ack_does_not_complete_when_card_correlation_fails(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
     api_store.begin_idempotency(
         engine,
-        operator_username="owner",
+        operator_username="ada",
         endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
         idempotency_key="key-1",
         request_hash="a" * 64,
@@ -418,9 +418,9 @@ def test_device_service_ack_does_not_complete_when_card_correlation_fails(
             )
         )
     )
-    _eventually(lambda: registry.devices_for("owner")[0].cards[0].card_id == "card-1")
+    _eventually(lambda: registry.devices_for("ada")[0].cards[0].card_id == "card-1")
     pending = registry.send_start_receive(
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         artifactclass="s-masters",

@@ -6,7 +6,7 @@
 (the helper daemon that consumes the contract), `design-intake-watch.md` (the road-mode
 reconciliation path, §8.5).
 **Review:** codex r1 folded (6 findings) 2026-07-02. Nothing is in production, so no
-backwards-compatibility/deprecation ceremony anywhere in this design (the owner, 2026-07-02).
+backwards-compatibility/deprecation ceremony anywhere in this design (the maintainer, 2026-07-02).
 **Implementation:** M1-M6 landed 2026-07-02. The M6 artifact workflow is
 `.github/workflows/receive-release.yml`; macOS signing and notarization secrets remain
 outside the repository.
@@ -22,7 +22,7 @@ validation, gRPC bag assembly, and member-name canonicalization; (b) the Python
 agent (`~/sutra-agent`) shells out to `sutra receive --json` — which silently requires
 the **full Python stack on every client machine**.
 
-Three requirements (the owner, 2026-07-02) break the Python-on-client model:
+Three requirements (the maintainer, 2026-07-02) break the Python-on-client model:
 
 1. **Road mode** — cards offloaded to external hard disks from MacBooks while the
    server is unreachable. The *full write side* (hash-on-read, package tar, resume,
@@ -35,7 +35,7 @@ Three requirements (the owner, 2026-07-02) break the Python-on-client model:
    with this exact contract-first shape: BagIt + resumable + byte-pinned conformance
    corpus (codex r1).
 
-**Decision (the owner, 2026-07-02): rewrite the receive core once, in Rust, as a single
+**Decision (the maintainer, 2026-07-02): rewrite the receive core once, in Rust, as a single
 crate producing three artifacts** — (i) a single-file edge CLI binary, (ii) the crate itself
 for Rust embedders (the Rust agent first), (iii) a PyO3/maturin wheel that preserves the
 `sutradhara_receive` import surface so the server and Python helper swap dependencies
@@ -246,7 +246,7 @@ wheel. The corpus ships with the OSS project as the normative contract definitio
 
 The Rust core ships as `sutradhara-receive` 0.1.0; bags carry
 `sutradhara-receive/0.1.0`. **Nothing is in production, so there is no legacy
-acceptance to preserve** (the owner, 2026-07-02): at M4, `SUPPORTED_RECEIVE_PACKAGES`
+acceptance to preserve** (the maintainer, 2026-07-02): at M4, `SUPPORTED_RECEIVE_PACKAGES`
 becomes `{"sutradhara-receive/0.1.0"}` only, `LEGACY_RECEIVE_SOFTWARE_AGENTS` is
 dropped, and any local test bags are simply regenerated. The marker mechanism itself is
 kept — it is the future drift/rollout gate once real edges exist — but no
@@ -298,7 +298,7 @@ buildable from a clean checkout so the harness never sees a half-migrated main.
 
 1. **OSS name + repo split timing.** Working name stays `sutradhara-receive` in-tree
    (crate and distribution share the package dir, §4); rename and split to its own repo
-   at publication (the owner's call — the tool deserves a name that doesn't require knowing
+   at publication (the maintainer's call — the tool deserves a name that doesn't require knowing
    what a sutradhara is).
 2. **Python `sutra-agent` helper daemon port to Rust** (tonic) — separate design if/when;
    nothing here depends on it.

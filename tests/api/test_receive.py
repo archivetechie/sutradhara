@@ -65,7 +65,7 @@ def test_operator_receive_stamps_header_operator_and_ignores_body_operator(
     with session_scope(api_engine) as session:
         intake = session.scalars(select(Intake)).one()
         assert intake.intake_id == body["intakeId"]
-        assert intake.operator == "owner"
+        assert intake.operator == "ada"
         assert intake.label == "MSR Day 1"
         assert intake.artifactclass == "s-masters"
 

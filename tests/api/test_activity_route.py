@@ -22,7 +22,7 @@ def test_activity_route_viewer_gets_contract_shape(api_engine: Engine, tmp_path:
         api_engine,
         tmp_path,
         intake_id="intake-1",
-        operator="owner",
+        operator="ada",
         device_id="mac-1",
         card_id="card-1",
         source_ref="DCIM/100APPLE",
@@ -56,7 +56,7 @@ def test_activity_route_viewer_gets_contract_shape(api_engine: Engine, tmp_path:
                 "batchLabel": "Morning shoot",
                 "sourceLabel": "card-1",
                 "deviceId": "mac-1",
-                "operator": "owner",
+                "operator": "ada",
                 "artifactclass": "s-masters",
                 "status": "verified",
                 "startedAt": "2026-07-02T07:00:00+00:00",
@@ -77,7 +77,7 @@ def test_activity_route_requires_view_capability(api_engine: Engine) -> None:
     response = client.get(
         "/api/activity",
         headers={
-            "X-Authentik-Username": "owner",
+            "X-Authentik-Username": "ada",
             "X-Authentik-Name": "Ada Operator",
             "X-Authentik-Groups": "",
         },
@@ -109,8 +109,8 @@ def test_activity_route_is_cross_operator_read_model(
     _insert_intake(
         api_engine,
         tmp_path,
-        intake_id="owner-intake",
-        operator="owner",
+        intake_id="ada-intake",
+        operator="ada",
         created_at=dt.datetime(2026, 7, 2, 7, 0, tzinfo=dt.UTC),
     )
     _insert_intake(
@@ -129,7 +129,7 @@ def test_activity_route_is_cross_operator_read_model(
     response = client.get("/api/activity", headers=auth_headers("viewer"))
 
     assert response.status_code == 200
-    assert {row["operator"] for row in response.json()["intakes"]} == {"owner", "other"}
+    assert {row["operator"] for row in response.json()["intakes"]} == {"ada", "other"}
 
 
 def _insert_intake(
@@ -137,7 +137,7 @@ def _insert_intake(
     landing_root: Path,
     *,
     intake_id: str,
-    operator: str = "owner",
+    operator: str = "ada",
     device_id: str = "mac-1",
     card_id: str | None = "card-1",
     source_kind: str = "card",

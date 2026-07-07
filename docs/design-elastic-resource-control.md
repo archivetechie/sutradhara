@@ -1,6 +1,6 @@
 # Design — P5.2: Elastic resource enforcement (cgroup CPU/IO, not `-threads`)
 
-> Design by Claude + the owner (2026-06-27), for review then implementation. **Repo: sutradhara (+ a
+> Design by Claude + the maintainer (2026-06-27), for review then implementation. **Repo: sutradhara (+ a
 > `~/system` live check).** Plan item **P5.2** — pulled forward to **near-term** (it's an ops guardrail,
 > not scale-deferred). Authoritative intent: **`design-worker-lease-scheduler.md §4a`** (the decisions
 > are made there); this designs the *implementation*. Depends: the worker (built).

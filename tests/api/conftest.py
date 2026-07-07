@@ -52,9 +52,9 @@ def seed_artifactclass(engine: Engine, artifactclass: str) -> None:
 
 def auth_headers(role: str = "operator") -> dict[str, str]:
     return {
-        "X-Authentik-Username": "owner",
+        "X-Authentik-Username": "ada",
         "X-Authentik-Name": "Ada Operator",
-        "X-Authentik-Email": "owner@example.test",
+        "X-Authentik-Email": "ada@example.test",
         "X-Authentik-Groups": _group_header_value(role),
     }
 

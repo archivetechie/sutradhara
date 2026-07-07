@@ -1446,7 +1446,7 @@ def _register_restore_request_item(
                 s,
                 identity=parse_identity(
                     {
-                        "X-Authentik-Username": "owner",
+                        "X-Authentik-Username": "ada",
                         "X-Authentik-Groups": "sutradhara-ingest",
                     }
                 ),
@@ -1468,7 +1468,7 @@ def _register_restore_request_item(
             return item.id
         request = RestoreRequest(
             id=f"restore-{asset_hash.hex()[:12]}",
-            identity="owner",
+            identity="ada",
             destination_id="media-server",
             state="active",
         )

@@ -79,7 +79,7 @@ def test_hdcache_schema_round_trips_inventory_and_restore_rows(engine: Engine, t
         )
         request = RestoreRequest(
             id="restore-1",
-            identity="owner",
+            identity="ada",
             destination_id="media-server",
             state="active",
         )

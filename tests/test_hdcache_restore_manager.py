@@ -101,7 +101,7 @@ def engine(tmp_path: Path) -> Iterator[Engine]:
 def test_identity_restore_grants_are_additive_and_admin_not_implicit() -> None:
     p3_restore = parse_identity(
         {
-            "X-Authentik-Username": "owner",
+            "X-Authentik-Username": "ada",
             "X-Authentik-Groups": "sutradhara-restore|sutradhara-restore-p3",
         }
     )
@@ -115,7 +115,7 @@ def test_identity_restore_grants_are_additive_and_admin_not_implicit() -> None:
 
     admin = parse_identity(
         {
-            "X-Authentik-Username": "owner",
+            "X-Authentik-Username": "ada",
             "X-Authentik-Groups": "sutradhara-admin",
         }
     )
@@ -371,7 +371,7 @@ def test_destination_confinement_rejects_escape_overwrite_and_unknown_id(
 
     with session_scope(engine) as session:
         digest, _backend_id, _memory = _seed_archived_asset(session, data=b"clip")
-        request = RestoreRequest(id="r1", identity="owner", destination_id="unknown")
+        request = RestoreRequest(id="r1", identity="ada", destination_id="unknown")
         request.items.append(
             RestoreRequestItem(
                 content_sha256=digest,
@@ -467,7 +467,7 @@ def test_request_admission_and_sequential_serve_persist_contract_states(
             ],
             config=config,
         )
-        assert request.admitted_by == "owner"
+        assert request.admitted_by == "ada"
         assert request.admitted_at is not None
         assert request.admitted_capabilities == ["can_view", "can_receive"]
         assert request.state == REQUEST_PENDING
@@ -512,7 +512,7 @@ def test_forged_queued_row_without_admission_inputs_is_refused(
         digest, _backend_id, _memory = _seed_archived_asset(session, data=b"public bytes")
         request = RestoreRequest(
             id="forged",
-            identity="owner",
+            identity="ada",
             destination_id="media-server",
             state=REQUEST_PENDING,
         )
@@ -1813,7 +1813,7 @@ def test_archive_cli_private_assets_fail_closed_and_override_audits(
 def _identity(groups: str):
     return parse_identity(
         {
-            "X-Authentik-Username": "owner",
+            "X-Authentik-Username": "ada",
             "X-Authentik-Name": "Ada Operator",
             "X-Authentik-Groups": groups,
         }
@@ -2076,10 +2076,10 @@ def _request_item(
 ) -> tuple[RestoreRequest, RestoreRequestItem]:
     request = RestoreRequest(
         id=request_id or f"r-{digest.hex()[:8]}",
-        identity="owner",
+        identity="ada",
         destination_id="media-server",
         state="active",
-        admitted_by="owner",
+        admitted_by="ada",
         admitted_at=dt.datetime.now(dt.UTC),
         admitted_capabilities=["can_view", "can_receive"],
     )

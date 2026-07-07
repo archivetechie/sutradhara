@@ -343,9 +343,9 @@ def test_tags_soft_delete_and_add_requires_archived(engine: Engine, tmp_path: Pa
         session.add(LogicalAsset(content_sha256=orphan_hash, size_bytes=len(b"not archived")))
         view = create_view(session, "tags", created_by="operator")
 
-        tag_1 = add_tag(session, asset_hash, "speaker:owner", actor="operator")
-        remove_tag(session, asset_hash, "speaker:owner", actor="operator")
-        tag_2 = add_tag(session, asset_hash, "speaker:owner", actor="operator")
+        tag_1 = add_tag(session, asset_hash, "speaker:ada", actor="operator")
+        remove_tag(session, asset_hash, "speaker:ada", actor="operator")
+        tag_2 = add_tag(session, asset_hash, "speaker:ada", actor="operator")
         rows = list(
             session.scalars(
                 select(AssetTag)

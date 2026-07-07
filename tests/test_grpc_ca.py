@@ -24,7 +24,7 @@ def test_sign_resolve_and_revoke_device_certificate(engine: Engine, tmp_path) ->
     pki = tmp_path / "pki"
     material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
     with session_scope(engine) as session:
-        token = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
+        token = store.issue_enroll_token(session, operator="ada", device_id="mac-1")
 
     signed = ca.sign_device_csr(
         engine,
@@ -43,7 +43,7 @@ def test_sign_resolve_and_revoke_device_certificate(engine: Engine, tmp_path) ->
 
     context = _FakeContext("mac-1", signed.cert_path.read_text(encoding="utf-8"))
     identity = ca.resolve_peer_identity(engine, context)
-    assert identity.operator == "owner"
+    assert identity.operator == "ada"
     assert identity.device_id == "mac-1"
 
     with session_scope(engine) as session:
@@ -66,7 +66,7 @@ def test_wrong_enrollment_token_refuses_signing(engine: Engine, tmp_path) -> Non
 def test_token_device_id_must_match_csr_common_name(engine: Engine, tmp_path) -> None:
     material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
     with session_scope(engine) as session:
-        token = store.issue_enroll_token(session, operator="owner", device_id="mac-2")
+        token = store.issue_enroll_token(session, operator="ada", device_id="mac-2")
 
     with pytest.raises(ValueError, match="common name"):
         ca.sign_device_csr(
@@ -80,7 +80,7 @@ def test_token_device_id_must_match_csr_common_name(engine: Engine, tmp_path) ->
 def test_signing_failure_releases_enrollment_token(engine: Engine, tmp_path, monkeypatch) -> None:
     material = ca.generate_device_csr(tmp_path / "device", device_id="mac-1")
     with session_scope(engine) as session:
-        token = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
+        token = store.issue_enroll_token(session, operator="ada", device_id="mac-1")
 
     original_run_openssl = ca._run_openssl
 
@@ -111,7 +111,7 @@ def test_signing_refuses_other_operator_and_releases_token(engine: Engine, tmp_p
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
         token = store.issue_enroll_token(session, operator="other", device_id="mac-1")
 
@@ -131,7 +131,7 @@ def test_signing_refuses_other_operator_and_releases_token(engine: Engine, tmp_p
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-        ).operator == "owner"
+        ).operator == "ada"
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="BB" * 32)
 
@@ -146,9 +146,9 @@ def test_signing_refuses_same_operator_rotation_without_proof(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-            operator="owner",
+            operator="ada",
         )
-        token = store.issue_enroll_token(session, operator="owner", device_id="mac-1")
+        token = store.issue_enroll_token(session, operator="ada", device_id="mac-1")
 
     with pytest.raises(ca.DeviceRotationProofCertificateError):
         ca.sign_device_csr(
@@ -166,7 +166,7 @@ def test_signing_refuses_same_operator_rotation_without_proof(
             session,
             device_id="mac-1",
             cert_fingerprint="AA" * 32,
-        ).operator == "owner"
+        ).operator == "ada"
 
 
 class _FakeContext:

@@ -9,7 +9,7 @@ v1 was panel-reviewed same day per `~/system/docs/process-panel-review.md`:
 contract/code-reality — codex xhigh), ~36 findings, 8 blockers. All folded here;
 the fold materially SHRANK the design (M4 dropped, M3 reduced to a pin).
 Origin: `~/system/docs/report-fable-review-hard-threads-2026-07-03.md` thread 1.
-Business rule pinned by the owner (B4): **≥3 copies spanning ≥2 implementation
+Business rule pinned by the maintainer (B4): **≥3 copies spanning ≥2 implementation
 families for archival classes; media-generation diversity is explicitly NOT
 policy.**
 
