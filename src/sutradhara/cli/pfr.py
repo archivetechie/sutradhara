@@ -16,9 +16,9 @@ from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
 from sutradhara.catalog.models import ArtifactClassPool, Backend, IngestItem, Pool
 from sutradhara.catalog.session import make_engine, session_scope
-from sutradhara.jobs.config import WorkerConfig, derivation_cache_root
+from sutradhara.jobs.config import derivation_cache_root
 from sutradhara.jobs.engine import submit
-from sutradhara.jobs.leases import LeaseError, LeaseManager
+from sutradhara.jobs.leases import LeaseError
 from sutradhara.jobs.reconcilers import derivation as derivation_reconciler
 from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, record_observation
 from sutradhara.pfr import (
@@ -229,13 +229,16 @@ def _restore_backends(session: Session, artifactclass: str) -> dict[int, Storage
 
 
 @contextmanager
-def _inline_io_lease() -> Iterator[dict[str, int]]:
-    manager = LeaseManager(WorkerConfig.defaults().capacities)
-    granted = manager.reserve({"io": 1})
-    try:
-        yield granted
-    finally:
-        manager.release(granted)
+def _inline_io_lease() -> Iterator[None]:
+    # ACCEPTED v1 LIMITATION (design-pfr-wiring-mxf §4, diff-gate 2026-07-07):
+    # LeaseManager is per-worker-process accounting by construction, so a CLI
+    # process cannot genuinely contend with the JobWorker's io pool — and a
+    # fresh manager here would only SIMULATE contention. Operator cuts run
+    # outside lease accounting (per-item advisory lock + temp-rename still
+    # apply; working copies sit on VTL where the contention cost is mild).
+    # The real fix is cut-as-job inside the worker, which arrives with the
+    # web request surface.
+    yield None
 
 
 def _reindex_items(

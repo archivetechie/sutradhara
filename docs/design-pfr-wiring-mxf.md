@@ -124,9 +124,12 @@ enqueue/dedupe, worker rails. Swap the body:
      clip is a documented operator step, NOT a code path — the I/O savings are already
      gone and design-pfr-restore §2.2 owns that pattern). **Scratch preflight before any
      tape I/O**: free space ≥ stored + decrypted + output estimates; configurable root.
-- **Concurrency**: `sutra pfr cut` acquires the worker io-lease path inline (cuts contend
-  fairly for drives), a per-item advisory lock (second concurrent cut → `busy`), and
-  temp-write+rename on output.
+- **Concurrency**: per-item advisory lock (second concurrent cut → `busy`) +
+  temp-write+rename on output. **Accepted v1 limitation (diff-gate 2026-07-07)**: CLI cuts
+  run OUTSIDE worker lease accounting — LeaseManager is per-process by construction, so
+  cross-process contention would require cut-as-job (the natural shape once the web request
+  surface lands; recorded follow-up). Risk is mild: operator-invoked, VTL-backed working
+  copies.
 - **CLI**: `sutra pfr cut <asset-selector> --from S --to S [-o PATH] [--json]`,
   `sutra pfr status <asset-selector>`, `sutra pfr reindex …`. Selector = existing
   `resolve_member_asset_hash` grammar (asset hash + `--artifactclass` + member selector) —
