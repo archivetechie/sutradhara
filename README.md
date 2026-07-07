@@ -27,13 +27,13 @@ data-loss event.
 - Not a vendor product like Miria — it is first-party software designed to
   outlive its dependencies.
 
-<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 74952cc -->
+<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 5c44b85 -->
 ## Status
 
 Beyond the v0.1 anchor spec (see [`docs/spec-v0.1.md`](docs/spec-v0.1.md) for
 the original design). The catalog, job engine, and CLI are built and in
-active use; large parts of the ingest → arrange → archive → restore lifecycle
-are implemented, including:
+active use — 842 passing tests — and the ingest → arrange → archive →
+restore lifecycle is implemented end to end, including:
 
 - Multi-backend copy fan-out with per-placement policy and durability
   enforcement (`sutra archive`, `sutra backends`).
@@ -41,12 +41,14 @@ are implemented, including:
   (`sutra intake`, `sutra arrangement`).
 - Post-archive organization via permanently-mutable virtual arrangements
   (`sutra virtual`, `sutra tag`).
-- A level-triggered reconciler spine driving copies and derivations
-  (`sutra reconcile`).
+- A level-triggered reconciler spine driving copies, derivations, cache
+  fills, and bundle self-heal (`sutra reconcile`).
 - Retention / deletion gating that only reclaims landing data once durable
   copies are verified and offsite-confirmed (`sutra retention`, `sutra offsite`).
 - Scrub and self-heal against live backend state (`sutra scrub`).
 - An expendable HD-cache disk tier in front of tape (`sutra hdcache`).
+- Partial file restore: container-index sidecars and byte-range clip cuts
+  with a whole-member fallback (`sutra pfr`).
 - A single-node lease-aware job worker with cgroup-based resource control
   (`sutra worker`).
 - An operator HTTP API + mTLS gRPC relay for browser/agent-driven intake and
@@ -57,7 +59,7 @@ superseded / historical) and is the authoritative map of what's built versus
 still proposed. `docs/roadmap.md` and
 `docs/implementation-plan-ingest-v2.md` track what's next.
 
-<!-- code-anchor: pyproject.toml @ 74952cc -->
+<!-- code-anchor: pyproject.toml packages @ 5c44b85 -->
 ## Layout
 
 ```
@@ -65,10 +67,10 @@ sutradhara/
 ├── README.md
 ├── LICENSE
 ├── packages/
-│   ├── sutra-agent/           # operator-facing edge receive agent (Rust)
-│   └── sutradhara-receive/    # dependency-light receive filesystem contract
+│   └── sutradhara-receive/    # dependency-light receive contract (maturin: Python + Rust core)
 ├── src/
 │   └── sutradhara/            # server/orchestrator package (the `sutra` CLI)
+├── proto/                     # gRPC contracts (device, intake, Remanence layer5)
 ├── docs/
 │   ├── spec-v0.1.md           # original design — start here for the "why"
 │   └── INDEX.md               # status of every design/contract/prompt doc
@@ -76,7 +78,11 @@ sutradhara/
 └── tests/
 ```
 
-<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py alembic @ 74952cc -->
+The Rust workstation helper (`sutra-agent`, tray + headless binaries) lives
+in its own repository and links `packages/sutradhara-receive` as a crate;
+an earlier in-tree `packages/sutra-agent` was removed when it moved.
+
+<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ 5c44b85 -->
 ## Install & verify
 
 Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/).
@@ -88,8 +94,9 @@ uv run pytest -q        # fast, hermetic test suite
 
 The CLI is installed as `sutra` inside the project's virtualenv
 (`.venv/bin/sutra`). It talks to a database configured via `SUTRADHARA_DB_URL`
-(default: sqlite at `/var/lib/replica/sutradhara.db`). For a scratch local
-database:
+(default: `sqlite:///./sutradhara.db`, a SQLite file in the current working
+directory — always set the variable explicitly for anything long-lived).
+For a scratch local database:
 
 ```sh
 export SUTRADHARA_DB_URL=sqlite:////tmp/sutradhara-dev.db
@@ -98,45 +105,54 @@ export SUTRADHARA_DB_URL=sqlite:////tmp/sutradhara-dev.db
 ```
 
 Production schema changes go through `alembic` (`alembic/`), not `sutra db
-init`.
+init`. [`docs/guide-quickstart.md`](docs/guide-quickstart.md) walks a full
+local tour, including a catalog rebuild from a fixture backend and one
+receive → register pass, plus troubleshooting.
 
-<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 74952cc -->
+<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 5c44b85 -->
 ## CLI overview
 
-`sutra --help` lists every command group; each group has its own `--help`.
-The main ones, roughly in lifecycle order:
+`sutra --help` lists every command group; each group has its own `--help`,
+and [`docs/reference-cli.md`](docs/reference-cli.md) documents every leaf
+command with flags and defaults. The main groups, roughly in lifecycle
+order:
 
 | Command | Purpose |
 |---|---|
-| `sutra receive` | Pull a source tree (card, drive, folder) into a landing intake as a BagIt bag. |
+| `sutra receive` | Pull a source tree (card, drive, folder) into a landing intake as a BagIt bag; sweep and verify landing shares. |
 | `sutra intake` | Inspect, register, and watch landing intakes into the catalog. |
 | `sutra prepare` | Record a derivation profile (transcode/index) for an intake. |
 | `sutra arrangement` | Arrange registered masters into an archive namespace and submit a frozen source-map. |
 | `sutra archive` | Manage artifactclass policy, build/review durable bundles, archive submissions, restore assets. |
 | `sutra virtual` | Post-archive, permanently-mutable views: place, move, exclude, restore members by virtual path. |
 | `sutra tag` / `reject` / `unreject` | Content-level governance: tags and reject markers (gate restore, never delete). |
-| `sutra reconcile` | Run one bounded reconcile cycle for a domain (copies, derivations). |
+| `sutra list` | Query the catalog (`list assets`). |
+| `sutra reconcile` | Run one bounded reconcile cycle for a domain (`copy`, `bundle_copy`, `derivation`, `hdcache`, `log_pipeline`). |
 | `sutra jobs` | Submit, run, and inspect individual jobs. |
 | `sutra worker` | Run the single-node lease-aware job worker that drains pending jobs. |
 | `sutra backends` | Register and inspect storage backends and their pools. |
-| `sutra hdcache` | Manage the HD-cache disk tier (enrollment, fills, walker, repopulation). |
 | `sutra scrub` | Re-enumerate a backend and reconcile it against the catalog. |
+| `sutra hdcache` | Manage the HD-cache disk tier (enrollment, fills, walker, repopulation). |
 | `sutra retention` / `offsite` | Retention release gate, offsite confirmation, staging sweep. |
+| `sutra pfr` | Partial file restore: clip cuts, sidecar status, forced reindex. |
 | `sutra serve` / `serve-api` / `serve-grpc` | Operator HTTP API and mTLS gRPC relay (device intake, browser console). |
-| `sutra admin` | Dangerous local catalog maintenance (`doctor`, `reset`). |
+| `sutra db` / `sutra admin` | Schema init (dev), doctor, and dangerous catalog maintenance. |
 
 Backends currently supported: `rem_tape` (gRPC to Remanence), `d2_tape` (Java
 CLI adapter for the legacy d2 tape library), `s3` (cloud), `ssh_disk`
-(rsync/SSH to a LAN file server), and `memory` (tests only).
+(rsync/SSH to a LAN file server), and `memory` (tests only). Other kinds
+accepted by `backends add` (`rem_disk`, `plain_disk`, `gcs`, `azure_blob`)
+are reserved names without adapters yet.
 
-<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 74952cc -->
+<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 5c44b85 -->
 ## Configuration
 
 Beyond `SUTRADHARA_DB_URL`, the environment variables most operators need:
 
-- `REM_BIN` — path to the local Remanence `rem-debug` CLI, used for RAO
-  sealing/opening. Falls back to `~/remanence/target/release/rem-debug`. Run
-  `sutra admin doctor` to check availability.
+- `REM_BIN` — path to the Remanence `rem` CLI, used for RAO
+  sealing/opening and archive builds. Resolution falls back to `rem` on
+  `PATH`, then `~/remanence/target/release/rem`. Run `sutra admin doctor`
+  to check availability.
 - `SUTRADHARA_KEY_REGISTRY_DIR` — root of the local key registry for
   encrypted (RAO-AEAD) copies. Defaults to
   `/var/lib/replica/sutradhara-key-registry`; deployments should create it
@@ -145,12 +161,11 @@ Beyond `SUTRADHARA_DB_URL`, the environment variables most operators need:
 - `SUTRA_API_SOCKET` — Unix domain socket path for `sutra serve`'s operator
   API (default `/run/sutradhara/api.sock`).
 
-The HD-cache tier, resource control, and a handful of other subsystems have
-their own tuning knobs (all `SUTRADHARA_*` environment variables) — see the
-relevant design doc in `docs/` (`design-hd-disk-tier.md`,
-`design-elastic-resource-control.md`) for the full list and defaults.
+Every other knob — hdcache tuning, resource control, PFR, the d2tape
+backend, test fakes — is documented with exact defaults in
+[`docs/reference-config.md`](docs/reference-config.md).
 
-<!-- code-anchor: src/sutradhara/sealing @ 74952cc -->
+<!-- code-anchor: src/sutradhara/sealing @ 5c44b85 -->
 ## Scenario O — sealed RAO copies
 
 Scenario O seals per-copy representations before storage instead of storing
@@ -169,13 +184,22 @@ redundantly on the row.
 <!-- code-anchor: none -->
 ## Documentation
 
+- [`docs/guide-quickstart.md`](docs/guide-quickstart.md) — install, a
+  scratch catalog, the rebuildable-index demo, one receive → register
+  pass, troubleshooting.
+- [`docs/architecture-overview.md`](docs/architecture-overview.md) — how
+  the code is actually organized: data model, lifecycle, job engine and
+  reconciler spine, backends, sealing, hdcache, operator surface.
+- [`docs/reference-cli.md`](docs/reference-cli.md) — every command and
+  flag, verified against `--help`.
+- [`docs/reference-config.md`](docs/reference-config.md) — every
+  environment variable with its exact default.
+- [`docs/reference-glossary.md`](docs/reference-glossary.md) — the
+  internal vocabulary, as the code uses it.
 - [`docs/spec-v0.1.md`](docs/spec-v0.1.md) — the original design (why this
-  exists, first principles, architecture).
+  exists, first principles).
 - [`docs/INDEX.md`](docs/INDEX.md) — status of every design, contract, and
   prompt doc in `docs/`; the map of what's built vs. proposed.
-- [`docs/roadmap.md`](docs/roadmap.md) and
-  [`docs/implementation-plan-ingest-v2.md`](docs/implementation-plan-ingest-v2.md)
-  — what's built and what's next.
 - [`docs/arrangement-arc-guide.md`](docs/arrangement-arc-guide.md) — a
   plain-language walkthrough of the intake → arrange → archive →
   organize-forever lifecycle, for archivists and operators rather than
