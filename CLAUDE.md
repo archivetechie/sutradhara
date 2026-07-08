@@ -25,4 +25,5 @@ Scenario J/N/O/Q green.
 The maintainer brainstorms with Claude → design/prompt docs in `docs/` → codex (or
 Claude) implements → harness scenarios verify. Background `gardener` auto-
 commits idle work, pushes, prunes merged branches — never ask the maintainer to do
-repo hygiene. Docs lifecycle: `docs/INDEX.md` + `docs/archive/`.
+repo hygiene. Docs lifecycle: `docs/INDEX.md` + `docs/historical/`
+(finished designs and implemented prompts; formerly `docs/archive/`).
