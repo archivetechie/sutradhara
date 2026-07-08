@@ -74,6 +74,10 @@ of the relevant process picks changes up.
 | `SUTRADHARA_HDCACHE_IDENTITY_PROBE_DEADLINE_SECONDS` | `2.0` | Deadline for the disk identity probe before a fill writes. Must be positive. |
 | `SUTRADHARA_HDCACHE_DELETE_DEADLINE_SECONDS` | `70.0` | Deadline for entry deletion I/O during fills/walks. Must be positive. |
 
+![Priority number line: operator restores at 0, cache fills at 50, repopulation at 75, migrations at 100; lower runs earlier and the strict ordering is enforced at config time](assets/hdcache-priorities.svg)
+
+*Fig. 1 — How the four priority knobs relate: lower runs earlier, and the config refuses any setting that breaks the strict ordering.*
+
 ### Restore serving
 
 | Variable | Default | Purpose |

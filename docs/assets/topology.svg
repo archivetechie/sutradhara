@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 515" role="img" aria-label="System topology: sutra CLI, HTTP API, and mTLS gRPC on top; catalog, job engine and worker, and reconciler spine in the orchestrator core; hdcache disks, ssh_disk, s3, d2_tape, and the Remanence boundary below">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .gs { fill: #fcfcfc; stroke: #17191b; }
+    .gsd { fill: #fcfcfc; stroke: #9a9a9a; stroke-dasharray: 3 3; }
+    .rs { fill: #fff8f0; stroke: #a45200; }
+    .rsd { fill: #fcfcfc; stroke: #a45200; stroke-dasharray: 3 3; }
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rta { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #a45200; letter-spacing: .18em; }
+    .rtg { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; letter-spacing: .18em; }
+    .rl { stroke: #9a9a9a; stroke-width: 1; fill: none; }
+  </style>
+  <defs><marker id="rah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#9a9a9a"/></marker></defs>
+
+  <text class="rtg" x="24" y="20">WHAT TALKS TO WHAT &#8212; ENTRY SURFACES, CORE, STORAGE</text>
+
+  <text class="rtd" x="135" y="40" text-anchor="middle">operators</text>
+  <rect class="gs" x="60" y="46" width="150" height="44"/>
+  <text class="rt" x="135" y="64" text-anchor="middle">sutra CLI</text>
+  <text class="rtd" x="135" y="79" text-anchor="middle">scripts + shell</text>
+
+  <text class="rtd" x="375" y="40" text-anchor="middle">browser console (via reverse proxy)</text>
+  <rect class="gs" x="280" y="46" width="190" height="44"/>
+  <text class="rt" x="375" y="64" text-anchor="middle">HTTP API</text>
+  <text class="rtd" x="375" y="79" text-anchor="middle">FastAPI on a unix socket</text>
+
+  <text class="rtd" x="615" y="40" text-anchor="middle">workstation agents</text>
+  <rect class="gs" x="520" y="46" width="190" height="44"/>
+  <text class="rt" x="615" y="64" text-anchor="middle">gRPC server (mTLS)</text>
+  <text class="rtd" x="615" y="79" text-anchor="middle">streaming intake + device relay</text>
+
+  <line class="rl" x1="135" y1="90" x2="135" y2="136" marker-end="url(#rah)"/>
+  <line class="rl" x1="375" y1="90" x2="375" y2="136" marker-end="url(#rah)"/>
+  <line class="rl" x1="615" y1="90" x2="615" y2="136" marker-end="url(#rah)"/>
+
+  <text class="rtg" x="160" y="133">THE ORCHESTRATOR CORE</text>
+  <rect class="gsd" x="24" y="140" width="712" height="210"/>
+
+  <rect class="gs" x="70" y="160" width="240" height="64"/>
+  <text class="rt" x="190" y="180" text-anchor="middle">job engine + worker</text>
+  <text class="rtd" x="190" y="196" text-anchor="middle">counted leases &#183; PENDING &#8594; RUNNING</text>
+  <text class="rtd" x="190" y="210" text-anchor="middle">9 handler kinds (copy, restore, &#8230;)</text>
+
+  <rect class="gs" x="430" y="160" width="250" height="64"/>
+  <text class="rt" x="555" y="180" text-anchor="middle">reconciler spine</text>
+  <text class="rtd" x="555" y="196" text-anchor="middle">copy &#183; bundle_copy &#183; derivation &#183;</text>
+  <text class="rtd" x="555" y="210" text-anchor="middle">hdcache &#183; log_pipeline</text>
+
+  <line class="rl" x1="428" y1="196" x2="314" y2="196" marker-end="url(#rah)"/>
+  <text class="rtd" x="371" y="188" text-anchor="middle">enqueues</text>
+
+  <rect class="gs" x="70" y="260" width="610" height="64"/>
+  <text class="rt" x="375" y="282" text-anchor="middle">catalog &#8212; one database (SUTRADHARA_DB_URL)</text>
+  <text class="rtd" x="375" y="300" text-anchor="middle">assets &#183; copies &#183; pools &#183; jobs &#183; conditions &#8212; rebuildable by re-enumerating backends</text>
+
+  <line class="rl" x1="190" y1="226" x2="190" y2="256" marker-end="url(#rah)"/>
+  <text class="rtd" x="198" y="245">claims + records attempts</text>
+  <line class="rl" x1="555" y1="258" x2="555" y2="228" marker-end="url(#rah)"/>
+  <text class="rtd" x="563" y="245">observes gaps</text>
+
+  <line class="rl" x1="114" y1="352" x2="114" y2="382" marker-end="url(#rah)"/>
+  <line class="rl" x1="279" y1="352" x2="279" y2="382" marker-end="url(#rah)"/>
+  <line class="rl" x1="399" y1="352" x2="399" y2="382" marker-end="url(#rah)"/>
+  <line class="rl" x1="524" y1="352" x2="524" y2="382" marker-end="url(#rah)"/>
+  <line class="rl" x1="674" y1="352" x2="674" y2="370" marker-end="url(#rah)"/>
+
+  <text class="rtg" x="24" y="377">STORAGE</text>
+
+  <rect class="gs" x="24" y="386" width="180" height="56"/>
+  <text class="rt" x="114" y="404" text-anchor="middle">hdcache disks</text>
+  <text class="rtd" x="114" y="419" text-anchor="middle">JBOD tier in front of tape</text>
+  <text class="rtd" x="114" y="433" text-anchor="middle">expendable; entries are not copies</text>
+
+  <rect class="gs" x="224" y="386" width="110" height="56"/>
+  <text class="rt" x="279" y="408" text-anchor="middle">ssh_disk</text>
+  <text class="rtd" x="279" y="424" text-anchor="middle">rsync / SSH</text>
+
+  <rect class="gs" x="354" y="386" width="90" height="56"/>
+  <text class="rt" x="399" y="408" text-anchor="middle">s3</text>
+  <text class="rtd" x="399" y="424" text-anchor="middle">boto3</text>
+
+  <rect class="rs" x="464" y="386" width="120" height="56"/>
+  <text class="rt" x="524" y="404" text-anchor="middle">d2_tape</text>
+  <text class="rtd" x="524" y="419" text-anchor="middle">java CLI,</text>
+  <text class="rtd" x="524" y="433" text-anchor="middle">legacy library</text>
+
+  <rect class="rsd" x="604" y="372" width="140" height="98"/>
+  <rect class="rs" x="614" y="380" width="120" height="32"/>
+  <text class="rt" x="674" y="399" text-anchor="middle">rem CLI &#8212; codec</text>
+  <rect class="rs" x="614" y="420" width="120" height="32"/>
+  <text class="rt" x="674" y="439" text-anchor="middle">layer-5 daemon</text>
+  <text class="rta" x="674" y="463" text-anchor="middle">REMANENCE &#8212; TAPE</text>
+
+  <text class="rtd" x="24" y="491">seal/open shells out to rem; the rem_tape backend speaks gRPC to the layer-5 daemon; d2_tape drives the legacy library via a java CLI.</text>
+  <text class="rtd" x="24" y="505">cache disks are not backends and durability math never counts them; scrub re-enumerates backends to rebuild the catalog.</text>
+</svg>

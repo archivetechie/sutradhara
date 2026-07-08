@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 190" role="img" aria-label="Archive lifecycle: receive, register, arrange and submit, archive, organize forever; landing bytes are released by retention only after every copy is verified and offsite-confirmed">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .gs { fill: #fcfcfc; stroke: #17191b; }
+    .rs { fill: #fff8f0; stroke: #a45200; }
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rta { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #a45200; letter-spacing: .18em; }
+    .rtg { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; letter-spacing: .18em; }
+    .rl { stroke: #9a9a9a; stroke-width: 1; fill: none; }
+  </style>
+  <defs><marker id="rah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#9a9a9a"/></marker></defs>
+
+  <text class="rtg" x="24" y="20">INGEST &#8594; ARRANGE &#8594; ARCHIVE &#8594; ORGANIZE FOREVER &#8212; BYTES MOVE ONCE</text>
+  <text class="rta" x="528" y="34" text-anchor="middle">THE DURABLE RECORD</text>
+
+  <rect class="gs" x="24" y="40" width="120" height="44"/>
+  <text class="rt" x="84" y="58" text-anchor="middle">receive</text>
+  <text class="rtd" x="84" y="73" text-anchor="middle">sutra receive</text>
+
+  <rect class="gs" x="172" y="40" width="120" height="44"/>
+  <text class="rt" x="232" y="58" text-anchor="middle">register</text>
+  <text class="rtd" x="232" y="73" text-anchor="middle">sutra intake</text>
+
+  <rect class="gs" x="320" y="40" width="120" height="44"/>
+  <text class="rt" x="380" y="58" text-anchor="middle">arrange + submit</text>
+  <text class="rtd" x="380" y="73" text-anchor="middle">sutra arrangement</text>
+
+  <rect class="rs" x="468" y="40" width="120" height="44"/>
+  <text class="rt" x="528" y="58" text-anchor="middle">archive</text>
+  <text class="rtd" x="528" y="73" text-anchor="middle">sutra archive</text>
+
+  <rect class="gs" x="616" y="40" width="120" height="44"/>
+  <text class="rt" x="676" y="58" text-anchor="middle">organize forever</text>
+  <text class="rtd" x="676" y="73" text-anchor="middle">sutra virtual</text>
+
+  <line class="rl" x1="146" y1="62" x2="168" y2="62" marker-end="url(#rah)"/>
+  <line class="rl" x1="294" y1="62" x2="316" y2="62" marker-end="url(#rah)"/>
+  <line class="rl" x1="442" y1="62" x2="464" y2="62" marker-end="url(#rah)"/>
+  <line class="rl" x1="590" y1="62" x2="612" y2="62" marker-end="url(#rah)"/>
+  <path class="rl" d="M 736 50 C 754 50 754 74 736 74" marker-end="url(#rah)"/>
+
+  <text class="rtd" x="84" y="100" text-anchor="middle">BagIt bag lands;</text>
+  <text class="rtd" x="84" y="113" text-anchor="middle">sentinel written last</text>
+  <text class="rtd" x="232" y="100" text-anchor="middle">LogicalAsset +</text>
+  <text class="rtd" x="232" y="113" text-anchor="middle">IngestItem rows</text>
+  <text class="rtd" x="380" y="100" text-anchor="middle">frozen, validated</text>
+  <text class="rtd" x="380" y="113" text-anchor="middle">source-map</text>
+  <text class="rtd" x="528" y="100" text-anchor="middle">sealed copies fan out</text>
+  <text class="rtd" x="528" y="113" text-anchor="middle">to every active pool</text>
+  <text class="rtd" x="676" y="100" text-anchor="middle">mutable views &#8212;</text>
+  <text class="rtd" x="676" y="113" text-anchor="middle">never touch bytes</text>
+
+  <path class="rl" d="M 84 134 L 84 138 L 528 138 L 528 134"/>
+  <text class="rtd" x="306" y="154" text-anchor="middle">landing bytes live only here &#8212; retention releases them after every copy is verified and offsite-confirmed</text>
+  <text class="rtd" x="380" y="172" text-anchor="middle">after archive the record is immutable &#8212; organization continues in the catalog only</text>
+</svg>

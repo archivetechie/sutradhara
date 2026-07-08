@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 165" role="img" aria-label="Job priority number line: operator restores at 0, cache fills at 50, repopulation at 75, migrations at 100; lower runs earlier and the ordering is enforced strictly">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rtg { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; letter-spacing: .18em; }
+    .rl { stroke: #9a9a9a; stroke-width: 1; fill: none; }
+  </style>
+
+  <text class="rtg" x="24" y="22">JOB PRIORITY &#8212; LOWER NUMBER RUNS EARLIER</text>
+
+  <text class="rt" x="60" y="60" text-anchor="middle">operator restores</text>
+  <text class="rtd" x="60" y="74" text-anchor="middle">0</text>
+  <text class="rt" x="380" y="60" text-anchor="middle">cache fills</text>
+  <text class="rtd" x="380" y="74" text-anchor="middle">50</text>
+  <text class="rt" x="540" y="60" text-anchor="middle">repopulation</text>
+  <text class="rtd" x="540" y="74" text-anchor="middle">75 (midpoint default)</text>
+  <text class="rt" x="700" y="60" text-anchor="middle">migrations</text>
+  <text class="rtd" x="700" y="74" text-anchor="middle">100</text>
+
+  <line class="rl" x1="60" y1="96" x2="700" y2="96"/>
+  <line class="rl" x1="60" y1="90" x2="60" y2="102"/>
+  <line class="rl" x1="380" y1="90" x2="380" y2="102"/>
+  <line class="rl" x1="540" y1="90" x2="540" y2="102"/>
+  <line class="rl" x1="700" y1="90" x2="700" y2="102"/>
+
+  <text class="rtd" x="380" y="126" text-anchor="middle">the config raises unless restores &#60; fills &#60; repopulation &#60; migrations (strict)</text>
+  <text class="rtd" x="380" y="144" text-anchor="middle">the reconciler keeps at most 500 fill jobs live; repopulation is capped at 100 by default</text>
+</svg>

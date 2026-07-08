@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 250" role="img" aria-label="Two-axis reconciliation condition state machine: observation moves rows between satisfied and open; attempt outcomes move them through backoff to blocked, reopened by an operator or a tool-version bump">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .gs { fill: #fcfcfc; stroke: #17191b; }
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rtg { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; letter-spacing: .18em; }
+    .rl { stroke: #9a9a9a; stroke-width: 1; fill: none; }
+  </style>
+  <defs><marker id="rah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#9a9a9a"/></marker></defs>
+
+  <text class="rtg" x="24" y="22">AXIS A &#8212; OBSERVATION OWNS REALITY; ONLY OBSERVATIONS CREATE ROWS</text>
+
+  <text class="rtd" x="89" y="40" text-anchor="middle">observed present,</text>
+  <text class="rtd" x="89" y="52" text-anchor="middle">or no longer desired</text>
+  <line class="rl" x1="89" y1="58" x2="89" y2="100" marker-end="url(#rah)"/>
+
+  <text class="rtd" x="280" y="40" text-anchor="middle">desired + observed missing</text>
+  <text class="rtd" x="280" y="52" text-anchor="middle">(held rows stay held)</text>
+  <line class="rl" x1="280" y1="58" x2="280" y2="100" marker-end="url(#rah)"/>
+
+  <text class="rtd" x="420" y="40">success needs no edge here: the next</text>
+  <text class="rtd" x="420" y="52">observation sees present &#8594; satisfied</text>
+
+  <rect class="gs" x="24" y="104" width="130" height="44"/>
+  <text class="rt" x="89" y="122" text-anchor="middle">satisfied</text>
+  <text class="rtd" x="89" y="137" text-anchor="middle">attempt count reset</text>
+
+  <rect class="gs" x="230" y="104" width="100" height="44"/>
+  <text class="rt" x="280" y="122" text-anchor="middle">open</text>
+  <text class="rtd" x="280" y="137" text-anchor="middle">due now</text>
+
+  <rect class="gs" x="406" y="104" width="120" height="44"/>
+  <text class="rt" x="466" y="122" text-anchor="middle">backoff</text>
+  <text class="rtd" x="466" y="137" text-anchor="middle">due later</text>
+
+  <rect class="gs" x="602" y="104" width="130" height="44"/>
+  <text class="rt" x="667" y="122" text-anchor="middle">blocked</text>
+  <text class="rtd" x="667" y="137" text-anchor="middle">waits for a human</text>
+
+  <line class="rl" x1="332" y1="126" x2="402" y2="126" marker-end="url(#rah)"/>
+  <text class="rtd" x="368" y="118" text-anchor="middle">attempt fails</text>
+
+  <line class="rl" x1="528" y1="126" x2="598" y2="126" marker-end="url(#rah)"/>
+  <text class="rtd" x="564" y="118" text-anchor="middle">3rd failure</text>
+
+  <path class="rl" d="M 436 148 C 436 172 496 172 496 150" marker-end="url(#rah)"/>
+  <text class="rtd" x="466" y="186" text-anchor="middle">due again after 60 s &#183; 2&#8319;&#8315;&#185;, jittered, &#8804; 1 h</text>
+
+  <path class="rl" d="M 640 148 L 640 208 L 280 208 L 280 152" marker-end="url(#rah)"/>
+  <text class="rtd" x="460" y="202" text-anchor="middle">reopened: operator --reopen-blocked, or a recorded tool-version bump</text>
+
+  <text class="rtg" x="24" y="238">AXIS B &#8212; ATTEMPT OUTCOME</text>
+  <text class="rtd" x="220" y="238">gate: due, workable, and no live job for the target &#8212; at most one attempt in flight</text>
+</svg>

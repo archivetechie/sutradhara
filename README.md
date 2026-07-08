@@ -19,6 +19,10 @@ The catalog uses **content-hash (SHA-256) as the logical asset identity** and
 is **rebuildable** by re-enumerating backends — losing the database is not a
 data-loss event.
 
+![The archive lifecycle: receive, register, arrange and submit, archive with sealed copies fanning out to every active pool, organize forever](docs/assets/lifecycle.svg)
+
+*Fig. 1 — The lifecycle: bytes move left to right once; after `archive` the record is immutable and all further organization is catalog-only.*
+
 ## What this is not
 
 - Not a tape driver — Remanence owns SCSI, library control, on-tape format,

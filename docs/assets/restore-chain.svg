@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 475" role="img" aria-label="Restore chain: every entry point passes the gates, chooses cache or tape, and ends in the verified read — stored hash check, open representation, plaintext hash check, atomic publish">
+  <rect width="100%" height="100%" fill="#fcfcfc"/>
+  <style>
+    .gs { fill: #fcfcfc; stroke: #17191b; }
+    .rs { fill: #fff8f0; stroke: #a45200; }
+    .rt { font: 11px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #17191b; }
+    .rtd { font: 10px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; }
+    .rta { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #a45200; letter-spacing: .18em; }
+    .rtg { font: 9px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #9a9a9a; letter-spacing: .18em; }
+    .rl { stroke: #9a9a9a; stroke-width: 1; fill: none; }
+    .rld { stroke: #9a9a9a; stroke-width: 1; fill: none; stroke-dasharray: 3 3; }
+  </style>
+  <defs><marker id="rah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#9a9a9a"/></marker></defs>
+
+  <text class="rtg" x="24" y="20">EVERY RESTORE CONVERGES ON ONE CHAIN</text>
+
+  <text class="rtd" x="380" y="44" text-anchor="middle">sutra archive restore &#183; sutra virtual restore &#183; sutra pfr cut (whole-member fallback) &#183; POST /api/ui/restores</text>
+  <line class="rl" x1="380" y1="54" x2="380" y2="76" marker-end="url(#rah)"/>
+
+  <rect class="gs" x="230" y="80" width="300" height="44"/>
+  <text class="rt" x="380" y="98" text-anchor="middle">gates</text>
+  <text class="rtd" x="380" y="114" text-anchor="middle">reject marker &#183; validity &#183; privacy capability</text>
+
+  <line class="rl" x1="330" y1="126" x2="234" y2="152" marker-end="url(#rah)"/>
+  <line class="rl" x1="430" y1="126" x2="526" y2="152" marker-end="url(#rah)"/>
+
+  <rect class="gs" x="90" y="158" width="260" height="56"/>
+  <text class="rt" x="220" y="176" text-anchor="middle">hdcache</text>
+  <text class="rtd" x="220" y="192" text-anchor="middle">healthy cache entry serves the read</text>
+  <text class="rtd" x="220" y="206" text-anchor="middle">expendable speed layer</text>
+
+  <rect class="rs" x="410" y="158" width="260" height="56"/>
+  <text class="rt" x="540" y="176" text-anchor="middle">archived copy</text>
+  <text class="rtd" x="540" y="192" text-anchor="middle">first healthy locator in the</text>
+  <text class="rtd" x="540" y="206" text-anchor="middle">artifactclass pool-preference order</text>
+
+  <line class="rld" x1="352" y1="186" x2="406" y2="186" marker-end="url(#rah)"/>
+  <text class="rtd" x="380" y="232" text-anchor="middle">any cache failure degrades silently to tape</text>
+
+  <line class="rl" x1="220" y1="214" x2="310" y2="250" marker-end="url(#rah)"/>
+  <line class="rl" x1="540" y1="214" x2="450" y2="250" marker-end="url(#rah)"/>
+
+  <text class="rta" x="24" y="270">THE VERIFIED READ</text>
+  <text class="rtd" x="24" y="286">restore.restore_copy</text>
+
+  <rect class="rs" x="210" y="254" width="340" height="34"/>
+  <text class="rt" x="380" y="275" text-anchor="middle">stored digest must equal Copy.integrity_hash</text>
+  <line class="rl" x1="380" y1="288" x2="380" y2="296" marker-end="url(#rah)"/>
+
+  <rect class="gs" x="210" y="298" width="340" height="34"/>
+  <text class="rt" x="380" y="319" text-anchor="middle">open the representation &#8212; decrypt / unwrap</text>
+  <line class="rl" x1="380" y1="332" x2="380" y2="340" marker-end="url(#rah)"/>
+
+  <rect class="rs" x="210" y="342" width="340" height="34"/>
+  <text class="rt" x="380" y="363" text-anchor="middle">plaintext digest must equal LogicalAsset.content_sha256</text>
+  <line class="rl" x1="380" y1="376" x2="380" y2="384" marker-end="url(#rah)"/>
+
+  <rect class="gs" x="210" y="386" width="340" height="34"/>
+  <text class="rt" x="380" y="407" text-anchor="middle">publish with an fsync-backed atomic write</text>
+
+  <text class="rtd" x="570" y="306">corruption fails closed</text>
+  <text class="rtd" x="570" y="318">with a typed error naming</text>
+  <text class="rtd" x="570" y="330">the mismatched layer</text>
+
+  <line class="rl" x1="380" y1="420" x2="380" y2="442" marker-end="url(#rah)"/>
+  <text class="rt" x="380" y="460" text-anchor="middle">destination</text>
+</svg>

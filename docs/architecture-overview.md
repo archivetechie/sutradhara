@@ -22,6 +22,10 @@ observed state and enqueues jobs to close them. The database is
 rebuildable by re-enumerating backends, so losing it is an inconvenience,
 not a data-loss event.
 
+![System topology: sutra CLI, HTTP API, and mTLS gRPC enter the orchestrator core — job engine plus worker, reconciler spine, and one catalog database — which drives hdcache disks, ssh_disk, s3, d2_tape, and the Remanence boundary](assets/topology.svg)
+
+*Fig. 1 — What talks to what: three entry surfaces over one catalog database, the reconciler enqueuing what the job engine runs, and storage below — amber marks the tape side, where copies are durable.*
+
 <!-- code-anchor: src/sutradhara pyproject.toml @ 5c44b85 -->
 ## The shape of the code
 
@@ -135,6 +139,10 @@ metadata, same database.
 
 <!-- code-anchor: none -->
 ## Lifecycle: receive to organize-forever
+
+![Lifecycle: receive, register, arrange and submit, archive, organize forever, with landing bytes released by retention only after every copy is verified and offsite-confirmed](assets/lifecycle.svg)
+
+*Fig. 2 — The lifecycle at a glance; the numbered steps below name the code behind each stage.*
 
 The intended flow, each step naming the code that implements it:
 
@@ -254,6 +262,10 @@ state machine:
   --reopen-blocked`) or a recorded tool-version bump, which reopens them
   automatically.
 
+![Two-axis condition state machine: observation moves rows between satisfied and open; failed attempts move them through backoff to blocked, reopened by an operator or a tool-version bump](assets/reconciler-two-axis.svg)
+
+*Fig. 3 — One condition row, two axes: observations (top) own reality and are the only writer that creates rows; attempt outcomes (bottom) only escalate through `backoff` to `blocked`.*
+
 `reconcile()` is one bounded cycle: reopen version-bumped rows, discover
 a batch of targets, process due conditions, and enqueue at most one live
 job per target. Level-triggered and idempotent: running it twice is safe,
@@ -361,6 +373,10 @@ Every restore, whatever the entry point (`sutra archive restore`,
    `LogicalAsset.content_sha256`, and only then publishes to the
    destination with an fsync-backed atomic write. Corruption fails
    closed with a typed error naming which layer mismatched.
+
+![Restore chain: every entry point passes the gates, chooses cache or tape, and converges on the verified read — stored hash check, open representation, plaintext hash check, atomic publish](assets/restore-chain.svg)
+
+*Fig. 4 — The restore chain: whatever the entry point, gates first, cache before tape, and both hash checks (amber) before anything reaches the destination.*
 
 Partial file restore (`pfr.py`, `sutra pfr cut`) shortcuts step 3 for
 indexed members: a `pfr-index-v1` sidecar plus `ReadObjectRange` byte
