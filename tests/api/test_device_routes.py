@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -112,6 +113,9 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
             "cardId": "card-1",
             "status": "streaming",
             "releaseSafe": False,
+            "destinationPath": str(tmp_path / "intake-1"),
+            "bytesReceived": None,
+            "bytesTotal": None,
         }
     ]
 
@@ -155,6 +159,7 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
             card_id="card-1",
         )
         grpc_store.set_committed_digest(session, "intake-committed", "b" * 64)
+    _write_receipts(tmp_path, "intake-committed", [5, 7])
 
     app = make_api_app(api_engine)
     app.state.registry = registry
@@ -171,6 +176,9 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
             "cardId": "card-1",
             "status": "verifying",
             "releaseSafe": True,
+            "destinationPath": str(tmp_path / "intake-committed"),
+            "bytesReceived": 12,
+            "bytesTotal": 12,
         }
     ]
     assert status.status_code == 200
@@ -179,6 +187,9 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
         "status": "verifying",
         "errors": [],
         "releaseSafe": True,
+        "destinationPath": str(tmp_path / "intake-committed"),
+        "bytesReceived": 12,
+        "bytesTotal": 12,
     }
 
 
@@ -607,6 +618,9 @@ def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path
         "status": "verified",
         "errors": [],
         "releaseSafe": True,
+        "destinationPath": str(tmp_path / "intake-1"),
+        "bytesReceived": None,
+        "bytesTotal": None,
     }
 
 
@@ -659,3 +673,21 @@ def _online_registry(engine: Engine, *, capabilities: list[str] | None = None) -
             operator="ada",
         )
     return registry
+
+
+def _write_receipts(landing_root: Path, intake_id: str, sizes: list[int]) -> None:
+    intake_dir = landing_root / intake_id
+    intake_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps(
+            {
+                "relpath": f"clip-{index}.mov",
+                "server_sha256": f"{index}".zfill(64),
+                "bytes": size,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for index, size in enumerate(sizes)
+    ]
+    (intake_dir / "receive-receipts.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")

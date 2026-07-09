@@ -13,6 +13,8 @@ from pathlib import Path
 
 from sutradhara.grpc import store as grpc_store
 
+RECEIPTS_NAME = "receive-receipts.jsonl"
+
 
 @dataclass(frozen=True)
 class IntakeStatusView:
@@ -26,7 +28,7 @@ class IntakeStatusView:
 def intake_status(row: grpc_store.GrpcIntake) -> IntakeStatusView:
     """Return the externally visible status and marker errors for an intake row."""
 
-    status, errors = marker_status(Path(row.landing_root) / row.intake_id)
+    status, errors = marker_status(intake_landing_path(row))
     if status is not None:
         return IntakeStatusView(
             status=status,
@@ -42,6 +44,31 @@ def intake_status(row: grpc_store.GrpcIntake) -> IntakeStatusView:
         errors=[],
         release_safe=release_safe_for_status(row, status),
     )
+
+
+def intake_landing_path(row: grpc_store.GrpcIntake) -> Path:
+    """Return the server-side landing directory for a gRPC intake row."""
+
+    return Path(row.landing_root) / row.intake_id
+
+
+def intake_receipt_bytes(row: grpc_store.GrpcIntake) -> int | None:
+    """Return bytes copied to the landing receipt ledger, if the ledger is readable."""
+
+    intake_dir = intake_landing_path(row)
+    path = intake_dir / RECEIPTS_NAME
+    if not path.exists():
+        return None
+    total = 0
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line:
+                continue
+            payload = json.loads(line)
+            total += int(payload["bytes"])
+    except Exception:
+        return None
+    return total
 
 
 def release_safe_for_status(row: grpc_store.GrpcIntake, status: str) -> bool:

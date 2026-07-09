@@ -43,7 +43,7 @@ from sutradhara.grpc.registry import (
     DeviceOwnerMismatch,
     StreamClosed,
 )
-from sutradhara.grpc.status import intake_status
+from sutradhara.grpc.status import intake_landing_path, intake_receipt_bytes, intake_status
 
 router = APIRouter()
 LOG = logging.getLogger(__name__)
@@ -355,6 +355,7 @@ def get_intake_status(intake_id: str, request: Request) -> dict[str, object]:
         "status": view.status,
         "errors": view.errors,
         "releaseSafe": view.release_safe,
+        **_receive_progress_payload(row, view.status),
     }
 
 
@@ -755,7 +756,7 @@ def _registered_device_payloads_for_operator(
 
 def _receive_payloads_for_operator(
     engine: object, operator_username: str
-) -> list[dict[str, str | None | bool]]:
+) -> list[dict[str, object]]:
     factory = make_session_factory(engine)
     with factory() as session:
         rows = list(
@@ -770,7 +771,7 @@ def _receive_payloads_for_operator(
         )
         for row in rows:
             session.expunge(row)
-    payloads: list[dict[str, str | None | bool]] = []
+    payloads: list[dict[str, object]] = []
     for row in rows:
         view = intake_status(row)
         payloads.append(
@@ -780,9 +781,27 @@ def _receive_payloads_for_operator(
                 "cardId": row.card_id,
                 "status": view.status,
                 "releaseSafe": view.release_safe,
+                **_receive_progress_payload(row, view.status),
             }
         )
     return payloads
+
+
+def _receive_progress_payload(row: grpc_store.GrpcIntake, status: str) -> dict[str, object]:
+    """Return additive operator-console progress metadata for a durable receive."""
+
+    bytes_received = intake_receipt_bytes(row)
+    bytes_total = (
+        bytes_received
+        if bytes_received is not None
+        and status in {"verifying", "verified", "quarantined", "discrepancy"}
+        else None
+    )
+    return {
+        "destinationPath": str(intake_landing_path(row)),
+        "bytesReceived": bytes_received,
+        "bytesTotal": bytes_total,
+    }
 
 
 def _device_receive_hash(device_id: str, body: DeviceReceiveRequest, *, source_ref: str) -> str:
