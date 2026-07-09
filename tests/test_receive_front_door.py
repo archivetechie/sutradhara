@@ -99,6 +99,38 @@ def test_bagit_writer_round_trips_to_shared_reader_and_payload_oxum(tmp_path: Pa
     assert validation.valid is True
 
 
+def test_validate_bag_reports_payload_hash_progress(tmp_path: Path) -> None:
+    bag = tmp_path / "bag"
+    data = bag / "data"
+    data.mkdir(parents=True)
+    payload = b"hello progress"
+    (data / "clip.mov").write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    write_bagit_files(
+        bag,
+        entries={"clip.mov": digest},
+        metadata=bag_info_metadata(
+            intake_id="bag-progress",
+            source_kind="card",
+            operator="op",
+            source_ref="A001",
+            artifactclass="camera-original",
+            label="shoot",
+            started_at=dt.datetime(2026, 6, 18, tzinfo=dt.UTC),
+            file_count=1,
+            total_bytes=len(payload),
+            skipped_count=0,
+        ),
+    )
+    events: list[tuple[int, int]] = []
+
+    validation = validate_bag(bag, progress=lambda done, total: events.append((done, total)))
+
+    assert validation.valid is True
+    assert events[0] == (0, len(payload))
+    assert events[-1] == (len(payload), len(payload))
+
+
 def test_bagit_writer_uses_native_atomic_observer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

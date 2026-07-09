@@ -45,6 +45,7 @@ from sutradhara.grpc.registry import (
     StreamClosed,
 )
 from sutradhara.grpc.status import intake_landing_path, intake_receipt_summary, intake_status
+from sutradhara.verification_progress import read_verification_progress
 
 router = APIRouter()
 LOG = logging.getLogger(__name__)
@@ -835,10 +836,15 @@ def _receive_progress_payload(
             and status in {"verifying", "verified", "quarantined", "discrepancy"}
             else None
         )
+    verification = read_verification_progress(intake_landing_path(row))
     return {
         "destinationPath": str(intake_landing_path(row)),
         "bytesReceived": bytes_received,
         "bytesTotal": bytes_total,
+        "verificationBytesVerified": (
+            verification.bytes_verified if verification is not None else None
+        ),
+        "verificationBytesTotal": verification.bytes_total if verification is not None else None,
     }
 
 

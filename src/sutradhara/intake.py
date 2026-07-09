@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -79,6 +80,7 @@ IMAGE_EXTENSIONS = {
 DOCUMENT_EXTENSIONS = {".csv", ".doc", ".docx", ".json", ".pdf", ".txt", ".xml"}
 
 PayloadRecord = FileReceipt
+VerificationProgressSink = Callable[[int, int], None]
 
 
 @dataclass(frozen=True)
@@ -184,11 +186,16 @@ def inspect_landing_root(
     return [inspect_intake(session, path) for path in _iter_intake_dirs(landing_root)]
 
 
-def inspect_intake(session: Session, intake_dir: str | Path) -> InspectReport:
+def inspect_intake(
+    session: Session,
+    intake_dir: str | Path,
+    *,
+    verification_progress: VerificationProgressSink | None = None,
+) -> InspectReport:
     """Validate one intake directory and report readiness without mutating catalog rows."""
 
     ctx = _read_intake_context(intake_dir)
-    validated = _validate_payload(ctx)
+    validated = _validate_payload(ctx, verification_progress=verification_progress)
     existing = session.get(Intake, validated.intake_id)
     artifactclass = _optional_str(validated.metadata.get("artifactclass"))
     if existing is not None and existing.status == IntakeStatus.REGISTERED:
@@ -258,11 +265,12 @@ def register_intake(
     cache_root: str | Path | None = None,
     cloud_backend_name: str = "cloud-temp",
     cloud_pool_id: str = "cloud-temp",
+    verification_progress: VerificationProgressSink | None = None,
 ) -> IntakeRegisterOutcome:
     """Validate and explicitly admit one intake into the catalog."""
 
     ctx = _read_intake_context(intake_dir)
-    validated = _validate_payload(ctx)
+    validated = _validate_payload(ctx, verification_progress=verification_progress)
     resolved_class = _resolve_artifactclass(ctx, validated.metadata, artifactclass)
     metadata = {**validated.metadata, "artifactclass": resolved_class}
     existing = session.get(Intake, validated.intake_id)
@@ -428,6 +436,7 @@ def accept_intake(
     cache_root: str | Path | None = None,
     cloud_backend_name: str = "cloud-temp",
     cloud_pool_id: str = "cloud-temp",
+    verification_progress: VerificationProgressSink | None = None,
 ) -> IntakeRegisterOutcome:
     """Register one intake and optionally prepare it in the caller's transaction."""
 
@@ -438,6 +447,7 @@ def accept_intake(
         cache_root=cache_root,
         cloud_backend_name=cloud_backend_name,
         cloud_pool_id=cloud_pool_id,
+        verification_progress=verification_progress,
     )
     if prepare_profile is None or outcome.status != IntakeStatus.REGISTERED.value:
         return outcome
@@ -652,9 +662,13 @@ def _read_intake_context(intake_dir: str | Path) -> _IntakeContext:
     )
 
 
-def _validate_payload(ctx: _IntakeContext) -> _ValidatedPayload:
+def _validate_payload(
+    ctx: _IntakeContext,
+    *,
+    verification_progress: VerificationProgressSink | None = None,
+) -> _ValidatedPayload:
     if ctx.is_bag:
-        validation = validate_bag(ctx.root)
+        validation = validate_bag(ctx.root, progress=verification_progress)
         metadata = _intake_metadata_from_labels(validation.metadata, ctx.sentinel, ctx.root)
         digest = (
             _sha256_file(ctx.manifest_path)
@@ -670,7 +684,7 @@ def _validate_payload(ctx: _IntakeContext) -> _ValidatedPayload:
             manifest_digest=digest,
             details=validation.details(),
         )
-    records = _hash_payload(ctx.payload_root)
+    records = _hash_payload(ctx.payload_root, verification_progress=verification_progress)
     return _ValidatedPayload(
         intake_id=ctx.intake_id,
         metadata=ctx.metadata,
@@ -843,8 +857,12 @@ def _register_payload_record(
     return item
 
 
-def _hash_payload(payload_root: Path) -> list[PayloadRecord]:
-    return hash_payload_tree(payload_root)
+def _hash_payload(
+    payload_root: Path,
+    *,
+    verification_progress: VerificationProgressSink | None = None,
+) -> list[PayloadRecord]:
+    return hash_payload_tree(payload_root, progress=verification_progress)
 
 
 def _legacy_manifest_digest(records: list[PayloadRecord]) -> str:

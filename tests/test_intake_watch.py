@@ -15,6 +15,7 @@ from sutradhara.catalog.session import create_all, make_engine, make_session_fac
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.intake import register_intake
 from sutradhara.intake_watch import process_landing_once
+from sutradhara.verification_progress import read_verification_progress
 from sutradhara_receive import receive_source
 
 
@@ -45,6 +46,10 @@ def test_watch_once_registers_completed_receive(
 
     assert [event.event for event in events] == ["intake-registered"]
     assert (result.intake_dir / "intake.verified.json").is_file()
+    progress = read_verification_progress(result.intake_dir)
+    assert progress is not None
+    assert progress.state == "completed"
+    assert progress.bytes_verified == progress.bytes_total == 10
     with session_scope(engine) as session:
         intake = session.get(Intake, result.intake_id)
         assert intake is not None

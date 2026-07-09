@@ -29,6 +29,7 @@ from sutradhara.intake import (
     publish_intake_marker,
     register_intake,
 )
+from sutradhara.verification_progress import read_verification_progress, write_verification_progress
 from sutradhara_receive import (
     BAG_INFO_NAME,
     DATA_DIR_NAME,
@@ -46,6 +47,7 @@ TERMINAL_MARKERS = (
     "intake.discrepancy.json",
 )
 ROUTE_REGISTER_STATUSES = {"ready", "already-registered", "quarantined"}
+VERIFICATION_PROGRESS_PASSES = 2
 
 SleepFn = Callable[[float], None]
 EventSink = Callable[["WatchEvent"], None]
@@ -334,13 +336,16 @@ def _process_candidate(
         return WatchEvent(event="intake-skipped", path=candidate, status="skipped", reason="not-stable")
 
     try:
+        progress = _VerificationProgressWriter(candidate)
         inspection = _inspect_with_retries(
             candidate,
             session_factory=session_factory,
             validation_attempts=validation_attempts,
+            verification_progress=progress.for_pass(0),
         )
     except Exception as exc:
         _remember_error(candidate, state)
+        _write_verification_failed(candidate)
         return WatchEvent(
             event="intake-error",
             path=candidate,
@@ -358,6 +363,7 @@ def _process_candidate(
             cache_root=cache_root,
             cloud_backend_name=cloud_backend_name,
             cloud_pool_id=cloud_pool_id,
+            verification_progress=progress.for_pass(1),
         )
     if inspection.status == "incomplete":
         return WatchEvent(
@@ -378,6 +384,7 @@ def _process_candidate(
                 cache_root=cache_root,
                 cloud_backend_name=cloud_backend_name,
                 cloud_pool_id=cloud_pool_id,
+                verification_progress=progress.for_pass(1),
             )
         return WatchEvent(
             event="intake-validation-retry",
@@ -406,6 +413,7 @@ def _register_candidate(
     cache_root: Path,
     cloud_backend_name: str,
     cloud_pool_id: str,
+    verification_progress: Callable[[int, int], None] | None = None,
 ) -> WatchEvent:
     session = session_factory()
     try:
@@ -417,6 +425,7 @@ def _register_candidate(
                 cache_root=cache_root,
                 cloud_backend_name=cloud_backend_name,
                 cloud_pool_id=cloud_pool_id,
+                verification_progress=verification_progress,
             )
         else:
             outcome = accept_intake(
@@ -427,10 +436,12 @@ def _register_candidate(
                 cache_root=cache_root,
                 cloud_backend_name=cloud_backend_name,
                 cloud_pool_id=cloud_pool_id,
+                verification_progress=verification_progress,
             )
         session.commit()
     except IntakeDiscrepancyError as exc:
         session.rollback()
+        _write_verification_failed(candidate)
         publish_intake_marker(exc.marker)
         return WatchEvent(
             event="intake-discrepancy",
@@ -443,6 +454,7 @@ def _register_candidate(
         )
     except Exception as exc:
         session.rollback()
+        _write_verification_failed(candidate)
         return WatchEvent(
             event="intake-error",
             path=candidate,
@@ -454,6 +466,7 @@ def _register_candidate(
         session.close()
 
     publish_intake_marker(outcome.marker)
+    _write_verification_completed(candidate)
     if outcome.status == IntakeStatus.QUARANTINED.value:
         event_name = "intake-quarantined"
     elif outcome.reason == "already-registered":
@@ -478,13 +491,22 @@ def _inspect_with_retries(
     *,
     session_factory: sessionmaker[Session] | Callable[[], Session],
     validation_attempts: int,
+    verification_progress: Callable[[int, int], None] | None = None,
 ) -> InspectReport:
     attempts = max(1, validation_attempts)
-    report = _inspect_once(candidate, session_factory=session_factory)
+    report = _inspect_once(
+        candidate,
+        session_factory=session_factory,
+        verification_progress=verification_progress,
+    )
     for _ in range(1, attempts):
         if report.status not in {"incomplete", "invalid"}:
             break
-        report = _inspect_once(candidate, session_factory=session_factory)
+        report = _inspect_once(
+            candidate,
+            session_factory=session_factory,
+            verification_progress=verification_progress,
+        )
     return report
 
 
@@ -492,12 +514,68 @@ def _inspect_once(
     candidate: Path,
     *,
     session_factory: sessionmaker[Session] | Callable[[], Session],
+    verification_progress: Callable[[int, int], None] | None = None,
 ) -> InspectReport:
     session = session_factory()
     try:
-        return inspect_intake(session, candidate)
+        return inspect_intake(
+            session,
+            candidate,
+            verification_progress=verification_progress,
+        )
     finally:
         session.close()
+
+
+class _VerificationProgressWriter:
+    """Write cumulative verification bytes across watcher validation passes."""
+
+    def __init__(self, intake_dir: Path) -> None:
+        self.intake_dir = intake_dir
+
+    def for_pass(self, pass_index: int) -> Callable[[int, int], None]:
+        """Return a progress sink for one validation pass."""
+
+        def update(bytes_verified: int, bytes_total: int) -> None:
+            total = max(0, int(bytes_total))
+            cumulative_total = total * VERIFICATION_PROGRESS_PASSES
+            cumulative_verified = (pass_index * total) + max(0, int(bytes_verified))
+            write_verification_progress(
+                self.intake_dir,
+                state="running",
+                bytes_verified=cumulative_verified,
+                bytes_total=cumulative_total,
+            )
+
+        return update
+
+
+def _write_verification_completed(candidate: Path) -> None:
+    current = _read_progress_numbers(candidate)
+    total = current[1]
+    write_verification_progress(
+        candidate,
+        state="completed",
+        bytes_verified=total,
+        bytes_total=total,
+    )
+
+
+def _write_verification_failed(candidate: Path) -> None:
+    current = _read_progress_numbers(candidate)
+    write_verification_progress(
+        candidate,
+        state="failed",
+        bytes_verified=current[0],
+        bytes_total=current[1],
+    )
+
+
+def _read_progress_numbers(candidate: Path) -> tuple[int, int]:
+    progress = read_verification_progress(candidate)
+    if progress is None:
+        return (0, 0)
+    return (progress.bytes_verified, progress.bytes_total)
 
 
 def _candidate_dirs(landing_root: Path) -> list[Path]:

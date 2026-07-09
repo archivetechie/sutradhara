@@ -1018,11 +1018,12 @@ def hash_payload_tree(
     payload_root: Path | str,
     *,
     reject_native_packages: bool = False,
+    progress: Callable[[int, int], None] | None = None,
 ) -> list[FileReceipt]:
     """Hash a payload tree using the same canonical relpaths as receive."""
 
     root = Path(payload_root)
-    if _native is not None:
+    if _native is not None and progress is None:
         try:
             records = json.loads(
                 _native.hash_payload_tree_json(
@@ -1062,7 +1063,7 @@ def hash_payload_tree(
             )
         return receipts
 
-    receipts: list[FileReceipt] = []
+    entries: list[tuple[Path, str, os.stat_result]] = []
     for path in sorted(root.rglob("*")):
         relpath = canonicalize_filesystem_path(path, root)
         try:
@@ -1084,18 +1085,35 @@ def hash_payload_tree(
                 f"payload contains unsupported {_special_file_reason(stat_result.st_mode)}: "
                 f"{relpath}"
             )
+        entries.append((path, relpath, stat_result))
+
+    receipts: list[FileReceipt] = []
+    total_bytes = sum(max(0, int(stat_result.st_size)) for _, _, stat_result in entries)
+    verified_bytes = 0
+    if progress is not None:
+        progress(0, total_bytes)
+    for path, relpath, stat_result in entries:
+        file_size = max(0, int(stat_result.st_size))
+
+        def file_progress(file_bytes: int, *, base: int = verified_bytes) -> None:
+            if progress is not None:
+                progress(min(total_bytes, base + max(0, file_bytes)), total_bytes)
+
         receipts.append(
             FileReceipt(
                 source_path=path,
                 relpath=relpath,
                 destination_path=path,
-                sha256_hex=sha256_file(path),
+                sha256_hex=sha256_file(path, progress=file_progress if progress else None),
                 size_bytes=stat_result.st_size,
                 st_dev=getattr(stat_result, "st_dev", None),
                 st_ino=getattr(stat_result, "st_ino", None),
                 copied=False,
             )
         )
+        verified_bytes += file_size
+        if progress is not None:
+            progress(min(total_bytes, verified_bytes), total_bytes)
     return receipts
 
 
@@ -1334,7 +1352,11 @@ def tagmanifest_text(bag_root: Path | str, tag_files: Iterable[str]) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def validate_bag(bag_root: Path | str) -> BagValidationResult:
+def validate_bag(
+    bag_root: Path | str,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> BagValidationResult:
     """Validate BagIt completeness and checksum validity for an intake bag."""
 
     root = Path(bag_root)
@@ -1347,7 +1369,13 @@ def validate_bag(bag_root: Path | str) -> BagValidationResult:
         errors.append(f"complete: missing {DATA_DIR_NAME}/ directory")
     else:
         try:
-            actual_records = tuple(hash_payload_tree(data_root, reject_native_packages=True))
+            actual_records = tuple(
+                hash_payload_tree(
+                    data_root,
+                    reject_native_packages=True,
+                    progress=progress,
+                )
+            )
         except ReceiveError as exc:
             errors.append(f"complete: cannot hash {DATA_DIR_NAME}/: {exc}")
     actual = {record.relpath: record.sha256_hex for record in actual_records}
@@ -1694,19 +1722,29 @@ def slug_operator(operator: str) -> str:
     return slug or "operator"
 
 
-def sha256_file(path: Path | str) -> str:
+def sha256_file(
+    path: Path | str,
+    *,
+    progress: Callable[[int], None] | None = None,
+) -> str:
     """Return a file's SHA-256 digest without loading it into memory."""
 
-    if _native is not None:
+    if _native is not None and progress is None:
         try:
             return str(_native.sha256_file(Path(path)))
         except RuntimeError as exc:
             raise ReceiveError(str(exc)) from exc
 
     digest = hashlib.sha256()
+    checked = 0
+    if progress is not None:
+        progress(0)
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(_COPY_BUFFER_BYTES), b""):
             digest.update(chunk)
+            checked += len(chunk)
+            if progress is not None:
+                progress(checked)
     return digest.hexdigest()
 
 

@@ -17,6 +17,7 @@ from sutradhara.grpc import store as grpc_store
 from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.registry import Card, CommandAck, ConnectedDeviceRegistry, StreamClosed
 from sutradhara.grpc.store import DeviceIdentity
+from sutradhara.verification_progress import write_verification_progress
 from tests.api.conftest import make_api_app, post_headers
 
 
@@ -117,6 +118,8 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
             "destinationPath": str(tmp_path / "intake-1"),
             "bytesReceived": None,
             "bytesTotal": None,
+            "verificationBytesVerified": None,
+            "verificationBytesTotal": None,
         }
     ]
 
@@ -159,6 +162,8 @@ def test_streaming_receive_reports_live_byte_progress(
         "destinationPath": str(tmp_path / "intake-streaming"),
         "bytesReceived": 25,
         "bytesTotal": 100,
+        "verificationBytesVerified": None,
+        "verificationBytesTotal": None,
     }
     assert devices.status_code == 200
     assert devices.json()["receives"] == [
@@ -221,6 +226,12 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
         )
         grpc_store.set_committed_digest(session, "intake-committed", "b" * 64)
     _write_receipts(tmp_path, "intake-committed", [5, 7])
+    write_verification_progress(
+        tmp_path / "intake-committed",
+        state="running",
+        bytes_verified=6,
+        bytes_total=24,
+    )
 
     app = make_api_app(api_engine)
     app.state.registry = registry
@@ -240,6 +251,8 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
             "destinationPath": str(tmp_path / "intake-committed"),
             "bytesReceived": 12,
             "bytesTotal": 12,
+            "verificationBytesVerified": 6,
+            "verificationBytesTotal": 24,
         }
     ]
     assert status.status_code == 200
@@ -251,6 +264,8 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
         "destinationPath": str(tmp_path / "intake-committed"),
         "bytesReceived": 12,
         "bytesTotal": 12,
+        "verificationBytesVerified": 6,
+        "verificationBytesTotal": 24,
     }
 
 
@@ -682,6 +697,8 @@ def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path
         "destinationPath": str(tmp_path / "intake-1"),
         "bytesReceived": None,
         "bytesTotal": None,
+        "verificationBytesVerified": None,
+        "verificationBytesTotal": None,
     }
 
 
