@@ -55,20 +55,37 @@ def intake_landing_path(row: grpc_store.GrpcIntake) -> Path:
 def intake_receipt_bytes(row: grpc_store.GrpcIntake) -> int | None:
     """Return bytes copied to the landing receipt ledger, if the ledger is readable."""
 
+    summary = intake_receipt_summary(row)
+    return None if summary is None else summary.bytes_total
+
+
+@dataclass(frozen=True)
+class IntakeReceiptSummary:
+    """Summary of durable file receipts already appended by the server."""
+
+    bytes_total: int
+    relpaths: frozenset[str]
+
+
+def intake_receipt_summary(row: grpc_store.GrpcIntake) -> IntakeReceiptSummary | None:
+    """Return copied bytes and relpaths from the landing receipt ledger."""
+
     intake_dir = intake_landing_path(row)
     path = intake_dir / RECEIPTS_NAME
     if not path.exists():
         return None
     total = 0
+    relpaths: set[str] = set()
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line:
                 continue
             payload = json.loads(line)
+            relpaths.add(str(payload["relpath"]))
             total += int(payload["bytes"])
     except Exception:
         return None
-    return total
+    return IntakeReceiptSummary(bytes_total=total, relpaths=frozenset(relpaths))
 
 
 def release_safe_for_status(row: grpc_store.GrpcIntake, status: str) -> bool:

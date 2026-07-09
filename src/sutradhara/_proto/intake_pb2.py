@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0cintake.proto\x12\x11sutradhara.intake\"\x98\x01\n\x12StartIntakeRequest\x12\x17\n\x0fidempotency_key\x18\x01 \x01(\t\x12\x15\n\rartifactclass\x18\x02 \x01(\t\x12\x13\n\x0bsource_kind\x18\x03 \x01(\t\x12\x12\n\nsource_ref\x18\x04 \x01(\t\x12\r\n\x05label\x18\x05 \x01(\t\x12\x1a\n\x12source_plan_digest\x18\x06 \x01(\t\"(\n\x13StartIntakeResponse\x12\x11\n\tintake_id\x18\x01 \x01(\t\"q\n\tFileChunk\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12\x0f\n\x07relpath\x18\x02 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x03 \x01(\x0c\x12\x0e\n\x06offset\x18\x04 \x01(\x03\x12\x0f\n\x07is_last\x18\x05 \x01(\x08\x12\x11\n\tfile_size\x18\x06 \x01(\x03\"M\n\x0b\x46ileReceipt\x12\x0f\n\x07relpath\x18\x01 \x01(\t\x12\x15\n\rserver_sha256\x18\x02 \x01(\t\x12\x16\n\x0ereceived_bytes\x18\x03 \x01(\x03\"+\n\x16ListIntakeFilesRequest\x12\x11\n\tintake_id\x18\x01 \x01(\t\"G\n\x17ListIntakeFilesResponse\x12,\n\x05\x66iles\x18\x01 \x03(\x0b\x32\x1d.sutradhara.intake.FileRecord\"C\n\nFileRecord\x12\x0f\n\x07relpath\x18\x01 \x01(\t\x12\x15\n\rserver_sha256\x18\x02 \x01(\t\x12\r\n\x05\x62ytes\x18\x03 \x01(\x03\"\xe4\x01\n\x13\x43ommitIntakeRequest\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12/\n\x05\x66iles\x18\x02 \x03(\x0b\x32 .sutradhara.intake.ManifestEntry\x12\x36\n\rreceive_facts\x18\x03 \x01(\x0b\x32\x1f.sutradhara.intake.ReceiveFacts\x12\x38\n\x0fpackage_indexes\x18\x04 \x03(\x0b\x32\x1f.sutradhara.intake.PackageIndex\x12\x17\n\x0fmanifest_digest\x18\x05 \x01(\t\"F\n\rManifestEntry\x12\x0f\n\x07relpath\x18\x01 \x01(\t\x12\x15\n\rclient_sha256\x18\x02 \x01(\t\x12\r\n\x05\x62ytes\x18\x03 \x01(\x03\"h\n\x0cReceiveFacts\x12 \n\x18\x63\x61nonicalization_version\x18\x01 \x01(\t\x12\x15\n\rskipped_count\x18\x02 \x01(\x03\x12\x1f\n\x17package_profile_version\x18\x03 \x01(\t\"\x8f\x01\n\x0cPackageIndex\x12\x1b\n\x13logical_member_path\x18\x01 \x01(\t\x12\x1a\n\x12stored_member_path\x18\x02 \x01(\t\x12\x0e\n\x06sha256\x18\x03 \x01(\t\x12\x36\n\x07members\x18\x04 \x03(\x0b\x32%.sutradhara.intake.PackageMemberEntry\"\xb0\x01\n\x12PackageMemberEntry\x12\x0e\n\x06member\x18\x01 \x01(\t\x12\x0c\n\x04type\x18\x02 \x01(\t\x12\x0e\n\x06length\x18\x03 \x01(\x03\x12\x13\n\x06sha256\x18\x04 \x01(\tH\x00\x88\x01\x01\x12\x18\n\x0b\x64\x61ta_offset\x18\x05 \x01(\x03H\x01\x88\x01\x01\x12\x15\n\x08linkname\x18\x06 \x01(\tH\x02\x88\x01\x01\x42\t\n\x07_sha256B\x0e\n\x0c_data_offsetB\x0b\n\t_linkname\"T\n\x14\x43ommitIntakeResponse\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x19\n\x11reupload_relpaths\x18\x03 \x03(\t\"(\n\x13IntakeStatusRequest\x12\x11\n\tintake_id\x18\x01 \x01(\t\"I\n\x14IntakeStatusResponse\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x0e\n\x06\x65rrors\x18\x03 \x03(\t\"\'\n\x12\x41\x62ortIntakeRequest\x12\x11\n\tintake_id\x18\x01 \x01(\t\"8\n\x13\x41\x62ortIntakeResponse\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t2\xc8\x04\n\rIntakeService\x12\\\n\x0bStartIntake\x12%.sutradhara.intake.StartIntakeRequest\x1a&.sutradhara.intake.StartIntakeResponse\x12L\n\nUploadFile\x12\x1c.sutradhara.intake.FileChunk\x1a\x1e.sutradhara.intake.FileReceipt(\x01\x12h\n\x0fListIntakeFiles\x12).sutradhara.intake.ListIntakeFilesRequest\x1a*.sutradhara.intake.ListIntakeFilesResponse\x12_\n\x0c\x43ommitIntake\x12&.sutradhara.intake.CommitIntakeRequest\x1a\'.sutradhara.intake.CommitIntakeResponse\x12\x62\n\x0fGetIntakeStatus\x12&.sutradhara.intake.IntakeStatusRequest\x1a\'.sutradhara.intake.IntakeStatusResponse\x12\\\n\x0b\x41\x62ortIntake\x12%.sutradhara.intake.AbortIntakeRequest\x1a&.sutradhara.intake.AbortIntakeResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0cintake.proto\x12\x11sutradhara.intake\"\xb5\x01\n\x12StartIntakeRequest\x12\x17\n\x0fidempotency_key\x18\x01 \x01(\t\x12\x15\n\rartifactclass\x18\x02 \x01(\t\x12\x13\n\x0bsource_kind\x18\x03 \x01(\t\x12\x12\n\nsource_ref\x18\x04 \x01(\t\x12\r\n\x05label\x18\x05 \x01(\t\x12\x1a\n\x12source_plan_digest\x18\x06 \x01(\t\x12\x1b\n\x13planned_bytes_total\x18\x07 \x01(\x03\"(\n\x13StartIntakeResponse\x12\x11\n\tintake_id\x18\x01 \x01(\t\"q\n\tFileChunk\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12\x0f\n\x07relpath\x18\x02 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x03 \x01(\x0c\x12\x0e\n\x06offset\x18\x04 \x01(\x03\x12\x0f\n\x07is_last\x18\x05 \x01(\x08\x12\x11\n\tfile_size\x18\x06 \x01(\x03\"M\n\x0b\x46ileReceipt\x12\x0f\n\x07relpath\x18\x01 \x01(\t\x12\x15\n\rserver_sha256\x18\x02 \x01(\t\x12\x16\n\x0ereceived_bytes\x18\x03 \x01(\x03\"+\n\x16ListIntakeFilesRequest\x12\x11\n\tintake_id\x18\x01 \x01(\t\"G\n\x17ListIntakeFilesResponse\x12,\n\x05\x66iles\x18\x01 \x03(\x0b\x32\x1d.sutradhara.intake.FileRecord\"C\n\nFileRecord\x12\x0f\n\x07relpath\x18\x01 \x01(\t\x12\x15\n\rserver_sha256\x18\x02 \x01(\t\x12\r\n\x05\x62ytes\x18\x03 \x01(\x03\"\xe4\x01\n\x13\x43ommitIntakeRequest\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12/\n\x05\x66iles\x18\x02 \x03(\x0b\x32 .sutradhara.intake.ManifestEntry\x12\x36\n\rreceive_facts\x18\x03 \x01(\x0b\x32\x1f.sutradhara.intake.ReceiveFacts\x12\x38\n\x0fpackage_indexes\x18\x04 \x03(\x0b\x32\x1f.sutradhara.intake.PackageIndex\x12\x17\n\x0fmanifest_digest\x18\x05 \x01(\t\"F\n\rManifestEntry\x12\x0f\n\x07relpath\x18\x01 \x01(\t\x12\x15\n\rclient_sha256\x18\x02 \x01(\t\x12\r\n\x05\x62ytes\x18\x03 \x01(\x03\"h\n\x0cReceiveFacts\x12 \n\x18\x63\x61nonicalization_version\x18\x01 \x01(\t\x12\x15\n\rskipped_count\x18\x02 \x01(\x03\x12\x1f\n\x17package_profile_version\x18\x03 \x01(\t\"\x8f\x01\n\x0cPackageIndex\x12\x1b\n\x13logical_member_path\x18\x01 \x01(\t\x12\x1a\n\x12stored_member_path\x18\x02 \x01(\t\x12\x0e\n\x06sha256\x18\x03 \x01(\t\x12\x36\n\x07members\x18\x04 \x03(\x0b\x32%.sutradhara.intake.PackageMemberEntry\"\xb0\x01\n\x12PackageMemberEntry\x12\x0e\n\x06member\x18\x01 \x01(\t\x12\x0c\n\x04type\x18\x02 \x01(\t\x12\x0e\n\x06length\x18\x03 \x01(\x03\x12\x13\n\x06sha256\x18\x04 \x01(\tH\x00\x88\x01\x01\x12\x18\n\x0b\x64\x61ta_offset\x18\x05 \x01(\x03H\x01\x88\x01\x01\x12\x15\n\x08linkname\x18\x06 \x01(\tH\x02\x88\x01\x01\x42\t\n\x07_sha256B\x0e\n\x0c_data_offsetB\x0b\n\t_linkname\"T\n\x14\x43ommitIntakeResponse\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x19\n\x11reupload_relpaths\x18\x03 \x03(\t\"(\n\x13IntakeStatusRequest\x12\x11\n\tintake_id\x18\x01 \x01(\t\"I\n\x14IntakeStatusResponse\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x0e\n\x06\x65rrors\x18\x03 \x03(\t\"\'\n\x12\x41\x62ortIntakeRequest\x12\x11\n\tintake_id\x18\x01 \x01(\t\"8\n\x13\x41\x62ortIntakeResponse\x12\x11\n\tintake_id\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t2\xc8\x04\n\rIntakeService\x12\\\n\x0bStartIntake\x12%.sutradhara.intake.StartIntakeRequest\x1a&.sutradhara.intake.StartIntakeResponse\x12L\n\nUploadFile\x12\x1c.sutradhara.intake.FileChunk\x1a\x1e.sutradhara.intake.FileReceipt(\x01\x12h\n\x0fListIntakeFiles\x12).sutradhara.intake.ListIntakeFilesRequest\x1a*.sutradhara.intake.ListIntakeFilesResponse\x12_\n\x0c\x43ommitIntake\x12&.sutradhara.intake.CommitIntakeRequest\x1a\'.sutradhara.intake.CommitIntakeResponse\x12\x62\n\x0fGetIntakeStatus\x12&.sutradhara.intake.IntakeStatusRequest\x1a\'.sutradhara.intake.IntakeStatusResponse\x12\\\n\x0b\x41\x62ortIntake\x12%.sutradhara.intake.AbortIntakeRequest\x1a&.sutradhara.intake.AbortIntakeResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,39 +32,39 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'intake_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_STARTINTAKEREQUEST']._serialized_start=36
-  _globals['_STARTINTAKEREQUEST']._serialized_end=188
-  _globals['_STARTINTAKERESPONSE']._serialized_start=190
-  _globals['_STARTINTAKERESPONSE']._serialized_end=230
-  _globals['_FILECHUNK']._serialized_start=232
-  _globals['_FILECHUNK']._serialized_end=345
-  _globals['_FILERECEIPT']._serialized_start=347
-  _globals['_FILERECEIPT']._serialized_end=424
-  _globals['_LISTINTAKEFILESREQUEST']._serialized_start=426
-  _globals['_LISTINTAKEFILESREQUEST']._serialized_end=469
-  _globals['_LISTINTAKEFILESRESPONSE']._serialized_start=471
-  _globals['_LISTINTAKEFILESRESPONSE']._serialized_end=542
-  _globals['_FILERECORD']._serialized_start=544
-  _globals['_FILERECORD']._serialized_end=611
-  _globals['_COMMITINTAKEREQUEST']._serialized_start=614
-  _globals['_COMMITINTAKEREQUEST']._serialized_end=842
-  _globals['_MANIFESTENTRY']._serialized_start=844
-  _globals['_MANIFESTENTRY']._serialized_end=914
-  _globals['_RECEIVEFACTS']._serialized_start=916
-  _globals['_RECEIVEFACTS']._serialized_end=1020
-  _globals['_PACKAGEINDEX']._serialized_start=1023
-  _globals['_PACKAGEINDEX']._serialized_end=1166
-  _globals['_PACKAGEMEMBERENTRY']._serialized_start=1169
-  _globals['_PACKAGEMEMBERENTRY']._serialized_end=1345
-  _globals['_COMMITINTAKERESPONSE']._serialized_start=1347
-  _globals['_COMMITINTAKERESPONSE']._serialized_end=1431
-  _globals['_INTAKESTATUSREQUEST']._serialized_start=1433
-  _globals['_INTAKESTATUSREQUEST']._serialized_end=1473
-  _globals['_INTAKESTATUSRESPONSE']._serialized_start=1475
-  _globals['_INTAKESTATUSRESPONSE']._serialized_end=1548
-  _globals['_ABORTINTAKEREQUEST']._serialized_start=1550
-  _globals['_ABORTINTAKEREQUEST']._serialized_end=1589
-  _globals['_ABORTINTAKERESPONSE']._serialized_start=1591
-  _globals['_ABORTINTAKERESPONSE']._serialized_end=1647
-  _globals['_INTAKESERVICE']._serialized_start=1650
-  _globals['_INTAKESERVICE']._serialized_end=2234
+  _globals['_STARTINTAKEREQUEST']._serialized_end=217
+  _globals['_STARTINTAKERESPONSE']._serialized_start=219
+  _globals['_STARTINTAKERESPONSE']._serialized_end=259
+  _globals['_FILECHUNK']._serialized_start=261
+  _globals['_FILECHUNK']._serialized_end=374
+  _globals['_FILERECEIPT']._serialized_start=376
+  _globals['_FILERECEIPT']._serialized_end=453
+  _globals['_LISTINTAKEFILESREQUEST']._serialized_start=455
+  _globals['_LISTINTAKEFILESREQUEST']._serialized_end=498
+  _globals['_LISTINTAKEFILESRESPONSE']._serialized_start=500
+  _globals['_LISTINTAKEFILESRESPONSE']._serialized_end=571
+  _globals['_FILERECORD']._serialized_start=573
+  _globals['_FILERECORD']._serialized_end=640
+  _globals['_COMMITINTAKEREQUEST']._serialized_start=643
+  _globals['_COMMITINTAKEREQUEST']._serialized_end=871
+  _globals['_MANIFESTENTRY']._serialized_start=873
+  _globals['_MANIFESTENTRY']._serialized_end=943
+  _globals['_RECEIVEFACTS']._serialized_start=945
+  _globals['_RECEIVEFACTS']._serialized_end=1049
+  _globals['_PACKAGEINDEX']._serialized_start=1052
+  _globals['_PACKAGEINDEX']._serialized_end=1195
+  _globals['_PACKAGEMEMBERENTRY']._serialized_start=1198
+  _globals['_PACKAGEMEMBERENTRY']._serialized_end=1374
+  _globals['_COMMITINTAKERESPONSE']._serialized_start=1376
+  _globals['_COMMITINTAKERESPONSE']._serialized_end=1460
+  _globals['_INTAKESTATUSREQUEST']._serialized_start=1462
+  _globals['_INTAKESTATUSREQUEST']._serialized_end=1502
+  _globals['_INTAKESTATUSRESPONSE']._serialized_start=1504
+  _globals['_INTAKESTATUSRESPONSE']._serialized_end=1577
+  _globals['_ABORTINTAKEREQUEST']._serialized_start=1579
+  _globals['_ABORTINTAKEREQUEST']._serialized_end=1618
+  _globals['_ABORTINTAKERESPONSE']._serialized_start=1620
+  _globals['_ABORTINTAKERESPONSE']._serialized_end=1676
+  _globals['_INTAKESERVICE']._serialized_start=1679
+  _globals['_INTAKESERVICE']._serialized_end=2263
 # @@protoc_insertion_point(module_scope)

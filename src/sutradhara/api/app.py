@@ -39,6 +39,7 @@ def create_app(
     ensure_schema: bool = True,
     registry: object | None = None,
     grpc_pki_dir: object | None = None,
+    grpc_progress_registry: object | None = None,
 ) -> FastAPI:
     """Create the HTTP API with catalog-backed state and strict edge assumptions."""
 
@@ -51,6 +52,8 @@ def create_app(
         app.state.registry = registry
     if grpc_pki_dir is not None:
         app.state.grpc_pki_dir = grpc_pki_dir
+    if grpc_progress_registry is not None:
+        app.state.grpc_progress_registry = grpc_progress_registry
     agent_bundle = _load_agent_bundle_config_from_env()
     if agent_bundle is not None:
         app.state.agent_bundle = agent_bundle

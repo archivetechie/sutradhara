@@ -16,6 +16,7 @@ from sqlalchemy import Engine
 from sutradhara._proto import device_pb2_grpc, intake_pb2_grpc
 from sutradhara.grpc.ca import load_server_credentials
 from sutradhara.grpc.device_service import DeviceService, DeviceServiceConfig
+from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.registry import ConnectedDeviceRegistry
 from sutradhara.grpc.servicer import GrpcIntakeConfig, IntakeServicer
 from sutradhara_receive import sweep_orphans
@@ -37,6 +38,7 @@ class GrpcServerConfig:
     port: int = DEFAULT_GRPC_PORT
     validate_artifactclass: bool = True
     registry: ConnectedDeviceRegistry | None = None
+    progress_registry: ReceiveProgressRegistry | None = None
 
 
 def make_server(config: GrpcServerConfig) -> grpc.Server:
@@ -45,6 +47,7 @@ def make_server(config: GrpcServerConfig) -> grpc.Server:
     validate_bind_address(config.bind)
     ca_cert, server_cert, server_key = load_server_credentials(config.pki_dir)
     registry = config.registry or ConnectedDeviceRegistry()
+    progress_registry = config.progress_registry or ReceiveProgressRegistry()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     intake_pb2_grpc.add_IntakeServiceServicer_to_server(
         IntakeServicer(
@@ -52,6 +55,7 @@ def make_server(config: GrpcServerConfig) -> grpc.Server:
                 engine=config.engine,
                 landing_root=config.landing_root,
                 validate_artifactclass=config.validate_artifactclass,
+                progress_registry=progress_registry,
             )
         ),
         server,

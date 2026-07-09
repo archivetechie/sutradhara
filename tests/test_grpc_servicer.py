@@ -17,6 +17,7 @@ from sutradhara.catalog.models import Intake
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.grpc import store
 from sutradhara.grpc.assembly import manifest_digest
+from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.server import sweep_landing_once, validate_bind_address
 from sutradhara.grpc.servicer import GrpcIntakeConfig, IntakeServicer
 from sutradhara.intake_watch import process_landing_once
@@ -47,8 +48,15 @@ def test_servicer_start_upload_commit_watch_and_owner_check(engine: Engine, tmp_
             operator="other",
         )
     landing = tmp_path / "landing"
+    payload = b"video"
+    progress_registry = ReceiveProgressRegistry()
     servicer = IntakeServicer(
-        GrpcIntakeConfig(engine=engine, landing_root=landing, validate_artifactclass=False)
+        GrpcIntakeConfig(
+            engine=engine,
+            landing_root=landing,
+            validate_artifactclass=False,
+            progress_registry=progress_registry,
+        )
     )
     context = _FakeContext("mac-1", fingerprint)
 
@@ -60,6 +68,7 @@ def test_servicer_start_upload_commit_watch_and_owner_check(engine: Engine, tmp_
             source_ref="card-a",
             label="Card A",
             source_plan_digest="a" * 64,
+            planned_bytes_total=len(payload),
         ),
         context,
     )
@@ -71,6 +80,7 @@ def test_servicer_start_upload_commit_watch_and_owner_check(engine: Engine, tmp_
             source_ref="card-a",
             label="Card A",
             source_plan_digest="a" * 64,
+            planned_bytes_total=len(payload),
         ),
         context,
     )
@@ -102,7 +112,6 @@ def test_servicer_start_upload_commit_watch_and_owner_check(engine: Engine, tmp_
     assert changed_source.value.code == grpc.StatusCode.FAILED_PRECONDITION
     assert "source changed" in changed_source.value.details
 
-    payload = b"video"
     receipt = servicer.UploadFile(
         iter(
             [
@@ -125,6 +134,10 @@ def test_servicer_start_upload_commit_watch_and_owner_check(engine: Engine, tmp_
         context,
     )
     assert receipt.server_sha256 == hashlib.sha256(payload).hexdigest()
+    progress = progress_registry.snapshot(start.intake_id)
+    assert progress is not None
+    assert progress.bytes_received == len(payload)
+    assert progress.bytes_total == len(payload)
     leftover = landing / start.intake_id / ".incoming" / "crash.tmp"
     leftover.write_bytes(b"partial")
     listed = servicer.ListIntakeFiles(
@@ -161,6 +174,7 @@ def test_servicer_start_upload_commit_watch_and_owner_check(engine: Engine, tmp_
         context,
     )
     assert commit.status == "verifying"
+    assert progress_registry.snapshot(start.intake_id) is None
     assert not (landing / start.intake_id / ".receiving.json").exists()
     assert servicer.GetIntakeStatus(
         intake_pb2.IntakeStatusRequest(intake_id=start.intake_id),

@@ -30,6 +30,7 @@ from sutradhara.catalog.session import make_session_factory
 from sutradhara.grpc import assembly
 from sutradhara.grpc import ca as grpc_ca
 from sutradhara.grpc import store as grpc_store
+from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.status import intake_status
 from sutradhara_receive import (
     CANONICALIZATION_VERSION,
@@ -48,6 +49,7 @@ class GrpcIntakeConfig:
     engine: Engine
     landing_root: Path
     validate_artifactclass: bool = True
+    progress_registry: ReceiveProgressRegistry | None = None
 
 
 @dataclass
@@ -62,6 +64,7 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
 
     def __init__(self, config: GrpcIntakeConfig) -> None:
         self.config = config
+        self.progress_registry = config.progress_registry or ReceiveProgressRegistry()
         self._runtime: dict[str, _RuntimeState] = {}
         self._runtime_lock = threading.Lock()
 
@@ -80,6 +83,10 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             response = decision.response_json or {}
             intake_id = str(response.get("intake_id", ""))
             self._assert_resume_source_plan(intake_id, identity, request.source_plan_digest, context)
+            self.progress_registry.start(
+                intake_id,
+                planned_bytes_total=_planned_bytes_total(request),
+            )
             return intake_pb2.StartIntakeResponse(intake_id=intake_id)
         if decision.state == "conflict":
             self._abort_if_resume_source_changed(request, identity, context)
@@ -134,6 +141,10 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                 idempotency_key=request.idempotency_key,
                 intake_id=intake_id,
                 response_json={"intake_id": intake_id},
+            )
+            self.progress_registry.start(
+                intake_id,
+                planned_bytes_total=_planned_bytes_total(request),
             )
         except Exception:
             api_store.abandon_idempotency(
@@ -233,6 +244,7 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             grpc_store.set_committed_digest(session, row.intake_id, request.manifest_digest)
         (_intake_dir(row) / ".receiving.json").unlink(missing_ok=True)
         _fsync_dir(_intake_dir(row))
+        self.progress_registry.discard(row.intake_id)
         return intake_pb2.CommitIntakeResponse(intake_id=row.intake_id, status="verifying")
 
     def GetIntakeStatus(self, request: Any, context: Any) -> Any:
@@ -261,6 +273,7 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                 endpoint=grpc_store.GRPC_START_ENDPOINT,
                 idempotency_key=row.idempotency_key,
             )
+        self.progress_registry.discard(row.intake_id)
         return intake_pb2.AbortIntakeResponse(intake_id=row.intake_id, status="aborted")
 
     def _receive_file(
@@ -279,18 +292,33 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
         destination = safe_payload_path(intake_dir / DATA_DIR_NAME, relpath)
         digest = hashlib.sha256()
         received = 0
+        total = max(0, int(first.file_size))
         last_seen = False
+        self.progress_registry.update_file(
+            row.intake_id,
+            relpath=relpath,
+            bytes_received=0,
+            bytes_total=total,
+        )
         try:
             with temp_path.open("xb") as handle:
                 for chunk in itertools.chain((first,), iterator):
                     if chunk.intake_id != row.intake_id or chunk.relpath != relpath:
                         _abort(context, grpc.StatusCode.INVALID_ARGUMENT, "chunk identity changed")
+                    if chunk.file_size > 0:
+                        total = max(total, int(chunk.file_size))
                     if chunk.data:
                         if chunk.offset != received:
                             _abort(context, grpc.StatusCode.INVALID_ARGUMENT, "unexpected chunk offset")
                         digest.update(chunk.data)
                         handle.write(chunk.data)
                         received += len(chunk.data)
+                        self.progress_registry.update_file(
+                            row.intake_id,
+                            relpath=relpath,
+                            bytes_received=received,
+                            bytes_total=total,
+                        )
                     if chunk.is_last:
                         last_seen = True
                         break
@@ -302,6 +330,12 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             temp_path.replace(destination)
             _fsync_dir(destination.parent)
             server_sha = digest.hexdigest()
+            self.progress_registry.update_file(
+                row.intake_id,
+                relpath=relpath,
+                bytes_received=received,
+                bytes_total=max(total, received),
+            )
             with runtime.ledger_lock:
                 _append_receipt(intake_dir, relpath=relpath, digest=server_sha, size=received)
             return intake_pb2.FileReceipt(
@@ -489,6 +523,11 @@ def _reupload_relpaths(
 
 def _intake_dir(row: grpc_store.GrpcIntake) -> Path:
     return Path(row.landing_root) / row.intake_id
+
+
+def _planned_bytes_total(request: Any) -> int | None:
+    value = int(getattr(request, "planned_bytes_total", 0) or 0)
+    return value if value > 0 else None
 
 
 def _mint_intake_id(operator: str, now: dt.datetime, landing_root: Path) -> str:

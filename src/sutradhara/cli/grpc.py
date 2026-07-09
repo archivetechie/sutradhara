@@ -9,6 +9,7 @@ import click
 from sutradhara.catalog.session import create_all, make_engine, make_session_factory
 from sutradhara.grpc import ca
 from sutradhara.grpc.admin import revoke_device as revoke_device_admin
+from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.registry import ConnectedDeviceRegistry
 from sutradhara.grpc.server import (
     DEFAULT_GRPC_PORT,
@@ -102,6 +103,7 @@ def serve_grpc_cmd(
         return
 
     registry = ConnectedDeviceRegistry()
+    progress_registry = ReceiveProgressRegistry()
     landing_root.mkdir(parents=True, exist_ok=True)
     server = make_server(
         GrpcServerConfig(
@@ -112,6 +114,7 @@ def serve_grpc_cmd(
             port=port,
             validate_artifactclass=not skip_artifactclass_validation,
             registry=registry,
+            progress_registry=progress_registry,
         )
     )
     server.start()

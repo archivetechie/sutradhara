@@ -7,20 +7,22 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class StartIntakeRequest(_message.Message):
-    __slots__ = ("idempotency_key", "artifactclass", "source_kind", "source_ref", "label", "source_plan_digest")
+    __slots__ = ("idempotency_key", "artifactclass", "source_kind", "source_ref", "label", "source_plan_digest", "planned_bytes_total")
     IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
     ARTIFACTCLASS_FIELD_NUMBER: _ClassVar[int]
     SOURCE_KIND_FIELD_NUMBER: _ClassVar[int]
     SOURCE_REF_FIELD_NUMBER: _ClassVar[int]
     LABEL_FIELD_NUMBER: _ClassVar[int]
     SOURCE_PLAN_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    PLANNED_BYTES_TOTAL_FIELD_NUMBER: _ClassVar[int]
     idempotency_key: str
     artifactclass: str
     source_kind: str
     source_ref: str
     label: str
     source_plan_digest: str
-    def __init__(self, idempotency_key: _Optional[str] = ..., artifactclass: _Optional[str] = ..., source_kind: _Optional[str] = ..., source_ref: _Optional[str] = ..., label: _Optional[str] = ..., source_plan_digest: _Optional[str] = ...) -> None: ...
+    planned_bytes_total: int
+    def __init__(self, idempotency_key: _Optional[str] = ..., artifactclass: _Optional[str] = ..., source_kind: _Optional[str] = ..., source_ref: _Optional[str] = ..., label: _Optional[str] = ..., source_plan_digest: _Optional[str] = ..., planned_bytes_total: _Optional[int] = ...) -> None: ...
 
 class StartIntakeResponse(_message.Message):
     __slots__ = ("intake_id",)

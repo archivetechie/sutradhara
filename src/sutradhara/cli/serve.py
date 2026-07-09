@@ -22,6 +22,7 @@ from sutradhara.cli.api import (
     validate_tcp_host,
 )
 from sutradhara.grpc import ca
+from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.registry import ConnectedDeviceRegistry
 from sutradhara.grpc.server import (
     DEFAULT_GRPC_PORT,
@@ -81,6 +82,7 @@ def serve_cmd(
     engine = make_engine()
     create_all(engine)
     registry = ConnectedDeviceRegistry()
+    progress_registry = ReceiveProgressRegistry()
     landing_root.mkdir(parents=True, exist_ok=True)
 
     grpc_server = make_server(
@@ -92,9 +94,16 @@ def serve_cmd(
             port=grpc_port,
             validate_artifactclass=not skip_artifactclass_validation,
             registry=registry,
+            progress_registry=progress_registry,
         )
     )
-    app = create_app(engine, ensure_schema=False, registry=registry, grpc_pki_dir=pki_dir)
+    app = create_app(
+        engine,
+        ensure_schema=False,
+        registry=registry,
+        grpc_pki_dir=pki_dir,
+        grpc_progress_registry=progress_registry,
+    )
     grpc_server.start()
     sweep_stop, sweep_thread = start_sweep_loop(landing_root)
     registry_stop, registry_thread = start_registry_sweep_loop(registry)

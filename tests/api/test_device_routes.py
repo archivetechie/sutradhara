@@ -14,6 +14,7 @@ from sutradhara._proto import device_pb2
 from sutradhara.api import store as api_store
 from sutradhara.catalog.session import session_scope
 from sutradhara.grpc import store as grpc_store
+from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.registry import Card, CommandAck, ConnectedDeviceRegistry, StreamClosed
 from sutradhara.grpc.store import DeviceIdentity
 from tests.api.conftest import make_api_app, post_headers
@@ -118,6 +119,66 @@ def test_get_devices_filters_online_devices_and_includes_durable_receives(
             "bytesTotal": None,
         }
     ]
+
+
+def test_streaming_receive_reports_live_byte_progress(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    progress = ReceiveProgressRegistry()
+    with session_scope(api_engine) as session:
+        grpc_store.insert_intake(
+            session,
+            intake_id="intake-streaming",
+            operator="ada",
+            device_id="mac-1",
+            idempotency_key="key-streaming",
+            source_plan_digest="a" * 64,
+            artifactclass="s-masters",
+            source_kind="card",
+            source_ref="card-1",
+            label="Card 1",
+            landing_root=str(tmp_path),
+        )
+    progress.start("intake-streaming", planned_bytes_total=100)
+    progress.update_file(
+        "intake-streaming",
+        relpath="clip.mov",
+        bytes_received=25,
+        bytes_total=100,
+    )
+
+    app = make_api_app(api_engine)
+    app.state.grpc_progress_registry = progress
+    client = TestClient(app)
+
+    devices = client.get("/api/devices", headers=post_headers("operator"))
+    status = client.get("/api/intake/intake-streaming/status", headers=post_headers("operator"))
+
+    expected = {
+        "destinationPath": str(tmp_path / "intake-streaming"),
+        "bytesReceived": 25,
+        "bytesTotal": 100,
+    }
+    assert devices.status_code == 200
+    assert devices.json()["receives"] == [
+        {
+            "intakeId": "intake-streaming",
+            "deviceId": "mac-1",
+            "cardId": None,
+            "status": "streaming",
+            "releaseSafe": False,
+            **expected,
+        }
+    ]
+    assert status.status_code == 200
+    assert status.json() == {
+        "intakeId": "intake-streaming",
+        "status": "streaming",
+        "errors": [],
+        "releaseSafe": False,
+        **expected,
+    }
 
 
 def test_status_and_devices_mark_committed_card_receive_release_safe(

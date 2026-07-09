@@ -18,6 +18,7 @@ message StartIntakeRequest {
   string source_ref = 4;
   string label = 5;
   string source_plan_digest = 6;
+  int64 planned_bytes_total = 7;
 }
 
 message StartIntakeResponse {

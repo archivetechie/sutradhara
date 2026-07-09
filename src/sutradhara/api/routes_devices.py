@@ -35,6 +35,7 @@ from sutradhara.artifactclass_policy import ArtifactClassPolicyError, get_artifa
 from sutradhara.catalog.session import make_session_factory
 from sutradhara.grpc import ca as grpc_ca
 from sutradhara.grpc import store as grpc_store
+from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.registry import (
     CardUnavailable,
     CommandAck,
@@ -43,7 +44,7 @@ from sutradhara.grpc.registry import (
     DeviceOwnerMismatch,
     StreamClosed,
 )
-from sutradhara.grpc.status import intake_landing_path, intake_receipt_bytes, intake_status
+from sutradhara.grpc.status import intake_landing_path, intake_receipt_summary, intake_status
 
 router = APIRouter()
 LOG = logging.getLogger(__name__)
@@ -116,6 +117,7 @@ async def get_devices(request: Request) -> dict[str, object]:
         _receive_payloads_for_operator,
         request.app.state.engine,
         identity.operator_username,
+        _progress_registry(request),
     )
     return {
         "registeredDevices": registered_devices,
@@ -355,7 +357,7 @@ def get_intake_status(intake_id: str, request: Request) -> dict[str, object]:
         "status": view.status,
         "errors": view.errors,
         "releaseSafe": view.release_safe,
-        **_receive_progress_payload(row, view.status),
+        **_receive_progress_payload(row, view.status, _progress_registry(request)),
     }
 
 
@@ -448,6 +450,11 @@ def install_default_state(app: object) -> None:
     """Install swappable operator-console relay dependencies."""
 
     app.state.registry = getattr(app.state, "registry", ConnectedDeviceRegistry())
+    app.state.grpc_progress_registry = getattr(
+        app.state,
+        "grpc_progress_registry",
+        ReceiveProgressRegistry(),
+    )
     app.state.command_ack_timeout = 5.0
     app.state.directory_listing_timeout = 5.0
     app.state.enroll_token_ttl = dt.timedelta(hours=24)
@@ -458,6 +465,10 @@ def install_default_state(app: object) -> None:
 
 def _registry(request: Request) -> ConnectedDeviceRegistry:
     return request.app.state.registry
+
+
+def _progress_registry(request: Request) -> ReceiveProgressRegistry:
+    return request.app.state.grpc_progress_registry
 
 
 def mint_enroll_token(
@@ -755,7 +766,9 @@ def _registered_device_payloads_for_operator(
 
 
 def _receive_payloads_for_operator(
-    engine: object, operator_username: str
+    engine: object,
+    operator_username: str,
+    progress_registry: ReceiveProgressRegistry,
 ) -> list[dict[str, object]]:
     factory = make_session_factory(engine)
     with factory() as session:
@@ -781,22 +794,47 @@ def _receive_payloads_for_operator(
                 "cardId": row.card_id,
                 "status": view.status,
                 "releaseSafe": view.release_safe,
-                **_receive_progress_payload(row, view.status),
+                **_receive_progress_payload(row, view.status, progress_registry),
             }
         )
     return payloads
 
 
-def _receive_progress_payload(row: grpc_store.GrpcIntake, status: str) -> dict[str, object]:
+def _receive_progress_payload(
+    row: grpc_store.GrpcIntake,
+    status: str,
+    progress_registry: ReceiveProgressRegistry,
+) -> dict[str, object]:
     """Return additive operator-console progress metadata for a durable receive."""
 
-    bytes_received = intake_receipt_bytes(row)
-    bytes_total = (
-        bytes_received
-        if bytes_received is not None
-        and status in {"verifying", "verified", "quarantined", "discrepancy"}
-        else None
-    )
+    receipt = intake_receipt_summary(row)
+    receipt_bytes = receipt.bytes_total if receipt is not None else None
+    receipt_relpaths = receipt.relpaths if receipt is not None else frozenset()
+    live = progress_registry.snapshot(row.intake_id)
+    if live is not None:
+        live_unreceipted = [item for item in live.files if item.relpath not in receipt_relpaths]
+        live_received = sum(item.bytes_received for item in live_unreceipted)
+        live_total = sum(item.bytes_total for item in live_unreceipted)
+        bytes_received = (receipt_bytes or 0) + live_received
+        live_planned = live.bytes_total
+        total_candidates = [
+            value
+            for value in (
+                live_planned,
+                (receipt_bytes or 0) + live_total if live_total > 0 else None,
+                receipt_bytes,
+            )
+            if value is not None
+        ]
+        bytes_total = max(total_candidates) if total_candidates else None
+    else:
+        bytes_received = receipt_bytes
+        bytes_total = (
+            receipt_bytes
+            if receipt_bytes is not None
+            and status in {"verifying", "verified", "quarantined", "discrepancy"}
+            else None
+        )
     return {
         "destinationPath": str(intake_landing_path(row)),
         "bytesReceived": bytes_received,
