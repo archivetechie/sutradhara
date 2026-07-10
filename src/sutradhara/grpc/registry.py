@@ -21,7 +21,9 @@ from typing import Any
 from sutradhara._proto import device_pb2
 from sutradhara.grpc.store import DeviceIdentity
 
-CARD_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# Colon is load-bearing: the real agent derives ids like "volume:<uuid>" /
+# "volume:<hex>" (sutradhara_receive::derive_card_id) on every platform.
+CARD_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 MAX_CARD_LABEL_LENGTH = 512
 
 
@@ -29,7 +31,7 @@ def validate_card_id(card_id: str) -> str:
     """Validate an untrusted card/volume identity at a relay ingress boundary."""
 
     if not CARD_ID_PATTERN.fullmatch(card_id) or card_id in {".", ".."}:
-        raise ValueError("card_id must match ^[A-Za-z0-9._-]{1,128}$")
+        raise ValueError("card_id must match ^[A-Za-z0-9._:-]{1,128}$")
     return card_id
 
 

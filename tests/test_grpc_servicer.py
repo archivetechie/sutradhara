@@ -399,3 +399,13 @@ def _authorize_receive_intent(engine: Engine, *, key: str, device_id: str) -> No
         acknowledge_duplicate=False,
     )
     assert decision.state == "authorized"
+
+
+def test_validate_card_id_accepts_real_agent_volume_ids() -> None:
+    """The Rust agent derives ids like ``volume:<uuid>``; the colon must pass
+    every ingress validator or the first card snapshot kills the device stream
+    (2026-07-10 diff-gate blocker)."""
+    from sutradhara.grpc.registry import validate_card_id
+
+    for card_id in ("volume:9AA5-66F8", "volume:abcdef012345abcdef012345", "volume:test"):
+        assert validate_card_id(card_id) == card_id
