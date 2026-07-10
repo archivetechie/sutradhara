@@ -30,7 +30,7 @@ in the hdcache/placement helpers.
 | `SUTRADHARA_OPERATOR_RESTORE_PRIORITY` | `0` | Job priority for operator restores (lower runs earlier). Must stay below the hdcache fill priority; the config constructor raises otherwise. (`hdcache/fill.py`) |
 | `SUTRADHARA_MIGRATION_PRIORITY` | `100` | Job priority for migration work. Must stay above the hdcache fill priority. (`hdcache/fill.py`) |
 
-<!-- code-anchor: src/sutradhara/cli/api.py src/sutradhara/api/app.py src/sutradhara/api/sources.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/api.py src/sutradhara/api/app.py src/sutradhara/api/sources.py @ 3d8310c -->
 ## Operator API and servers
 
 | Variable | Default | Purpose |

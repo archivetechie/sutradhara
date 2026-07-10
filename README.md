@@ -31,12 +31,12 @@ data-loss event.
 - Not a vendor product like Miria — it is first-party software designed to
   outlive its dependencies.
 
-<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 05a2e66 -->
+<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 3d8310c -->
 ## Status
 
 Beyond the v0.1 anchor spec (see [`docs/spec-v0.1.md`](docs/spec-v0.1.md) for
 the original design). The catalog, job engine, and CLI are built and in
-active use — 842 passing tests — and the ingest → arrange → archive →
+active use — 856 passing tests — and the ingest → arrange → archive →
 restore lifecycle is implemented end to end, including:
 
 - Multi-backend copy fan-out with per-placement policy and durability
@@ -56,14 +56,16 @@ restore lifecycle is implemented end to end, including:
 - A single-node lease-aware job worker with cgroup-based resource control
   (`sutra worker`).
 - An operator HTTP API + mTLS gRPC relay for browser/agent-driven intake and
-  restore (`sutra serve`).
+  restore (`sutra serve`), with a duplicate-card-receive handshake (a durable
+  receive-intent state machine warns on a repeat card before bytes move, with
+  an explicit operator override).
 
 `docs/INDEX.md` tracks every design doc's status (current / implemented /
 superseded / historical) and is the authoritative map of what's built versus
 still proposed. `docs/roadmap.md` and
 `docs/implementation-plan-ingest-v2.md` track what's next.
 
-<!-- code-anchor: pyproject.toml packages @ 5c44b85 -->
+<!-- code-anchor: pyproject.toml packages @ 3d8310c -->
 ## Layout
 
 ```
@@ -86,7 +88,7 @@ The Rust workstation helper (`sutra-agent`, tray + headless binaries) lives
 in its own repository and links `packages/sutradhara-receive` as a crate;
 an earlier in-tree `packages/sutra-agent` was removed when it moved.
 
-<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ 5c44b85 -->
+<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ 3d8310c -->
 ## Install & verify
 
 Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/).
@@ -113,7 +115,7 @@ init`. [`docs/guide-quickstart.md`](docs/guide-quickstart.md) walks a full
 local tour, including a catalog rebuild from a fixture backend and one
 receive → register pass, plus troubleshooting.
 
-<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 3d8310c -->
 ## CLI overview
 
 `sutra --help` lists every command group; each group has its own `--help`,
@@ -148,7 +150,7 @@ CLI adapter for the legacy d2 tape library), `s3` (cloud), `ssh_disk`
 accepted by `backends add` (`rem_disk`, `plain_disk`, `gcs`, `azure_blob`)
 are reserved names without adapters yet.
 
-<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 3d8310c -->
 ## Configuration
 
 Beyond `SUTRADHARA_DB_URL`, the environment variables most operators need:

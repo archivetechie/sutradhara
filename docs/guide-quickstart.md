@@ -7,7 +7,7 @@ here mirrors an invocation the test suite runs (`tests/test_cli.py`,
 `tests/test_receive_front_door.py`), so it works on a machine with no
 tape library, no Remanence build, and no ffmpeg.
 
-<!-- code-anchor: pyproject.toml uv.lock @ 5c44b85 -->
+<!-- code-anchor: pyproject.toml uv.lock @ 3d8310c -->
 ## Install
 
 Requires Python ≥ 3.11 and [`uv`](https://docs.astral.sh/uv/).
@@ -15,7 +15,7 @@ Requires Python ≥ 3.11 and [`uv`](https://docs.astral.sh/uv/).
 ```sh
 git clone <repo> sutradhara && cd sutradhara
 uv sync            # installs the workspace, incl. packages/sutradhara-receive
-uv run pytest -q   # hermetic; 842 passed, 1 skipped (live-MinIO) as of 5c44b85
+uv run pytest -q   # hermetic; 856 passed, 1 skipped (live-MinIO) as of 3d8310c
 ```
 
 The CLI lands in the virtualenv as `.venv/bin/sutra`. The examples below
@@ -58,7 +58,7 @@ scrub again — the catalog comes back. That round trip is exactly
 `test_scrub_against_empty_catalog_populates_everything` and
 `test_second_scrub_is_idempotent`.
 
-<!-- code-anchor: src/sutradhara/cli/receive.py src/sutradhara/cli/intake.py tests/test_receive_front_door.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/receive.py src/sutradhara/cli/intake.py tests/test_receive_front_door.py @ 3d8310c -->
 ## Receive and register an intake
 
 Make a source folder and a landing share, then receive:

@@ -4,7 +4,7 @@ The internal vocabulary of Sutradhara, as the code actually uses it. Each
 entry names the defining module so you can check the source. Terms that
 appear in older design docs but not in the code are flagged as such.
 
-<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ 5c44b85 -->
+<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ 3d8310c -->
 ## Receive and intake
 
 **bag / BagIt** — the on-disk form of a received intake: a BagIt 1.0 bag
@@ -26,7 +26,11 @@ still being written.
 **intake** — one landing batch admitted into the catalog. Status walks
 `receiving` → `verifying` → `registered`, or ends `quarantined`
 (`IntakeStatus` in `catalog/types.py`). Registration is idempotent, keyed
-on an acceptance fingerprint of manifest digest plus artifactclass.
+on an acceptance fingerprint of manifest digest plus artifactclass. For
+device-relayed receives, the row also carries `card_id`/`device_id`
+(indexed, copied from the gRPC intake at registration) so a later receive
+of the same physical card can be matched against this one — see
+"receive intent" below.
 
 **quarantine** — the terminal state of a batch that failed validation
 before ever being accepted: the intake row records the failure and no
@@ -48,7 +52,7 @@ on the CLI.
 `~/sutra-agent` name for offline card-to-external-disk offload; on this
 side it is just a normal receive whose landing arrives later.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py @ 3d8310c -->
 ## Catalog identities
 
 **logical asset** — content identity. One row per distinct SHA-256; the
@@ -99,7 +103,7 @@ to override), never deletion or preservation. `sutra unreject` clears it.
 **tag** — a soft-deleted governance label on an asset (`AssetTag`);
 removal tombstones the row for audit.
 
-<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ 3d8310c -->
 ## Policy and placement
 
 **artifactclass** — the policy class of a piece of content (e.g. masters
@@ -267,7 +271,7 @@ drill. `forget` tombstones a drained dead disk's id.
 Restoring cached private material requires the mapped capability
 (`can_restore_p2`/`can_restore_p3`), fail-closed for unmapped levels.
 
-<!-- code-anchor: src/sutradhara/grpc src/sutradhara/api/routes_devices.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/grpc src/sutradhara/api/routes_devices.py @ 3d8310c -->
 ## Relay and enrollment
 
 **agent / helper** — the Rust `sutra-agent` workstation program (separate
@@ -284,3 +288,33 @@ onboarding: a minted token plus device CSR yields an mTLS cert with
 packages token, enroll URL, CA PEM, and endpoints for one-click setup;
 `POST /api/enroll/bundle` produces it when `SUTRA_AGENT_BUNDLE_CONFIG` is
 set.
+
+**receive intent** — the durable per-request row (`IdempotencyRecord` in
+`api/store.py`, extended by migration `d4e5f6a7b8c9`) tracking one
+device-relayed receive attempt from first request to terminal outcome:
+`warned → authorized → started → terminal(committed|aborted|quarantined|
+failed)`. It is the same table that already handled plain HTTP
+idempotency replay; receive-dedup adds the card/device identity and
+duplicate-warning columns to it rather than introducing a parallel one.
+
+**duplicate warning (409 handshake)** — `POST /api/devices/{id}/receive`
+checks the requested card's identity against its receive history
+(`api/receive_history.py:latest_card_history`) before starting a
+transfer. A match returns HTTP 409 with a `duplicateWarning` body (prior
+intake id, label, device, timestamp, state); the client resubmits with
+`acknowledge_duplicate: true` to proceed anyway. `sutra-agent`/the
+console are expected to surface this as a confirmation prompt, never a
+silent retry.
+
+**source lease** — a `SourceClaim` row (`card-identity:<card_id>`)
+admitted at `authorized`, distinct from the job-engine "lease" in
+[Jobs and reconciliation](#jobs-and-reconciliation). It prevents two
+concurrent receives of the same physical card; a second request while one
+is in flight gets a `source_busy` 409 instead of racing the first.
+
+**archive_state** — an additive read-model field on intake rows
+(`api/routes_intake_archive.py`, `archiveSemantics: 2`) computed with
+ALL-semantics: `none` | `partial` | `complete`, true only when every
+ingest item's content hash is sealed into a bundle or an archived
+submission. Coexists with the older `archived` boolean, which stays
+any-semantics until a later phase retires it.

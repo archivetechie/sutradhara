@@ -58,7 +58,7 @@ pieces mean, see [`reference-glossary.md`](reference-glossary.md) and
 | `sutra db` | Schema management (dev convenience; production uses alembic). |
 | `sutra admin` | Dangerous local catalog maintenance. |
 
-<!-- code-anchor: src/sutradhara/cli/receive.py packages/sutradhara-receive/src/sutradhara_receive @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/receive.py packages/sutradhara-receive/src/sutradhara_receive @ 3d8310c -->
 ## sutra receive
 
 Receive source trees (cards, drives, folders) into landing intakes as BagIt
@@ -104,7 +104,7 @@ Verify completed bags whose destination-verification sidecar is absent,
 mid-transfer, or failed. Flags: `--landing DIRECTORY` (required,
 repeatable), `--json`. Exits 4 when any bag fails.
 
-<!-- code-anchor: src/sutradhara/cli/intake.py src/sutradhara/intake.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/intake.py src/sutradhara/intake.py @ 3d8310c -->
 ## sutra intake and sutra prepare
 
 Landing intakes cross the acceptance boundary here: `inspect` validates
@@ -417,7 +417,7 @@ available.
 | `status` | `[ASSET_HASH_HEX]` | Show PFR readiness for one asset or member selector. `--artifactclass TEXT` (required), `--member-name TEXT`, `--json`. |
 | `reindex` | `[ASSET_HASH_HEX]` | Enqueue forced pfr-index jobs, bypassing the presence-gated reconciler. `--artifactclass TEXT`, `--member-name TEXT`, `--grammar [fallback]`, `--all` reindexes every current PFR sidecar, `--json`. |
 
-<!-- code-anchor: src/sutradhara/cli/serve.py src/sutradhara/cli/api.py src/sutradhara/cli/grpc.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/serve.py src/sutradhara/cli/api.py src/sutradhara/cli/grpc.py @ 3d8310c -->
 ## sutra serve, serve-api, serve-grpc
 
 The operator-facing servers. `sutra serve` runs both halves in one process;
