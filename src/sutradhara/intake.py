@@ -17,7 +17,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -279,7 +279,7 @@ def register_intake(
     )
 
     if existing is not None and existing.status == IntakeStatus.REGISTERED:
-        return _handle_registered_intake(
+        outcome = _handle_registered_intake(
             session,
             ctx,
             validated,
@@ -289,6 +289,9 @@ def register_intake(
             cloud_backend_name=cloud_backend_name,
             cloud_pool_id=cloud_pool_id,
         )
+        _copy_grpc_identity(session, existing)
+        _transition_receive_intent(session, validated.intake_id, "committed")
+        return outcome
 
     if not validated.valid:
         reason = "bag-incomplete" if not validated.complete else "bag-invalid"
@@ -301,6 +304,7 @@ def register_intake(
         )
         intake.manifest_digest = validated.manifest_digest
         session.flush()
+        _transition_receive_intent(session, validated.intake_id, "quarantined")
         marker = _quarantine_receipt_marker(
             ctx.root,
             intake,
@@ -334,6 +338,7 @@ def register_intake(
     intake.quarantined_at = None
     intake.updated_at = intake.registered_at
     session.flush()
+    _transition_receive_intent(session, validated.intake_id, "committed")
 
     submitted = _enqueue_missing_cloud_job(
         session,
@@ -791,7 +796,36 @@ def _upsert_intake(
     if status == IntakeStatus.QUARANTINED:
         intake.quarantined_at = now
         intake.registered_at = None
+    _copy_grpc_identity(session, intake)
     return intake
+
+
+def _copy_grpc_identity(session: Session, intake: Intake) -> None:
+    """Copy indexed card/device identity from the durable gRPC registration row."""
+
+    from sutradhara.grpc.store import GrpcIntake
+
+    grpc_intake = session.get(GrpcIntake, intake.intake_id)
+    if grpc_intake is None:
+        return
+    intake.card_id = grpc_intake.card_id
+    intake.device_id = grpc_intake.device_id
+
+
+def _transition_receive_intent(
+    session: Session,
+    intake_id: str,
+    terminal_state: Literal["committed", "quarantined"],
+) -> None:
+    """Publish catalog registration truth into the linked receive intent."""
+
+    from sutradhara.api.store import transition_device_intent_terminal
+
+    transition_device_intent_terminal(
+        session,
+        intake_id=intake_id,
+        terminal_state=terminal_state,
+    )
 
 
 def _register_payload_record(

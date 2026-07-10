@@ -10,7 +10,11 @@ from typing import Any
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select
 
-from sutradhara.api.routes_intake_archive import MAX_LIMIT
+from sutradhara.api.routes_intake_archive import (
+    MAX_LIMIT,
+    _intake_archive_state_expr,
+    _intake_payload,
+)
 from sutradhara.catalog.models import (
     Arrangement,
     AssetDerivation,
@@ -55,6 +59,8 @@ INTAKE_KEYS = {
     "quarantined_at",
     "item_count",
     "bytes_total",
+    "archive_state",
+    "archiveSemantics",
 }
 INTAKE_DETAIL_KEYS = INTAKE_KEYS | {"items", "derivations"}
 INGEST_ITEM_KEYS = {"content_sha256", "virtual_path", "size_bytes", "artifactclass"}
@@ -151,7 +157,9 @@ def test_intake_contract_detail_uses_virtual_paths_and_cross_intake_derivations(
         )
     client = TestClient(make_api_app(api_engine))
 
-    list_response = client.get("/api/ui/intakes?status=registered&limit=10", headers=auth_headers("viewer"))
+    list_response = client.get(
+        "/api/ui/intakes?status=registered&limit=10", headers=auth_headers("viewer")
+    )
     detail_response = client.get("/api/ui/intakes/intake-a", headers=auth_headers("viewer"))
 
     assert list_response.status_code == 200
@@ -321,9 +329,7 @@ def test_intakes_stage_filters_registered_archive_evidence(api_engine: Engine) -
     assert unarchived.status_code == 200
     assert unarchived.json()["total"] == 1
     assert unarchived.json()["truncated"] is False
-    assert [row["intake_id"] for row in unarchived.json()["intakes"]] == [
-        "registered-unarchived"
-    ]
+    assert [row["intake_id"] for row in unarchived.json()["intakes"]] == ["registered-unarchived"]
 
     assert quarantined.status_code == 200
     assert quarantined.json()["total"] == 1
@@ -335,6 +341,78 @@ def test_intakes_stage_filters_registered_archive_evidence(api_engine: Engine) -
     assert contradictory.json() == {"total": 0, "truncated": False, "intakes": []}
     assert bad_stage.status_code == 400
     assert bad_stage.json()["detail"]["error"] == "bad_request"
+
+
+def test_intake_archive_state_none_partial_complete_and_empty(api_engine: Engine) -> None:
+    base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
+    sealed_hash = _digest("archive-state-sealed")
+    missing_hash = _digest("archive-state-missing")
+    with session_scope(api_engine) as session:
+        _add_asset(session, sealed_hash, size=10)
+        _add_asset(session, missing_hash, size=20)
+        for intake_id in ("none", "partial", "complete", "empty"):
+            _add_intake(session, intake_id, artifactclass="s-masters", created_at=base)
+        _add_item(
+            session,
+            intake_id="none",
+            digest=missing_hash,
+            artifactclass="s-masters",
+            virtual_path="none.mov",
+            as_received_path="/card/none.mov",
+            created_at=base,
+        )
+        for intake_id in ("partial", "complete"):
+            _add_item(
+                session,
+                intake_id=intake_id,
+                digest=sealed_hash,
+                artifactclass="s-masters",
+                virtual_path=f"{intake_id}/sealed.mov",
+                as_received_path=f"/card/{intake_id}/sealed.mov",
+                created_at=base,
+            )
+        _add_item(
+            session,
+            intake_id="partial",
+            digest=missing_hash,
+            artifactclass="s-masters",
+            virtual_path="partial/missing.mov",
+            as_received_path="/card/partial/missing.mov",
+            created_at=base,
+        )
+        bundle = _add_bundle(
+            session,
+            "archive-state-bundle",
+            artifactclass="s-masters",
+            status="sealed",
+            total_bytes=10,
+            member_count=1,
+            opened_at=base,
+            sealed_at=base,
+        )
+        _add_bundle_member(session, bundle, sealed_hash, size=10)
+
+    with session_scope(api_engine) as session:
+        rows = session.execute(
+            select(Intake, _intake_archive_state_expr().label("archive_state")).where(
+                Intake.intake_id.in_(("none", "partial", "complete", "empty"))
+            )
+        )
+        by_id = {
+            intake.intake_id: _intake_payload(
+                intake,
+                item_count=len(intake.items),
+                bytes_total=sum(item.size_bytes for item in intake.items),
+                archive_state=str(archive_state),
+            )
+            for intake, archive_state in rows
+        }
+
+    assert by_id["none"]["archive_state"] == "none"
+    assert by_id["partial"]["archive_state"] == "partial"
+    assert by_id["complete"]["archive_state"] == "complete"
+    assert by_id["empty"]["archive_state"] == "none"
+    assert all(row["archiveSemantics"] == 2 for row in by_id.values())
 
 
 def test_archive_bundle_and_submission_contracts_and_status_vocabularies(

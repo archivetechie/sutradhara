@@ -23,14 +23,15 @@ from uuid import UUID
 
 import anyio
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import Response
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import select
 
 from sutradhara._proto import device_pb2
 from sutradhara.api import store as api_store
 from sutradhara.api.identity import Identity, parse_identity
 from sutradhara.api.paths import DevicePathError, canonical_device_rel_path
+from sutradhara.api.receive_history import ReceiveHistoryMatch, latest_card_history
 from sutradhara.artifactclass_policy import ArtifactClassPolicyError, get_artifactclass_policy
 from sutradhara.catalog.session import make_session_factory
 from sutradhara.grpc import ca as grpc_ca
@@ -43,6 +44,8 @@ from sutradhara.grpc.registry import (
     DeviceOffline,
     DeviceOwnerMismatch,
     StreamClosed,
+    validate_card_id,
+    validate_card_label,
 )
 from sutradhara.grpc.status import intake_landing_path, intake_receipt_summary, intake_status
 from sutradhara.verification_progress import read_verification_progress
@@ -56,11 +59,24 @@ DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 class DeviceReceiveRequest(BaseModel):
     """JSON body accepted by POST /api/devices/{device_id}/receive."""
 
+    model_config = ConfigDict(extra="forbid")
+
     card_id: str
     artifactclass: str
     idempotencyKey: UUID
     label: str | None = None
     source_ref: str | None = None
+    acknowledge_duplicate: bool = False
+
+    @field_validator("card_id")
+    @classmethod
+    def _valid_card_id(cls, value: str) -> str:
+        return validate_card_id(value)
+
+    @field_validator("label")
+    @classmethod
+    def _valid_label(cls, value: str | None) -> str | None:
+        return validate_card_label(value)
 
 
 class EnrollTokenRequest(BaseModel):
@@ -120,9 +136,15 @@ async def get_devices(request: Request) -> dict[str, object]:
         identity.operator_username,
         _progress_registry(request),
     )
+    device_payloads = await anyio.to_thread.run_sync(
+        _device_payloads_with_history,
+        request.app.state.engine,
+        identity.operator_username,
+        devices,
+    )
     return {
         "registeredDevices": registered_devices,
-        "devices": [_device_payload(device) for device in devices],
+        "devices": device_payloads,
         "receives": receives,
     }
 
@@ -137,6 +159,10 @@ async def get_device_browse(
     """Relay one directory-listing request to a browse-capable helper."""
 
     identity = _require_receive(parse_identity(request.headers))
+    try:
+        validate_card_id(card_id)
+    except ValueError as exc:
+        _raise(400, "invalid_card_id", str(exc))
     rel_path = _canonical_device_path_or_400(path)
     try:
         await anyio.to_thread.run_sync(
@@ -220,12 +246,12 @@ async def get_device_browse(
     }
 
 
-@router.post("/api/devices/{device_id}/receive")
+@router.post("/api/devices/{device_id}/receive", response_model=None)
 async def post_device_receive(
     device_id: str,
     request: Request,
     body: DeviceReceiveRequest,
-) -> dict[str, str]:
+) -> dict[str, str] | JSONResponse:
     """Relay a receive-start command to an operator-owned helper device."""
 
     identity = _require_receive(parse_identity(request.headers))
@@ -246,27 +272,58 @@ async def post_device_receive(
     except ArtifactClassPolicyError as exc:
         _raise(400, "bad_artifactclass", str(exc))
 
+    try:
+        card = await anyio.to_thread.run_sync(
+            partial(
+                _registry(request).card_for,
+                operator=identity.operator_username,
+                device_id=device_id,
+                card_id=body.card_id,
+            )
+        )
+    except DeviceOwnerMismatch as exc:
+        _raise(403, "forbidden", str(exc))
+    except (DeviceOffline, CardUnavailable) as exc:
+        _raise(409, "device_unavailable", str(exc))
+
     idempotency_key = str(body.idempotencyKey)
     request_hash = _device_receive_hash(device_id, body, source_ref=canonical_source_ref)
     decision = await anyio.to_thread.run_sync(
         partial(
-            api_store.begin_idempotency,
+            api_store.begin_device_receive_intent,
             engine,
             operator_username=identity.operator_username,
-            endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+            device_id=device_id,
+            card_identity=card.card_id,
+            card_label=card.label,
             idempotency_key=idempotency_key,
             request_hash=request_hash,
+            acknowledge_duplicate=body.acknowledge_duplicate,
             ttl=request.app.state.idempotency_ttl,
         )
     )
     if decision.state == "conflict":
         _raise(409, "idempotency_conflict", "same idempotencyKey used with a different body")
+    if decision.state == "warned":
+        if decision.response_json is None:
+            _raise(409, "idempotency_conflict", "warned intent has no stored warning")
+        return JSONResponse(status_code=409, content=decision.response_json)
     if decision.state == "completed":
         if decision.response_json is None:
             _raise(409, "idempotency_conflict", "completed request has no stored response")
         return {str(key): str(value) for key, value in decision.response_json.items()}
+    if decision.state == "busy":
+        _raise(409, "source_busy", "card is busy / already in progress")
+    if decision.state == "terminal":
+        _raise(
+            409,
+            "receive_terminal",
+            f"prior receive attempt is {decision.terminal_state}; start a new receive intent",
+        )
     if decision.state == "in_progress":
         _raise(409, "already_in_progress", "receive is already in progress")
+    if decision.state != "authorized":
+        _raise(409, "idempotency_conflict", "receive intent could not be authorized")
 
     try:
         pending = await anyio.to_thread.run_sync(
@@ -283,10 +340,10 @@ async def post_device_receive(
             )
         )
     except DeviceOwnerMismatch as exc:
-        await _abandon_if_new_claim(request, identity, idempotency_key, decision.state)
+        await _fail_device_intent(request, identity, device_id, idempotency_key)
         _raise(403, "forbidden", str(exc))
     except (DeviceOffline, CardUnavailable) as exc:
-        await _abandon_if_new_claim(request, identity, idempotency_key, decision.state)
+        await _fail_device_intent(request, identity, device_id, idempotency_key)
         _raise(409, "device_unavailable", str(exc))
 
     try:
@@ -294,7 +351,7 @@ async def post_device_receive(
     except TimeoutError:
         _raise(409, "ack_timeout", "device did not ack before the advisory timeout")
     except PermissionError as exc:
-        await _abandon_if_new_claim(request, identity, idempotency_key, decision.state)
+        await _fail_device_intent(request, identity, device_id, idempotency_key)
         _raise(403, "forbidden", str(exc))
     except RuntimeError as exc:
         _raise(409, "device_unavailable", str(exc))
@@ -303,10 +360,10 @@ async def post_device_receive(
         if pending.abandon_on_reject:
             await anyio.to_thread.run_sync(
                 partial(
-                    api_store.abandon_idempotency,
+                    api_store.fail_device_receive_intent,
                     engine,
                     operator_username=identity.operator_username,
-                    endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+                    device_id=device_id,
                     idempotency_key=idempotency_key,
                 )
             )
@@ -462,6 +519,10 @@ def install_default_state(app: object) -> None:
     app.state.enroll_csr_limiter = SimpleRateLimiter()
     app.state.grpc_pki_dir = getattr(app.state, "grpc_pki_dir", grpc_ca.DEFAULT_PKI_DIR)
     app.state.agent_bundle = getattr(app.state, "agent_bundle", None)
+    api_store.reconcile_device_receive_leases(
+        app.state.engine,
+        ttl=app.state.idempotency_ttl,
+    )
 
 
 def _registry(request: Request) -> ConnectedDeviceRegistry:
@@ -725,7 +786,10 @@ def _rotation_authorization(
     )
 
 
-def _device_payload(device: object) -> dict[str, object]:
+def _device_payload(
+    device: object,
+    history_by_card: dict[str, ReceiveHistoryMatch | None],
+) -> dict[str, object]:
     return {
         "deviceId": device.device_id,
         "enrolledAs": device.operator,
@@ -739,9 +803,45 @@ def _device_payload(device: object) -> dict[str, object]:
                 "kind": card.kind,
                 "sizeBytes": card.size_bytes,
                 "status": card.status,
+                "receivedBefore": _received_before_payload(history_by_card.get(card.card_id)),
             }
             for card in device.cards
         ],
+    }
+
+
+def _device_payloads_with_history(
+    engine: object,
+    operator_username: str,
+    devices: list[object],
+) -> list[dict[str, object]]:
+    """Attach the authorization-scoped history projection to live card rows."""
+
+    factory = make_session_factory(engine)
+    with factory() as session:
+        history_by_card = {
+            card.card_id: latest_card_history(
+                session,
+                card_identity=card.card_id,
+                requester=operator_username,
+            )
+            for device in devices
+            for card in device.cards
+        }
+    return [_device_payload(device, history_by_card) for device in devices]
+
+
+def _received_before_payload(
+    match: ReceiveHistoryMatch | None,
+) -> dict[str, object] | None:
+    if match is None:
+        return None
+    if not match.visible:
+        return {"state": None, "receivedAt": None, "visible": False}
+    return {
+        "state": match.state,
+        "receivedAt": _datetime_payload(match.received_at),
+        "visible": True,
     }
 
 
@@ -861,6 +961,8 @@ def _device_receive_hash(device_id: str, body: DeviceReceiveRequest, *, source_r
 
 
 def _datetime_payload(value: dt.datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.UTC)
     return value.astimezone(dt.UTC).isoformat()
 
 
@@ -913,20 +1015,18 @@ def _raise_for_directory_status(listing: object) -> None:
     _raise(http_status, error, detail)
 
 
-async def _abandon_if_new_claim(
+async def _fail_device_intent(
     request: Request,
     identity: Identity,
+    device_id: str,
     idempotency_key: str,
-    state: str,
 ) -> None:
-    if state != "claimed":
-        return
     await anyio.to_thread.run_sync(
         partial(
-            api_store.abandon_idempotency,
+            api_store.fail_device_receive_intent,
             request.app.state.engine,
             operator_username=identity.operator_username,
-            endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+            device_id=device_id,
             idempotency_key=idempotency_key,
         )
     )
@@ -953,22 +1053,21 @@ def _complete_http_receive(
         )
     if not correlated:
         if abandon_on_failure:
-            api_store.abandon_idempotency(
+            api_store.fail_device_receive_intent(
                 engine,
                 operator_username=operator,
-                endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+                device_id=device_id,
                 idempotency_key=idempotency_key,
             )
         return False
-    api_store.complete_idempotency(
+    return api_store.store_device_receive_response(
         engine,
         operator_username=operator,
-        endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+        device_id=device_id,
         idempotency_key=idempotency_key,
         intake_id=intake_id,
         response_json={"intakeId": intake_id, "status": "streaming"},
     )
-    return True
 
 
 def _revoke_device(

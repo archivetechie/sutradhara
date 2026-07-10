@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, Request
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import aliased
 
 from sutradhara.api.console import (
@@ -107,6 +107,7 @@ def get_intakes(
                 Intake,
                 func.coalesce(aggregates.c.item_count, 0).label("item_count"),
                 func.coalesce(aggregates.c.bytes_total, 0).label("bytes_total"),
+                _intake_archive_state_expr().label("archive_state"),
                 func.count().over().label("total"),
             )
             .outerjoin(aggregates, aggregates.c.intake_id == Intake.intake_id)
@@ -126,10 +127,15 @@ def get_intakes(
             query = query.where(Intake.created_at >= days_filter)
         rows = list(session.execute(query))
         intakes = [
-            _intake_payload(row[0], item_count=int(row[1] or 0), bytes_total=int(row[2] or 0))
+            _intake_payload(
+                row[0],
+                item_count=int(row[1] or 0),
+                bytes_total=int(row[2] or 0),
+                archive_state=str(row[3]),
+            )
             for row in rows
         ]
-        total = int(rows[0][3]) if rows else 0
+        total = int(rows[0][4]) if rows else 0
     return {"total": total, "truncated": total > len(intakes), "intakes": intakes}
 
 
@@ -142,8 +148,13 @@ def get_intake(request: Request, intake_id: str) -> dict[str, object]:
         row = _intake_row(session, intake_id)
         if row is None:
             raise_console_error(404, "not_found", f"unknown intake {intake_id!r}")
-        intake, item_count, bytes_total = row
-        payload = _intake_payload(intake, item_count=item_count, bytes_total=bytes_total)
+        intake, item_count, bytes_total, archive_state = row
+        payload = _intake_payload(
+            intake,
+            item_count=item_count,
+            bytes_total=bytes_total,
+            archive_state=archive_state,
+        )
         items = list(
             session.scalars(
                 select(IngestItem)
@@ -259,9 +270,7 @@ def get_archive_asset(request: Request, content_sha256: str) -> dict[str, object
             "content_sha256": digest.hex(),
             "artifactclass": artifactclass,
             "size_bytes": asset.size_bytes,
-            "originating_intake_id": (
-                None if origin is None else _text(origin.intake_id)
-            ),
+            "originating_intake_id": (None if origin is None else _text(origin.intake_id)),
             "copies": [
                 _asset_copy_payload(locator, copy, backend, is_admin=is_admin)
                 for locator, copy, backend in copy_rows
@@ -296,7 +305,9 @@ def get_catalog_assets(
         assets = _assets_by_hash(session, hashes)
         rollups = _copy_rollups_by_hash(session, hashes)
         rows = [
-            _catalog_asset_payload(pair, assets[pair.content_sha256], rollups.get(pair.content_sha256))
+            _catalog_asset_payload(
+                pair, assets[pair.content_sha256], rollups.get(pair.content_sha256)
+            )
             for pair in page
             if pair.content_sha256 in assets
         ]
@@ -347,23 +358,82 @@ def _intake_archive_evidence_exists() -> Any:
     return or_(sealed_bundle_evidence, archived_submission_evidence)
 
 
-def _intake_row(session: Any, intake_id: str) -> tuple[Intake, int, int] | None:
+def _intake_archive_state_expr() -> Any:
+    """Return the ALL-semantics archive state via an indexed anti-join."""
+
+    archived_submission_item = aliased(IngestItem)
+    sealed_for_hash = (
+        select(1)
+        .select_from(BundleMember)
+        .join(Bundle, Bundle.id == BundleMember.bundle_id)
+        .where(
+            BundleMember.logical_asset_hash == IngestItem.logical_asset_hash,
+            Bundle.status == "sealed",
+        )
+        .exists()
+    )
+    archived_submission_for_hash = (
+        select(1)
+        .select_from(SubmissionMember)
+        .join(Submission, Submission.id == SubmissionMember.submission_id)
+        .join(
+            archived_submission_item,
+            archived_submission_item.id == SubmissionMember.ingest_item_id,
+        )
+        .where(
+            archived_submission_item.logical_asset_hash == IngestItem.logical_asset_hash,
+            Submission.status == SubmissionStatus.ARCHIVED.value,
+        )
+        .exists()
+    )
+    hash_archived = or_(sealed_for_hash, archived_submission_for_hash)
+    any_relevant = (
+        select(1).select_from(IngestItem).where(IngestItem.intake_id == Intake.intake_id).exists()
+    )
+    any_archived = (
+        select(1)
+        .select_from(IngestItem)
+        .where(IngestItem.intake_id == Intake.intake_id, hash_archived)
+        .exists()
+    )
+    any_missing = (
+        select(1)
+        .select_from(IngestItem)
+        .where(IngestItem.intake_id == Intake.intake_id, ~hash_archived)
+        .exists()
+    )
+    return case(
+        (~any_relevant, "none"),
+        (~any_missing, "complete"),
+        (any_archived, "partial"),
+        else_="none",
+    )
+
+
+def _intake_row(session: Any, intake_id: str) -> tuple[Intake, int, int, str] | None:
     aggregates = _intake_aggregates_subquery()
     row = session.execute(
         select(
             Intake,
             func.coalesce(aggregates.c.item_count, 0).label("item_count"),
             func.coalesce(aggregates.c.bytes_total, 0).label("bytes_total"),
+            _intake_archive_state_expr().label("archive_state"),
         )
         .outerjoin(aggregates, aggregates.c.intake_id == Intake.intake_id)
         .where(Intake.intake_id == intake_id)
     ).one_or_none()
     if row is None:
         return None
-    return row[0], int(row[1] or 0), int(row[2] or 0)
+    return row[0], int(row[1] or 0), int(row[2] or 0), str(row[3])
 
 
-def _intake_payload(intake: Intake, *, item_count: int, bytes_total: int) -> dict[str, object]:
+def _intake_payload(
+    intake: Intake,
+    *,
+    item_count: int,
+    bytes_total: int,
+    archive_state: str,
+) -> dict[str, object]:
     return {
         "intake_id": _text(intake.intake_id),
         "operator": _text(intake.operator),
@@ -378,6 +448,8 @@ def _intake_payload(intake: Intake, *, item_count: int, bytes_total: int) -> dic
         "quarantined_at": _optional_iso(intake.quarantined_at),
         "item_count": item_count,
         "bytes_total": bytes_total,
+        "archive_state": archive_state,
+        "archiveSemantics": 2,
     }
 
 
@@ -532,7 +604,11 @@ def _catalog_pairs(
         filtered.append(_CatalogPair(content_hash, artifactclass, _aware_utc(latest_at)))
     return sorted(
         filtered,
-        key=lambda pair: (-pair.latest_at.timestamp(), pair.content_sha256.hex(), pair.artifactclass),
+        key=lambda pair: (
+            -pair.latest_at.timestamp(),
+            pair.content_sha256.hex(),
+            pair.artifactclass,
+        ),
     )
 
 
@@ -668,7 +744,9 @@ def _locator_summary(
     return f"locator {_digest_token(combined)}"
 
 
-def _first_locator_string(locators: tuple[dict[str, Any], ...], keys: tuple[str, ...]) -> str | None:
+def _first_locator_string(
+    locators: tuple[dict[str, Any], ...], keys: tuple[str, ...]
+) -> str | None:
     for locator in locators:
         for key in keys:
             value = locator.get(key)

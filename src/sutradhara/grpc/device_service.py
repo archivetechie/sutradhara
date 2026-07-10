@@ -31,6 +31,7 @@ from sutradhara.grpc.registry import (
     PendingListing,
     RegisteredDeviceStream,
     StreamClosed,
+    validate_card_id,
 )
 
 LOG = logging.getLogger(__name__)
@@ -168,16 +169,25 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
                 )
             return
         if pending.abandon_on_reject:
-            api_store.abandon_idempotency(
+            api_store.fail_device_receive_intent(
                 self.config.engine,
                 operator_username=pending.operator,
-                endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+                device_id=pending.device_id,
                 idempotency_key=pending.idempotency_key,
             )
 
     def _rebuild_active_receive(self, stream: RegisteredDeviceStream, receive: Any) -> None:
         identity = self._stream_identity(stream)
         if identity is None or not receive.intake_id or not receive.idempotency_key:
+            return
+        try:
+            validate_card_id(receive.card_id)
+        except ValueError:
+            LOG.warning(
+                "ignored active receive with invalid card identity: device_id=%s intake_id=%s",
+                identity.device_id,
+                receive.intake_id,
+            )
             return
         self._complete_receive(
             operator=identity.operator,
@@ -209,22 +219,21 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
             )
         if not correlated:
             if abandon_on_failure:
-                api_store.abandon_idempotency(
+                api_store.fail_device_receive_intent(
                     self.config.engine,
                     operator_username=operator,
-                    endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+                    device_id=device_id,
                     idempotency_key=idempotency_key,
                 )
             return False
-        api_store.complete_idempotency(
+        return api_store.store_device_receive_response(
             self.config.engine,
             operator_username=operator,
-            endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+            device_id=device_id,
             idempotency_key=idempotency_key,
             intake_id=intake_id,
             response_json={"intakeId": intake_id, "status": "streaming"},
         )
-        return True
 
     def _identity(self, context: Any) -> grpc_store.DeviceIdentity:
         try:
@@ -257,7 +266,9 @@ class DeviceService(device_pb2_grpc.DeviceServiceServicer):
                 return None
         if operator is None:
             return None
-        return grpc_store.DeviceIdentity(operator=operator, device_id=stream.device_id, fingerprint="")
+        return grpc_store.DeviceIdentity(
+            operator=operator, device_id=stream.device_id, fingerprint=""
+        )
 
 
 def _card_from_proto(card: Any) -> Card:

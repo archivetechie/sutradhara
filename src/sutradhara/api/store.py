@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     CheckConstraint,
     DateTime,
     Index,
@@ -15,7 +17,10 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     delete,
+    false,
+    func,
     select,
+    update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, Session, mapped_column
@@ -27,8 +32,21 @@ DEFAULT_TTL = dt.timedelta(minutes=30)
 DEFAULT_HEARTBEAT_INTERVAL = dt.timedelta(seconds=5)
 RECEIVE_ENDPOINT = "/api/receive"
 DEVICE_RECEIVE_ENDPOINT = "POST /api/devices/receive"
+DUPLICATE_WARNED_EVENT = "receive_duplicate_warned"
+DUPLICATE_ACKNOWLEDGED_EVENT = "receive_duplicate_acknowledged"
+CARD_LEASE_PREFIX = "card-identity:"
+LOG = logging.getLogger(__name__)
 
 IdempotencyState = Literal["claimed", "completed", "conflict", "in_progress"]
+DeviceIntentState = Literal[
+    "warned",
+    "authorized",
+    "completed",
+    "conflict",
+    "in_progress",
+    "busy",
+    "terminal",
+]
 
 
 class IdempotencyRecord(Base):
@@ -43,10 +61,17 @@ class IdempotencyRecord(Base):
             name="uq_idempotency_scope",
         ),
         CheckConstraint(
-            "status IN ('in_progress', 'completed')",
+            "status IN ('in_progress', 'completed', 'warned', 'authorized', 'started', "
+            "'committed', 'aborted', 'quarantined', 'failed')",
             name="ck_idempotency_record_status",
         ),
         Index("ix_idempotency_record_last_heartbeat", "last_heartbeat"),
+        Index(
+            "ix_idempotency_record_card_intent",
+            "endpoint",
+            "card_identity",
+            "status",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -57,6 +82,20 @@ class IdempotencyRecord(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     intake_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     response_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    device_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    card_identity: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    card_label: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    duplicate_warning: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    duplicate_acknowledged: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    lease_source_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    warned_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    authorized_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    terminal_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
     )
@@ -72,9 +111,7 @@ class SourceClaim(Base):
     """One durable lease for a receive source while a receive is in progress."""
 
     __tablename__ = "source_claim"
-    __table_args__ = (
-        Index("ix_source_claim_last_heartbeat", "last_heartbeat"),
-    )
+    __table_args__ = (Index("ix_source_claim_last_heartbeat", "last_heartbeat"),)
 
     source_id: Mapped[str] = mapped_column(String(256), primary_key=True)
     operator_username: Mapped[str] = mapped_column(String(256), nullable=False)
@@ -99,6 +136,23 @@ class IdempotencyDecision:
     response_json: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class DeviceIntentDecision:
+    """Result of claiming or replaying a card-identity receive intent."""
+
+    state: DeviceIntentState
+    response_json: dict[str, Any] | None = None
+    terminal_state: str | None = None
+
+
+@dataclass(frozen=True)
+class StartIntentDecision:
+    """Atomic authorization result used by the proto-unchanged StartIntake RPC."""
+
+    state: Literal["claimed", "resume", "missing"]
+    intake_id: str | None = None
+
+
 def begin_idempotency(
     engine: Any,
     *,
@@ -121,6 +175,328 @@ def begin_idempotency(
         )
     except IntegrityError:
         return IdempotencyDecision("in_progress")
+
+
+def begin_device_receive_intent(
+    engine: Any,
+    *,
+    operator_username: str,
+    device_id: str,
+    card_identity: str,
+    card_label: str | None,
+    idempotency_key: str,
+    request_hash: str,
+    acknowledge_duplicate: bool,
+    ttl: dt.timedelta = DEFAULT_TTL,
+) -> DeviceIntentDecision:
+    """Atomically perform the duplicate handshake and card lease transition."""
+
+    try:
+        return _begin_device_receive_intent_once(
+            engine,
+            operator_username=operator_username,
+            device_id=device_id,
+            card_identity=card_identity,
+            card_label=card_label,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            acknowledge_duplicate=acknowledge_duplicate,
+            ttl=ttl,
+        )
+    except IntegrityError:
+        try:
+            return _begin_device_receive_intent_once(
+                engine,
+                operator_username=operator_username,
+                device_id=device_id,
+                card_identity=card_identity,
+                card_label=card_label,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                acknowledge_duplicate=acknowledge_duplicate,
+                ttl=ttl,
+            )
+        except IntegrityError:
+            return DeviceIntentDecision("in_progress")
+
+
+def claim_start_intake(
+    session: Session,
+    *,
+    operator_username: str,
+    device_id: str,
+    idempotency_key: str,
+    intake_id: str,
+    ttl: dt.timedelta = DEFAULT_TTL,
+) -> StartIntentDecision:
+    """Link StartIntake to an authorized HTTP intent in the caller transaction."""
+
+    record = _idempotency_record(
+        session,
+        operator_username=operator_username,
+        endpoint=DEVICE_RECEIVE_ENDPOINT,
+        idempotency_key=idempotency_key,
+    )
+    if record is None or record.device_id != device_id:
+        return StartIntentDecision("missing")
+    now = _utcnow()
+    if record.status in {"authorized", "started"} and _is_stale(
+        record.last_heartbeat,
+        ttl=ttl,
+        now=now,
+    ):
+        record.status = "failed"
+        record.terminal_at = now
+        record.updated_at = now
+        _release_record_lease(session, record)
+        return StartIntentDecision("missing")
+    if record.status == "started" and record.intake_id:
+        return StartIntentDecision("resume", record.intake_id)
+    if record.status != "authorized" or record.card_identity is None:
+        return StartIntentDecision("missing")
+    lease_source_id = record.lease_source_id or card_lease_source_id(record.card_identity)
+    if not _claim_source_in_session(
+        session,
+        source_id=lease_source_id,
+        operator_username=operator_username,
+        idempotency_key=idempotency_key,
+        ttl=ttl,
+        now=now,
+    ):
+        return StartIntentDecision("missing")
+    claimed = session.execute(
+        update(IdempotencyRecord)
+        .where(
+            IdempotencyRecord.id == record.id,
+            IdempotencyRecord.status == "authorized",
+        )
+        .values(
+            status="started",
+            intake_id=intake_id,
+            lease_source_id=lease_source_id,
+            started_at=now,
+            updated_at=now,
+            last_heartbeat=now,
+        )
+    )
+    if claimed.rowcount != 1:
+        session.expire(record)
+        session.refresh(record)
+        if record.status == "started" and record.intake_id:
+            return StartIntentDecision("resume", record.intake_id)
+        return StartIntentDecision("missing")
+    claim = session.get(SourceClaim, lease_source_id)
+    if claim is not None and claim.idempotency_key == idempotency_key:
+        claim.intake_id = intake_id
+        claim.updated_at = now
+    return StartIntentDecision("claimed", intake_id)
+
+
+def store_device_receive_response(
+    engine: Any,
+    *,
+    operator_username: str,
+    device_id: str,
+    idempotency_key: str,
+    intake_id: str,
+    response_json: dict[str, Any],
+) -> bool:
+    """Persist the HTTP response without collapsing the intent's started state."""
+
+    now = _utcnow()
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        record = _idempotency_record(
+            session,
+            operator_username=operator_username,
+            endpoint=DEVICE_RECEIVE_ENDPOINT,
+            idempotency_key=idempotency_key,
+        )
+        if (
+            record is None
+            or record.device_id != device_id
+            or record.intake_id != intake_id
+            or record.status not in {"started", "committed"}
+        ):
+            return False
+        record.response_json = response_json
+        record.updated_at = now
+        record.last_heartbeat = now
+        return True
+
+
+def transition_device_intent_terminal(
+    session: Session,
+    *,
+    intake_id: str,
+    terminal_state: Literal["committed", "aborted", "quarantined", "failed"],
+) -> bool:
+    """Terminalize an intake-linked intent and release its card lease atomically."""
+
+    record = session.scalars(
+        select(IdempotencyRecord).where(
+            IdempotencyRecord.endpoint == DEVICE_RECEIVE_ENDPOINT,
+            IdempotencyRecord.intake_id == intake_id,
+        )
+    ).one_or_none()
+    if record is None:
+        return False
+    if record.status == terminal_state:
+        return True
+    if record.status in {"aborted", "quarantined", "failed"}:
+        return False
+    if record.status not in {"started", "committed"}:
+        return False
+    now = _utcnow()
+    record.status = terminal_state
+    record.terminal_at = now
+    record.updated_at = now
+    record.last_heartbeat = now
+    _release_record_lease(session, record)
+    return True
+
+
+def fail_device_receive_intent(
+    engine: Any,
+    *,
+    operator_username: str,
+    device_id: str,
+    idempotency_key: str,
+) -> bool:
+    """Fail a pre-link authorized intent and release its lease for a clean retry."""
+
+    now = _utcnow()
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        record = _idempotency_record(
+            session,
+            operator_username=operator_username,
+            endpoint=DEVICE_RECEIVE_ENDPOINT,
+            idempotency_key=idempotency_key,
+        )
+        if record is None or record.device_id != device_id:
+            return False
+        if record.status != "authorized":
+            return False
+        record.status = "failed"
+        record.terminal_at = now
+        record.updated_at = now
+        record.last_heartbeat = now
+        _release_record_lease(session, record)
+        return True
+
+
+def renew_device_intake_lease(
+    engine: Any,
+    *,
+    intake_id: str,
+    floor: dt.timedelta = DEFAULT_HEARTBEAT_INTERVAL,
+) -> bool:
+    """Renew a started intent and its lease after a committed file receipt."""
+
+    now = _utcnow()
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        record = session.scalars(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.endpoint == DEVICE_RECEIVE_ENDPOINT,
+                IdempotencyRecord.intake_id == intake_id,
+                IdempotencyRecord.status == "started",
+            )
+        ).one_or_none()
+        if record is None or record.lease_source_id is None:
+            return False
+        if _aware(record.last_heartbeat) + floor > now:
+            return False
+        claim = session.get(SourceClaim, record.lease_source_id)
+        if claim is None or claim.idempotency_key != record.idempotency_key:
+            return False
+        record.updated_at = now
+        record.last_heartbeat = now
+        claim.updated_at = now
+        claim.last_heartbeat = now
+        return True
+
+
+def reconcile_device_receive_leases(
+    engine: Any,
+    *,
+    ttl: dt.timedelta = DEFAULT_TTL,
+) -> dict[str, int]:
+    """Rebuild live card leases from durable intents and expire stale owners."""
+
+    now = _utcnow()
+    rebuilt = 0
+    expired = 0
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        records = list(
+            session.scalars(
+                select(IdempotencyRecord)
+                .where(
+                    IdempotencyRecord.endpoint == DEVICE_RECEIVE_ENDPOINT,
+                    IdempotencyRecord.status.in_(("authorized", "started")),
+                    IdempotencyRecord.card_identity.is_not(None),
+                )
+                .order_by(IdempotencyRecord.created_at, IdempotencyRecord.id)
+            )
+        )
+        for record in records:
+            if _is_stale(record.last_heartbeat, ttl=ttl, now=now):
+                record.status = "failed"
+                record.terminal_at = now
+                record.updated_at = now
+                _release_record_lease(session, record)
+                expired += 1
+                continue
+            assert record.card_identity is not None
+            lease_source_id = record.lease_source_id or card_lease_source_id(record.card_identity)
+            if _claim_source_in_session(
+                session,
+                source_id=lease_source_id,
+                operator_username=record.operator_username,
+                idempotency_key=record.idempotency_key,
+                ttl=ttl,
+                now=now,
+            ):
+                record.lease_source_id = lease_source_id
+                rebuilt += 1
+            else:
+                record.status = "failed"
+                record.terminal_at = now
+                record.updated_at = now
+                expired += 1
+    return {"rebuilt": rebuilt, "expired": expired}
+
+
+def card_lease_source_id(card_identity: str) -> str:
+    """Namespace a card identity away from `/api/receive` source ids."""
+
+    return f"{CARD_LEASE_PREFIX}{card_identity}"
+
+
+def duplicate_telemetry_counts(engine: Any) -> dict[str, int]:
+    """Count the two named duplicate-warning outcomes from durable intent rows."""
+
+    factory = make_session_factory(engine)
+    with factory() as session:
+        unacknowledged = session.scalar(
+            select(func.count(IdempotencyRecord.id)).where(
+                IdempotencyRecord.endpoint == DEVICE_RECEIVE_ENDPOINT,
+                IdempotencyRecord.status == "warned",
+                IdempotencyRecord.duplicate_acknowledged.is_(False),
+            )
+        )
+        acknowledged = session.scalar(
+            select(func.count(IdempotencyRecord.id)).where(
+                IdempotencyRecord.endpoint == DEVICE_RECEIVE_ENDPOINT,
+                IdempotencyRecord.duplicate_acknowledged.is_(True),
+            )
+        )
+    return {
+        "warned_then_never_acknowledged": int(unacknowledged or 0),
+        "warned_then_acknowledged": int(acknowledged or 0),
+    }
 
 
 def complete_idempotency(
@@ -173,32 +549,6 @@ def abandon_idempotency(
             session.delete(record)
 
 
-def release_idempotency(
-    engine: Any,
-    *,
-    operator_username: str,
-    endpoint: str,
-    idempotency_key: str,
-) -> None:
-    """Delete an idempotency row regardless of completion state.
-
-    gRPC AbortIntake uses this after deleting a not-yet-committed intake so the
-    same StartIntake key can mint a fresh id. The HTTP receive endpoint keeps
-    using ``abandon_idempotency`` for non-durable in-progress failures.
-    """
-
-    factory = make_session_factory(engine)
-    with factory.begin() as session:
-        record = _idempotency_record(
-            session,
-            operator_username=operator_username,
-            endpoint=endpoint,
-            idempotency_key=idempotency_key,
-        )
-        if record is not None:
-            session.delete(record)
-
-
 def refresh_idempotency(
     engine: Any,
     *,
@@ -236,28 +586,14 @@ def claim_source(
     factory = make_session_factory(engine)
     try:
         with factory.begin() as session:
-            claim = session.get(SourceClaim, source_id)
-            if claim is None:
-                session.add(
-                    SourceClaim(
-                        source_id=source_id,
-                        operator_username=operator_username,
-                        idempotency_key=idempotency_key,
-                        created_at=now,
-                        updated_at=now,
-                        last_heartbeat=now,
-                    )
-                )
-                return True
-            if not _is_stale(claim.last_heartbeat, ttl=ttl, now=now):
-                return False
-            claim.operator_username = operator_username
-            claim.idempotency_key = idempotency_key
-            claim.intake_id = None
-            claim.created_at = now
-            claim.updated_at = now
-            claim.last_heartbeat = now
-            return True
+            return _claim_source_in_session(
+                session,
+                source_id=source_id,
+                operator_username=operator_username,
+                idempotency_key=idempotency_key,
+                ttl=ttl,
+                now=now,
+            )
     except IntegrityError:
         return False
 
@@ -357,6 +693,188 @@ def _begin_idempotency_once(
         record.updated_at = now
         record.last_heartbeat = now
         return IdempotencyDecision("claimed")
+
+
+def _begin_device_receive_intent_once(
+    engine: Any,
+    *,
+    operator_username: str,
+    device_id: str,
+    card_identity: str,
+    card_label: str | None,
+    idempotency_key: str,
+    request_hash: str,
+    acknowledge_duplicate: bool,
+    ttl: dt.timedelta,
+) -> DeviceIntentDecision:
+    from sutradhara.api.receive_history import latest_card_history
+
+    now = _utcnow()
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        record = _idempotency_record(
+            session,
+            operator_username=operator_username,
+            endpoint=DEVICE_RECEIVE_ENDPOINT,
+            idempotency_key=idempotency_key,
+        )
+        if record is None:
+            record = IdempotencyRecord(
+                operator_username=operator_username,
+                endpoint=DEVICE_RECEIVE_ENDPOINT,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                status="in_progress",
+                device_id=device_id,
+                card_identity=card_identity,
+                card_label=card_label,
+                created_at=now,
+                updated_at=now,
+                last_heartbeat=now,
+            )
+            session.add(record)
+            session.flush()
+            history = latest_card_history(
+                session,
+                card_identity=card_identity,
+                requester=operator_username,
+                exclude_intent_id=record.id,
+            )
+            if history is not None:
+                warning = {"duplicateWarning": history.warning_payload()}
+                record.status = "warned"
+                record.duplicate_warning = warning
+                record.warned_at = now
+                LOG.info(
+                    "%s operator=%s device_id=%s card_identity=%s visible=%s",
+                    DUPLICATE_WARNED_EVENT,
+                    operator_username,
+                    device_id,
+                    card_identity,
+                    history.visible,
+                )
+                return DeviceIntentDecision("warned", warning)
+            if not _authorize_record_lease(session, record, ttl=ttl, now=now):
+                session.delete(record)
+                return DeviceIntentDecision("busy")
+            return DeviceIntentDecision("authorized")
+
+        if record.request_hash != request_hash:
+            return DeviceIntentDecision("conflict")
+        if record.device_id != device_id or record.card_identity != card_identity:
+            return DeviceIntentDecision("conflict")
+        if record.status in {"authorized", "started"} and _is_stale(
+            record.last_heartbeat,
+            ttl=ttl,
+            now=now,
+        ):
+            record.status = "failed"
+            record.terminal_at = now
+            record.updated_at = now
+            _release_record_lease(session, record)
+            return DeviceIntentDecision("terminal", terminal_state="failed")
+        if record.status == "warned":
+            if not acknowledge_duplicate:
+                return DeviceIntentDecision("warned", record.duplicate_warning)
+            history = latest_card_history(
+                session,
+                card_identity=card_identity,
+                requester=operator_username,
+                exclude_intent_id=record.id,
+            )
+            if history is not None:
+                record.duplicate_warning = {"duplicateWarning": history.warning_payload()}
+            if not _authorize_record_lease(session, record, ttl=ttl, now=now):
+                return DeviceIntentDecision("busy")
+            record.duplicate_acknowledged = True
+            LOG.info(
+                "%s operator=%s device_id=%s card_identity=%s",
+                DUPLICATE_ACKNOWLEDGED_EVENT,
+                operator_username,
+                device_id,
+                card_identity,
+            )
+            return DeviceIntentDecision("authorized")
+        if record.status in {"authorized", "started"}:
+            if record.response_json is not None:
+                return DeviceIntentDecision("completed", record.response_json)
+            return DeviceIntentDecision("in_progress")
+        if record.status == "committed":
+            if record.response_json is not None:
+                return DeviceIntentDecision("completed", record.response_json)
+            return DeviceIntentDecision("terminal", terminal_state=record.status)
+        if record.status in {"aborted", "quarantined", "failed"}:
+            return DeviceIntentDecision("terminal", terminal_state=record.status)
+        return DeviceIntentDecision("conflict")
+
+
+def _authorize_record_lease(
+    session: Session,
+    record: IdempotencyRecord,
+    *,
+    ttl: dt.timedelta,
+    now: dt.datetime,
+) -> bool:
+    assert record.card_identity is not None
+    lease_source_id = card_lease_source_id(record.card_identity)
+    if not _claim_source_in_session(
+        session,
+        source_id=lease_source_id,
+        operator_username=record.operator_username,
+        idempotency_key=record.idempotency_key,
+        ttl=ttl,
+        now=now,
+    ):
+        return False
+    record.status = "authorized"
+    record.lease_source_id = lease_source_id
+    record.authorized_at = now
+    record.updated_at = now
+    record.last_heartbeat = now
+    return True
+
+
+def _claim_source_in_session(
+    session: Session,
+    *,
+    source_id: str,
+    operator_username: str,
+    idempotency_key: str,
+    ttl: dt.timedelta,
+    now: dt.datetime,
+) -> bool:
+    claim = session.get(SourceClaim, source_id)
+    if claim is None:
+        session.add(
+            SourceClaim(
+                source_id=source_id,
+                operator_username=operator_username,
+                idempotency_key=idempotency_key,
+                created_at=now,
+                updated_at=now,
+                last_heartbeat=now,
+            )
+        )
+        return True
+    if claim.operator_username == operator_username and claim.idempotency_key == idempotency_key:
+        return True
+    if not _is_stale(claim.last_heartbeat, ttl=ttl, now=now):
+        return False
+    claim.operator_username = operator_username
+    claim.idempotency_key = idempotency_key
+    claim.intake_id = None
+    claim.created_at = now
+    claim.updated_at = now
+    claim.last_heartbeat = now
+    return True
+
+
+def _release_record_lease(session: Session, record: IdempotencyRecord) -> None:
+    if record.lease_source_id is None:
+        return
+    claim = session.get(SourceClaim, record.lease_source_id)
+    if claim is not None and claim.idempotency_key == record.idempotency_key:
+        session.delete(claim)
 
 
 def _idempotency_record(

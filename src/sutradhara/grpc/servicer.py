@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import grpc
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine
 
 from sutradhara._proto import intake_pb2, intake_pb2_grpc
 from sutradhara.api import store as api_store
@@ -50,6 +50,7 @@ class GrpcIntakeConfig:
     landing_root: Path
     validate_artifactclass: bool = True
     progress_registry: ReceiveProgressRegistry | None = None
+    lease_renewal_floor: dt.timedelta = api_store.DEFAULT_HEARTBEAT_INTERVAL
 
 
 @dataclass
@@ -71,56 +72,60 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
     def StartIntake(self, request: Any, context: Any) -> Any:
         identity = self._identity(context)
         self._validate_start_request(request, context)
-        request_hash = _start_request_hash(request)
-        decision = api_store.begin_idempotency(
-            self.config.engine,
-            operator_username=identity.operator,
-            endpoint=grpc_store.GRPC_START_ENDPOINT,
-            idempotency_key=request.idempotency_key,
-            request_hash=request_hash,
-        )
-        if decision.state == "completed":
-            response = decision.response_json or {}
-            intake_id = str(response.get("intake_id", ""))
-            self._assert_resume_source_plan(intake_id, identity, request.source_plan_digest, context)
-            self.progress_registry.start(
-                intake_id,
-                planned_bytes_total=_planned_bytes_total(request),
-            )
-            return intake_pb2.StartIntakeResponse(intake_id=intake_id)
-        if decision.state == "conflict":
-            self._abort_if_resume_source_changed(request, identity, context)
-            _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "idempotency key conflict")
-        if decision.state != "claimed":
-            _abort(context, grpc.StatusCode.ALREADY_EXISTS, "intake start already in progress")
-
         now = dt.datetime.now(dt.UTC)
         intake_id = _mint_intake_id(identity.operator, now, self.config.landing_root)
         intake_dir = self.config.landing_root / intake_id
         try:
-            intake_dir.mkdir(parents=True, mode=0o755)
-            (intake_dir / DATA_DIR_NAME).mkdir()
-            (intake_dir / ".incoming").mkdir()
-            _write_json(
-                intake_dir / ".receiving.json",
-                {
-                    "intake_id": intake_id,
-                    "landing": str(self.config.landing_root),
-                    "source_kind": request.source_kind,
-                    "operator": identity.operator,
-                    "device_id": identity.device_id,
-                    "source_ref": request.source_ref,
-                    "artifactclass": request.artifactclass,
-                    "label": request.label,
-                    "started_at": now.isoformat(),
-                    "receive_version": "grpc-stream-v1",
-                    "canonicalization_version": CANONICALIZATION_VERSION,
-                    "transport": "grpc-stream",
-                    "state": "streaming",
-                },
-            )
             factory = make_session_factory(self.config.engine)
             with factory.begin() as session:
+                decision = api_store.claim_start_intake(
+                    session,
+                    operator_username=identity.operator,
+                    device_id=identity.device_id,
+                    idempotency_key=request.idempotency_key,
+                    intake_id=intake_id,
+                )
+                if decision.state == "missing":
+                    _abort(
+                        context,
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        "no authorized receive intent",
+                    )
+                if decision.state == "resume":
+                    assert decision.intake_id is not None
+                    self._assert_resume_request(
+                        decision.intake_id,
+                        identity,
+                        request,
+                        context,
+                    )
+                    self.progress_registry.start(
+                        decision.intake_id,
+                        planned_bytes_total=_planned_bytes_total(request),
+                    )
+                    return intake_pb2.StartIntakeResponse(intake_id=decision.intake_id)
+
+                intake_dir.mkdir(parents=True, mode=0o755)
+                (intake_dir / DATA_DIR_NAME).mkdir()
+                (intake_dir / ".incoming").mkdir()
+                _write_json(
+                    intake_dir / ".receiving.json",
+                    {
+                        "intake_id": intake_id,
+                        "landing": str(self.config.landing_root),
+                        "source_kind": request.source_kind,
+                        "operator": identity.operator,
+                        "device_id": identity.device_id,
+                        "source_ref": request.source_ref,
+                        "artifactclass": request.artifactclass,
+                        "label": request.label,
+                        "started_at": now.isoformat(),
+                        "receive_version": "grpc-stream-v1",
+                        "canonicalization_version": CANONICALIZATION_VERSION,
+                        "transport": "grpc-stream",
+                        "state": "streaming",
+                    },
+                )
                 grpc_store.insert_intake(
                     session,
                     intake_id=intake_id,
@@ -134,25 +139,11 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                     label=request.label or None,
                     landing_root=str(self.config.landing_root),
                 )
-            api_store.complete_idempotency(
-                self.config.engine,
-                operator_username=identity.operator,
-                endpoint=grpc_store.GRPC_START_ENDPOINT,
-                idempotency_key=request.idempotency_key,
-                intake_id=intake_id,
-                response_json={"intake_id": intake_id},
-            )
             self.progress_registry.start(
                 intake_id,
                 planned_bytes_total=_planned_bytes_total(request),
             )
         except Exception:
-            api_store.abandon_idempotency(
-                self.config.engine,
-                operator_username=identity.operator,
-                endpoint=grpc_store.GRPC_START_ENDPOINT,
-                idempotency_key=request.idempotency_key,
-            )
             if intake_dir.exists():
                 shutil.rmtree(intake_dir)
             raise
@@ -259,7 +250,9 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
     def AbortIntake(self, request: Any, context: Any) -> Any:
         row = self._owned_row(request.intake_id, context)
         if row.state == "committed":
-            _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "committed intake cannot be aborted")
+            _abort(
+                context, grpc.StatusCode.FAILED_PRECONDITION, "committed intake cannot be aborted"
+            )
         if row.state != "aborted":
             intake_dir = _intake_dir(row)
             if intake_dir.exists():
@@ -267,12 +260,11 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             factory = make_session_factory(self.config.engine)
             with factory.begin() as session:
                 grpc_store.set_state(session, row.intake_id, "aborted")
-            api_store.release_idempotency(
-                self.config.engine,
-                operator_username=row.operator,
-                endpoint=grpc_store.GRPC_START_ENDPOINT,
-                idempotency_key=row.idempotency_key,
-            )
+                api_store.transition_device_intent_terminal(
+                    session,
+                    intake_id=row.intake_id,
+                    terminal_state="aborted",
+                )
         self.progress_registry.discard(row.intake_id)
         return intake_pb2.AbortIntakeResponse(intake_id=row.intake_id, status="aborted")
 
@@ -309,7 +301,9 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                         total = max(total, int(chunk.file_size))
                     if chunk.data:
                         if chunk.offset != received:
-                            _abort(context, grpc.StatusCode.INVALID_ARGUMENT, "unexpected chunk offset")
+                            _abort(
+                                context, grpc.StatusCode.INVALID_ARGUMENT, "unexpected chunk offset"
+                            )
                         digest.update(chunk.data)
                         handle.write(chunk.data)
                         received += len(chunk.data)
@@ -338,6 +332,11 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             )
             with runtime.ledger_lock:
                 _append_receipt(intake_dir, relpath=relpath, digest=server_sha, size=received)
+            api_store.renew_device_intake_lease(
+                self.config.engine,
+                intake_id=row.intake_id,
+                floor=self.config.lease_renewal_floor,
+            )
             return intake_pb2.FileReceipt(
                 relpath=relpath,
                 server_sha256=server_sha,
@@ -394,11 +393,11 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             except ArtifactClassPolicyError as exc:
                 _abort(context, grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
-    def _assert_resume_source_plan(
+    def _assert_resume_request(
         self,
         intake_id: str,
         identity: grpc_store.DeviceIdentity,
-        source_plan_digest: str,
+        request: Any,
         context: Any,
     ) -> None:
         if not intake_id:
@@ -410,52 +409,19 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                 _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "resume intake is unknown")
             if row.operator != identity.operator or row.device_id != identity.device_id:
                 _abort(context, grpc.StatusCode.PERMISSION_DENIED, "intake owner mismatch")
-            if row.source_plan_digest != source_plan_digest:
-                _abort(
-                    context,
-                    grpc.StatusCode.FAILED_PRECONDITION,
-                    "source changed; start a new intake",
-                )
-
-    def _abort_if_resume_source_changed(
-        self,
-        request: Any,
-        identity: grpc_store.DeviceIdentity,
-        context: Any,
-    ) -> None:
-        factory = make_session_factory(self.config.engine)
-        with factory() as session:
-            record = session.scalars(
-                select(api_store.IdempotencyRecord).where(
-                    api_store.IdempotencyRecord.operator_username == identity.operator,
-                    api_store.IdempotencyRecord.endpoint == grpc_store.GRPC_START_ENDPOINT,
-                    api_store.IdempotencyRecord.idempotency_key == request.idempotency_key,
-                )
-            ).one_or_none()
-            if record is None or record.status != "completed" or record.intake_id is None:
-                return
-            row = grpc_store.get_intake(session, record.intake_id)
-            if row is None or row.operator != identity.operator or row.device_id != identity.device_id:
-                return
             if row.source_plan_digest != request.source_plan_digest:
                 _abort(
                     context,
                     grpc.StatusCode.FAILED_PRECONDITION,
                     "source changed; start a new intake",
                 )
-
-
-def _start_request_hash(request: Any) -> str:
-    payload = {
-        "artifactclass": request.artifactclass,
-        "source_kind": request.source_kind,
-        "source_ref": request.source_ref,
-        "label": request.label,
-        "source_plan_digest": request.source_plan_digest,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+            if (
+                row.artifactclass != request.artifactclass
+                or row.source_kind != request.source_kind
+                or (row.source_ref or "") != request.source_ref
+                or (row.label or "") != request.label
+            ):
+                _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "idempotency key conflict")
 
 
 def _validate_wire_relpath(raw: str, context: Any) -> str:

@@ -135,13 +135,7 @@ def test_device_service_ack_correlates_card_id_and_completes_http_idempotency(
             label="Card 1",
             landing_root=str(tmp_path),
         )
-    api_store.begin_idempotency(
-        engine,
-        operator_username="ada",
-        endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
-        idempotency_key="key-1",
-        request_hash="a" * 64,
-    )
+    _add_started_http_intent(engine, intake_id="intake-1")
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
@@ -185,9 +179,12 @@ def test_device_service_ack_correlates_card_id_and_completes_http_idempotency(
     )
     assert pending.future.result(timeout=2).intake_id == "intake-1"
     _eventually(lambda: _stored_card_id(engine) == "card-1")
-    _eventually(lambda: _idempotency_status(engine) == "completed")
+    _eventually(
+        lambda: _idempotency_response(engine) == {"intakeId": "intake-1", "status": "streaming"}
+    )
     with session_scope(engine) as session:
         record = session.scalars(select(api_store.IdempotencyRecord)).one()
+        assert record.status == "started"
         assert record.response_json == {"intakeId": "intake-1", "status": "streaming"}
     messages.close()
     responses.close()
@@ -219,13 +216,7 @@ def test_active_receives_rebuilds_card_correlation_after_restart(
             label="Card 1",
             landing_root=str(tmp_path),
         )
-    api_store.begin_idempotency(
-        engine,
-        operator_username="ada",
-        endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
-        idempotency_key="key-1",
-        request_hash="a" * 64,
-    )
+    _add_started_http_intent(engine, intake_id="intake-1")
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
@@ -392,13 +383,7 @@ def test_device_service_ack_does_not_complete_when_card_correlation_fails(
             cert_fingerprint="AA" * 32,
             operator="ada",
         )
-    api_store.begin_idempotency(
-        engine,
-        operator_username="ada",
-        endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
-        idempotency_key="key-1",
-        request_hash="a" * 64,
-    )
+    _add_started_http_intent(engine, intake_id="intake-expected")
 
     messages = _BlockingIterator()
     responses = servicer.Connect(messages, _FakeContext("mac-1", "AA" * 32))
@@ -441,7 +426,8 @@ def test_device_service_ack_does_not_complete_when_card_correlation_fails(
         )
     )
     assert pending.future.result(timeout=2).intake_id == "missing-intake"
-    _eventually(lambda: _idempotency_record_count(engine) == 0)
+    _eventually(lambda: _idempotency_status(engine) == "started")
+    assert _idempotency_response(engine) is None
     messages.close()
     responses.close()
 
@@ -452,15 +438,41 @@ def _stored_card_id(engine: Engine) -> str | None:
         return None if row is None else row.card_id
 
 
-def _idempotency_record_count(engine: Engine) -> int:
-    with session_scope(engine) as session:
-        return len(list(session.scalars(select(api_store.IdempotencyRecord))))
-
-
 def _idempotency_status(engine: Engine) -> str | None:
     with session_scope(engine) as session:
         record = session.scalars(select(api_store.IdempotencyRecord)).one_or_none()
         return None if record is None else record.status
+
+
+def _idempotency_response(engine: Engine) -> dict[str, object] | None:
+    with session_scope(engine) as session:
+        record = session.scalars(select(api_store.IdempotencyRecord)).one_or_none()
+        return None if record is None else record.response_json
+
+
+def _add_started_http_intent(engine: Engine, *, intake_id: str) -> None:
+    """Create the durable HTTP authorization consumed before a device ack."""
+
+    decision = api_store.begin_device_receive_intent(
+        engine,
+        operator_username="ada",
+        device_id="mac-1",
+        card_identity="card-1",
+        card_label="Card 1",
+        idempotency_key="key-1",
+        request_hash="a" * 64,
+        acknowledge_duplicate=False,
+    )
+    assert decision.state == "authorized"
+    with session_scope(engine) as session:
+        linked = api_store.claim_start_intake(
+            session,
+            operator_username="ada",
+            device_id="mac-1",
+            idempotency_key="key-1",
+            intake_id=intake_id,
+        )
+        assert linked.state == "claimed"
 
 
 def _ignore_stop_iteration(iterator: Iterator[object]) -> None:

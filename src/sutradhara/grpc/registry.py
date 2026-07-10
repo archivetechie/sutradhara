@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import queue
+import re
 import threading
 import uuid
 from concurrent.futures import Future
@@ -19,6 +20,29 @@ from typing import Any
 
 from sutradhara._proto import device_pb2
 from sutradhara.grpc.store import DeviceIdentity
+
+CARD_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+MAX_CARD_LABEL_LENGTH = 512
+
+
+def validate_card_id(card_id: str) -> str:
+    """Validate an untrusted card/volume identity at a relay ingress boundary."""
+
+    if not CARD_ID_PATTERN.fullmatch(card_id) or card_id in {".", ".."}:
+        raise ValueError("card_id must match ^[A-Za-z0-9._-]{1,128}$")
+    return card_id
+
+
+def validate_card_label(label: str | None) -> str | None:
+    """Bound an untrusted card display label and reject control characters."""
+
+    if label is None:
+        return None
+    if len(label) > MAX_CARD_LABEL_LENGTH:
+        raise ValueError(f"label must be at most {MAX_CARD_LABEL_LENGTH} characters")
+    if any(ord(character) < 32 and character not in {"\t"} for character in label):
+        raise ValueError("label must not contain control characters")
+    return label
 
 
 class RegistryError(RuntimeError):
@@ -50,6 +74,12 @@ class Card:
     kind: str
     size_bytes: int
     status: str
+
+    def __post_init__(self) -> None:
+        """Reject unbounded helper-supplied card identity and display metadata."""
+
+        validate_card_id(self.card_id)
+        validate_card_label(self.label)
 
 
 @dataclass(frozen=True)
@@ -109,7 +139,9 @@ class DeviceView:
 class _DeviceEntry:
     identity: DeviceIdentity
     generation: int
-    command_queue: queue.Queue[PendingCommand | PendingListing | None] = field(default_factory=queue.Queue)
+    command_queue: queue.Queue[PendingCommand | PendingListing | None] = field(
+        default_factory=queue.Queue
+    )
     pending: dict[str, PendingCommand] = field(default_factory=dict)
     pending_listings: dict[str, PendingListing] = field(default_factory=dict)
     cards: dict[str, Card] = field(default_factory=dict)

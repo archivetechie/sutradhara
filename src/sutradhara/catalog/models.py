@@ -143,6 +143,8 @@ class Intake(Base):
     operator: Mapped[str] = mapped_column(String(128), nullable=False)
     source_kind: Mapped[IntakeSourceKind] = mapped_column(String(32), nullable=False)
     source_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    card_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    device_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     label: Mapped[str | None] = mapped_column(String(512), nullable=True)
     manifest_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)

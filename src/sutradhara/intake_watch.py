@@ -12,6 +12,7 @@ import errno
 import fcntl
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -153,8 +154,12 @@ def process_landing_once(
                         reason="locked",
                     )
                 ]
-            return _run_once_with_stability(scan, stable_polls=stable_polls, sleep=sleep, interval=interval_seconds)
-    return _run_once_with_stability(scan, stable_polls=stable_polls, sleep=sleep, interval=interval_seconds)
+            return _run_once_with_stability(
+                scan, stable_polls=stable_polls, sleep=sleep, interval=interval_seconds
+            )
+    return _run_once_with_stability(
+        scan, stable_polls=stable_polls, sleep=sleep, interval=interval_seconds
+    )
 
 
 def watch_landing(
@@ -258,7 +263,11 @@ def _merge_scan_events(
         previous = merged.get(key)
         if previous is not None and event.reason == "terminal-marker":
             continue
-        if previous is not None and previous.reason != "not-stable" and event.reason == "not-stable":
+        if (
+            previous is not None
+            and previous.reason != "not-stable"
+            and event.reason == "not-stable"
+        ):
             continue
         if key not in merged:
             order.append(key)
@@ -326,14 +335,22 @@ def _process_candidate(
     state: WatchState,
 ) -> WatchEvent:
     if (candidate / ".receiving.json").exists():
-        return WatchEvent(event="intake-skipped", path=candidate, status="skipped", reason="active-receive")
+        return WatchEvent(
+            event="intake-skipped", path=candidate, status="skipped", reason="active-receive"
+        )
     if _has_terminal_marker(candidate):
-        return WatchEvent(event="intake-skipped", path=candidate, status="skipped", reason="terminal-marker")
+        return WatchEvent(
+            event="intake-skipped", path=candidate, status="skipped", reason="terminal-marker"
+        )
     sentinel = candidate / "intake.json"
     if _file_age_seconds(sentinel) < settle_seconds:
-        return WatchEvent(event="intake-skipped", path=candidate, status="skipped", reason="not-settled")
+        return WatchEvent(
+            event="intake-skipped", path=candidate, status="skipped", reason="not-settled"
+        )
     if not _observe_stable(candidate, state=state, stable_polls=stable_polls):
-        return WatchEvent(event="intake-skipped", path=candidate, status="skipped", reason="not-stable")
+        return WatchEvent(
+            event="intake-skipped", path=candidate, status="skipped", reason="not-stable"
+        )
 
     try:
         progress = _VerificationProgressWriter(candidate)
@@ -441,6 +458,14 @@ def _register_candidate(
         session.commit()
     except IntakeDiscrepancyError as exc:
         session.rollback()
+        from sutradhara.api.store import transition_device_intent_terminal
+
+        with suppress(Exception), session.begin():
+            transition_device_intent_terminal(
+                session,
+                intake_id=exc.intake_id,
+                terminal_state="failed",
+            )
         _write_verification_failed(candidate)
         publish_intake_marker(exc.marker)
         return WatchEvent(
@@ -454,6 +479,14 @@ def _register_candidate(
         )
     except Exception as exc:
         session.rollback()
+        from sutradhara.api.store import transition_device_intent_terminal
+
+        with suppress(Exception), session.begin():
+            transition_device_intent_terminal(
+                session,
+                intake_id=candidate.name,
+                terminal_state="failed",
+            )
         _write_verification_failed(candidate)
         return WatchEvent(
             event="intake-error",
@@ -626,7 +659,14 @@ def _snapshot_is_unchanged(candidate: Path, state: WatchState) -> bool:
 
 def _stability_snapshot(candidate: Path) -> tuple[tuple[str, str, int, int], ...]:
     entries: list[tuple[str, str, int, int]] = []
-    for name in ("intake.json", BAGIT_NAME, BAG_INFO_NAME, MANIFEST_NAME, TAGMANIFEST_NAME, PACKAGE_INDEX_NAME):
+    for name in (
+        "intake.json",
+        BAGIT_NAME,
+        BAG_INFO_NAME,
+        MANIFEST_NAME,
+        TAGMANIFEST_NAME,
+        PACKAGE_INDEX_NAME,
+    ):
         _append_path_snapshot(entries, candidate / name, name)
     data_root = candidate / DATA_DIR_NAME
     if data_root.exists():

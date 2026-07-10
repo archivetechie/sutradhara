@@ -1,0 +1,403 @@
+"""Hermetic tests for receive-dedup phase 1a intent, history, and lease behavior."""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import json
+import logging
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import Engine, select
+from starlette.requests import Request
+
+from sutradhara.api import routes_devices
+from sutradhara.api import store as api_store
+from sutradhara.api.receive_history import latest_card_history
+from sutradhara.api.routes_devices import (
+    DeviceReceiveRequest,
+    _device_payloads_with_history,
+    post_device_receive,
+)
+from sutradhara.catalog.models import Intake
+from sutradhara.catalog.session import session_scope
+from sutradhara.catalog.types import IntakeSourceKind, IntakeStatus
+from sutradhara.grpc import store as grpc_store
+from sutradhara.grpc.registry import Card, CommandAck, ConnectedDeviceRegistry
+from sutradhara.grpc.store import DeviceIdentity
+from tests.api.conftest import make_api_app, post_headers
+
+
+def test_warned_authorized_replays_and_other_body_conflict(api_engine: Engine) -> None:
+    _add_catalog_intake(api_engine, intake_id="prior", card_id="card-1")
+    key = str(uuid4())
+
+    warned = _begin(api_engine, key=key, request_hash="base")
+    replay = _begin(api_engine, key=key, request_hash="base")
+    conflict = _begin(api_engine, key=key, request_hash="changed")
+    authorized = _begin(
+        api_engine,
+        key=key,
+        request_hash="base",
+        acknowledge_duplicate=True,
+    )
+    authorized_replay = _begin(
+        api_engine,
+        key=key,
+        request_hash="base",
+        acknowledge_duplicate=True,
+    )
+
+    assert warned.state == replay.state == "warned"
+    assert warned.response_json == replay.response_json
+    assert warned.response_json is not None
+    assert warned.response_json["duplicateWarning"]["matchKind"] == "card_identity"
+    assert conflict.state == "conflict"
+    assert authorized.state == "authorized"
+    assert authorized_replay.state == "in_progress"
+    with session_scope(api_engine) as session:
+        intent = session.scalars(
+            select(api_store.IdempotencyRecord).where(
+                api_store.IdempotencyRecord.idempotency_key == key
+            )
+        ).one()
+        assert intent.status == "authorized"
+        assert intent.duplicate_acknowledged is True
+        assert intent.warned_at is not None
+        assert intent.authorized_at is not None
+        assert intent.lease_source_id == api_store.card_lease_source_id("card-1")
+    assert api_store.duplicate_telemetry_counts(api_engine) == {
+        "warned_then_never_acknowledged": 0,
+        "warned_then_acknowledged": 1,
+    }
+
+
+def test_card_lease_excludes_concurrent_identity_and_reconciles_on_restart(
+    api_engine: Engine,
+) -> None:
+    first = _begin(api_engine, key="key-a", request_hash="a")
+    second = _begin(api_engine, key="key-b", request_hash="b", operator="other")
+
+    assert first.state == "authorized"
+    assert second.state == "busy"
+
+    lease_id = api_store.card_lease_source_id("card-1")
+    with session_scope(api_engine) as session:
+        claim = session.get(api_store.SourceClaim, lease_id)
+        assert claim is not None
+        session.delete(claim)
+
+    result = api_store.reconcile_device_receive_leases(api_engine)
+
+    assert result == {"rebuilt": 1, "expired": 0}
+    with session_scope(api_engine) as session:
+        claim = session.get(api_store.SourceClaim, lease_id)
+        assert claim is not None
+        assert claim.idempotency_key == "key-a"
+
+
+def test_history_projection_prefers_most_recent_failed_over_verified(
+    api_engine: Engine,
+) -> None:
+    old = dt.datetime(2026, 7, 1, tzinfo=dt.UTC)
+    _add_catalog_intake(
+        api_engine,
+        intake_id="verified-old",
+        card_id="card-1",
+        created_at=old,
+    )
+    with session_scope(api_engine) as session:
+        session.add(
+            api_store.IdempotencyRecord(
+                operator_username="ada",
+                endpoint=api_store.DEVICE_RECEIVE_ENDPOINT,
+                idempotency_key="failed-key",
+                request_hash="failed-body",
+                status="failed",
+                intake_id="failed-new",
+                device_id="mac-2",
+                card_identity="card-1",
+                card_label="Card One",
+                created_at=old + dt.timedelta(days=1),
+                updated_at=old + dt.timedelta(days=1),
+                last_heartbeat=old + dt.timedelta(days=1),
+                started_at=old + dt.timedelta(days=1),
+                terminal_at=old + dt.timedelta(days=1),
+            )
+        )
+
+    with session_scope(api_engine) as session:
+        match = latest_card_history(
+            session,
+            card_identity="card-1",
+            requester="ada",
+        )
+
+    assert match is not None
+    assert match.intake_id == "failed-new"
+    assert match.state == "failed"
+    assert match.visible is True
+
+
+def test_foreign_history_warning_contains_no_prior_metadata(api_engine: Engine) -> None:
+    _add_catalog_intake(api_engine, intake_id="foreign-prior", card_id="card-1")
+
+    warning = _begin(
+        api_engine,
+        key="foreign-key",
+        request_hash="foreign",
+        operator="other",
+    )
+
+    assert warning.state == "warned"
+    assert warning.response_json == {
+        "duplicateWarning": {
+            "matchKind": "card_identity",
+            "visible": False,
+        }
+    }
+
+
+def test_file_receipt_renewal_honors_floor_timer(api_engine: Engine) -> None:
+    assert _begin(api_engine, key="renew-key", request_hash="renew").state == "authorized"
+    with session_scope(api_engine) as session:
+        linked = api_store.claim_start_intake(
+            session,
+            operator_username="ada",
+            device_id="device-ada",
+            idempotency_key="renew-key",
+            intake_id="renew-intake",
+        )
+        assert linked.state == "claimed"
+        intent = session.scalars(
+            select(api_store.IdempotencyRecord).where(
+                api_store.IdempotencyRecord.idempotency_key == "renew-key"
+            )
+        ).one()
+        old = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=1)
+        intent.last_heartbeat = old
+        assert intent.lease_source_id is not None
+        claim = session.get(api_store.SourceClaim, intent.lease_source_id)
+        assert claim is not None
+        claim.last_heartbeat = old
+
+    assert api_store.renew_device_intake_lease(
+        api_engine,
+        intake_id="renew-intake",
+        floor=dt.timedelta(seconds=5),
+    )
+    assert not api_store.renew_device_intake_lease(
+        api_engine,
+        intake_id="renew-intake",
+        floor=dt.timedelta(seconds=5),
+    )
+
+
+def test_device_receive_returns_stored_409_then_acknowledges(
+    api_engine: Engine,
+    tmp_path: Path,
+    caplog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _add_catalog_intake(api_engine, intake_id="prior", card_id="card-1")
+    registry = _online_registry(api_engine)
+    original = registry.send_start_receive
+
+    def auto_ack(**kwargs):
+        pending = original(**kwargs)
+        with session_scope(api_engine) as session:
+            linked = api_store.claim_start_intake(
+                session,
+                operator_username="ada",
+                device_id="mac-1",
+                idempotency_key=kwargs["idempotency_key"],
+                intake_id="new-intake",
+            )
+            assert linked.state == "claimed"
+            grpc_store.insert_intake(
+                session,
+                intake_id="new-intake",
+                operator="ada",
+                device_id="mac-1",
+                idempotency_key=kwargs["idempotency_key"],
+                source_plan_digest="a" * 64,
+                artifactclass=kwargs["artifactclass"],
+                source_kind="card",
+                source_ref=kwargs["source_ref"],
+                label=kwargs["label"],
+                landing_root=str(tmp_path),
+            )
+        pending.future.set_result(
+            CommandAck(
+                command_id=pending.command_id,
+                accepted=True,
+                reason=None,
+                intake_id="new-intake",
+            )
+        )
+        return pending
+
+    registry.send_start_receive = auto_ack  # type: ignore[method-assign]
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    key = str(uuid4())
+    payload = {
+        "card_id": "card-1",
+        "artifactclass": "s-masters",
+        "idempotencyKey": key,
+    }
+
+    async def direct_run_sync(func, *args, **_kwargs):
+        return func(*args)
+
+    monkeypatch.setattr(routes_devices.anyio.to_thread, "run_sync", direct_run_sync)
+    request = _request(app)
+
+    with caplog.at_level(logging.INFO, logger="sutradhara.api.store"):
+        warning = asyncio.run(
+            post_device_receive(
+                "mac-1",
+                request,
+                DeviceReceiveRequest.model_validate(payload),
+            )
+        )
+        warning_replay = asyncio.run(
+            post_device_receive(
+                "mac-1",
+                request,
+                DeviceReceiveRequest.model_validate(payload),
+            )
+        )
+        accepted = asyncio.run(
+            post_device_receive(
+                "mac-1",
+                request,
+                DeviceReceiveRequest.model_validate({**payload, "acknowledge_duplicate": True}),
+            )
+        )
+
+    assert warning.status_code == warning_replay.status_code == 409
+    warning_body = json.loads(warning.body)
+    assert warning_body == json.loads(warning_replay.body)
+    assert warning_body["duplicateWarning"]["priorIntake"]["intakeId"] == "prior"
+    assert accepted == {"intakeId": "new-intake", "status": "streaming"}
+    assert api_store.DUPLICATE_WARNED_EVENT in caplog.text
+    assert api_store.DUPLICATE_ACKNOWLEDGED_EVENT in caplog.text
+
+
+def test_devices_received_before_uses_same_projection(api_engine: Engine) -> None:
+    _add_catalog_intake(api_engine, intake_id="prior", card_id="card-1")
+    registry = _online_registry(api_engine, enroll=False)
+
+    payload = _device_payloads_with_history(api_engine, "ada", registry.devices_for("ada"))
+
+    badge = payload[0]["cards"][0]["receivedBefore"]
+    assert badge["state"] == "verified"
+    assert badge["visible"] is True
+    assert badge["receivedAt"] is not None
+
+
+def test_card_snapshot_identity_and_label_are_bounded() -> None:
+    with pytest.raises(ValueError, match="card_id"):
+        Card(card_id="bad/card", label="Card", kind="card", size_bytes=1, status="available")
+    with pytest.raises(ValueError, match="at most 512"):
+        Card(
+            card_id="card-1",
+            label="x" * 513,
+            kind="card",
+            size_bytes=1,
+            status="available",
+        )
+
+
+def _begin(
+    engine: Engine,
+    *,
+    key: str,
+    request_hash: str,
+    acknowledge_duplicate: bool = False,
+    operator: str = "ada",
+):
+    return api_store.begin_device_receive_intent(
+        engine,
+        operator_username=operator,
+        device_id=f"device-{operator}",
+        card_identity="card-1",
+        card_label="Card One",
+        idempotency_key=key,
+        request_hash=request_hash,
+        acknowledge_duplicate=acknowledge_duplicate,
+    )
+
+
+def _add_catalog_intake(
+    engine: Engine,
+    *,
+    intake_id: str,
+    card_id: str,
+    created_at: dt.datetime | None = None,
+) -> None:
+    timestamp = created_at or dt.datetime.now(dt.UTC)
+    with session_scope(engine) as session:
+        session.add(
+            Intake(
+                intake_id=intake_id,
+                operator="ada",
+                source_kind=IntakeSourceKind.CARD,
+                source_ref="DCIM",
+                card_id=card_id,
+                device_id="mac-old",
+                artifactclass="s-masters",
+                label="Card One",
+                status=IntakeStatus.REGISTERED,
+                created_at=timestamp,
+                updated_at=timestamp,
+                registered_at=timestamp,
+            )
+        )
+
+
+def _online_registry(
+    engine: Engine,
+    *,
+    enroll: bool = True,
+) -> ConnectedDeviceRegistry:
+    registry = ConnectedDeviceRegistry()
+    stream = registry.register(
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
+    )
+    stream.update_cards(
+        [Card(card_id="card-1", label="Card One", kind="card", size_bytes=10, status="available")]
+    )
+    if enroll:
+        with session_scope(engine) as session:
+            grpc_store.record_device_enrollment(
+                session,
+                device_id="mac-1",
+                cert_fingerprint="AA" * 32,
+                operator="ada",
+            )
+    return registry
+
+
+def _request(app) -> Request:
+    headers = [
+        (key.lower().encode("ascii"), value.encode("ascii"))
+        for key, value in post_headers("operator").items()
+    ]
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/devices/mac-1/receive",
+            "headers": headers,
+            "app": app,
+            "scheme": "http",
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 1),
+            "root_path": "",
+        }
+    )

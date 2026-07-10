@@ -19,7 +19,6 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from sutradhara.catalog.models import Base
 
-GRPC_START_ENDPOINT = "grpc:StartIntake"
 GrpcIntakeState = Literal["streaming", "committing", "committed", "aborted"]
 RotationAuthority = Literal["self", "admin"]
 LOG = logging.getLogger(__name__)
@@ -35,6 +34,7 @@ class GrpcIntake(Base):
             name="ck_grpc_intake_state",
         ),
         Index("ix_grpc_intake_owner", "operator", "device_id"),
+        Index("ix_grpc_intake_card_id", "card_id"),
     )
 
     intake_id: Mapped[str] = mapped_column(String(128), primary_key=True)

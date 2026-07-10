@@ -434,6 +434,14 @@ def test_post_device_receive_early_ack_completes_idempotency_and_replays(
         call_count += 1
         pending = original(**kwargs)
         with session_scope(api_engine) as session:
+            intent = api_store.claim_start_intake(
+                session,
+                operator_username="ada",
+                device_id="mac-1",
+                idempotency_key=kwargs["idempotency_key"],
+                intake_id="intake-1",
+            )
+            assert intent.state == "claimed"
             grpc_store.insert_intake(
                 session,
                 intake_id="intake-1",
@@ -469,8 +477,12 @@ def test_post_device_receive_early_ack_completes_idempotency_and_replays(
         "idempotencyKey": key,
     }
 
-    first = client.post("/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload)
-    replay = client.post("/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload)
+    first = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload
+    )
+    replay = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload
+    )
     conflict = client.post(
         "/api/devices/mac-1/receive",
         headers=post_headers("operator"),
@@ -513,8 +525,12 @@ def test_post_device_receive_in_progress_does_not_recommand(
         "idempotencyKey": str(uuid4()),
     }
 
-    first = client.post("/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload)
-    retry = client.post("/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload)
+    first = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload
+    )
+    retry = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload
+    )
 
     assert first.status_code == 409
     assert first.json()["error"] == "ack_timeout"
@@ -538,6 +554,14 @@ def test_post_device_receive_canonicalizes_source_ref_before_idempotency(
         seen_source_refs.append(kwargs["source_ref"])
         pending = original(**kwargs)
         with session_scope(api_engine) as session:
+            intent = api_store.claim_start_intake(
+                session,
+                operator_username="ada",
+                device_id="mac-1",
+                idempotency_key=kwargs["idempotency_key"],
+                intake_id="intake-1",
+            )
+            assert intent.state == "claimed"
             grpc_store.insert_intake(
                 session,
                 intake_id="intake-1",
@@ -572,7 +596,9 @@ def test_post_device_receive_canonicalizes_source_ref_before_idempotency(
         "idempotencyKey": key,
     }
 
-    first = client.post("/api/devices/mac-1/receive", headers=post_headers("operator"), json=base_payload)
+    first = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=base_payload
+    )
     replay = client.post(
         "/api/devices/mac-1/receive",
         headers=post_headers("operator"),
@@ -657,7 +683,9 @@ def test_post_device_receive_does_not_complete_when_card_correlation_fails(
     assert response.json()["error"] == "correlation_failed"
     with session_scope(api_engine) as session:
         records = list(session.scalars(select(api_store.IdempotencyRecord)))
-        assert records == []
+        assert len(records) == 1
+        assert records[0].status == "failed"
+        assert session.get(api_store.SourceClaim, records[0].lease_source_id) is None
 
 
 def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path: Path) -> None:
@@ -734,7 +762,9 @@ def test_post_device_receive_rejects_cross_operator_device(api_engine: Engine) -
     assert response.status_code == 403
 
 
-def _online_registry(engine: Engine, *, capabilities: list[str] | None = None) -> ConnectedDeviceRegistry:
+def _online_registry(
+    engine: Engine, *, capabilities: list[str] | None = None
+) -> ConnectedDeviceRegistry:
     registry = ConnectedDeviceRegistry()
     stream = registry.register(
         DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
