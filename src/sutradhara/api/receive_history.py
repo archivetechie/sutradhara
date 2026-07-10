@@ -108,7 +108,7 @@ def latest_card_history(
         attempt.device_id = attempt.device_id or row.device_id
         if attempt.catalog is None:
             receipt = intake_receipt_summary(row)
-            attempt.file_count = 0 if receipt is None else len(receipt.relpaths)
+            attempt.file_count = 0 if receipt is None else receipt.file_count
 
     intent_query = select(api_store.IdempotencyRecord).where(
         api_store.IdempotencyRecord.endpoint == api_store.DEVICE_RECEIVE_ENDPOINT,

@@ -92,7 +92,7 @@ def test_card_lease_excludes_concurrent_identity_and_reconciles_on_restart(
 
     result = api_store.reconcile_device_receive_leases(api_engine)
 
-    assert result == {"rebuilt": 1, "expired": 0}
+    assert result == {"rebuilt": 1, "expired": 0, "orphaned": 0}
     with session_scope(api_engine) as session:
         claim = session.get(api_store.SourceClaim, lease_id)
         assert claim is not None
@@ -188,16 +188,16 @@ def test_file_receipt_renewal_honors_floor_timer(api_engine: Engine) -> None:
         api_engine,
         intake_id="renew-intake",
         floor=dt.timedelta(seconds=5),
-    )
-    assert not api_store.renew_device_intake_lease(
+    ) == "renewed"
+    assert api_store.renew_device_intake_lease(
         api_engine,
         intake_id="renew-intake",
         floor=dt.timedelta(seconds=5),
-    )
+    ) == "throttled"
 
 
-def test_stale_same_key_reclaims_intent_and_fresh_lease(api_engine: Engine) -> None:
-    """An identical stored-key replay restarts instead of becoming terminal."""
+def test_stale_same_key_terminalizes_and_fresh_key_rechecks_history(api_engine: Engine) -> None:
+    """A stale key fails durably; only a fresh key reruns duplicate history."""
 
     assert _begin(api_engine, key="stale-replay", request_hash="same").state == "authorized"
     with session_scope(api_engine) as session:
@@ -209,14 +209,6 @@ def test_stale_same_key_reclaims_intent_and_fresh_lease(api_engine: Engine) -> N
             intake_id="stalled-intake",
         )
         assert linked.state == "claimed"
-    assert api_store.store_device_receive_response(
-        api_engine,
-        operator_username="ada",
-        device_id="device-ada",
-        idempotency_key="stale-replay",
-        intake_id="stalled-intake",
-        response_json={"intakeId": "stalled-intake", "status": "streaming"},
-    )
     with session_scope(api_engine) as session:
         intent = session.scalars(
             select(api_store.IdempotencyRecord).where(
@@ -231,33 +223,39 @@ def test_stale_same_key_reclaims_intent_and_fresh_lease(api_engine: Engine) -> N
         claim.last_heartbeat = stale
 
     changed = _begin(api_engine, key="stale-replay", request_hash="changed")
-    peeked = api_store.peek_device_receive_intent(
+    terminal = _begin(api_engine, key="stale-replay", request_hash="same")
+    terminal_replay = api_store.peek_device_receive_intent(
         api_engine,
         operator_username="ada",
         idempotency_key="stale-replay",
         request_hash="same",
         acknowledge_duplicate=False,
     )
-    restarted = _begin(api_engine, key="stale-replay", request_hash="same")
+    fresh = _begin(api_engine, key="fresh-retry", request_hash="fresh")
 
     assert changed.state == "conflict"
-    assert peeked is None
-    assert restarted.state == "authorized"
+    assert terminal.state == "terminal"
+    assert terminal.terminal_state == "failed"
+    assert terminal_replay is not None
+    assert terminal_replay.state == "terminal"
+    assert terminal_replay.terminal_state == "failed"
+    assert fresh.state == "warned"
+    assert fresh.response_json is not None
+    assert fresh.response_json["duplicateWarning"]["priorIntake"]["state"] == "failed"
     with session_scope(api_engine) as session:
         intent = session.scalars(
             select(api_store.IdempotencyRecord).where(
                 api_store.IdempotencyRecord.idempotency_key == "stale-replay"
             )
         ).one()
-        assert intent.status == "authorized"
-        assert intent.intake_id is None
+        assert intent.status == "failed"
+        assert intent.intake_id == "stalled-intake"
         assert intent.response_json is None
-        assert intent.started_at is None
-        assert intent.terminal_at is None
+        assert intent.started_at is not None
+        assert intent.terminal_at is not None
         assert intent.lease_source_id is not None
         claim = session.get(api_store.SourceClaim, intent.lease_source_id)
-        assert claim is not None
-        assert claim.idempotency_key == "stale-replay"
+        assert claim is None
 
 
 def test_terminal_history_receipts_are_memoized_for_device_polls(
@@ -305,7 +303,7 @@ def test_terminal_history_receipts_are_memoized_for_device_polls(
             reads += 1
         return original_read_text(path, *args, **kwargs)
 
-    grpc_status._terminal_receipt_summary.cache_clear()
+    grpc_status._cached_terminal_receipt_summary.cache_clear()
     monkeypatch.setattr(Path, "read_text", counted_read_text)
 
     first = _device_payloads_with_history(api_engine, "ada", registry.devices_for("ada"))
@@ -314,6 +312,96 @@ def test_terminal_history_receipts_are_memoized_for_device_polls(
     assert first == second
     assert first[0]["cards"][0]["receivedBefore"]["state"] == "verifying"
     assert reads == 1
+
+
+def test_terminal_receipt_summary_retries_failed_read_and_stays_bounded(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """A missing terminal ledger is retried and cached without retaining relpaths."""
+
+    with session_scope(api_engine) as session:
+        row = grpc_store.insert_intake(
+            session,
+            intake_id="late-ledger",
+            operator="ada",
+            device_id="mac-1",
+            idempotency_key="late-key",
+            source_plan_digest="a" * 64,
+            artifactclass="s-masters",
+            source_kind="card",
+            source_ref=None,
+            label=None,
+            landing_root=str(tmp_path),
+        )
+        grpc_store.set_committed_digest(session, row.intake_id, "b" * 64)
+        session.flush()
+        session.expunge(row)
+    grpc_status._cached_terminal_receipt_summary.cache_clear()
+
+    assert grpc_status.intake_receipt_summary(row) is None
+    ledger = tmp_path / "late-ledger" / "receive-receipts.jsonl"
+    ledger.parent.mkdir()
+    ledger.write_text(
+        json.dumps({"relpath": "clip.mov", "server_sha256": "c" * 64, "bytes": 9}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = grpc_status.intake_receipt_summary(row)
+    assert summary == grpc_status.IntakeReceiptSummary(bytes_total=9, file_count=1)
+    assert not hasattr(summary, "relpaths")
+
+
+def test_reconcile_terminalizes_inactive_orphaned_grpc_intake(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """A stale streaming row without a live intent stops projecting as verifying."""
+
+    old = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    with session_scope(api_engine) as session:
+        grpc_store.insert_intake(
+            session,
+            intake_id="orphan-stream",
+            operator="ada",
+            device_id="mac-old",
+            idempotency_key="orphan-key",
+            source_plan_digest="a" * 64,
+            artifactclass="s-masters",
+            source_kind="card",
+            source_ref=None,
+            label="Orphan",
+            landing_root=str(tmp_path),
+        )
+        assert grpc_store.set_card_id(
+            session,
+            intake_id="orphan-stream",
+            operator="ada",
+            device_id="mac-old",
+            card_id="orphan-card",
+        )
+        row = grpc_store.get_intake(session, "orphan-stream")
+        assert row is not None
+        row.created_at = old
+        row.updated_at = old
+
+    with session_scope(api_engine) as session:
+        before = latest_card_history(session, card_identity="orphan-card", requester="ada")
+    result = api_store.reconcile_device_receive_leases(
+        api_engine,
+        ttl=dt.timedelta(minutes=30),
+    )
+    with session_scope(api_engine) as session:
+        row = grpc_store.get_intake(session, "orphan-stream")
+        after = latest_card_history(session, card_identity="orphan-card", requester="ada")
+        assert row is not None
+        assert row.state == "aborted"
+
+    assert before is not None
+    assert before.state == "verifying"
+    assert after is not None
+    assert after.state == "failed"
+    assert result == {"rebuilt": 0, "expired": 0, "orphaned": 1}
 
 
 def test_device_receive_returns_stored_409_then_acknowledges(

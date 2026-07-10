@@ -300,6 +300,7 @@ async def post_device_receive(
                 409,
                 "receive_terminal",
                 f"prior receive attempt is {peeked.terminal_state}; start a new receive intent",
+                retryable=True,
             )
 
     try:
@@ -346,6 +347,7 @@ async def post_device_receive(
             409,
             "receive_terminal",
             f"prior receive attempt is {decision.terminal_state}; start a new receive intent",
+            retryable=True,
         )
     if decision.state == "in_progress":
         _raise(409, "already_in_progress", "receive is already in progress")
@@ -381,7 +383,17 @@ async def post_device_receive(
         await _fail_device_intent(request, identity, device_id, idempotency_key)
         _raise(403, "forbidden", str(exc))
     except RuntimeError as exc:
-        await _fail_device_intent(request, identity, device_id, idempotency_key)
+        failure_state = await anyio.to_thread.run_sync(
+            partial(
+                api_store.fail_device_receive_intent_if_unstarted,
+                engine,
+                operator_username=identity.operator_username,
+                device_id=device_id,
+                idempotency_key=idempotency_key,
+            )
+        )
+        if failure_state == "in_progress":
+            _raise(409, "already_in_progress", "receive is already in progress")
         _raise(409, "device_unavailable", str(exc))
 
     if not ack.accepted or not ack.intake_id:
@@ -938,12 +950,10 @@ def _receive_progress_payload(
 
     receipt = intake_receipt_summary(row)
     receipt_bytes = receipt.bytes_total if receipt is not None else None
-    receipt_relpaths = receipt.relpaths if receipt is not None else frozenset()
     live = progress_registry.snapshot(row.intake_id)
     if live is not None:
-        live_unreceipted = [item for item in live.files if item.relpath not in receipt_relpaths]
-        live_received = sum(item.bytes_received for item in live_unreceipted)
-        live_total = sum(item.bytes_total for item in live_unreceipted)
+        live_received = sum(item.bytes_received for item in live.files)
+        live_total = sum(item.bytes_total for item in live.files)
         bytes_received = (receipt_bytes or 0) + live_received
         live_planned = live.bytes_total
         total_candidates = [
@@ -1113,5 +1123,8 @@ def _revoke_device(
     }
 
 
-def _raise(status_code: int, error: str, detail: str) -> None:
-    raise HTTPException(status_code=status_code, detail={"error": error, "detail": detail})
+def _raise(status_code: int, error: str, detail: str, **extra: object) -> None:
+    raise HTTPException(
+        status_code=status_code,
+        detail={"error": error, "detail": detail, **extra},
+    )

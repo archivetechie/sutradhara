@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -12,6 +13,7 @@ from sqlalchemy import Engine, select
 
 from sutradhara._proto import device_pb2
 from sutradhara.api import store as api_store
+from sutradhara.api.routes_devices import DeviceReceiveRequest, _device_receive_hash
 from sutradhara.catalog.session import session_scope
 from sutradhara.grpc import store as grpc_store
 from sutradhara.grpc.progress import ReceiveProgressRegistry
@@ -596,6 +598,69 @@ def test_stream_drop_releases_card_lease_for_immediate_retry(api_engine: Engine)
         assert list(session.scalars(select(api_store.SourceClaim))) == []
 
 
+def test_stream_drop_after_start_keeps_live_receive_and_lease(api_engine: Engine, tmp_path: Path) -> None:
+    """An ack-stream failure cannot terminalize a StartIntake-claimed receive."""
+
+    registry = _online_registry(api_engine)
+    original = registry.send_start_receive
+
+    def start_then_drop(**kwargs):
+        pending = original(**kwargs)
+        with session_scope(api_engine) as session:
+            linked = api_store.claim_start_intake(
+                session,
+                operator_username="ada",
+                device_id="mac-1",
+                idempotency_key=kwargs["idempotency_key"],
+                intake_id="live-intake",
+            )
+            assert linked.state == "claimed"
+            grpc_store.insert_intake(
+                session,
+                intake_id="live-intake",
+                operator="ada",
+                device_id="mac-1",
+                idempotency_key=kwargs["idempotency_key"],
+                source_plan_digest="a" * 64,
+                artifactclass=kwargs["artifactclass"],
+                source_kind="card",
+                source_ref=kwargs["source_ref"],
+                label=kwargs["label"],
+                landing_root=str(tmp_path),
+            )
+        pending.future.set_exception(StreamClosed("device stream ended after StartIntake"))
+        return pending
+
+    registry.send_start_receive = start_then_drop  # type: ignore[method-assign]
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+    payload = {
+        "card_id": "card-1",
+        "artifactclass": "s-masters",
+        "idempotencyKey": str(uuid4()),
+    }
+
+    response = client.post(
+        "/api/devices/mac-1/receive",
+        headers=post_headers("operator"),
+        json=payload,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "already_in_progress"
+    with session_scope(api_engine) as session:
+        intent = session.scalars(select(api_store.IdempotencyRecord)).one()
+        intake = grpc_store.get_intake(session, "live-intake")
+        assert intent.status == "started"
+        assert intake is not None
+        assert intake.state == "streaming"
+        assert intent.lease_source_id is not None
+        claim = session.get(api_store.SourceClaim, intent.lease_source_id)
+        assert claim is not None
+        assert claim.intake_id == "live-intake"
+
+
 def test_post_device_receive_canonicalizes_source_ref_before_idempotency(
     api_engine: Engine,
     tmp_path: Path,
@@ -821,7 +886,162 @@ def test_terminal_replay_precedes_ejected_card_resolution(api_engine: Engine) ->
     assert first.json()["error"] == "receive_rejected"
     assert replay.status_code == 409
     assert replay.json()["error"] == "receive_terminal"
+    assert replay.json()["retryable"] is True
     assert "failed" in replay.json()["detail"]
+
+
+def test_stale_receive_terminal_is_retryable_and_fresh_key_runs_history_gate(
+    api_engine: Engine,
+) -> None:
+    """Stale same-key replay fails; a fresh key gets the duplicate warning."""
+
+    registry = _online_registry(api_engine)
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+    key = str(uuid4())
+    payload = {
+        "card_id": "card-1",
+        "artifactclass": "s-masters",
+        "idempotencyKey": key,
+    }
+    body = DeviceReceiveRequest.model_validate(payload)
+    request_hash = _device_receive_hash("mac-1", body, source_ref="")
+    decision = api_store.begin_device_receive_intent(
+        api_engine,
+        operator_username="ada",
+        device_id="mac-1",
+        card_identity="card-1",
+        card_label="Card 1",
+        idempotency_key=key,
+        request_hash=request_hash,
+        acknowledge_duplicate=False,
+    )
+    assert decision.state == "authorized"
+    with session_scope(api_engine) as session:
+        linked = api_store.claim_start_intake(
+            session,
+            operator_username="ada",
+            device_id="mac-1",
+            idempotency_key=key,
+            intake_id="stale-intake",
+        )
+        assert linked.state == "claimed"
+        intent = session.scalars(select(api_store.IdempotencyRecord)).one()
+        stale = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+        intent.last_heartbeat = stale
+        assert intent.lease_source_id is not None
+        claim = session.get(api_store.SourceClaim, intent.lease_source_id)
+        assert claim is not None
+        claim.last_heartbeat = stale
+
+    terminal = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload
+    )
+    fresh = client.post(
+        "/api/devices/mac-1/receive",
+        headers=post_headers("operator"),
+        json={**payload, "idempotencyKey": str(uuid4())},
+    )
+
+    assert terminal.status_code == 409
+    assert terminal.json()["error"] == "receive_terminal"
+    assert terminal.json()["retryable"] is True
+    assert fresh.status_code == 409
+    assert fresh.json()["duplicateWarning"]["priorIntake"]["state"] == "failed"
+
+
+def test_stored_started_response_and_committed_verdict_replay_after_eject(
+    api_engine: Engine,
+) -> None:
+    """Stored response wins over stale-skip; committed-without-response is terminal."""
+
+    registry = _online_registry(api_engine)
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+
+    def seed(key: str, *, intake_id: str, store_response: bool) -> dict[str, str]:
+        payload = {
+            "card_id": "card-1",
+            "artifactclass": "s-masters",
+            "idempotencyKey": key,
+        }
+        body = DeviceReceiveRequest.model_validate(payload)
+        request_hash = _device_receive_hash("mac-1", body, source_ref="")
+        decision = api_store.begin_device_receive_intent(
+            api_engine,
+            operator_username="ada",
+            device_id="mac-1",
+            card_identity="card-1",
+            card_label="Card 1",
+            idempotency_key=key,
+            request_hash=request_hash,
+            acknowledge_duplicate=False,
+        )
+        if decision.state == "warned":
+            decision = api_store.begin_device_receive_intent(
+                api_engine,
+                operator_username="ada",
+                device_id="mac-1",
+                card_identity="card-1",
+                card_label="Card 1",
+                idempotency_key=key,
+                request_hash=request_hash,
+                acknowledge_duplicate=True,
+            )
+        assert decision.state == "authorized"
+        with session_scope(api_engine) as session:
+            linked = api_store.claim_start_intake(
+                session,
+                operator_username="ada",
+                device_id="mac-1",
+                idempotency_key=key,
+                intake_id=intake_id,
+            )
+            assert linked.state == "claimed"
+            if not store_response:
+                assert api_store.transition_device_intent_terminal(
+                    session,
+                    intake_id=intake_id,
+                    terminal_state="committed",
+                )
+        if store_response:
+            assert api_store.store_device_receive_response(
+                api_engine,
+                operator_username="ada",
+                device_id="mac-1",
+                idempotency_key=key,
+                intake_id=intake_id,
+                response_json={"intakeId": intake_id, "status": "streaming"},
+            )
+            with session_scope(api_engine) as session:
+                intent = session.scalars(
+                    select(api_store.IdempotencyRecord).where(
+                        api_store.IdempotencyRecord.idempotency_key == key
+                    )
+                ).one()
+                intent.last_heartbeat = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+        return payload
+
+    committed_payload = seed(str(uuid4()), intake_id="committed-intake", store_response=False)
+    stored_payload = seed(str(uuid4()), intake_id="stored-intake", store_response=True)
+    view = registry.devices_for("ada")[0]
+    registry.update_cards("mac-1", view.generation, [])
+
+    stored = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=stored_payload
+    )
+    committed = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=committed_payload
+    )
+
+    assert stored.status_code == 200
+    assert stored.json() == {"intakeId": "stored-intake", "status": "streaming"}
+    assert committed.status_code == 409
+    assert committed.json()["error"] == "receive_terminal"
+    assert committed.json()["retryable"] is True
+    assert "committed" in committed.json()["detail"]
 
 
 def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path: Path) -> None:

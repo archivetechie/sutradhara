@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from sqlalchemy import (
@@ -16,9 +18,11 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    and_,
     delete,
     false,
     func,
+    or_,
     select,
     update,
 )
@@ -30,6 +34,7 @@ from sutradhara.catalog.session import make_session_factory
 
 DEFAULT_TTL = dt.timedelta(minutes=30)
 DEFAULT_HEARTBEAT_INTERVAL = dt.timedelta(seconds=5)
+ORPHAN_RECONCILE_BATCH = 100
 RECEIVE_ENDPOINT = "/api/receive"
 DEVICE_RECEIVE_ENDPOINT = "POST /api/devices/receive"
 DUPLICATE_WARNED_EVENT = "receive_duplicate_warned"
@@ -47,6 +52,8 @@ DeviceIntentState = Literal[
     "busy",
     "terminal",
 ]
+AckFailureState = Literal["failed", "in_progress", "unchanged"]
+LeaseRenewalState = Literal["renewed", "throttled", "lost"]
 
 
 class IdempotencyRecord(Base):
@@ -386,13 +393,76 @@ def fail_device_receive_intent(
         return True
 
 
+def fail_device_receive_intent_if_unstarted(
+    engine: Any,
+    *,
+    operator_username: str,
+    device_id: str,
+    idempotency_key: str,
+) -> AckFailureState:
+    """Fail an ack-wait intent only while no live gRPC intake has claimed it.
+
+    ``StartIntake`` and the HTTP ack waiter run independently.  A command-stream
+    failure may therefore reach the waiter after the helper has already started
+    uploading.  That live receive owns the lease and must be allowed to finish.
+    """
+
+    from sutradhara.grpc.store import GrpcIntake
+
+    now = _utcnow()
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        record = _idempotency_record(
+            session,
+            operator_username=operator_username,
+            endpoint=DEVICE_RECEIVE_ENDPOINT,
+            idempotency_key=idempotency_key,
+        )
+        if record is None or record.device_id != device_id:
+            return "unchanged"
+        live_intake = session.scalar(
+            select(GrpcIntake.intake_id)
+            .where(
+                GrpcIntake.operator == operator_username,
+                GrpcIntake.device_id == device_id,
+                GrpcIntake.idempotency_key == idempotency_key,
+                GrpcIntake.state.in_(("streaming", "committing", "committed")),
+            )
+            .limit(1)
+        )
+        if record.status == "started" or live_intake is not None:
+            return "in_progress"
+        if record.status != "authorized":
+            return "unchanged"
+        failed = session.execute(
+            update(IdempotencyRecord)
+            .where(
+                IdempotencyRecord.id == record.id,
+                IdempotencyRecord.status == "authorized",
+            )
+            .values(
+                status="failed",
+                terminal_at=now,
+                updated_at=now,
+                last_heartbeat=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if failed.rowcount != 1:
+            session.expire(record)
+            session.refresh(record)
+            return "in_progress" if record.status == "started" else "unchanged"
+        _release_record_lease(session, record)
+        return "failed"
+
+
 def renew_device_intake_lease(
     engine: Any,
     *,
     intake_id: str,
     floor: dt.timedelta = DEFAULT_HEARTBEAT_INTERVAL,
-) -> bool:
-    """Renew a started intent and its lease during streamed upload activity."""
+) -> LeaseRenewalState:
+    """Renew a started intent lease, distinguishing throttling from claim loss."""
 
     now = _utcnow()
     factory = make_session_factory(engine)
@@ -405,17 +475,17 @@ def renew_device_intake_lease(
             )
         ).one_or_none()
         if record is None or record.lease_source_id is None:
-            return False
-        if _aware(record.last_heartbeat) + floor > now:
-            return False
+            return "lost"
         claim = session.get(SourceClaim, record.lease_source_id)
-        if claim is None or claim.idempotency_key != record.idempotency_key:
-            return False
+        if claim is None or not _claim_owned_by_record(claim, record):
+            return "lost"
+        if _aware(record.last_heartbeat) + floor > now:
+            return "throttled"
         record.updated_at = now
         record.last_heartbeat = now
         claim.updated_at = now
         claim.last_heartbeat = now
-        return True
+        return "renewed"
 
 
 def reconcile_device_receive_leases(
@@ -423,11 +493,12 @@ def reconcile_device_receive_leases(
     *,
     ttl: dt.timedelta = DEFAULT_TTL,
 ) -> dict[str, int]:
-    """Rebuild live card leases from durable intents and expire stale owners."""
+    """Rebuild live card leases, expire stale owners, and fail stale orphans."""
 
     now = _utcnow()
     rebuilt = 0
     expired = 0
+    orphaned = 0
     factory = make_session_factory(engine)
     with factory.begin() as session:
         records = list(
@@ -443,9 +514,22 @@ def reconcile_device_receive_leases(
         )
         for record in records:
             if _is_stale(record.last_heartbeat, ttl=ttl, now=now):
-                record.status = "failed"
-                record.terminal_at = now
-                record.updated_at = now
+                terminalized = session.execute(
+                    update(IdempotencyRecord)
+                    .where(
+                        IdempotencyRecord.id == record.id,
+                        IdempotencyRecord.status.in_(("authorized", "started")),
+                        IdempotencyRecord.last_heartbeat < now - ttl,
+                    )
+                    .values(
+                        status="failed",
+                        terminal_at=now,
+                        updated_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if terminalized.rowcount != 1:
+                    continue
                 _release_record_lease(session, record)
                 expired += 1
                 continue
@@ -460,13 +544,22 @@ def reconcile_device_receive_leases(
                 now=now,
             ):
                 record.lease_source_id = lease_source_id
+                claim = session.get(SourceClaim, lease_source_id)
+                if claim is not None and _claim_owned_by_record(claim, record):
+                    claim.intake_id = record.intake_id
                 rebuilt += 1
             else:
                 record.status = "failed"
                 record.terminal_at = now
                 record.updated_at = now
                 expired += 1
-    return {"rebuilt": rebuilt, "expired": expired}
+        orphaned = _reconcile_orphaned_grpc_intakes(
+            session,
+            ttl=ttl,
+            now=now,
+            batch_size=ORPHAN_RECONCILE_BATCH,
+        )
+    return {"rebuilt": rebuilt, "expired": expired, "orphaned": orphaned}
 
 
 def card_lease_source_id(card_identity: str) -> str:
@@ -728,15 +821,17 @@ def peek_device_receive_intent(
             return DeviceIntentDecision("warned", record.duplicate_warning)
         if record.status in {"aborted", "quarantined", "failed"}:
             return DeviceIntentDecision("terminal", terminal_state=record.status)
-        if record.status in {"authorized", "started"} and _is_stale(
-            record.last_heartbeat, ttl=ttl, now=_utcnow()
-        ):
-            return None
         if (
             record.status in {"authorized", "started", "committed"}
             and record.response_json is not None
         ):
             return DeviceIntentDecision("completed", record.response_json)
+        if record.status == "committed":
+            return DeviceIntentDecision("terminal", terminal_state=record.status)
+        if record.status in {"authorized", "started"} and _is_stale(
+            record.last_heartbeat, ttl=ttl, now=_utcnow()
+        ):
+            return None
         return None
 
 
@@ -764,6 +859,15 @@ def _begin_device_receive_intent_once(
             idempotency_key=idempotency_key,
         )
         if record is None:
+            if _source_claim_is_busy(
+                session,
+                source_id=card_lease_source_id(card_identity),
+                operator_username=operator_username,
+                idempotency_key=idempotency_key,
+                ttl=ttl,
+                now=now,
+            ):
+                return DeviceIntentDecision("busy")
             record = IdempotencyRecord(
                 operator_username=operator_username,
                 endpoint=DEVICE_RECEIVE_ENDPOINT,
@@ -779,16 +883,6 @@ def _begin_device_receive_intent_once(
             )
             session.add(record)
             session.flush()
-            if _source_claim_is_busy(
-                session,
-                source_id=card_lease_source_id(card_identity),
-                operator_username=operator_username,
-                idempotency_key=idempotency_key,
-                ttl=ttl,
-                now=now,
-            ):
-                session.delete(record)
-                return DeviceIntentDecision("busy")
             history = latest_card_history(
                 session,
                 card_identity=card_identity,
@@ -818,21 +912,43 @@ def _begin_device_receive_intent_once(
             return DeviceIntentDecision("conflict")
         if record.device_id != device_id or record.card_identity != card_identity:
             return DeviceIntentDecision("conflict")
+        if (
+            record.status in {"authorized", "started", "committed"}
+            and record.response_json is not None
+        ):
+            return DeviceIntentDecision("completed", record.response_json)
         if record.status in {"authorized", "started"} and _is_stale(
             record.last_heartbeat,
             ttl=ttl,
             now=now,
         ):
+            terminalized = session.execute(
+                update(IdempotencyRecord)
+                .where(
+                    IdempotencyRecord.id == record.id,
+                    IdempotencyRecord.status.in_(("authorized", "started")),
+                    IdempotencyRecord.last_heartbeat < now - ttl,
+                )
+                .values(
+                    status="failed",
+                    terminal_at=now,
+                    updated_at=now,
+                    last_heartbeat=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if terminalized.rowcount != 1:
+                session.expire(record)
+                session.refresh(record)
+                if record.response_json is not None:
+                    return DeviceIntentDecision("completed", record.response_json)
+                if record.status in {"authorized", "started"}:
+                    return DeviceIntentDecision("in_progress")
+                if record.status in {"committed", "aborted", "quarantined", "failed"}:
+                    return DeviceIntentDecision("terminal", terminal_state=record.status)
+                return DeviceIntentDecision("conflict")
             _release_record_lease(session, record)
-            session.flush()
-            if not _authorize_record_lease(session, record, ttl=ttl, now=now):
-                return DeviceIntentDecision("busy")
-            record.intake_id = None
-            record.response_json = None
-            record.started_at = None
-            record.terminal_at = None
-            record.created_at = now
-            return DeviceIntentDecision("authorized")
+            return DeviceIntentDecision("terminal", terminal_state="failed")
         if record.status == "warned":
             if not acknowledge_duplicate:
                 return DeviceIntentDecision("warned", record.duplicate_warning)
@@ -856,12 +972,8 @@ def _begin_device_receive_intent_once(
             )
             return DeviceIntentDecision("authorized")
         if record.status in {"authorized", "started"}:
-            if record.response_json is not None:
-                return DeviceIntentDecision("completed", record.response_json)
             return DeviceIntentDecision("in_progress")
         if record.status == "committed":
-            if record.response_json is not None:
-                return DeviceIntentDecision("completed", record.response_json)
             return DeviceIntentDecision("terminal", terminal_state=record.status)
         if record.status in {"aborted", "quarantined", "failed"}:
             return DeviceIntentDecision("terminal", terminal_state=record.status)
@@ -916,7 +1028,11 @@ def _claim_source_in_session(
             )
         )
         return True
-    if claim.operator_username == operator_username and claim.idempotency_key == idempotency_key:
+    if _claim_owned_by(
+        claim,
+        operator_username=operator_username,
+        idempotency_key=idempotency_key,
+    ):
         return True
     if not _is_stale(claim.last_heartbeat, ttl=ttl, now=now):
         return False
@@ -943,7 +1059,11 @@ def _source_claim_is_busy(
     claim = session.get(SourceClaim, source_id)
     if claim is None:
         return False
-    if claim.operator_username == operator_username and claim.idempotency_key == idempotency_key:
+    if _claim_owned_by(
+        claim,
+        operator_username=operator_username,
+        idempotency_key=idempotency_key,
+    ):
         return False
     return not _is_stale(claim.last_heartbeat, ttl=ttl, now=now)
 
@@ -952,8 +1072,121 @@ def _release_record_lease(session: Session, record: IdempotencyRecord) -> None:
     if record.lease_source_id is None:
         return
     claim = session.get(SourceClaim, record.lease_source_id)
-    if claim is not None and claim.idempotency_key == record.idempotency_key:
+    if claim is not None and _claim_owned_by_record(claim, record):
         session.delete(claim)
+
+
+def _claim_owned_by_record(claim: SourceClaim, record: IdempotencyRecord) -> bool:
+    """Return whether a source claim belongs to one durable intent."""
+
+    return _claim_owned_by(
+        claim,
+        operator_username=record.operator_username,
+        idempotency_key=record.idempotency_key,
+    )
+
+
+def _claim_owned_by(
+    claim: SourceClaim,
+    *,
+    operator_username: str,
+    idempotency_key: str,
+) -> bool:
+    """Centralize the operator-and-key source-claim ownership predicate."""
+
+    return (
+        claim.operator_username == operator_username
+        and claim.idempotency_key == idempotency_key
+    )
+
+
+def _reconcile_orphaned_grpc_intakes(
+    session: Session,
+    *,
+    ttl: dt.timedelta,
+    now: dt.datetime,
+    batch_size: int,
+) -> int:
+    """Abort inactive streaming rows whose linked receive intent is terminal or absent."""
+
+    from sutradhara.grpc.store import GrpcIntake
+
+    terminal_states = ("committed", "aborted", "quarantined", "failed")
+    cutoff = now - ttl
+    rows = list(
+        session.scalars(
+            select(GrpcIntake)
+            .outerjoin(
+                IdempotencyRecord,
+                and_(
+                    IdempotencyRecord.endpoint == DEVICE_RECEIVE_ENDPOINT,
+                    IdempotencyRecord.intake_id == GrpcIntake.intake_id,
+                ),
+            )
+            .where(
+                GrpcIntake.state.in_(("streaming", "committing")),
+                GrpcIntake.updated_at < cutoff,
+                or_(
+                    IdempotencyRecord.id.is_(None),
+                    IdempotencyRecord.status.in_(terminal_states),
+                ),
+            )
+            .order_by(GrpcIntake.updated_at, GrpcIntake.intake_id)
+            .limit(batch_size)
+        )
+        .unique()
+    )
+    if not rows:
+        return 0
+    intake_ids = [row.intake_id for row in rows]
+    intents = {
+        record.intake_id: record
+        for record in session.scalars(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.endpoint == DEVICE_RECEIVE_ENDPOINT,
+                IdempotencyRecord.intake_id.in_(intake_ids),
+            )
+        )
+        if record.intake_id is not None
+    }
+    orphaned = 0
+    for row in rows:
+        intent = intents.get(row.intake_id)
+        latest_activity = _grpc_landing_last_activity(row)
+        if latest_activity + ttl >= now:
+            row.updated_at = latest_activity
+            continue
+        row.state = "aborted"
+        row.updated_at = now
+        orphaned += 1
+        LOG.warning(
+            "terminalized inactive orphan grpc intake: intake_id=%s linked_intent=%s",
+            row.intake_id,
+            "absent" if intent is None else intent.status,
+        )
+    return orphaned
+
+
+def _grpc_landing_last_activity(row: Any) -> dt.datetime:
+    """Return the latest durable or known landing-path activity for a gRPC intake."""
+
+    latest = _aware(row.updated_at)
+    intake_dir = Path(row.landing_root) / row.intake_id
+    paths = [
+        intake_dir,
+        intake_dir / ".receiving.json",
+        intake_dir / "receive-receipts.jsonl",
+    ]
+    incoming = intake_dir / ".incoming"
+    with contextlib.suppress(OSError):
+        paths.extend(incoming.iterdir())
+    for path in paths:
+        try:
+            modified = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.UTC)
+        except OSError:
+            continue
+        latest = max(latest, modified)
+    return latest
 
 
 def _idempotency_record(

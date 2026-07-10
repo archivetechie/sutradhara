@@ -91,6 +91,12 @@ class ReceiveProgressRegistry:
             self._planned_totals.pop(intake_id, None)
             self._files.pop(intake_id, None)
 
+    def complete_file(self, intake_id: str, *, relpath: str) -> None:
+        """Drop a file once its bytes are represented by the durable receipt summary."""
+
+        with self._lock:
+            self._files.get(intake_id, {}).pop(relpath, None)
+
     def snapshot(self, intake_id: str) -> ReceiveProgressSnapshot | None:
         """Return a stable snapshot for one intake, if this process has progress."""
 

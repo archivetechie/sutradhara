@@ -1,6 +1,6 @@
 # Prompt: receive-dedup 1a fix round 2 — gate findings on f6479eb (2026-07-10)
 
-**Status: pending dispatch.** The fix-round diff gate (22-agent review) confirmed 12
+**Status: implemented 2026-07-10; gate pending.** The fix-round diff gate (22-agent review) confirmed 12
 distinct defects, clustered on the stale-reclaim path that fix-round-1 introduced.
 **Design decision (Claude, recorded): the in-place reclaim is REVERTED.** Stale
 authorized/started intents with an identical-hash replay go back to the simpler

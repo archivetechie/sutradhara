@@ -36,10 +36,7 @@ def intake_status(row: grpc_store.GrpcIntake) -> IntakeStatusView:
             errors=errors,
             release_safe=release_safe_for_status(row, status),
         )
-    if row.state == "committed":
-        status = "verifying"
-    else:
-        status = row.state
+    status = "verifying" if row.state == "committed" else row.state
     return IntakeStatusView(
         status=status,
         errors=[],
@@ -65,7 +62,7 @@ class IntakeReceiptSummary:
     """Summary of durable file receipts already appended by the server."""
 
     bytes_total: int
-    relpaths: frozenset[str]
+    file_count: int
 
 
 def intake_receipt_summary(row: grpc_store.GrpcIntake) -> IntakeReceiptSummary | None:
@@ -77,15 +74,34 @@ def intake_receipt_summary(row: grpc_store.GrpcIntake) -> IntakeReceiptSummary |
     return _read_receipt_summary(path)
 
 
-@lru_cache(maxsize=1024)
 def _terminal_receipt_summary(
     receipt_path: str,
     terminal_state: str,
 ) -> IntakeReceiptSummary | None:
-    """Memoize one immutable terminal receipt ledger in a bounded cache."""
+    """Memoize only successful immutable terminal-ledger reads."""
+
+    try:
+        return _cached_terminal_receipt_summary(receipt_path, terminal_state)
+    except _ReceiptSummaryUnavailable:
+        return None
+
+
+class _ReceiptSummaryUnavailable(Exception):
+    """Prevent a missing or temporarily unreadable ledger from entering the cache."""
+
+
+@lru_cache(maxsize=1024)
+def _cached_terminal_receipt_summary(
+    receipt_path: str,
+    terminal_state: str,
+) -> IntakeReceiptSummary:
+    """Cache a bounded count-and-bytes summary for one terminal ledger."""
 
     del terminal_state
-    return _read_receipt_summary(Path(receipt_path))
+    summary = _read_receipt_summary(Path(receipt_path))
+    if summary is None:
+        raise _ReceiptSummaryUnavailable
+    return summary
 
 
 def _read_receipt_summary(path: Path) -> IntakeReceiptSummary | None:
@@ -104,7 +120,7 @@ def _read_receipt_summary(path: Path) -> IntakeReceiptSummary | None:
             total += int(payload["bytes"])
     except Exception:
         return None
-    return IntakeReceiptSummary(bytes_total=total, relpaths=frozenset(relpaths))
+    return IntakeReceiptSummary(bytes_total=total, file_count=len(relpaths))
 
 
 def release_safe_for_status(row: grpc_store.GrpcIntake, status: str) -> bool:

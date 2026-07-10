@@ -20,7 +20,7 @@ from sutradhara.grpc import store
 from sutradhara.grpc.assembly import manifest_digest
 from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.server import sweep_landing_once, validate_bind_address
-from sutradhara.grpc.servicer import GrpcIntakeConfig, IntakeServicer
+from sutradhara.grpc.servicer import LEASE_LOST_DETAIL, GrpcIntakeConfig, IntakeServicer
 from sutradhara.intake_watch import process_landing_once
 
 
@@ -146,8 +146,9 @@ def test_servicer_start_upload_commit_watch_and_owner_check(engine: Engine, tmp_
     assert receipt.server_sha256 == hashlib.sha256(payload).hexdigest()
     progress = progress_registry.snapshot(start.intake_id)
     assert progress is not None
-    assert progress.bytes_received == len(payload)
+    assert progress.bytes_received == 0
     assert progress.bytes_total == len(payload)
+    assert progress.files == ()
     leftover = landing / start.intake_id / ".incoming" / "crash.tmp"
     leftover.write_bytes(b"partial")
     listed = servicer.ListIntakeFiles(
@@ -375,6 +376,168 @@ def test_stream_activity_renews_lease_before_any_file_receipt(
 
     assert receipt.received_bytes == 3
     assert receipt.server_sha256 == hashlib.sha256(b"abc").hexdigest()
+
+
+def test_upload_aborts_when_source_lease_is_lost(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """A resumed leaseless stream fails while preserving the replacement owner."""
+
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="ada",
+        )
+    _authorize_receive_intent(engine, key="lost-key", device_id="mac-1")
+    servicer = IntakeServicer(
+        GrpcIntakeConfig(
+            engine=engine,
+            landing_root=tmp_path / "landing",
+            validate_artifactclass=False,
+            lease_renewal_floor=dt.timedelta(0),
+        )
+    )
+    context = _FakeContext("mac-1", "AA" * 32)
+    started = servicer.StartIntake(
+        intake_pb2.StartIntakeRequest(
+            idempotency_key="lost-key",
+            artifactclass="video-master",
+            source_kind="card",
+            source_plan_digest="a" * 64,
+        ),
+        context,
+    )
+    with session_scope(engine) as session:
+        intent = session.scalars(
+            select(api_store.IdempotencyRecord).where(
+                api_store.IdempotencyRecord.idempotency_key == "lost-key"
+            )
+        ).one()
+        assert intent.lease_source_id is not None
+        lease_source_id = intent.lease_source_id
+        old_claim = session.get(api_store.SourceClaim, lease_source_id)
+        assert old_claim is not None
+        session.delete(old_claim)
+        session.flush()
+        session.add(
+            api_store.SourceClaim(
+                source_id=lease_source_id,
+                operator_username="other",
+                idempotency_key="replacement-key",
+                intake_id="replacement-intake",
+            )
+        )
+
+    with pytest.raises(_Abort) as lost:
+        servicer.UploadFile(
+            iter(
+                [
+                    intake_pb2.FileChunk(
+                        intake_id=started.intake_id,
+                        relpath="clip.mov",
+                        data=b"x",
+                        offset=0,
+                        is_last=True,
+                        file_size=1,
+                    )
+                ]
+            ),
+            context,
+        )
+
+    assert lost.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert lost.value.details == LEASE_LOST_DETAIL
+    with session_scope(engine) as session:
+        intent = session.scalars(
+            select(api_store.IdempotencyRecord).where(
+                api_store.IdempotencyRecord.idempotency_key == "lost-key"
+            )
+        ).one()
+        row = store.get_intake(session, started.intake_id)
+        replacement = session.get(api_store.SourceClaim, lease_source_id)
+        assert intent.status == "failed"
+        assert row is not None
+        assert row.state == "aborted"
+        assert replacement is not None
+        assert replacement.idempotency_key == "replacement-key"
+
+
+def test_transient_lease_renewal_error_retries_without_aborting_upload(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB renewal error is tolerated and the next chunk retries renewal."""
+
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="ada",
+        )
+    _authorize_receive_intent(engine, key="retry-renewal", device_id="mac-1")
+    servicer = IntakeServicer(
+        GrpcIntakeConfig(
+            engine=engine,
+            landing_root=tmp_path / "landing",
+            validate_artifactclass=False,
+            lease_renewal_floor=dt.timedelta(0),
+        )
+    )
+    context = _FakeContext("mac-1", "AA" * 32)
+    started = servicer.StartIntake(
+        intake_pb2.StartIntakeRequest(
+            idempotency_key="retry-renewal",
+            artifactclass="video-master",
+            source_kind="card",
+            source_plan_digest="a" * 64,
+        ),
+        context,
+    )
+    original = api_store.renew_device_intake_lease
+    calls = 0
+
+    def flaky_renewal(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary database outage")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api_store, "renew_device_intake_lease", flaky_renewal)
+    receipt = servicer.UploadFile(
+        iter(
+            [
+                intake_pb2.FileChunk(
+                    intake_id=started.intake_id,
+                    relpath="clip.mov",
+                    data=b"a",
+                    offset=0,
+                    file_size=2,
+                ),
+                intake_pb2.FileChunk(
+                    intake_id=started.intake_id,
+                    relpath="clip.mov",
+                    data=b"b",
+                    offset=1,
+                    is_last=True,
+                    file_size=2,
+                ),
+            ]
+        ),
+        context,
+    )
+
+    assert calls == 2
+    assert receipt.received_bytes == 2
+    with session_scope(engine) as session:
+        row = store.get_intake(session, started.intake_id)
+        assert row is not None
+        assert row.state == "streaming"
 
 
 def test_start_intake_commits_stale_intent_expiry_before_rpc_abort(

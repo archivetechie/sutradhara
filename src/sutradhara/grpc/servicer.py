@@ -11,6 +11,7 @@ import datetime as dt
 import hashlib
 import itertools
 import json
+import logging
 import os
 import shutil
 import threading
@@ -42,6 +43,9 @@ from sutradhara_receive import (
     slug_operator,
 )
 
+LOG = logging.getLogger(__name__)
+LEASE_LOST_DETAIL = "source lease lost during upload"
+
 
 @dataclass(frozen=True)
 class GrpcIntakeConfig:
@@ -62,6 +66,7 @@ class _RuntimeState:
     ledger_lock: threading.Lock = field(default_factory=threading.Lock)
     lease_renewal_lock: threading.Lock = field(default_factory=threading.Lock)
     next_lease_renewal_at: float = 0.0
+    lease_lost: bool = False
     in_flight: int = 0
 
 
@@ -304,7 +309,7 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                 for chunk in itertools.chain((first,), iterator):
                     if chunk.intake_id != row.intake_id or chunk.relpath != relpath:
                         _abort(context, grpc.StatusCode.INVALID_ARGUMENT, "chunk identity changed")
-                    self._renew_lease_on_activity(row.intake_id, runtime)
+                    self._renew_lease_on_activity(row.intake_id, runtime, context)
                     if chunk.file_size > 0:
                         total = max(total, int(chunk.file_size))
                     if chunk.data:
@@ -340,6 +345,7 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             )
             with runtime.ledger_lock:
                 _append_receipt(intake_dir, relpath=relpath, digest=server_sha, size=received)
+            self.progress_registry.complete_file(row.intake_id, relpath=relpath)
             return intake_pb2.FileReceipt(
                 relpath=relpath,
                 server_sha256=server_sha,
@@ -349,22 +355,61 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             temp_path.unlink(missing_ok=True)
             raise
 
-    def _renew_lease_on_activity(self, intake_id: str, runtime: _RuntimeState) -> None:
+    def _renew_lease_on_activity(
+        self,
+        intake_id: str,
+        runtime: _RuntimeState,
+        context: Any,
+    ) -> None:
         """Throttle durable lease renewal while upload chunks are arriving."""
 
         now = time.monotonic()
+        renewal: api_store.LeaseRenewalState | None = None
         with runtime.lease_renewal_lock:
-            if now < runtime.next_lease_renewal_at:
+            if runtime.lease_lost:
+                renewal = "lost"
+            elif now < runtime.next_lease_renewal_at:
                 return
-            runtime.next_lease_renewal_at = now + max(
-                0.0,
-                self.config.lease_renewal_floor.total_seconds(),
+            else:
+                runtime.next_lease_renewal_at = now + max(
+                    0.0,
+                    self.config.lease_renewal_floor.total_seconds(),
+                )
+                try:
+                    renewal = api_store.renew_device_intake_lease(
+                        self.config.engine,
+                        intake_id=intake_id,
+                        floor=self.config.lease_renewal_floor,
+                    )
+                except Exception:
+                    runtime.next_lease_renewal_at = 0.0
+                    LOG.warning(
+                        "transient receive lease renewal error; upload continues: intake_id=%s",
+                        intake_id,
+                        exc_info=True,
+                    )
+                    return
+                if renewal == "lost":
+                    runtime.lease_lost = True
+        if renewal != "lost":
+            return
+        self._fail_intake_after_lease_loss(intake_id)
+        self.progress_registry.discard(intake_id)
+        _abort(context, grpc.StatusCode.FAILED_PRECONDITION, LEASE_LOST_DETAIL)
+
+    def _fail_intake_after_lease_loss(self, intake_id: str) -> None:
+        """Durably fail an intake without disturbing a replacement lease owner."""
+
+        factory = make_session_factory(self.config.engine)
+        with factory.begin() as session:
+            row = grpc_store.get_intake(session, intake_id)
+            if row is not None and row.state in {"streaming", "committing"}:
+                grpc_store.set_state(session, intake_id, "aborted")
+            api_store.transition_device_intent_terminal(
+                session,
+                intake_id=intake_id,
+                terminal_state="failed",
             )
-        api_store.renew_device_intake_lease(
-            self.config.engine,
-            intake_id=intake_id,
-            floor=self.config.lease_renewal_floor,
-        )
 
     def _identity(self, context: Any) -> grpc_store.DeviceIdentity:
         try:
