@@ -447,6 +447,72 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     _assert_hdcache_invariants(db_path)
 
 
+def test_receive_dedup_migration_preserves_dead_intent_heartbeat_and_downgrades(
+    tmp_path: Path,
+) -> None:
+    """Phase 1a must not make an old streaming receive look newly alive."""
+
+    db_path = tmp_path / "receive-dedup-backfill.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "c9a0d1e2f3b4"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    old_timestamp = "2025-01-02 03:04:05"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO grpc_intake "
+            "(intake_id, operator, device_id, state, manifest_digest, idempotency_key, "
+            "source_plan_digest, artifactclass, source_kind, source_ref, label, landing_root, "
+            "created_at, updated_at, card_id) "
+            "VALUES (?, 'ada', 'mac-1', 'streaming', NULL, 'dead-key', ?, 's-masters', "
+            "'card', 'DCIM', 'Dead Card', '/tmp/landing', ?, ?, 'card-dead')",
+            ("dead-intake", "a" * 64, old_timestamp, old_timestamp),
+        )
+        conn.execute(
+            "INSERT INTO idempotency_record "
+            "(operator_username, endpoint, idempotency_key, request_hash, status, intake_id, "
+            "response_json, created_at, updated_at, last_heartbeat) "
+            "VALUES ('ada', 'POST /api/devices/receive', 'dead-key', ?, 'in_progress', "
+            "'dead-intake', NULL, ?, ?, ?)",
+            ("b" * 64, old_timestamp, old_timestamp, old_timestamp),
+        )
+        conn.commit()
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "d4e5f6a7b8c9"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        migrated = conn.execute(
+            "SELECT status, updated_at, last_heartbeat, card_identity "
+            "FROM idempotency_record WHERE idempotency_key='dead-key'"
+        ).fetchone()
+    assert migrated == ("started", old_timestamp, old_timestamp, "card-dead")
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "c9a0d1e2f3b4"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        downgraded = conn.execute(
+            "SELECT status, updated_at, last_heartbeat "
+            "FROM idempotency_record WHERE idempotency_key='dead-key'"
+        ).fetchone()
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(idempotency_record)")}
+    assert downgraded == ("in_progress", old_timestamp, old_timestamp)
+    assert "card_identity" not in columns
+
+
 def test_copygrain_m3_migration_backfills_and_preserves_constraints(tmp_path: Path) -> None:
     db_path = tmp_path / "m3-backfill.db"
     repo_root = Path(__file__).resolve().parents[1]

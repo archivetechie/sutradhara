@@ -539,6 +539,63 @@ def test_post_device_receive_in_progress_does_not_recommand(
     assert call_count == 1
 
 
+def test_stream_drop_releases_card_lease_for_immediate_retry(api_engine: Engine) -> None:
+    """A dropped command stream must not strand its authorized card lease."""
+
+    registry = _online_registry(api_engine)
+    original = registry.send_start_receive
+    calls = 0
+
+    def drop_then_reject(**kwargs):
+        nonlocal calls
+        calls += 1
+        pending = original(**kwargs)
+        if calls == 1:
+            pending.future.set_exception(StreamClosed("device stream ended"))
+        else:
+            pending.future.set_result(
+                CommandAck(
+                    command_id=pending.command_id,
+                    accepted=False,
+                    reason="operator retry reached device",
+                    intake_id=None,
+                )
+            )
+        return pending
+
+    registry.send_start_receive = drop_then_reject  # type: ignore[method-assign]
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+    payload = {
+        "card_id": "card-1",
+        "artifactclass": "s-masters",
+        "idempotencyKey": str(uuid4()),
+    }
+
+    dropped = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload
+    )
+    retried = client.post(
+        "/api/devices/mac-1/receive",
+        headers=post_headers("operator"),
+        json={**payload, "idempotencyKey": str(uuid4())},
+    )
+
+    assert dropped.status_code == 409
+    assert dropped.json()["error"] == "device_unavailable"
+    assert retried.status_code == 409
+    assert retried.json() == {
+        "error": "receive_rejected",
+        "detail": "operator retry reached device",
+    }
+    assert calls == 2
+    with session_scope(api_engine) as session:
+        records = list(session.scalars(select(api_store.IdempotencyRecord)))
+        assert [record.status for record in records] == ["failed", "failed"]
+        assert list(session.scalars(select(api_store.SourceClaim))) == []
+
+
 def test_post_device_receive_canonicalizes_source_ref_before_idempotency(
     api_engine: Engine,
     tmp_path: Path,
@@ -648,12 +705,35 @@ def test_post_device_receive_rejects_bad_source_ref_before_claim_or_dispatch(
 
 def test_post_device_receive_does_not_complete_when_card_correlation_fails(
     api_engine: Engine,
+    tmp_path: Path,
 ) -> None:
     registry = _online_registry(api_engine)
     original = registry.send_start_receive
 
     def bad_ack(**kwargs):
         pending = original(**kwargs)
+        with session_scope(api_engine) as session:
+            linked = api_store.claim_start_intake(
+                session,
+                operator_username="ada",
+                device_id="mac-1",
+                idempotency_key=kwargs["idempotency_key"],
+                intake_id="owned-intake",
+            )
+            assert linked.state == "claimed"
+            grpc_store.insert_intake(
+                session,
+                intake_id="owned-intake",
+                operator="ada",
+                device_id="mac-1",
+                idempotency_key=kwargs["idempotency_key"],
+                source_plan_digest="a" * 64,
+                artifactclass=kwargs["artifactclass"],
+                source_kind="card",
+                source_ref=kwargs["source_ref"],
+                label=kwargs["label"],
+                landing_root=str(tmp_path),
+            )
         pending.future.set_result(
             CommandAck(
                 command_id=pending.command_id,
@@ -686,6 +766,62 @@ def test_post_device_receive_does_not_complete_when_card_correlation_fails(
         assert len(records) == 1
         assert records[0].status == "failed"
         assert session.get(api_store.SourceClaim, records[0].lease_source_id) is None
+
+
+def test_terminal_replay_precedes_ejected_card_resolution(api_engine: Engine) -> None:
+    """A stored terminal verdict must replay even after the source card is gone."""
+
+    registry = ConnectedDeviceRegistry()
+    stream = registry.register(
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
+    )
+    stream.update_cards(
+        [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")]
+    )
+    with session_scope(api_engine) as session:
+        grpc_store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="ada",
+        )
+    original = registry.send_start_receive
+
+    def reject(**kwargs):
+        pending = original(**kwargs)
+        pending.future.set_result(
+            CommandAck(
+                command_id=pending.command_id,
+                accepted=False,
+                reason="receive refused",
+                intake_id=None,
+            )
+        )
+        return pending
+
+    registry.send_start_receive = reject  # type: ignore[method-assign]
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+    payload = {
+        "card_id": "card-1",
+        "artifactclass": "s-masters",
+        "idempotencyKey": str(uuid4()),
+    }
+
+    first = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload
+    )
+    stream.update_cards([])
+    replay = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload
+    )
+
+    assert first.status_code == 409
+    assert first.json()["error"] == "receive_rejected"
+    assert replay.status_code == 409
+    assert replay.json()["error"] == "receive_terminal"
+    assert "failed" in replay.json()["detail"]
 
 
 def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path: Path) -> None:

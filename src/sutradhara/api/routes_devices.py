@@ -285,6 +285,7 @@ async def post_device_receive(
             idempotency_key=idempotency_key,
             request_hash=request_hash,
             acknowledge_duplicate=body.acknowledge_duplicate,
+            ttl=request.app.state.idempotency_ttl,
         )
     )
     if peeked is not None:
@@ -294,6 +295,12 @@ async def post_device_receive(
             return JSONResponse(status_code=409, content=peeked.response_json)
         if peeked.state == "completed" and peeked.response_json is not None:
             return {str(key): str(value) for key, value in peeked.response_json.items()}
+        if peeked.state == "terminal":
+            _raise(
+                409,
+                "receive_terminal",
+                f"prior receive attempt is {peeked.terminal_state}; start a new receive intent",
+            )
 
     try:
         card = await anyio.to_thread.run_sync(
@@ -374,6 +381,7 @@ async def post_device_receive(
         await _fail_device_intent(request, identity, device_id, idempotency_key)
         _raise(403, "forbidden", str(exc))
     except RuntimeError as exc:
+        await _fail_device_intent(request, identity, device_id, idempotency_key)
         _raise(409, "device_unavailable", str(exc))
 
     if not ack.accepted or not ack.intake_id:

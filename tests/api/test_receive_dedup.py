@@ -24,6 +24,7 @@ from sutradhara.api.routes_devices import (
 from sutradhara.catalog.models import Intake
 from sutradhara.catalog.session import session_scope
 from sutradhara.catalog.types import IntakeSourceKind, IntakeStatus
+from sutradhara.grpc import status as grpc_status
 from sutradhara.grpc import store as grpc_store
 from sutradhara.grpc.registry import Card, CommandAck, ConnectedDeviceRegistry
 from sutradhara.grpc.store import DeviceIdentity
@@ -193,6 +194,126 @@ def test_file_receipt_renewal_honors_floor_timer(api_engine: Engine) -> None:
         intake_id="renew-intake",
         floor=dt.timedelta(seconds=5),
     )
+
+
+def test_stale_same_key_reclaims_intent_and_fresh_lease(api_engine: Engine) -> None:
+    """An identical stored-key replay restarts instead of becoming terminal."""
+
+    assert _begin(api_engine, key="stale-replay", request_hash="same").state == "authorized"
+    with session_scope(api_engine) as session:
+        linked = api_store.claim_start_intake(
+            session,
+            operator_username="ada",
+            device_id="device-ada",
+            idempotency_key="stale-replay",
+            intake_id="stalled-intake",
+        )
+        assert linked.state == "claimed"
+    assert api_store.store_device_receive_response(
+        api_engine,
+        operator_username="ada",
+        device_id="device-ada",
+        idempotency_key="stale-replay",
+        intake_id="stalled-intake",
+        response_json={"intakeId": "stalled-intake", "status": "streaming"},
+    )
+    with session_scope(api_engine) as session:
+        intent = session.scalars(
+            select(api_store.IdempotencyRecord).where(
+                api_store.IdempotencyRecord.idempotency_key == "stale-replay"
+            )
+        ).one()
+        stale = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+        intent.last_heartbeat = stale
+        assert intent.lease_source_id is not None
+        claim = session.get(api_store.SourceClaim, intent.lease_source_id)
+        assert claim is not None
+        claim.last_heartbeat = stale
+
+    changed = _begin(api_engine, key="stale-replay", request_hash="changed")
+    peeked = api_store.peek_device_receive_intent(
+        api_engine,
+        operator_username="ada",
+        idempotency_key="stale-replay",
+        request_hash="same",
+        acknowledge_duplicate=False,
+    )
+    restarted = _begin(api_engine, key="stale-replay", request_hash="same")
+
+    assert changed.state == "conflict"
+    assert peeked is None
+    assert restarted.state == "authorized"
+    with session_scope(api_engine) as session:
+        intent = session.scalars(
+            select(api_store.IdempotencyRecord).where(
+                api_store.IdempotencyRecord.idempotency_key == "stale-replay"
+            )
+        ).one()
+        assert intent.status == "authorized"
+        assert intent.intake_id is None
+        assert intent.response_json is None
+        assert intent.started_at is None
+        assert intent.terminal_at is None
+        assert intent.lease_source_id is not None
+        claim = session.get(api_store.SourceClaim, intent.lease_source_id)
+        assert claim is not None
+        assert claim.idempotency_key == "stale-replay"
+
+
+def test_terminal_history_receipts_are_memoized_for_device_polls(
+    api_engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated card-history polls parse a terminal receipt ledger only once."""
+
+    with session_scope(api_engine) as session:
+        grpc_store.insert_intake(
+            session,
+            intake_id="historical-grpc",
+            operator="ada",
+            device_id="mac-old",
+            idempotency_key="historical-key",
+            source_plan_digest="a" * 64,
+            artifactclass="s-masters",
+            source_kind="card",
+            source_ref="DCIM",
+            label="Card One",
+            landing_root=str(tmp_path),
+        )
+        assert grpc_store.set_card_id(
+            session,
+            intake_id="historical-grpc",
+            operator="ada",
+            device_id="mac-old",
+            card_id="card-1",
+        )
+        grpc_store.set_committed_digest(session, "historical-grpc", "b" * 64)
+    ledger = tmp_path / "historical-grpc" / "receive-receipts.jsonl"
+    ledger.parent.mkdir()
+    ledger.write_text(
+        json.dumps({"relpath": "clip.mov", "server_sha256": "c" * 64, "bytes": 7}) + "\n",
+        encoding="utf-8",
+    )
+    registry = _online_registry(api_engine, enroll=False)
+    original_read_text = Path.read_text
+    reads = 0
+
+    def counted_read_text(path: Path, *args, **kwargs):
+        nonlocal reads
+        if path == ledger:
+            reads += 1
+        return original_read_text(path, *args, **kwargs)
+
+    grpc_status._terminal_receipt_summary.cache_clear()
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+
+    first = _device_payloads_with_history(api_engine, "ada", registry.devices_for("ada"))
+    second = _device_payloads_with_history(api_engine, "ada", registry.devices_for("ada"))
+
+    assert first == second
+    assert first[0]["cards"][0]["receivedBefore"]["state"] == "verifying"
+    assert reads == 1
 
 
 def test_device_receive_returns_stored_409_then_acknowledges(

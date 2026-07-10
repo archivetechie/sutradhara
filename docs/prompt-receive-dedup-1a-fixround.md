@@ -1,6 +1,6 @@
 # Prompt: receive-dedup 1a fix round — diff-gate findings (2026-07-10)
 
-**Status: pending (dispatch at codex quota reset).** The 1a diff gate (33-agent
+**Status: implemented 2026-07-10; awaiting the fix-round diff gate.** The 1a diff gate (33-agent
 workflow review of 6cf48d8^..HEAD against the frozen design + contract) confirmed
 10 findings. Finding 1 (CARD_ID_PATTERN rejecting `volume:` ids) is already fixed
 on main with a regression test. Fix the remaining nine, in this order. The design

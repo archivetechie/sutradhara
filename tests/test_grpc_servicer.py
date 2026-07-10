@@ -292,6 +292,147 @@ def test_start_intake_requires_authorized_http_intent(engine: Engine, tmp_path: 
     assert "authorized receive intent" in missing.value.details
 
 
+def test_stream_activity_renews_lease_before_any_file_receipt(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single multi-TTL file must keep excluding a concurrent card receive."""
+
+    clock = [dt.datetime(2026, 7, 10, tzinfo=dt.UTC)]
+    monkeypatch.setattr(api_store, "_utcnow", lambda: clock[0])
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="ada",
+        )
+    decision = api_store.begin_device_receive_intent(
+        engine,
+        operator_username="ada",
+        device_id="mac-1",
+        card_identity="card-long",
+        card_label="Long Card",
+        idempotency_key="long-key",
+        request_hash="long-hash",
+        acknowledge_duplicate=False,
+    )
+    assert decision.state == "authorized"
+    servicer = IntakeServicer(
+        GrpcIntakeConfig(
+            engine=engine,
+            landing_root=tmp_path / "landing",
+            validate_artifactclass=False,
+            lease_renewal_floor=dt.timedelta(0),
+        )
+    )
+    context = _FakeContext("mac-1", "AA" * 32)
+    started = servicer.StartIntake(
+        intake_pb2.StartIntakeRequest(
+            idempotency_key="long-key",
+            artifactclass="video-master",
+            source_kind="card",
+            source_plan_digest="a" * 64,
+        ),
+        context,
+    )
+
+    def chunks() -> Iterator[object]:
+        yield intake_pb2.FileChunk(
+            intake_id=started.intake_id,
+            relpath="event.mov",
+            data=b"a",
+            offset=0,
+            file_size=3,
+        )
+        for minutes, offset, data, is_last in (
+            (20, 1, b"b", False),
+            (40, 2, b"c", True),
+        ):
+            clock[0] = dt.datetime(2026, 7, 10, tzinfo=dt.UTC) + dt.timedelta(minutes=minutes)
+            competing = api_store.begin_device_receive_intent(
+                engine,
+                operator_username="other",
+                device_id="mac-2",
+                card_identity="card-long",
+                card_label="Long Card",
+                idempotency_key=f"other-{minutes}",
+                request_hash=f"other-hash-{minutes}",
+                acknowledge_duplicate=False,
+            )
+            assert competing.state == "busy"
+            yield intake_pb2.FileChunk(
+                intake_id=started.intake_id,
+                relpath="event.mov",
+                data=data,
+                offset=offset,
+                is_last=is_last,
+                file_size=3,
+            )
+
+    receipt = servicer.UploadFile(chunks(), context)
+
+    assert receipt.received_bytes == 3
+    assert receipt.server_sha256 == hashlib.sha256(b"abc").hexdigest()
+
+
+def test_start_intake_commits_stale_intent_expiry_before_rpc_abort(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """The FAILED_PRECONDITION abort must not roll back stale lease cleanup."""
+
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="ada",
+        )
+    _authorize_receive_intent(engine, key="stale-key", device_id="mac-1")
+    with session_scope(engine) as session:
+        intent = session.scalars(
+            select(api_store.IdempotencyRecord).where(
+                api_store.IdempotencyRecord.idempotency_key == "stale-key"
+            )
+        ).one()
+        stale = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+        intent.last_heartbeat = stale
+        assert intent.lease_source_id is not None
+        claim = session.get(api_store.SourceClaim, intent.lease_source_id)
+        assert claim is not None
+        claim.last_heartbeat = stale
+    servicer = IntakeServicer(
+        GrpcIntakeConfig(
+            engine=engine,
+            landing_root=tmp_path / "landing",
+            validate_artifactclass=False,
+        )
+    )
+
+    with pytest.raises(_Abort) as rejected:
+        servicer.StartIntake(
+            intake_pb2.StartIntakeRequest(
+                idempotency_key="stale-key",
+                artifactclass="video-master",
+                source_kind="card",
+                source_plan_digest="a" * 64,
+            ),
+            _FakeContext("mac-1", "AA" * 32),
+        )
+
+    assert rejected.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    with session_scope(engine) as session:
+        intent = session.scalars(
+            select(api_store.IdempotencyRecord).where(
+                api_store.IdempotencyRecord.idempotency_key == "stale-key"
+            )
+        ).one()
+        assert intent.status == "failed"
+        assert session.get(api_store.SourceClaim, intent.lease_source_id) is None
+
+
 def test_abort_terminalizes_http_intent_and_releases_card_lease(
     engine: Engine,
     tmp_path: Path,

@@ -363,7 +363,7 @@ def fail_device_receive_intent(
     device_id: str,
     idempotency_key: str,
 ) -> bool:
-    """Fail a pre-link authorized intent and release its lease for a clean retry."""
+    """Fail an authorized or started intent and release its lease for a clean retry."""
 
     now = _utcnow()
     factory = make_session_factory(engine)
@@ -376,7 +376,7 @@ def fail_device_receive_intent(
         )
         if record is None or record.device_id != device_id:
             return False
-        if record.status != "authorized":
+        if record.status not in {"authorized", "started"}:
             return False
         record.status = "failed"
         record.terminal_at = now
@@ -392,7 +392,7 @@ def renew_device_intake_lease(
     intake_id: str,
     floor: dt.timedelta = DEFAULT_HEARTBEAT_INTERVAL,
 ) -> bool:
-    """Renew a started intent and its lease after a committed file receipt."""
+    """Renew a started intent and its lease during streamed upload activity."""
 
     now = _utcnow()
     factory = make_session_factory(engine)
@@ -702,6 +702,7 @@ def peek_device_receive_intent(
     idempotency_key: str,
     request_hash: str,
     acknowledge_duplicate: bool,
+    ttl: dt.timedelta = DEFAULT_TTL,
 ) -> DeviceIntentDecision | None:
     """Read-only pre-check so idempotency verdicts precede card resolution.
 
@@ -725,7 +726,16 @@ def peek_device_receive_intent(
             return DeviceIntentDecision("conflict")
         if record.status == "warned" and not acknowledge_duplicate:
             return DeviceIntentDecision("warned", record.duplicate_warning)
-        if record.status in {"authorized", "started", "committed"} and record.response_json is not None:
+        if record.status in {"aborted", "quarantined", "failed"}:
+            return DeviceIntentDecision("terminal", terminal_state=record.status)
+        if record.status in {"authorized", "started"} and _is_stale(
+            record.last_heartbeat, ttl=ttl, now=_utcnow()
+        ):
+            return None
+        if (
+            record.status in {"authorized", "started", "committed"}
+            and record.response_json is not None
+        ):
             return DeviceIntentDecision("completed", record.response_json)
         return None
 
@@ -769,6 +779,16 @@ def _begin_device_receive_intent_once(
             )
             session.add(record)
             session.flush()
+            if _source_claim_is_busy(
+                session,
+                source_id=card_lease_source_id(card_identity),
+                operator_username=operator_username,
+                idempotency_key=idempotency_key,
+                ttl=ttl,
+                now=now,
+            ):
+                session.delete(record)
+                return DeviceIntentDecision("busy")
             history = latest_card_history(
                 session,
                 card_identity=card_identity,
@@ -803,11 +823,16 @@ def _begin_device_receive_intent_once(
             ttl=ttl,
             now=now,
         ):
-            record.status = "failed"
-            record.terminal_at = now
-            record.updated_at = now
             _release_record_lease(session, record)
-            return DeviceIntentDecision("terminal", terminal_state="failed")
+            session.flush()
+            if not _authorize_record_lease(session, record, ttl=ttl, now=now):
+                return DeviceIntentDecision("busy")
+            record.intake_id = None
+            record.response_json = None
+            record.started_at = None
+            record.terminal_at = None
+            record.created_at = now
+            return DeviceIntentDecision("authorized")
         if record.status == "warned":
             if not acknowledge_duplicate:
                 return DeviceIntentDecision("warned", record.duplicate_warning)
@@ -902,6 +927,25 @@ def _claim_source_in_session(
     claim.updated_at = now
     claim.last_heartbeat = now
     return True
+
+
+def _source_claim_is_busy(
+    session: Session,
+    *,
+    source_id: str,
+    operator_username: str,
+    idempotency_key: str,
+    ttl: dt.timedelta,
+    now: dt.datetime,
+) -> bool:
+    """Return whether another live owner holds a source before history warning."""
+
+    claim = session.get(SourceClaim, source_id)
+    if claim is None:
+        return False
+    if claim.operator_username == operator_username and claim.idempotency_key == idempotency_key:
+        return False
+    return not _is_stale(claim.last_heartbeat, ttl=ttl, now=now)
 
 
 def _release_record_lease(session: Session, record: IdempotencyRecord) -> None:

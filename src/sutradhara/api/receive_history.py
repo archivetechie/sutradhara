@@ -74,7 +74,7 @@ def latest_card_history(
     requester: str,
     exclude_intent_id: int | None = None,
 ) -> ReceiveHistoryMatch | None:
-    """Return the newest non-revoked attempt matching only the card identity."""
+    """Return the newest attempt matching only the card identity."""
 
     attempts: dict[str, _Attempt] = {}
     catalog_rows = list(session.scalars(select(Intake).where(Intake.card_id == card_identity)))
@@ -144,10 +144,9 @@ def latest_card_history(
         )
         for attempt in attempts.values()
     ]
-    non_revoked = [match for match in projected if match.state != "revoked"]
-    if not non_revoked:
+    if not projected:
         return None
-    return max(non_revoked, key=lambda match: (_aware(match.received_at), match.intake_id))
+    return max(projected, key=lambda match: (_aware(match.received_at), match.intake_id))
 
 
 def _attempt(

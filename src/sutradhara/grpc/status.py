@@ -7,8 +7,9 @@ the landing registrar has finished verification.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from sutradhara.grpc import store as grpc_store
@@ -68,10 +69,28 @@ class IntakeReceiptSummary:
 
 
 def intake_receipt_summary(row: grpc_store.GrpcIntake) -> IntakeReceiptSummary | None:
-    """Return copied bytes and relpaths from the landing receipt ledger."""
+    """Return copied bytes and relpaths, caching immutable terminal ledgers."""
 
-    intake_dir = intake_landing_path(row)
-    path = intake_dir / RECEIPTS_NAME
+    path = intake_landing_path(row) / RECEIPTS_NAME
+    if row.state in {"committed", "aborted"}:
+        return _terminal_receipt_summary(str(path), row.state)
+    return _read_receipt_summary(path)
+
+
+@lru_cache(maxsize=1024)
+def _terminal_receipt_summary(
+    receipt_path: str,
+    terminal_state: str,
+) -> IntakeReceiptSummary | None:
+    """Memoize one immutable terminal receipt ledger in a bounded cache."""
+
+    del terminal_state
+    return _read_receipt_summary(Path(receipt_path))
+
+
+def _read_receipt_summary(path: Path) -> IntakeReceiptSummary | None:
+    """Parse a receipt ledger without applying terminal-state caching."""
+
     if not path.exists():
         return None
     total = 0

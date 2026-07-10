@@ -74,7 +74,7 @@ def upgrade() -> None:
             "WHEN EXISTS (SELECT 1 FROM grpc_intake WHERE grpc_intake.intake_id = "
             "idempotency_record.intake_id AND grpc_intake.state = 'aborted') THEN 'aborted' "
             "ELSE 'started' END, "
-            "updated_at = CURRENT_TIMESTAMP, last_heartbeat = CURRENT_TIMESTAMP, "
+            "last_heartbeat = updated_at, "
             "terminal_at = CASE WHEN EXISTS (SELECT 1 FROM intake WHERE intake.intake_id = "
             "idempotency_record.intake_id AND intake.status IN ('registered', 'quarantined')) "
             "OR EXISTS (SELECT 1 FROM grpc_intake WHERE grpc_intake.intake_id = "

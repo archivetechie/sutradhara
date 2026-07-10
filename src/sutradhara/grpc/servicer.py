@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import threading
+import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -55,8 +56,12 @@ class GrpcIntakeConfig:
 
 @dataclass
 class _RuntimeState:
+    """Process-local coordination for concurrent streams of one intake."""
+
     lock: threading.Lock = field(default_factory=threading.Lock)
     ledger_lock: threading.Lock = field(default_factory=threading.Lock)
+    lease_renewal_lock: threading.Lock = field(default_factory=threading.Lock)
+    next_lease_renewal_at: float = 0.0
     in_flight: int = 0
 
 
@@ -85,12 +90,6 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                     idempotency_key=request.idempotency_key,
                     intake_id=intake_id,
                 )
-                if decision.state == "missing":
-                    _abort(
-                        context,
-                        grpc.StatusCode.FAILED_PRECONDITION,
-                        "no authorized receive intent",
-                    )
                 if decision.state == "resume":
                     assert decision.intake_id is not None
                     self._assert_resume_request(
@@ -99,46 +98,54 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                         request,
                         context,
                     )
-                    self.progress_registry.start(
-                        decision.intake_id,
-                        planned_bytes_total=_planned_bytes_total(request),
+                elif decision.state == "claimed":
+                    intake_dir.mkdir(parents=True, mode=0o755)
+                    (intake_dir / DATA_DIR_NAME).mkdir()
+                    (intake_dir / ".incoming").mkdir()
+                    _write_json(
+                        intake_dir / ".receiving.json",
+                        {
+                            "intake_id": intake_id,
+                            "landing": str(self.config.landing_root),
+                            "source_kind": request.source_kind,
+                            "operator": identity.operator,
+                            "device_id": identity.device_id,
+                            "source_ref": request.source_ref,
+                            "artifactclass": request.artifactclass,
+                            "label": request.label,
+                            "started_at": now.isoformat(),
+                            "receive_version": "grpc-stream-v1",
+                            "canonicalization_version": CANONICALIZATION_VERSION,
+                            "transport": "grpc-stream",
+                            "state": "streaming",
+                        },
                     )
-                    return intake_pb2.StartIntakeResponse(intake_id=decision.intake_id)
-
-                intake_dir.mkdir(parents=True, mode=0o755)
-                (intake_dir / DATA_DIR_NAME).mkdir()
-                (intake_dir / ".incoming").mkdir()
-                _write_json(
-                    intake_dir / ".receiving.json",
-                    {
-                        "intake_id": intake_id,
-                        "landing": str(self.config.landing_root),
-                        "source_kind": request.source_kind,
-                        "operator": identity.operator,
-                        "device_id": identity.device_id,
-                        "source_ref": request.source_ref,
-                        "artifactclass": request.artifactclass,
-                        "label": request.label,
-                        "started_at": now.isoformat(),
-                        "receive_version": "grpc-stream-v1",
-                        "canonicalization_version": CANONICALIZATION_VERSION,
-                        "transport": "grpc-stream",
-                        "state": "streaming",
-                    },
+                    grpc_store.insert_intake(
+                        session,
+                        intake_id=intake_id,
+                        operator=identity.operator,
+                        device_id=identity.device_id,
+                        idempotency_key=request.idempotency_key,
+                        source_plan_digest=request.source_plan_digest,
+                        artifactclass=request.artifactclass,
+                        source_kind=request.source_kind,
+                        source_ref=request.source_ref or None,
+                        label=request.label or None,
+                        landing_root=str(self.config.landing_root),
+                    )
+            if decision.state == "missing":
+                _abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "no authorized receive intent",
                 )
-                grpc_store.insert_intake(
-                    session,
-                    intake_id=intake_id,
-                    operator=identity.operator,
-                    device_id=identity.device_id,
-                    idempotency_key=request.idempotency_key,
-                    source_plan_digest=request.source_plan_digest,
-                    artifactclass=request.artifactclass,
-                    source_kind=request.source_kind,
-                    source_ref=request.source_ref or None,
-                    label=request.label or None,
-                    landing_root=str(self.config.landing_root),
+            if decision.state == "resume":
+                assert decision.intake_id is not None
+                self.progress_registry.start(
+                    decision.intake_id,
+                    planned_bytes_total=_planned_bytes_total(request),
                 )
+                return intake_pb2.StartIntakeResponse(intake_id=decision.intake_id)
             self.progress_registry.start(
                 intake_id,
                 planned_bytes_total=_planned_bytes_total(request),
@@ -297,6 +304,7 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                 for chunk in itertools.chain((first,), iterator):
                     if chunk.intake_id != row.intake_id or chunk.relpath != relpath:
                         _abort(context, grpc.StatusCode.INVALID_ARGUMENT, "chunk identity changed")
+                    self._renew_lease_on_activity(row.intake_id, runtime)
                     if chunk.file_size > 0:
                         total = max(total, int(chunk.file_size))
                     if chunk.data:
@@ -332,11 +340,6 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
             )
             with runtime.ledger_lock:
                 _append_receipt(intake_dir, relpath=relpath, digest=server_sha, size=received)
-            api_store.renew_device_intake_lease(
-                self.config.engine,
-                intake_id=row.intake_id,
-                floor=self.config.lease_renewal_floor,
-            )
             return intake_pb2.FileReceipt(
                 relpath=relpath,
                 server_sha256=server_sha,
@@ -345,6 +348,23 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
         except Exception:
             temp_path.unlink(missing_ok=True)
             raise
+
+    def _renew_lease_on_activity(self, intake_id: str, runtime: _RuntimeState) -> None:
+        """Throttle durable lease renewal while upload chunks are arriving."""
+
+        now = time.monotonic()
+        with runtime.lease_renewal_lock:
+            if now < runtime.next_lease_renewal_at:
+                return
+            runtime.next_lease_renewal_at = now + max(
+                0.0,
+                self.config.lease_renewal_floor.total_seconds(),
+            )
+        api_store.renew_device_intake_lease(
+            self.config.engine,
+            intake_id=intake_id,
+            floor=self.config.lease_renewal_floor,
+        )
 
     def _identity(self, context: Any) -> grpc_store.DeviceIdentity:
         try:
