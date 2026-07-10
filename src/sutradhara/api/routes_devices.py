@@ -272,6 +272,29 @@ async def post_device_receive(
     except ArtifactClassPolicyError as exc:
         _raise(400, "bad_artifactclass", str(exc))
 
+    idempotency_key = str(body.idempotencyKey)
+    request_hash = _device_receive_hash(device_id, body, source_ref=canonical_source_ref)
+    # Idempotency verdicts precede card resolution: a mutated-body replay must
+    # surface idempotency_conflict (not device_unavailable), and stored
+    # warned/completed responses replay even after the card is ejected.
+    peeked = await anyio.to_thread.run_sync(
+        partial(
+            api_store.peek_device_receive_intent,
+            engine,
+            operator_username=identity.operator_username,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            acknowledge_duplicate=body.acknowledge_duplicate,
+        )
+    )
+    if peeked is not None:
+        if peeked.state == "conflict":
+            _raise(409, "idempotency_conflict", "same idempotencyKey used with a different body")
+        if peeked.state == "warned" and peeked.response_json is not None:
+            return JSONResponse(status_code=409, content=peeked.response_json)
+        if peeked.state == "completed" and peeked.response_json is not None:
+            return {str(key): str(value) for key, value in peeked.response_json.items()}
+
     try:
         card = await anyio.to_thread.run_sync(
             partial(
@@ -285,9 +308,6 @@ async def post_device_receive(
         _raise(403, "forbidden", str(exc))
     except (DeviceOffline, CardUnavailable) as exc:
         _raise(409, "device_unavailable", str(exc))
-
-    idempotency_key = str(body.idempotencyKey)
-    request_hash = _device_receive_hash(device_id, body, source_ref=canonical_source_ref)
     decision = await anyio.to_thread.run_sync(
         partial(
             api_store.begin_device_receive_intent,

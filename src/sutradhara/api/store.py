@@ -695,6 +695,41 @@ def _begin_idempotency_once(
         return IdempotencyDecision("claimed")
 
 
+def peek_device_receive_intent(
+    engine: Any,
+    *,
+    operator_username: str,
+    idempotency_key: str,
+    request_hash: str,
+    acknowledge_duplicate: bool,
+) -> DeviceIntentDecision | None:
+    """Read-only pre-check so idempotency verdicts precede card resolution.
+
+    A same-key/different-body request must surface ``idempotency_conflict`` even
+    when the mutated body references a card that no longer resolves, and stored
+    warned/completed responses must replay without requiring the card to still be
+    mounted. Never creates records, transitions states, or touches leases; every
+    other outcome falls through to ``begin_device_receive_intent``.
+    """
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        record = _idempotency_record(
+            session,
+            operator_username=operator_username,
+            endpoint=DEVICE_RECEIVE_ENDPOINT,
+            idempotency_key=idempotency_key,
+        )
+        if record is None:
+            return None
+        if record.request_hash != request_hash:
+            return DeviceIntentDecision("conflict")
+        if record.status == "warned" and not acknowledge_duplicate:
+            return DeviceIntentDecision("warned", record.duplicate_warning)
+        if record.status in {"authorized", "started", "committed"} and record.response_json is not None:
+            return DeviceIntentDecision("completed", record.response_json)
+        return None
+
+
 def _begin_device_receive_intent_once(
     engine: Any,
     *,
