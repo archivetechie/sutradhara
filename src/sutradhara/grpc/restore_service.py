@@ -44,6 +44,7 @@ from sutradhara.grpc import ca as grpc_ca
 from sutradhara.grpc import store as grpc_store
 from sutradhara.hdcache.fill import effective_privacy_level
 from sutradhara.hdcache.manager import (
+    ITEM_DONE,
     ITEM_QUEUED,
     ITEM_SENT,
     ITEM_STREAMING,
@@ -52,13 +53,19 @@ from sutradhara.hdcache.manager import (
     InvalidRestoreDestination,
     RestoreConfig,
     _select_cache_entry,
+    _update_request_state,
     authorize_agent_restore_destination,
     open_cache_plaintext_chunks,
     restore_backends_for_artifactclass,
     restore_config_from_env,
     validate_restore_relative_path,
 )
-from sutradhara.hdcache.models import CacheEntry, RestoreOpenSession, RestoreRequestItem
+from sutradhara.hdcache.models import (
+    CacheEntry,
+    RestoreItemCheckpoint,
+    RestoreOpenSession,
+    RestoreRequestItem,
+)
 from sutradhara.restore import RestoreIntegrityError as ChunkRestoreIntegrityError
 from sutradhara.staging import StagingError
 
@@ -123,6 +130,9 @@ class _PreparedOpen:
     member: PlannedMember | None
     cache_entry_hash: bytes | None
     source: str
+    committed_index: int
+    revealed: bool
+    expected_generation: int | None
 
 
 @dataclass(frozen=True)
@@ -157,27 +167,174 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         try:
             identity = self._identity(context)
             prepared = self._prepare_open(request, identity, context)
+            if prepared.revealed:
+                yield restore_pb2.RestoreFrame(
+                    job_end=restore_pb2.JobEnd(
+                        files=0,
+                        bytes=0,
+                        manifest_sha256=prepared.manifest_sha256,
+                    )
+                )
+                return
             lease = self._acquire_lease(prepared, context)
             self._mark_streaming(prepared)
-            if (yield from self._stream(prepared, lease, context)):
-                completed = self._mark_sent(prepared, lease)
+            emitted = yield from self._stream(prepared, lease, context)
+            if emitted is not None:
+                completed = self._mark_sent(prepared, lease, emitted)
         finally:
             if prepared is not None and prepared.plan is not None:
                 prepared.plan.close()
-            if lease is not None:
-                if not completed and prepared is not None:
-                    self._restore_interrupted_state(prepared, lease)
+            if lease is not None and not completed and prepared is not None:
+                self._restore_interrupted_state(prepared, lease)
                 self._release_lease(lease)
             self._slots.release()
 
     def CommitRestore(self, request: Any, context: Any) -> Any:
-        """Reserve the stable RM1.3 commit surface without implementing its CAS."""
+        """Durably advance staged progress or terminally reveal one restore item."""
 
-        _abort(
-            context,
-            grpc.StatusCode.UNIMPLEMENTED,
-            "CommitRestore durable STAGED/REVEALED semantics land in RM1.3",
-        )
+        identity = self._identity(context)
+        self._require_restore_device(identity, context)
+        if request.restore_request_item_id <= 0:
+            _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "restore item id must be positive")
+        if len(request.manifest_sha256) != hashlib.sha256().digest_size:
+            _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "manifest digest is invalid")
+        if not request.HasField("lease_token"):
+            _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "lease token is required")
+        token = request.lease_token
+        if (
+            token.restore_request_item_id != request.restore_request_item_id
+            or token.receiver_device_id != identity.device_id
+            or token.manifest_sha256 != request.manifest_sha256
+            or token.generation <= 0
+        ):
+            _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "lease token does not match")
+        if request.committed_index > 1:
+            _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "committed index exceeds manifest")
+        if request.durable_state not in {
+            restore_pb2.DURABLE_STATE_STAGED,
+            restore_pb2.DURABLE_STATE_REVEALED,
+        }:
+            _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "durable state is invalid")
+        if (
+            request.durable_state == restore_pb2.DURABLE_STATE_REVEALED
+            and request.committed_index != 1
+        ):
+            _abort(
+                context, grpc.StatusCode.FAILED_PRECONDITION, "revealed commit must cover manifest"
+            )
+
+        now = dt.datetime.now(dt.UTC)
+        with self._factory.begin() as session:
+            preconditions = (
+                RestoreItemCheckpoint.restore_request_item_id == request.restore_request_item_id,
+                RestoreItemCheckpoint.manifest_sha256 == request.manifest_sha256,
+                RestoreItemCheckpoint.item.has(
+                    RestoreRequestItem.request.has(receiver_device_id=identity.device_id)
+                ),
+                RestoreItemCheckpoint.item.has(
+                    RestoreRequestItem.open_session.has(
+                        and_(
+                            RestoreOpenSession.receiver_device_id == identity.device_id,
+                            RestoreOpenSession.manifest_sha256 == request.manifest_sha256,
+                            RestoreOpenSession.generation == token.generation,
+                        )
+                    )
+                ),
+            )
+            live_lease = RestoreItemCheckpoint.item.has(
+                RestoreRequestItem.open_session.has(RestoreOpenSession.expires_at > now)
+            )
+            if request.durable_state == restore_pb2.DURABLE_STATE_STAGED:
+                result = session.connection().execute(
+                    update(RestoreItemCheckpoint)
+                    .where(
+                        *preconditions,
+                        live_lease,
+                        RestoreItemCheckpoint.revealed.is_(False),
+                        RestoreItemCheckpoint.committed_index < request.committed_index,
+                    )
+                    .values(committed_index=request.committed_index, updated_at=now)
+                )
+            else:
+                result = session.connection().execute(
+                    update(RestoreItemCheckpoint)
+                    .where(
+                        *preconditions,
+                        live_lease,
+                        RestoreItemCheckpoint.revealed.is_(False),
+                    )
+                    .values(
+                        committed_index=request.committed_index,
+                        revealed=True,
+                        updated_at=now,
+                    )
+                )
+
+            checkpoint = session.scalar(
+                select(RestoreItemCheckpoint)
+                .options(
+                    selectinload(RestoreItemCheckpoint.item).selectinload(
+                        RestoreRequestItem.request
+                    ),
+                    selectinload(RestoreItemCheckpoint.item).selectinload(
+                        RestoreRequestItem.open_session
+                    ),
+                )
+                .where(*preconditions)
+            )
+            if checkpoint is None:
+                _abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "manifest, receiver, or lease generation does not match",
+                )
+            open_session = checkpoint.item.open_session
+            lease_is_live = open_session is not None and _as_utc(open_session.expires_at) > now
+            if not lease_is_live and not checkpoint.revealed:
+                _abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "restore lease has expired",
+                )
+            status = "advanced" if result.rowcount == 1 else "unchanged"
+            if request.durable_state == restore_pb2.DURABLE_STATE_REVEALED:
+                if result.rowcount == 1:
+                    item_result = session.connection().execute(
+                        update(RestoreRequestItem)
+                        .where(
+                            RestoreRequestItem.id == request.restore_request_item_id,
+                            RestoreRequestItem.state == ITEM_SENT,
+                        )
+                        .values(state=ITEM_DONE, detail=None, updated_at=now)
+                    )
+                    if item_result.rowcount != 1:
+                        _abort(
+                            context,
+                            grpc.StatusCode.FAILED_PRECONDITION,
+                            "restore item has not reached sent",
+                        )
+                    session.expire(checkpoint.item)
+                    session.refresh(checkpoint.item)
+                    if checkpoint.item.request is not None:
+                        _update_request_state(checkpoint.item.request)
+                    status = "revealed"
+                elif checkpoint.revealed and checkpoint.item.state == ITEM_DONE:
+                    status = "already_done"
+                else:
+                    _abort(
+                        context,
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        "restore reveal could not be committed",
+                    )
+            elif checkpoint.revealed:
+                status = "already_done"
+
+            return restore_pb2.CommitRestoreReply(
+                restore_request_item_id=request.restore_request_item_id,
+                status=status,
+                committed_index=checkpoint.committed_index,
+                revealed=checkpoint.revealed,
+            )
 
     def WatchAssignments(self, request: Any, context: Any) -> Iterator[Any]:
         """Emit device-scoped metadata; OpenRestore separately gates object bytes."""
@@ -240,8 +397,6 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
     ) -> _PreparedOpen:
         if request.restore_request_item_id <= 0:
             _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "restore item id must be positive")
-        if request.HasField("resume_token"):
-            _abort(context, grpc.StatusCode.UNIMPLEMENTED, "resume re-drive lands in RM1.3")
         self._require_restore_device(identity, context)
         with self._factory() as session:
             item = session.scalar(
@@ -261,8 +416,13 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             # ``streaming`` is reopenable only through its persisted lease: the
             # lease CAS below rejects a live generation and supersedes an
             # expired one. A bare streaming state remains fail-closed.
-            if item.state not in {ITEM_QUEUED, ITEM_SENT} and (
-                item.state != ITEM_STREAMING or item.open_session is None
+            revealed_done = (
+                item.state == ITEM_DONE and item.checkpoint is not None and item.checkpoint.revealed
+            )
+            if (
+                not revealed_done
+                and item.state not in {ITEM_QUEUED, ITEM_SENT}
+                and (item.state != ITEM_STREAMING or item.open_session is None)
             ):
                 _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "item is not streamable")
             try:
@@ -287,6 +447,34 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 content_sha256=item.content_sha256,
             )
             digest = _manifest_digest([manifest])
+            checkpoint = item.checkpoint
+            if checkpoint is None:
+                checkpoint = RestoreItemCheckpoint(
+                    restore_request_item_id=item.id,
+                    manifest_sha256=digest,
+                    committed_index=0,
+                    revealed=False,
+                )
+                try:
+                    with session.begin_nested():
+                        session.add(checkpoint)
+                        session.flush()
+                except IntegrityError:
+                    checkpoint = session.get(RestoreItemCheckpoint, item.id)
+                    if checkpoint is None:
+                        _abort(
+                            context,
+                            grpc.StatusCode.ALREADY_EXISTS,
+                            "restore checkpoint is being frozen by another open",
+                        )
+            if checkpoint.manifest_sha256 != digest:
+                _abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "server-frozen restore manifest changed",
+                )
+
+            expected_generation: int | None = None
             if request.HasField("lease_token"):
                 supplied = request.lease_token
                 if (
@@ -297,6 +485,61 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     _abort(
                         context, grpc.StatusCode.FAILED_PRECONDITION, "lease token does not match"
                     )
+                expected_generation = supplied.generation
+                if item.open_session is None or item.open_session.generation != expected_generation:
+                    _abort(
+                        context,
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        "lease generation is stale or superseded",
+                    )
+            if request.HasField("resume_token"):
+                resume = request.resume_token
+                if resume.restore_request_item_id != item.id or resume.manifest_sha256 != digest:
+                    _abort(
+                        context,
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        "resume token manifest does not match the frozen plan",
+                    )
+                if not request.HasField("lease_token"):
+                    _abort(
+                        context,
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        "resume requires the prior lease generation",
+                    )
+
+            session.commit()
+            if checkpoint.revealed:
+                return _PreparedOpen(
+                    item_id=item.id,
+                    device_id=identity.device_id,
+                    artifactclass=item.artifactclass,
+                    original_state=item.state,
+                    manifest=manifest,
+                    manifest_sha256=digest,
+                    plan=None,
+                    member=None,
+                    cache_entry_hash=None,
+                    source=item.source or "cache",
+                    committed_index=checkpoint.committed_index,
+                    revealed=True,
+                    expected_generation=expected_generation,
+                )
+            if checkpoint.committed_index > manifest.index:
+                return _PreparedOpen(
+                    item_id=item.id,
+                    device_id=identity.device_id,
+                    artifactclass=item.artifactclass,
+                    original_state=ITEM_QUEUED if item.state == ITEM_STREAMING else item.state,
+                    manifest=manifest,
+                    manifest_sha256=digest,
+                    plan=None,
+                    member=None,
+                    cache_entry_hash=None,
+                    source=item.source or "cache",
+                    committed_index=checkpoint.committed_index,
+                    revealed=False,
+                    expected_generation=expected_generation,
+                )
             plan: RestorePlan | None = None
             member: PlannedMember | None = None
             cache_entry_hash: bytes | None = None
@@ -337,6 +580,9 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 member=member,
                 cache_entry_hash=cache_entry_hash,
                 source=source,
+                committed_index=checkpoint.committed_index,
+                revealed=False,
+                expected_generation=expected_generation,
             )
 
     def _probe_cache_entry(
@@ -394,6 +640,11 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 .where(
                     RestoreOpenSession.restore_request_item_id == prepared.item_id,
                     RestoreOpenSession.expires_at <= now,
+                    *(
+                        (RestoreOpenSession.generation == prepared.expected_generation,)
+                        if prepared.expected_generation is not None
+                        else ()
+                    ),
                 )
                 .values(
                     receiver_device_id=prepared.device_id,
@@ -408,6 +659,12 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     select(RestoreOpenSession.generation).where(
                         RestoreOpenSession.restore_request_item_id == prepared.item_id
                     )
+                )
+            elif prepared.expected_generation is not None:
+                _abort(
+                    context,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "lease generation is stale, live, or superseded",
                 )
             else:
                 session.add(
@@ -438,7 +695,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
 
     def _stream(
         self, prepared: _PreparedOpen, lease: _Lease, context: Any
-    ) -> Generator[Any, None, bool]:
+    ) -> Generator[Any, None, int | None]:
         manifest = prepared.manifest
         top_component = PurePosixPath(manifest.final_rel_path).parts[0]
         token = _lease_proto(lease)
@@ -459,6 +716,15 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 file_count=1,
             )
         )
+        if prepared.committed_index > manifest.index:
+            yield restore_pb2.RestoreFrame(
+                job_end=restore_pb2.JobEnd(
+                    files=0,
+                    bytes=0,
+                    manifest_sha256=prepared.manifest_sha256,
+                )
+            )
+            return 0
         _require_active(context)
         yield restore_pb2.RestoreFrame(file_header=_file_header_proto(manifest))
         offset = 0
@@ -474,7 +740,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             yield restore_pb2.RestoreFrame(
                 error=restore_pb2.RestoreError(code="ARCHIVE_RESTORE_FAILED", message=str(exc))
             )
-            return False
+            return None
         if offset != manifest.size:
             raise RestoreSourceUnavailable(
                 f"restore plan emitted {offset} bytes, expected {manifest.size}"
@@ -494,7 +760,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 manifest_sha256=prepared.manifest_sha256,
             )
         )
-        return True
+        return offset
 
     @contextmanager
     def _open_prepared_chunks(self, prepared: _PreparedOpen) -> Iterator[Iterator[bytes]]:
@@ -532,7 +798,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             if item.request is not None:
                 item.request.state = REQUEST_ACTIVE
 
-    def _mark_sent(self, prepared: _PreparedOpen, lease: _Lease) -> bool:
+    def _mark_sent(self, prepared: _PreparedOpen, lease: _Lease, emitted_bytes: int) -> bool:
         now = dt.datetime.now(dt.UTC)
         with self._factory.begin() as session:
             result = session.connection().execute(
@@ -553,7 +819,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     state=ITEM_SENT,
                     detail=None,
                     source=prepared.source,
-                    bytes_restored=prepared.manifest.size,
+                    bytes_restored=emitted_bytes,
                     updated_at=now,
                 )
             )
@@ -760,6 +1026,14 @@ def _assignment_proto(item: RestoreRequestItem) -> Any:
 def _require_active(context: Any) -> None:
     if not context.is_active():
         raise grpc.RpcError("restore stream cancelled")
+
+
+def _as_utc(value: dt.datetime) -> dt.datetime:
+    """Normalize SQLite-naive and timezone-aware lease timestamps."""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
 
 
 def _abort(context: Any, code: grpc.StatusCode, detail: str) -> NoReturn:

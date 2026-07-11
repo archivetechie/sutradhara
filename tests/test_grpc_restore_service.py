@@ -9,6 +9,7 @@ import socket
 import struct
 import tracemalloc
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -56,6 +57,7 @@ from sutradhara.hdcache.manager import RestoreConfig
 from sutradhara.hdcache.models import (
     CacheDisk,
     CacheEntry,
+    RestoreItemCheckpoint,
     RestoreOpenSession,
     RestoreRequest,
     RestoreRequestItem,
@@ -70,6 +72,8 @@ from sutradhara.hdcache.store import (
     write_entry,
 )
 from sutradhara.jobs.models import Job
+from sutradhara.jobs.reconcilers import restore_open as restore_open_reconciler
+from sutradhara.jobs.reconcilers.spine import reconcile
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyRegistry
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
@@ -565,6 +569,10 @@ def test_manifest_digest_is_source_independent_between_archive_and_cache(rig: _R
         )
     )
     _seed_cache_entry(rig, item_id, payload)
+    with session_scope(rig.engine) as session:
+        lease = session.get(RestoreOpenSession, item_id)
+        assert lease is not None
+        lease.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
     cache_frames = list(
         rig.service.OpenRestore(
             restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
@@ -908,11 +916,330 @@ def test_watch_assignments_isolates_authenticated_device(rig: _Rig) -> None:
     assert wrong_watch.value.code == grpc.StatusCode.PERMISSION_DENIED
 
 
-def test_commit_restore_is_explicitly_deferred_to_rm13(rig: _Rig) -> None:
-    with pytest.raises(_Abort) as deferred:
+def test_commit_restore_rejects_an_invalid_request(rig: _Rig) -> None:
+    with pytest.raises(_Abort) as invalid:
         rig.service.CommitRestore(restore_pb2.CommitRestoreRequest(), rig.context("receiver"))
-    assert deferred.value.code == grpc.StatusCode.UNIMPLEMENTED
-    assert "RM1.3" in deferred.value.details
+    assert invalid.value.code == grpc.StatusCode.FAILED_PRECONDITION
+
+
+def test_commit_staged_is_durable_monotonic_and_checks_all_cas_bindings(rig: _Rig) -> None:
+    item_id = _seed_item(rig, "commit-staged", b"durable staged", receiver="receiver")
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+    token = frames[0].manifest_head.lease_token
+    digest = frames[0].manifest_head.manifest_sha256
+
+    advanced = rig.service.CommitRestore(
+        _commit_request(item_id, digest, token, committed_index=1),
+        rig.context("receiver"),
+    )
+    unchanged = rig.service.CommitRestore(
+        _commit_request(item_id, digest, token, committed_index=0),
+        rig.context("receiver"),
+    )
+    assert (advanced.status, advanced.committed_index, advanced.revealed) == (
+        "advanced",
+        1,
+        False,
+    )
+    assert (unchanged.status, unchanged.committed_index) == ("unchanged", 1)
+    with session_scope(rig.engine) as session:
+        checkpoint = session.get(RestoreItemCheckpoint, item_id)
+        assert checkpoint is not None
+        assert checkpoint.committed_index == 1
+
+    wrong_digest = hashlib.sha256(b"changed plan").digest()
+    wrong_manifest_token = restore_pb2.LeaseToken()
+    wrong_manifest_token.CopyFrom(token)
+    wrong_manifest_token.manifest_sha256 = wrong_digest
+    with pytest.raises(_Abort) as mismatch:
+        rig.service.CommitRestore(
+            _commit_request(item_id, wrong_digest, wrong_manifest_token, committed_index=1),
+            rig.context("receiver"),
+        )
+    assert mismatch.value.code == grpc.StatusCode.FAILED_PRECONDITION
+
+    stale = restore_pb2.LeaseToken()
+    stale.CopyFrom(token)
+    stale.generation += 1
+    with pytest.raises(_Abort) as stale_lease:
+        rig.service.CommitRestore(
+            _commit_request(item_id, digest, stale, committed_index=1),
+            rig.context("receiver"),
+        )
+    assert stale_lease.value.code == grpc.StatusCode.FAILED_PRECONDITION
+
+    with pytest.raises(_Abort) as wrong_receiver:
+        rig.service.CommitRestore(
+            _commit_request(item_id, digest, token, committed_index=1),
+            rig.context("wrong-receiver"),
+        )
+    assert wrong_receiver.value.code == grpc.StatusCode.FAILED_PRECONDITION
+
+
+def test_concurrent_staged_commits_keep_the_highest_index(rig: _Rig) -> None:
+    item_id = _seed_item(rig, "commit-race", b"race safely", receiver="receiver")
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+    token = frames[0].manifest_head.lease_token
+    digest = frames[0].manifest_head.manifest_sha256
+
+    def commit(index: int) -> tuple[str, int]:
+        reply = rig.service.CommitRestore(
+            _commit_request(item_id, digest, token, committed_index=index),
+            rig.context("receiver"),
+        )
+        return reply.status, reply.committed_index
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(commit, (1, 0)))
+
+    assert {index for _status, index in results} <= {0, 1}
+    with session_scope(rig.engine) as session:
+        checkpoint = session.get(RestoreItemCheckpoint, item_id)
+        assert checkpoint is not None
+        assert checkpoint.committed_index == 1
+
+
+def test_revealed_is_terminal_idempotent_and_completes_only_after_every_item(rig: _Rig) -> None:
+    first_id = _seed_item(rig, "reveal-first", b"first reveal", receiver="receiver")
+    second_id = _seed_item(rig, "reveal-second", b"second reveal", receiver="receiver")
+    with session_scope(rig.engine) as session:
+        first = session.get(RestoreRequestItem, first_id)
+        second = session.get(RestoreRequestItem, second_id)
+        assert first is not None
+        assert second is not None
+        second_request = second.request
+        second.request = first.request
+        session.flush()
+        session.delete(second_request)
+
+    commits: list[tuple[int, bytes, Any]] = []
+    for item_id in (first_id, second_id):
+        frames = list(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+        )
+        commits.append(
+            (
+                item_id,
+                frames[0].manifest_head.manifest_sha256,
+                frames[0].manifest_head.lease_token,
+            )
+        )
+
+    first_request = _commit_request(*commits[0], committed_index=1, revealed=True)
+    first_reply = rig.service.CommitRestore(first_request, rig.context("receiver"))
+    replay = rig.service.CommitRestore(first_request, rig.context("receiver"))
+    assert (first_reply.status, first_reply.revealed) == ("revealed", True)
+    assert (replay.status, replay.revealed) == ("already_done", True)
+    with session_scope(rig.engine) as session:
+        first = session.get(RestoreRequestItem, first_id)
+        second = session.get(RestoreRequestItem, second_id)
+        assert first is not None
+        assert second is not None
+        assert first.state == "done"
+        assert second.state == "sent"
+        assert first.request.state == "active"
+        assert _request_payload(first.request)["state"] == "active"
+
+    second_reply = rig.service.CommitRestore(
+        _commit_request(*commits[1], committed_index=1, revealed=True),
+        rig.context("receiver"),
+    )
+    assert second_reply.status == "revealed"
+    with session_scope(rig.engine) as session:
+        second = session.get(RestoreRequestItem, second_id)
+        assert second is not None
+        assert second.request.state == "completed"
+
+
+def test_resume_redrives_in_progress_file_from_start_and_reveals(rig: _Rig) -> None:
+    payload = b"resume from file boundary\n" * 100_000
+    item_id = _seed_item(rig, "resume-redrive", payload, receiver="receiver")
+    context = rig.context("receiver")
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), context
+    )
+    head = next(stream).manifest_head
+    for frame in stream:
+        if frame.HasField("chunk"):
+            assert frame.chunk.offset == 0
+            break
+    staged = rig.service.CommitRestore(
+        _commit_request(item_id, head.manifest_sha256, head.lease_token, committed_index=0),
+        rig.context("receiver"),
+    )
+    assert staged.committed_index == 0
+    stream.close()  # type: ignore[attr-defined]
+
+    resumed = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(
+                restore_request_item_id=item_id,
+                lease_token=head.lease_token,
+                resume_token=restore_pb2.ResumeToken(
+                    restore_request_item_id=item_id,
+                    manifest_sha256=head.manifest_sha256,
+                    committed_index=1,
+                ),
+            ),
+            rig.context("receiver"),
+        )
+    )
+    assert resumed[3].file_header.index == 0
+    assert next(frame.chunk.offset for frame in resumed if frame.HasField("chunk")) == 0
+    assert _payload_digest(resumed) == hashlib.sha256(payload).digest()
+    resumed_token = resumed[0].manifest_head.lease_token
+    revealed = rig.service.CommitRestore(
+        _commit_request(item_id, head.manifest_sha256, resumed_token, 1, revealed=True),
+        rig.context("receiver"),
+    )
+    assert revealed.revealed
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        assert item.state == "done"
+
+
+def test_resume_skips_committed_file_and_revealed_resume_is_already_done(rig: _Rig) -> None:
+    item_id = _seed_item(rig, "resume-skip", b"already staged", receiver="receiver")
+    initial = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+    head = initial[0].manifest_head
+    rig.service.CommitRestore(
+        _commit_request(item_id, head.manifest_sha256, head.lease_token, 1),
+        rig.context("receiver"),
+    )
+    rig.backend.paths["object-resume-skip"].unlink()
+    with session_scope(rig.engine) as session:
+        lease = session.get(RestoreOpenSession, item_id)
+        assert lease is not None
+        lease.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
+
+    resumed = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(
+                restore_request_item_id=item_id,
+                lease_token=head.lease_token,
+                resume_token=restore_pb2.ResumeToken(
+                    restore_request_item_id=item_id,
+                    manifest_sha256=head.manifest_sha256,
+                    committed_index=0,
+                ),
+            ),
+            rig.context("receiver"),
+        )
+    )
+    assert [frame.WhichOneof("payload") for frame in resumed] == [
+        "manifest_head",
+        "manifest_entry",
+        "manifest_end",
+        "job_end",
+    ]
+    resumed_token = resumed[0].manifest_head.lease_token
+    rig.service.CommitRestore(
+        _commit_request(item_id, head.manifest_sha256, resumed_token, 1, revealed=True),
+        rig.context("receiver"),
+    )
+    already_done = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(
+                restore_request_item_id=item_id,
+                lease_token=resumed_token,
+                resume_token=restore_pb2.ResumeToken(
+                    restore_request_item_id=item_id,
+                    manifest_sha256=head.manifest_sha256,
+                    committed_index=1,
+                ),
+            ),
+            rig.context("receiver"),
+        )
+    )
+    assert len(already_done) == 1
+    assert already_done[0].HasField("job_end")
+    assert already_done[0].job_end.files == 0
+
+
+def test_resume_manifest_mismatch_is_refused(rig: _Rig) -> None:
+    item_id = _seed_item(rig, "resume-mismatch", b"frozen plan", receiver="receiver")
+    initial = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+    head = initial[0].manifest_head
+    with session_scope(rig.engine) as session:
+        lease = session.get(RestoreOpenSession, item_id)
+        assert lease is not None
+        lease.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
+    emitted: list[Any] = []
+    with pytest.raises(_Abort) as mismatch:
+        emitted.extend(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(
+                    restore_request_item_id=item_id,
+                    lease_token=head.lease_token,
+                    resume_token=restore_pb2.ResumeToken(
+                        restore_request_item_id=item_id,
+                        manifest_sha256=hashlib.sha256(b"other plan").digest(),
+                    ),
+                ),
+                rig.context("receiver"),
+            )
+        )
+    assert mismatch.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert emitted == []
+
+
+def test_expired_sent_lease_reconciles_reopenable_and_gets_new_generation(rig: _Rig) -> None:
+    payload = b"remote bytes only"
+    item_id = _seed_item(rig, "lease-reconcile", payload, receiver="receiver")
+    forbidden = rig.root / "agent-destinations" / "receiver" / "exports" / "lease-reconcile.bin"
+    initial = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+    first_generation = initial[0].manifest_head.lease_token.generation
+    with session_scope(rig.engine) as session:
+        lease = session.get(RestoreOpenSession, item_id)
+        assert lease is not None
+        lease.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
+    with session_scope(rig.engine) as session:
+        assert reconcile(session, restore_open_reconciler.DOMAIN, cursor=item_id - 1) == (1, 1)
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        assert item.state == "sent"
+        assert item.request.state == "active"
+        assert item.detail == restore_open_reconciler.REOPENABLE_DETAIL
+
+    reopened = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+    assert reopened[0].manifest_head.lease_token.generation == first_generation + 1
+    assert _payload_digest(reopened) == hashlib.sha256(payload).digest()
+    assert not forbidden.exists()
 
 
 def test_restore_proto_cross_language_field_numbers_are_frozen() -> None:
@@ -1086,6 +1413,27 @@ def _seed_item(
         session.add(request)
         session.flush()
         return item.id
+
+
+def _commit_request(
+    item_id: int,
+    manifest_sha256: bytes,
+    lease_token: Any,
+    committed_index: int,
+    *,
+    revealed: bool = False,
+) -> Any:
+    """Build a commit bound to the exact server-issued manifest generation."""
+
+    return restore_pb2.CommitRestoreRequest(
+        restore_request_item_id=item_id,
+        manifest_sha256=manifest_sha256,
+        committed_index=committed_index,
+        durable_state=(
+            restore_pb2.DURABLE_STATE_REVEALED if revealed else restore_pb2.DURABLE_STATE_STAGED
+        ),
+        lease_token=lease_token,
+    )
 
 
 def _seed_cache_entry(
