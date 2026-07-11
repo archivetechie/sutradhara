@@ -7,11 +7,13 @@ not replace stored bytes. For self-describing backends, the catalogue can be
 rebuilt by enumerating the backend.
 
 The live source of truth is the SQLAlchemy model set in
-`src/sutradhara/catalog/models.py`, `jobs/models.py`, and
-`hdcache/models.py`, applied in order by `alembic/`. This page was checked
-against those models and the Alembic head. Do not hand-edit a production
-database: use the CLI/API and Alembic migrations. When this reference and the
-models disagree, the models and migrations win; please fix this page.
+`src/sutradhara/catalog/models.py`, `jobs/models.py`, `api/store.py`,
+`grpc/store.py`, and `hdcache/models.py`, applied in order by `alembic/`.
+This page was checked against the full model set loaded by
+`catalog.session.create_all` and the Alembic head. Do not hand-edit a
+production database: use the CLI/API and Alembic migrations. When this
+reference and the models disagree, the models and migrations win; please fix
+this page.
 
 ## Reading this reference
 
@@ -132,6 +134,93 @@ the same kind of edge being recorded twice for one source/derived pair.
 | `source_item_id` | integer, FK -> `ingest_item.id` | Source occurrence. |
 | `kind` | text | Derivation kind, such as a transcode profile. |
 | `created_at` | time | When the provenance edge was recorded. |
+
+## Receive API and device relay
+
+These tables make duplicate-receive decisions, live source ownership, and
+workstation enrollment durable. They deliberately sit beside the catalogue:
+an HTTP retry, a helper reconnect, or a server restart must not turn one card
+receive into a second uncontrolled copy.
+
+### `idempotency_record`
+
+One durable API request/receive-intent record, scoped by operator, endpoint,
+and client key. The unique scope protects normal retries; the card index makes
+the explicit duplicate-warning workflow fast enough to use at receive time.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Record identifier. |
+| `operator_username`, `endpoint`, `idempotency_key` | text, unique triple | Actor, API endpoint, and client retry key. |
+| `request_hash` | text | SHA-256 hex digest of the canonical request body; detects key reuse with different input. |
+| `status` | enum | Durable state: `in_progress`, `completed`, `warned`, `authorized`, `started`, `committed`, `aborted`, `quarantined`, or `failed`. |
+| `intake_id` | text, optional | Intake created or associated with the request. |
+| `response_json` | json, optional | Stored response for a safe replay. |
+| `device_id`, `card_identity`, `card_label` | text, optional | Device/card context used for the duplicate-receive decision. |
+| `duplicate_warning` | json, optional | Server-generated history warning shown before an override. |
+| `duplicate_acknowledged` | boolean | Whether the operator explicitly accepted that warning; defaults to false. |
+| `lease_source_id` | text, optional | Source claim held while the receive is active. |
+| `warned_at`, `authorized_at`, `started_at`, `terminal_at` | time, optional | Receive-intent state-transition audit. |
+| `created_at`, `updated_at`, `last_heartbeat` | time | Record lifecycle and liveness timestamps. |
+
+### `source_claim`
+
+One durable receive lease per source identity. It stops two live requests from
+reading the same card/source simultaneously; an expired or terminal request
+can be reconciled rather than guessed away.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `source_id` | text, PK | Claimed source/card identity. |
+| `operator_username` | text | Current claim owner. |
+| `idempotency_key` | text | Intent that holds the claim. |
+| `intake_id` | text, optional | Intake created once receiving begins. |
+| `created_at`, `updated_at`, `last_heartbeat` | time | Claim audit and liveness times. |
+
+### `grpc_intake`
+
+Durable ownership and state for a streamed workstation intake. The filesystem
+marker is only a watcher/sweep hint; this row is the authority through commit.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `intake_id` | text, PK | Streaming-intake identifier. |
+| `operator`, `device_id` | text | Authorized operator and enrolled helper. |
+| `state` | enum | `streaming`, `committing`, `committed`, or `aborted`. |
+| `manifest_digest` | text, optional | SHA-256 hex digest after commit. |
+| `card_id` | text, optional, indexed | Card identity for history/projection. |
+| `idempotency_key`, `source_plan_digest` | text | Receive intent and the selected-source plan digest. |
+| `artifactclass`, `source_kind` | text | Archive policy class and declared source category. |
+| `source_ref`, `label` | text, optional | Operator-visible selected-folder/source context. |
+| `landing_root` | text | Server-configured landing destination. |
+| `created_at`, `updated_at` | time | Lifecycle timestamps. |
+
+### `grpc_device_enrollment`
+
+Maps an mTLS client-certificate fingerprint to its authorized device and
+operator. Keeping enrollment server-side means a browser cannot nominate a
+device merely by supplying its identifier.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Enrollment-row identifier. |
+| `device_id`, `cert_fingerprint` | text, unique pair | Enrolled helper and certificate fingerprint. |
+| `operator` | text | Owning operator. |
+| `revoked` | boolean | Whether the certificate may still authenticate; defaults to false. |
+| `created_at`, `revoked_at` | time | Enrollment and optional revocation time. |
+
+### `grpc_enroll_token`
+
+One-use, short-lived authority for a device CSR. The token itself is the
+primary key because it is the secret bearer value and may only be consumed once.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `token` | text, PK | Enrollment bearer token. |
+| `created_at`, `expires_at`, `used_at` | time | Creation, expiry, and optional consumption time. |
+| `operator`, `device_id` | text | Intended owner and device binding. |
+| `rotation_authority` | text, optional | `self` or `admin` authority for a re-enrollment. |
+| `rotation_fingerprint` | text, optional | Existing certificate fingerprint required for a self-rotation. |
 
 ## Arrangement and submission
 
@@ -329,11 +418,12 @@ an individual-file copy.
 | `id` | integer, PK | Copy identifier. |
 | `logical_asset_hash` | hash, optional FK -> `logical_asset.content_sha256` | Asset represented by a direct copy. |
 | `bundle_id` | text, optional FK -> `bundle.id` | Bundle represented by a bundle copy. |
-| `backend_id`, `pool_id` | FK | Backend and policy pool that hold it. |
+| `backend_id` | integer, FK -> `backend.id` | Backend that holds it. |
+| `pool_id` | text, optional FK -> `pool.id` | Policy pool when the copy is policy-routed; null for legacy or discovered copies without one. |
 | `native_locator` | json | Adapter-specific address for read, verify, and delete. |
 | `native_locator_key` | text | Canonical indexed locator; unique with `backend_id`. |
 | `storage_metadata` | json | Representation-specific facts, such as RAO metadata. |
-| `integrity_hash` | hash, optional | Digest of the stored representation. |
+| `integrity_hash` | hash | Required digest of the stored representation. |
 | `health` | enum | `ok`, `suspect`, `corrupt`, or `missing`; defaults to `ok`. |
 | `last_verified_at` | time, optional | Last successful verification time. |
 | `deleted_at` | time, optional | Tombstone time after physical deletion. |
