@@ -43,6 +43,7 @@ from sutradhara.catalog.types import (
     BackendTier,
     CopyHealth,
     CopySource,
+    IngestDisposition,
     IntakeSourceKind,
     IntakeStatus,
     MediaKind,
@@ -177,6 +178,7 @@ class Intake(Base):
         back_populates="intake",
         cascade="all, delete-orphan",
         lazy="selectin",
+        foreign_keys="IngestItem.intake_id",
     )
 
     def __repr__(self) -> str:
@@ -195,6 +197,11 @@ class IngestItem(Base):
 
     __tablename__ = "ingest_item"
     __table_args__ = (
+        CheckConstraint(
+            "disposition IN ('new', 'known_durable', 'known_under_durable', "
+            "'reverified', 'legacy_unknown')",
+            name="ck_ingest_item_disposition",
+        ),
         UniqueConstraint(
             "intake_id",
             "as_received_path",
@@ -226,6 +233,25 @@ class IngestItem(Base):
     st_ino: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    disposition: Mapped[IngestDisposition] = mapped_column(
+        String(32),
+        nullable=False,
+        default=IngestDisposition.LEGACY_UNKNOWN,
+        server_default=IngestDisposition.LEGACY_UNKNOWN.value,
+    )
+    disposition_evaluated_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    disposition_policy_generation: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    disposition_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    prior_intake_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("intake.intake_id"),
+        nullable=True,
+        index=True,
+    )
     item_metadata: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
         JSON,
@@ -236,7 +262,7 @@ class IngestItem(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
-    intake: Mapped[Intake] = relationship(back_populates="items")
+    intake: Mapped[Intake] = relationship(back_populates="items", foreign_keys=[intake_id])
     logical_asset: Mapped[LogicalAsset] = relationship(back_populates="ingest_items")
     derived_from_edges: Mapped[list[AssetDerivation]] = relationship(
         back_populates="derived_item",

@@ -21,6 +21,7 @@ from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, OBSERVED_PR
 from sutradhara.jobs.reconcilers.profiles import DerivationEntry, entries_for, entry_for_job
 from sutradhara.jobs.reconcilers.registry import Reconciler, TargetObservation, register_reconciler
 from sutradhara.pfr import pfr_sidecar_complete
+from sutradhara.receive_novelty import work_suppression_safe
 
 DOMAIN = "derivation"
 TARGET_PREFIX = "derivation"
@@ -62,7 +63,7 @@ def enumerate_targets(
 
     observations: list[TargetObservation] = []
     for item in _live_prepared_items(session, cursor=cursor, batch=batch):
-        for entry in _matching_entries(item):
+        for entry in _matching_entries(session, item):
             observations.append(_observe_entry(session, item, entry))
     return observations
 
@@ -78,7 +79,7 @@ def observe(session: Session, target_key: str) -> TargetObservation:
             desired=False,
             observed_state=OBSERVED_MISSING,
         )
-    entry = _matching_entry_for_job(item, job_kind)
+    entry = _matching_entry_for_job(session, item, job_kind)
     if entry is None:
         return TargetObservation(
             target_key=target_key,
@@ -95,7 +96,7 @@ def reconcile_target(session: Session, target_key: str) -> None:
     item = session.get(IngestItem, source_item_id, options=(joinedload(IngestItem.intake),))
     if item is None:
         raise ValueError(f"no IngestItem with id={source_item_id}; cannot reconcile {target_key!r}")
-    entry = _matching_entry_for_job(item, job_kind)
+    entry = _matching_entry_for_job(session, item, job_kind)
     if entry is None:
         raise ValueError(f"no matching derivation profile entry for {target_key!r}")
 
@@ -138,17 +139,27 @@ def _live_prepared_items(
     return list(session.scalars(query))
 
 
-def _matching_entries(item: IngestItem) -> tuple[DerivationEntry, ...]:
+def _matching_entries(session: Session, item: IngestItem) -> tuple[DerivationEntry, ...]:
     intake = item.intake
-    if intake is None or intake.status != IntakeStatus.REGISTERED:
+    if (
+        intake is None
+        or intake.status != IntakeStatus.REGISTERED
+        or work_suppression_safe(session, item)
+    ):
         return ()
     media_kind = media_kind_for_path(item.as_received_path)
     return entries_for(item.artifactclass, intake.requested_profile, media_kind)
 
 
-def _matching_entry_for_job(item: IngestItem, job_kind: str) -> DerivationEntry | None:
+def _matching_entry_for_job(
+    session: Session, item: IngestItem, job_kind: str
+) -> DerivationEntry | None:
     intake = item.intake
-    if intake is None or intake.status != IntakeStatus.REGISTERED:
+    if (
+        intake is None
+        or intake.status != IntakeStatus.REGISTERED
+        or work_suppression_safe(session, item)
+    ):
         return None
     media_kind = media_kind_for_path(item.as_received_path)
     return entry_for_job(item.artifactclass, intake.requested_profile, media_kind, job_kind)

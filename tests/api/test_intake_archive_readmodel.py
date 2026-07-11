@@ -60,9 +60,17 @@ INTAKE_KEYS = {
     "archived",
     "archive_state",
     "archiveSemantics",
+    "source_release_safe",
+    "novelty",
 }
 INTAKE_DETAIL_KEYS = INTAKE_KEYS | {"items", "derivations"}
-INGEST_ITEM_KEYS = {"content_sha256", "virtual_path", "size_bytes", "artifactclass"}
+INGEST_ITEM_KEYS = {
+    "content_sha256",
+    "virtual_path",
+    "size_bytes",
+    "artifactclass",
+    "disposition",
+}
 DERIVATION_KEYS = {"kind", "source_sha256", "derived_sha256"}
 BUNDLE_KEYS = {
     "id",
@@ -181,6 +189,7 @@ def test_intake_contract_detail_uses_virtual_paths_and_cross_intake_derivations(
             "virtual_path": "event/source.mov",
             "size_bytes": 10,
             "artifactclass": "s-masters",
+            "disposition": "legacy_unknown",
         }
     ]
     assert set(body["items"][0]) == INGEST_ITEM_KEYS

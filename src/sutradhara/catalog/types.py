@@ -137,6 +137,16 @@ class IntakeStatus(StrEnum):
     REGISTERED = "registered"
 
 
+class IngestDisposition(StrEnum):
+    """Immutable content-novelty verdict recorded when an item is registered."""
+
+    NEW = "new"
+    KNOWN_DURABLE = "known_durable"
+    KNOWN_UNDER_DURABLE = "known_under_durable"
+    REVERIFIED = "reverified"
+    LEGACY_UNKNOWN = "legacy_unknown"
+
+
 class ArrangementStatus(StrEnum):
     """Lifecycle for a mutable pre-archive arrangement workspace."""
 

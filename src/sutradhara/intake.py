@@ -20,9 +20,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
     Copy,
     IngestItem,
     Intake,
@@ -30,14 +34,18 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.types import (
     AssetValidity,
+    IngestDisposition,
     IntakeSourceKind,
     IntakeStatus,
     MediaKind,
     RetentionState,
 )
+from sutradhara.durability import AssetTarget, placement_status
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job
 from sutradhara.jobs.reconcilers.profiles import known_profile_names
+from sutradhara.receive_novelty import work_suppression_safe
+from sutradhara.replication import ReplicationPolicyMissing
 from sutradhara_receive import (
     BAG_INFO_NAME,
     DATA_DIR_NAME,
@@ -338,6 +346,11 @@ def register_intake(
     intake.quarantined_at = None
     intake.updated_at = intake.registered_at
     session.flush()
+    # SQLite drops timezone metadata on round-trip. The atomic Core insert above
+    # flushes catalog state earlier than the former ORM-only path, so normalize
+    # this field to its persisted representation for idempotent callers.
+    if session.get_bind().dialect.name == "sqlite":
+        session.refresh(intake, attribute_names=["updated_at"])
     _transition_receive_intent(session, validated.intake_id, "committed")
 
     submitted = _enqueue_missing_cloud_job(
@@ -573,6 +586,8 @@ def _enqueue_missing_cloud_job(
     cloud_backend_name: str,
     cloud_pool_id: str,
 ) -> int:
+    if _intake_is_fully_known_durable(session, intake.intake_id):
+        return 0
     if _cloud_bundle_has_copy(session, intake.intake_id):
         return 0
     return int(
@@ -591,6 +606,17 @@ def _enqueue_missing_cloud_job(
             resources=[{"pool": "io", "count": 1}],
         )
     )
+
+
+def _intake_is_fully_known_durable(session: Session, intake_id: str) -> bool:
+    """Return true only when a nonempty intake needs no new cloud object work."""
+
+    items = list(
+        session.scalars(
+            select(IngestItem).where(IngestItem.intake_id == intake_id)
+        )
+    )
+    return bool(items) and all(work_suppression_safe(session, item) for item in items)
 
 
 def _submit_once(
@@ -836,25 +862,31 @@ def _register_payload_record(
 ) -> IngestItem:
     as_received_path = record.as_received_relpath
     stored_member_path = record.stored_relpath or record.relpath
-    asset = session.get(LogicalAsset, record.sha256_bytes)
-    if asset is None:
-        asset = LogicalAsset(
-            content_sha256=record.sha256_bytes,
-            size_bytes=record.size_bytes,
-            media_kind=media_kind_for_path(as_received_path),
-            media_info={"path": as_received_path, "stored_member_path": stored_member_path},
-            validity=AssetValidity.UNVALIDATED,
-        )
-        session.add(asset)
-    elif asset.media_kind is None:
-        asset.media_kind = media_kind_for_path(as_received_path)
-
     item = session.scalars(
         select(IngestItem).where(
             IngestItem.intake_id == intake.intake_id,
             IngestItem.as_received_path == as_received_path,
         )
     ).one_or_none()
+    if item is not None:
+        asset = session.get(LogicalAsset, record.sha256_bytes)
+        if asset is None:
+            raise ValueError(f"catalog item {item.id} references a missing logical asset")
+        inserted = False
+    else:
+        asset, inserted = _insert_logical_asset_if_absent(
+            session,
+            record,
+            as_received_path=as_received_path,
+            stored_member_path=stored_member_path,
+        )
+    if asset.size_bytes != record.size_bytes:
+        raise ValueError(
+            f"sha256 {record.sha256_hex} has catalog size {asset.size_bytes}, "
+            f"received size {record.size_bytes}"
+        )
+    if asset.media_kind is None:
+        asset.media_kind = media_kind_for_path(as_received_path)
     metadata = {
         "source_path": str(record.source_path),
         "payload_root": str(payload_root),
@@ -868,6 +900,14 @@ def _register_payload_record(
     if record.package_index is not None:
         metadata["package_index_path"] = str(payload_root.parent / record.package_index)
     if item is None:
+        disposition, prior_intake, evidence_at, policy_generation, evidence = (
+            _classify_disposition(
+                session,
+                intake,
+                record.sha256_bytes,
+                inserted=inserted,
+            )
+        )
         item = IngestItem(
             intake=intake,
             logical_asset=asset,
@@ -877,6 +917,11 @@ def _register_payload_record(
             st_ino=record.st_ino,
             size_bytes=record.size_bytes,
             artifactclass=intake.artifactclass,
+            disposition=disposition,
+            disposition_evaluated_at=evidence_at,
+            disposition_policy_generation=policy_generation,
+            disposition_evidence=evidence,
+            prior_intake_id=None if prior_intake is None else prior_intake.intake_id,
             item_metadata=metadata,
         )
         session.add(item)
@@ -889,6 +934,118 @@ def _register_payload_record(
         item.artifactclass = intake.artifactclass
         item.item_metadata = {**(item.item_metadata or {}), **metadata}
     return item
+
+
+def _insert_logical_asset_if_absent(
+    session: Session,
+    record: PayloadRecord,
+    *,
+    as_received_path: str,
+    stored_member_path: str,
+) -> tuple[LogicalAsset, bool]:
+    """Atomically insert content identity and return whether this transaction won."""
+
+    values = {
+        "content_sha256": record.sha256_bytes,
+        "size_bytes": record.size_bytes,
+        "media_kind": media_kind_for_path(as_received_path),
+        "media_info": {"path": as_received_path, "stored_member_path": stored_member_path},
+        "validity": AssetValidity.UNVALIDATED,
+    }
+    dialect = session.get_bind().dialect.name
+    statement: Any
+    if dialect == "sqlite":
+        statement = sqlite_insert(LogicalAsset).values(**values).on_conflict_do_nothing(
+            index_elements=[LogicalAsset.content_sha256]
+        )
+    elif dialect == "postgresql":
+        statement = postgresql_insert(LogicalAsset).values(**values).on_conflict_do_nothing(
+            index_elements=[LogicalAsset.content_sha256]
+        )
+    else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL.
+        raise RuntimeError(
+            f"atomic logical-asset registration is unsupported for {dialect!r}"
+        )
+    result = session.execute(statement.execution_options(synchronize_session=False))
+    assert isinstance(result, CursorResult)
+    inserted = result.rowcount == 1
+    asset = session.get(LogicalAsset, record.sha256_bytes)
+    if asset is None:  # pragma: no cover - database contract violation.
+        raise RuntimeError("logical asset insert-if-absent did not produce a catalog row")
+    return asset, inserted
+
+
+def _classify_disposition(
+    session: Session,
+    intake: Intake,
+    asset_hash: bytes,
+    *,
+    inserted: bool,
+) -> tuple[IngestDisposition, Intake | None, dt.datetime, str | None, dict[str, Any]]:
+    """Evaluate immutable novelty evidence from server hash and live durability."""
+
+    evaluated_at = _utcnow()
+    policy = session.get(ArtifactClassPolicyRecord, intake.artifactclass)
+    generation = (
+        "missing-policy"
+        if policy is None
+        else policy.policy_sha256 or _aware_iso(policy.updated_at)
+    )
+    prior = session.scalars(
+        select(Intake)
+        .join(IngestItem, IngestItem.intake_id == Intake.intake_id)
+        .where(
+            IngestItem.logical_asset_hash == asset_hash,
+            Intake.intake_id != intake.intake_id,
+            Intake.status == IntakeStatus.REGISTERED,
+        )
+        .order_by(Intake.registered_at.desc(), Intake.created_at.desc(), Intake.intake_id.desc())
+        .limit(1)
+    ).one_or_none()
+    if inserted:
+        disposition = IngestDisposition.NEW
+        safe = False
+        status = None
+    elif prior is None:
+        disposition = IngestDisposition.REVERIFIED
+        safe = False
+        status = None
+    else:
+        try:
+            status = placement_status(
+                session,
+                AssetTarget(asset_hash, intake.artifactclass),
+                require_verified=True,
+            )
+        except ReplicationPolicyMissing:
+            status = {"complete": False, "want": set(), "have": set(), "missing": set()}
+        safe = policy is not None and status["complete"] and bool(status["want"])
+        disposition = (
+            IngestDisposition.KNOWN_DURABLE
+            if safe
+            else IngestDisposition.KNOWN_UNDER_DURABLE
+        )
+    evidence: dict[str, Any] = {
+        "server_sha256": asset_hash.hex(),
+        "logical_asset_inserted": inserted,
+        "prior_registered_intake": prior is not None,
+        "work_suppression_safe": safe,
+    }
+    if status is not None:
+        evidence.update(
+            {
+                "required_pools": sorted(target.pool_id for target in status["want"]),
+                "verified_pools": sorted(target.pool_id for target in status["have"]),
+                "missing_pools": sorted(target.pool_id for target in status["missing"]),
+            }
+        )
+    return disposition, prior, evaluated_at, generation, evidence
+
+
+def _aware_iso(value: dt.datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC).isoformat()
 
 
 def _hash_payload(

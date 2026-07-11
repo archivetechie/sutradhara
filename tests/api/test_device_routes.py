@@ -184,6 +184,14 @@ def test_streaming_receive_reports_live_byte_progress(
         "status": "streaming",
         "errors": [],
         "releaseSafe": False,
+        "source_release_safe": False,
+        "novelty": {
+            "total": 0,
+            "new": 0,
+            "known_durable": 0,
+            "known_under_durable": 0,
+            "reverified": 0,
+        },
         **expected,
     }
 
@@ -263,6 +271,14 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
         "status": "verifying",
         "errors": [],
         "releaseSafe": True,
+        "source_release_safe": True,
+        "novelty": {
+            "total": 0,
+            "new": 0,
+            "known_durable": 0,
+            "known_under_durable": 0,
+            "reverified": 0,
+        },
         "destinationPath": str(tmp_path / "intake-committed"),
         "bytesReceived": 12,
         "bytesTotal": 12,
@@ -890,10 +906,10 @@ def test_terminal_replay_precedes_ejected_card_resolution(api_engine: Engine) ->
     assert "failed" in replay.json()["detail"]
 
 
-def test_stale_receive_terminal_is_retryable_and_fresh_key_runs_history_gate(
+def test_stale_receive_terminal_is_retryable_and_fresh_key_ignores_identity_history(
     api_engine: Engine,
 ) -> None:
-    """Stale same-key replay fails; a fresh key gets the duplicate warning."""
+    """Stale same-key replay fails; identity alone does not block a fresh key."""
 
     registry = _online_registry(api_engine)
     app = make_api_app(api_engine)
@@ -948,7 +964,7 @@ def test_stale_receive_terminal_is_retryable_and_fresh_key_runs_history_gate(
     assert terminal.json()["error"] == "receive_terminal"
     assert terminal.json()["retryable"] is True
     assert fresh.status_code == 409
-    assert fresh.json()["duplicateWarning"]["priorIntake"]["state"] == "failed"
+    assert fresh.json()["error"] == "ack_timeout"
 
 
 def test_stored_started_response_and_committed_verdict_replay_after_eject(
@@ -1078,6 +1094,14 @@ def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path
         "status": "verified",
         "errors": [],
         "releaseSafe": True,
+        "source_release_safe": True,
+        "novelty": {
+            "total": 0,
+            "new": 0,
+            "known_durable": 0,
+            "known_under_durable": 0,
+            "reverified": 0,
+        },
         "destinationPath": str(tmp_path / "intake-1"),
         "bytesReceived": None,
         "bytesTotal": None,

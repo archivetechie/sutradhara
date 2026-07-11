@@ -39,6 +39,7 @@ from sutradhara.catalog.types import (
     RetentionState,
     SubmissionStatus,
 )
+from sutradhara.receive_novelty import work_suppression_safe
 from sutradhara.restore import _fsync_directory, atomic_write_verified_file, sha256_file
 
 DEFAULT_SUBMISSION_ROOT = Path("/replica/submissions")
@@ -572,7 +573,7 @@ def _one_excluded_member_by_path(arrangement: Arrangement, member_path: str) -> 
 
 def _live_master_items_for_intake(session: Session, intake_id: str) -> list[IngestItem]:
     derived_exists = exists().where(AssetDerivation.derived_item_id == IngestItem.id)
-    return list(
+    candidates = list(
         session.scalars(
             select(IngestItem)
             .join(Intake, Intake.intake_id == IngestItem.intake_id)
@@ -584,6 +585,7 @@ def _live_master_items_for_intake(session: Session, intake_id: str) -> list[Inge
             .order_by(IngestItem.as_received_path)
         )
     )
+    return [item for item in candidates if not work_suppression_safe(session, item)]
 
 
 def _validate_live_master(session: Session, item: IngestItem) -> None:

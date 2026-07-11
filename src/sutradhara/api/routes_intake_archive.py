@@ -46,6 +46,7 @@ from sutradhara.catalog.types import (
     SubmissionStatus,
     is_content_hash,
 )
+from sutradhara.receive_novelty import novelty_summaries, novelty_summary
 
 router = APIRouter()
 
@@ -128,6 +129,7 @@ def get_intakes(
         if days_filter is not None:
             query = query.where(Intake.created_at >= days_filter)
         rows = list(session.execute(query))
+        summaries = novelty_summaries(session, [row[0].intake_id for row in rows])
         intakes = [
             _intake_payload(
                 row[0],
@@ -135,6 +137,7 @@ def get_intakes(
                 bytes_total=int(row[2] or 0),
                 archive_state=str(row[3]),
                 archived=bool(row[4]),
+                novelty=summaries[row[0].intake_id],
             )
             for row in rows
         ]
@@ -159,6 +162,7 @@ def get_intake(request: Request, intake_id: str) -> dict[str, object]:
             bytes_total=bytes_total,
             archive_state=archive_state,
             archived=archived,
+            novelty=novelty_summary(session, intake.intake_id),
         )
         items = list(
             session.scalars(
@@ -365,8 +369,9 @@ def _intake_payload(
     bytes_total: int,
     archive_state: str,
     archived: bool,
+    novelty: dict[str, int] | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "intake_id": _text(intake.intake_id),
         "operator": _text(intake.operator),
         "source_kind": _value(intake.source_kind),
@@ -383,7 +388,18 @@ def _intake_payload(
         "archived": archived,
         "archive_state": archive_state,
         "archiveSemantics": 2,
+        "source_release_safe": (
+            intake.source_kind == "card" and intake.status == IntakeStatus.REGISTERED
+        ),
+        "novelty": novelty or {
+            "total": 0,
+            "new": 0,
+            "known_durable": 0,
+            "known_under_durable": 0,
+            "reverified": 0,
+        },
     }
+    return payload
 
 
 def _ingest_item_payload(item: IngestItem) -> dict[str, object]:
@@ -392,6 +408,7 @@ def _ingest_item_payload(item: IngestItem) -> dict[str, object]:
         "virtual_path": _text(item.virtual_path),
         "size_bytes": item.size_bytes,
         "artifactclass": _text(item.artifactclass),
+        "disposition": _value(item.disposition),
     }
 
 

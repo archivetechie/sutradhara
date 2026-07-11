@@ -194,6 +194,8 @@ def begin_device_receive_intent(
     idempotency_key: str,
     request_hash: str,
     acknowledge_duplicate: bool,
+    current_listing: list[tuple[str, int]] | None = None,
+    listing_complete: bool = False,
     ttl: dt.timedelta = DEFAULT_TTL,
 ) -> DeviceIntentDecision:
     """Atomically perform the duplicate handshake and card lease transition."""
@@ -208,6 +210,8 @@ def begin_device_receive_intent(
             idempotency_key=idempotency_key,
             request_hash=request_hash,
             acknowledge_duplicate=acknowledge_duplicate,
+            current_listing=current_listing,
+            listing_complete=listing_complete,
             ttl=ttl,
         )
     except IntegrityError:
@@ -221,6 +225,8 @@ def begin_device_receive_intent(
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
                 acknowledge_duplicate=acknowledge_duplicate,
+                current_listing=current_listing,
+                listing_complete=listing_complete,
                 ttl=ttl,
             )
         except IntegrityError:
@@ -802,8 +808,8 @@ def peek_device_receive_intent(
     A same-key/different-body request must surface ``idempotency_conflict`` even
     when the mutated body references a card that no longer resolves, and stored
     warned/completed responses must replay without requiring the card to still be
-    mounted. Never creates records, transitions states, or touches leases; every
-    other outcome falls through to ``begin_device_receive_intent``.
+    mounted. Never creates records, transitions states, or touches leases; new,
+    stale, and acknowledged-warning outcomes fall through to the mutating path.
     """
     factory = make_session_factory(engine)
     with factory.begin() as session:
@@ -832,6 +838,8 @@ def peek_device_receive_intent(
             record.last_heartbeat, ttl=ttl, now=_utcnow()
         ):
             return None
+        if record.status in {"authorized", "started"}:
+            return DeviceIntentDecision("in_progress")
         return None
 
 
@@ -900,9 +908,11 @@ def _begin_device_receive_intent_once(
     idempotency_key: str,
     request_hash: str,
     acknowledge_duplicate: bool,
+    current_listing: list[tuple[str, int]] | None,
+    listing_complete: bool,
     ttl: dt.timedelta,
 ) -> DeviceIntentDecision:
-    from sutradhara.api.receive_history import latest_card_history
+    from sutradhara.receive_novelty import ListingEntry, estimate_listing_novelty
 
     now = _utcnow()
     factory = make_session_factory(engine)
@@ -938,14 +948,20 @@ def _begin_device_receive_intent_once(
             )
             session.add(record)
             session.flush()
-            history = latest_card_history(
+            estimate = estimate_listing_novelty(
                 session,
                 card_identity=card_identity,
                 requester=operator_username,
-                exclude_intent_id=record.id,
+                listing=[ListingEntry(path, size) for path, size in (current_listing or [])],
+                listing_complete=listing_complete,
             )
-            if history is not None:
-                warning = {"duplicateWarning": history.warning_payload()}
+            if current_listing is not None and estimate["all_known_estimate"]:
+                warning = {
+                    "error": "nothing_new",
+                    "detail": "nothing new detected on this card",
+                    "retryable": True,
+                    "estimate": estimate,
+                }
                 record.status = "warned"
                 record.duplicate_warning = warning
                 record.warned_at = now
@@ -955,7 +971,7 @@ def _begin_device_receive_intent_once(
                     operator_username,
                     device_id,
                     card_identity,
-                    history.visible,
+                    estimate["visible"],
                 )
                 return DeviceIntentDecision("warned", warning)
             if not _authorize_record_lease(session, record, ttl=ttl, now=now):
@@ -1007,14 +1023,6 @@ def _begin_device_receive_intent_once(
         if record.status == "warned":
             if not acknowledge_duplicate:
                 return DeviceIntentDecision("warned", record.duplicate_warning)
-            history = latest_card_history(
-                session,
-                card_identity=card_identity,
-                requester=operator_username,
-                exclude_intent_id=record.id,
-            )
-            if history is not None:
-                record.duplicate_warning = {"duplicateWarning": history.warning_payload()}
             if not _authorize_record_lease(session, record, ttl=ttl, now=now):
                 return DeviceIntentDecision("busy")
             record.duplicate_acknowledged = True

@@ -188,7 +188,12 @@ def direct_copies(session: Session, asset_hash: bytes) -> list[Copy]:
     )
 
 
-def placement_status(session: Session, target: Target) -> PlacementStatus:
+def placement_status(
+    session: Session,
+    target: Target,
+    *,
+    require_verified: bool = False,
+) -> PlacementStatus:
     """Report wanted pools versus realized durable placements for a target.
 
     Entries extend ``PoolTarget`` with ``have``, ``duplicate_count``, and
@@ -204,7 +209,7 @@ def placement_status(session: Session, target: Target) -> PlacementStatus:
         for copy in durable_placements(
             session,
             target,
-            require_verified=False,
+            require_verified=require_verified,
             artifactclass=artifactclass,
         ):
             if copy.pool_id is None:

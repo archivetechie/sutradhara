@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import posixpath
 import re
 import tempfile
 import threading
@@ -48,6 +49,7 @@ from sutradhara.grpc.registry import (
     validate_card_label,
 )
 from sutradhara.grpc.status import intake_landing_path, intake_receipt_summary, intake_status
+from sutradhara.receive_novelty import ListingEntry, estimate_listing_novelty, novelty_summary
 from sutradhara.verification_progress import read_verification_progress
 
 router = APIRouter()
@@ -246,6 +248,36 @@ async def get_device_browse(
     }
 
 
+@router.get("/api/devices/{device_id}/receive-preview")
+async def get_device_receive_preview(
+    device_id: str,
+    request: Request,
+    card_id: str,
+    path: str | None = None,
+) -> dict[str, object]:
+    """Return a heuristic path/size comparison before any card bytes transfer."""
+
+    identity = _require_receive(parse_identity(request.headers))
+    source_ref = _canonical_device_path_or_400(path)
+    listing, complete = await _current_card_listing(
+        request,
+        operator=identity.operator_username,
+        device_id=device_id,
+        card_id=card_id,
+        source_ref=source_ref,
+    )
+    factory = make_session_factory(request.app.state.engine)
+    with factory() as session:
+        estimate = estimate_listing_novelty(
+            session,
+            card_identity=card_id,
+            requester=identity.operator_username,
+            listing=[ListingEntry(file_path, size) for file_path, size in listing],
+            listing_complete=complete,
+        )
+    return {"estimate": estimate}
+
+
 @router.post("/api/devices/{device_id}/receive", response_model=None)
 async def post_device_receive(
     device_id: str,
@@ -295,6 +327,8 @@ async def post_device_receive(
             return JSONResponse(status_code=409, content=peeked.response_json)
         if peeked.state == "completed" and peeked.response_json is not None:
             return {str(key): str(value) for key, value in peeked.response_json.items()}
+        if peeked.state == "in_progress":
+            _raise(409, "already_in_progress", "receive is already in progress")
         if peeked.state == "terminal":
             _raise(
                 409,
@@ -324,18 +358,31 @@ async def post_device_receive(
         )
 
     try:
-        card = await anyio.to_thread.run_sync(
+        device = await anyio.to_thread.run_sync(
             partial(
-                _registry(request).card_for,
+                _registry(request).device_for,
                 operator=identity.operator_username,
                 device_id=device_id,
-                card_id=body.card_id,
             )
         )
+        card = next((item for item in device.cards if item.card_id == body.card_id), None)
+        if card is None:
+            raise CardUnavailable("card is not present on the device")
+        assert card is not None
     except DeviceOwnerMismatch as exc:
         _raise(403, "forbidden", str(exc))
     except (DeviceOffline, CardUnavailable) as exc:
         _raise(409, "device_unavailable", str(exc))
+    current_listing: list[tuple[str, int]] | None = None
+    listing_complete = False
+    if not body.acknowledge_duplicate and "browse" in device.capabilities:
+        current_listing, listing_complete = await _try_current_card_listing(
+            request,
+            operator=identity.operator_username,
+            device_id=device_id,
+            card_id=body.card_id,
+            source_ref=canonical_source_ref,
+        )
     decision = await anyio.to_thread.run_sync(
         partial(
             api_store.begin_device_receive_intent,
@@ -347,6 +394,8 @@ async def post_device_receive(
             idempotency_key=idempotency_key,
             request_hash=request_hash,
             acknowledge_duplicate=body.acknowledge_duplicate,
+            current_listing=current_listing,
+            listing_complete=listing_complete,
             ttl=request.app.state.idempotency_ttl,
         )
     )
@@ -479,6 +528,7 @@ def get_intake_status(intake_id: str, request: Request) -> dict[str, object]:
             _raise(404, "not_found", "unknown intake")
         if row.operator != identity.operator_username:
             _raise(403, "forbidden", "intake owner mismatch")
+        novelty = novelty_summary(session, intake_id)
         session.expunge(row)
     view = intake_status(row)
     return {
@@ -486,6 +536,8 @@ def get_intake_status(intake_id: str, request: Request) -> dict[str, object]:
         "status": view.status,
         "errors": view.errors,
         "releaseSafe": view.release_safe,
+        "source_release_safe": view.release_safe,
+        "novelty": novelty,
         **_receive_progress_payload(row, view.status, _progress_registry(request)),
     }
 
@@ -1043,6 +1095,112 @@ async def _await_ack(future: object, *, timeout: float) -> CommandAck:
 async def _await_listing(future: object, *, timeout: float) -> object:
     wrapped = asyncio.wrap_future(future)
     return await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
+
+
+async def _current_card_listing(
+    request: Request,
+    *,
+    operator: str,
+    device_id: str,
+    card_id: str,
+    source_ref: str,
+) -> tuple[list[tuple[str, int]], bool]:
+    """Walk browse responses into root-relative file paths for the heuristic."""
+
+    try:
+        validate_card_id(card_id)
+        await anyio.to_thread.run_sync(
+            partial(
+                _validate_device_owner,
+                request.app.state.engine,
+                operator=operator,
+                device_id=device_id,
+            )
+        )
+        device = await anyio.to_thread.run_sync(
+            partial(_registry(request).device_for, operator=operator, device_id=device_id)
+        )
+    except ValueError as exc:
+        _raise(400, "invalid_card_id", str(exc))
+    except PermissionError as exc:
+        _raise(403, "forbidden", str(exc))
+    except DeviceOwnerMismatch as exc:
+        _raise(403, "forbidden", str(exc))
+    except DeviceOffline as exc:
+        _raise(404, "device_not_found", str(exc))
+    if "browse" not in device.capabilities:
+        _raise(409, "browse_unsupported", "device helper does not support receive preview")
+    if not any(card.card_id == card_id for card in device.cards):
+        _raise(404, "card_not_found", "card is not present on the device")
+
+    files: list[tuple[str, int]] = []
+    pending_paths: list[tuple[str, str]] = [(source_ref, "")]
+    complete = True
+    while pending_paths:
+        device_path, relative_root = pending_paths.pop()
+        pending = None
+        try:
+            pending = await anyio.to_thread.run_sync(
+                partial(
+                    _registry(request).request_directory_listing,
+                    operator=operator,
+                    device_id=device_id,
+                    card_id=card_id,
+                    rel_path=device_path,
+                )
+            )
+            listing = await _await_listing(
+                pending.future,
+                timeout=request.app.state.directory_listing_timeout,
+            )
+        except TimeoutError:
+            if pending is not None:
+                await anyio.to_thread.run_sync(
+                    partial(
+                        _registry(request).fail_listing,
+                        device_id,
+                        pending.generation,
+                        pending.request_id,
+                        TimeoutError("directory listing timed out"),
+                    )
+                )
+            _raise(504, "browse_timeout", "device did not return a directory listing in time")
+        except DeviceOwnerMismatch as exc:
+            _raise(403, "forbidden", str(exc))
+        except (DeviceOffline, CardUnavailable) as exc:
+            _raise(409, "device_unavailable", str(exc))
+        except (StreamClosed, RuntimeError) as exc:
+            _raise(409, "device_unavailable", str(exc))
+        _raise_for_directory_status(listing)
+        complete = complete and not listing.truncated
+        for entry in listing.entries:
+            if not entry.name or entry.name in {".", ".."} or "/" in entry.name or "\\" in entry.name:
+                _raise(502, "listing_failed", "device returned an invalid directory entry")
+            relative_path = posixpath.join(relative_root, entry.name)
+            if entry.is_dir and not entry.is_package:
+                pending_paths.append((posixpath.join(device_path, entry.name), relative_path))
+            else:
+                if int(entry.size_bytes) < 0:
+                    _raise(502, "listing_failed", "device returned a negative file size")
+                files.append((relative_path, int(entry.size_bytes)))
+    files.sort()
+    return files, complete
+
+
+async def _try_current_card_listing(
+    request: Request,
+    **kwargs: str,
+) -> tuple[list[tuple[str, int]] | None, bool]:
+    """Fail open when the heuristic listing is unavailable on the receive path."""
+
+    try:
+        return await _current_card_listing(request, **kwargs)
+    except HTTPException as exc:
+        LOG.warning(
+            "receive preview unavailable; proceeding without nothing-new gate: %s",
+            exc.detail,
+        )
+        return None, False
 
 
 def _canonical_device_path_or_400(value: str | None) -> str:

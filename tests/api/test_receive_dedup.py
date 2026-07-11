@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import Engine, select
 from starlette.requests import Request
 
+from sutradhara._proto import device_pb2
 from sutradhara.api import routes_devices
 from sutradhara.api import store as api_store
 from sutradhara.api.receive_history import latest_card_history
@@ -31,19 +32,13 @@ from sutradhara.grpc.store import DeviceIdentity
 from tests.api.conftest import make_api_app, post_headers
 
 
-def test_warned_authorized_replays_and_other_body_conflict(api_engine: Engine) -> None:
+def test_identity_match_authorizes_and_other_body_conflicts(api_engine: Engine) -> None:
     _add_catalog_intake(api_engine, intake_id="prior", card_id="card-1")
     key = str(uuid4())
 
-    warned = _begin(api_engine, key=key, request_hash="base")
+    authorized = _begin(api_engine, key=key, request_hash="base")
     replay = _begin(api_engine, key=key, request_hash="base")
     conflict = _begin(api_engine, key=key, request_hash="changed")
-    authorized = _begin(
-        api_engine,
-        key=key,
-        request_hash="base",
-        acknowledge_duplicate=True,
-    )
     authorized_replay = _begin(
         api_engine,
         key=key,
@@ -51,13 +46,9 @@ def test_warned_authorized_replays_and_other_body_conflict(api_engine: Engine) -
         acknowledge_duplicate=True,
     )
 
-    assert warned.state == replay.state == "warned"
-    assert warned.response_json == replay.response_json
-    assert warned.response_json is not None
-    assert warned.response_json["duplicateWarning"]["matchKind"] == "card_identity"
-    assert conflict.state == "conflict"
     assert authorized.state == "authorized"
-    assert authorized_replay.state == "in_progress"
+    assert replay.state == authorized_replay.state == "in_progress"
+    assert conflict.state == "conflict"
     with session_scope(api_engine) as session:
         intent = session.scalars(
             select(api_store.IdempotencyRecord).where(
@@ -65,13 +56,13 @@ def test_warned_authorized_replays_and_other_body_conflict(api_engine: Engine) -
             )
         ).one()
         assert intent.status == "authorized"
-        assert intent.duplicate_acknowledged is True
-        assert intent.warned_at is not None
+        assert intent.duplicate_acknowledged is False
+        assert intent.warned_at is None
         assert intent.authorized_at is not None
         assert intent.lease_source_id == api_store.card_lease_source_id("card-1")
     assert api_store.duplicate_telemetry_counts(api_engine) == {
         "warned_then_never_acknowledged": 0,
-        "warned_then_acknowledged": 1,
+        "warned_then_acknowledged": 0,
     }
 
 
@@ -142,23 +133,17 @@ def test_history_projection_prefers_most_recent_failed_over_verified(
     assert match.visible is True
 
 
-def test_foreign_history_warning_contains_no_prior_metadata(api_engine: Engine) -> None:
+def test_foreign_identity_history_does_not_block(api_engine: Engine) -> None:
     _add_catalog_intake(api_engine, intake_id="foreign-prior", card_id="card-1")
 
-    warning = _begin(
+    decision = _begin(
         api_engine,
         key="foreign-key",
         request_hash="foreign",
         operator="other",
     )
 
-    assert warning.state == "warned"
-    assert warning.response_json == {
-        "duplicateWarning": {
-            "matchKind": "card_identity",
-            "visible": False,
-        }
-    }
+    assert decision.state == "authorized"
 
 
 def test_file_receipt_renewal_honors_floor_timer(api_engine: Engine) -> None:
@@ -239,9 +224,7 @@ def test_stale_same_key_terminalizes_and_fresh_key_rechecks_history(api_engine: 
     assert terminal_replay is not None
     assert terminal_replay.state == "terminal"
     assert terminal_replay.terminal_state == "failed"
-    assert fresh.state == "warned"
-    assert fresh.response_json is not None
-    assert fresh.response_json["duplicateWarning"]["priorIntake"]["state"] == "failed"
+    assert fresh.state == "authorized"
     with session_scope(api_engine) as session:
         intent = session.scalars(
             select(api_store.IdempotencyRecord).where(
@@ -255,7 +238,8 @@ def test_stale_same_key_terminalizes_and_fresh_key_rechecks_history(api_engine: 
         assert intent.terminal_at is not None
         assert intent.lease_source_id is not None
         claim = session.get(api_store.SourceClaim, intent.lease_source_id)
-        assert claim is None
+        assert claim is not None
+        assert claim.idempotency_key == "fresh-retry"
 
 
 def test_terminal_history_receipts_are_memoized_for_device_polls(
@@ -404,14 +388,34 @@ def test_reconcile_terminalizes_inactive_orphaned_grpc_intake(
     assert result == {"rebuilt": 0, "expired": 0, "orphaned": 1}
 
 
-def test_device_receive_returns_stored_409_then_acknowledges(
+def test_device_receive_identity_match_proceeds_without_acknowledgement(
     api_engine: Engine,
     tmp_path: Path,
     caplog,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _add_catalog_intake(api_engine, intake_id="prior", card_id="card-1")
-    registry = _online_registry(api_engine)
+    registry = _online_registry(api_engine, capabilities=["browse"])
+    original_listing = registry.request_directory_listing
+
+    def listing_with_new_file(**kwargs):
+        pending = original_listing(**kwargs)
+        pending.future.set_result(
+            device_pb2.DirectoryListing(
+                request_id=pending.request_id,
+                status=device_pb2.DIR_STATUS_OK,
+                entries=[
+                    device_pb2.DirectoryEntry(
+                        name="new.mov",
+                        is_dir=False,
+                        size_bytes=12,
+                    )
+                ],
+            )
+        )
+        return pending
+
+    registry.request_directory_listing = listing_with_new_file  # type: ignore[method-assign]
     original = registry.send_start_receive
 
     def auto_ack(**kwargs):
@@ -465,21 +469,21 @@ def test_device_receive_returns_stored_409_then_acknowledges(
     request = _request(app)
 
     with caplog.at_level(logging.INFO, logger="sutradhara.api.store"):
-        warning = asyncio.run(
-            post_device_receive(
-                "mac-1",
-                request,
-                DeviceReceiveRequest.model_validate(payload),
-            )
-        )
-        warning_replay = asyncio.run(
-            post_device_receive(
-                "mac-1",
-                request,
-                DeviceReceiveRequest.model_validate(payload),
-            )
-        )
         accepted = asyncio.run(
+            post_device_receive(
+                "mac-1",
+                request,
+                DeviceReceiveRequest.model_validate(payload),
+            )
+        )
+        replay = asyncio.run(
+            post_device_receive(
+                "mac-1",
+                request,
+                DeviceReceiveRequest.model_validate(payload),
+            )
+        )
+        acknowledged_replay = asyncio.run(
             post_device_receive(
                 "mac-1",
                 request,
@@ -487,13 +491,110 @@ def test_device_receive_returns_stored_409_then_acknowledges(
             )
         )
 
-    assert warning.status_code == warning_replay.status_code == 409
-    warning_body = json.loads(warning.body)
-    assert warning_body == json.loads(warning_replay.body)
-    assert warning_body["duplicateWarning"]["priorIntake"]["intakeId"] == "prior"
     assert accepted == {"intakeId": "new-intake", "status": "streaming"}
-    assert api_store.DUPLICATE_WARNED_EVENT in caplog.text
-    assert api_store.DUPLICATE_ACKNOWLEDGED_EVENT in caplog.text
+    assert replay == accepted
+    assert acknowledged_replay == accepted
+    assert api_store.DUPLICATE_WARNED_EVENT not in caplog.text
+
+
+def test_device_receive_returns_nothing_new_409_for_all_known_listing(
+    api_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the content estimate, not identity alone, creates the blocking 409."""
+
+    _add_catalog_intake(api_engine, intake_id="prior", card_id="card-1")
+    registry = _online_registry(api_engine, capabilities=["browse"])
+    original = registry.request_directory_listing
+
+    def empty_listing(**kwargs):
+        pending = original(**kwargs)
+        pending.future.set_result(
+            device_pb2.DirectoryListing(
+                request_id=pending.request_id,
+                status=device_pb2.DIR_STATUS_OK,
+            )
+        )
+        return pending
+
+    registry.request_directory_listing = empty_listing  # type: ignore[method-assign]
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+
+    async def direct_run_sync(func, *args, **_kwargs):
+        return func(*args)
+
+    monkeypatch.setattr(routes_devices.anyio.to_thread, "run_sync", direct_run_sync)
+    response = asyncio.run(
+        post_device_receive(
+            "mac-1",
+            _request(app),
+            DeviceReceiveRequest.model_validate(
+                {
+                    "card_id": "card-1",
+                    "artifactclass": "s-masters",
+                    "idempotencyKey": str(uuid4()),
+                }
+            ),
+        )
+    )
+
+    assert response.status_code == 409
+    payload = json.loads(response.body)
+    assert payload["error"] == "nothing_new"
+    assert payload["retryable"] is True
+    assert payload["estimate"]["all_known_estimate"] is True
+
+
+def test_preview_treats_package_as_opaque_listing_item(
+    api_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _online_registry(api_engine, capabilities=["browse"])
+    original = registry.request_directory_listing
+    calls = 0
+
+    def package_listing(**kwargs):
+        nonlocal calls
+        calls += 1
+        pending = original(**kwargs)
+        pending.future.set_result(
+            device_pb2.DirectoryListing(
+                request_id=pending.request_id,
+                status=device_pb2.DIR_STATUS_OK,
+                entries=[
+                    device_pb2.DirectoryEntry(
+                        name="A001.fcpbundle",
+                        is_dir=True,
+                        is_package=True,
+                        size_bytes=42,
+                    )
+                ],
+            )
+        )
+        return pending
+
+    registry.request_directory_listing = package_listing  # type: ignore[method-assign]
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+
+    async def direct_run_sync(func, *args, **_kwargs):
+        return func(*args)
+
+    monkeypatch.setattr(routes_devices.anyio.to_thread, "run_sync", direct_run_sync)
+    listing, complete = asyncio.run(
+        routes_devices._current_card_listing(
+            _request(app),
+            operator="ada",
+            device_id="mac-1",
+            card_id="card-1",
+            source_ref="",
+        )
+    )
+
+    assert calls == 1
+    assert listing == [("A001.fcpbundle", 42)]
+    assert complete is True
 
 
 def test_devices_received_before_uses_same_projection(api_engine: Engine) -> None:
@@ -572,13 +673,15 @@ def _online_registry(
     engine: Engine,
     *,
     enroll: bool = True,
+    capabilities: list[str] | None = None,
 ) -> ConnectedDeviceRegistry:
     registry = ConnectedDeviceRegistry()
     stream = registry.register(
         DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
     )
     stream.update_cards(
-        [Card(card_id="card-1", label="Card One", kind="card", size_bytes=10, status="available")]
+        [Card(card_id="card-1", label="Card One", kind="card", size_bytes=10, status="available")],
+        capabilities=capabilities,
     )
     if enroll:
         with session_scope(engine) as session:

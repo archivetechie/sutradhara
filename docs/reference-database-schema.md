@@ -119,6 +119,11 @@ can preserve their own provenance even when their bytes deduplicate.
 | `st_dev`, `st_ino` | bigint, optional | Source filesystem device/inode evidence when available. |
 | `size_bytes` | bigint | Observed item size. |
 | `artifactclass` | text, indexed | Item's archive-policy class. |
+| `disposition` | enum | Immutable registration verdict: `new`, `known_durable`, `known_under_durable`, `reverified`, or `legacy_unknown`. |
+| `disposition_evaluated_at` | time, optional | When server-sha novelty and durability were evaluated; null only for legacy backfill. |
+| `disposition_policy_generation` | text, optional | Policy SHA/generation used for the evaluated-at verdict. |
+| `disposition_evidence` | json, optional | Immutable server hash and policy-qualified durability facts supporting the verdict. |
+| `prior_intake_id` | text, optional FK -> `intake.intake_id`, indexed | Most recent prior verified occurrence linked by the server hash. |
 | `metadata` | json | Per-occurrence metadata captured at registration. |
 | `created_at` | time | Registration time. |
 
@@ -157,8 +162,8 @@ the explicit duplicate-warning workflow fast enough to use at receive time.
 | `intake_id` | text, optional | Intake created or associated with the request. |
 | `response_json` | json, optional | Stored response for a safe replay. |
 | `device_id`, `card_identity`, `card_label` | text, optional | Device/card context used for the duplicate-receive decision. |
-| `duplicate_warning` | json, optional | Server-generated history warning shown before an override. |
-| `duplicate_acknowledged` | boolean | Whether the operator explicitly accepted that warning; defaults to false. |
+| `duplicate_warning` | json, optional | Stored `nothing_new` estimate warning shown before an override (legacy column name retained). |
+| `duplicate_acknowledged` | boolean | Whether the operator explicitly accepted that content warning; defaults to false. |
 | `lease_source_id` | text, optional | Source claim held while the receive is active. |
 | `warned_at`, `authorized_at`, `started_at`, `terminal_at` | time, optional | Receive-intent state-transition audit. |
 | `created_at`, `updated_at`, `last_heartbeat` | time | Record lifecycle and liveness timestamps. |
