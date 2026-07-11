@@ -112,12 +112,15 @@ def estimate_listing_novelty(
     ).one_or_none()
     prior_entries: set[tuple[str, int]] = set()
     if prior is not None:
+        listing_entries = {(entry.path, entry.size_bytes) for entry in listing}
         prior_entries = {
             (item.as_received_path, item.size_bytes)
             for item in session.scalars(
                 select(IngestItem).where(IngestItem.intake_id == prior.intake_id)
             )
-            if asset_policy_qualified_durable(session, item)
+            if item.disposition != IngestDisposition.LEGACY_UNKNOWN
+            and (item.as_received_path, item.size_bytes) in listing_entries
+            and asset_policy_qualified_durable(session, item)
         }
     match_prior = sum(
         (entry.path, entry.size_bytes) in prior_entries for entry in listing

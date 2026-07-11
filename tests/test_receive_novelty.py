@@ -132,6 +132,11 @@ def test_registration_classifies_all_authoritative_dispositions_and_suppression(
             ).one()
             legacy.disposition = IngestDisposition.LEGACY_UNKNOWN
             assert legacy.disposition == IngestDisposition.LEGACY_UNKNOWN
+            legacy_summary = novelty_summary(session, "first")
+            assert legacy_summary["legacy_unknown"] == 1
+            assert legacy_summary["total"] == sum(
+                count for bucket, count in legacy_summary.items() if bucket != "total"
+            )
     finally:
         engine.dispose()
 
@@ -197,11 +202,21 @@ def test_estimate_and_nothing_new_handshake_are_content_based(tmp_path: Path) ->
                 listing=[ListingEntry("known.mov", 5)],
                 listing_complete=True,
             )
+            item.disposition = IngestDisposition.LEGACY_UNKNOWN
+            legacy = estimate_listing_novelty(
+                session,
+                card_identity="card-1",
+                requester=intake.operator,
+                listing=[ListingEntry("known.mov", 5)],
+                listing_complete=True,
+            )
+            item.disposition = IngestDisposition.NEW
         assert same["all_known_estimate"] is True
         assert changed["likely_new"] == 1
         assert changed["all_known_estimate"] is False
         assert foreign["visible"] is False
         assert "prior_intake_id" not in foreign
+        assert legacy["all_known_estimate"] is False
 
         warned = api_store.begin_device_receive_intent(
             engine,
