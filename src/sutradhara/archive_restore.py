@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import selectors
 import shutil
 import subprocess
@@ -60,6 +61,14 @@ from sutradhara_receive.member_name import (
 )
 
 _MAX_LOCAL_ARCHIVE_HEADER_BYTES = 16 * 1024 * 1024
+# The 2026-07-07 MSL3040 field leg measured position/read operations at
+# 103.3--110.0 s (including transfer), with an ordinary mount at 80 s.  Six
+# hundred seconds is over 3x that measured ~190 s combined envelope, leaving
+# room for a farther filemark and robot contention without weakening the
+# separate streaming inactivity watchdog below.
+_REM_STREAM_MOUNT_GRACE_SECONDS = float(
+    os.environ.get("SUTRADHARA_REM_STREAM_MOUNT_GRACE_SECONDS", "600.0")
+)
 _REM_STREAM_INACTIVITY_TIMEOUT_SECONDS = 120.0
 _REM_STREAM_EXIT_TIMEOUT_SECONDS = 10.0
 _REM_STREAM_STDERR_LIMIT_BYTES = 64 * 1024
@@ -1279,6 +1288,7 @@ def _open_rao_aead_plaintext_stream(
     stderr_parts: list[bytes] = []
     stderr_size = [0]
     last_activity = [time.monotonic()]
+    streaming_started = [False]
     ciphertext_range = _stored_object_range(copy)
 
     def pump_ciphertext() -> None:
@@ -1288,6 +1298,8 @@ def _open_rao_aead_plaintext_stream(
                 dict(copy.native_locator),
                 ciphertext_range,
             ) as source_chunks:
+                last_activity[0] = time.monotonic()
+                streaming_started[0] = True
                 chunks = source_chunks
                 if not ciphertext_range.is_whole_object:
                     chunks = _require_exact_range(source_chunks, ciphertext_range.length)
@@ -1335,6 +1347,7 @@ def _open_rao_aead_plaintext_stream(
         writer_errors=writer_errors,
         stderr_parts=stderr_parts,
         last_activity=last_activity,
+        streaming_started=streaming_started,
     )
     try:
         yield plaintext
@@ -1381,6 +1394,7 @@ def _iter_rem_plaintext(
     writer_errors: list[Exception],
     stderr_parts: list[bytes],
     last_activity: list[float],
+    streaming_started: list[bool],
 ) -> Generator[bytes, None, None]:
     """Yield helper stdout and require clean ciphertext input plus exit zero."""
 
@@ -1408,7 +1422,12 @@ def _iter_rem_plaintext(
                     yield chunk
                     continue
                 break
-            if time.monotonic() - last_activity[0] > _REM_STREAM_INACTIVITY_TIMEOUT_SECONDS:
+            timeout_seconds = (
+                _REM_STREAM_INACTIVITY_TIMEOUT_SECONDS
+                if streaming_started[0]
+                else _REM_STREAM_MOUNT_GRACE_SECONDS
+            )
+            if time.monotonic() - last_activity[0] > timeout_seconds:
                 _terminate_and_reap(process)
                 raise ArchiveRestoreError(
                     "rem archive extract-stream exceeded its inactivity timeout"

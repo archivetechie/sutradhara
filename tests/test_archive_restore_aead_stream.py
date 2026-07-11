@@ -6,6 +6,7 @@ import hashlib
 import stat
 import subprocess
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -56,10 +57,19 @@ def engine() -> Iterator[Engine]:
 class _StreamingObjectBackend:
     """Test backend that exposes objects only through bounded range chunks."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        mount_delay_seconds: float = 0.0,
+        mount_error: Exception | None = None,
+        stream_delay_seconds: float = 0.0,
+    ) -> None:
         self.objects: dict[str, bytes] = {}
         self.max_chunk_seen = 0
         self.whole_reads = 0
+        self.mount_delay_seconds = mount_delay_seconds
+        self.mount_error = mount_error
+        self.stream_delay_seconds = stream_delay_seconds
 
     @property
     def name(self) -> str:
@@ -92,10 +102,14 @@ class _StreamingObjectBackend:
         *,
         chunk_bytes: int,
     ) -> Iterator[Iterator[bytes]]:
+        time.sleep(self.mount_delay_seconds)
+        if self.mount_error is not None:
+            raise self.mount_error
         data = self.objects[str(locator["object_id"])]
         end = len(data) if byte_range.is_whole_object else byte_range.end
 
         def chunks() -> Iterator[bytes]:
+            time.sleep(self.stream_delay_seconds)
             for cursor in range(byte_range.start, end, chunk_bytes):
                 chunk = data[cursor : min(cursor + chunk_bytes, end)]
                 self.max_chunk_seen = max(self.max_chunk_seen, len(chunk))
@@ -405,6 +419,118 @@ time.sleep(60)
 
     assert not destination.exists()
     assert list(tmp_path.glob(".hung.bin.*.tmp")) == []
+
+
+def test_slow_mount_uses_mount_grace_before_streaming_timeout(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logical = b"slow cold mount still restores"
+    # Longer than both the patched streaming watchdog and the reader's 250 ms
+    # polling interval: the former single-clock implementation fails this case.
+    backend = _StreamingObjectBackend(mount_delay_seconds=0.4)
+    registry = KeyRegistry(tmp_path / "keys")
+    epoch = registry.create_epoch()
+    backend_id, _copy_ids = _install_candidates(
+        engine,
+        backend,
+        logical=logical,
+        stored_candidates=[logical],
+        key_epoch=epoch.key_id,
+    )
+    monkeypatch.setattr(archive_restore_module, "_REM_STREAM_INACTIVITY_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(archive_restore_module, "_REM_STREAM_MOUNT_GRACE_SECONDS", 1.0)
+
+    with session_scope(engine) as session:
+        result = restore_asset(
+            session,
+            asset_hash=_sha(logical),
+            artifactclass="aead-test",
+            destination=tmp_path / "slow-mount.bin",
+            backends={backend_id: backend},
+            extractor=RemArchiveExtractor(
+                _write_stream_helper(tmp_path / "slow-mount-rem"), keys=registry
+            ),
+        )
+
+    assert result.output_path.read_bytes() == logical
+
+
+def test_streaming_inactivity_timeout_still_fires_after_mount(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logical = b"stream stalls after mount"
+    backend = _StreamingObjectBackend(stream_delay_seconds=0.75)
+    registry = KeyRegistry(tmp_path / "keys")
+    epoch = registry.create_epoch()
+    backend_id, _copy_ids = _install_candidates(
+        engine,
+        backend,
+        logical=logical,
+        stored_candidates=[logical],
+        key_epoch=epoch.key_id,
+    )
+    monkeypatch.setattr(archive_restore_module, "_REM_STREAM_INACTIVITY_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(archive_restore_module, "_REM_STREAM_MOUNT_GRACE_SECONDS", 2.0)
+    destination = tmp_path / "stream-stall.bin"
+
+    with (
+        session_scope(engine) as session,
+        pytest.raises(RestoreIntegrityError, match="inactivity timeout"),
+    ):
+        restore_asset(
+            session,
+            asset_hash=_sha(logical),
+            artifactclass="aead-test",
+            destination=destination,
+            backends={backend_id: backend},
+            extractor=RemArchiveExtractor(
+                _write_stream_helper(tmp_path / "stream-stall-rem"), keys=registry
+            ),
+        )
+
+    assert not destination.exists()
+
+
+def test_mount_error_fails_fast_without_waiting_for_grace(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logical = b"mount must fail"
+    backend = _StreamingObjectBackend(mount_error=RuntimeError("library mount failed"))
+    registry = KeyRegistry(tmp_path / "keys")
+    epoch = registry.create_epoch()
+    backend_id, _copy_ids = _install_candidates(
+        engine,
+        backend,
+        logical=logical,
+        stored_candidates=[logical],
+        key_epoch=epoch.key_id,
+    )
+    monkeypatch.setattr(archive_restore_module, "_REM_STREAM_INACTIVITY_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(archive_restore_module, "_REM_STREAM_MOUNT_GRACE_SECONDS", 10.0)
+    started = time.monotonic()
+
+    with (
+        session_scope(engine) as session,
+        pytest.raises(RestoreIntegrityError, match="library mount failed"),
+    ):
+        restore_asset(
+            session,
+            asset_hash=_sha(logical),
+            artifactclass="aead-test",
+            destination=tmp_path / "mount-error.bin",
+            backends={backend_id: backend},
+            extractor=RemArchiveExtractor(
+                _write_stream_helper(tmp_path / "mount-error-rem"), keys=registry
+            ),
+        )
+
+    assert time.monotonic() - started < 2.0
 
 
 def test_large_duplex_restore_has_bounded_rss_and_does_not_deadlock(

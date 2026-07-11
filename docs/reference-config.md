@@ -28,6 +28,7 @@ in the hdcache/placement helpers.
 | `SUTRADHARA_STATE_DIR` | unset | Where the worker's single-instance lock file goes for non-file database URLs: `$SUTRADHARA_STATE_DIR/worker-locks`, else `$XDG_STATE_HOME/sutradhara/worker-locks`, else `~/.local/state/sutradhara/worker-locks`. SQLite file URLs ignore this and lock next to the database file (`<database>.worker.lock`). (`jobs/worker_lock.py`) |
 | `SUTRADHARA_LOG_STORE_URL` | `http://127.0.0.1:9428` | Base URL of the VictoriaLogs instance backing `/api/ui/logs` and the `log_pipeline` reconciler. (`logs_store.py`) |
 | `SUTRADHARA_CLOUD_KEY_EPOCH` | unset | Key epoch used by the `cloud-blob` job when the job params don't carry one. When unset, a fresh epoch is minted via `KeyRegistry().create_epoch()`. (`jobs/handlers/cloud_blob.py`) |
+| `SUTRADHARA_REM_STREAM_MOUNT_GRACE_SECONDS` | `600.0` | Seconds allowed for a synchronous Remanence tape session open (robot mount plus locate) before an AEAD `extract-stream` restore is aborted. Once the session opens, the separate fixed 120-second streaming inactivity timeout applies. (`archive_restore.py`) |
 | `SUTRADHARA_OPERATOR_RESTORE_PRIORITY` | `0` | Job priority for operator restores (lower runs earlier). Must stay below the hdcache fill priority; the config constructor raises otherwise. (`hdcache/fill.py`) |
 | `SUTRADHARA_MIGRATION_PRIORITY` | `100` | Job priority for migration work. Must stay above the hdcache fill priority. (`hdcache/fill.py`) |
 
