@@ -36,7 +36,7 @@ data-loss event.
 
 Beyond the v0.1 anchor spec (see [`docs/spec-v0.1.md`](docs/spec-v0.1.md) for
 the original design). The catalog, job engine, and CLI are built and in
-active use — 856 passing tests — and the ingest → arrange → archive →
+active use, and the ingest → arrange → archive →
 restore lifecycle is implemented end to end, including:
 
 - Multi-backend copy fan-out with per-placement policy and durability
@@ -200,6 +200,9 @@ redundantly on the row.
   flag, verified against `--help`.
 - [`docs/reference-config.md`](docs/reference-config.md) — every
   environment variable with its exact default.
+- [`docs/reference-database-schema.md`](docs/reference-database-schema.md) —
+  every application table, field, relationship, and the reason for the
+  catalogue's key modelling boundaries.
 - [`docs/reference-glossary.md`](docs/reference-glossary.md) — the
   internal vocabulary, as the code uses it.
 - [`docs/spec-v0.1.md`](docs/spec-v0.1.md) — the original design (why this

@@ -24,7 +24,7 @@ not a data-loss event.
 
 ![System topology: sutra CLI, HTTP API, and mTLS gRPC enter the orchestrator core — job engine plus worker, reconciler spine, and one catalog database — which drives hdcache disks, ssh_disk, s3, d2_tape, and the Remanence boundary](assets/topology.svg)
 
-*Fig. 1 — What talks to what: three entry surfaces over one catalog database, the reconciler enqueuing what the job engine runs, and storage below — amber marks the tape side, where copies are durable.*
+*Fig. 1 — What talks to what: three entry surfaces over one catalog database, the reconciler enqueuing what the job engine runs, and storage below. The tape-side path is where durable copies are written.*
 
 <!-- code-anchor: src/sutradhara pyproject.toml @ 3d8310c -->
 ## The shape of the code
@@ -382,7 +382,7 @@ Every restore, whatever the entry point (`sutra archive restore`,
 
 ![Restore chain: every entry point passes the gates, chooses cache or tape, and converges on the verified read — stored hash check, open representation, plaintext hash check, atomic publish](assets/restore-chain.svg)
 
-*Fig. 4 — The restore chain: whatever the entry point, gates first, cache before tape, and both hash checks (amber) before anything reaches the destination.*
+*Fig. 4 — The restore chain: whatever the entry point, gates first, cache before tape, and both hash checks before anything reaches the destination.*
 
 Partial file restore (`pfr.py`, `sutra pfr cut`) shortcuts step 3 for
 indexed members: a `pfr-index-v1` sidecar plus `ReadObjectRange` byte

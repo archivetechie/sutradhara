@@ -15,7 +15,7 @@ Requires Python ≥ 3.11 and [`uv`](https://docs.astral.sh/uv/).
 ```sh
 git clone <repo> sutradhara && cd sutradhara
 uv sync            # installs the workspace, incl. packages/sutradhara-receive
-uv run pytest -q   # hermetic; 856 passed, 1 skipped (live-MinIO) as of 3d8310c
+uv run pytest -q   # hermetic test suite; one optional live-MinIO test may skip
 ```
 
 The CLI lands in the virtualenv as `.venv/bin/sutra`. The examples below
