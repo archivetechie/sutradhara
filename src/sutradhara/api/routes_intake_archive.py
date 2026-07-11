@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, Request
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import aliased
 
 from sutradhara.api.console import (
@@ -25,6 +25,13 @@ from sutradhara.api.console import (
     sanitize_text,
 )
 from sutradhara.api.identity import parse_identity
+from sutradhara.archive_predicate import (
+    archived_all_semantics_enabled,
+    legacy_archived_expr,
+)
+from sutradhara.archive_predicate import (
+    intake_archive_state_expr as _intake_archive_state_expr,
+)
 from sutradhara.catalog.models import (
     AssetDerivation,
     AssetLocator,
@@ -36,7 +43,6 @@ from sutradhara.catalog.models import (
     Intake,
     LogicalAsset,
     Submission,
-    SubmissionMember,
 )
 from sutradhara.catalog.session import session_scope
 from sutradhara.catalog.types import (
@@ -117,12 +123,12 @@ def get_intakes(
         if status_filter is not None:
             query = query.where(Intake.status == status_filter)
         if stage_filter is not None:
-            archive_evidence = _intake_archive_evidence_exists()
+            archived = legacy_archived_expr(all_semantics=archived_all_semantics_enabled())
             query = query.where(Intake.status == IntakeStatus.REGISTERED.value)
             if stage_filter == "archived":
-                query = query.where(archive_evidence)
+                query = query.where(archived)
             elif stage_filter == "registered_unarchived":
-                query = query.where(~archive_evidence)
+                query = query.where(~archived)
         if days_filter is not None:
             query = query.where(Intake.created_at >= days_filter)
         rows = list(session.execute(query))
@@ -330,86 +336,6 @@ def _intake_aggregates_subquery() -> Any:
     )
 
 
-def _intake_archive_evidence_exists() -> Any:
-    """Return the normative archived-stage evidence predicate for one intake."""
-
-    sealed_bundle_evidence = (
-        select(1)
-        .select_from(IngestItem)
-        .join(BundleMember, BundleMember.logical_asset_hash == IngestItem.logical_asset_hash)
-        .join(Bundle, Bundle.id == BundleMember.bundle_id)
-        .where(
-            IngestItem.intake_id == Intake.intake_id,
-            Bundle.status == "sealed",
-        )
-        .exists()
-    )
-    archived_submission_evidence = (
-        select(1)
-        .select_from(IngestItem)
-        .join(SubmissionMember, SubmissionMember.ingest_item_id == IngestItem.id)
-        .join(Submission, Submission.id == SubmissionMember.submission_id)
-        .where(
-            IngestItem.intake_id == Intake.intake_id,
-            Submission.status == SubmissionStatus.ARCHIVED.value,
-        )
-        .exists()
-    )
-    return or_(sealed_bundle_evidence, archived_submission_evidence)
-
-
-def _intake_archive_state_expr() -> Any:
-    """Return the ALL-semantics archive state via an indexed anti-join."""
-
-    archived_submission_item = aliased(IngestItem)
-    sealed_for_hash = (
-        select(1)
-        .select_from(BundleMember)
-        .join(Bundle, Bundle.id == BundleMember.bundle_id)
-        .where(
-            BundleMember.logical_asset_hash == IngestItem.logical_asset_hash,
-            Bundle.status == "sealed",
-        )
-        .exists()
-    )
-    archived_submission_for_hash = (
-        select(1)
-        .select_from(SubmissionMember)
-        .join(Submission, Submission.id == SubmissionMember.submission_id)
-        .join(
-            archived_submission_item,
-            archived_submission_item.id == SubmissionMember.ingest_item_id,
-        )
-        .where(
-            archived_submission_item.logical_asset_hash == IngestItem.logical_asset_hash,
-            Submission.status == SubmissionStatus.ARCHIVED.value,
-        )
-        .exists()
-    )
-    hash_archived = or_(sealed_for_hash, archived_submission_for_hash)
-    any_relevant = (
-        select(1).select_from(IngestItem).where(IngestItem.intake_id == Intake.intake_id).exists()
-    )
-    any_archived = (
-        select(1)
-        .select_from(IngestItem)
-        .where(IngestItem.intake_id == Intake.intake_id, hash_archived)
-        .exists()
-    )
-    any_missing = (
-        select(1)
-        .select_from(IngestItem)
-        .where(IngestItem.intake_id == Intake.intake_id, ~hash_archived)
-        .exists()
-    )
-    return case(
-        (~any_relevant, "none"),
-        (~any_missing, "complete"),
-        (any_archived, "partial"),
-        else_="none",
-    )
-
-
 def _intake_row(session: Any, intake_id: str) -> tuple[Intake, int, int, str] | None:
     aggregates = _intake_aggregates_subquery()
     row = session.execute(
@@ -448,6 +374,11 @@ def _intake_payload(
         "quarantined_at": _optional_iso(intake.quarantined_at),
         "item_count": item_count,
         "bytes_total": bytes_total,
+        "archived": (
+            archive_state == "complete"
+            if archived_all_semantics_enabled()
+            else archive_state in {"partial", "complete"}
+        ),
         "archive_state": archive_state,
         "archiveSemantics": 2,
     }

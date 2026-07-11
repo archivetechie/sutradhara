@@ -93,10 +93,7 @@ def _assert_archive_invariants(db_path: Path) -> None:
     ) in _unique_index_columns(db_path, "blob_root")
     assert "ck_copy_asset_xor_bundle" in _table_sql(db_path, "copy")
     assert ("backend_id", "native_locator_key") in _unique_index_columns(db_path, "copy")
-    assert (
-        _foreign_key_delete_actions(db_path, "asset_locator")[("pool_id", "pool")]
-        == "RESTRICT"
-    )
+    assert _foreign_key_delete_actions(db_path, "asset_locator")[("pool_id", "pool")] == "RESTRICT"
     assert _foreign_key_delete_actions(db_path, "blob_root")[("pool_id", "pool")] == "RESTRICT"
     assert (
         "bundle_member_id",
@@ -147,6 +144,7 @@ def _assert_intake_invariants(db_path: Path) -> None:
         "intake_id",
         "as_received_path",
     ) in _unique_index_columns(db_path, "ingest_item")
+    assert ("intake_id", "logical_asset_hash") in _index_columns(db_path, "ingest_item")
     assert (
         "derived_item_id",
         "source_item_id",

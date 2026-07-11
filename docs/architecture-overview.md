@@ -455,17 +455,21 @@ its terminal state (`committed` or `quarantined`) as the last step of
 catalog acceptance. `/api/devices` card entries carry a `receivedBefore`
 badge from the same projection, and the intake archive read models add an
 additive `archive_state` (`none`/`partial`/`complete`, ALL-semantics over
-every ingest item's hash) alongside the legacy any-semantics `archived`
-boolean.
+nonempty distinct ingest-item hashes) alongside the legacy `archived` boolean.
+Phase 1c gates that compatibility boolean and its stage filters with
+`SUTRADHARA_ARCHIVED_ALL_SEMANTICS`: the default remains ANY-semantics until the
+read-only `sutra archive predicate-audit` is clean, after which it derives from
+`archive_state == complete`.
 
 <!-- code-anchor: alembic @ 3d8310c -->
 ## Migrations
 
-Schema history is alembic, in `alembic/`: 29 migrations in a single
+Schema history is alembic, in `alembic/`: 30 migrations in a single
 linear chain from `ea7254a77d7a` (the initial
-logical-asset/backend/copy tables) to head `d4e5f6a7b8c9` (receive-dedup
-phase 1a: durable receive-intent columns on the idempotency table, plus
-`card_id`/`device_id` on `Intake`). The chain tracks the system's growth:
+logical-asset/backend/copy tables) to head `e5f6a7b8c9d0` (receive-dedup
+phase 1c: the composite intake/hash anti-join index). Phase 1a's preceding
+`d4e5f6a7b8c9` revision adds durable receive-intent columns on the idempotency
+table plus `card_id`/`device_id` on `Intake`. The chain tracks the system's growth:
 job table, pools, staging transforms, leases, the reconciler spine,
 arrangements and submissions, virtual arrangements, retention, gRPC
 intake and relay state, the hdcache tier, restore admission, and

@@ -200,6 +200,11 @@ class IngestItem(Base):
             "as_received_path",
             name="uq_ingest_item_intake_as_received_path",
         ),
+        Index(
+            "ix_ingest_item_intake_hash",
+            "intake_id",
+            "logical_asset_hash",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

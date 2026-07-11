@@ -119,6 +119,29 @@ def test_virtual_and_tag_help_surface_expected_verbs(cli_env: dict[str, str]) ->
     assert "--force-rejected" in restore.output
 
 
+def test_archive_help_surfaces_predicate_audit(cli_env: dict[str, str]) -> None:
+    archive = _run(["archive", "--help"])
+    assert "predicate-audit" in archive.output
+
+
+def test_archive_predicate_audit_writes_artifact(cli_env: dict[str, str], tmp_path: Path) -> None:
+    _run(["db", "init"])
+    output = tmp_path / "archive-predicate-audit.json"
+
+    result = _run(["archive", "predicate-audit", "--output", str(output)])
+
+    assert "audited=0 affected=0 gate_safe=True" in result.output
+    report = json.loads(output.read_text())
+    assert report["summary"] == {
+        "audited_intakes": 0,
+        "affected_intakes": 0,
+        "missing_distinct_assets": 0,
+        "gate_safe": True,
+    }
+    duplicate = _run(["archive", "predicate-audit", "--output", str(output)], expect_exit=1)
+    assert "pass --force" in duplicate.output
+
+
 def test_retention_help_surfaces_expected_verbs(cli_env: dict[str, str]) -> None:
     offsite = _run(["offsite", "--help"])
     assert "confirm" in offsite.output
@@ -229,7 +252,9 @@ def test_intake_watch_cli_once_registers_prepares_and_surfaces_quarantine(
     )
     manifest = bad.manifest_path
     manifest.write_text(
-        manifest.read_text(encoding="utf-8").replace(hashlib.sha256(b"video").hexdigest(), "0" * 64),
+        manifest.read_text(encoding="utf-8").replace(
+            hashlib.sha256(b"video").hexdigest(), "0" * 64
+        ),
         encoding="utf-8",
     )
     quarantined = _run(

@@ -187,6 +187,14 @@ workspaces; submissions are terminal (revise by cloning, not resubmitting).
 Artifactclass policy, durable bundles, held-bundle review, archiving frozen
 submissions, and asset restore.
 
+### sutra archive predicate-audit
+
+Write the read-only receive-dedup phase-1c preservation audit as a
+schema-versioned JSON artifact. `--output FILE` is required; an existing file
+is refused unless `--force` is supplied. Run it against the deployment catalog
+before enabling `SUTRADHARA_ARCHIVED_ALL_SEMANTICS`; only a report with
+`summary.gate_safe: true` clears the rollout gate.
+
 ### sutra archive artifactclass apply ARTIFACTCLASS POLICY_PATH
 
 Strict-validate and apply an artifactclass TOML policy. Unknown keys are an

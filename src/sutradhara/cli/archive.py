@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import cast
 
@@ -18,6 +19,7 @@ from sutradhara.archive_fanout import (
     RemArchiveBuilder,
     flush_bundle,
 )
+from sutradhara.archive_predicate import build_archive_predicate_audit
 from sutradhara.archive_restore import (
     ArchiveRestoreError,
     RemArchiveExtractor,
@@ -74,6 +76,40 @@ def bundle_group() -> None:
 @archive_group.group("submission")
 def submission_group() -> None:
     """Archive frozen arrangement submissions."""
+
+
+@archive_group.command("predicate-audit")
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="Write the reusable JSON audit artifact to this path.",
+)
+@click.option("--force", is_flag=True, help="Replace an existing output artifact.")
+def predicate_audit(output: Path, force: bool) -> None:
+    """Audit retention-passed intakes before enabling ALL semantics."""
+
+    if output.exists() and not force:
+        raise click.ClickException(f"output already exists: {output}; pass --force to replace it")
+    engine = make_engine()
+    with session_scope(engine) as session:
+        report = build_archive_predicate_audit(session)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    summary = report["summary"]
+    assert isinstance(summary, dict)
+    click.echo(
+        f"wrote {output}: audited={summary['audited_intakes']} "
+        f"affected={summary['affected_intakes']} gate_safe={summary['gate_safe']}"
+    )
 
 
 @submission_group.command("flush")
@@ -334,9 +370,7 @@ def restore_cmd(
             raise click.ClickException(exc.detail) from exc
         except (ArchiveRestoreError, RestoreManagerError) as exc:
             raise click.ClickException(str(exc)) from exc
-    click.echo(
-        f"restored {asset_hash.hex()} from {result.source} to {result.output_path}"
-    )
+    click.echo(f"restored {asset_hash.hex()} from {result.source} to {result.output_path}")
 
 
 def _target_backends(session: Session, artifactclass: str) -> dict[int, WritableStorageBackend]:
