@@ -23,7 +23,13 @@ from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
 from sutradhara.keys import KeyEpoch
-from sutradhara.restore import RestoreError, atomic_write_verified_file, restore_copy
+from sutradhara.restore import (
+    RestoreError,
+    RestoreIntegrityError,
+    atomic_write_verified_chunks,
+    atomic_write_verified_file,
+    restore_copy,
+)
 from sutradhara.sealing.port import Representation
 
 
@@ -46,7 +52,9 @@ class _FakeOpener:
         representation: Representation,
         *,
         key_epoch: KeyEpoch | None = None,
+        work_dir: Path | str | None = None,
     ) -> Iterator[Path]:
+        del work_dir
         key_id = key_epoch.key_id if key_epoch is not None else None
         self.calls.append((representation, key_id))
         source = Path(source_path)
@@ -67,6 +75,68 @@ class _FakeOpener:
 
 def _sha(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
+
+
+def test_atomic_write_verified_chunks_commits_only_exact_verified_stream(tmp_path: Path) -> None:
+    destination = (tmp_path / "verified.bin").resolve()
+    payload = b"verified " * 1000
+
+    atomic_write_verified_chunks(
+        iter((payload[:17], payload[17:])),
+        destination,
+        expected_sha256=_sha(payload),
+        expected_size_bytes=len(payload),
+    )
+
+    assert destination.read_bytes() == payload
+    assert list(tmp_path.glob(".verified.bin.*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    ("expected_sha256", "expected_size", "match"),
+    [
+        (_sha(b"wrong"), 7, "SHA-256"),
+        (_sha(b"payload"), 8, "size"),
+    ],
+)
+def test_atomic_write_verified_chunks_deletes_temp_on_fixity_failure(
+    tmp_path: Path,
+    expected_sha256: bytes,
+    expected_size: int,
+    match: str,
+) -> None:
+    destination = (tmp_path / "failed.bin").resolve()
+    destination.write_bytes(b"existing")
+
+    with pytest.raises(RestoreIntegrityError, match=match):
+        atomic_write_verified_chunks(
+            iter((b"pay", b"load")),
+            destination,
+            expected_sha256=expected_sha256,
+            expected_size_bytes=expected_size,
+        )
+
+    assert destination.read_bytes() == b"existing"
+    assert list(tmp_path.glob(".failed.bin.*.tmp")) == []
+
+
+def test_atomic_write_verified_chunks_deletes_temp_on_source_failure(tmp_path: Path) -> None:
+    destination = (tmp_path / "source-failed.bin").resolve()
+
+    def failing_chunks() -> Iterator[bytes]:
+        yield b"partial"
+        raise OSError("source failed")
+
+    with pytest.raises(OSError, match="source failed"):
+        atomic_write_verified_chunks(
+            failing_chunks(),
+            destination,
+            expected_sha256=_sha(b"partial"),
+            expected_size_bytes=len(b"partial"),
+        )
+
+    assert not destination.exists()
+    assert list(tmp_path.glob(".source-failed.bin.*.tmp")) == []
 
 
 def _stored_bytes(data: bytes, representation: Representation, key_epoch: str = "epoch-1") -> bytes:

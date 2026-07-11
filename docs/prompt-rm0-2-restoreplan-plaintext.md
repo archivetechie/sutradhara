@@ -1,6 +1,6 @@
 # Prompt RM0.2 — selection-preserving `RestorePlan` + plaintext streaming pipeline (sutradhara)
 
-**Status:** pending (gpt-5.6-sol). Second milestone of streaming restore (RM0). Builds on **RM0.1**
+**Status:** implemented 2026-07-11 (gpt-5.6-sol). Second milestone of streaming restore (RM0). Builds on **RM0.1**
 (landed b47c6b5: `StreamingStorageBackend.open_range_chunks` context manager + `StreamKind`).
 **Normative (read FIRST, binding — do NOT inline):** `docs/design-streaming-restore.md` v0.2 — §3.2
 (`RestorePlan`), §3.3 (representation producers), §3.4 (Opener seam), §3.5 (bounded memory), §5-E +

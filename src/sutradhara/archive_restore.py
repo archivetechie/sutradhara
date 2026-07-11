@@ -8,19 +8,25 @@ asset identity.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import shutil
 import tarfile
 import tempfile
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, BinaryIO, Protocol, cast
 
+import zstandard as zstd
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
+from typing_extensions import Buffer
 
 from sutradhara.artifactclass_policy import get_artifactclass_policy
-from sutradhara.backend.port import ByteRange, StorageBackend
+from sutradhara.backend.port import BackendError, ByteRange, StorageBackend, StreamingStorageBackend
 from sutradhara.catalog.models import (
     ArtifactClassPool,
     AssetLocator,
@@ -34,10 +40,15 @@ from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
 from sutradhara.durability import locator_artifactclass_filter
 from sutradhara.keys import KeyRegistry
 from sutradhara.resource_control import run_managed
-from sutradhara.restore import atomic_write_verified_file
+from sutradhara.restore import (
+    RestoreIntegrityError as ChunkRestoreIntegrityError,
+)
+from sutradhara.restore import (
+    atomic_write_verified_chunks,
+)
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
-from sutradhara.staging import StagingError, reverse_transforms_to_path
+from sutradhara.staging import StagingError
 from sutradhara_receive.member_name import (
     MemberNameError,
     escape_member_name,
@@ -57,6 +68,14 @@ class RestoreSourceUnavailable(ArchiveRestoreError):
 
 class RestoreIntegrityError(ArchiveRestoreError):
     """Restored bytes do not match the logical asset hash."""
+
+
+class StoredMemberIntegrityError(ArchiveRestoreError):
+    """A selected member range does not match its staged/member digest."""
+
+
+class LogicalMemberIntegrityError(ArchiveRestoreError):
+    """A clean stored member does not recover to its logical asset identity."""
 
 
 class RestoreNameError(ArchiveRestoreError):
@@ -80,6 +99,152 @@ class RestoreResult:
     copy_id: int
     output_path: Path
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class PlannedMember:
+    """One typed copy/locator/transform candidate in a restore plan."""
+
+    asset_hash: bytes
+    expected_logical_size: int
+    expected_stored_sha256: bytes
+    pool_id: str
+    copy: Copy
+    locator: AssetLocator
+    transforms: tuple[StagingTransform, ...]
+    backend: StorageBackend
+    buffered: bool
+
+
+class _ChunkIteratorReader(io.RawIOBase):
+    """Adapt pull-driven chunks to the ``readinto`` API used by zstandard."""
+
+    def __init__(self, chunks: Iterator[bytes]) -> None:
+        self._chunks = chunks
+        self._current = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target: Buffer) -> int:
+        view = memoryview(target).cast("B")
+        while not self._current:
+            try:
+                chunk = next(self._chunks)
+            except StopIteration:
+                return 0
+            if not isinstance(chunk, bytes):
+                raise TypeError("archive member stream yielded a non-bytes chunk")
+            self._current = memoryview(chunk)
+        count = min(len(view), len(self._current))
+        view[:count] = self._current[:count]
+        self._current = self._current[count:]
+        return count
+
+
+class RestorePlan:
+    """Built restore selection whose member streams execute only when opened.
+
+    Single-asset plans contain ordered copy/locator candidates. Bundle plans
+    contain the members of exactly one all-covering copy group. Streamable
+    representations stay pull-driven; AEAD and D2 tar members lacking a block
+    range retain the existing scratch/extractor machinery.
+    """
+
+    def __init__(
+        self,
+        members: list[PlannedMember],
+        *,
+        extractor: ArchiveExtractor,
+        bundle_group: bool,
+    ) -> None:
+        self._members = tuple(members)
+        self._extractor = extractor
+        self._bundle_group = bundle_group
+        self._bundle_temp: tempfile.TemporaryDirectory[str] | None = None
+        self._bundle_paths: dict[bytes, Path] | None = None
+
+    def __enter__(self) -> RestorePlan:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release any shared buffered bundle materialization."""
+
+        if self._bundle_temp is not None:
+            self._bundle_temp.cleanup()
+            self._bundle_temp = None
+            self._bundle_paths = None
+
+    def iter_members(self) -> Iterator[PlannedMember]:
+        """Yield candidates in their selection order."""
+
+        return iter(self._members)
+
+    @contextmanager
+    def open_member_stream(self, member: PlannedMember) -> Iterator[Iterator[bytes]]:
+        """Yield verified logical plaintext chunks for one planned member."""
+
+        if member not in self._members:
+            raise ValueError("planned member does not belong to this restore plan")
+        with self._open_stored_stream(member) as stored_chunks:
+            identity_is_logical = not any(item.reversible for item in member.transforms) and (
+                member.expected_stored_sha256 == member.asset_hash
+            )
+            verified_stored = _verify_stored_chunks(
+                stored_chunks,
+                expected_sha256=member.expected_stored_sha256,
+                copy_id=member.copy.id,
+                mismatch_is_logical=identity_is_logical,
+            )
+            logical_chunks = _reverse_transform_chunks(verified_stored, member.transforms)
+            yield _verify_logical_chunks(
+                logical_chunks,
+                expected_sha256=member.asset_hash,
+                expected_size=member.expected_logical_size,
+                copy_id=member.copy.id,
+            )
+
+    @contextmanager
+    def _open_stored_stream(self, member: PlannedMember) -> Iterator[Iterator[bytes]]:
+        if self._bundle_group and any(item.buffered for item in self._members):
+            paths = self._ensure_buffered_bundle()
+            with paths[member.asset_hash].open("rb") as handle:
+                yield _file_chunks(handle)
+            return
+        if member.buffered:
+            with tempfile.TemporaryDirectory(prefix=".sutradhara-plan-member-") as raw:
+                path = Path(raw) / "stored"
+                self._extractor.extract_to_path(
+                    locator=member.locator,
+                    copy=member.copy,
+                    backend=member.backend,
+                    destination=path,
+                )
+                with path.open("rb") as handle:
+                    yield _file_chunks(handle)
+            return
+        with _open_locator_range_chunks(member) as chunks:
+            yield chunks
+
+    def _ensure_buffered_bundle(self) -> dict[bytes, Path]:
+        if self._bundle_paths is not None:
+            return self._bundle_paths
+        self._bundle_temp = tempfile.TemporaryDirectory(prefix=".sutradhara-plan-bundle-")
+        root = Path(self._bundle_temp.name)
+        paths = {member.asset_hash: root / member.asset_hash.hex() for member in self._members}
+        first = self._members[0]
+        _extract_bundle_to_paths(
+            self._extractor,
+            locators=[member.locator for member in self._members],
+            copy=first.copy,
+            backend=first.backend,
+            destinations=paths,
+        )
+        self._bundle_paths = paths
+        return paths
 
 
 class ArchiveExtractor(Protocol):
@@ -310,6 +475,162 @@ def read_member_bytes(
         return member_path.read_bytes()
 
 
+def build_restore_plan(
+    session: Session,
+    *,
+    asset_hash: bytes,
+    artifactclass: str,
+    backends: dict[int, StorageBackend],
+    extractor: ArchiveExtractor | None = None,
+) -> RestorePlan:
+    """Build ordered typed candidates using the user-restore selector."""
+
+    from sutradhara.durability import AssetTarget
+    from sutradhara.replication import select_source_candidates
+
+    archive_extractor = extractor or LocalArchiveExtractor()
+    locators = list(
+        session.scalars(
+            select(AssetLocator)
+            .outerjoin(Bundle, AssetLocator.bundle_id == Bundle.id)
+            .where(
+                AssetLocator.logical_asset_hash == asset_hash,
+                locator_artifactclass_filter(session, asset_hash, artifactclass),
+            )
+            .order_by(AssetLocator.id)
+        )
+    )
+    locators_by_copy: dict[int, list[AssetLocator]] = {}
+    for locator in locators:
+        if locator.copy_id is not None:
+            locators_by_copy.setdefault(locator.copy_id, []).append(locator)
+
+    members: list[PlannedMember] = []
+    # Parity with pre-RM0.2 restore_asset: only locators whose pool is in the
+    # artifactclass restore pool order are eligible. The user-restore selector ranks
+    # (never excludes) non-preferred pools, so without this gate a copy in an
+    # excluded/retired pool would leak in as a last-resort restore source — a policy
+    # divergence (not a corruption; bytes are still verified). RM0.2 diff-gate defect.
+    policy = get_artifactclass_policy(session, artifactclass)
+    pool_order = set(_restore_pool_order(session, artifactclass, policy.restore_preference))
+    candidates = select_source_candidates(
+        session,
+        AssetTarget(asset_hash=asset_hash, artifactclass=artifactclass),
+        purpose="user_restore",
+    )
+    for copy in candidates:
+        if copy.health != CopyHealth.OK or copy.deleted_at is not None:
+            continue
+        backend = backends.get(copy.backend_id)
+        if backend is None:
+            continue
+        for locator in locators_by_copy.get(copy.id, []):
+            if locator.pool_id not in pool_order:
+                continue
+            members.append(
+                _planned_member(
+                    session,
+                    locator=locator,
+                    copy=copy,
+                    backend=backend,
+                    extractor=archive_extractor,
+                )
+            )
+    return RestorePlan(members, extractor=archive_extractor, bundle_group=False)
+
+
+def build_bundle_restore_plan(
+    session: Session,
+    *,
+    asset_hashes: list[bytes],
+    artifactclass: str,
+    backends: dict[int, StorageBackend],
+    extractor: BundleArchiveExtractor | ArchiveExtractor | None = None,
+) -> RestorePlan:
+    """Build one all-covering bundle group without cross-group retry."""
+
+    archive_extractor = extractor or LocalArchiveExtractor()
+    chosen = _choose_bundle_restore_group(
+        session,
+        asset_hashes,
+        artifactclass,
+        backends=backends,
+    )
+    if chosen is None:
+        return RestorePlan([], extractor=archive_extractor, bundle_group=True)
+    _pool_id, copy, backend, locator_by_hash = chosen
+    members = [
+        _planned_member(
+            session,
+            locator=locator_by_hash[asset_hash],
+            copy=copy,
+            backend=backend,
+            extractor=archive_extractor,
+        )
+        for asset_hash in asset_hashes
+    ]
+    return RestorePlan(members, extractor=archive_extractor, bundle_group=True)
+
+
+def _planned_member(
+    session: Session,
+    *,
+    locator: AssetLocator,
+    copy: Copy,
+    backend: StorageBackend,
+    extractor: ArchiveExtractor,
+) -> PlannedMember:
+    asset = session.get(LogicalAsset, locator.logical_asset_hash)
+    if asset is None:
+        raise RestoreSourceUnavailable(
+            f"logical asset {locator.logical_asset_hash.hex()} disappeared while planning restore"
+        )
+    transforms = tuple(_locator_transforms(session, locator))
+    stored_sha256 = _expected_stored_member_sha256(session, locator, transforms)
+    representation = Representation(locator.representation)
+    trusted_extractor = isinstance(extractor, (LocalArchiveExtractor, RemArchiveExtractor))
+    buffered = (
+        not trusted_extractor
+        or representation is Representation.RAO_AEAD_V1
+        or (
+            representation is Representation.D2TAR_RAW
+            and "block_range" not in locator.native_locator
+        )
+    )
+    return PlannedMember(
+        asset_hash=locator.logical_asset_hash,
+        expected_logical_size=asset.size_bytes,
+        expected_stored_sha256=stored_sha256,
+        pool_id=locator.pool_id,
+        copy=copy,
+        locator=locator,
+        transforms=transforms,
+        backend=backend,
+        buffered=buffered,
+    )
+
+
+def _expected_stored_member_sha256(
+    session: Session,
+    locator: AssetLocator,
+    transforms: tuple[StagingTransform, ...],
+) -> bytes:
+    reversible = [transform for transform in transforms if transform.reversible]
+    if reversible:
+        return max(reversible, key=lambda item: item.step_order).stored_sha256
+    if locator.bundle_id is not None:
+        digest = session.scalar(
+            select(BundleMember.file_sha256).where(
+                BundleMember.bundle_id == locator.bundle_id,
+                BundleMember.logical_asset_hash == locator.logical_asset_hash,
+                BundleMember.member_path == locator.member_path,
+            )
+        )
+        if digest is not None:
+            return digest
+    return locator.logical_asset_hash
+
+
 def restore_asset(
     session: Session,
     *,
@@ -321,7 +642,7 @@ def restore_asset(
     force_suspect: bool = False,
     force_rejected: bool = False,
 ) -> RestoreResult:
-    """Restore one asset using the artifactclass ordered pool preference."""
+    """Restore one asset from the first candidate that reaches verified EOF."""
     if not is_content_hash(asset_hash):
         raise ValueError("asset_hash must be a 32-byte SHA-256 hash")
     check_asset_restore_allowed(
@@ -330,75 +651,45 @@ def restore_asset(
         force_suspect=force_suspect,
         force_rejected=force_rejected,
     )
-    archive_extractor = extractor or LocalArchiveExtractor()
     output_path = Path(destination).resolve()
-    policy = get_artifactclass_policy(session, artifactclass)
-    pool_order = _restore_pool_order(session, artifactclass, policy.restore_preference)
-    locators = list(
-        session.scalars(
-            select(AssetLocator)
-            .options(joinedload(AssetLocator.copy).joinedload(Copy.backend))
-            .outerjoin(Bundle, AssetLocator.bundle_id == Bundle.id)
-            .where(
-                AssetLocator.logical_asset_hash == asset_hash,
-                locator_artifactclass_filter(session, asset_hash, artifactclass),
-            )
-        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plan = build_restore_plan(
+        session,
+        asset_hash=asset_hash,
+        artifactclass=artifactclass,
+        backends=backends,
+        extractor=extractor,
     )
-    by_pool: dict[str, list[AssetLocator]] = {pool_id: [] for pool_id in pool_order}
-    for locator in locators:
-        if locator.pool_id in by_pool:
-            by_pool[locator.pool_id].append(locator)
 
     integrity_errors: list[str] = []
-    for pool_id in pool_order:
-        for locator in by_pool.get(pool_id, []):
-            copy = locator.copy
-            if copy is None or copy.health != CopyHealth.OK or copy.deleted_at is not None:
-                continue
-            backend = backends.get(copy.backend_id)
-            if backend is None:
-                continue
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+    with plan:
+        for member in plan.iter_members():
             try:
-                with tempfile.TemporaryDirectory(
-                    prefix=".sutradhara-restore-",
-                    dir=output_path.parent,
-                ) as raw_tmp:
-                    temp_dir = Path(raw_tmp)
-                    stored_path = temp_dir / "stored-member"
-                    restored_path = temp_dir / "restored-member"
-                    archive_extractor.extract_to_path(
-                        locator=locator,
-                        copy=copy,
-                        backend=backend,
-                        destination=stored_path,
+                with plan.open_member_stream(member) as chunks:
+                    atomic_write_verified_chunks(
+                        chunks,
+                        output_path,
+                        expected_sha256=member.asset_hash,
+                        expected_size_bytes=member.expected_logical_size,
                     )
-                    restored = reverse_transforms_to_path(
-                        stored_path,
-                        restored_path,
-                        _locator_transforms(session, locator),
-                    )
-                    if restored.sha256 != asset_hash:
-                        copy.health = CopyHealth.SUSPECT
-                        integrity_errors.append(
-                            f"copy id={copy.id} pool={pool_id}: "
-                            f"{restored.sha256.hex()} != {asset_hash.hex()}"
-                        )
-                        continue
-                    atomic_write_verified_file(restored_path, output_path)
-                    return RestoreResult(
-                        asset_hash=asset_hash,
-                        pool_id=pool_id,
-                        copy_id=copy.id,
-                        output_path=output_path,
-                        size_bytes=restored.size_bytes,
-                    )
-            except ArchiveRestoreError as exc:
-                integrity_errors.append(f"copy id={copy.id} pool={pool_id}: {exc}")
+                return RestoreResult(
+                    asset_hash=asset_hash,
+                    pool_id=member.pool_id,
+                    copy_id=member.copy.id,
+                    output_path=output_path,
+                    size_bytes=member.expected_logical_size,
+                )
+            except LogicalMemberIntegrityError as exc:
+                member.copy.health = CopyHealth.SUSPECT
+                integrity_errors.append(f"copy id={member.copy.id} pool={member.pool_id}: {exc}")
                 continue
-            except StagingError as exc:
-                integrity_errors.append(f"copy id={copy.id} pool={pool_id}: {exc}")
+            except (
+                ArchiveRestoreError,
+                BackendError,
+                StagingError,
+                ChunkRestoreIntegrityError,
+            ) as exc:
+                integrity_errors.append(f"copy id={member.copy.id} pool={member.pool_id}: {exc}")
                 continue
 
     if integrity_errors:
@@ -451,59 +742,47 @@ def restore_assets_from_bundle(
 
     destination_root = Path(destination_dir).resolve()
     destination_root.mkdir(parents=True, exist_ok=True)
-    archive_extractor = extractor or LocalArchiveExtractor()
-    chosen = _choose_bundle_restore_group(
+    plan = build_bundle_restore_plan(
         session,
-        unique_hashes,
-        artifactclass,
+        asset_hashes=unique_hashes,
+        artifactclass=artifactclass,
         backends=backends,
+        extractor=extractor,
     )
-    if chosen is None:
+    members = list(plan.iter_members())
+    if not members:
         hashes = ", ".join(asset_hash.hex() for asset_hash in unique_hashes)
         raise RestoreSourceUnavailable(
             f"no healthy bundle copy can restore all requested assets for "
             f"artifactclass {artifactclass!r}: {hashes}"
         )
-    pool_id, copy, backend, locator_by_hash = chosen
-
-    with tempfile.TemporaryDirectory(prefix=".sutradhara-bundle-restore-", dir=destination_root) as raw:
-        temp_dir = Path(raw)
-        stored_dir = temp_dir / "stored"
-        restored_dir = temp_dir / "restored"
-        stored_dir.mkdir()
-        restored_dir.mkdir()
-        stored_destinations = {
-            asset_hash: stored_dir / asset_hash.hex() for asset_hash in unique_hashes
-        }
-        _extract_bundle_to_paths(
-            archive_extractor,
-            locators=[locator_by_hash[asset_hash] for asset_hash in unique_hashes],
-            copy=copy,
-            backend=backend,
-            destinations=stored_destinations,
-        )
+    with plan:
         results_by_hash: dict[bytes, RestoreResult] = {}
-        for asset_hash in unique_hashes:
-            locator = locator_by_hash[asset_hash]
-            restored_path = restored_dir / asset_hash.hex()
-            restored = reverse_transforms_to_path(
-                stored_destinations[asset_hash],
-                restored_path,
-                _locator_transforms(session, locator),
-            )
-            if restored.sha256 != asset_hash:
+        for member in members:
+            output_path = destination_root / member.asset_hash.hex()
+            try:
+                with plan.open_member_stream(member) as chunks:
+                    atomic_write_verified_chunks(
+                        chunks,
+                        output_path,
+                        expected_sha256=member.asset_hash,
+                        expected_size_bytes=member.expected_logical_size,
+                    )
+            except (
+                ArchiveRestoreError,
+                BackendError,
+                StagingError,
+                ChunkRestoreIntegrityError,
+            ) as exc:
                 raise RestoreIntegrityError(
-                    f"bundle restore copy id={copy.id} pool={pool_id}: "
-                    f"{restored.sha256.hex()} != {asset_hash.hex()}"
-                )
-            output_path = destination_root / asset_hash.hex()
-            atomic_write_verified_file(restored_path, output_path)
-            results_by_hash[asset_hash] = RestoreResult(
-                asset_hash=asset_hash,
-                pool_id=pool_id,
-                copy_id=copy.id,
+                    f"bundle restore copy id={member.copy.id} pool={member.pool_id}: {exc}"
+                ) from exc
+            results_by_hash[member.asset_hash] = RestoreResult(
+                asset_hash=member.asset_hash,
+                pool_id=member.pool_id,
+                copy_id=member.copy.id,
                 output_path=output_path,
-                size_bytes=restored.size_bytes,
+                size_bytes=member.expected_logical_size,
             )
     return [results_by_hash[asset_hash] for asset_hash in asset_hashes]
 
@@ -821,6 +1100,194 @@ def _try_extract_from_local_archive_to_path(
         destination,
     )
     return True
+
+
+@contextmanager
+def _open_locator_range_chunks(member: PlannedMember) -> Iterator[Iterator[bytes]]:
+    """Open the exact stored-member range and structurally own its source."""
+
+    native = dict(member.locator.native_locator)
+    size = _size_bytes(native)
+    representation = Representation(member.locator.representation)
+    if size == 0:
+        yield iter(())
+        return
+    if representation is Representation.D2TAR_RAW:
+        raw_range = native.get("block_range")
+        if not isinstance(raw_range, list) or len(raw_range) != 2:
+            raise ArchiveRestoreError("ranged D2 member is missing a valid block_range")
+        start = int(raw_range[0])
+    elif "offset" in native:
+        start = _local_archive_member_start(member.backend, member.copy, member.locator)
+    elif representation is Representation.RAO_PLAIN_V1:
+        start = member_byte_base(native)
+    elif representation is Representation.RAW_BYTES and "block_range" in native:
+        raw_range = native["block_range"]
+        if not isinstance(raw_range, list) or len(raw_range) != 2:
+            raise ArchiveRestoreError("RAW member has an invalid block_range")
+        start = int(raw_range[0])
+    else:
+        start = 0
+    if start < 0:
+        raise ArchiveRestoreError(f"invalid backend member start {start}")
+    byte_range = ByteRange(start, start + size)
+    with _open_backend_range_chunks(
+        member.backend,
+        dict(member.copy.native_locator),
+        byte_range,
+    ) as chunks:
+        yield _require_exact_range(chunks, byte_range.length)
+
+
+def _local_archive_member_start(
+    backend: StorageBackend,
+    copy: Copy,
+    locator: AssetLocator,
+) -> int:
+    native = dict(locator.native_locator)
+    offset = int(native["offset"])
+    if offset < 0:
+        raise ArchiveRestoreError("local archive locator has a negative offset")
+    header_len_raw = backend.read_range(copy.native_locator, ByteRange(0, 8))
+    if len(header_len_raw) != 8:
+        return offset
+    header_len = int.from_bytes(header_len_raw, "big")
+    if header_len <= 0 or header_len > _MAX_LOCAL_ARCHIVE_HEADER_BYTES:
+        return offset
+    try:
+        header_bytes = backend.read_range(copy.native_locator, ByteRange(8, 8 + header_len))
+        header = json.loads(header_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return offset
+    if isinstance(header, dict) and header.get("format") == "sutradhara-local-archive-v1":
+        return 8 + header_len + offset
+    return offset
+
+
+@contextmanager
+def _open_backend_range_chunks(
+    backend: StorageBackend,
+    locator: dict[str, Any],
+    byte_range: ByteRange,
+) -> Iterator[Iterator[bytes]]:
+    if isinstance(backend, StreamingStorageBackend):
+        with backend.open_range_chunks(
+            locator,
+            byte_range,
+            chunk_bytes=RAO_CHUNK_SIZE,
+        ) as chunks:
+            yield chunks
+        return
+    materialized = getattr(backend, "open_materialized_range_chunks", None)
+    if callable(materialized):
+        with materialized(locator, byte_range, chunk_bytes=RAO_CHUNK_SIZE) as chunks:
+            yield chunks
+        return
+
+    @contextmanager
+    def legacy_range_reader() -> Iterator[Iterator[bytes]]:
+        def chunks() -> Iterator[bytes]:
+            for cursor in range(byte_range.start, byte_range.end, RAO_CHUNK_SIZE):
+                end = min(cursor + RAO_CHUNK_SIZE, byte_range.end)
+                yield backend.read_range(locator, ByteRange(cursor, end))
+
+        yield chunks()
+
+    with legacy_range_reader() as chunks:
+        yield chunks
+
+
+def _require_exact_range(chunks: Iterator[bytes], expected_size: int) -> Iterator[bytes]:
+    seen = 0
+    for chunk in chunks:
+        seen += len(chunk)
+        if seen > expected_size:
+            raise ArchiveRestoreError(
+                f"backend member stream exceeded expected range size {expected_size}"
+            )
+        if chunk:
+            yield chunk
+    if seen != expected_size:
+        raise ArchiveRestoreError(
+            f"backend member stream returned {seen} bytes, expected {expected_size}"
+        )
+
+
+def _verify_stored_chunks(
+    chunks: Iterator[bytes],
+    *,
+    expected_sha256: bytes,
+    copy_id: int,
+    mismatch_is_logical: bool = False,
+) -> Iterator[bytes]:
+    digest = hashlib.sha256()
+    for chunk in chunks:
+        digest.update(chunk)
+        yield chunk
+    actual = digest.digest()
+    if actual != expected_sha256:
+        message = (
+            f"copy id={copy_id} stored-member SHA-256 {actual.hex()} != {expected_sha256.hex()}"
+        )
+        if mismatch_is_logical:
+            raise LogicalMemberIntegrityError(message)
+        raise StoredMemberIntegrityError(message)
+
+
+def _reverse_transform_chunks(
+    chunks: Iterator[bytes],
+    transforms: tuple[StagingTransform, ...],
+) -> Iterator[bytes]:
+    current = chunks
+    for transform in sorted(transforms, key=lambda item: item.step_order, reverse=True):
+        if not transform.reversible:
+            continue
+        if transform.kind == "zstd-file-v1":
+            current = _decompress_zstd_chunks(current)
+            continue
+        raise StagingError(f"unsupported reversible transform {transform.kind!r}")
+    return current
+
+
+def _decompress_zstd_chunks(chunks: Iterator[bytes]) -> Iterator[bytes]:
+    reader = _ChunkIteratorReader(chunks)
+    try:
+        with zstd.ZstdDecompressor().stream_reader(
+            cast(BinaryIO, reader), closefd=False
+        ) as decompressed:
+            while chunk := decompressed.read(RAO_CHUNK_SIZE):
+                yield chunk
+    except zstd.ZstdError as exc:
+        raise StagingError("zstd decompression failed during restore") from exc
+
+
+def _verify_logical_chunks(
+    chunks: Iterator[bytes],
+    *,
+    expected_sha256: bytes,
+    expected_size: int,
+    copy_id: int,
+) -> Iterator[bytes]:
+    digest = hashlib.sha256()
+    size = 0
+    for chunk in chunks:
+        digest.update(chunk)
+        size += len(chunk)
+        yield chunk
+    actual = digest.digest()
+    if size != expected_size:
+        raise LogicalMemberIntegrityError(
+            f"copy id={copy_id} logical size {size} != expected {expected_size}"
+        )
+    if actual != expected_sha256:
+        raise LogicalMemberIntegrityError(
+            f"copy id={copy_id} logical SHA-256 {actual.hex()} != {expected_sha256.hex()}"
+        )
+
+
+def _file_chunks(handle: Any) -> Iterator[bytes]:
+    while chunk := handle.read(RAO_CHUNK_SIZE):
+        yield chunk
 
 
 def _copy_backend_range_to_path(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tracemalloc
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -31,6 +32,7 @@ from sutradhara.archive_fanout import (
     flush_bundle,
 )
 from sutradhara.archive_restore import (
+    ArchiveRestoreError,
     RemArchiveExtractor,
     RestoreIntegrityError,
     RestoreNameError,
@@ -40,6 +42,7 @@ from sutradhara.archive_restore import (
     read_member_to_path,
     resolve_member_asset_hash,
     restore_asset,
+    restore_assets_from_bundle,
 )
 from sutradhara.artifactclass_policy import (
     ArtifactClassPolicy,
@@ -56,10 +59,13 @@ from sutradhara.backend.port import (
     BackendLocator,
     ByteRange,
     CopyRecord,
+    StorageBackend,
+    StreamKind,
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import (
+    ArtifactClassPool,
     AssetLocator,
     Backend,
     BlobRoot,
@@ -119,6 +125,10 @@ class _ArchiveWriteBackend:
     def name(self) -> str:
         return self._name
 
+    @property
+    def stream_kind(self) -> StreamKind:
+        return StreamKind.native_stream
+
     def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
@@ -148,6 +158,24 @@ class _ArchiveWriteBackend:
         if byte_range.is_whole_object:
             return data
         return data[byte_range.start : byte_range.end]
+
+    @contextmanager
+    def open_range_chunks(
+        self,
+        locator: BackendLocator,
+        byte_range: ByteRange,
+        *,
+        chunk_bytes: int,
+    ) -> Iterator[Iterator[bytes]]:
+        self.reads.append(byte_range)
+        data = self._objects[str(locator["object_id"])]
+        end = len(data) if byte_range.is_whole_object else byte_range.end
+
+        def chunks() -> Iterator[bytes]:
+            for cursor in range(byte_range.start, end, chunk_bytes):
+                yield data[cursor : min(cursor + chunk_bytes, end)]
+
+        yield chunks()
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
         data = self.read_range(locator, ByteRange(0, 0))
@@ -392,6 +420,59 @@ def _create_rao_plain_copy(
     return rem_id, assets
 
 
+def _create_raw_bytes_copy(
+    engine: Engine,
+    tmp_path: Path,
+    backend: _ArchiveWriteBackend,
+    payload: bytes,
+) -> int:
+    """Create a ranged RAW_BYTES bundle member on the D2 archive pool."""
+
+    _, d2_id = _install_policy(engine)
+    prefix = b"raw-object-prefix"
+    object_path = tmp_path / "manual-raw.bin"
+    object_path.write_bytes(prefix + payload)
+
+    with session_scope(engine) as s:
+        pool = s.get(Pool, "d2-shelf-pool")
+        assert pool is not None
+        pool.representation = Representation.RAW_BYTES.value
+        s.add(Bundle(id="bundle-raw", artifactclass="o-archive", status="sealed"))
+        s.add(LogicalAsset(content_sha256=_digest(payload), size_bytes=len(payload)))
+        s.flush()
+        record = backend.write_object_to_pool(object_path, "d2-shelf-pool")
+        copy, _ = add_bundle_copy(
+            s,
+            bundle_id="bundle-raw",
+            backend_id=d2_id,
+            pool_id="d2-shelf-pool",
+            native_locator=record.native_locator,
+            integrity_hash=record.integrity_hash,
+            source=CopySource.INGEST,
+            health=CopyHealth.OK,
+            storage_metadata={
+                "representation": Representation.RAW_BYTES.value,
+                "stored_size_bytes": record.size_bytes,
+            },
+        )
+        s.add(
+            AssetLocator(
+                logical_asset_hash=_digest(payload),
+                pool_id="d2-shelf-pool",
+                copy_id=copy.id,
+                bundle_id="bundle-raw",
+                member_path="large.raw",
+                native_locator={
+                    "member_path": "large.raw",
+                    "size_bytes": len(payload),
+                    "block_range": [len(prefix), len(prefix) + len(payload)],
+                },
+                representation=Representation.RAW_BYTES.value,
+            )
+        )
+    return d2_id
+
+
 def test_enqueue_due_and_flush_fans_out_bundle_copies(
     engine: Engine,
     tmp_path: Path,
@@ -500,7 +581,11 @@ def test_flush_bundle_transient_partial_seals_and_repair_heals(
             return d2_backend
         raise AssertionError(f"unexpected backend row {row.id}")
 
-    monkeypatch.setattr(bundle_repair.factory, "backend_from_row", backend_from_row)
+    monkeypatch.setattr(
+        bundle_repair.factory,  # type: ignore[attr-defined]
+        "backend_from_row",
+        backend_from_row,
+    )
     monkeypatch.setattr(
         bundle_repair,
         "make_archive_builder",
@@ -575,7 +660,9 @@ def test_build_bundle_copy_for_pool_records_copy_locators_blob_roots_but_no_excl
         assert copy.pool_id == "o-copy-1-pool"
         assert copy.last_verified_at is not None
         assert bundle.status == "open"
-        assert len(list(s.scalars(select(AssetLocator).where(AssetLocator.copy_id == copy.id)))) == 2
+        assert (
+            len(list(s.scalars(select(AssetLocator).where(AssetLocator.copy_id == copy.id)))) == 2
+        )
         assert len(list(s.scalars(select(BlobRoot).where(BlobRoot.copy_id == copy.id)))) == 1
         assert list(s.scalars(select(ExclusionRecord))) == []
 
@@ -791,6 +878,49 @@ def test_restore_uses_policy_preference_and_falls_back_to_d2(
         assert all(not byte_range.is_whole_object for byte_range in d2_backend.reads)
 
 
+def test_restore_excludes_copy_in_retired_artifactclass_pool(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_bundle(engine, tmp_path)
+    rem_backend = _ArchiveWriteBackend("rem")
+    d2_backend = _ArchiveWriteBackend("d2")
+    [asset_hash] = list(setup.assets)[:1]
+
+    with session_scope(engine) as s:
+        flush_bundle(
+            s,
+            bundle_id=setup.bundle_id,
+            backends={
+                setup.rem_backend_id: rem_backend,
+                setup.d2_backend_id: d2_backend,
+            },
+            builder=LocalArchiveBuilder(),
+        )
+        rem_copy = s.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
+        rem_copy.health = CopyHealth.MISSING
+        membership = s.scalars(
+            select(ArtifactClassPool).where(
+                ArtifactClassPool.artifactclass == "o-archive",
+                ArtifactClassPool.pool_id == "d2-shelf-pool",
+            )
+        ).one()
+        membership.active = False
+        get_artifactclass_policy(s, "o-archive").restore_preference = ["o-copy-1-pool"]
+
+        with pytest.raises(RestoreSourceUnavailable):
+            restore_asset(
+                s,
+                asset_hash=asset_hash,
+                artifactclass="o-archive",
+                destination=tmp_path / "retired-pool.bin",
+                backends={
+                    setup.rem_backend_id: rem_backend,
+                    setup.d2_backend_id: d2_backend,
+                },
+            )
+
+
 def test_rao_plain_restore_reads_only_member_range(
     engine: Engine,
     tmp_path: Path,
@@ -822,6 +952,63 @@ def test_rao_plain_restore_reads_only_member_range(
     start = first_lba * RAO_CHUNK_SIZE
     assert restored.output_path.read_bytes() == assets[asset_hash]
     assert backend.reads == [ByteRange(start, start + len(target))]
+
+
+def test_rao_plain_streamed_restore_has_bounded_python_peak_memory(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    backend = _ArchiveWriteBackend("rem")
+    payload = b"x" * (32 * 1024 * 1024)
+    rem_id, _ = _create_rao_plain_copy(
+        engine,
+        tmp_path,
+        backend,
+        [("large.bin", payload, 1)],
+    )
+
+    tracemalloc.start()
+    try:
+        with session_scope(engine) as s:
+            restored = restore_asset(
+                s,
+                asset_hash=_digest(payload),
+                artifactclass="o-archive",
+                destination=tmp_path / "large-restored.bin",
+                backends={rem_id: backend},
+            )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert restored.output_path.read_bytes() == payload
+    assert peak < len(payload) // 4
+
+
+def test_raw_bytes_streamed_restore_round_trip_has_bounded_python_peak_memory(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    backend = _ArchiveWriteBackend("d2")
+    payload = b"r" * (32 * 1024 * 1024)
+    d2_id = _create_raw_bytes_copy(engine, tmp_path, backend, payload)
+
+    tracemalloc.start()
+    try:
+        with session_scope(engine) as s:
+            restored = restore_asset(
+                s,
+                asset_hash=_digest(payload),
+                artifactclass="o-archive",
+                destination=tmp_path / "large-raw-restored.bin",
+                backends={d2_id: backend},
+            )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert _digest(restored.output_path.read_bytes()) == _digest(payload)
+    assert peak < len(payload) // 4
 
 
 def test_zero_byte_rao_plain_member_restores_without_backend_read(
@@ -1076,6 +1263,34 @@ def test_zstd_staged_member_fans_out_manifests_and_restores_original(
             backends={rem_id: rem_backend, d2_id: d2_backend},
         )
 
+        transforms[0].kind = "unknown-reversible-v1"
+        unknown_destination = tmp_path / "unknown-transform.img"
+        with pytest.raises(RestoreIntegrityError, match="unsupported reversible transform"):
+            restore_asset(
+                s,
+                asset_hash=_digest(original),
+                artifactclass="o-archive",
+                destination=unknown_destination,
+                backends={rem_id: rem_backend},
+            )
+        assert not unknown_destination.exists()
+        transforms[0].kind = "zstd-file-v1"
+
+        rem_copy = s.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
+        transforms[0].stored_sha256 = b"\0" * 32
+        stored_mismatch_destination = tmp_path / "stored-mismatch.img"
+        with pytest.raises(RestoreIntegrityError, match="stored-member SHA-256"):
+            restore_asset(
+                s,
+                asset_hash=_digest(original),
+                artifactclass="o-archive",
+                destination=stored_mismatch_destination,
+                backends={rem_id: rem_backend},
+            )
+        assert rem_copy.health == CopyHealth.OK
+        assert not stored_mismatch_destination.exists()
+        assert list(tmp_path.glob(".stored-mismatch.img.*.tmp")) == []
+
     assert restored.output_path.read_bytes() == original
     assert rem_backend.reads
     assert all(not byte_range.is_whole_object for byte_range in rem_backend.reads)
@@ -1191,6 +1406,101 @@ def test_restore_asset_marks_digest_mismatch_copy_suspect_and_falls_through(
 
         assert restored.pool_id == "d2-shelf-pool"
         assert primary_copy.health == CopyHealth.SUSPECT
+
+
+def test_restore_asset_extraction_error_falls_through_without_suspect(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_bundle(engine, tmp_path)
+    rem_backend = _ArchiveWriteBackend("rem")
+    d2_backend = _ArchiveWriteBackend("d2")
+    [asset_hash] = list(setup.assets)[:1]
+
+    class FailingPrimaryExtractor:
+        def extract_to_path(
+            self,
+            *,
+            locator: AssetLocator,
+            copy: Copy,
+            backend: StorageBackend,
+            destination: Path,
+        ) -> None:
+            if locator.pool_id == "o-copy-1-pool":
+                raise ArchiveRestoreError("primary extraction failed")
+            read_member_to_path(backend, copy, locator, destination)
+
+    with session_scope(engine) as s:
+        flush_bundle(
+            s,
+            bundle_id=setup.bundle_id,
+            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
+            builder=LocalArchiveBuilder(),
+        )
+        primary = s.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
+
+        restored = restore_asset(
+            s,
+            asset_hash=asset_hash,
+            artifactclass="o-archive",
+            destination=tmp_path / "extraction-fallback.bin",
+            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
+            extractor=FailingPrimaryExtractor(),
+        )
+
+        assert restored.pool_id == "d2-shelf-pool"
+        assert primary.health == CopyHealth.OK
+
+
+def test_bundle_member_mismatch_does_not_retry_group_or_mark_suspect(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    setup = _create_bundle(engine, tmp_path)
+    rem_backend = _ArchiveWriteBackend("rem")
+    d2_backend = _ArchiveWriteBackend("d2")
+
+    class CorruptBundleExtractor:
+        def __init__(self) -> None:
+            self.backends: list[str] = []
+
+        def extract_to_path(self, **_kwargs: Any) -> None:
+            raise AssertionError("bundle extraction must use the batch seam")
+
+        def extract_bundle_to_paths(
+            self,
+            *,
+            locators: list[AssetLocator],
+            copy: Copy,
+            backend: _ArchiveWriteBackend,
+            destinations: dict[bytes, Path],
+        ) -> None:
+            self.backends.append(backend.name)
+            for locator in locators:
+                destinations[locator.logical_asset_hash].write_bytes(b"corrupt member")
+
+    extractor = CorruptBundleExtractor()
+    with session_scope(engine) as s:
+        flush_bundle(
+            s,
+            bundle_id=setup.bundle_id,
+            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
+            builder=LocalArchiveBuilder(),
+        )
+        copies = list(s.scalars(select(Copy).order_by(Copy.id)))
+
+        with pytest.raises(RestoreIntegrityError, match="bundle restore copy"):
+            restore_assets_from_bundle(
+                s,
+                asset_hashes=list(setup.assets),
+                artifactclass="o-archive",
+                destination_dir=tmp_path / "bundle-mismatch",
+                backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
+                extractor=extractor,
+            )
+
+        assert extractor.backends == ["rem"]
+        assert [copy.health for copy in copies] == [CopyHealth.OK, CopyHealth.OK]
 
 
 def test_encrypted_restore_plumbing_uses_key_epoch_and_rao_range_args(

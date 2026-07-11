@@ -140,6 +140,65 @@ def atomic_write_verified_file(
         raise
 
 
+def atomic_write_verified_chunks(
+    chunks: Iterator[bytes],
+    destination: Path,
+    *,
+    expected_sha256: bytes,
+    expected_size_bytes: int,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
+    """Atomically publish a chunk stream only after size and SHA-256 verification.
+
+    The destination-side temporary file is exclusively created and removed on
+    every producer, write, size, or digest failure.  The caller's producer is
+    responsible for any representation-layer verification before clean EOF.
+    """
+
+    if not destination.is_absolute():
+        raise ValueError("restore destination path must be absolute")
+    if len(expected_sha256) != hashlib.sha256().digest_size:
+        raise ValueError("expected_sha256 must be a 32-byte SHA-256 hash")
+    if expected_size_bytes < 0:
+        raise ValueError("expected_size_bytes must be non-negative")
+    parent = destination.parent
+    if not parent.is_dir():
+        raise ValueError(f"restore destination parent does not exist: {parent}")
+
+    fd, temp_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=parent)
+    temp_path = Path(temp_name)
+    digest = hashlib.sha256()
+    size_bytes = 0
+    try:
+        callback = progress_callback or _PROGRESS_CALLBACK.get()
+        with os.fdopen(fd, "wb") as out_handle:
+            for chunk in chunks:
+                if not isinstance(chunk, bytes):
+                    raise TypeError("restore stream yielded a non-bytes chunk")
+                out_handle.write(chunk)
+                digest.update(chunk)
+                size_bytes += len(chunk)
+                if callback is not None:
+                    callback(len(chunk))
+            if size_bytes != expected_size_bytes:
+                raise RestoreIntegrityError(
+                    f"restored size {size_bytes} != expected {expected_size_bytes}"
+                )
+            actual_sha256 = digest.digest()
+            if actual_sha256 != expected_sha256:
+                raise RestoreIntegrityError(
+                    f"restored SHA-256 {actual_sha256.hex()} != expected {expected_sha256.hex()}"
+                )
+            out_handle.flush()
+            os.fsync(out_handle.fileno())
+        os.replace(temp_path, destination)
+        _fsync_directory(parent)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            temp_path.unlink()
+        raise
+
+
 @contextlib.contextmanager
 def restore_progress_context(callback: Callable[[int], None] | None) -> Iterator[None]:
     """Apply a byte-progress callback to nested atomic restore publishes."""
