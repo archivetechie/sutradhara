@@ -191,6 +191,7 @@ def test_streaming_receive_reports_live_byte_progress(
             "known_durable": 0,
             "known_under_durable": 0,
             "reverified": 0,
+            "legacy_unknown": 0,
         },
         **expected,
     }
@@ -278,6 +279,7 @@ def test_status_and_devices_mark_committed_card_receive_release_safe(
             "known_durable": 0,
             "known_under_durable": 0,
             "reverified": 0,
+            "legacy_unknown": 0,
         },
         "destinationPath": str(tmp_path / "intake-committed"),
         "bytesReceived": 12,
@@ -1101,6 +1103,7 @@ def test_device_status_reads_same_grpc_marker_logic(api_engine: Engine, tmp_path
             "known_durable": 0,
             "known_under_durable": 0,
             "reverified": 0,
+            "legacy_unknown": 0,
         },
         "destinationPath": str(tmp_path / "intake-1"),
         "bytesReceived": None,

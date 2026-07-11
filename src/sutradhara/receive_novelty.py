@@ -62,14 +62,13 @@ def _novelty_counts(counts: Counter[str]) -> dict[str, int]:
         "known_durable": counts[IngestDisposition.KNOWN_DURABLE.value],
         "known_under_durable": counts[IngestDisposition.KNOWN_UNDER_DURABLE.value],
         "reverified": counts[IngestDisposition.REVERIFIED.value],
+        "legacy_unknown": counts[IngestDisposition.LEGACY_UNKNOWN.value],
     }
 
 
-def work_suppression_safe(session: Session, item: IngestItem) -> bool:
-    """Re-check I2 live durability before suppressing work for an occurrence."""
+def asset_policy_qualified_durable(session: Session, item: IngestItem) -> bool:
+    """Return whether an item's asset currently satisfies its durability policy."""
 
-    if item.disposition != IngestDisposition.KNOWN_DURABLE:
-        return False
     if session.get(ArtifactClassPolicyRecord, item.artifactclass) is None:
         return False
     try:
@@ -81,6 +80,15 @@ def work_suppression_safe(session: Session, item: IngestItem) -> bool:
     except ReplicationPolicyMissing:
         return False
     return status["complete"] and bool(status["want"])
+
+
+def work_suppression_safe(session: Session, item: IngestItem) -> bool:
+    """Re-check I2 live durability before suppressing work for an occurrence."""
+
+    return (
+        item.disposition == IngestDisposition.KNOWN_DURABLE
+        and asset_policy_qualified_durable(session, item)
+    )
 
 
 def estimate_listing_novelty(
@@ -105,12 +113,11 @@ def estimate_listing_novelty(
     prior_entries: set[tuple[str, int]] = set()
     if prior is not None:
         prior_entries = {
-            (str(path), int(size))
-            for path, size in session.execute(
-                select(IngestItem.as_received_path, IngestItem.size_bytes).where(
-                    IngestItem.intake_id == prior.intake_id
-                )
+            (item.as_received_path, item.size_bytes)
+            for item in session.scalars(
+                select(IngestItem).where(IngestItem.intake_id == prior.intake_id)
             )
+            if asset_policy_qualified_durable(session, item)
         }
     match_prior = sum(
         (entry.path, entry.size_bytes) in prior_entries for entry in listing

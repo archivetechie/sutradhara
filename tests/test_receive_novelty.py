@@ -116,6 +116,7 @@ def test_registration_classifies_all_authoritative_dispositions_and_suppression(
                 "known_durable": 1,
                 "known_under_durable": 0,
                 "reverified": 0,
+                "legacy_unknown": 0,
             }
             copy = session.scalars(select(Copy)).one()
             copy.health = CopyHealth.SUSPECT
@@ -141,10 +142,40 @@ def test_estimate_and_nothing_new_handshake_are_content_based(tmp_path: Path) ->
     prior_root = _write_intake(tmp_path, "prior", {"known.mov": b"known"})
     try:
         with session_scope(engine) as session:
+            session.add(
+                ArtifactClassPolicyRecord(
+                    artifactclass="masters",
+                    ruleset="test.rules.v1",
+                    expect="messy",
+                    target_bytes=1024,
+                    max_age_seconds=3600,
+                    restore_preference=[],
+                    min_copies=1,
+                    min_impl_families=1,
+                    staging_config={},
+                    policy_sha256="b" * 64,
+                )
+            )
+        with session_scope(engine) as session:
             register_intake(session, prior_root, artifactclass="masters")
             intake = session.get(Intake, "prior")
             assert intake is not None
             intake.card_id = "card-1"
+            item = session.scalars(
+                select(IngestItem).where(IngestItem.intake_id == "prior")
+            ).one()
+            pool = _add_pool(session, "archive", "masters")
+            add_copy(
+                session,
+                logical_asset_hash=item.logical_asset_hash,
+                backend_id=pool.backend_id,
+                pool_id=pool.id,
+                native_locator={"object": "durable-prior"},
+                integrity_hash=item.logical_asset_hash,
+                source=CopySource.INGEST,
+                health=CopyHealth.OK,
+                last_verified_at=dt.datetime.now(dt.UTC),
+            )
             same = estimate_listing_novelty(
                 session,
                 card_identity="card-1",
@@ -200,6 +231,68 @@ def test_estimate_and_nothing_new_handshake_are_content_based(tmp_path: Path) ->
             listing_complete=True,
         )
         assert acknowledged.state == "authorized"
+    finally:
+        engine.dispose()
+
+
+def test_under_durable_prior_does_not_block_repair_receive(tmp_path: Path) -> None:
+    """A path/size match is not known when its prior asset still needs repair."""
+
+    engine = make_engine(f"sqlite:///{tmp_path / 'under-durable-estimate.db'}")
+    create_all(engine)
+    seed_root = _write_intake(tmp_path, "seed", {"seed.mov": b"repair me"})
+    prior_root = _write_intake(tmp_path, "repair-prior", {"known.mov": b"repair me"})
+    try:
+        with session_scope(engine) as session:
+            session.add(
+                ArtifactClassPolicyRecord(
+                    artifactclass="masters",
+                    ruleset="test.rules.v1",
+                    expect="messy",
+                    target_bytes=1024,
+                    max_age_seconds=3600,
+                    restore_preference=[],
+                    min_copies=1,
+                    min_impl_families=1,
+                    staging_config={},
+                    policy_sha256="c" * 64,
+                )
+            )
+            _add_pool(session, "repair-archive", "masters")
+        with session_scope(engine) as session:
+            register_intake(session, seed_root, artifactclass="masters")
+            register_intake(session, prior_root, artifactclass="masters")
+            prior = session.get(Intake, "repair-prior")
+            assert prior is not None
+            prior.card_id = "repair-card"
+            item = session.scalars(
+                select(IngestItem).where(IngestItem.intake_id == prior.intake_id)
+            ).one()
+            assert item.disposition == IngestDisposition.KNOWN_UNDER_DURABLE
+            estimate = estimate_listing_novelty(
+                session,
+                card_identity="repair-card",
+                requester=prior.operator,
+                listing=[ListingEntry("known.mov", 9)],
+                listing_complete=True,
+            )
+
+        assert estimate["match_prior"] == 0
+        assert estimate["likely_new"] == 1
+        assert estimate["all_known_estimate"] is False
+        decision = api_store.begin_device_receive_intent(
+            engine,
+            operator_username="unknown",
+            device_id="device-1",
+            card_identity="repair-card",
+            card_label="Repair Card",
+            idempotency_key="repair-receive",
+            request_hash="repair-listing",
+            acknowledge_duplicate=False,
+            current_listing=[("known.mov", 9)],
+            listing_complete=True,
+        )
+        assert decision.state == "authorized"
     finally:
         engine.dispose()
 

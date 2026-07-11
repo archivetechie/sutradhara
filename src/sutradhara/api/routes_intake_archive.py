@@ -397,6 +397,7 @@ def _intake_payload(
             "known_durable": 0,
             "known_under_durable": 0,
             "reverified": 0,
+            "legacy_unknown": 0,
         },
     }
     return payload

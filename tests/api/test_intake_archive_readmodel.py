@@ -183,6 +183,14 @@ def test_intake_contract_detail_uses_virtual_paths_and_cross_intake_derivations(
     assert body["intake_id"] == "intake-a"
     assert body["item_count"] == 1
     assert body["bytes_total"] == 10
+    assert body["novelty"] == {
+        "total": 1,
+        "new": 0,
+        "known_durable": 0,
+        "known_under_durable": 0,
+        "reverified": 0,
+        "legacy_unknown": 1,
+    }
     assert body["items"] == [
         {
             "content_sha256": source_hash.hex(),
