@@ -25,6 +25,7 @@ from sutradhara.api.routes_receive import install_default_state
 from sutradhara.api.routes_receive import router as receive_router
 from sutradhara.api.routes_restore import router as restore_router
 from sutradhara.api.routes_session import router as session_router
+from sutradhara.archive_predicate import archived_all_semantics_enabled
 from sutradhara.catalog.session import create_all, make_engine
 
 AGENT_BUNDLE_CONFIG_ENV = "SUTRA_AGENT_BUNDLE_CONFIG"
@@ -43,11 +44,16 @@ def create_app(
 ) -> FastAPI:
     """Create the HTTP API with catalog-backed state and strict edge assumptions."""
 
+    try:
+        archive_all_semantics = archived_all_semantics_enabled()
+    except ValueError as exc:
+        raise RuntimeError(f"invalid configuration: {exc}") from exc
     final_engine = engine or make_engine()
     if ensure_schema:
         create_all(final_engine)
     app = FastAPI(title="sutradhara API")
     app.state.engine = final_engine
+    app.state.archived_all_semantics = archive_all_semantics
     if registry is not None:
         app.state.registry = registry
     if grpc_pki_dir is not None:

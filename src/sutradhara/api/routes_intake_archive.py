@@ -25,13 +25,7 @@ from sutradhara.api.console import (
     sanitize_text,
 )
 from sutradhara.api.identity import parse_identity
-from sutradhara.archive_predicate import (
-    archived_all_semantics_enabled,
-    legacy_archived_expr,
-)
-from sutradhara.archive_predicate import (
-    intake_archive_state_expr as _intake_archive_state_expr,
-)
+from sutradhara.archive_predicate import intake_archive_state_expr, legacy_archived_expr
 from sutradhara.catalog.models import (
     AssetDerivation,
     AssetLocator,
@@ -106,14 +100,17 @@ def get_intakes(
     stage_filter = _optional_enum(stage, INTAKE_STAGES, field="stage")
     days_filter = _optional_days(days)
     page_limit = _parse_limit(limit)
+    all_semantics = bool(request.app.state.archived_all_semantics)
     with session_scope(request.app.state.engine) as session:
         aggregates = _intake_aggregates_subquery()
+        archived = legacy_archived_expr(all_semantics=all_semantics)
         query = (
             select(
                 Intake,
                 func.coalesce(aggregates.c.item_count, 0).label("item_count"),
                 func.coalesce(aggregates.c.bytes_total, 0).label("bytes_total"),
-                _intake_archive_state_expr().label("archive_state"),
+                intake_archive_state_expr().label("archive_state"),
+                archived.label("archived"),
                 func.count().over().label("total"),
             )
             .outerjoin(aggregates, aggregates.c.intake_id == Intake.intake_id)
@@ -123,7 +120,6 @@ def get_intakes(
         if status_filter is not None:
             query = query.where(Intake.status == status_filter)
         if stage_filter is not None:
-            archived = legacy_archived_expr(all_semantics=archived_all_semantics_enabled())
             query = query.where(Intake.status == IntakeStatus.REGISTERED.value)
             if stage_filter == "archived":
                 query = query.where(archived)
@@ -138,10 +134,11 @@ def get_intakes(
                 item_count=int(row[1] or 0),
                 bytes_total=int(row[2] or 0),
                 archive_state=str(row[3]),
+                archived=bool(row[4]),
             )
             for row in rows
         ]
-        total = int(rows[0][4]) if rows else 0
+        total = int(rows[0][5]) if rows else 0
     return {"total": total, "truncated": total > len(intakes), "intakes": intakes}
 
 
@@ -150,16 +147,18 @@ def get_intake(request: Request, intake_id: str) -> dict[str, object]:
     """Return one intake with virtual-path items and item-id derivation edges."""
 
     require_view(parse_identity(request.headers))
+    all_semantics = bool(request.app.state.archived_all_semantics)
     with session_scope(request.app.state.engine) as session:
-        row = _intake_row(session, intake_id)
+        row = _intake_row(session, intake_id, all_semantics=all_semantics)
         if row is None:
             raise_console_error(404, "not_found", f"unknown intake {intake_id!r}")
-        intake, item_count, bytes_total, archive_state = row
+        intake, item_count, bytes_total, archive_state, archived = row
         payload = _intake_payload(
             intake,
             item_count=item_count,
             bytes_total=bytes_total,
             archive_state=archive_state,
+            archived=archived,
         )
         items = list(
             session.scalars(
@@ -336,21 +335,27 @@ def _intake_aggregates_subquery() -> Any:
     )
 
 
-def _intake_row(session: Any, intake_id: str) -> tuple[Intake, int, int, str] | None:
+def _intake_row(
+    session: Any,
+    intake_id: str,
+    *,
+    all_semantics: bool,
+) -> tuple[Intake, int, int, str, bool] | None:
     aggregates = _intake_aggregates_subquery()
     row = session.execute(
         select(
             Intake,
             func.coalesce(aggregates.c.item_count, 0).label("item_count"),
             func.coalesce(aggregates.c.bytes_total, 0).label("bytes_total"),
-            _intake_archive_state_expr().label("archive_state"),
+            intake_archive_state_expr().label("archive_state"),
+            legacy_archived_expr(all_semantics=all_semantics).label("archived"),
         )
         .outerjoin(aggregates, aggregates.c.intake_id == Intake.intake_id)
         .where(Intake.intake_id == intake_id)
     ).one_or_none()
     if row is None:
         return None
-    return row[0], int(row[1] or 0), int(row[2] or 0), str(row[3])
+    return row[0], int(row[1] or 0), int(row[2] or 0), str(row[3]), bool(row[4])
 
 
 def _intake_payload(
@@ -359,6 +364,7 @@ def _intake_payload(
     item_count: int,
     bytes_total: int,
     archive_state: str,
+    archived: bool,
 ) -> dict[str, object]:
     return {
         "intake_id": _text(intake.intake_id),
@@ -374,11 +380,7 @@ def _intake_payload(
         "quarantined_at": _optional_iso(intake.quarantined_at),
         "item_count": item_count,
         "bytes_total": bytes_total,
-        "archived": (
-            archive_state == "complete"
-            if archived_all_semantics_enabled()
-            else archive_state in {"partial", "complete"}
-        ),
+        "archived": archived,
         "archive_state": archive_state,
         "archiveSemantics": 2,
     }

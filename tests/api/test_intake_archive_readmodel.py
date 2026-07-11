@@ -11,11 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select
 
-from sutradhara.api.routes_intake_archive import (
-    MAX_LIMIT,
-    _intake_archive_state_expr,
-    _intake_payload,
-)
+from sutradhara.api.routes_intake_archive import MAX_LIMIT, _intake_payload
+from sutradhara.archive_predicate import intake_archive_state_expr
 from sutradhara.catalog.models import (
     Arrangement,
     AssetDerivation,
@@ -396,7 +393,7 @@ def test_intake_archive_state_none_partial_complete_and_empty(api_engine: Engine
 
     with session_scope(api_engine) as session:
         rows = session.execute(
-            select(Intake, _intake_archive_state_expr().label("archive_state")).where(
+            select(Intake, intake_archive_state_expr().label("archive_state")).where(
                 Intake.intake_id.in_(("none", "partial", "complete", "empty"))
             )
         )
@@ -406,6 +403,7 @@ def test_intake_archive_state_none_partial_complete_and_empty(api_engine: Engine
                 item_count=len(intake.items),
                 bytes_total=sum(item.size_bytes for item in intake.items),
                 archive_state=str(archive_state),
+                archived=str(archive_state) in {"partial", "complete"},
             )
             for intake, archive_state in rows
         }
@@ -453,26 +451,110 @@ def test_archived_rollout_gate_flips_payload_and_stage_filter(
             sealed_at=base,
         )
         _add_bundle_member(session, bundle, archived_hash, size=10)
-    client = TestClient(make_api_app(api_engine))
+    legacy_client = TestClient(make_api_app(api_engine))
 
-    legacy = client.get("/api/ui/intakes/gate-partial", headers=auth_headers("viewer"))
-    legacy_stage = client.get("/api/ui/intakes?stage=archived", headers=auth_headers("viewer"))
+    legacy = legacy_client.get("/api/ui/intakes/gate-partial", headers=auth_headers("viewer"))
+    legacy_stage = legacy_client.get(
+        "/api/ui/intakes?stage=archived", headers=auth_headers("viewer")
+    )
 
     assert legacy.json()["archive_state"] == "partial"
     assert legacy.json()["archived"] is True
     assert [row["intake_id"] for row in legacy_stage.json()["intakes"]] == ["gate-partial"]
 
     monkeypatch.setenv("SUTRADHARA_ARCHIVED_ALL_SEMANTICS", "true")
-    flipped = client.get("/api/ui/intakes/gate-partial", headers=auth_headers("viewer"))
-    flipped_archived = client.get("/api/ui/intakes?stage=archived", headers=auth_headers("viewer"))
-    flipped_unarchived = client.get(
+    still_legacy = legacy_client.get(
+        "/api/ui/intakes/gate-partial", headers=auth_headers("viewer")
+    )
+    flipped_client = TestClient(make_api_app(api_engine))
+    flipped = flipped_client.get("/api/ui/intakes/gate-partial", headers=auth_headers("viewer"))
+    flipped_archived = flipped_client.get(
+        "/api/ui/intakes?stage=archived", headers=auth_headers("viewer")
+    )
+    flipped_unarchived = flipped_client.get(
         "/api/ui/intakes?stage=registered_unarchived", headers=auth_headers("viewer")
     )
 
+    assert still_legacy.json()["archived"] is True
     assert flipped.json()["archive_state"] == "partial"
     assert flipped.json()["archived"] is False
     assert flipped_archived.json()["intakes"] == []
     assert [row["intake_id"] for row in flipped_unarchived.json()["intakes"]] == ["gate-partial"]
+
+
+def test_gate_off_cross_intake_submission_evidence_keeps_chip_and_filter_aligned(
+    api_engine: Engine,
+) -> None:
+    base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
+    shared_hash = _digest("cross-intake-archived")
+    missing_hash = _digest("cross-intake-missing")
+    with session_scope(api_engine) as session:
+        _add_asset(session, shared_hash, size=10)
+        _add_asset(session, missing_hash, size=20)
+        _add_intake(session, "victim", artifactclass="s-masters", created_at=base)
+        _add_intake(session, "donor", artifactclass="s-masters", created_at=base)
+        _add_item(
+            session,
+            intake_id="victim",
+            digest=shared_hash,
+            artifactclass="s-masters",
+            virtual_path="victim/shared.mov",
+            as_received_path="/card/victim/shared.mov",
+            created_at=base,
+        )
+        _add_item(
+            session,
+            intake_id="victim",
+            digest=missing_hash,
+            artifactclass="s-masters",
+            virtual_path="victim/missing.mov",
+            as_received_path="/card/victim/missing.mov",
+            created_at=base,
+        )
+        donor_item = _add_item(
+            session,
+            intake_id="donor",
+            digest=shared_hash,
+            artifactclass="s-masters",
+            virtual_path="donor/shared.mov",
+            as_received_path="/card/donor/shared.mov",
+            created_at=base,
+        )
+        _add_archived_submission_member(
+            session,
+            item=donor_item,
+            submission_id="cross-intake-submission",
+            artifactclass="s-masters",
+            created_at=base,
+        )
+
+    client = TestClient(make_api_app(api_engine))
+    victim = client.get("/api/ui/intakes/victim", headers=auth_headers("viewer"))
+    unarchived = client.get(
+        "/api/ui/intakes?stage=registered_unarchived", headers=auth_headers("viewer")
+    )
+    archived = client.get("/api/ui/intakes?stage=archived", headers=auth_headers("viewer"))
+
+    assert victim.status_code == 200
+    assert victim.json()["archive_state"] == "partial"
+    assert victim.json()["archived"] is False
+    assert [row["intake_id"] for row in unarchived.json()["intakes"]] == ["victim"]
+    assert all(row["archived"] is False for row in unarchived.json()["intakes"])
+    assert [row["intake_id"] for row in archived.json()["intakes"]] == ["donor"]
+    assert all(row["archived"] is True for row in archived.json()["intakes"])
+
+
+def test_invalid_archive_gate_fails_during_app_creation(
+    api_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SUTRADHARA_ARCHIVED_ALL_SEMANTICS", "enabled")
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid configuration: SUTRADHARA_ARCHIVED_ALL_SEMANTICS",
+    ):
+        make_api_app(api_engine)
 
 
 def test_archive_bundle_and_submission_contracts_and_status_vocabularies(

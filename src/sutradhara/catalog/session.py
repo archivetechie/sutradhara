@@ -10,6 +10,7 @@ from importlib import import_module
 from typing import Any
 
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from sutradhara.catalog.models import Base
@@ -35,6 +36,37 @@ def make_engine(url: str | None = None, *, echo: bool = False) -> Engine:
 
     if final_url.startswith("sqlite"):
         _install_sqlite_pragmas(engine)
+
+    return engine
+
+
+def make_read_only_engine(url: str | None = None, *, echo: bool = False) -> Engine:
+    """Create an engine whose database transactions cannot write.
+
+    SQLite is opened through its ``mode=ro`` URI and deliberately receives no
+    connection pragma hook, so inspection cannot create a WAL or alter the
+    catalog's journal mode. Other SQL databases enforce read-only transactions
+    when SQLAlchemy begins them.
+    """
+
+    final_url = url or database_url()
+    parsed = make_url(final_url)
+    if parsed.get_backend_name() == "sqlite":
+        database = parsed.database
+        if not database or database == ":memory:":
+            raise ValueError("a read-only SQLite engine requires a file-backed database")
+        uri_database = database if database.startswith("file:") else f"file:{database}"
+        read_only_url = parsed.set(
+            database=uri_database,
+            query={**parsed.query, "mode": "ro", "uri": "true"},
+        )
+        return create_engine(read_only_url, echo=echo, future=True)
+
+    engine = create_engine(parsed, echo=echo, future=True)
+
+    @event.listens_for(engine, "begin")
+    def _set_transaction_read_only(connection: Any) -> None:
+        connection.exec_driver_sql("SET TRANSACTION READ ONLY")
 
     return engine
 

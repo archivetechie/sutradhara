@@ -34,7 +34,7 @@ from sutradhara.artifactclass_policy import (
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
 from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool, Submission
-from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.catalog.session import make_engine, make_read_only_engine, session_scope
 from sutradhara.hdcache.manager import (
     PrivacyOverride,
     RestoreDenied,
@@ -91,9 +91,12 @@ def predicate_audit(output: Path, force: bool) -> None:
 
     if output.exists() and not force:
         raise click.ClickException(f"output already exists: {output}; pass --force to replace it")
-    engine = make_engine()
-    with session_scope(engine) as session:
-        report = build_archive_predicate_audit(session)
+    engine = make_read_only_engine()
+    try:
+        with Session(engine) as session:
+            report = build_archive_predicate_audit(session)
+    finally:
+        engine.dispose()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
     try:

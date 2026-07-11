@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ from sutradhara.catalog.models import (
     ReviewDecision,
     Submission,
 )
-from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import (
     AssetValidity,
     IntakeSourceKind,
@@ -140,6 +141,31 @@ def test_archive_predicate_audit_writes_artifact(cli_env: dict[str, str], tmp_pa
     }
     duplicate = _run(["archive", "predicate-audit", "--output", str(output)], expect_exit=1)
     assert "pass --force" in duplicate.output
+
+
+def test_archive_predicate_audit_accepts_mode_ro_url_without_changing_journal(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = Path(cli_env["db"])
+    engine = make_engine(f"sqlite:///{db_path}")
+    create_all(engine)
+    engine.dispose()
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA journal_mode = DELETE").fetchone() == ("delete",)
+    monkeypatch.setenv(
+        "SUTRADHARA_DB_URL",
+        f"sqlite:///file:{db_path}?mode=ro&uri=true",
+    )
+    output = tmp_path / "read-only-audit.json"
+
+    result = _run(["archive", "predicate-audit", "--output", str(output)])
+
+    assert "gate_safe=True" in result.output
+    assert output.exists()
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
 
 
 def test_retention_help_surfaces_expected_verbs(cli_env: dict[str, str]) -> None:

@@ -14,9 +14,24 @@ from sutradhara.archive_predicate import (
     intake_archive_state_expr,
     legacy_archived_expr,
 )
-from sutradhara.catalog.models import Bundle, BundleMember, IngestItem, Intake, LogicalAsset
+from sutradhara.catalog.models import (
+    Arrangement,
+    Bundle,
+    BundleMember,
+    IngestItem,
+    Intake,
+    LogicalAsset,
+    Submission,
+    SubmissionMember,
+)
 from sutradhara.catalog.session import create_all, make_engine, session_scope
-from sutradhara.catalog.types import IntakeSourceKind, IntakeStatus, RetentionState
+from sutradhara.catalog.types import (
+    ArrangementStatus,
+    IntakeSourceKind,
+    IntakeStatus,
+    RetentionState,
+    SubmissionStatus,
+)
 
 
 def test_rollout_gate_defaults_off_and_rejects_ambiguous_values() -> None:
@@ -105,7 +120,7 @@ def test_audit_reports_partial_retention_passed_intakes_without_mutating(tmp_pat
     assert legacy_archived is True
     assert flipped_archived is False
     assert report["schema"] == "sutradhara.archive-predicate-audit/v1"
-    assert report["generated_at"] == "2026-07-11T10:00:00Z"
+    assert report["generated_at"] == "2026-07-11T10:00:00+00:00"
     assert report["summary"] == {
         "audited_intakes": 1,
         "affected_intakes": 1,
@@ -118,7 +133,7 @@ def test_audit_reports_partial_retention_passed_intakes_without_mutating(tmp_pat
         {
             "intake_id": "released-partial",
             "retention_state": "released",
-            "released_at": "2026-07-11T09:00:00Z",
+            "released_at": "2026-07-11T09:00:00+00:00",
             "staging_deleted_at": None,
             "archive_state": "partial",
             "legacy_archived": True,
@@ -131,6 +146,133 @@ def test_audit_reports_partial_retention_passed_intakes_without_mutating(tmp_pat
                     "occurrence_count": 1,
                 }
             ],
+        }
+    ]
+
+
+def test_audit_catches_released_partial_from_cross_intake_submission_evidence(tmp_path) -> None:
+    engine = make_engine(f"sqlite:///{tmp_path / 'cross-intake-audit.db'}")
+    create_all(engine)
+    shared_hash = _digest("cross-intake-shared")
+    missing_hash = _digest("cross-intake-missing")
+    now = dt.datetime(2026, 7, 11, 9, 0, tzinfo=dt.UTC)
+    with session_scope(engine) as session:
+        for digest in (shared_hash, missing_hash):
+            session.add(LogicalAsset(content_sha256=digest, size_bytes=10))
+        victim = Intake(
+            intake_id="victim",
+            operator="ada",
+            source_kind=IntakeSourceKind.CARD,
+            artifactclass="s-masters",
+            status=IntakeStatus.REGISTERED,
+            retention_state=RetentionState.RELEASED,
+            released_at=now,
+            created_at=now,
+            updated_at=now,
+            registered_at=now,
+        )
+        donor = Intake(
+            intake_id="donor",
+            operator="ada",
+            source_kind=IntakeSourceKind.CARD,
+            artifactclass="s-masters",
+            status=IntakeStatus.REGISTERED,
+            retention_state=RetentionState.HELD,
+            created_at=now,
+            updated_at=now,
+            registered_at=now,
+        )
+        session.add_all((victim, donor))
+        session.flush()
+        victim_shared = IngestItem(
+            intake_id="victim",
+            logical_asset_hash=shared_hash,
+            as_received_path="victim/shared.mov",
+            virtual_path="victim/shared.mov",
+            size_bytes=10,
+            artifactclass="s-masters",
+            item_metadata={},
+            created_at=now,
+        )
+        victim_missing = IngestItem(
+            intake_id="victim",
+            logical_asset_hash=missing_hash,
+            as_received_path="victim/missing.mov",
+            virtual_path="victim/missing.mov",
+            size_bytes=10,
+            artifactclass="s-masters",
+            item_metadata={},
+            created_at=now,
+        )
+        donor_shared = IngestItem(
+            intake_id="donor",
+            logical_asset_hash=shared_hash,
+            as_received_path="donor/shared.mov",
+            virtual_path="donor/shared.mov",
+            size_bytes=10,
+            artifactclass="s-masters",
+            item_metadata={},
+            created_at=now,
+        )
+        session.add_all((victim_shared, victim_missing, donor_shared))
+        session.flush()
+        arrangement = Arrangement(
+            label="Donor arrangement",
+            intake_id="donor",
+            artifactclass="s-masters",
+            status=ArrangementStatus.SUBMITTED,
+            created_at=now,
+            updated_at=now,
+            submitted_at=now,
+        )
+        session.add(arrangement)
+        session.flush()
+        submission = Submission(
+            id="donor-submission",
+            arrangement_id=arrangement.id,
+            artifactclass="s-masters",
+            source_map_path="/tmp/donor-source-map.tsv",
+            manifest_digest="d" * 64,
+            member_count=1,
+            status=SubmissionStatus.ARCHIVED,
+            submitted_by="ada",
+            submitted_at=now,
+            archived_at=now,
+        )
+        session.add(submission)
+        session.flush()
+        session.add(
+            SubmissionMember(
+                submission_id=submission.id,
+                ingest_item_id=donor_shared.id,
+                archive_path="donor/shared.mov",
+                source_path="donor/shared.mov",
+                sha256=shared_hash,
+                size_bytes=10,
+                ord=0,
+            )
+        )
+        arrangement.submission_id = submission.id
+
+    with session_scope(engine) as session:
+        report = build_archive_predicate_audit(session, generated_at=now)
+
+    assert report["summary"] == {
+        "audited_intakes": 1,
+        "affected_intakes": 1,
+        "missing_distinct_assets": 1,
+        "gate_safe": False,
+    }
+    affected = report["affected_intakes"]
+    assert isinstance(affected, list)
+    assert affected[0]["intake_id"] == "victim"
+    assert affected[0]["archive_state"] == "partial"
+    assert affected[0]["legacy_archived"] is False
+    assert affected[0]["missing_assets"] == [
+        {
+            "content_sha256": missing_hash.hex(),
+            "artifactclass": "s-masters",
+            "occurrence_count": 1,
         }
     ]
 
