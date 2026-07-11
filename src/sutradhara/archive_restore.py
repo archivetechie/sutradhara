@@ -11,14 +11,18 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import selectors
 import shutil
+import subprocess
 import tarfile
 import tempfile
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+import threading
+import time
+from collections.abc import Generator, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol, cast
+from typing import IO, Any, BinaryIO, Protocol, cast
 
 import zstandard as zstd
 from sqlalchemy import select
@@ -56,6 +60,9 @@ from sutradhara_receive.member_name import (
 )
 
 _MAX_LOCAL_ARCHIVE_HEADER_BYTES = 16 * 1024 * 1024
+_REM_STREAM_INACTIVITY_TIMEOUT_SECONDS = 120.0
+_REM_STREAM_EXIT_TIMEOUT_SECONDS = 10.0
+_REM_STREAM_STDERR_LIMIT_BYTES = 64 * 1024
 
 
 class ArchiveRestoreError(Exception):
@@ -147,8 +154,9 @@ class RestorePlan:
 
     Single-asset plans contain ordered copy/locator candidates. Bundle plans
     contain the members of exactly one all-covering copy group. Streamable
-    representations stay pull-driven; AEAD and D2 tar members lacking a block
-    range retain the existing scratch/extractor machinery.
+    representations stay pull-driven; AEAD uses Remanence's authenticated
+    stream helper, while D2 tar members lacking a block range retain the
+    existing scratch/extractor machinery.
     """
 
     def __init__(
@@ -225,6 +233,12 @@ class RestorePlan:
                 )
                 with path.open("rb") as handle:
                     yield _file_chunks(handle)
+            return
+        if Representation(member.locator.representation) is Representation.RAO_AEAD_V1:
+            if not isinstance(self._extractor, RemArchiveExtractor):
+                raise ArchiveRestoreError("encrypted restore requires a streaming RAO adapter")
+            with self._extractor.open_aead_member_stream(member) as chunks:
+                yield chunks
             return
         with _open_locator_range_chunks(member) as chunks:
             yield chunks
@@ -371,6 +385,23 @@ class RemArchiveExtractor(LocalArchiveExtractor):
             backend=backend,
             destinations=destinations,
         )
+
+    @contextmanager
+    def open_aead_member_stream(self, member: PlannedMember) -> Iterator[Iterator[bytes]]:
+        """Decrypt one planned AEAD member without materializing its stored object."""
+
+        key_epoch = _key_epoch(member.copy.storage_metadata)
+        with (
+            self._keys.materialized_root_key(key_epoch) as key_file,
+            _open_rao_aead_plaintext_stream(
+                backend=member.backend,
+                copy=member.copy,
+                locator=member.locator,
+                rem_bin=self._rem_bin,
+                key_file=key_file,
+            ) as chunks,
+        ):
+            yield chunks
 
 
 def read_member_to_path(
@@ -591,7 +622,10 @@ def _planned_member(
     trusted_extractor = isinstance(extractor, (LocalArchiveExtractor, RemArchiveExtractor))
     buffered = (
         not trusted_extractor
-        or representation is Representation.RAO_AEAD_V1
+        or (
+            representation is Representation.RAO_AEAD_V1
+            and not isinstance(extractor, RemArchiveExtractor)
+        )
         or (
             representation is Representation.D2TAR_RAW
             and "block_range" not in locator.native_locator
@@ -1195,6 +1229,230 @@ def _open_backend_range_chunks(
 
     with legacy_range_reader() as chunks:
         yield chunks
+
+
+@contextmanager
+def _open_rao_aead_plaintext_stream(
+    *,
+    backend: StorageBackend,
+    copy: Copy,
+    locator: AssetLocator,
+    rem_bin: str,
+    key_file: Path,
+) -> Iterator[Iterator[bytes]]:
+    """Pipe a complete encrypted RAO object through ``extract-stream``.
+
+    Ciphertext is written on its own thread while the caller pulls plaintext
+    from stdout.  Publication remains transactional in
+    ``atomic_write_verified_chunks``: this producer raises after EOF unless the
+    helper exits zero, so authenticated prefixes from a failed run are never
+    committed.
+    """
+
+    if not isinstance(backend, StreamingStorageBackend):
+        raise ArchiveRestoreError("RAO AEAD streaming restore requires a native streaming backend")
+    command = [rem_bin, "archive", "extract-stream", "--key-file", str(key_file)]
+    native = dict(locator.native_locator)
+    size = _size_bytes(native)
+    if locator.bundle_id is not None or member_byte_base(native) != 0:
+        command.extend(["--range", f"{member_byte_base(native)}:{size}"])
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+    except OSError as exc:
+        raise ArchiveRestoreError(f"cannot start rem archive extract-stream: {exc}") from exc
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        _terminate_and_reap(process)
+        raise ArchiveRestoreError("rem archive extract-stream did not create all required pipes")
+    stdin = process.stdin
+    stdout = process.stdout
+    stderr = process.stderr
+
+    stop = threading.Event()
+    writer_errors: list[Exception] = []
+    stderr_parts: list[bytes] = []
+    stderr_size = [0]
+    last_activity = [time.monotonic()]
+    ciphertext_range = _stored_object_range(copy)
+
+    def pump_ciphertext() -> None:
+        try:
+            with _open_backend_range_chunks(
+                backend,
+                dict(copy.native_locator),
+                ciphertext_range,
+            ) as source_chunks:
+                chunks = source_chunks
+                if not ciphertext_range.is_whole_object:
+                    chunks = _require_exact_range(source_chunks, ciphertext_range.length)
+                for chunk in chunks:
+                    if stop.is_set():
+                        break
+                    if not isinstance(chunk, bytes):
+                        raise TypeError("ciphertext backend stream yielded a non-bytes chunk")
+                    _write_pipe_chunk(stdin, chunk, last_activity)
+        except BrokenPipeError:
+            # The helper reports the authoritative validation/write failure.
+            pass
+        except Exception as exc:  # retained and re-raised on the reader thread
+            writer_errors.append(exc)
+        finally:
+            with suppress(OSError):
+                stdin.close()
+
+    def drain_stderr() -> None:
+        try:
+            while data := stderr.read(8192):
+                remaining = _REM_STREAM_STDERR_LIMIT_BYTES - stderr_size[0]
+                if remaining > 0:
+                    stderr_parts.append(data[:remaining])
+                    stderr_size[0] += min(len(data), remaining)
+        except OSError:
+            pass
+
+    writer = threading.Thread(
+        target=pump_ciphertext,
+        name="sutradhara-rem-ciphertext-pump",
+        daemon=True,
+    )
+    stderr_reader = threading.Thread(
+        target=drain_stderr,
+        name="sutradhara-rem-stderr-drain",
+        daemon=True,
+    )
+    writer.start()
+    stderr_reader.start()
+    plaintext = _iter_rem_plaintext(
+        process,
+        writer=writer,
+        stderr_reader=stderr_reader,
+        writer_errors=writer_errors,
+        stderr_parts=stderr_parts,
+        last_activity=last_activity,
+    )
+    try:
+        yield plaintext
+    finally:
+        plaintext.close()
+        stop.set()
+        _terminate_and_reap(process)
+        with suppress(OSError):
+            stdin.close()
+        writer.join(_REM_STREAM_EXIT_TIMEOUT_SECONDS)
+        with suppress(OSError):
+            stdout.close()
+        with suppress(OSError):
+            stderr.close()
+        stderr_reader.join(_REM_STREAM_EXIT_TIMEOUT_SECONDS)
+
+
+def _write_pipe_chunk(handle: IO[bytes], chunk: bytes, last_activity: list[float]) -> None:
+    """Write one ciphertext chunk completely without allocating another copy."""
+
+    remaining = memoryview(chunk)
+    while remaining:
+        written = handle.write(remaining)
+        if written is None or written <= 0:
+            raise BrokenPipeError("rem archive extract-stream stdin accepted no bytes")
+        remaining = remaining[written:]
+        last_activity[0] = time.monotonic()
+
+
+def _stored_object_range(copy: Copy) -> ByteRange:
+    """Return the complete stored-object range without guessing its endpoint."""
+
+    size = copy.storage_metadata.get("stored_size_bytes")
+    if isinstance(size, int) and size > 0:
+        return ByteRange(0, size)
+    return ByteRange(0, 0)
+
+
+def _iter_rem_plaintext(
+    process: subprocess.Popen[bytes],
+    *,
+    writer: threading.Thread,
+    stderr_reader: threading.Thread,
+    writer_errors: list[Exception],
+    stderr_parts: list[bytes],
+    last_activity: list[float],
+) -> Generator[bytes, None, None]:
+    """Yield helper stdout and require clean ciphertext input plus exit zero."""
+
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            if writer_errors:
+                _terminate_and_reap(process)
+                break
+            ready = selector.select(timeout=0.25)
+            if ready:
+                chunk = process.stdout.read(RAO_CHUNK_SIZE)
+                if not chunk:
+                    break
+                last_activity[0] = time.monotonic()
+                yield chunk
+                continue
+            if process.poll() is not None:
+                # A final select/read observes any bytes buffered before exit.
+                chunk = process.stdout.read(RAO_CHUNK_SIZE)
+                if chunk:
+                    last_activity[0] = time.monotonic()
+                    yield chunk
+                    continue
+                break
+            if time.monotonic() - last_activity[0] > _REM_STREAM_INACTIVITY_TIMEOUT_SECONDS:
+                _terminate_and_reap(process)
+                raise ArchiveRestoreError(
+                    "rem archive extract-stream exceeded its inactivity timeout"
+                )
+    finally:
+        selector.close()
+
+    try:
+        returncode = process.wait(timeout=_REM_STREAM_EXIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_and_reap(process)
+        raise ArchiveRestoreError("rem archive extract-stream did not exit after EOF") from exc
+    writer.join(_REM_STREAM_EXIT_TIMEOUT_SECONDS)
+    stderr_reader.join(_REM_STREAM_EXIT_TIMEOUT_SECONDS)
+    if writer.is_alive():
+        raise ArchiveRestoreError("ciphertext writer did not stop after helper exit")
+    if stderr_reader.is_alive():
+        raise ArchiveRestoreError("helper diagnostic reader did not stop after helper exit")
+    if writer_errors:
+        error = writer_errors[0]
+        raise ArchiveRestoreError(f"ciphertext backend stream failed: {error}") from error
+    if returncode != 0:
+        diagnostic = b"".join(stderr_parts).decode("utf-8", errors="replace").strip()
+        raise ArchiveRestoreError(
+            f"rem archive extract-stream failed (exit {returncode}): {diagnostic[:500]!r}"
+        )
+
+
+def _terminate_and_reap(process: subprocess.Popen[bytes]) -> None:
+    """Terminate a stream helper within bounded waits and require reaping."""
+
+    if process.poll() is not None:
+        return
+    with suppress(OSError):
+        process.terminate()
+    try:
+        process.wait(timeout=_REM_STREAM_EXIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        with suppress(OSError):
+            process.kill()
+        try:
+            process.wait(timeout=_REM_STREAM_EXIT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise ArchiveRestoreError("rem archive extract-stream could not be reaped") from exc
 
 
 def _require_exact_range(chunks: Iterator[bytes], expected_size: int) -> Iterator[bytes]:

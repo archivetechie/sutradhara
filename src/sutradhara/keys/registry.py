@@ -106,11 +106,12 @@ class KeyRegistry:
 
     @contextlib.contextmanager
     def materialized_root_key(self, key_id: str) -> Iterator[Path]:
-        """Yield a short-lived 0600 file containing the raw root key."""
+        """Yield a short-lived 0600 file, then zeroize and remove it."""
         path = self._write_temp_root_key(key_id)
         try:
             yield path
         finally:
+            _best_effort_zeroize(path)
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()
 
@@ -206,8 +207,7 @@ class KeyRegistry:
 
     def _next_generation(self, domain: str) -> int:
         generations = [
-            _state_generation(state)
-            for _key_id, state in self._states_for_domain(domain)
+            _state_generation(state) for _key_id, state in self._states_for_domain(domain)
         ]
         return max(generations, default=-1) + 1
 
@@ -244,9 +244,7 @@ def _derive_test_epoch_for_domain(domain: str, *, generation: int = 0) -> tuple[
     else:
         domain_bytes = domain.encode("ascii")
         generation_part = b"" if generation == 0 else b":" + str(generation).encode("ascii")
-        key_suffix = hashlib.sha256(
-            _TEST_SEED + b":" + domain_bytes + generation_part + b":key-id"
-        )
+        key_suffix = hashlib.sha256(_TEST_SEED + b":" + domain_bytes + generation_part + b":key-id")
         key_id = f"{domain}-{key_suffix.digest()[:16].hex()}"
         root_key = hashlib.sha256(
             _TEST_SEED + b":" + domain_bytes + generation_part + b":root-key"
@@ -347,6 +345,18 @@ def _secure_temp_dir() -> Path:
     fallback.mkdir(mode=0o700, exist_ok=True)
     os.chmod(fallback, 0o700)
     return fallback
+
+
+def _best_effort_zeroize(path: Path) -> None:
+    """Overwrite a materialized key before unlinking when the file still exists."""
+
+    try:
+        size = path.stat().st_size
+        with path.open("r+b", buffering=0) as handle:
+            handle.write(b"\0" * size)
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
 
 
 def _write_private_bytes(path: Path, data: bytes) -> None:

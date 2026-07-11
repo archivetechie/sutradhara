@@ -38,6 +38,7 @@ from sutradhara.archive_restore import (
     RestoreNameError,
     RestoreSourceUnavailable,
     RestoreSuspectAsset,
+    build_restore_plan,
     read_member_bytes,
     read_member_to_path,
     resolve_member_asset_hash,
@@ -1515,18 +1516,17 @@ def test_encrypted_restore_plumbing_uses_key_epoch_and_rao_range_args(
     rem_script = tmp_path / "fake-rem"
     rem_script.write_text(
         """#!/usr/bin/env python3
-import pathlib
 import sys
 args = sys.argv[1:]
-required = ["--path", "--first-chunk-lba", "--file-size-bytes", "--range", "--key-file"]
+required = ["--range", "--key-file"]
 missing = [flag for flag in required if flag not in args]
 if missing:
     raise SystemExit("missing " + ",".join(missing))
-dest = pathlib.Path(args[args.index("--dest") + 1])
-member = args[args.index("--path") + 1]
-out = dest / member
-out.parent.mkdir(parents=True, exist_ok=True)
-out.write_bytes(b"encrypted member")
+if args[args.index("--range") + 1] != "1048576:16":
+    raise SystemExit("wrong range")
+sys.stdin.buffer.read()
+sys.stdout.buffer.write(b"encrypted member")
+sys.stderr.write('{"command":"archive extract-stream","status":"ok"}\\n')
 """,
         encoding="utf-8",
     )
@@ -1596,6 +1596,16 @@ out.write_bytes(b"encrypted member")
                 representation=Representation.RAO_AEAD_V1.value,
             )
         )
+        s.flush()
+        with build_restore_plan(
+            s,
+            asset_hash=asset_hash,
+            artifactclass="o-archive",
+            backends={row.id: backend},
+            extractor=RemArchiveExtractor(rem_script, keys=keys),  # type: ignore[arg-type]
+        ) as plan:
+            [planned] = list(plan.iter_members())
+            assert planned.buffered is False
         result = restore_asset(
             s,
             asset_hash=asset_hash,

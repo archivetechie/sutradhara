@@ -68,6 +68,27 @@ def test_key_registry_create_epoch_is_idempotent(tmp_path: Path) -> None:
     assert second == first
 
 
+def test_materialized_root_key_is_zeroized_before_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = KeyRegistry(tmp_path / "keys")
+    epoch = registry.create_epoch()
+    original_unlink = Path.unlink
+    erased: list[bytes] = []
+
+    def recording_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.name.startswith("rao-root-") and path.exists():
+            erased.append(path.read_bytes())
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", recording_unlink)
+    with registry.materialized_root_key(epoch.key_id) as key_path:
+        assert key_path.read_bytes() != b"\0" * 32
+
+    assert erased == [b"\0" * 32]
+
+
 def test_key_registry_hdcache_domain_is_namespaced_and_separate(tmp_path: Path) -> None:
     registry = KeyRegistry(tmp_path / "keys")
 
