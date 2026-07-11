@@ -1155,3 +1155,68 @@ def _write_receipts(landing_root: Path, intake_id: str, sizes: list[int]) -> Non
         for index, size in enumerate(sizes)
     ]
     (intake_dir / "receive-receipts.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_stale_intent_with_ejected_card_terminalizes_before_card_resolution(
+    api_engine: Engine,
+) -> None:
+    """A stale same-key replay must 409 receive_terminal even when the card is
+    gone — never device_unavailable (2026-07-11 gate finding)."""
+
+    registry = ConnectedDeviceRegistry()
+    stream = registry.register(
+        DeviceIdentity(operator="ada", device_id="mac-1", fingerprint="AA" * 32)
+    )
+    stream.update_cards(
+        [Card(card_id="card-1", label="Card 1", kind="card", size_bytes=10, status="available")],
+        capabilities=None,
+    )
+    with session_scope(api_engine) as session:
+        grpc_store.record_device_enrollment(
+            session, device_id="mac-1", cert_fingerprint="AA" * 32, operator="ada"
+        )
+    app = make_api_app(api_engine)
+    app.state.registry = registry
+    client = TestClient(app)
+    key = str(uuid4())
+    payload = {
+        "card_id": "card-1",
+        "artifactclass": "s-masters",
+        "idempotencyKey": key,
+    }
+    body = DeviceReceiveRequest.model_validate(payload)
+    request_hash = _device_receive_hash("mac-1", body, source_ref="")
+    decision = api_store.begin_device_receive_intent(
+        api_engine,
+        operator_username="ada",
+        device_id="mac-1",
+        card_identity="card-1",
+        card_label="Card 1",
+        idempotency_key=key,
+        request_hash=request_hash,
+        acknowledge_duplicate=False,
+    )
+    assert decision.state == "authorized"
+    with session_scope(api_engine) as session:
+        intent = session.scalars(select(api_store.IdempotencyRecord)).one()
+        stale = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+        intent.last_heartbeat = stale
+        assert intent.lease_source_id is not None
+        claim = session.get(api_store.SourceClaim, intent.lease_source_id)
+        if claim is not None:
+            claim.last_heartbeat = stale
+
+    # Eject the card: the device stays online but reports no cards.
+    stream.update_cards([], capabilities=None)
+
+    terminal = client.post(
+        "/api/devices/mac-1/receive", headers=post_headers("operator"), json=payload
+    )
+    assert terminal.status_code == 409
+    assert terminal.json()["error"] == "receive_terminal"
+    assert terminal.json()["retryable"] is True
+
+    with session_scope(api_engine) as session:
+        record = session.scalars(select(api_store.IdempotencyRecord)).one()
+        assert record.status == "failed"
+        assert session.get(api_store.SourceClaim, "card-identity:card-1") is None

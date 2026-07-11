@@ -303,6 +303,26 @@ async def post_device_receive(
                 retryable=True,
             )
 
+    # Stale same-key intents terminalize BEFORE card resolution: the stored
+    # identity suffices, and the card may have been ejected long ago.
+    stale = await anyio.to_thread.run_sync(
+        partial(
+            api_store.terminalize_stale_device_receive_intent,
+            engine,
+            operator_username=identity.operator_username,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            ttl=request.app.state.idempotency_ttl,
+        )
+    )
+    if stale is not None and stale.state == "terminal":
+        _raise(
+            409,
+            "receive_terminal",
+            f"prior receive attempt is {stale.terminal_state}; start a new receive intent",
+            retryable=True,
+        )
+
     try:
         card = await anyio.to_thread.run_sync(
             partial(
@@ -380,7 +400,18 @@ async def post_device_receive(
     except TimeoutError:
         _raise(409, "ack_timeout", "device did not ack before the advisory timeout")
     except PermissionError as exc:
-        await _fail_device_intent(request, identity, device_id, idempotency_key)
+        # Same live-receive guard as the RuntimeError path: a permission failure
+        # surfacing at ack-wait must never kill an intake StartIntake already
+        # claimed (2026-07-11 gate finding). 403 wins outward either way.
+        await anyio.to_thread.run_sync(
+            partial(
+                api_store.fail_device_receive_intent_if_unstarted,
+                engine,
+                operator_username=identity.operator_username,
+                device_id=device_id,
+                idempotency_key=idempotency_key,
+            )
+        )
         _raise(403, "forbidden", str(exc))
     except RuntimeError as exc:
         failure_state = await anyio.to_thread.run_sync(

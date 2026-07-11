@@ -835,6 +835,61 @@ def peek_device_receive_intent(
         return None
 
 
+def terminalize_stale_device_receive_intent(
+    engine: Any,
+    *,
+    operator_username: str,
+    idempotency_key: str,
+    request_hash: str,
+    ttl: dt.timedelta = DEFAULT_TTL,
+) -> DeviceIntentDecision | None:
+    """Durably fail a stale same-key intent BEFORE card resolution.
+
+    The read-only peek skips stale records, so without this step a stale intent
+    whose card has been ejected answers ``device_unavailable`` forever instead
+    of the retryable ``receive_terminal`` the contract promises (2026-07-11
+    gate finding). Uses the stored identity — the card need not resolve.
+    Returns the terminal decision, or None when nothing stale matched.
+    """
+
+    now = _utcnow()
+    factory = make_session_factory(engine)
+    with factory.begin() as session:
+        record = _idempotency_record(
+            session,
+            operator_username=operator_username,
+            endpoint=DEVICE_RECEIVE_ENDPOINT,
+            idempotency_key=idempotency_key,
+        )
+        if record is None or record.request_hash != request_hash:
+            return None
+        if record.status not in {"authorized", "started"}:
+            return None
+        if record.response_json is not None:
+            return None
+        if not _is_stale(record.last_heartbeat, ttl=ttl, now=now):
+            return None
+        terminalized = session.execute(
+            update(IdempotencyRecord)
+            .where(
+                IdempotencyRecord.id == record.id,
+                IdempotencyRecord.status.in_(("authorized", "started")),
+                IdempotencyRecord.last_heartbeat < now - ttl,
+            )
+            .values(
+                status="failed",
+                terminal_at=now,
+                updated_at=now,
+                last_heartbeat=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if terminalized.rowcount != 1:
+            return None
+        _release_record_lease(session, record)
+        return DeviceIntentDecision("terminal", terminal_state="failed")
+
+
 def _begin_device_receive_intent_once(
     engine: Any,
     *,
