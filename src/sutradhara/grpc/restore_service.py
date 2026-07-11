@@ -70,6 +70,11 @@ from sutradhara.restore import RestoreIntegrityError as ChunkRestoreIntegrityErr
 from sutradhara.staging import StagingError
 
 _MANIFEST_DOMAIN = b"sutradhara.restore.manifest.v1\x00"
+# Maximum plaintext bytes per `chunk` frame on the wire. Must stay <= the RM2 client's
+# MAX_CHUNK_BYTES (256 KiB) — the agent rejects any larger chunk frame. Source producers
+# differ (archive yields 256 KiB, the hdcache producer yields 1 MiB), so `_stream`
+# re-chunks every source chunk to this bound regardless of the producer's buffer size.
+_WIRE_CHUNK_BYTES = 256 * 1024
 _SYNTHETIC_MODE = 0o644
 _SYNTHETIC_UID = 0
 _SYNTHETIC_GID = 0
@@ -731,11 +736,17 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         try:
             with self._open_prepared_chunks(prepared) as chunks:
                 for chunk in chunks:
-                    _require_active(context)
-                    yield restore_pb2.RestoreFrame(
-                        chunk=restore_pb2.Chunk(data=chunk, offset=offset)
-                    )
-                    offset += len(chunk)
+                    # Re-chunk to a wire-safe size regardless of the source producer's
+                    # buffer (archive yields 256 KiB, the hdcache producer yields 1 MiB);
+                    # the RM2 client rejects any chunk frame larger than its 256 KiB limit.
+                    view = memoryview(chunk)
+                    for start in range(0, len(view), _WIRE_CHUNK_BYTES):
+                        _require_active(context)
+                        piece = bytes(view[start : start + _WIRE_CHUNK_BYTES])
+                        yield restore_pb2.RestoreFrame(
+                            chunk=restore_pb2.Chunk(data=piece, offset=offset)
+                        )
+                        offset += len(piece)
         except (ArchiveRestoreError, CacheServeFailed) as exc:
             yield restore_pb2.RestoreFrame(
                 error=restore_pb2.RestoreError(code="ARCHIVE_RESTORE_FAILED", message=str(exc))

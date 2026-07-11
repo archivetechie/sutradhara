@@ -463,7 +463,10 @@ def test_cache_hit_streams_plaintext_bounded_without_archive_read(rig: _Rig) -> 
         tracemalloc.stop()
 
     assert digest.digest() == hashlib.sha256(payload).digest()
-    assert max_frame <= 1024 * 1024
+    # Every chunk frame must fit the RM2 client's 256 KiB wire limit — the hdcache
+    # producer reads in 1 MiB buffers, so _stream re-chunks to this bound. (A looser
+    # <=1 MiB assertion here was vacuous: it let agent-rejecting frames through.)
+    assert max_frame <= 256 * 1024
     assert peak - baseline < len(payload) // 2
     assert rig.backend.open_calls == archive_opens
 
