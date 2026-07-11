@@ -133,6 +133,15 @@ class RestoreRequest(Base):
             "state IN ('pending', 'active', 'completed', 'completed_with_errors')",
             name="ck_restore_request_state",
         ),
+        CheckConstraint(
+            "delivery_mode IN ('server_local', 'agent')",
+            name="ck_restore_request_delivery_mode",
+        ),
+        CheckConstraint(
+            "(delivery_mode = 'server_local' AND receiver_device_id IS NULL) OR "
+            "(delivery_mode = 'agent' AND receiver_device_id IS NOT NULL)",
+            name="ck_restore_request_receiver_binding",
+        ),
         Index("ix_restore_request_created_at", "created_at"),
         Index("ix_restore_request_state", "state"),
         UniqueConstraint("idempotency_key", name="uq_restore_request_idempotency_key"),
@@ -144,6 +153,14 @@ class RestoreRequest(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     destination_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    delivery_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="server_local", server_default="server_local"
+    )
+    receiver_device_id: Mapped[str | None] = mapped_column(
+        String(256),
+        ForeignKey("grpc_logical_device.device_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     admitted_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
     admitted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -165,7 +182,7 @@ class RestoreRequestItem(Base):
     __table_args__ = (
         CheckConstraint(
             "state IN ("
-            "'queued', 'waking_disk', 'streaming', 'done', "
+            "'queued', 'waking_disk', 'streaming', 'sent', 'done', "
             "'fell_back_to_tape', 'denied', 'failed'"
             ")",
             name="ck_restore_request_item_state",
@@ -197,6 +214,7 @@ class RestoreRequestItem(Base):
         nullable=False,
     )
     artifactclass: Mapped[str] = mapped_column(String(128), nullable=False)
+    final_rel_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     denial_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -210,3 +228,87 @@ class RestoreRequestItem(Base):
     )
 
     request: Mapped[RestoreRequest] = relationship(back_populates="items")
+    checkpoint: Mapped[RestoreItemCheckpoint | None] = relationship(
+        back_populates="item",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        uselist=False,
+    )
+    open_session: Mapped[RestoreOpenSession | None] = relationship(
+        back_populates="item",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class RestoreItemCheckpoint(Base):
+    """Durable per-item staged/revealed progress for agent delivery."""
+
+    __tablename__ = "restore_item_checkpoint"
+    __table_args__ = (
+        CheckConstraint(
+            "committed_index >= 0 AND committed_index <= 2147483647",
+            name="ck_restore_item_checkpoint_index",
+        ),
+        CheckConstraint(
+            "revealed = false OR committed_index >= 1",
+            name="ck_restore_item_checkpoint_revealed",
+        ),
+        CheckConstraint(
+            "length(manifest_sha256) = 32",
+            name="ck_restore_item_checkpoint_manifest_sha256",
+        ),
+    )
+
+    restore_request_item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("restore_request_item.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    manifest_sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    committed_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    revealed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    item: Mapped[RestoreRequestItem] = relationship(back_populates="checkpoint")
+
+
+class RestoreOpenSession(Base):
+    """Exclusive, expiring generation lease for opening one agent restore item."""
+
+    __tablename__ = "restore_open_session"
+    __table_args__ = (
+        CheckConstraint("generation >= 1", name="ck_restore_open_session_generation"),
+        CheckConstraint(
+            "length(manifest_sha256) = 32",
+            name="ck_restore_open_session_manifest_sha256",
+        ),
+        UniqueConstraint(
+            "restore_request_item_id",
+            name="uq_restore_open_session_item",
+        ),
+    )
+
+    restore_request_item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("restore_request_item.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    receiver_device_id: Mapped[str] = mapped_column(
+        String(256),
+        ForeignKey("grpc_logical_device.device_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    manifest_sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    item: Mapped[RestoreRequestItem] = relationship(back_populates="open_session")

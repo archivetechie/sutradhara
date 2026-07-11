@@ -25,7 +25,7 @@ from uuid import UUID
 import anyio
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
 from sutradhara._proto import device_pb2
@@ -84,12 +84,22 @@ class DeviceReceiveRequest(BaseModel):
 class EnrollTokenRequest(BaseModel):
     """JSON body accepted by POST /api/enroll/token."""
 
+    model_config = ConfigDict(extra="forbid")
+
     device_id: str
     reenroll: bool = False
+    scopes: list[str] = Field(default_factory=lambda: ["ingest"])
+
+    @field_validator("scopes")
+    @classmethod
+    def _valid_scopes(cls, value: list[str]) -> list[str]:
+        return list(grpc_store.validate_device_scopes(value))
 
 
 class EnrollCsrRequest(BaseModel):
     """JSON body accepted by POST /api/enroll/csr."""
+
+    model_config = ConfigDict(extra="forbid")
 
     csr_pem: str
     token: str
@@ -543,18 +553,23 @@ def get_intake_status(intake_id: str, request: Request) -> dict[str, object]:
 
 
 @router.post("/api/enroll/token")
-def post_enroll_token(request: Request, body: EnrollTokenRequest) -> dict[str, str]:
+def post_enroll_token(request: Request, body: EnrollTokenRequest) -> dict[str, object]:
     """Mint a one-time operator-scoped, device-bound enrollment token."""
 
     token, expires = mint_enroll_token(request, body)
-    return {"token": token, "deviceId": body.device_id, "expiresAt": expires.isoformat()}
+    return {
+        "token": token,
+        "deviceId": body.device_id,
+        "expiresAt": expires.isoformat(),
+        "scopes": body.scopes,
+    }
 
 
 @router.post("/api/enroll/bundle")
 def post_enroll_bundle(request: Request, body: EnrollTokenRequest) -> Response:
     """Mint and package a downloadable enrollment bundle."""
 
-    identity = _require_receive(parse_identity(request.headers))
+    identity = _require_enrollment_scopes(parse_identity(request.headers), body.scopes)
     config = _agent_bundle_config_or_503(request)
     token, expires = mint_enroll_token(request, body, identity=identity)
     bundle: dict[str, object] = {
@@ -563,6 +578,7 @@ def post_enroll_bundle(request: Request, body: EnrollTokenRequest) -> Response:
         "enroll_url": config.enroll_url,
         "enroll_ca_pem": config.enroll_ca_pem,
         "token": token,
+        "scopes": body.scopes,
         "expires_at": expires.isoformat(),
         "endpoints": [
             {
@@ -665,7 +681,9 @@ def mint_enroll_token(
     """Apply the shared enroll-token mint guard and return ``(token, expires_at)``."""
 
     if identity is None:
-        identity = _require_receive(parse_identity(request.headers))
+        identity = _require_enrollment_scopes(parse_identity(request.headers), body.scopes)
+    else:
+        identity = _require_enrollment_scopes(identity, body.scopes)
     _validate_device_id(body.device_id)
     factory = make_session_factory(request.app.state.engine)
     ttl = request.app.state.enroll_token_ttl
@@ -727,6 +745,7 @@ def mint_enroll_token(
             session,
             operator=identity.operator_username,
             device_id=body.device_id,
+            scopes=tuple(body.scopes),
             ttl=ttl,
             rotation_authority=rotation_authority,
             rotation_fingerprint=rotation_fingerprint,
@@ -745,6 +764,17 @@ def _require_receive(identity: Identity) -> Identity:
     _require_view(identity)
     if not identity.has_capability("can_receive"):
         _raise(403, "forbidden", "your group doesn't permit this")
+    return identity
+
+
+def _require_enrollment_scopes(identity: Identity, scopes: list[str]) -> Identity:
+    """Authorize every requested enrollment scope independently."""
+
+    _require_view(identity)
+    required = {"ingest": "can_receive", "restore": "can_restore"}
+    for scope in grpc_store.validate_device_scopes(scopes):
+        if not identity.has_capability(required[scope]):
+            _raise(403, "forbidden", f"operator cannot enroll scope {scope}")
     return identity
 
 

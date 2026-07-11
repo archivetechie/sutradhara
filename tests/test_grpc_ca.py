@@ -35,6 +35,10 @@ def test_sign_resolve_and_revoke_device_certificate(engine: Engine, tmp_path) ->
 
     assert signed.device_id == "mac-1"
     assert signed.cert_path.is_file()
+    with session_scope(engine) as session:
+        logical = session.get(store.GrpcLogicalDevice, "mac-1")
+        assert logical is not None
+        assert logical.scopes == ["ingest"]
     cert_text = ca._run_openssl(["x509", "-in", str(signed.cert_path), "-noout", "-text"])
     assert "Version: 3 (0x2)" in cert_text
     assert "CA:FALSE" in cert_text
@@ -50,6 +54,39 @@ def test_sign_resolve_and_revoke_device_certificate(engine: Engine, tmp_path) ->
         store.revoke_device(session, "mac-1")
     with pytest.raises(PermissionError):
         ca.resolve_peer_identity(engine, context)
+
+
+def test_redeemed_rotation_token_replaces_logical_device_scopes(
+    engine: Engine, tmp_path: Path
+) -> None:
+    with session_scope(engine) as session:
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="AA" * 32,
+            operator="ada",
+            scopes=("ingest", "restore"),
+        )
+        token = store.issue_enroll_token(
+            session,
+            operator="ada",
+            device_id="mac-1",
+            scopes=("restore",),
+            rotation_authority="admin",
+        )
+    material = ca.generate_device_csr(tmp_path / "rotation", device_id="mac-1")
+
+    ca.sign_device_csr(
+        engine,
+        pki_dir=tmp_path / "pki",
+        csr_path=material.csr_path,
+        token=token,
+    )
+
+    with session_scope(engine) as session:
+        logical = session.get(store.GrpcLogicalDevice, "mac-1")
+        assert logical is not None
+        assert logical.scopes == ["restore"]
 
 
 def test_wrong_enrollment_token_refuses_signing(engine: Engine, tmp_path) -> None:
@@ -127,11 +164,14 @@ def test_signing_refuses_other_operator_and_releases_token(engine: Engine, tmp_p
         row = session.get(store.GrpcEnrollToken, token)
         assert row is not None
         assert row.used_at is None
-        assert store.resolve_device(
-            session,
-            device_id="mac-1",
-            cert_fingerprint="AA" * 32,
-        ).operator == "ada"
+        assert (
+            store.resolve_device(
+                session,
+                device_id="mac-1",
+                cert_fingerprint="AA" * 32,
+            ).operator
+            == "ada"
+        )
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="BB" * 32)
 
@@ -162,11 +202,14 @@ def test_signing_refuses_same_operator_rotation_without_proof(
         row = session.get(store.GrpcEnrollToken, token)
         assert row is not None
         assert row.used_at is None
-        assert store.resolve_device(
-            session,
-            device_id="mac-1",
-            cert_fingerprint="AA" * 32,
-        ).operator == "ada"
+        assert (
+            store.resolve_device(
+                session,
+                device_id="mac-1",
+                cert_fingerprint="AA" * 32,
+            ).operator
+            == "ada"
+        )
 
 
 class _FakeContext:

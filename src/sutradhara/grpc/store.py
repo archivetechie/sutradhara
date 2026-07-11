@@ -12,15 +12,28 @@ import datetime as dt
 import logging
 import secrets
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Index, String, UniqueConstraint, select
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    select,
+)
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from sutradhara.catalog.models import Base
 
 GrpcIntakeState = Literal["streaming", "committing", "committed", "aborted"]
 RotationAuthority = Literal["self", "admin"]
+DeviceScope = Literal["ingest", "restore"]
+VALID_DEVICE_SCOPES = frozenset({"ingest", "restore"})
 LOG = logging.getLogger(__name__)
 
 
@@ -58,6 +71,53 @@ class GrpcIntake(Base):
     )
 
 
+class GrpcLogicalDevice(Base):
+    """Stable device identity carrying enrollment scopes across certificate rotations."""
+
+    __tablename__ = "grpc_logical_device"
+    __table_args__ = (
+        CheckConstraint(
+            'CAST(scopes AS TEXT) IN (\'["ingest"]\', \'["restore"]\', \'["ingest", "restore"]\')',
+            name="ck_grpc_logical_device_scopes",
+        ),
+    )
+
+    device_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=lambda: ["ingest"])
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
+    )
+
+
+class GrpcDeviceDestinationGrant(Base):
+    """One opaque restore destination binding authorized for a logical device."""
+
+    __tablename__ = "grpc_device_destination_grant"
+    __table_args__ = (
+        UniqueConstraint(
+            "device_id",
+            "destination_id",
+            name="uq_grpc_device_destination_grant",
+        ),
+        Index("ix_grpc_device_destination_grant_destination", "destination_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    device_id: Mapped[str] = mapped_column(
+        String(256),
+        ForeignKey("grpc_logical_device.device_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    destination_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    dest_root: Mapped[str] = mapped_column(String(2048), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
+    )
+
+
 class GrpcDeviceEnrollment(Base):
     """Device-certificate fingerprint mapped to a server-assigned operator."""
 
@@ -68,7 +128,12 @@ class GrpcDeviceEnrollment(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    device_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    device_id: Mapped[str] = mapped_column(
+        String(256),
+        ForeignKey("grpc_logical_device.device_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     cert_fingerprint: Mapped[str] = mapped_column(String(95), nullable=False)
     operator: Mapped[str] = mapped_column(String(128), nullable=False)
     revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -82,6 +147,12 @@ class GrpcEnrollToken(Base):
     """One-use, short-lived authorization token for CSR signing."""
 
     __tablename__ = "grpc_enroll_token"
+    __table_args__ = (
+        CheckConstraint(
+            'CAST(scopes AS TEXT) IN (\'["ingest"]\', \'["restore"]\', \'["ingest", "restore"]\')',
+            name="ck_grpc_enroll_token_scopes",
+        ),
+    )
 
     token: Mapped[str] = mapped_column(String(128), primary_key=True)
     created_at: Mapped[dt.datetime] = mapped_column(
@@ -90,6 +161,7 @@ class GrpcEnrollToken(Base):
     expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     operator: Mapped[str] = mapped_column(String(128), nullable=False)
     device_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=lambda: ["ingest"])
     rotation_authority: Mapped[str | None] = mapped_column(String(32), nullable=True)
     rotation_fingerprint: Mapped[str | None] = mapped_column(String(95), nullable=True)
     used_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -110,6 +182,7 @@ class EnrollTokenGrant:
 
     operator: str
     device_id: str
+    scopes: tuple[DeviceScope, ...]
     rotation_authority: RotationAuthority | None = None
     rotation_fingerprint: str | None = None
 
@@ -291,12 +364,14 @@ def issue_enroll_token(
     *,
     operator: str,
     device_id: str,
+    scopes: tuple[str, ...] = ("ingest",),
     ttl: dt.timedelta = dt.timedelta(hours=24),
     rotation_authority: RotationAuthority | None = None,
     rotation_fingerprint: str | None = None,
 ) -> str:
     """Create and persist a one-time operator/device-bound enrollment token."""
 
+    normalized_scopes = validate_device_scopes(scopes)
     token = secrets.token_urlsafe(32)
     now = _utcnow()
     if rotation_authority is None and rotation_fingerprint is not None:
@@ -322,6 +397,7 @@ def issue_enroll_token(
             expires_at=now + ttl,
             operator=operator,
             device_id=device_id,
+            scopes=list(normalized_scopes),
             rotation_authority=rotation_authority,
             rotation_fingerprint=normalized_rotation_fingerprint,
         )
@@ -348,11 +424,14 @@ def consume_enroll_token(
         raise ValueError("enrollment token has expired")
     if device_id is not None and row.device_id != device_id:
         raise ValueError("CSR common name does not match enrollment token device_id")
+    if row.rotation_authority not in {None, "self", "admin"}:
+        raise ValueError("enrollment token has invalid rotation authority")
     row.used_at = timestamp
     return EnrollTokenGrant(
         operator=row.operator,
         device_id=row.device_id,
-        rotation_authority=row.rotation_authority,
+        scopes=validate_device_scopes(row.scopes),
+        rotation_authority=cast(RotationAuthority | None, row.rotation_authority),
         rotation_fingerprint=row.rotation_fingerprint,
     )
 
@@ -373,6 +452,7 @@ def record_device_enrollment(
     device_id: str,
     cert_fingerprint: str,
     operator: str,
+    scopes: tuple[str, ...] = ("ingest",),
     rotation_authority: RotationAuthority | None = None,
     rotation_fingerprint: str | None = None,
 ) -> GrpcDeviceEnrollment:
@@ -384,6 +464,7 @@ def record_device_enrollment(
     existing rows.
     """
 
+    normalized_scopes = validate_device_scopes(scopes)
     normalized = normalize_fingerprint(cert_fingerprint)
     normalized_rotation_fingerprint = (
         normalize_fingerprint(rotation_fingerprint) if rotation_fingerprint is not None else None
@@ -407,6 +488,16 @@ def record_device_enrollment(
         )
 
     now = _utcnow()
+    logical_device = _get_or_create_logical_device(
+        session,
+        device_id=device_id,
+        scopes=normalized_scopes,
+        now=now,
+    )
+    # A redeemed rotation token is authoritative: scopes replace, never union.
+    logical_device.scopes = list(normalized_scopes)
+    logical_device.updated_at = now
+    session.flush([logical_device])
     for row in superseded_rows:
         row.revoked = True
         row.revoked_at = now
@@ -480,6 +571,67 @@ def normalize_fingerprint(value: str) -> str:
     return ":".join(compact[index : index + 2] for index in range(0, len(compact), 2))
 
 
+def validate_device_scopes(scopes: object) -> tuple[DeviceScope, ...]:
+    """Return a canonical non-empty scope tuple, rejecting unknown or duplicate grants."""
+
+    if not isinstance(scopes, (list, tuple)) or not scopes:
+        raise ValueError("enrollment scopes must be a non-empty list")
+    if any(not isinstance(scope, str) or scope not in VALID_DEVICE_SCOPES for scope in scopes):
+        raise ValueError("enrollment scopes must contain only ingest and restore")
+    if len(set(scopes)) != len(scopes):
+        raise ValueError("enrollment scopes must not contain duplicates")
+    return cast(
+        tuple[DeviceScope, ...],
+        tuple(scope for scope in ("ingest", "restore") if scope in scopes),
+    )
+
+
+def _get_or_create_logical_device(
+    session: Session,
+    *,
+    device_id: str,
+    scopes: tuple[DeviceScope, ...],
+    now: dt.datetime,
+) -> GrpcLogicalDevice:
+    """Atomically ensure the certificate's stable parent exists on supported databases."""
+
+    existing = session.get(GrpcLogicalDevice, device_id)
+    if existing is not None:
+        return existing
+    values = {
+        "device_id": device_id,
+        "scopes": list(scopes),
+        "created_at": now,
+        "updated_at": now,
+    }
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        session.execute(
+            sqlite_insert(GrpcLogicalDevice)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=["device_id"])
+        )
+    elif dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+
+        session.execute(
+            postgresql_insert(GrpcLogicalDevice)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=["device_id"])
+        )
+    else:
+        row = GrpcLogicalDevice(**values)
+        session.add(row)
+        session.flush([row])
+        return row
+    inserted = session.get(GrpcLogicalDevice, device_id)
+    if inserted is None:
+        raise RuntimeError("logical device parent upsert did not produce a row")
+    return inserted
+
+
 def _require_rotation_authority(
     *,
     active_rows: list[GrpcDeviceEnrollment],
@@ -488,9 +640,12 @@ def _require_rotation_authority(
 ) -> None:
     if rotation_authority == "admin":
         return
-    if rotation_authority == "self" and rotation_fingerprint is not None:
-        if any(row.cert_fingerprint == rotation_fingerprint for row in active_rows):
-            return
+    if (
+        rotation_authority == "self"
+        and rotation_fingerprint is not None
+        and any(row.cert_fingerprint == rotation_fingerprint for row in active_rows)
+    ):
+        return
     raise DeviceRotationProofError("active device certificate rotation requires old-key proof")
 
 

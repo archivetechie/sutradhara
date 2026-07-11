@@ -1435,6 +1435,7 @@ def _register_restore_request_item(
     content: bytes = b"restore-me",
     state: str = "queued",
     admitted: bool = True,
+    delivery_mode: str = "server_local",
 ) -> int:
     """Register one restore request item and return its id."""
     asset_hash = hashlib.sha256(content).digest()
@@ -1466,11 +1467,19 @@ def _register_restore_request_item(
             item.state = state
             s.flush([item])
             return item.id
+        if delivery_mode == "agent":
+            from sutradhara.grpc.store import GrpcLogicalDevice
+
+            if s.get(GrpcLogicalDevice, "agent-device") is None:
+                s.add(GrpcLogicalDevice(device_id="agent-device", scopes=["ingest", "restore"]))
+                s.flush()
         request = RestoreRequest(
             id=f"restore-{asset_hash.hex()[:12]}",
             identity="ada",
             destination_id="media-server",
             state="active",
+            delivery_mode=delivery_mode,
+            receiver_device_id="agent-device" if delivery_mode == "agent" else None,
         )
         item = RestoreRequestItem(
             content_sha256=asset_hash,
@@ -1516,6 +1525,19 @@ def test_dispatch_restore_rejects_nonqueued_item(engine: Engine) -> None:
     item_id = _register_restore_request_item(engine, state="denied")
 
     with session_scope(engine) as s, pytest.raises(RestoreRequestItemNotRunnable, match="denied"):
+        dispatch_restore(s, item_id)
+
+
+def test_dispatch_restore_rejects_agent_delivery_item(engine: Engine) -> None:
+    """Defense-in-depth: an agent-delivery item must never dispatch to the local writer."""
+    from sutradhara.jobs.dispatch import RestoreRequestItemNotRunnable, dispatch_restore
+
+    item_id = _register_restore_request_item(engine, admitted=False, delivery_mode="agent")
+
+    with session_scope(engine) as s, pytest.raises(
+        RestoreRequestItemNotRunnable,
+        match="agent-delivery",
+    ):
         dispatch_restore(s, item_id)
 
 

@@ -47,6 +47,11 @@ from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
 from sutradhara.catalog.models import ArtifactClassPool, Backend, LogicalAsset, Pool
 from sutradhara.catalog.types import AssetValidity, is_content_hash
+from sutradhara.grpc.store import (
+    GrpcDeviceDestinationGrant,
+    GrpcLogicalDevice,
+    validate_device_scopes,
+)
 from sutradhara.hdcache.fill import (
     effective_privacy_level,
     entry_policy_conformant,
@@ -63,8 +68,8 @@ from sutradhara.hdcache.store import (
     StoreError,
     StoreReadTimeout,
     probe_disk_liveness_with_deadline,
-    read_hmac_secret,
     read_entry_verified,
+    read_hmac_secret,
     verify_disk_identity_with_deadline,
 )
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
@@ -90,6 +95,7 @@ REQUEST_COMPLETED_WITH_ERRORS = "completed_with_errors"
 ITEM_QUEUED = "queued"
 ITEM_WAKING_DISK = "waking_disk"
 ITEM_STREAMING = "streaming"
+ITEM_SENT = "sent"
 ITEM_DONE = "done"
 ITEM_FELL_BACK_TO_TAPE = "fell_back_to_tape"
 ITEM_DENIED = "denied"
@@ -241,6 +247,7 @@ class RestoreItemSpec:
 
     content_sha256: bytes
     artifactclass: str
+    final_rel_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -465,6 +472,8 @@ def admit_restore_request(
     identity: Identity,
     destination_id: str,
     items: Iterable[RestoreItemSpec],
+    delivery_mode: str = "server_local",
+    receiver_device_id: str | None = None,
     force_suspect: bool = False,
     force_rejected: bool = False,
     idempotency_key: str | None = None,
@@ -473,13 +482,28 @@ def admit_restore_request(
 ) -> RestoreRequest:
     """Persist an API-style restore request, denying inadmissible items individually."""
 
+    if delivery_mode not in {"server_local", "agent"}:
+        raise RestoreAdmissionInvalid(f"unknown delivery_mode {delivery_mode!r}")
+    if delivery_mode == "server_local" and receiver_device_id is not None:
+        raise RestoreAdmissionInvalid("receiver_device_id is only valid for agent delivery")
+    if delivery_mode == "agent" and not receiver_device_id:
+        raise RestoreAdmissionInvalid("receiver_device_id is required for agent delivery")
+
     final_config = bind_restore_event_sink_to_session(config or restore_config_from_env(), session)
     destination = _destination_by_id(final_config, destination_id)
+    if delivery_mode == "agent":
+        authorize_agent_restore_destination(
+            session,
+            receiver_device_id=receiver_device_id,
+            destination_id=destination.id,
+        )
     admitted_at = _utcnow()
     request = RestoreRequest(
         id=_new_request_id(),
         identity=identity.operator_username,
         destination_id=destination.id,
+        delivery_mode=delivery_mode,
+        receiver_device_id=receiver_device_id,
         state=REQUEST_PENDING,
         admitted_by=identity.operator_username,
         admitted_at=admitted_at,
@@ -490,10 +514,15 @@ def admit_restore_request(
     session.add(request)
     session.flush([request])
     for spec in items:
+        if delivery_mode == "agent":
+            if spec.final_rel_path is None:
+                raise RestoreAdmissionInvalid("final_rel_path is required for every agent item")
+            validate_restore_relative_path(spec.final_rel_path)
         item = RestoreRequestItem(
             request_id=request.id,
             content_sha256=spec.content_sha256,
             artifactclass=spec.artifactclass,
+            final_rel_path=spec.final_rel_path if delivery_mode == "agent" else None,
             state=ITEM_QUEUED,
             detail=None,
             denial_kind=None,
@@ -627,7 +656,9 @@ def _serve_restore_request_parallel(
         while submitted < len(pending) and len(futures) < window:
             item_id = pending[submitted].id
             if item_id is None:
-                raise RestoreManagerError("restore request item must be flushed before parallel serve")
+                raise RestoreManagerError(
+                    "restore request item must be flushed before parallel serve"
+                )
             futures[
                 executor.submit(
                     _serve_restore_item_in_worker_session,
@@ -700,6 +731,8 @@ def serve_restore_item(
 ) -> ServeResult:
     """Serve one admitted restore item from cache or tape with fallback."""
 
+    if item.request is not None and item.request.delivery_mode != "server_local":
+        raise RestoreAdmissionInvalid("agent delivery items cannot enter the server-local writer")
     final_config = bind_restore_event_sink_to_session(config or restore_config_from_env(), session)
     if item.request is None:
         raise RestoreManagerError("restore request item is not attached to a request")
@@ -979,10 +1012,59 @@ def canonicalize_restore_destination(
     try:
         parent_real.relative_to(root_path)
     except ValueError as exc:
-        raise InvalidRestoreDestination("restore destination escapes configured export root") from exc
+        raise InvalidRestoreDestination(
+            "restore destination escapes configured export root"
+        ) from exc
     final = parent_real / candidate.relative_to(parent).as_posix()
     _reject_overwrite(final, overwrite=overwrite)
     return final
+
+
+def validate_restore_relative_path(value: str) -> str:
+    """Validate a client-supplied relative path without touching any server filesystem."""
+
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise InvalidRestoreDestination("restore destination must be a non-empty relative path")
+    windows_path = PureWindowsPath(value)
+    if Path(value).is_absolute() or windows_path.is_absolute() or windows_path.drive:
+        raise InvalidRestoreDestination("restore destination must be relative")
+    normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise InvalidRestoreDestination("restore destination contains unsafe path traversal")
+    if len(value) > 2048:
+        raise InvalidRestoreDestination("restore destination is too long")
+    return value
+
+
+def authorize_agent_restore_destination(
+    session: Session,
+    *,
+    receiver_device_id: str | None,
+    destination_id: str,
+) -> GrpcDeviceDestinationGrant:
+    """Authorize an opaque device/destination binding without resolving a server path."""
+
+    if not receiver_device_id:
+        raise RestoreAdmissionInvalid("receiver_device_id is required for agent delivery")
+    device = session.get(GrpcLogicalDevice, receiver_device_id)
+    if device is None:
+        raise RestoreAdmissionInvalid("receiver device is not enrolled")
+    try:
+        scopes = validate_device_scopes(device.scopes)
+    except ValueError as exc:
+        raise RestoreAdmissionInvalid("receiver device has invalid enrollment scopes") from exc
+    if "restore" not in scopes:
+        raise RestoreAdmissionInvalid("receiver device is not restore-scoped")
+    grant = session.scalars(
+        select(GrpcDeviceDestinationGrant).where(
+            GrpcDeviceDestinationGrant.device_id == receiver_device_id,
+            GrpcDeviceDestinationGrant.destination_id == destination_id,
+        )
+    ).one_or_none()
+    if grant is None:
+        raise RestoreAdmissionInvalid("receiver device has no grant for the destination")
+    return grant
 
 
 def restore_backends_for_artifactclass(
@@ -1023,7 +1105,9 @@ def _serve_from_cache(
     if disk is None or disk.state != "active":
         raise CacheServeFailed("disk-inactive", "cache disk is not active", mark_lost=False)
     if config.breaker.is_open(disk.disk_id):
-        raise CacheServeFailed("disk-circuit-open", "cache disk circuit breaker is open", mark_lost=False)
+        raise CacheServeFailed(
+            "disk-circuit-open", "cache disk circuit breaker is open", mark_lost=False
+        )
     if config.read_deadline_seconds <= 0:
         raise CacheServeFailed(
             "read-deadline",
@@ -1097,24 +1181,28 @@ def _serve_from_cache(
                         deadline_monotonic=deadline,
                         disk_id=disk.disk_id,
                     )
-                opener = config.opener or RaoCliOpener(config.registry(), work_dir=config.scratch_root)
+                opener = config.opener or RaoCliOpener(
+                    config.registry(), work_dir=config.scratch_root
+                )
                 key_epoch = _cache_key_epoch(entry)
-                with _optional_unheld_aead_slot():
-                    with opener.open(
+                with (
+                    _optional_unheld_aead_slot(),
+                    opener.open(
                         sealed,
                         Representation.RAO_AEAD_V1,
                         key_epoch=key_epoch,
                         work_dir=config.scratch_root,
-                    ) as plaintext:
-                        digest = sha256_file(plaintext)
-                        if digest != entry.content_sha256:
-                            raise StoreContentMismatch(
-                                "opened cache plaintext digest mismatch: "
-                                f"{digest.hex()} != {entry.content_sha256.hex()}"
-                            )
-                        size_bytes = plaintext.stat().st_size
-                        with _optional_semaphore_slot(_current_stream_slots()):
-                            _publish_cache_plaintext(plaintext, destination)
+                    ) as plaintext,
+                ):
+                    digest = sha256_file(plaintext)
+                    if digest != entry.content_sha256:
+                        raise StoreContentMismatch(
+                            "opened cache plaintext digest mismatch: "
+                            f"{digest.hex()} != {entry.content_sha256.hex()}"
+                        )
+                    size_bytes = plaintext.stat().st_size
+                    with _optional_semaphore_slot(_current_stream_slots()):
+                        _publish_cache_plaintext(plaintext, destination)
             else:
                 raise StoreError(f"unsupported cache representation {entry.representation!r}")
     except StoreReadTimeout as exc:
@@ -1158,9 +1246,11 @@ def _serve_from_cache_controlled(
     stream_slots = None if runtime is None else runtime.stream_slots
     aead_slots = None if runtime is None else runtime.aead_slots
     if entry.representation == AEAD_REPRESENTATION and aead_slots is not None:
-        with _semaphore_slot(aead_slots):
-            with _serve_slot_context(stream_slots, aead_slots, aead_slot_held=True):
-                return _serve_from_cache(session, entry, destination, config)
+        with (
+            _semaphore_slot(aead_slots),
+            _serve_slot_context(stream_slots, aead_slots, aead_slot_held=True),
+        ):
+            return _serve_from_cache(session, entry, destination, config)
     with _serve_slot_context(stream_slots, aead_slots, aead_slot_held=False):
         return _serve_from_cache(session, entry, destination, config)
 
@@ -1355,8 +1445,7 @@ def _record_cache_failure(
                 content_sha256=content_sha256.hex(),
                 artifactclass=artifactclass,
                 detail=(
-                    f"cache disk {disk.disk_id} exceeded cache failure threshold; "
-                    "state set absent"
+                    f"cache disk {disk.disk_id} exceeded cache failure threshold; state set absent"
                 ),
                 request_id=request_id,
                 item_id=item_id,
@@ -1524,13 +1613,14 @@ def _select_cache_entry(
     disk = session.get(CacheDisk, entry.disk_id)
     if disk is None:
         return None
-    if disk.state != "active" or (config is not None and config.breaker.is_open(disk.disk_id)):
-        if (
-            config is None
-            or not allow_recovery_probe
-            or not _probe_cache_disk_recovery(session, disk, config)
-        ):
-            return None
+    if (
+        disk.state != "active" or (config is not None and config.breaker.is_open(disk.disk_id))
+    ) and (
+        config is None
+        or not allow_recovery_probe
+        or not _probe_cache_disk_recovery(session, disk, config)
+    ):
+        return None
     if disk.state != "active":
         return None
     return entry
@@ -1763,7 +1853,9 @@ def _destinations_from_env() -> dict[str, RestoreDestination]:
             if label_raw is None:
                 label = dest_id
             elif not isinstance(label_raw, str) or not label_raw.strip():
-                raise ArtifactClassPolicyError(f"restore destination {dest_id!r} label must be a string")
+                raise ArtifactClassPolicyError(
+                    f"restore destination {dest_id!r} label must be a string"
+                )
             elif _looks_like_raw_path_label(label_raw.strip(), root_raw):
                 raise ArtifactClassPolicyError(
                     f"restore destination {dest_id!r} label must not be a raw path"
@@ -1812,7 +1904,9 @@ def _destination_by_id(config: RestoreConfig, destination_id: str) -> RestoreDes
     if destination is None:
         raise UnknownRestoreDestination(f"unknown restore destination_id {destination_id!r}")
     if not destination.writable:
-        raise InvalidRestoreDestination(f"restore destination_id {destination_id!r} is not writable")
+        raise InvalidRestoreDestination(
+            f"restore destination_id {destination_id!r} is not writable"
+        )
     return destination
 
 
@@ -1840,7 +1934,10 @@ def _update_request_state(request: RestoreRequest) -> None:
     if not states:
         request.state = REQUEST_COMPLETED
         return
-    if any(state in {ITEM_WAKING_DISK, ITEM_STREAMING, ITEM_FELL_BACK_TO_TAPE} for state in states):
+    if any(
+        state in {ITEM_WAKING_DISK, ITEM_STREAMING, ITEM_SENT, ITEM_FELL_BACK_TO_TAPE}
+        for state in states
+    ):
         request.state = REQUEST_ACTIVE
         return
     if ITEM_QUEUED in states:

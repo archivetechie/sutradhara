@@ -250,6 +250,7 @@ def sign_device_csr(
                 device_id=device_id,
                 cert_fingerprint=fingerprint,
                 operator=grant.operator,
+                scopes=grant.scopes,
                 rotation_authority=grant.rotation_authority,
                 rotation_fingerprint=grant.rotation_fingerprint,
             )
@@ -315,7 +316,9 @@ def peer_certificate_identity(context: Any) -> tuple[str, str]:
         fingerprint = cert_fingerprint(temp_path)
     finally:
         temp_path.unlink(missing_ok=True)
-    return common_name.decode("utf-8") if isinstance(common_name, bytes) else common_name, fingerprint
+    return common_name.decode("utf-8") if isinstance(
+        common_name, bytes
+    ) else common_name, fingerprint
 
 
 def load_server_credentials(pki_dir: Path | str) -> tuple[bytes, bytes, bytes]:

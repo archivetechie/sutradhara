@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _tables(db_path: Path) -> set[str]:
     with sqlite3.connect(db_path) as conn:
@@ -443,6 +445,120 @@ def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
     _assert_retention_invariants(db_path)
     _assert_grpc_relay_invariants(db_path)
     _assert_hdcache_invariants(db_path)
+
+
+def test_restore_agent_foundation_migration_backfills_constraints_and_downgrades(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "restore-agent-backfill.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "e5f6a7b8c9d0"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    now = "2026-01-01 00:00:00"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO grpc_device_enrollment "
+            "(device_id, cert_fingerprint, operator, revoked, created_at, revoked_at) "
+            "VALUES ('existing-device', ?, 'ada', 0, ?, NULL)",
+            ("AA:" * 31 + "AA", now),
+        )
+        conn.execute(
+            "INSERT INTO grpc_enroll_token "
+            "(token, created_at, expires_at, used_at, operator, device_id, "
+            "rotation_authority, rotation_fingerprint) "
+            "VALUES ('existing-token', ?, ?, NULL, 'ada', 'pending-device', NULL, NULL)",
+            (now, "2027-01-01 00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO restore_request "
+            "(id, identity, created_at, destination_id, state, admitted_by, admitted_at, "
+            "admitted_capabilities, idempotency_key, idempotency_body_hash) "
+            "VALUES ('existing-restore', 'ada', ?, 'media-server', 'pending', NULL, NULL, "
+            "NULL, NULL, NULL)",
+            (now,),
+        )
+        conn.commit()
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        assert conn.execute(
+            "SELECT scopes FROM grpc_logical_device WHERE device_id='existing-device'"
+        ).fetchone() == ('["ingest"]',)
+        assert conn.execute(
+            "SELECT scopes FROM grpc_enroll_token WHERE token='existing-token'"
+        ).fetchone() == ('["ingest"]',)
+        assert conn.execute(
+            "SELECT delivery_mode, receiver_device_id FROM restore_request "
+            "WHERE id='existing-restore'"
+        ).fetchone() == ("server_local", None)
+        delivery_column = next(
+            row
+            for row in conn.execute("PRAGMA table_info(restore_request)")
+            if row[1] == "delivery_mode"
+        )
+        assert delivery_column[4] == "'server_local'"
+        tables = _tables(db_path)
+        assert {
+            "grpc_logical_device",
+            "grpc_device_destination_grant",
+            "restore_item_checkpoint",
+            "restore_open_session",
+            "operator_capability_sync",
+            "operator_live_capability",
+        }.issubset(tables)
+        checkpoint_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_item_checkpoint'"
+        ).fetchone()[0]
+        lease_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_open_session'"
+        ).fetchone()[0]
+        assert "committed_index >= 0" in checkpoint_sql
+        assert "revealed = false OR committed_index >= 1" in checkpoint_sql
+        assert "length(manifest_sha256) = 32" in checkpoint_sql
+        assert "generation >= 1" in lease_sql
+        assert "length(manifest_sha256) = 32" in lease_sql
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO grpc_device_enrollment "
+                "(device_id, cert_fingerprint, operator, revoked, created_at, revoked_at) "
+                "VALUES ('orphan', ?, 'ada', 0, ?, NULL)",
+                ("BB:" * 31 + "BB", now),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO restore_item_checkpoint "
+                "(restore_request_item_id, manifest_sha256, committed_index, revealed, updated_at) "
+                "VALUES (999, ?, -1, 0, ?)",
+                (bytes(32), now),
+            )
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "e5f6a7b8c9d0"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        assert "grpc_logical_device" not in _tables(db_path)
+        assert "scopes" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(grpc_enroll_token)")
+        }
+        assert "delivery_mode" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(restore_request)")
+        }
 
 
 def test_receive_dedup_migration_preserves_dead_intent_heartbeat_and_downgrades(

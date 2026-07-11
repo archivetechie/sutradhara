@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, select
+from starlette.requests import Request
 
 from sutradhara.api import routes_restore
+from sutradhara.catalog.session import session_scope
+from sutradhara.grpc.store import GrpcDeviceDestinationGrant, GrpcLogicalDevice
 from sutradhara.hdcache.alarms import (
     ALARM_DOMAIN,
     restore_event_alarm_sink,
@@ -49,9 +53,7 @@ def test_restore_destinations_contract_shape(api_engine: Engine, tmp_path: Path)
 
     assert response.status_code == 200
     assert response.json() == {
-        "destinations": [
-            {"id": "media-server", "label": "Media server restore", "writable": True}
-        ]
+        "destinations": [{"id": "media-server", "label": "Media server restore", "writable": True}]
     }
 
 
@@ -95,6 +97,74 @@ def test_restore_post_requires_can_restore(
     assert can_view_only.json()["detail"]["error"] == "forbidden"
     assert can_restore.status_code == 201
     assert can_restore.json()["request_id"]
+
+
+def test_agent_restore_admission_binds_receiver_and_does_not_submit_local_job(
+    api_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    digest = hashlib.sha256(b"agent restore").hexdigest()
+    _seed_asset(api_engine, bytes.fromhex(digest), privacy="none")
+    with session_scope(api_engine) as session:
+        session.add(GrpcLogicalDevice(device_id="restore-1", scopes=["restore"]))
+        session.flush()
+        session.add(
+            GrpcDeviceDestinationGrant(
+                device_id="restore-1",
+                destination_id="media-server",
+                dest_root="/srv/restore",
+            )
+        )
+    app = make_api_app(api_engine)
+    app.state.restore_config = RestoreConfig(
+        destinations={
+            "media-server": RestoreDestination(
+                id="media-server",
+                root=root,
+                label="Media server restore",
+                writable=True,
+            )
+        }
+    )
+    headers = post_headers("restore")
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+            "headers": [
+                (key.lower().encode("latin-1"), value.encode("latin-1"))
+                for key, value in headers.items()
+            ],
+        }
+    )
+    response = routes_restore.post_restore(
+        request,
+        {
+            "destination_id": "media-server",
+            "delivery_mode": "agent",
+            "receiver_device_id": "restore-1",
+            "items": [
+                {
+                    "content_sha256": digest,
+                    "artifactclass": "s-masters",
+                    "final_rel_path": "project/clip.mov",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    response_body = json.loads(response.body)
+    with session_scope(api_engine) as session:
+        row = session.get(RestoreRequest, response_body["request_id"])
+        assert row is not None
+        assert row.delivery_mode == "agent"
+        assert row.receiver_device_id == "restore-1"
+        assert row.items[0].final_rel_path == "project/clip.mov"
+        assert list(session.scalars(select(Job))) == []
+    assert list(root.iterdir()) == []
 
 
 def test_restore_post_mixed_cart_and_request_status_shapes(
@@ -144,6 +214,8 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
         "identity",
         "created_at",
         "destination_id",
+        "delivery_mode",
+        "receiver_device_id",
         "state",
         "bytes_total",
         "bytes_restored",
@@ -152,6 +224,8 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
     assert body["id"] == request_id
     assert body["identity"] == "ada"
     assert body["destination_id"] == "media-server"
+    assert body["delivery_mode"] == "server_local"
+    assert body["receiver_device_id"] is None
     assert body["state"] == "pending"
     assert body["bytes_total"] == 2
     assert body["bytes_restored"] == 0
@@ -159,6 +233,7 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
         {
             "content_sha256": allowed,
             "artifactclass": "s-masters",
+            "final_rel_path": None,
             "state": "queued",
             "detail": None,
             "denial_kind": None,
@@ -166,10 +241,12 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
             "bytes_restored": 0,
             "source": None,
             "updated_at": body["items"][0]["updated_at"],
+            "checkpoint": None,
         },
         {
             "content_sha256": denied,
             "artifactclass": "private",
+            "final_rel_path": None,
             "state": "denied",
             "detail": "requires sutradhara-restore-p3",
             "denial_kind": "capability",
@@ -177,9 +254,12 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
             "bytes_restored": 0,
             "source": None,
             "updated_at": body["items"][1]["updated_at"],
+            "checkpoint": None,
         },
     ]
-    listed = client.get("/api/ui/restore-requests?state=pending&limit=5", headers=auth_headers("viewer"))
+    listed = client.get(
+        "/api/ui/restore-requests?state=pending&limit=5", headers=auth_headers("viewer")
+    )
     assert listed.status_code == 200
     assert listed.json()["requests"][0]["id"] == request_id
     with api_engine.connect() as conn:

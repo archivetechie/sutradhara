@@ -7,9 +7,14 @@ import logging
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import Engine, func, select
+from starlette.requests import Request
 
+from sutradhara.api import routes_devices
+from sutradhara.api.routes_devices import EnrollCsrRequest, EnrollTokenRequest
 from sutradhara.catalog.session import session_scope
 from sutradhara.grpc import ca, store
 from sutradhara.grpc.registry import ConnectedDeviceRegistry
@@ -59,6 +64,20 @@ def _enroll_token_count(engine: Engine) -> int:
     with session_scope(engine) as session:
         count = session.scalar(select(func.count()).select_from(store.GrpcEnrollToken))
     return int(count or 0)
+
+
+def _direct_request(app: object, role: str) -> Request:
+    headers = post_headers(role)
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "headers": [
+                (key.lower().encode("latin-1"), value.encode("latin-1"))
+                for key, value in headers.items()
+            ],
+        }
+    )
 
 
 @pytest.mark.parametrize(
@@ -297,6 +316,7 @@ def test_enroll_bundle_returns_downloadable_bundle_and_redeemable_token(
         "enroll_url": ENROLL_URL,
         "enroll_ca_pem": ca_cert.read_text(encoding="utf-8"),
         "token": bundle["token"],
+        "scopes": ["ingest"],
         "expires_at": bundle["expires_at"],
         "endpoints": [
             {
@@ -315,6 +335,45 @@ def test_enroll_bundle_returns_downloadable_bundle_and_redeemable_token(
     )
     assert signed.status_code == 200
     assert "BEGIN CERTIFICATE" in signed.json()["cert_pem"]
+
+
+def test_restore_only_operator_can_mint_restore_scope_and_token_is_authoritative(
+    api_engine: Engine,
+) -> None:
+    response = routes_devices.post_enroll_token(
+        _direct_request(make_api_app(api_engine), "restore"),
+        EnrollTokenRequest(device_id="restore-1", scopes=["restore"]),
+    )
+
+    assert response["scopes"] == ["restore"]
+    with session_scope(api_engine) as session:
+        grant = store.consume_enroll_token(session, str(response["token"]), device_id="restore-1")
+        assert grant.scopes == ("restore",)
+
+
+@pytest.mark.parametrize(
+    ("groups", "scopes"),
+    [
+        ("restore", ["ingest"]),
+        ("operator", ["restore"]),
+        ("restore", ["ingest", "restore"]),
+    ],
+)
+def test_enrollment_authorizes_each_requested_scope_independently(
+    api_engine: Engine, groups: str, scopes: list[str]
+) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        routes_devices.post_enroll_token(
+            _direct_request(make_api_app(api_engine), groups),
+            EnrollTokenRequest(device_id="scope-test", scopes=scopes),
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+def test_csr_redemption_rejects_bundle_only_scope_claim() -> None:
+    with pytest.raises(ValidationError):
+        EnrollCsrRequest.model_validate({"csr_pem": "pem", "token": "token", "scopes": ["restore"]})
 
 
 def test_enroll_bundle_loads_agent_bundle_from_env(

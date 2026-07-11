@@ -126,6 +126,14 @@ def dispatch_restore(
         raise RestoreRequestItemNotRunnable(
             f"restore request item id={restore_request_item_id} is state={item.state!r}"
         )
+    # Single-funnel guard (mirrors serve_restore_item): the local-write "restore"
+    # job is server_local only. An agent-delivery item must never be dispatched to
+    # the local writer — RM1.2's assignment surface routes it via OpenRestore instead.
+    if item.request is not None and item.request.delivery_mode != "server_local":
+        raise RestoreRequestItemNotRunnable(
+            f"restore request item id={restore_request_item_id} is agent-delivery; "
+            "not dispatchable to the server-local writer"
+        )
     try:
         validate_restore_item_admission(session, item)
     except (

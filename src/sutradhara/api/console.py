@@ -10,7 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, NoReturn
 
 from fastapi import HTTPException
 
@@ -29,7 +29,7 @@ def require_view(identity: Identity) -> Identity:
     return identity
 
 
-def raise_console_error(status_code: int, error: str, detail: str) -> None:
+def raise_console_error(status_code: int, error: str, detail: str) -> NoReturn:
     """Raise a FastAPI error using the restore-console nested detail shape."""
 
     raise HTTPException(status_code=status_code, detail={"error": error, "detail": detail})

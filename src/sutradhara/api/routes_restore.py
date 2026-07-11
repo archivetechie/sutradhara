@@ -6,7 +6,7 @@ import datetime as dt
 import hashlib
 import json
 from dataclasses import replace
-from typing import Any
+from typing import Any, NoReturn
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -79,7 +79,13 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
     destination_id = payload.get("destination_id")
     if not isinstance(destination_id, str) or not destination_id:
         _raise(400, "bad_request", "destination_id is required")
-    items = _parse_items(payload.get("items"))
+    delivery_mode = payload.get("delivery_mode", "server_local")
+    if delivery_mode not in {"server_local", "agent"}:
+        _raise(400, "bad_request", "delivery_mode must be server_local or agent")
+    receiver_device_id = payload.get("receiver_device_id")
+    if receiver_device_id is not None and not isinstance(receiver_device_id, str):
+        _raise(400, "bad_request", "receiver_device_id must be a string")
+    items = _parse_items(payload.get("items"), delivery_mode=delivery_mode)
     force = _optional_bool(payload.get("force"), default=False, field="force")
     force_rejected = _optional_bool(
         payload.get("force_rejected"),
@@ -90,6 +96,8 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
     body_hash = _request_body_hash(
         destination_id=destination_id,
         items=items,
+        delivery_mode=delivery_mode,
+        receiver_device_id=receiver_device_id,
         force=force,
         force_rejected=force_rejected,
     )
@@ -111,6 +119,8 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
                 identity=identity,
                 destination_id=destination_id,
                 items=items,
+                delivery_mode=delivery_mode,
+                receiver_device_id=receiver_device_id,
                 force_suspect=force,
                 force_rejected=force_rejected,
                 idempotency_key=idempotency_key,
@@ -118,7 +128,11 @@ def post_restore(request: Request, payload: dict[str, Any]) -> JSONResponse:
                 config=config,
             )
             for item in restore_request.items:
-                if item.state == ITEM_QUEUED and item.id is not None:
+                if (
+                    restore_request.delivery_mode == "server_local"
+                    and item.state == ITEM_QUEUED
+                    and item.id is not None
+                ):
                     submit(
                         session,
                         "restore",
@@ -234,7 +248,7 @@ def _require_restore(identity: Identity) -> Identity:
     return identity
 
 
-def _parse_items(raw: Any) -> list[RestoreItemSpec]:
+def _parse_items(raw: Any, *, delivery_mode: str = "server_local") -> list[RestoreItemSpec]:
     if not isinstance(raw, list) or not raw:
         _raise(400, "bad_request", "items must be a non-empty list")
     items: list[RestoreItemSpec] = []
@@ -243,6 +257,7 @@ def _parse_items(raw: Any) -> list[RestoreItemSpec]:
             _raise(400, "bad_request", f"items[{index}] must be an object")
         raw_hash = item.get("content_sha256")
         artifactclass = item.get("artifactclass")
+        final_rel_path = item.get("final_rel_path")
         if not isinstance(raw_hash, str) or raw_hash.lower() != raw_hash:
             _raise(400, "bad_request", f"items[{index}].content_sha256 must be lowercase hex")
         try:
@@ -253,7 +268,11 @@ def _parse_items(raw: Any) -> list[RestoreItemSpec]:
             _raise(400, "bad_request", f"items[{index}].content_sha256 must be sha256")
         if not isinstance(artifactclass, str) or not artifactclass:
             _raise(400, "bad_request", f"items[{index}].artifactclass is required")
-        items.append(RestoreItemSpec(digest, artifactclass))
+        if delivery_mode == "agent" and not isinstance(final_rel_path, str):
+            _raise(400, "bad_request", f"items[{index}].final_rel_path is required")
+        if delivery_mode == "server_local" and final_rel_path is not None:
+            _raise(400, "bad_request", f"items[{index}].final_rel_path is agent-only")
+        items.append(RestoreItemSpec(digest, artifactclass, final_rel_path))
     return items
 
 
@@ -282,6 +301,8 @@ def _request_body_hash(
     items: list[RestoreItemSpec],
     force: bool,
     force_rejected: bool,
+    delivery_mode: str = "server_local",
+    receiver_device_id: str | None = None,
 ) -> str:
     payload = {
         "destination_id": destination_id,
@@ -289,20 +310,25 @@ def _request_body_hash(
             {
                 "content_sha256": item.content_sha256.hex(),
                 "artifactclass": item.artifactclass,
+                **({"final_rel_path": item.final_rel_path} if delivery_mode == "agent" else {}),
             }
             for item in items
         ],
         "force": force,
         "force_rejected": force_rejected,
     }
+    if delivery_mode == "agent":
+        payload["delivery_mode"] = delivery_mode
+        payload["receiver_device_id"] = receiver_device_id
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def _restore_request_for_idempotency(session: Any, key: str) -> RestoreRequest | None:
-    return session.scalars(
+    row: RestoreRequest | None = session.scalars(
         select(RestoreRequest).where(RestoreRequest.idempotency_key == key)
     ).one_or_none()
+    return row
 
 
 def _request_payload(row: RestoreRequest) -> dict[str, object]:
@@ -314,6 +340,8 @@ def _request_payload(row: RestoreRequest) -> dict[str, object]:
         "identity": row.identity,
         "created_at": _iso(row.created_at),
         "destination_id": row.destination_id,
+        "delivery_mode": row.delivery_mode,
+        "receiver_device_id": row.receiver_device_id,
         "state": row.state,
         "bytes_total": bytes_total,
         "bytes_restored": bytes_restored,
@@ -325,6 +353,7 @@ def _item_payload(item: RestoreRequestItem) -> dict[str, object]:
     return {
         "content_sha256": item.content_sha256.hex(),
         "artifactclass": item.artifactclass,
+        "final_rel_path": item.final_rel_path,
         "state": item.state,
         "detail": None if item.detail is None else _sanitize_detail(item.detail),
         "denial_kind": item.denial_kind,
@@ -332,6 +361,16 @@ def _item_payload(item: RestoreRequestItem) -> dict[str, object]:
         "bytes_restored": item.bytes_restored,
         "source": item.source,
         "updated_at": _iso(item.updated_at),
+        "checkpoint": (
+            None
+            if item.checkpoint is None
+            else {
+                "manifest_sha256": item.checkpoint.manifest_sha256.hex(),
+                "committed_index": item.checkpoint.committed_index,
+                "revealed": item.checkpoint.revealed,
+                "updated_at": _iso(item.checkpoint.updated_at),
+            }
+        ),
     }
 
 
@@ -346,9 +385,7 @@ def _condition_payload(row: ReconciliationCondition, *, is_admin: bool) -> dict[
             None if row.blocked_tool_name is None else _sanitize_detail(row.blocked_tool_name)
         ),
         "blocked_tool_version": (
-            None
-            if row.blocked_tool_version is None
-            else _sanitize_detail(row.blocked_tool_version)
+            None if row.blocked_tool_version is None else _sanitize_detail(row.blocked_tool_version)
         ),
         "attempt_count": row.attempt_count,
         "owner": ALARM_OWNER if row.domain in {ALARM_DOMAIN, "log_pipeline"} else None,
@@ -436,7 +473,7 @@ def _iso(value: dt.datetime) -> str:
     return iso_utc(value)
 
 
-def _raise(status_code: int, error: str, detail: str) -> None:
+def _raise(status_code: int, error: str, detail: str) -> NoReturn:
     raise_console_error(status_code, error, detail)
 
 

@@ -45,11 +45,12 @@ from sutradhara.catalog.types import (
     CopySource,
 )
 from sutradhara.cli.archive import archive_group
+from sutradhara.grpc.store import GrpcDeviceDestinationGrant, GrpcLogicalDevice
 from sutradhara.hdcache.manager import (
-    DiskCircuitBreaker,
     ITEM_DENIED,
     ITEM_DONE,
     ITEM_QUEUED,
+    ITEM_SENT,
     ITEM_STREAMING,
     ITEM_WAKING_DISK,
     REQUEST_ACTIVE,
@@ -57,6 +58,7 @@ from sutradhara.hdcache.manager import (
     REQUEST_COMPLETED_WITH_ERRORS,
     REQUEST_PENDING,
     RESTORE_DESTINATIONS_ENV,
+    DiskCircuitBreaker,
     InvalidRestoreDestination,
     RestoreAdmissionInvalid,
     RestoreConfig,
@@ -73,6 +75,7 @@ from sutradhara.hdcache.manager import (
     restore_to_path,
     serve_restore_item,
     serve_restore_request,
+    validate_restore_relative_path,
 )
 from sutradhara.hdcache.models import CacheDisk, CacheEntry, RestoreRequest, RestoreRequestItem
 from sutradhara.hdcache.store import (
@@ -382,7 +385,123 @@ def test_destination_confinement_rejects_escape_overwrite_and_unknown_id(
         session.add(request)
         session.flush()
         with pytest.raises(UnknownRestoreDestination):
-            destination_for_request_item(RestoreConfig(destinations={}), "unknown", request.items[0])
+            destination_for_request_item(
+                RestoreConfig(destinations={}), "unknown", request.items[0]
+            )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../escape.mov", "/absolute.mov", r"C:\\absolute.mov", "a/../../escape.mov", "a//b"],
+)
+def test_agent_relative_path_validation_is_pure_and_rejects_traversal(path: str) -> None:
+    with pytest.raises(InvalidRestoreDestination):
+        validate_restore_relative_path(path)
+
+
+@pytest.mark.parametrize(
+    ("device_scopes", "with_grant", "device_exists", "message"),
+    [
+        (["ingest"], True, True, "not restore-scoped"),
+        (["restore"], False, True, "no grant"),
+        (["restore"], True, False, "not enrolled"),
+    ],
+)
+def test_agent_admission_requires_logical_device_scope_and_destination_grant(
+    engine: Engine,
+    tmp_path: Path,
+    device_scopes: list[str],
+    with_grant: bool,
+    device_exists: bool,
+    message: str,
+) -> None:
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=b"agent bytes")
+        if device_exists:
+            session.add(GrpcLogicalDevice(device_id="restore-1", scopes=device_scopes))
+            session.flush()
+        if with_grant and device_exists:
+            session.add(
+                GrpcDeviceDestinationGrant(
+                    device_id="restore-1",
+                    destination_id="media-server",
+                    dest_root="/srv/restore",
+                )
+            )
+            session.flush()
+
+        with pytest.raises(RestoreAdmissionInvalid, match=message):
+            admit_restore_request(
+                session,
+                identity=_identity("sutradhara-restore"),
+                destination_id="media-server",
+                delivery_mode="agent",
+                receiver_device_id="restore-1",
+                items=[RestoreItemSpec(digest, "s-masters", "project/clip.mov")],
+                config=_config(root),
+            )
+
+
+def test_agent_admission_binds_item_and_cannot_enter_local_writer(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "restore-root"
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=b"agent bytes")
+        session.add(GrpcLogicalDevice(device_id="restore-1", scopes=["restore"]))
+        session.flush()
+        session.add(
+            GrpcDeviceDestinationGrant(
+                device_id="restore-1",
+                destination_id="media-server",
+                dest_root="/srv/restore",
+            )
+        )
+        request = admit_restore_request(
+            session,
+            identity=_identity("sutradhara-restore"),
+            destination_id="media-server",
+            delivery_mode="agent",
+            receiver_device_id="restore-1",
+            items=[RestoreItemSpec(digest, "s-masters", "project/clip.mov")],
+            config=_config(root),
+        )
+        item = request.items[0]
+
+        assert request.delivery_mode == "agent"
+        assert request.receiver_device_id == "restore-1"
+        assert item.final_rel_path == "project/clip.mov"
+        assert item.state == ITEM_QUEUED
+        with pytest.raises(RestoreAdmissionInvalid, match="server-local writer"):
+            serve_restore_item(session, item, config=_config(root))
+        assert not root.exists()
+
+
+def test_sent_agent_item_keeps_request_active_until_revealed_completion(
+    engine: Engine,
+) -> None:
+    with session_scope(engine) as session:
+        digest, _backend_id, _memory = _seed_archived_asset(session, data=b"sent bytes")
+        request = RestoreRequest(
+            id="agent-sent",
+            identity="ada",
+            destination_id="media-server",
+            state=REQUEST_PENDING,
+        )
+        request.items.append(
+            RestoreRequestItem(
+                content_sha256=digest,
+                artifactclass="s-masters",
+                state=ITEM_SENT,
+            )
+        )
+        session.add(request)
+        restore_manager._update_request_state(request)
+
+        assert request.state == REQUEST_ACTIVE
 
 
 def test_configured_destinations_do_not_expose_raw_root_paths(
@@ -966,6 +1085,7 @@ def test_parallel_serve_respects_publish_stream_pool(
             identity_or_override=_identity("sutradhara-ingest"),
             config=RestoreConfig(
                 destinations=_config(root).destinations,
+                scratch_root=root / ".scratch",
                 stream_pool_size=6,
                 aead_stream_cap=2,
                 worker_session_factory=factory,
@@ -1850,7 +1970,7 @@ def _config(
         restore_manager.DEFAULT_LIVENESS_PROBE_DEADLINE_SECONDS
     ),
     breaker: DiskCircuitBreaker | None = None,
-    identity_probe: "FakeDiskIdentityProbe | None" = None,
+    identity_probe: FakeDiskIdentityProbe | None = None,
 ) -> RestoreConfig:
     return RestoreConfig(
         destinations={
@@ -1861,6 +1981,7 @@ def _config(
             )
         },
         restore_backends=restore_backends,
+        scratch_root=root / ".scratch",
         event_sink=None if events is None else events.append,
         read_deadline_seconds=read_deadline_seconds,
         liveness_probe_deadline_seconds=liveness_probe_deadline_seconds,
@@ -2097,6 +2218,4 @@ def _request_item(
 
 
 def _reader_thread_count(disk_id: str) -> int:
-    return sum(
-        1 for thread in threading.enumerate() if thread.name == f"hdcache-reader-{disk_id}"
-    )
+    return sum(1 for thread in threading.enumerate() if thread.name == f"hdcache-reader-{disk_id}")
