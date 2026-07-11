@@ -34,6 +34,12 @@ bytes_restored ~94).
    cert_fingerprint)` is). It holds the device's **scopes** (`{ingest,restore}`) and **destination
    grants** (which destination_id / dest_root a device may receive). `receiver_device_id` FKs to THIS
    table. Migrate/backfill existing enrolled device_ids into it with scope `{ingest}`.
+   **CRITICAL (verify-round MAJOR): `record_device_enrollment` (`grpc/store.py`, reached via
+   `sign_device_csr`) MUST get-or-create the logical device parent (default scope `{ingest}`) BEFORE
+   inserting the cert child** — a first-time enrollment auto-creates its logical row. Do NOT add a
+   NOT-NULL FK without this upsert (it would break first-time INGEST enrollment — the live sutra-agent
+   flow), and do NOT skip the FK (an orphan `device_id` could be bound). Grants are NOT auto-created —
+   see item 6.
 4. **Restore-scope enrollment (§7.2):** add nullable `scopes` to the token + enrollment (via the logical
    device), backfill existing token/enrollment rows to exactly `["ingest"]`, then non-null + strict
    validation. Thread `scopes` in the `EnrollTokenGrant` (NOT just the .sutra-enroll bundle — tamper);
@@ -53,7 +59,11 @@ bytes_restored ~94).
    `server_local` items to the existing `restore` job UNCHANGED; **agent items must NEVER submit the
    local-write handler** — decide + implement whether an agent item enqueues a "prepare/lease" job or is
    simply left admitted-and-bound awaiting `OpenRestore` (RM1.2). No agent item may reach
-   `serve_restore_item`'s local publish.
+   `serve_restore_item`'s local publish. **Scope note (verify-round): RM1.1 adds NO destination-grant
+   provisioning endpoint** — grants are seeded test-only in RM1.1 (a grant-admin surface / at-enrollment
+   grant is a later milestone); do NOT invent an admin API. **`final_rel_path` is client-supplied per
+   item at admission** (validated lexically per item 7); manifest granularity is **per-item** (each
+   item carries its own `manifest_sha256`). Surface this decision, don't default it silently.
 7. **Split destination auth from confinement (§7.2):** factor `canonicalize_restore_destination` into
    (1) opaque destination/grant authorization, (2) pure lexical relative-path validation, (3)
    server-local root confinement + overwrite (server_local ONLY). `server_local` path byte-for-byte
@@ -76,6 +86,9 @@ bytes_restored ~94).
 - Enrollment scopes: a restore-only operator can mint a restore enrollment; each scope authorized
   independently; rotation replaces (not unions) scopes; the token carries the grant (bundle-only is
   rejected).
+- **First-time enrollment get-or-create: enroll a BRAND-NEW device end-to-end (token→CSR→sign→record)
+  → its logical device row EXISTS with scope `{ingest}` (the parent was auto-created); the existing
+  sutra-agent ingest enrollment flow is unbroken.**
 - Live-capability resolver: returns live caps; fail-closed (unreachable ⇒ deny); unit-tested.
 - Destination split: lexical validation rejects `..`/absolute/traversal; server_local confinement +
   overwrite behavior unchanged; agent path never resolves a server root.
