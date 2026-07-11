@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -60,6 +61,7 @@ from sutradhara.hdcache.fill import (
 from sutradhara.hdcache.models import CacheDisk, CacheEntry, RestoreRequest, RestoreRequestItem
 from sutradhara.hdcache.store import (
     AEAD_REPRESENTATION,
+    BUFFER_SIZE,
     RAW_REPRESENTATION,
     DiskIdentityProbe,
     DiskIdentityResult,
@@ -153,6 +155,35 @@ class CacheServeFailed(RestoreManagerError):
         self.mark_lost = mark_lost
         self.count_breaker = count_breaker
         super().__init__(detail)
+
+
+@dataclass(frozen=True)
+class VerifiedCachePlaintext:
+    """A staged, verified cache plaintext with a bounded verifying producer."""
+
+    path: Path
+    content_sha256: bytes
+    size_bytes: int
+
+    def iter_chunks(self) -> Iterator[bytes]:
+        """Yield bounded plaintext and re-verify its catalog identity at EOF."""
+
+        digest = hashlib.sha256()
+        emitted = 0
+        with self.path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(BUFFER_SIZE), b""):
+                digest.update(chunk)
+                emitted += len(chunk)
+                yield chunk
+        if emitted != self.size_bytes:
+            raise StoreContentMismatch(
+                f"cache plaintext size mismatch: {emitted} != {self.size_bytes}"
+            )
+        actual = digest.digest()
+        if actual != self.content_sha256:
+            raise StoreContentMismatch(
+                f"cache plaintext digest mismatch: {actual.hex()} != {self.content_sha256.hex()}"
+            )
 
 
 class DiskCircuitBreaker:
@@ -1101,14 +1132,90 @@ def _serve_from_cache(
     destination: Path,
     config: RestoreConfig,
 ) -> ServeResult:
+    asset = session.get(LogicalAsset, entry.content_sha256)
+    if asset is None:
+        raise CacheServeFailed(
+            "read-failed", "cache entry logical asset is unavailable", mark_lost=False
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        open_verified_cache_plaintext(
+            session,
+            entry,
+            expected_content_sha256=entry.content_sha256,
+            expected_size_bytes=asset.size_bytes,
+            artifactclass=entry.artifactclass,
+            config=config,
+        ) as plaintext,
+        _optional_semaphore_slot(_current_stream_slots()),
+    ):
+        _publish_cache_plaintext(plaintext.path, destination)
+
+    entry.last_read_at = _utcnow()
+    if not entry.trusted:
+        entry.trusted = True
+    session.flush([entry])
+    return ServeResult(None, "cache", destination, plaintext.size_bytes)
+
+
+@contextmanager
+def open_cache_plaintext_chunks(
+    session: Session,
+    entry: CacheEntry,
+    *,
+    expected_content_sha256: bytes,
+    expected_size_bytes: int,
+    artifactclass: str,
+    config: RestoreConfig | None = None,
+) -> Iterator[Iterator[bytes]]:
+    """Yield bounded, digest-verified plaintext chunks from one hdcache entry."""
+
+    with open_verified_cache_plaintext(
+        session,
+        entry,
+        expected_content_sha256=expected_content_sha256,
+        expected_size_bytes=expected_size_bytes,
+        artifactclass=artifactclass,
+        config=config,
+    ) as plaintext:
+        yield plaintext.iter_chunks()
+
+
+@contextmanager
+def open_verified_cache_plaintext(
+    session: Session,
+    entry: CacheEntry,
+    *,
+    expected_content_sha256: bytes,
+    expected_size_bytes: int,
+    artifactclass: str,
+    config: RestoreConfig | None = None,
+) -> Iterator[VerifiedCachePlaintext]:
+    """Open one cache entry through the shared stored/plaintext verification funnel.
+
+    Raw and private entries both stage through the existing verified disk reader;
+    private entries additionally use the configured RAO opener and hdcache key
+    epoch validation. The yielded producer remains bounded and verifies the
+    catalog plaintext digest and size again as it is consumed.
+    """
+
+    final_config = config or restore_config_from_env()
+    if entry.content_sha256 != expected_content_sha256:
+        raise CacheServeFailed(
+            "read-failed", "cache entry does not match the requested asset", mark_lost=False
+        )
+    if expected_size_bytes < 0:
+        raise CacheServeFailed(
+            "read-failed", "cache plaintext size cannot be negative", mark_lost=False
+        )
     disk = session.get(CacheDisk, entry.disk_id)
     if disk is None or disk.state != "active":
         raise CacheServeFailed("disk-inactive", "cache disk is not active", mark_lost=False)
-    if config.breaker.is_open(disk.disk_id):
+    if final_config.breaker.is_open(disk.disk_id):
         raise CacheServeFailed(
             "disk-circuit-open", "cache disk circuit breaker is open", mark_lost=False
         )
-    if config.read_deadline_seconds <= 0:
+    if final_config.read_deadline_seconds <= 0:
         raise CacheServeFailed(
             "read-deadline",
             "cache read deadline exceeded before stream start",
@@ -1116,7 +1223,7 @@ def _serve_from_cache(
             count_breaker=True,
         )
     try:
-        identity = _verify_cache_disk_identity(disk, config)
+        identity = _verify_cache_disk_identity(disk, final_config)
     except StoreReadTimeout as exc:
         raise CacheServeFailed(
             "disk-identity-timeout",
@@ -1126,7 +1233,7 @@ def _serve_from_cache(
         ) from exc
     if not identity.ok:
         _emit(
-            config,
+            final_config,
             RestoreEvent(
                 code="disk-identity-unverified",
                 severity="alarm",
@@ -1140,19 +1247,20 @@ def _serve_from_cache(
             _identity_failure_detail(disk, identity),
             mark_lost=False,
         )
-    if not entry_policy_conformant(session, entry, key_registry=config.registry()):
+    if not entry_policy_conformant(session, entry, key_registry=final_config.registry()):
         raise CacheServeFailed(
             "representation-mismatch",
-            "cache entry representation does not satisfy current privacy policy",
+            f"cache entry representation does not satisfy current privacy policy for {artifactclass}",
             mark_lost=True,
         )
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    config.scratch_root.mkdir(parents=True, exist_ok=True)
-    os.chmod(config.scratch_root, 0o700)
-    deadline = time.monotonic() + config.read_deadline_seconds
+    final_config.scratch_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(final_config.scratch_root, 0o700)
+    deadline = time.monotonic() + final_config.read_deadline_seconds
     try:
-        with tempfile.TemporaryDirectory(prefix="hdcache-serve-", dir=config.scratch_root) as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="hdcache-serve-", dir=final_config.scratch_root
+        ) as raw:
             temp_dir = Path(raw)
             if entry.representation == RAW_REPRESENTATION:
                 plaintext = temp_dir / "plain"
@@ -1165,8 +1273,6 @@ def _serve_from_cache(
                         deadline_monotonic=deadline,
                         disk_id=disk.disk_id,
                     )
-                with _optional_semaphore_slot(_current_stream_slots()):
-                    _publish_cache_plaintext(plaintext, destination)
                 size_bytes = read_result.size_bytes
             elif entry.representation == AEAD_REPRESENTATION:
                 sealed = temp_dir / "sealed"
@@ -1181,8 +1287,8 @@ def _serve_from_cache(
                         deadline_monotonic=deadline,
                         disk_id=disk.disk_id,
                     )
-                opener = config.opener or RaoCliOpener(
-                    config.registry(), work_dir=config.scratch_root
+                opener = final_config.opener or RaoCliOpener(
+                    final_config.registry(), work_dir=final_config.scratch_root
                 )
                 key_epoch = _cache_key_epoch(entry)
                 with (
@@ -1191,20 +1297,38 @@ def _serve_from_cache(
                         sealed,
                         Representation.RAO_AEAD_V1,
                         key_epoch=key_epoch,
-                        work_dir=config.scratch_root,
+                        work_dir=final_config.scratch_root,
                     ) as plaintext,
                 ):
                     digest = sha256_file(plaintext)
-                    if digest != entry.content_sha256:
+                    if digest != expected_content_sha256:
                         raise StoreContentMismatch(
                             "opened cache plaintext digest mismatch: "
-                            f"{digest.hex()} != {entry.content_sha256.hex()}"
+                            f"{digest.hex()} != {expected_content_sha256.hex()}"
                         )
                     size_bytes = plaintext.stat().st_size
-                    with _optional_semaphore_slot(_current_stream_slots()):
-                        _publish_cache_plaintext(plaintext, destination)
+                    if size_bytes != expected_size_bytes:
+                        raise StoreContentMismatch(
+                            f"opened cache plaintext size mismatch: {size_bytes} != "
+                            f"{expected_size_bytes}"
+                        )
+                    yield VerifiedCachePlaintext(
+                        path=plaintext,
+                        content_sha256=expected_content_sha256,
+                        size_bytes=expected_size_bytes,
+                    )
+                    return
             else:
                 raise StoreError(f"unsupported cache representation {entry.representation!r}")
+            if size_bytes != expected_size_bytes:
+                raise StoreContentMismatch(
+                    f"cache plaintext size mismatch: {size_bytes} != {expected_size_bytes}"
+                )
+            yield VerifiedCachePlaintext(
+                path=plaintext,
+                content_sha256=expected_content_sha256,
+                size_bytes=expected_size_bytes,
+            )
     except StoreReadTimeout as exc:
         raise CacheServeFailed(
             "read-deadline",
@@ -1228,12 +1352,6 @@ def _serve_from_cache(
             mark_lost=False,
             count_breaker=True,
         ) from exc
-
-    entry.last_read_at = _utcnow()
-    if not entry.trusted:
-        entry.trusted = True
-    session.flush([entry])
-    return ServeResult(None, "cache", destination, size_bytes)
 
 
 def _serve_from_cache_controlled(
@@ -1753,7 +1871,7 @@ def _serve_slot_context(
     aead_slots: threading.BoundedSemaphore | None,
     *,
     aead_slot_held: bool,
-) -> Iterable[None]:
+) -> Iterator[None]:
     previous = getattr(_SERVE_SLOT_CONTEXT, "value", None)
     _SERVE_SLOT_CONTEXT.value = _ServeSlotContext(
         stream_slots=stream_slots,
@@ -1786,7 +1904,7 @@ def _current_aead_slot_held() -> bool:
 
 
 @contextmanager
-def _semaphore_slot(semaphore: threading.BoundedSemaphore) -> Iterable[None]:
+def _semaphore_slot(semaphore: threading.BoundedSemaphore) -> Iterator[None]:
     semaphore.acquire()
     try:
         yield
@@ -1797,7 +1915,7 @@ def _semaphore_slot(semaphore: threading.BoundedSemaphore) -> Iterable[None]:
 @contextmanager
 def _optional_semaphore_slot(
     semaphore: threading.BoundedSemaphore | None,
-) -> Iterable[None]:
+) -> Iterator[None]:
     if semaphore is None:
         yield
         return
@@ -1806,7 +1924,7 @@ def _optional_semaphore_slot(
 
 
 @contextmanager
-def _optional_unheld_aead_slot() -> Iterable[None]:
+def _optional_unheld_aead_slot() -> Iterator[None]:
     if _current_aead_slot_held():
         yield
         return

@@ -1,4 +1,4 @@
-"""RM1.2a authorization, lease, and real-socket restore-stream verification."""
+"""RM1.2 authorization, source selection, lease, and restore-stream verification."""
 
 from __future__ import annotations
 
@@ -29,9 +29,11 @@ from sutradhara.artifactclass_policy import (
     HdcachePolicy,
     PlacementPolicy,
     apply_artifactclass_policy,
+    get_artifactclass_policy,
 )
 from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, StreamKind, VerifyResult
 from sutradhara.catalog.models import (
+    ArtifactClassPool,
     AssetLocator,
     Backend,
     Bundle,
@@ -50,9 +52,25 @@ from sutradhara.grpc.restore_service import (
     _ManifestFile,
 )
 from sutradhara.grpc.server import GrpcServerConfig, make_server
-from sutradhara.hdcache.models import RestoreOpenSession, RestoreRequest, RestoreRequestItem
+from sutradhara.hdcache.manager import RestoreConfig
+from sutradhara.hdcache.models import (
+    CacheDisk,
+    CacheEntry,
+    RestoreOpenSession,
+    RestoreRequest,
+    RestoreRequestItem,
+)
+from sutradhara.hdcache.store import (
+    AEAD_REPRESENTATION,
+    RAW_REPRESENTATION,
+    ExpectedDiskIdentity,
+    ObservedBlockIdentity,
+    entry_path,
+    write_disk_sentinel,
+    write_entry,
+)
 from sutradhara.jobs.models import Job
-from sutradhara.keys import KeyRegistry
+from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyRegistry
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
@@ -65,6 +83,7 @@ class _DiskArchiveBackend:
         self.paths: dict[str, Path] = {}
         self.max_chunk_seen = 0
         self.whole_reads = 0
+        self.open_calls = 0
 
     @property
     def name(self) -> str:
@@ -99,6 +118,7 @@ class _DiskArchiveBackend:
         *,
         chunk_bytes: int,
     ) -> Iterator[Iterator[bytes]]:
+        self.open_calls += 1
         path = self.paths[str(locator["object_id"])]
         handle = path.open("rb")
         handle.seek(byte_range.start)
@@ -124,6 +144,44 @@ class _DiskArchiveBackend:
     def verify(self, locator: BackendLocator) -> VerifyResult:
         del locator
         return VerifyResult(ok=True)
+
+
+class _CacheIdentityProbe:
+    """Report the physical identity assigned to the cache fixture disk."""
+
+    def observe(self, _mount: Path) -> ObservedBlockIdentity:
+        return ObservedBlockIdentity(
+            mounted=True,
+            serial="RM12B-CACHE",
+            fs_uuid="rm12b-cache-fs",
+        )
+
+
+class _CacheTestOpener:
+    """Test RAO opener preserving the private stored/plaintext boundary."""
+
+    prefix = b"sealed-aead-test\0"
+
+    @contextmanager
+    def open(
+        self,
+        source_path: Path | str,
+        representation: Representation,
+        *,
+        key_epoch: Any | None = None,
+        work_dir: Path | str | None = None,
+    ) -> Iterator[Path]:
+        assert representation is Representation.RAO_AEAD_V1
+        assert key_epoch is not None
+        root = Path(work_dir) if work_dir is not None else Path(source_path).parent
+        plaintext = root / f"opened-{hashlib.sha256(Path(source_path).read_bytes()).hexdigest()}"
+        stored = Path(source_path).read_bytes()
+        assert stored.startswith(self.prefix)
+        plaintext.write_bytes(stored[len(self.prefix) :])
+        try:
+            yield plaintext
+        finally:
+            plaintext.unlink(missing_ok=True)
 
 
 class _Abort(Exception):
@@ -236,11 +294,19 @@ def rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Rig]:
 
     rem_bin = resolve_rem_bin()
     keys = KeyRegistry(root / "keys")
+    cache_config = RestoreConfig(
+        scratch_root=root / "cache-scratch",
+        key_registry=keys,
+        opener=_CacheTestOpener(),
+        hmac_secret=b"rm12b-test-hmac-secret",
+        identity_probe=_CacheIdentityProbe(),
+    )
     config = RestoreServiceConfig(
         engine=engine,
         live_capabilities=LiveCapabilityResolver(capability_source),
         backend_resolver=lambda _session, _artifactclass: dict(backend_by_id),
         extractor_factory=lambda: RemArchiveExtractor(rem_bin, keys=keys),
+        cache_config=cache_config,
         max_concurrent_streams=4,
         lease_duration=dt.timedelta(minutes=5),
         assignment_poll_seconds=0.01,
@@ -368,6 +434,146 @@ def test_open_restore_real_socket_streams_rao_aead_plaintext(rig: _Rig, socket_p
     assert digest.digest() == hashlib.sha256(payload).digest()
     assert kinds[:4] == ["manifest_head", "manifest_entry", "manifest_end", "file_header"]
     assert kinds[-2:] == ["file_end", "job_end"]
+
+
+def test_cache_hit_streams_plaintext_bounded_without_archive_read(rig: _Rig) -> None:
+    payload = (b"bounded hdcache plaintext\n" * 400_000)[: 8 * 1024 * 1024]
+    item_id = _seed_item(rig, "cache-plain", payload, receiver="receiver")
+    _seed_cache_entry(rig, item_id, payload)
+    archive_opens = rig.backend.open_calls
+    digest = hashlib.sha256()
+    max_frame = 0
+
+    tracemalloc.start()
+    baseline, _ = tracemalloc.get_traced_memory()
+    try:
+        for frame in rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        ):
+            if frame.HasField("chunk"):
+                digest.update(frame.chunk.data)
+                max_frame = max(max_frame, len(frame.chunk.data))
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert digest.digest() == hashlib.sha256(payload).digest()
+    assert max_frame <= 1024 * 1024
+    assert peak - baseline < len(payload) // 2
+    assert rig.backend.open_calls == archive_opens
+
+
+def test_private_cache_hit_aead_opens_verified_plaintext_without_archive_read(rig: _Rig) -> None:
+    payload = b"private cache plaintext\n" * 20_000
+    item_id = _seed_item(
+        rig,
+        "cache-aead",
+        payload,
+        receiver="receiver",
+        privacy_level="p2",
+    )
+    _seed_cache_entry(rig, item_id, payload, private=True)
+    archive_opens = rig.backend.open_calls
+    original = rig.capabilities["ada"]
+    try:
+        rig.capabilities["ada"] = frozenset({"can_restore", "can_restore_p2"})
+        frames = list(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+        )
+    finally:
+        rig.capabilities["ada"] = original
+
+    assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+    assert rig.backend.open_calls == archive_opens
+
+
+def test_cache_miss_falls_back_to_verified_archive_disk(rig: _Rig) -> None:
+    payload = b"cache miss archive fallback"
+    item_id = _seed_item(rig, "cache-miss", payload, receiver="receiver")
+    archive_opens = rig.backend.open_calls
+
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+
+    assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+    assert rig.backend.open_calls > archive_opens
+
+
+def test_corrupt_cache_degrades_to_verified_archive(rig: _Rig) -> None:
+    payload = b"archive truth survives a corrupt cache"
+    item_id = _seed_item(rig, "cache-corrupt", payload, receiver="receiver")
+    cache_path = _seed_cache_entry(rig, item_id, payload)
+    cache_path.write_bytes(b"corrupt cache bytes")
+    archive_opens = rig.backend.open_calls
+
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+
+    assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+    assert rig.backend.open_calls > archive_opens
+
+
+def test_archive_integrity_failure_marks_suspect_and_uses_next_disk_candidate(
+    rig: _Rig,
+) -> None:
+    payload = b"secondary disk candidate is healthy"
+    item_id = _seed_item(rig, "suspect-fallback", payload, receiver="receiver")
+    primary_path = rig.backend.paths["object-suspect-fallback"]
+    fallback_copy_id = _add_archive_candidate(rig, item_id, payload, suffix="secondary")
+    corrupt = bytearray(payload)
+    corrupt[0] ^= 0xFF
+    primary_path.write_bytes(b"archive-prefix" + corrupt)
+
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+
+    assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+    with session_scope(rig.engine) as session:
+        copies = list(
+            session.scalars(
+                select(Copy).where(Copy.bundle_id == "bundle-suspect-fallback").order_by(Copy.id)
+            )
+        )
+        assert copies[0].health == CopyHealth.SUSPECT
+        assert copies[1].id == fallback_copy_id
+        assert copies[1].health == CopyHealth.OK
+
+
+def test_manifest_digest_is_source_independent_between_archive_and_cache(rig: _Rig) -> None:
+    payload = b"manifest identity ignores selected source"
+    item_id = _seed_item(rig, "manifest-source", payload, receiver="receiver")
+    archive_frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+    _seed_cache_entry(rig, item_id, payload)
+    cache_frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+
+    assert _manifest_sha256(archive_frames) == _manifest_sha256(cache_frames)
+    assert _payload_digest(archive_frames) == _payload_digest(cache_frames)
 
 
 def test_manifest_digest_golden_vectors_and_cross_frame_consistency(rig: _Rig) -> None:
@@ -597,20 +803,22 @@ def test_restore_capacity_fails_fast_and_cancellation_releases_state(rig: _Rig) 
         assert lease.expires_at <= dt.datetime.now(dt.UTC).replace(tzinfo=None)
 
 
-def test_archive_error_frame_does_not_mark_item_sent(rig: _Rig) -> None:
+def test_archive_integrity_exhaustion_aborts_before_any_frame(rig: _Rig) -> None:
     item_id = _seed_item(rig, "stream-error", b"expected bytes", receiver="receiver")
     path = rig.backend.paths["object-stream-error"]
     path.write_bytes(b"archive-prefix" + b"corrupted data")
 
-    frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+    emitted: list[Any] = []
+    with pytest.raises(_Abort) as failed:
+        emitted.extend(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
         )
-    )
 
-    assert frames[-1].HasField("error")
-    assert not any(frame.HasField("job_end") for frame in frames)
+    assert failed.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert emitted == []
     with session_scope(rig.engine) as session:
         item = session.get(RestoreRequestItem, item_id)
         assert item is not None
@@ -643,25 +851,31 @@ def test_completed_stream_is_sent_without_job_or_local_write_and_console_is_acti
     assert not forbidden_local.exists()
 
 
-def test_completed_stream_records_actual_tape_source(rig: _Rig) -> None:
+def test_tape_only_source_is_deferred_without_opening_tape(rig: _Rig) -> None:
     item_id = _seed_item(rig, "source-tape", b"served from tape", receiver="receiver")
     with session_scope(rig.engine) as session:
         backend = session.scalar(select(Backend).where(Backend.name == "disk-source-tape"))
         assert backend is not None
         backend.kind = BackendKind.REM_TAPE
 
-    frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+    archive_opens = rig.backend.open_calls
+    emitted: list[Any] = []
+    with pytest.raises(_Abort) as deferred:
+        emitted.extend(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
         )
-    )
 
-    assert frames[-1].HasField("job_end")
+    assert deferred.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert "RM3" in deferred.value.details
+    assert emitted == []
+    assert rig.backend.open_calls == archive_opens
     with session_scope(rig.engine) as session:
         item = session.get(RestoreRequestItem, item_id)
         assert item is not None
-        assert item.source == "tape"
+        assert item.state == "queued"
 
 
 def test_watch_assignments_isolates_authenticated_device(rig: _Rig) -> None:
@@ -872,6 +1086,178 @@ def _seed_item(
         session.add(request)
         session.flush()
         return item.id
+
+
+def _seed_cache_entry(
+    rig: _Rig,
+    item_id: int,
+    payload: bytes,
+    *,
+    private: bool = False,
+) -> Path:
+    """Place the item's bytes in a live hdcache disk using the real layout."""
+
+    mount = rig.root / "hdcache-disk"
+    mount.mkdir(parents=True, exist_ok=True)
+    identity = ExpectedDiskIdentity("d-cache", "RM12B-CACHE", "rm12b-cache-fs")
+    write_disk_sentinel(
+        mount,
+        identity,
+        hmac_secret=b"rm12b-test-hmac-secret",
+    )
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        disk = session.get(CacheDisk, identity.disk_id)
+        if disk is None:
+            disk = CacheDisk(
+                disk_id=identity.disk_id,
+                serial=identity.serial,
+                fs_uuid=identity.fs_uuid,
+                mount=str(mount),
+                state="active",
+                capacity_bytes=10 * 1024 * 1024 * 1024,
+                filled_bytes=0,
+            )
+            session.add(disk)
+            session.flush()
+        representation = RAW_REPRESENTATION
+        key_epoch: str | None = None
+        stored_digest: bytes | None = None
+        if private:
+            cache_config = rig.service_config.cache_config
+            assert cache_config is not None
+            registry = cache_config.key_registry
+            assert registry is not None
+            epoch = registry.create_epoch(KEY_DOMAIN_HDCACHE)
+            stored = _CacheTestOpener.prefix + payload
+            representation = AEAD_REPRESENTATION
+            key_epoch = epoch.key_id
+            stored_digest = hashlib.sha256(stored).digest()
+            result = write_entry(
+                mount,
+                item.content_sha256,
+                stored,
+                representation=representation,
+                key_epoch=key_epoch,
+                expected_stream_sha256=stored_digest,
+            )
+        else:
+            result = write_entry(mount, item.content_sha256, payload)
+        session.add(
+            CacheEntry(
+                content_sha256=item.content_sha256,
+                artifactclass=item.artifactclass,
+                disk_id=disk.disk_id,
+                relpath=result.relpath,
+                size_bytes=result.size_bytes,
+                state="present",
+                representation=representation,
+                key_epoch=key_epoch,
+                stored_digest=stored_digest,
+                trusted=True,
+            )
+        )
+        disk.filled_bytes += result.size_bytes
+        return entry_path(
+            mount,
+            item.content_sha256,
+            representation=representation,
+            key_epoch=key_epoch,
+        )
+
+
+def _add_archive_candidate(rig: _Rig, item_id: int, payload: bytes, *, suffix: str) -> int:
+    """Append a lower-priority disk copy for candidate-fallback verification."""
+
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        primary = session.scalar(
+            select(Copy).where(Copy.bundle_id == "bundle-suspect-fallback").order_by(Copy.id)
+        )
+        assert primary is not None
+        pool_id = f"pool-suspect-fallback-{suffix}"
+        backend_row = Backend(
+            name=f"disk-suspect-fallback-{suffix}",
+            kind=BackendKind.REM_DISK,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        session.add(backend_row)
+        session.flush()
+        rig.backend_by_id[backend_row.id] = rig.backend
+        session.add(
+            Pool(
+                id=pool_id,
+                backend_id=backend_row.id,
+                representation=Representation.RAW_BYTES.value,
+            )
+        )
+        session.add(
+            ArtifactClassPool(
+                artifactclass=item.artifactclass,
+                pool_id=pool_id,
+                active=True,
+                sort_order=1,
+            )
+        )
+        policy = get_artifactclass_policy(session, item.artifactclass)
+        assert primary.pool_id is not None
+        policy.restore_preference = [primary.pool_id, pool_id]
+        prefix = b"archive-prefix"
+        stored_path = rig.root / f"object-suspect-fallback-{suffix}.raw"
+        stored_path.write_bytes(prefix + payload)
+        native = rig.backend.add(f"object-suspect-fallback-{suffix}", stored_path)
+        copy = Copy(
+            bundle_id=primary.bundle_id,
+            backend_id=backend_row.id,
+            pool_id=pool_id,
+            native_locator=native,
+            native_locator_key=locator_key(native),
+            storage_metadata={
+                "representation": Representation.RAW_BYTES.value,
+                "stored_size_bytes": stored_path.stat().st_size,
+            },
+            integrity_hash=hashlib.sha256(stored_path.read_bytes()).digest(),
+            source=CopySource.INGEST,
+            health=CopyHealth.OK,
+        )
+        session.add(copy)
+        session.flush()
+        session.add(
+            AssetLocator(
+                logical_asset_hash=item.content_sha256,
+                pool_id=pool_id,
+                copy_id=copy.id,
+                bundle_id=primary.bundle_id,
+                member_path="payload.bin",
+                native_locator={
+                    "member_path": "payload.bin",
+                    "size_bytes": len(payload),
+                    "block_range": [len(prefix), len(prefix) + len(payload)],
+                },
+                representation=Representation.RAW_BYTES.value,
+            )
+        )
+        return copy.id
+
+
+def _payload_digest(frames: list[Any]) -> bytes:
+    digest = hashlib.sha256()
+    for frame in frames:
+        if frame.HasField("chunk"):
+            digest.update(frame.chunk.data)
+    return digest.digest()
+
+
+def _manifest_sha256(frames: list[Any]) -> bytes:
+    return bytes(
+        next(
+            frame.manifest_head.manifest_sha256
+            for frame in frames
+            if frame.HasField("manifest_head")
+        )
+    )
 
 
 def _reference_manifest_digest(entries: list[tuple[str, int, bytes]]) -> bytes:

@@ -1,6 +1,6 @@
 # Prompt RM1.2b — bounded hdcache producer + unified cache-first source-selection (B4)
 
-**Status:** pending (gpt-5.6-sol). RM1.2 part b. Builds on RM1.2a (landed sutradhara main @a2301ff:
+**Status:** implemented 2026-07-12 (gpt-5.6-sol). RM1.2 part b. Builds on RM1.2a (landed sutradhara main @a2301ff:
 OpenRestore streaming over archive-backed items) + RM0. **This is the SECOND safety funnel of RM1.2:
 source-SELECTION. Additive — it deepens where OpenRestore gets its bytes; it does NOT change the proto,
 the auth gate, the lease, the frame protocol, the frozen-manifest rule, or `sent`-not-`done`.**

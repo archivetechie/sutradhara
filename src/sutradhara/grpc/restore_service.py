@@ -13,6 +13,7 @@ import hashlib
 import struct
 import threading
 from collections.abc import Callable, Generator, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, NoReturn
@@ -27,16 +28,18 @@ from sutradhara.api.live_capabilities import LiveCapabilityResolver
 from sutradhara.archive_restore import (
     ArchiveExtractor,
     ArchiveRestoreError,
+    LogicalMemberIntegrityError,
     PlannedMember,
     RemArchiveExtractor,
+    RestoreIntegrityError,
     RestorePlan,
     RestoreSourceUnavailable,
     build_restore_plan,
 )
 from sutradhara.artifactclass_policy import hdcache_privacy_capability_map_from_env
-from sutradhara.backend.port import StorageBackend
+from sutradhara.backend.port import BackendError, StorageBackend
 from sutradhara.catalog.session import make_session_factory
-from sutradhara.catalog.types import BackendKind
+from sutradhara.catalog.types import BackendKind, CopyHealth
 from sutradhara.grpc import ca as grpc_ca
 from sutradhara.grpc import store as grpc_store
 from sutradhara.hdcache.fill import effective_privacy_level
@@ -45,12 +48,19 @@ from sutradhara.hdcache.manager import (
     ITEM_SENT,
     ITEM_STREAMING,
     REQUEST_ACTIVE,
+    CacheServeFailed,
     InvalidRestoreDestination,
+    RestoreConfig,
+    _select_cache_entry,
     authorize_agent_restore_destination,
+    open_cache_plaintext_chunks,
     restore_backends_for_artifactclass,
+    restore_config_from_env,
     validate_restore_relative_path,
 )
-from sutradhara.hdcache.models import RestoreOpenSession, RestoreRequestItem
+from sutradhara.hdcache.models import CacheEntry, RestoreOpenSession, RestoreRequestItem
+from sutradhara.restore import RestoreIntegrityError as ChunkRestoreIntegrityError
+from sutradhara.staging import StagingError
 
 _MANIFEST_DOMAIN = b"sutradhara.restore.manifest.v1\x00"
 _SYNTHETIC_MODE = 0o644
@@ -70,6 +80,7 @@ class RestoreServiceConfig:
     live_capabilities: LiveCapabilityResolver | None = None
     backend_resolver: BackendResolver = restore_backends_for_artifactclass
     extractor_factory: ExtractorFactory = RemArchiveExtractor
+    cache_config: RestoreConfig | None = None
     max_concurrent_streams: int = 4
     # Mid-stream lease renewal lands in RM1.3; this default only raises the ceiling.
     lease_duration: dt.timedelta = dt.timedelta(minutes=30)
@@ -104,11 +115,13 @@ class _PreparedOpen:
 
     item_id: int
     device_id: str
+    artifactclass: str
     original_state: str
     manifest: _ManifestFile
     manifest_sha256: bytes
-    plan: RestorePlan
-    member: PlannedMember
+    plan: RestorePlan | None
+    member: PlannedMember | None
+    cache_entry_hash: bytes | None
     source: str
 
 
@@ -130,6 +143,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         self.config = config
         self._factory = make_session_factory(config.engine)
         self._live = config.live_capabilities or LiveCapabilityResolver.from_database(config.engine)
+        self._cache = config.cache_config or restore_config_from_env()
         self._slots = threading.BoundedSemaphore(config.max_concurrent_streams)
 
     def OpenRestore(self, request: Any, context: Any) -> Iterator[Any]:
@@ -148,7 +162,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             if (yield from self._stream(prepared, lease, context)):
                 completed = self._mark_sent(prepared, lease)
         finally:
-            if prepared is not None:
+            if prepared is not None and prepared.plan is not None:
                 prepared.plan.close()
             if lease is not None:
                 if not completed and prepared is not None:
@@ -266,29 +280,12 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 final_rel_path = validate_restore_relative_path(item.final_rel_path)
             except InvalidRestoreDestination as exc:
                 _abort(context, grpc.StatusCode.FAILED_PRECONDITION, str(exc))
-            backends = self.config.backend_resolver(session, item.artifactclass)
-            plan = build_restore_plan(
-                session,
-                asset_hash=item.content_sha256,
-                artifactclass=item.artifactclass,
-                backends=backends,
-                extractor=self.config.extractor_factory(),
-            )
             manifest = _ManifestFile(
                 index=0,
                 final_rel_path=final_rel_path,
                 size=item.size_bytes,
                 content_sha256=item.content_sha256,
             )
-            try:
-                member = _first_matching_member(plan, manifest)
-            except RestoreSourceUnavailable:
-                plan.close()
-                _abort(
-                    context,
-                    grpc.StatusCode.FAILED_PRECONDITION,
-                    "no archive source matches the item manifest",
-                )
             digest = _manifest_digest([manifest])
             if request.HasField("lease_token"):
                 supplied = request.lease_token
@@ -297,20 +294,70 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     or supplied.receiver_device_id != identity.device_id
                     or supplied.manifest_sha256 != digest
                 ):
-                    plan.close()
                     _abort(
                         context, grpc.StatusCode.FAILED_PRECONDITION, "lease token does not match"
                     )
+            plan: RestorePlan | None = None
+            member: PlannedMember | None = None
+            cache_entry_hash: bytes | None = None
+            source = "cache"
+            entry = _select_cache_entry(session, item.content_sha256, config=self._cache)
+            if entry is not None and self._probe_cache_entry(session, entry, item):
+                cache_entry_hash = entry.content_sha256
+            else:
+                backends = self.config.backend_resolver(session, item.artifactclass)
+                plan = build_restore_plan(
+                    session,
+                    asset_hash=item.content_sha256,
+                    artifactclass=item.artifactclass,
+                    backends=backends,
+                    extractor=self.config.extractor_factory(),
+                )
+                try:
+                    member = _select_verified_disk_member(plan, manifest)
+                    session.commit()
+                except TapeSourceDeferred as exc:
+                    plan.close()
+                    _abort(context, grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+                except RestoreIntegrityError as exc:
+                    session.commit()
+                    plan.close()
+                    _abort(context, grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+                except RestoreSourceUnavailable as exc:
+                    plan.close()
+                    _abort(context, grpc.StatusCode.FAILED_PRECONDITION, str(exc))
             return _PreparedOpen(
                 item_id=item.id,
                 device_id=identity.device_id,
+                artifactclass=item.artifactclass,
                 original_state=ITEM_QUEUED if item.state == ITEM_STREAMING else item.state,
                 manifest=manifest,
                 manifest_sha256=digest,
                 plan=plan,
                 member=member,
-                source=_member_source(member),
+                cache_entry_hash=cache_entry_hash,
+                source=source,
             )
+
+    def _probe_cache_entry(
+        self, session: Session, entry: CacheEntry, item: RestoreRequestItem
+    ) -> bool:
+        """Verify a cache hit to EOF before any restore frame can be emitted."""
+
+        assert item.size_bytes is not None
+        try:
+            with open_cache_plaintext_chunks(
+                session,
+                entry,
+                expected_content_sha256=item.content_sha256,
+                expected_size_bytes=item.size_bytes,
+                artifactclass=item.artifactclass,
+                config=self._cache,
+            ) as chunks:
+                _drain_chunks(chunks)
+        except CacheServeFailed:
+            return False
+        return True
 
     def _require_live_capabilities(
         self,
@@ -416,14 +463,14 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         yield restore_pb2.RestoreFrame(file_header=_file_header_proto(manifest))
         offset = 0
         try:
-            with prepared.plan.open_member_stream(prepared.member) as chunks:
+            with self._open_prepared_chunks(prepared) as chunks:
                 for chunk in chunks:
                     _require_active(context)
                     yield restore_pb2.RestoreFrame(
                         chunk=restore_pb2.Chunk(data=chunk, offset=offset)
                     )
                     offset += len(chunk)
-        except ArchiveRestoreError as exc:
+        except (ArchiveRestoreError, CacheServeFailed) as exc:
             yield restore_pb2.RestoreFrame(
                 error=restore_pb2.RestoreError(code="ARCHIVE_RESTORE_FAILED", message=str(exc))
             )
@@ -448,6 +495,30 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             )
         )
         return True
+
+    @contextmanager
+    def _open_prepared_chunks(self, prepared: _PreparedOpen) -> Iterator[Iterator[bytes]]:
+        """Open the one pre-verified source through the common plaintext funnel."""
+
+        if prepared.cache_entry_hash is not None:
+            with self._factory() as session:
+                entry = _select_cache_entry(session, prepared.cache_entry_hash, config=self._cache)
+                if entry is None:
+                    raise RestoreSourceUnavailable("verified cache source became unavailable")
+                with open_cache_plaintext_chunks(
+                    session,
+                    entry,
+                    expected_content_sha256=prepared.manifest.content_sha256,
+                    expected_size_bytes=prepared.manifest.size,
+                    artifactclass=prepared.artifactclass,
+                    config=self._cache,
+                ) as chunks:
+                    yield chunks
+            return
+        if prepared.plan is None or prepared.member is None:
+            raise RestoreSourceUnavailable("prepared restore source is incomplete")
+        with prepared.plan.open_member_stream(prepared.member) as chunks:
+            yield chunks
 
     def _mark_streaming(self, prepared: _PreparedOpen) -> None:
         with self._factory.begin() as session:
@@ -491,6 +562,11 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             item = session.get(RestoreRequestItem, prepared.item_id)
             if item is not None and item.request is not None:
                 item.request.state = REQUEST_ACTIVE
+            if prepared.cache_entry_hash is not None:
+                entry = session.get(CacheEntry, prepared.cache_entry_hash)
+                if entry is not None:
+                    entry.last_read_at = now
+                    entry.trusted = True
             return True
 
     def _restore_interrupted_state(self, prepared: _PreparedOpen, lease: _Lease) -> None:
@@ -568,22 +644,55 @@ def _manifest_digest(files: Iterable[_ManifestFile]) -> bytes:
     return digest.digest()
 
 
-def _first_matching_member(plan: RestorePlan, manifest: _ManifestFile) -> PlannedMember:
+class TapeSourceDeferred(RestoreSourceUnavailable):
+    """The frozen item has only tape-backed sources, deferred until RM3."""
+
+
+def _select_verified_disk_member(plan: RestorePlan, manifest: _ManifestFile) -> PlannedMember:
+    """Probe ordered archive candidates, persisting restore_asset's SUSPECT rule."""
+
+    errors: list[str] = []
+    saw_tape = False
+    saw_disk = False
     for member in plan.iter_members():
-        if (
-            member.asset_hash == manifest.content_sha256
-            and member.expected_logical_size == manifest.size
+        if member.asset_hash != manifest.content_sha256 or (
+            member.expected_logical_size != manifest.size
         ):
+            continue
+        if member.copy.backend.kind in {BackendKind.REM_TAPE, BackendKind.D2_TAPE}:
+            saw_tape = True
+            continue
+        saw_disk = True
+        try:
+            with plan.open_member_stream(member) as chunks:
+                _drain_chunks(chunks)
             return member
-    raise RestoreSourceUnavailable("restore plan has no member matching the frozen manifest")
+        except LogicalMemberIntegrityError as exc:
+            member.copy.health = CopyHealth.SUSPECT
+            errors.append(f"copy id={member.copy.id} pool={member.pool_id}: {exc}")
+        except (
+            ArchiveRestoreError,
+            BackendError,
+            StagingError,
+            ChunkRestoreIntegrityError,
+        ) as exc:
+            errors.append(f"copy id={member.copy.id} pool={member.pool_id}: {exc}")
+
+    if errors:
+        raise RestoreIntegrityError(
+            f"all disk candidate restores for asset {manifest.content_sha256.hex()} "
+            "failed integrity: " + "; ".join(errors)
+        )
+    if saw_tape and not saw_disk:
+        raise TapeSourceDeferred("tape source deferred to RM3")
+    raise RestoreSourceUnavailable("no healthy disk locator matches the frozen item manifest")
 
 
-def _member_source(member: PlannedMember) -> str:
-    """Map the selected backend to the persisted cache/disk-or-tape vocabulary."""
+def _drain_chunks(chunks: Iterator[bytes]) -> None:
+    """Pull a bounded producer to verified EOF without retaining its payload."""
 
-    if member.copy.backend.kind in {BackendKind.REM_TAPE, BackendKind.D2_TAPE}:
-        return "tape"
-    return "cache"
+    for _chunk in chunks:
+        pass
 
 
 def _manifest_entry_proto(entry: _ManifestFile) -> Any:
