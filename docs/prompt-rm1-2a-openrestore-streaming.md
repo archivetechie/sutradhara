@@ -1,6 +1,6 @@
 # Prompt RM1.2a — authorized `OpenRestore` streaming + shared restore.proto (NO hdcache source-depth)
 
-**Status:** pending (gpt-5.6-sol). Second RM1 milestone, part a. Builds on RM1.1 (landed
+**Status:** implemented. Second RM1 milestone, part a. Builds on RM1.1 (landed
 sutradhara main @ba04c6e) and RM0 (streaming restore, landed).
 **Normative (read FIRST, binding — do NOT inline):**
 `docs/design-restore-agent-protocol-v0.1.md` **§7** (the v0.2 fold) — esp **§7.5 RM1.2**, §3.2

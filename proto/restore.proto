@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+package sutradhara.restore;
+
+// Shared server/RM2 restore-agent contract.
+//
+// CommitRestore(REVEALED) is terminal and idempotent whether or not the agent
+// previously reported STAGED. committed_index is the count of complete files
+// durably staged in manifest order. If a STAGED acknowledgement is lost, the
+// server may re-stream from an older committed_index; the client MUST verify
+// every received file, skip data it already knows is durable, and truncate the
+// in-progress file before accepting its re-stream. RM1.3 implements these
+// durable commit and resume rules; RM1.2a fixes their wire representation.
+//
+// Version 1 carries regular files only. mode/uid/gid/mtime are synthetic
+// catalog-independent metadata. Xattrs and other entry types are out of v1.
+//
+// manifest_sha256 is SHA-256 over these bytes in order: the domain
+// "sutradhara.restore.manifest.v1\0"; a big-endian uint32 file count; then,
+// for each ordered entry, a big-endian uint32 UTF-8 path length, the path,
+// a big-endian uint64 plaintext size, and the 32-byte plaintext content hash.
+// The server freezes this digest before emitting any data frame.
+//
+// OpenRestore rejects a live open-session generation and supersedes only an
+// expired generation. WatchAssignments polls admitted queued/sent agent items
+// and emits each observed item once per watch. It deliberately exposes only
+// device-scoped metadata (item id/path/size/artifactclass/destination) and does
+// not apply the live operator-capability gate; OpenRestore fully gates object
+// bytes. It is scoped to the authenticated mTLS peer: device_id MUST equal that
+// peer's device id.
+service RestoreService {
+  rpc OpenRestore(OpenRestoreRequest) returns (stream RestoreFrame);
+  rpc CommitRestore(CommitRestoreRequest) returns (CommitRestoreReply);
+  rpc WatchAssignments(WatchRequest) returns (stream Assignment);
+}
+
+message OpenRestoreRequest {
+  int64 restore_request_item_id = 1;
+  LeaseToken lease_token = 2;
+  ResumeToken resume_token = 3;
+}
+
+message LeaseToken {
+  int64 restore_request_item_id = 1;
+  string receiver_device_id = 2;
+  bytes manifest_sha256 = 3;
+  uint64 generation = 4;
+  int64 expires_unix_ms = 5;
+}
+
+message ResumeToken {
+  int64 restore_request_item_id = 1;
+  bytes manifest_sha256 = 2;
+  uint32 committed_index = 3;
+}
+
+message RestoreFrame {
+  oneof payload {
+    ManifestHead manifest_head = 1;
+    ManifestEntry manifest_entry = 2;
+    FileHeader file_header = 3;
+    Chunk chunk = 4;
+    FileEnd file_end = 5;
+    ManifestEnd manifest_end = 6;
+    JobEnd job_end = 7;
+    RestoreError error = 8;
+  }
+}
+
+message ManifestHead {
+  uint64 total_bytes = 1;
+  uint32 file_count = 2;
+  bool single_top_level = 3;
+  string top_component = 4;
+  bytes manifest_sha256 = 5;
+  LeaseToken lease_token = 6;
+}
+
+// Whole-manifest-up-front entry, allowing the client to bound memory and verify.
+// This is intentionally distinct from the identical per-file FileHeader below.
+message ManifestEntry {
+  uint32 index = 1;
+  string final_rel_path = 2;
+  uint64 size = 3;
+  bytes content_sha256 = 4;
+  uint32 mode = 5;
+  uint32 uid = 6;
+  uint32 gid = 7;
+  int64 mtime_unix_seconds = 8;
+}
+
+// Per-file delivery preamble; it is not redundant with ManifestEntry.
+message FileHeader {
+  uint32 index = 1;
+  string final_rel_path = 2;
+  uint64 size = 3;
+  bytes content_sha256 = 4;
+  uint32 mode = 5;
+  uint32 uid = 6;
+  uint32 gid = 7;
+  int64 mtime_unix_seconds = 8;
+}
+
+message Chunk {
+  bytes data = 1;
+  // File-relative byte offset; resets to zero at each file boundary.
+  oneof optional_offset {
+    uint64 offset = 2;
+  }
+}
+
+message FileEnd {
+  uint32 index = 1;
+  string final_rel_path = 2;
+  uint64 bytes = 3;
+  bytes content_sha256 = 4;
+}
+
+message ManifestEnd {
+  bytes manifest_sha256 = 1;
+  uint32 file_count = 2;
+}
+
+message JobEnd {
+  uint32 files = 1;
+  uint64 bytes = 2;
+  bytes manifest_sha256 = 3;
+}
+
+message RestoreError {
+  string code = 1;
+  string message = 2;
+}
+
+enum DurableState {
+  DURABLE_STATE_UNSPECIFIED = 0;
+  DURABLE_STATE_STAGED = 1;
+  DURABLE_STATE_REVEALED = 2;
+}
+
+message CommitRestoreRequest {
+  int64 restore_request_item_id = 1;
+  bytes manifest_sha256 = 2;
+  uint32 committed_index = 3;
+  DurableState durable_state = 4;
+  LeaseToken lease_token = 5;
+}
+
+message CommitRestoreReply {
+  int64 restore_request_item_id = 1;
+  string status = 2;
+  uint32 committed_index = 3;
+  bool revealed = 4;
+}
+
+message WatchRequest {
+  string device_id = 1;
+}
+
+message Assignment {
+  int64 restore_request_item_id = 1;
+  string restore_request_id = 2;
+  bytes manifest_sha256 = 3;
+  string final_rel_path = 4;
+  uint64 size = 5;
+  string artifactclass = 6;
+  string destination_id = 7;
+  string state = 8;
+}

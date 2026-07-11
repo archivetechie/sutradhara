@@ -13,11 +13,12 @@ from pathlib import Path
 import grpc
 from sqlalchemy import Engine
 
-from sutradhara._proto import device_pb2_grpc, intake_pb2_grpc
+from sutradhara._proto import device_pb2_grpc, intake_pb2_grpc, restore_pb2_grpc
 from sutradhara.grpc.ca import load_server_credentials
 from sutradhara.grpc.device_service import DeviceService, DeviceServiceConfig
 from sutradhara.grpc.progress import ReceiveProgressRegistry
 from sutradhara.grpc.registry import ConnectedDeviceRegistry
+from sutradhara.grpc.restore_service import RestoreService, RestoreServiceConfig
 from sutradhara.grpc.servicer import GrpcIntakeConfig, IntakeServicer
 from sutradhara_receive import sweep_orphans
 
@@ -29,7 +30,7 @@ DEFAULT_REGISTRY_SWEEP_INTERVAL_SECONDS = 30.0
 
 @dataclass(frozen=True)
 class GrpcServerConfig:
-    """Configuration for the streaming-intake gRPC server."""
+    """Configuration for the shared intake, device, and restore mTLS server."""
 
     engine: Engine
     landing_root: Path
@@ -39,6 +40,7 @@ class GrpcServerConfig:
     validate_artifactclass: bool = True
     registry: ConnectedDeviceRegistry | None = None
     progress_registry: ReceiveProgressRegistry | None = None
+    restore: RestoreServiceConfig | None = None
 
 
 def make_server(config: GrpcServerConfig) -> grpc.Server:
@@ -48,8 +50,17 @@ def make_server(config: GrpcServerConfig) -> grpc.Server:
     ca_cert, server_cert, server_key = load_server_credentials(config.pki_dir)
     registry = config.registry or ConnectedDeviceRegistry()
     progress_registry = config.progress_registry or ReceiveProgressRegistry()
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
-    intake_pb2_grpc.add_IntakeServiceServicer_to_server(
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=16),
+        options=(
+            ("grpc.keepalive_time_ms", 30_000),
+            ("grpc.keepalive_timeout_ms", 20_000),
+            ("grpc.http2.max_pings_without_data", 0),
+            ("grpc.http2.initial_stream_window_size", 4 * 1024 * 1024),
+            ("grpc.http2.initial_connection_window_size", 4 * 1024 * 1024),
+        ),
+    )
+    intake_pb2_grpc.add_IntakeServiceServicer_to_server(  # type: ignore[no-untyped-call]
         IntakeServicer(
             GrpcIntakeConfig(
                 engine=config.engine,
@@ -60,8 +71,15 @@ def make_server(config: GrpcServerConfig) -> grpc.Server:
         ),
         server,
     )
-    device_pb2_grpc.add_DeviceServiceServicer_to_server(
+    device_pb2_grpc.add_DeviceServiceServicer_to_server(  # type: ignore[no-untyped-call]
         DeviceService(DeviceServiceConfig(engine=config.engine, registry=registry)),
+        server,
+    )
+    restore_config = config.restore or RestoreServiceConfig(engine=config.engine)
+    if restore_config.engine is not config.engine:
+        raise ValueError("restore service must use the shared server database engine")
+    restore_pb2_grpc.add_RestoreServiceServicer_to_server(  # type: ignore[no-untyped-call]
+        RestoreService(restore_config),
         server,
     )
     creds = grpc.ssl_server_credentials(

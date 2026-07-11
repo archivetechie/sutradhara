@@ -47,7 +47,8 @@ fi
     --grpc_python_out="${SERVER_PROTO_OUT}" \
     "${PROTO_SRC}/layer5.proto" \
     "${PROTO_SRC}/intake.proto" \
-    "${PROTO_SRC}/device.proto"
+    "${PROTO_SRC}/device.proto" \
+    "${PROTO_SRC}/restore.proto"
 
 # protoc emits imports like `import layer5_pb2`, which only works if
 # ${PROTO_OUT} is on sys.path. We're a package, so rewrite to a relative
