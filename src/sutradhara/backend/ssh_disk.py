@@ -13,9 +13,10 @@ import shlex
 import subprocess
 import tempfile
 from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from subprocess import CompletedProcess
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from sutradhara.backend.port import (
     BackendError,
@@ -24,6 +25,7 @@ from sutradhara.backend.port import (
     BackendUnavailableError,
     ByteRange,
     CopyRecord,
+    StreamKind,
     VerifyResult,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
@@ -154,7 +156,9 @@ class RsyncSshTransport:
         try:
             size = int(result.stdout.strip())
         except ValueError as exc:
-            raise BackendError(f"stat {relpath!r} returned invalid size: {result.stdout!r}") from exc
+            raise BackendError(
+                f"stat {relpath!r} returned invalid size: {result.stdout!r}"
+            ) from exc
         if size < 0:
             raise BackendError(f"stat {relpath!r} returned negative size: {size}")
         return size
@@ -207,8 +211,7 @@ class RsyncSshTransport:
                 + (f": {detail}" if detail else "")
             )
         raise BackendError(
-            f"{operation} failed with exit {result.returncode}"
-            + (f": {detail}" if detail else "")
+            f"{operation} failed with exit {result.returncode}" + (f": {detail}" if detail else "")
         )
 
     def _ssh_base_args(self) -> list[str]:
@@ -267,6 +270,12 @@ class SshDiskBackend:
     def name(self) -> str:
         return self._name
 
+    @property
+    def stream_kind(self) -> StreamKind:
+        """SSH disk reads rsync the whole object to scratch before delivery."""
+
+        return StreamKind.scratch_stream
+
     def enumerate(self) -> Iterator[CopyRecord]:
         for relpath in self._transport.list_files():
             try:
@@ -324,13 +333,42 @@ class SshDiskBackend:
                 fh.seek(byte_range.start)
                 return fh.read(byte_range.length)
 
+    @contextmanager
+    def open_materialized_range_chunks(
+        self,
+        locator: BackendLocator,
+        byte_range: ByteRange,
+        *,
+        chunk_bytes: int,
+    ) -> Iterator[Iterator[bytes]]:
+        """Rsync wholly to scratch, then keep that scratch alive while chunking."""
+
+        if chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be greater than zero")
+        key = _locator_key(locator)
+        with tempfile.TemporaryDirectory(prefix="sutradhara-ssh-disk-") as raw:
+            tmp = Path(raw) / "object"
+            self._download(key, tmp)
+            size = tmp.stat().st_size
+            end = size if byte_range.is_whole_object else byte_range.end
+            if end > size:
+                raise ValueError(f"byte range end {end} exceeds object size {size}")
+            with tmp.open("rb") as source:
+                source.seek(byte_range.start)
+                yield _read_file_chunks(
+                    source,
+                    remaining=end - byte_range.start,
+                    chunk_bytes=chunk_bytes,
+                )
+
     def verify(self, locator: BackendLocator) -> VerifyResult:
         key = _locator_key(locator)
-        digest_hex = self._transport.sha256(key)
-        if digest_hex is None:
+        digest_value: object = self._transport.sha256(key)
+        if digest_value is None:
             return VerifyResult(ok=False, detail="absent")
-        if not isinstance(digest_hex, str):
+        if not isinstance(digest_value, str):
             return VerifyResult(ok=False, detail="invalid hash")
+        digest_hex = digest_value
         expected_hex = locator.get("sha256")
         if not isinstance(expected_hex, str):
             return VerifyResult(ok=False, detail="invalid hash")
@@ -349,6 +387,12 @@ class SshDiskBackend:
 
     def delete_object(self, locator: BackendLocator) -> None:
         self._transport.remove(_locator_key(locator))
+
+    def _download(self, key: str, destination: Path) -> None:
+        try:
+            self._transport.get(key, destination)
+        except (FileNotFoundError, BackendNotFoundError) as exc:
+            raise BackendNotFoundError(f"ssh_disk object not found: {key}") from exc
 
 
 def _default_runner(
@@ -400,3 +444,19 @@ def _sha256_file(path: Path) -> bytes:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.digest()
+
+
+def _read_file_chunks(
+    source: BinaryIO,
+    *,
+    remaining: int,
+    chunk_bytes: int,
+) -> Iterator[bytes]:
+    """Read a bounded range from the materialized SSH scratch file."""
+
+    while remaining:
+        chunk = source.read(min(chunk_bytes, remaining))
+        if not chunk:
+            raise BackendError("ssh_disk scratch object ended before the requested range")
+        remaining -= len(chunk)
+        yield chunk

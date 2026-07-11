@@ -22,9 +22,10 @@ import datetime as dt
 import hashlib
 import json
 from collections.abc import Iterator
-from types import TracebackType
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Protocol, cast
 
 import grpc
@@ -40,6 +41,7 @@ from sutradhara.backend.port import (
     BackendUnavailableError,
     ByteRange,
     CopyRecord,
+    StreamKind,
     VerifyResult,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
@@ -111,14 +113,20 @@ class _WriteSessionClient(Protocol):
     ) -> layer5_pb2.WriteSession: ...
 
 
+class _ReadRangeCall(Protocol):
+    """The cancellable gRPC call, retained separately from its iteration."""
+
+    def __iter__(self) -> Iterator[layer5_pb2.BytesChunk]: ...
+
+    def cancel(self) -> bool: ...
+
+
 class _ReadSessionClient(Protocol):
     def OpenReadSession(
         self, request: layer5_pb2.OpenReadSessionRequest
     ) -> layer5_pb2.ReadSession: ...
 
-    def ReadObjectRange(
-        self, request: layer5_pb2.ReadObjectRangeRequest
-    ) -> Iterator[layer5_pb2.BytesChunk]: ...
+    def ReadObjectRange(self, request: layer5_pb2.ReadObjectRangeRequest) -> _ReadRangeCall: ...
 
     def CloseReadSession(
         self, request: layer5_pb2.CloseReadSessionRequest
@@ -172,6 +180,12 @@ class RemanenceBackend:
         """Return whether Catalog RPCs are available for live metadata checks."""
 
         return self._catalog is not None
+
+    @property
+    def stream_kind(self) -> StreamKind:
+        """Remanence ranges are pulled directly from the live gRPC stream."""
+
+        return StreamKind.native_stream
 
     # --- constructors ----------------------------------------------------
 
@@ -290,6 +304,22 @@ class RemanenceBackend:
             )
         return obj.content[byte_range.start : byte_range.end]
 
+    @contextmanager
+    def open_range_chunks(
+        self,
+        locator: BackendLocator,
+        byte_range: ByteRange,
+        *,
+        chunk_bytes: int,
+    ) -> Iterator[Iterator[bytes]]:
+        """Own a lazy range stream and cancel it before closing its session."""
+
+        with (
+            self.open_read_session(locator) as reader,
+            reader.open_range_chunks(byte_range, chunk_bytes=chunk_bytes) as chunks,
+        ):
+            yield chunks
+
     def open_read_session(self, locator: BackendLocator) -> RemanenceReadSession:
         """Open one reusable Remanence read session for a copy locator."""
 
@@ -332,8 +362,7 @@ class RemanenceBackend:
                 )
             except grpc.RpcError as e:
                 raise BackendUnavailableError(
-                    f"Remanence Catalog.GetFile at {self._endpoint!r} failed: "
-                    f"{_rpc_error_text(e)}"
+                    f"Remanence Catalog.GetFile at {self._endpoint!r} failed: {_rpc_error_text(e)}"
                 ) from e
         obj = self._object_for_locator(locator)
         if obj.content is None:
@@ -605,6 +634,74 @@ class RemanenceReadSession:
         except grpc.RpcError as e:
             raise _read_object_range_error(self._backend._endpoint, e) from e
 
+    @contextmanager
+    def open_range_chunks(
+        self,
+        byte_range: ByteRange,
+        *,
+        chunk_bytes: int,
+    ) -> Iterator[Iterator[bytes]]:
+        """Yield range chunks while retaining ownership of the cancellable RPC call."""
+
+        if chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be greater than zero")
+        if self._closed:
+            raise BackendUnavailableError("Remanence read session is already closed")
+        if self._client is None:
+            yield self._fixture_range_chunks(byte_range, chunk_bytes=chunk_bytes)
+            return
+
+        assert self._session_id is not None
+        assert self._object_id is not None
+        try:
+            call = self._client.ReadObjectRange(
+                layer5_pb2.ReadObjectRangeRequest(
+                    session_id=self._session_id,
+                    object_id=self._object_id,
+                    start_byte=byte_range.start,
+                    end_byte=byte_range.end,
+                )
+            )
+        except grpc.RpcError as e:
+            raise _read_object_range_error(self._backend._endpoint, e) from e
+        try:
+            yield self._grpc_range_chunks(call)
+        finally:
+            # Correctness-critical ordering: dropping the server receiver must
+            # unblock its bounded producer before CloseReadSession reaches the
+            # same drive actor.
+            call.cancel()
+
+    def _fixture_range_chunks(
+        self,
+        byte_range: ByteRange,
+        *,
+        chunk_bytes: int,
+    ) -> Iterator[bytes]:
+        if self._fixture_locator is None:
+            raise BackendUnavailableError("fixture read session has no locator")
+        obj = self._backend._object_for_locator(self._fixture_locator)
+        if obj.content is None:
+            raise BackendNotFoundError(
+                "RemanenceBackend fixture mode has no bytes for this object; "
+                "fixture is missing 'content_b64' / 'content_hex'"
+            )
+        end = len(obj.content) if byte_range.is_whole_object else byte_range.end
+        if end > len(obj.content):
+            raise ValueError(f"byte range end {end} exceeds object size {len(obj.content)}")
+        position = byte_range.start
+        while position < end:
+            next_position = min(position + chunk_bytes, end)
+            yield obj.content[position:next_position]
+            position = next_position
+
+    def _grpc_range_chunks(self, call: _ReadRangeCall) -> Iterator[bytes]:
+        try:
+            for chunk in call:
+                yield chunk.data
+        except grpc.RpcError as e:
+            raise _read_object_range_error(self._backend._endpoint, e) from e
+
     def close(self) -> None:
         if self._closed:
             return
@@ -689,9 +786,7 @@ def _copy_record_from_proto(obj: layer5_pb2.ObjectRecord, cp: layer5_pb2.ObjectC
         **{f"caller_meta:{k}": v for k, v in obj.caller_metadata.items()},
     }
     if obj.HasField("append_commit_info"):
-        metadata["append_commit_info"] = _append_commit_info_from_proto(
-            obj.append_commit_info
-        )
+        metadata["append_commit_info"] = _append_commit_info_from_proto(obj.append_commit_info)
     return CopyRecord(
         logical_id=digest,
         native_locator=_native_locator_from_proto(obj, cp),
@@ -878,10 +973,7 @@ def _grpc_channel_options(endpoint: str) -> tuple[tuple[str, str], ...]:
 
 
 def _read_object_range_error(endpoint: str | None, error: grpc.RpcError) -> BackendError:
-    text = (
-        f"Remanence ReadObjectRange at {endpoint!r} failed: "
-        f"{_rpc_error_text(error)}"
-    )
+    text = f"Remanence ReadObjectRange at {endpoint!r} failed: {_rpc_error_text(error)}"
     code = error.code()
     if code in {
         grpc.StatusCode.UNAVAILABLE,

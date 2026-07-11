@@ -41,6 +41,12 @@ def test_ssh_disk_backend_write_range_verify_enumerate_and_delete(tmp_path: Path
     assert record.metadata == {"pool": "cloud-temp"}
     assert backend.read_range(record.native_locator, ByteRange(0, 0)) == b"abcdef"
     assert backend.read_range(record.native_locator, ByteRange(1, 4)) == b"bcd"
+    with backend.open_materialized_range_chunks(
+        record.native_locator,
+        ByteRange(1, 6),
+        chunk_bytes=2,
+    ) as chunks:
+        assert list(chunks) == [b"bc", b"de", b"f"]
     assert backend.verify(record.native_locator).ok
 
     backend.write_object(source, key="intakes/card-1.rao", pool="cloud-temp")

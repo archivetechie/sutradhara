@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from sutradhara.backend.port import (
     BackendNotFoundError,
     ByteRange,
     CopyRecord,
+    StreamKind,
     VerifyResult,
 )
 from sutradhara.catalog.types import content_hash
@@ -41,6 +43,12 @@ class S3Backend:
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def stream_kind(self) -> StreamKind:
+        """S3 ranges are pulled lazily from the HTTP response body."""
+
+        return StreamKind.native_stream
 
     def enumerate(self) -> Iterator[CopyRecord]:
         paginator = self._client.get_paginator("list_objects_v2")
@@ -118,6 +126,37 @@ class S3Backend:
             if not isinstance(data, bytes):
                 raise TypeError("S3 body read did not return bytes")
             return data
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
+
+    @contextmanager
+    def open_range_chunks(
+        self,
+        locator: BackendLocator,
+        byte_range: ByteRange,
+        *,
+        chunk_bytes: int,
+    ) -> Iterator[Iterator[bytes]]:
+        """Open a ranged HTTP body and close it on every context exit path."""
+
+        if chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be greater than zero")
+        if not byte_range.is_whole_object and byte_range.length == 0:
+            yield iter(())
+            return
+        bucket, key = self._bucket_key(locator)
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Key": key}
+        if not byte_range.is_whole_object:
+            kwargs["Range"] = f"bytes={byte_range.start}-{byte_range.end - 1}"
+        try:
+            response = self._client.get_object(**kwargs)
+        except Exception as exc:
+            raise BackendNotFoundError(f"S3 object not found: s3://{bucket}/{key}") from exc
+        body = response["Body"]
+        try:
+            yield body.iter_chunks(chunk_size=chunk_bytes)
         finally:
             close = getattr(body, "close", None)
             if callable(close):

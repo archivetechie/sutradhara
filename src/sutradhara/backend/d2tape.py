@@ -21,9 +21,10 @@ import subprocess
 import tempfile
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from sutradhara.backend.port import (
     BackendError,
@@ -32,6 +33,7 @@ from sutradhara.backend.port import (
     BackendUnavailableError,
     ByteRange,
     CopyRecord,
+    StreamKind,
     VerifyResult,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
@@ -90,6 +92,12 @@ class D2TapeBackend:
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def stream_kind(self) -> StreamKind:
+        """D2 reads materialize the tape object to scratch before delivery."""
+
+        return StreamKind.scratch_stream
 
     # --- StorageBackend protocol -----------------------------------------
 
@@ -154,6 +162,32 @@ class D2TapeBackend:
         if byte_range.end > len(data):
             raise ValueError(f"byte range end {byte_range.end} exceeds object size {len(data)}")
         return data[byte_range.start : byte_range.end]
+
+    @contextmanager
+    def open_materialized_range_chunks(
+        self,
+        locator: BackendLocator,
+        byte_range: ByteRange,
+        *,
+        chunk_bytes: int,
+    ) -> Iterator[Iterator[bytes]]:
+        """Restore wholly to scratch, then keep that scratch alive while chunking."""
+
+        if chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be greater than zero")
+        with tempfile.TemporaryDirectory(prefix="sutradhara-d2tape-restore-") as raw:
+            restored = self._restore_payload(locator, Path(raw))
+            size = restored.stat().st_size
+            end = size if byte_range.is_whole_object else byte_range.end
+            if end > size:
+                raise ValueError(f"byte range end {end} exceeds object size {size}")
+            with restored.open("rb") as source:
+                source.seek(byte_range.start)
+                yield _read_file_chunks(
+                    source,
+                    remaining=end - byte_range.start,
+                    chunk_bytes=chunk_bytes,
+                )
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
         device = self._device_config()
@@ -305,6 +339,40 @@ class D2TapeBackend:
             size_bytes=source_path.stat().st_size,
             metadata={"representation": Representation.D2TAR_RAW.value},
         )
+
+    def _restore_payload(self, locator: BackendLocator, dest: Path) -> Path:
+        """Run the existing whole-artifact restore into ``dest`` and return its payload."""
+
+        device = self._device_config()
+        artifact_name = _required_str(locator, "artifact_name")
+        report = self._run_d2tape(
+            [
+                "restore",
+                "--device",
+                device.device,
+                "--volume-blocksize",
+                str(_required_int(locator, "volume_blocksize")),
+                "--archive-blocksize",
+                str(device.archive_blocksize),
+                "--artifact-name",
+                artifact_name,
+                "--start-block",
+                str(_required_int(locator, "start_block")),
+                "--end-block",
+                str(_required_int(locator, "end_block")),
+                "--dest",
+                str(dest),
+            ],
+            device,
+        )
+        if report.get("ok") is not True:
+            raise BackendError(f"d2tape restore reported ok=false for {artifact_name}")
+        restored = dest / artifact_name / _PAYLOAD_NAME
+        if not restored.is_file():
+            raise BackendNotFoundError(
+                f"d2tape restore did not materialize expected payload {restored}"
+            )
+        return restored
 
     # --- helpers ---------------------------------------------------------
 
@@ -500,6 +568,22 @@ def _sha256_file(path: Path) -> ContentHash:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return content_hash(digest.digest())
+
+
+def _read_file_chunks(
+    source: BinaryIO,
+    *,
+    remaining: int,
+    chunk_bytes: int,
+) -> Iterator[bytes]:
+    """Read at most ``remaining`` bytes without materializing the scratch file."""
+
+    while remaining:
+        chunk = source.read(min(chunk_bytes, remaining))
+        if not chunk:
+            raise BackendError("d2tape scratch payload ended before the requested range")
+        remaining -= len(chunk)
+        yield chunk
 
 
 def _load_json_object(path: Path) -> dict[str, Any]:

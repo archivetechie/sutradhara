@@ -9,7 +9,9 @@ verify() re-checks integrity.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from sutradhara.catalog.types import ContentHash
@@ -18,6 +20,14 @@ from sutradhara.catalog.types import ContentHash
 # own shape (e.g. tape: {tape_uuid, tape_file_number}; s3: {bucket, key};
 # disk: {path}). The catalog stores it as JSON; adapters interpret it.
 BackendLocator = dict[str, Any]
+
+
+class StreamKind(StrEnum):
+    """How a backend makes range chunks available to a consumer."""
+
+    native_stream = "native_stream"
+    scratch_stream = "scratch_stream"
+    memory_buffered = "memory_buffered"
 
 
 @dataclass(frozen=True)
@@ -134,6 +144,26 @@ class DeletableStorageBackend(StorageBackend, Protocol):
         Implementations must treat an already-absent object as success so
         callers can safely retry after a delete-before-DB crash window.
         """
+        ...
+
+
+@runtime_checkable
+class StreamingStorageBackend(StorageBackend, Protocol):
+    """Optional capability for genuinely lazy, context-owned range streams."""
+
+    @property
+    def stream_kind(self) -> StreamKind:
+        """Describe the storage behavior behind ``open_range_chunks``."""
+        ...
+
+    def open_range_chunks(
+        self,
+        locator: BackendLocator,
+        byte_range: ByteRange,
+        *,
+        chunk_bytes: int,
+    ) -> AbstractContextManager[Iterator[bytes]]:
+        """Open a lazy byte stream whose context structurally owns cleanup."""
         ...
 
 

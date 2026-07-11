@@ -62,6 +62,12 @@ def test_write_read_verify_round_trip_and_sidecar_progression(
 
     assert backend.read_range(first_record.native_locator, ByteRange(0, 0)) == b"first payload"
     assert backend.read_range(first_record.native_locator, ByteRange(6, 13)) == b"payload"
+    with backend.open_materialized_range_chunks(
+        first_record.native_locator,
+        ByteRange(2, 11),
+        chunk_bytes=3,
+    ) as chunks:
+        assert list(chunks) == [b"rst", b" pa", b"ylo"]
     verify = backend.verify(first_record.native_locator)
     assert verify.ok
     assert verify.actual_hash == first_hash
