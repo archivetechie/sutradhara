@@ -21,6 +21,8 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -47,6 +49,11 @@ from sutradhara.backend.port import (
 from sutradhara.catalog.types import ContentHash, content_hash
 
 _WRITE_CHUNK_BYTES = 1024 * 1024
+_DRIVE_ASSIGNMENT_POLL_SECONDS = 0.1
+_DRIVE_ASSIGNMENT_ACTIVE = layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_ACTIVE")
+_DRIVE_ASSIGNMENT_IDLE = layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_IDLE")
+
+DriveQueueKey = tuple[str, int]
 
 
 @dataclass(frozen=True)
@@ -133,6 +140,132 @@ class _ReadSessionClient(Protocol):
     ) -> layer5_pb2.ReadSession: ...
 
 
+class _LibraryClient(Protocol):
+    def GetLiveStatus(
+        self, request: layer5_pb2.GetLiveStatusRequest
+    ) -> layer5_pb2.GetLiveStatusResponse: ...
+
+
+class _DriveQueueLease:
+    """One process-local turn for an advisory ``(library_serial, bay)`` queue."""
+
+    def __init__(self, key: DriveQueueKey, lock: threading.Lock) -> None:
+        self.key = key
+        self._lock = lock
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._lock.release()
+
+
+class _DriveRestoreQueue:
+    """Serialize tape session opens by Remanence's bay enforcement unit.
+
+    Live status is advisory. Every turn still calls ``OpenReadSession`` and a
+    lost atomic-reservation race is returned to this queue for another turn.
+    """
+
+    def __init__(
+        self,
+        client: _LibraryClient,
+        *,
+        poll_seconds: float = _DRIVE_ASSIGNMENT_POLL_SECONDS,
+    ) -> None:
+        self._client = client
+        self._poll_seconds = poll_seconds
+        self._guard = threading.Lock()
+        self._locks: dict[DriveQueueKey, threading.Lock] = {}
+
+    def acquire(self, tape_uuid: bytes) -> _DriveQueueLease | None:
+        # Advisory: with no usable assignment (surface absent / no match for this tape /
+        # assignment vanished / unspecified state) return None — the caller opens directly
+        # and the atomic bay reservation + FailedPrecondition-requeue still arbitrate.
+        assignments = self._assignments()
+        with self._guard:
+            held_keys = frozenset(key for key, lock in self._locks.items() if lock.locked())
+            assignment = _select_drive_assignment(assignments, tape_uuid, held_keys)
+            if assignment is None:
+                return None
+            key = (assignment.library_serial, int(assignment.bay))
+            lock = self._locks.setdefault(key, threading.Lock())
+        lock.acquire()
+        try:
+            while True:
+                current = _assignment_for_key(self._assignments(), key)
+                if current is None or current.state not in (
+                    _DRIVE_ASSIGNMENT_IDLE,
+                    _DRIVE_ASSIGNMENT_ACTIVE,
+                ):
+                    lock.release()
+                    return None
+                if current.state == _DRIVE_ASSIGNMENT_IDLE:
+                    return _DriveQueueLease(key, lock)
+                time.sleep(self._poll_seconds)
+        except BaseException:
+            lock.release()
+            raise
+
+    def _assignments(self) -> list[layer5_pb2.DriveAssignment]:
+        # The drive-assignment surface is ADVISORY. An older daemon without the RPC
+        # (UNIMPLEMENTED), or a transient GetLiveStatus failure, degrades to "no
+        # assignment info": the caller then opens directly and re-queues on a lost
+        # FailedPrecondition race. Never hard-fail a restore on the advisory surface.
+        try:
+            response = self._client.GetLiveStatus(layer5_pb2.GetLiveStatusRequest())
+        except grpc.RpcError:
+            return []
+        return list(response.drive_assignments)
+
+
+_DRIVE_QUEUES_GUARD = threading.Lock()
+_DRIVE_QUEUES: dict[str, _DriveRestoreQueue] = {}
+
+
+def _drive_queue_for_endpoint(endpoint: str, client: _LibraryClient) -> _DriveRestoreQueue:
+    """Share bay queues across backend instances resolving the same daemon."""
+
+    with _DRIVE_QUEUES_GUARD:
+        return _DRIVE_QUEUES.setdefault(endpoint, _DriveRestoreQueue(client))
+
+
+def _select_drive_assignment(
+    assignments: list[layer5_pb2.DriveAssignment],
+    tape_uuid: bytes,
+    held_keys: frozenset[DriveQueueKey] = frozenset(),
+) -> layer5_pb2.DriveAssignment | None:
+    """Choose by bay state and loaded tape; ``drive_uuid`` is never a key."""
+
+    ordered = sorted(assignments, key=lambda item: (item.library_serial, int(item.bay)))
+    for assignment in ordered:
+        if bytes(assignment.loaded_tape_uuid) == tape_uuid:
+            return assignment
+    for assignment in ordered:
+        key = (assignment.library_serial, int(assignment.bay))
+        if assignment.state == _DRIVE_ASSIGNMENT_IDLE and key not in held_keys:
+            return assignment
+    for assignment in ordered:
+        key = (assignment.library_serial, int(assignment.bay))
+        if key not in held_keys:
+            return assignment
+    return ordered[0] if ordered else None
+
+
+def _assignment_for_key(
+    assignments: list[layer5_pb2.DriveAssignment], key: DriveQueueKey
+) -> layer5_pb2.DriveAssignment | None:
+    return next(
+        (
+            assignment
+            for assignment in assignments
+            if (assignment.library_serial, int(assignment.bay)) == key
+        ),
+        None,
+    )
+
+
 class RemanenceBackend:
     """Adapter implementing `StorageBackend` over a Remanence Layer 5 contract.
 
@@ -149,6 +282,7 @@ class RemanenceBackend:
         catalog: _CatalogClient | None = None,
         write_session: _WriteSessionClient | None = None,
         read_session: _ReadSessionClient | None = None,
+        library: _LibraryClient | None = None,
         channel: grpc.Channel | None = None,
     ) -> None:
         self._name = name
@@ -156,7 +290,13 @@ class RemanenceBackend:
         self._catalog = catalog
         self._write_session = write_session
         self._read_session = read_session
+        self._library = library
         self._channel = channel
+        self._drive_queue = (
+            _drive_queue_for_endpoint(endpoint, library)
+            if endpoint is not None and library is not None
+            else None
+        )
         self._objects = objects or []
         # Index by (tape_uuid, tape_file_number) for fast read_range lookup.
         # Live mode (endpoint set) holds no fixture objects, so the index is empty.
@@ -231,12 +371,17 @@ class RemanenceBackend:
             _ReadSessionClient,
             layer5_pb2_grpc.ReadSessionServiceStub(channel),  # type: ignore[no-untyped-call]
         )
+        library = cast(
+            _LibraryClient,
+            layer5_pb2_grpc.LibraryServiceStub(channel),  # type: ignore[no-untyped-call]
+        )
         return cls(
             name,
             endpoint=endpoint,
             catalog=catalog,
             write_session=write_session,
             read_session=read_session,
+            library=library,
             channel=channel,
         )
 
@@ -321,31 +466,46 @@ class RemanenceBackend:
             yield chunks
 
     def open_read_session(self, locator: BackendLocator) -> RemanenceReadSession:
-        """Open one reusable Remanence read session for a copy locator."""
+        """Open one reusable session through the advisory per-bay tape queue."""
 
         if self._read_session is None:
             return RemanenceReadSession.fixture(self, locator)
         client = self._require_read_session()
         tape_uuid = _uuid_bytes_from_locator(locator, "tape_uuid")
         object_id = _uuid_bytes_from_locator(locator, "object_id")
-        try:
-            session = client.OpenReadSession(
-                layer5_pb2.OpenReadSessionRequest(
-                    tape_target=layer5_pb2.TapeTarget(
-                        tape_uuid=tape_uuid,
-                        mount_if_needed=True,
+        while True:
+            lease = self._drive_queue.acquire(tape_uuid) if self._drive_queue is not None else None
+            try:
+                session = client.OpenReadSession(
+                    layer5_pb2.OpenReadSessionRequest(
+                        tape_target=layer5_pb2.TapeTarget(
+                            tape_uuid=tape_uuid,
+                            mount_if_needed=True,
+                        )
                     )
                 )
-            )
-        except grpc.RpcError as e:
-            raise BackendUnavailableError(
-                f"Remanence OpenReadSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
-            ) from e
+            except grpc.RpcError as e:
+                if lease is not None:
+                    lease.release()
+                if self._drive_queue is not None and _is_active_read_session_race(e):
+                    # Bounded backoff so a persistently-busy bay (or a degraded advisory
+                    # surface that returned no lease) re-queues without busy-spinning.
+                    time.sleep(_DRIVE_ASSIGNMENT_POLL_SECONDS)
+                    continue
+                raise BackendUnavailableError(
+                    f"Remanence OpenReadSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
+                ) from e
+            except BaseException:
+                if lease is not None:
+                    lease.release()
+                raise
+            break
         return RemanenceReadSession.live(
             backend=self,
             client=client,
             session_id=session.session_id,
             object_id=object_id,
+            drive_queue_lease=lease,
         )
 
     def get_file(self, locator: BackendLocator, *, path: str) -> layer5_pb2.FileRecord:
@@ -554,12 +714,14 @@ class RemanenceReadSession:
         session_id: bytes | None,
         object_id: bytes | None,
         fixture_locator: BackendLocator | None = None,
+        drive_queue_lease: _DriveQueueLease | None = None,
     ) -> None:
         self._backend = backend
         self._client = client
         self._session_id = session_id
         self._object_id = object_id
         self._fixture_locator = fixture_locator
+        self._drive_queue_lease = drive_queue_lease
         self._closed = False
 
     @classmethod
@@ -570,12 +732,14 @@ class RemanenceReadSession:
         client: _ReadSessionClient,
         session_id: bytes,
         object_id: bytes,
+        drive_queue_lease: _DriveQueueLease | None = None,
     ) -> RemanenceReadSession:
         return cls(
             backend=backend,
             client=client,
             session_id=session_id,
             object_id=object_id,
+            drive_queue_lease=drive_queue_lease,
         )
 
     @classmethod
@@ -707,8 +871,14 @@ class RemanenceReadSession:
             return
         self._closed = True
         if self._client is None or self._session_id is None:
+            if self._drive_queue_lease is not None:
+                self._drive_queue_lease.release()
             return
-        self._backend._safe_close_read(self._client, self._session_id)
+        try:
+            self._backend._safe_close_read(self._client, self._session_id)
+        finally:
+            if self._drive_queue_lease is not None:
+                self._drive_queue_lease.release()
 
 
 # --- fixture decoding ----------------------------------------------------
@@ -989,6 +1159,15 @@ def _read_object_range_error(endpoint: str | None, error: grpc.RpcError) -> Back
     }:
         return BackendSessionInvalidatedError(text)
     return BackendUnavailableError(text)
+
+
+def _is_active_read_session_race(error: grpc.RpcError) -> bool:
+    """Recognize the atomic bay-reservation race that must return to the queue."""
+
+    details = error.details()
+    return error.code() == grpc.StatusCode.FAILED_PRECONDITION and bool(
+        details and "read session already active" in str(details).lower()
+    )
 
 
 def _rpc_error_text(error: grpc.RpcError) -> str:

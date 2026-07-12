@@ -7,6 +7,7 @@ live gRPC mapping without requiring the real daemon in unit tests.
 from __future__ import annotations
 
 import hashlib
+import threading
 from collections.abc import Iterator
 from concurrent import futures
 from contextlib import contextmanager
@@ -360,6 +361,200 @@ def _read_locator(content_sha256_hex: str) -> dict[str, str | int]:
         "pool_id": "scenario-a",
         "body_format": "rem-tar-v1",
     }
+
+
+class _QueueLibrary:
+    """Thread-safe advisory assignment source for bay-queue tests."""
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self.active = False
+        self.loaded_tape_uuid = b""
+
+    def GetLiveStatus(
+        self, request: layer5_pb2.GetLiveStatusRequest
+    ) -> layer5_pb2.GetLiveStatusResponse:
+        with self._guard:
+            return layer5_pb2.GetLiveStatusResponse(
+                drive_assignments=[
+                    layer5_pb2.DriveAssignment(
+                        library_serial="LIB-A",
+                        bay=0x101,
+                        drive_uuid=bytes.fromhex("11" * 16),
+                        state=(
+                            layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_ACTIVE")
+                            if self.active
+                            else layer5_pb2.DriveAssignment.State.Value(
+                                "DRIVE_ASSIGNMENT_STATE_IDLE"
+                            )
+                        ),
+                        loaded_tape_uuid=self.loaded_tape_uuid,
+                    )
+                ]
+            )
+
+    def set_active(self, active: bool, tape_uuid: bytes = b"") -> None:
+        with self._guard:
+            self.active = active
+            self.loaded_tape_uuid = tape_uuid if active else b""
+
+
+class _QueueReadClient:
+    """Read client that makes Open/Close visible through the advisory fake."""
+
+    def __init__(self, library: _QueueLibrary) -> None:
+        self.library = library
+        self.open_count = 0
+        self.opened = threading.Event()
+        self.second_opened = threading.Event()
+
+    def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+        self.open_count += 1
+        if self.open_count == 2:
+            self.second_opened.set()
+        tape_uuid = bytes(request.tape_target.tape_uuid)
+        self.library.set_active(True, tape_uuid)
+        self.opened.set()
+        return layer5_pb2.ReadSession(
+            session_id=f"session-{self.open_count}".encode(),
+            tape_uuid=tape_uuid,
+            drive_element_address=0x101,
+        )
+
+    def ReadObjectRange(
+        self, request: layer5_pb2.ReadObjectRangeRequest
+    ) -> Iterator[layer5_pb2.BytesChunk]:
+        yield layer5_pb2.BytesChunk(data=b"payload", is_last=True)
+
+    def CloseReadSession(
+        self, request: layer5_pb2.CloseReadSessionRequest
+    ) -> layer5_pb2.ReadSession:
+        self.library.set_active(False)
+        return layer5_pb2.ReadSession(session_id=request.session_id)
+
+
+class _LostRaceError(grpc.RpcError):  # type: ignore[misc]
+    def code(self) -> grpc.StatusCode:
+        return grpc.StatusCode.FAILED_PRECONDITION
+
+    def details(self) -> str:
+        return "read session already active"
+
+
+class _LostRaceReadClient(_QueueReadClient):
+    def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+        self.open_count += 1
+        if self.open_count == 1:
+            raise _LostRaceError()
+        tape_uuid = bytes(request.tape_target.tape_uuid)
+        self.library.set_active(True, tape_uuid)
+        return layer5_pb2.ReadSession(
+            session_id=b"won-after-requeue",
+            tape_uuid=tape_uuid,
+            drive_element_address=0x101,
+        )
+
+
+def _queue_backend(library: _QueueLibrary, client: _QueueReadClient) -> RemanenceBackend:
+    backend = RemanenceBackend(
+        "queued-rem-tape",
+        endpoint="queue-test",
+        read_session=client,
+    )
+    backend._drive_queue = remanence_module._DriveRestoreQueue(library, poll_seconds=0.001)
+    return backend
+
+
+def test_busy_bay_queues_second_tape_restore_until_first_closes() -> None:
+    library = _QueueLibrary()
+    client = _QueueReadClient(library)
+    queued_backend = _queue_backend(library, client)
+    release = [threading.Event(), threading.Event()]
+    errors: list[BaseException] = []
+
+    def restore(index: int, tape_byte: int) -> None:
+        locator = _read_locator(hashlib.sha256(b"payload").hexdigest())
+        locator["tape_uuid"] = (bytes([tape_byte]) * 16).hex()
+        try:
+            with queued_backend.open_read_session(locator):
+                assert release[index].wait(timeout=2), "test did not release queued restore"
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=restore, args=(0, 0x21))
+    first.start()
+    assert client.opened.wait(timeout=1), "first restore did not open"
+
+    second = threading.Thread(target=restore, args=(1, 0x22))
+    second.start()
+    assert not client.second_opened.wait(timeout=0.05), (
+        "second restore opened instead of queueing behind the busy bay"
+    )
+
+    release[0].set()
+    assert client.second_opened.wait(timeout=1), "queued restore did not proceed after close"
+    release[1].set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert client.open_count == 2
+
+
+def test_lost_open_read_session_race_requeues_instead_of_failing() -> None:
+    library = _QueueLibrary()
+    client = _LostRaceReadClient(library)
+    queued_backend = _queue_backend(library, client)
+    locator = _read_locator(hashlib.sha256(b"payload").hexdigest())
+
+    with queued_backend.open_read_session(locator) as session:
+        assert session is not None
+
+    assert client.open_count == 2
+
+
+def test_drive_uuid_float_does_not_change_library_bay_queue_key() -> None:
+    tape_uuid = bytes.fromhex("33" * 16)
+    before = [
+        layer5_pb2.DriveAssignment(
+            library_serial="LIB-A",
+            bay=0x101,
+            drive_uuid=bytes.fromhex("aa" * 16),
+            state=layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_IDLE"),
+        ),
+        layer5_pb2.DriveAssignment(
+            library_serial="LIB-A",
+            bay=0x102,
+            drive_uuid=bytes.fromhex("bb" * 16),
+            state=layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_ACTIVE"),
+            loaded_tape_uuid=tape_uuid,
+        ),
+    ]
+    after_float = [
+        layer5_pb2.DriveAssignment(
+            library_serial="LIB-A",
+            bay=0x101,
+            drive_uuid=bytes.fromhex("bb" * 16),
+            state=layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_IDLE"),
+        ),
+        layer5_pb2.DriveAssignment(
+            library_serial="LIB-A",
+            bay=0x102,
+            drive_uuid=bytes.fromhex("aa" * 16),
+            state=layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_ACTIVE"),
+            loaded_tape_uuid=tape_uuid,
+        ),
+    ]
+
+    selected_before = remanence_module._select_drive_assignment(before, tape_uuid)
+    selected_after = remanence_module._select_drive_assignment(after_float, tape_uuid)
+
+    assert selected_before is not None
+    assert selected_after is not None
+    assert (selected_before.library_serial, selected_before.bay) == ("LIB-A", 0x102)
+    assert (selected_after.library_serial, selected_after.bay) == ("LIB-A", 0x102)
 
 
 class _ReadSession(layer5_pb2_grpc.ReadSessionServiceServicer):

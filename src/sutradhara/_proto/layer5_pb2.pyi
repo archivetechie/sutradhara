@@ -290,7 +290,7 @@ class LibraryState(_message.Message):
     def __init__(self, library: _Optional[_Union[Library, _Mapping]] = ..., drives: _Optional[_Iterable[_Union[Drive, _Mapping]]] = ..., slots: _Optional[_Iterable[_Union[Slot, _Mapping]]] = ..., import_export_ports: _Optional[_Iterable[_Union[PortalSlot, _Mapping]]] = ..., last_inventory_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., managed: _Optional[str] = ...) -> None: ...
 
 class Drive(_message.Message):
-    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status", "drive_uuid", "cleaning_due", "fenced", "lifetime_read_bytes", "lifetime_write_bytes", "counter_epoch", "session_id", "active_alert_names")
+    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status", "drive_uuid", "cleaning_due", "fenced", "lifetime_read_bytes", "lifetime_write_bytes", "counter_epoch", "session_id", "active_alert_names", "tape_io_staging_ring_buffers", "tape_io_effective_batch_blocks", "tape_io_gap_p50_us", "tape_io_gap_p95_us", "tape_io_gap_max_us", "tape_io_ioctl_p50_us", "tape_io_ioctl_p95_us", "tape_io_ioctl_max_us", "tape_io_cadence_us", "tape_io_effective_feed_bytes_per_second")
     class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         DRIVE_STATUS_UNSPECIFIED: _ClassVar[Drive.Status]
@@ -322,6 +322,16 @@ class Drive(_message.Message):
     COUNTER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     ACTIVE_ALERT_NAMES_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_STAGING_RING_BUFFERS_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_EFFECTIVE_BATCH_BLOCKS_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_GAP_P50_US_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_GAP_P95_US_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_GAP_MAX_US_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_IOCTL_P50_US_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_IOCTL_P95_US_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_IOCTL_MAX_US_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_CADENCE_US_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_EFFECTIVE_FEED_BYTES_PER_SECOND_FIELD_NUMBER: _ClassVar[int]
     element_address: int
     drive_serial: str
     host_device_path: str
@@ -337,7 +347,17 @@ class Drive(_message.Message):
     counter_epoch: int
     session_id: bytes
     active_alert_names: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ..., drive_uuid: _Optional[bytes] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., lifetime_read_bytes: _Optional[int] = ..., lifetime_write_bytes: _Optional[int] = ..., counter_epoch: _Optional[int] = ..., session_id: _Optional[bytes] = ..., active_alert_names: _Optional[_Iterable[str]] = ...) -> None: ...
+    tape_io_staging_ring_buffers: int
+    tape_io_effective_batch_blocks: int
+    tape_io_gap_p50_us: int
+    tape_io_gap_p95_us: int
+    tape_io_gap_max_us: int
+    tape_io_ioctl_p50_us: int
+    tape_io_ioctl_p95_us: int
+    tape_io_ioctl_max_us: int
+    tape_io_cadence_us: int
+    tape_io_effective_feed_bytes_per_second: int
+    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ..., drive_uuid: _Optional[bytes] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., lifetime_read_bytes: _Optional[int] = ..., lifetime_write_bytes: _Optional[int] = ..., counter_epoch: _Optional[int] = ..., session_id: _Optional[bytes] = ..., active_alert_names: _Optional[_Iterable[str]] = ..., tape_io_staging_ring_buffers: _Optional[int] = ..., tape_io_effective_batch_blocks: _Optional[int] = ..., tape_io_gap_p50_us: _Optional[int] = ..., tape_io_gap_p95_us: _Optional[int] = ..., tape_io_gap_max_us: _Optional[int] = ..., tape_io_ioctl_p50_us: _Optional[int] = ..., tape_io_ioctl_p95_us: _Optional[int] = ..., tape_io_ioctl_max_us: _Optional[int] = ..., tape_io_cadence_us: _Optional[int] = ..., tape_io_effective_feed_bytes_per_second: _Optional[int] = ...) -> None: ...
 
 class DriveCatalogEntry(_message.Message):
     __slots__ = ("drive_uuid", "serial", "identity_source", "actionable", "vendor", "product", "firmware_rev", "managed", "state", "cleaning_due", "fenced", "first_seen_utc", "last_seen_utc", "last_library_serial", "last_element_address", "purchase_date", "warranty_until", "cost", "notes", "retired_at_utc", "retire_reason", "correlation_rollups")
@@ -623,19 +643,45 @@ class GetLiveStatusRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
 
+class DriveAssignment(_message.Message):
+    __slots__ = ("library_serial", "bay", "drive_uuid", "state", "current_session_id", "loaded_tape_uuid")
+    class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        DRIVE_ASSIGNMENT_STATE_UNSPECIFIED: _ClassVar[DriveAssignment.State]
+        DRIVE_ASSIGNMENT_STATE_IDLE: _ClassVar[DriveAssignment.State]
+        DRIVE_ASSIGNMENT_STATE_ACTIVE: _ClassVar[DriveAssignment.State]
+    DRIVE_ASSIGNMENT_STATE_UNSPECIFIED: DriveAssignment.State
+    DRIVE_ASSIGNMENT_STATE_IDLE: DriveAssignment.State
+    DRIVE_ASSIGNMENT_STATE_ACTIVE: DriveAssignment.State
+    LIBRARY_SERIAL_FIELD_NUMBER: _ClassVar[int]
+    BAY_FIELD_NUMBER: _ClassVar[int]
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    CURRENT_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    LOADED_TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    library_serial: str
+    bay: int
+    drive_uuid: bytes
+    state: DriveAssignment.State
+    current_session_id: bytes
+    loaded_tape_uuid: bytes
+    def __init__(self, library_serial: _Optional[str] = ..., bay: _Optional[int] = ..., drive_uuid: _Optional[bytes] = ..., state: _Optional[_Union[DriveAssignment.State, str]] = ..., current_session_id: _Optional[bytes] = ..., loaded_tape_uuid: _Optional[bytes] = ...) -> None: ...
+
 class GetLiveStatusResponse(_message.Message):
-    __slots__ = ("libraries", "operations", "alarms", "snapshot_at_utc", "daemon_epoch")
+    __slots__ = ("libraries", "operations", "alarms", "snapshot_at_utc", "daemon_epoch", "drive_assignments")
     LIBRARIES_FIELD_NUMBER: _ClassVar[int]
     OPERATIONS_FIELD_NUMBER: _ClassVar[int]
     ALARMS_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_AT_UTC_FIELD_NUMBER: _ClassVar[int]
     DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    DRIVE_ASSIGNMENTS_FIELD_NUMBER: _ClassVar[int]
     libraries: _containers.RepeatedCompositeFieldContainer[LibraryState]
     operations: _containers.RepeatedCompositeFieldContainer[OperationRef]
     alarms: _containers.RepeatedCompositeFieldContainer[Alarm]
     snapshot_at_utc: str
     daemon_epoch: int
-    def __init__(self, libraries: _Optional[_Iterable[_Union[LibraryState, _Mapping]]] = ..., operations: _Optional[_Iterable[_Union[OperationRef, _Mapping]]] = ..., alarms: _Optional[_Iterable[_Union[Alarm, _Mapping]]] = ..., snapshot_at_utc: _Optional[str] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
+    drive_assignments: _containers.RepeatedCompositeFieldContainer[DriveAssignment]
+    def __init__(self, libraries: _Optional[_Iterable[_Union[LibraryState, _Mapping]]] = ..., operations: _Optional[_Iterable[_Union[OperationRef, _Mapping]]] = ..., alarms: _Optional[_Iterable[_Union[Alarm, _Mapping]]] = ..., snapshot_at_utc: _Optional[str] = ..., daemon_epoch: _Optional[int] = ..., drive_assignments: _Optional[_Iterable[_Union[DriveAssignment, _Mapping]]] = ...) -> None: ...
 
 class Slot(_message.Message):
     __slots__ = ("element_address", "voltag", "tape_uuid")
@@ -954,16 +1000,18 @@ class FileRecord(_message.Message):
     def __init__(self, object_id: _Optional[bytes] = ..., file_id: _Optional[bytes] = ..., path: _Optional[str] = ..., size_bytes: _Optional[int] = ..., file_sha256: _Optional[bytes] = ..., first_chunk_body_lba: _Optional[int] = ..., chunk_count: _Optional[int] = ...) -> None: ...
 
 class ListTapesRequest(_message.Message):
-    __slots__ = ("library_uuid", "page_token", "page_size", "pool_id")
+    __slots__ = ("library_uuid", "page_token", "page_size", "pool_id", "kind")
     LIBRARY_UUID_FIELD_NUMBER: _ClassVar[int]
     PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
     PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
     POOL_ID_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
     library_uuid: bytes
     page_token: PageToken
     page_size: int
     pool_id: str
-    def __init__(self, library_uuid: _Optional[bytes] = ..., page_token: _Optional[_Union[PageToken, _Mapping]] = ..., page_size: _Optional[int] = ..., pool_id: _Optional[str] = ...) -> None: ...
+    kind: str
+    def __init__(self, library_uuid: _Optional[bytes] = ..., page_token: _Optional[_Union[PageToken, _Mapping]] = ..., page_size: _Optional[int] = ..., pool_id: _Optional[str] = ..., kind: _Optional[str] = ...) -> None: ...
 
 class ListTapesResponse(_message.Message):
     __slots__ = ("tapes", "next_page_token")
