@@ -1516,17 +1516,47 @@ def test_encrypted_restore_plumbing_uses_key_epoch_and_rao_range_args(
     rem_script = tmp_path / "fake-rem"
     rem_script.write_text(
         """#!/usr/bin/env python3
+import json
+import pathlib
 import sys
 args = sys.argv[1:]
-required = ["--range", "--key-file"]
-missing = [flag for flag in required if flag not in args]
-if missing:
-    raise SystemExit("missing " + ",".join(missing))
-if args[args.index("--range") + 1] != "1048576:16":
-    raise SystemExit("wrong range")
-sys.stdin.buffer.read()
-sys.stdout.buffer.write(b"encrypted member")
-sys.stderr.write('{"command":"archive extract-stream","status":"ok"}\\n')
+if args[:2] == ["archive", "covering-range"]:
+    required = ["--range", "--key-file", "--object-id", "--file-id"]
+    if any(flag not in args for flag in required):
+        raise SystemExit("missing covering-range args")
+    if args[args.index("--range") + 1] != "1048576:16":
+        raise SystemExit("wrong query range")
+    prefix = sys.stdin.buffer.read()
+    print(json.dumps({
+        "command": "archive covering-range",
+        "status": "ok",
+        "object_id": args[args.index("--object-id") + 1],
+        "file_id": args[args.index("--file-id") + 1],
+        "plaintext_start": 1048576,
+        "plaintext_len": 16,
+        "stored_range_start": 2048,
+        "stored_range_len": 16,
+        "stored_range_end": 2064,
+        "authenticated_prefix_len": len(prefix),
+    }))
+elif args[:2] == ["archive", "extract-stream"]:
+    required = ["--range", "--key-file", "--authenticated-prefix", "--stored-range-start"]
+    if any(flag not in args for flag in required):
+        raise SystemExit("missing ranged extract args")
+    if args[args.index("--range") + 1] != "1048576:16":
+        raise SystemExit("wrong extract range")
+    if args[args.index("--stored-range-start") + 1] != "2048":
+        raise SystemExit("wrong stored start")
+    prefix = pathlib.Path(args[args.index("--authenticated-prefix") + 1]).read_bytes()
+    if len(prefix) != 145:
+        raise SystemExit("wrong authenticated prefix")
+    ciphertext = sys.stdin.buffer.read()
+    if ciphertext != b"encrypted member":
+        raise SystemExit("wrong covering ciphertext")
+    sys.stdout.buffer.write(ciphertext)
+    sys.stderr.write('{"command":"archive extract-stream","status":"ok"}\\n')
+else:
+    raise SystemExit("unexpected command")
 """,
         encoding="utf-8",
     )
@@ -1534,7 +1564,15 @@ sys.stderr.write('{"command":"archive extract-stream","status":"ok"}\\n')
     keys = _FakeKeyRegistry(key_file)
     backend = _ArchiveWriteBackend("enc")
     object_path = tmp_path / "encrypted.rao"
-    object_path.write_bytes(b"not a local archive")
+    stored = bytearray(b"x" * 4096)
+    header = bytearray(128)
+    header[:4] = b"RAO1"
+    header[6] = 1
+    header[0x30:0x38] = (17).to_bytes(8, "big")
+    stored[:128] = header
+    stored[128:145] = b"m" * 17
+    stored[2048:2064] = restored
+    object_path.write_bytes(stored)
 
     with session_scope(engine) as s:
         row = Backend(
@@ -1617,3 +1655,5 @@ sys.stderr.write('{"command":"archive extract-stream","status":"ok"}\\n')
 
     assert result.output_path.read_bytes() == restored
     assert keys.seen == [key_epoch]
+    assert ByteRange(2048, 2064) in backend.reads
+    assert ByteRange(0, len(stored)) not in backend.reads

@@ -72,6 +72,9 @@ _REM_STREAM_MOUNT_GRACE_SECONDS = float(
 _REM_STREAM_INACTIVITY_TIMEOUT_SECONDS = 120.0
 _REM_STREAM_EXIT_TIMEOUT_SECONDS = 10.0
 _REM_STREAM_STDERR_LIMIT_BYTES = 64 * 1024
+_RAO_HEADER_BYTES = 128
+_RAO_MAX_METADATA_FRAME_BYTES = 16 * 1024 * 1024
+_RAO_MAX_KEY_FRAME_BYTES = 4096
 
 
 class ArchiveRestoreError(Exception):
@@ -130,6 +133,15 @@ class PlannedMember:
     transforms: tuple[StagingTransform, ...]
     backend: StorageBackend
     buffered: bool
+
+
+@dataclass(frozen=True)
+class _RangedCiphertextPlan:
+    """Rust-authenticated stored geometry and its exact envelope prefix."""
+
+    byte_range: ByteRange
+    authenticated_prefix: Path
+    temporary_directory: tempfile.TemporaryDirectory[str]
 
 
 class _ChunkIteratorReader(io.RawIOBase):
@@ -1263,8 +1275,33 @@ def _open_rao_aead_plaintext_stream(
     command = [rem_bin, "archive", "extract-stream", "--key-file", str(key_file)]
     native = dict(locator.native_locator)
     size = _size_bytes(native)
+    plaintext_range: tuple[int, int] | None = None
     if locator.bundle_id is not None or member_byte_base(native) != 0:
-        command.extend(["--range", f"{member_byte_base(native)}:{size}"])
+        plaintext_range = (member_byte_base(native), size)
+        command.extend(["--range", f"{plaintext_range[0]}:{plaintext_range[1]}"])
+
+    ranged_plan = None
+    if locator.bundle_id is not None and plaintext_range is not None and size > 0:
+        ranged_plan = _query_covering_stored_range(
+            backend=backend,
+            copy=copy,
+            locator=locator,
+            rem_bin=rem_bin,
+            key_file=key_file,
+            plaintext_start=plaintext_range[0],
+            plaintext_len=plaintext_range[1],
+        )
+    ciphertext_range = _stored_object_range(copy)
+    if ranged_plan is not None:
+        ciphertext_range = ranged_plan.byte_range
+        command.extend(
+            [
+                "--authenticated-prefix",
+                str(ranged_plan.authenticated_prefix),
+                "--stored-range-start",
+                str(ciphertext_range.start),
+            ]
+        )
 
     try:
         process = subprocess.Popen(
@@ -1275,9 +1312,13 @@ def _open_rao_aead_plaintext_stream(
             bufsize=0,
         )
     except OSError as exc:
+        if ranged_plan is not None:
+            ranged_plan.temporary_directory.cleanup()
         raise ArchiveRestoreError(f"cannot start rem archive extract-stream: {exc}") from exc
     if process.stdin is None or process.stdout is None or process.stderr is None:
         _terminate_and_reap(process)
+        if ranged_plan is not None:
+            ranged_plan.temporary_directory.cleanup()
         raise ArchiveRestoreError("rem archive extract-stream did not create all required pipes")
     stdin = process.stdin
     stdout = process.stdout
@@ -1289,7 +1330,6 @@ def _open_rao_aead_plaintext_stream(
     stderr_size = [0]
     last_activity = [time.monotonic()]
     streaming_started = [False]
-    ciphertext_range = _stored_object_range(copy)
 
     def pump_ciphertext() -> None:
         try:
@@ -1363,6 +1403,8 @@ def _open_rao_aead_plaintext_stream(
         with suppress(OSError):
             stderr.close()
         stderr_reader.join(_REM_STREAM_EXIT_TIMEOUT_SECONDS)
+        if ranged_plan is not None:
+            ranged_plan.temporary_directory.cleanup()
 
 
 def _write_pipe_chunk(handle: IO[bytes], chunk: bytes, last_activity: list[float]) -> None:
@@ -1384,6 +1426,121 @@ def _stored_object_range(copy: Copy) -> ByteRange:
     if isinstance(size, int) and size > 0:
         return ByteRange(0, size)
     return ByteRange(0, 0)
+
+
+def _query_covering_stored_range(
+    *,
+    backend: StorageBackend,
+    copy: Copy,
+    locator: AssetLocator,
+    rem_bin: str,
+    key_file: Path,
+    plaintext_start: int,
+    plaintext_len: int,
+) -> _RangedCiphertextPlan | None:
+    """Ask Rust for a member's covering stored range, degrading on absence."""
+
+    temporary_directory = tempfile.TemporaryDirectory(prefix="sutradhara-rem-prefix-")
+    prefix_path = Path(temporary_directory.name) / "authenticated-prefix.rao"
+    object_id = str(copy.native_locator.get("object_id", copy.id))
+    file_id = locator.member_path
+    try:
+        prefix_len = _write_rao_authenticated_prefix(
+            backend,
+            dict(copy.native_locator),
+            prefix_path,
+        )
+        with prefix_path.open("rb") as prefix:
+            completed = subprocess.run(
+                [
+                    rem_bin,
+                    "archive",
+                    "covering-range",
+                    "--key-file",
+                    str(key_file),
+                    "--object-id",
+                    object_id,
+                    "--file-id",
+                    file_id,
+                    "--range",
+                    f"{plaintext_start}:{plaintext_len}",
+                ],
+                stdin=prefix,
+                capture_output=True,
+                text=False,
+                check=False,
+                timeout=_REM_STREAM_EXIT_TIMEOUT_SECONDS,
+            )
+        if completed.returncode != 0:
+            raise ValueError("covering-range query is unavailable")
+        report = json.loads(completed.stdout)
+        if not isinstance(report, dict):
+            raise ValueError("covering-range response is not an object")
+        expected = {
+            "command": "archive covering-range",
+            "status": "ok",
+            "object_id": object_id,
+            "file_id": file_id,
+            "plaintext_start": plaintext_start,
+            "plaintext_len": plaintext_len,
+            "authenticated_prefix_len": prefix_len,
+        }
+        if any(report.get(name) != value for name, value in expected.items()):
+            raise ValueError("covering-range response does not match its request")
+        start = report.get("stored_range_start")
+        length = report.get("stored_range_len")
+        end = report.get("stored_range_end")
+        if not all(type(value) is int for value in (start, length, end)):
+            raise ValueError("covering-range response has invalid stored geometry")
+        start = cast(int, start)
+        length = cast(int, length)
+        end = cast(int, end)
+        if start < prefix_len or length <= 0 or end != start + length:
+            raise ValueError("covering-range response has inconsistent stored geometry")
+        stored_size = copy.storage_metadata.get("stored_size_bytes")
+        if isinstance(stored_size, int) and stored_size > 0 and end > stored_size:
+            raise ValueError("covering-range response exceeds the stored object")
+        return _RangedCiphertextPlan(
+            byte_range=ByteRange(start, end),
+            authenticated_prefix=prefix_path,
+            temporary_directory=temporary_directory,
+        )
+    except (
+        ArchiveRestoreError,
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        temporary_directory.cleanup()
+        return None
+
+
+def _write_rao_authenticated_prefix(
+    backend: StorageBackend,
+    locator: dict[str, Any],
+    destination: Path,
+) -> int:
+    """Copy only the bounded RAO header/key/metadata prefix for Rust to authenticate."""
+
+    header_range = ByteRange(0, _RAO_HEADER_BYTES)
+    header = backend.read_range(locator, header_range)
+    if len(header) != _RAO_HEADER_BYTES:
+        raise ArchiveRestoreError("encrypted RAO object has a truncated scalar header")
+    metadata_len = int.from_bytes(header[0x30:0x38], "big")
+    key_frame_len = int.from_bytes(header[0x3C:0x40], "big") if header[6] == 2 else 0
+    if not 17 <= metadata_len <= _RAO_MAX_METADATA_FRAME_BYTES:
+        raise ArchiveRestoreError("encrypted RAO object has invalid metadata framing")
+    if key_frame_len > _RAO_MAX_KEY_FRAME_BYTES:
+        raise ArchiveRestoreError("encrypted RAO object has invalid key framing")
+    prefix_len = _RAO_HEADER_BYTES + key_frame_len + metadata_len
+    remainder_range = ByteRange(_RAO_HEADER_BYTES, prefix_len)
+    with destination.open("xb") as output:
+        output.write(header)
+        with _open_backend_range_chunks(backend, locator, remainder_range) as source_chunks:
+            for chunk in _require_exact_range(source_chunks, remainder_range.length):
+                output.write(chunk)
+    return prefix_len
 
 
 def _iter_rem_plaintext(

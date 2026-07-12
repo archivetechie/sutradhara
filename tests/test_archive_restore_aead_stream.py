@@ -43,7 +43,7 @@ from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopyS
 from sutradhara.keys import KeyRegistry
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RaoCliSealer
+from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
 
 
 @pytest.fixture
@@ -67,6 +67,7 @@ class _StreamingObjectBackend:
         self.objects: dict[str, bytes] = {}
         self.max_chunk_seen = 0
         self.whole_reads = 0
+        self.range_requests: list[ByteRange] = []
         self.mount_delay_seconds = mount_delay_seconds
         self.mount_error = mount_error
         self.stream_delay_seconds = stream_delay_seconds
@@ -87,6 +88,7 @@ class _StreamingObjectBackend:
         return iter(())
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+        self.range_requests.append(byte_range)
         if byte_range.is_whole_object:
             self.whole_reads += 1
         data = self.objects[str(locator["object_id"])]
@@ -102,6 +104,7 @@ class _StreamingObjectBackend:
         *,
         chunk_bytes: int,
     ) -> Iterator[Iterator[bytes]]:
+        self.range_requests.append(byte_range)
         time.sleep(self.mount_delay_seconds)
         if self.mount_error is not None:
             raise self.mount_error
@@ -149,6 +152,196 @@ sys.stderr.write('{"command":"archive extract-stream","status":"ok"}\\n')
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def _write_ranged_stream_helper(
+    path: Path,
+    ranges: dict[str, tuple[int, int, int, int]],
+) -> Path:
+    """Write a strict fake of both RM3.3 commands for transport plumbing tests."""
+
+    path.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+ranges = {ranges!r}
+args = sys.argv[1:]
+if args[:2] == ["archive", "covering-range"]:
+    prefix = sys.stdin.buffer.read()
+    file_id = args[args.index("--file-id") + 1]
+    object_id = args[args.index("--object-id") + 1]
+    plaintext_start, plaintext_len, stored_start, stored_end = ranges[file_id]
+    if args[args.index("--range") + 1] != f"{{plaintext_start}}:{{plaintext_len}}":
+        raise SystemExit("wrong covering plaintext range")
+    print(json.dumps({{
+        "command": "archive covering-range",
+        "status": "ok",
+        "object_id": object_id,
+        "file_id": file_id,
+        "plaintext_start": plaintext_start,
+        "plaintext_len": plaintext_len,
+        "stored_range_start": stored_start,
+        "stored_range_len": stored_end - stored_start,
+        "stored_range_end": stored_end,
+        "authenticated_prefix_len": len(prefix),
+    }}))
+elif args[:2] == ["archive", "extract-stream"]:
+    required = ["--range", "--key-file", "--authenticated-prefix", "--stored-range-start"]
+    if any(flag not in args for flag in required):
+        raise SystemExit("missing ranged extract arguments")
+    prefix = pathlib.Path(args[args.index("--authenticated-prefix") + 1]).read_bytes()
+    if len(prefix) != 145:
+        raise SystemExit("wrong authenticated prefix")
+    stored_start = int(args[args.index("--stored-range-start") + 1])
+    plaintext_range = args[args.index("--range") + 1]
+    if not any(
+        stored_start == item[2] and plaintext_range == f"{{item[0]}}:{{item[1]}}"
+        for item in ranges.values()
+    ):
+        raise SystemExit("mismatched ranged extract geometry")
+    sys.stdout.buffer.write(sys.stdin.buffer.read())
+    sys.stderr.write('{{"command":"archive extract-stream","status":"ok"}}\\n')
+else:
+    raise SystemExit("unexpected command")
+""",
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def _synthetic_rao_prefix() -> bytes:
+    """Return framing sufficient for Python to bound input to the Rust query."""
+
+    header = bytearray(128)
+    header[:4] = b"RAO1"
+    header[6] = 1
+    header[0x30:0x38] = (17).to_bytes(8, "big")
+    return bytes(header) + b"m" * 17
+
+
+def _transient_member(
+    *,
+    object_id: str,
+    stored_size: int,
+    member_path: str,
+    plaintext_start: int,
+    plaintext_len: int,
+) -> tuple[Copy, AssetLocator]:
+    copy = Copy(
+        id=7,
+        native_locator={"object_id": object_id},
+        storage_metadata={"stored_size_bytes": stored_size},
+    )
+    locator = AssetLocator(
+        bundle_id="bundle-ranged",
+        member_path=member_path,
+        native_locator={
+            "first_chunk_lba": plaintext_start // RAO_CHUNK_SIZE,
+            "size_bytes": plaintext_len,
+        },
+        representation=Representation.RAO_AEAD_V1.value,
+    )
+    return copy, locator
+
+
+def test_aead_member_reads_only_rust_covering_stored_range(tmp_path: Path) -> None:
+    plaintext = b"byte-identical member plaintext"
+    plaintext_start = RAO_CHUNK_SIZE
+    stored_start = 1024
+    stored_end = stored_start + len(plaintext)
+    stored = bytearray(b"x" * 8192)
+    prefix = _synthetic_rao_prefix()
+    stored[: len(prefix)] = prefix
+    stored[stored_start:stored_end] = plaintext
+    backend = _StreamingObjectBackend()
+    backend.add("ranged-object", bytes(stored))
+    copy, locator = _transient_member(
+        object_id="ranged-object",
+        stored_size=len(stored),
+        member_path="member.bin",
+        plaintext_start=plaintext_start,
+        plaintext_len=len(plaintext),
+    )
+    helper = _write_ranged_stream_helper(
+        tmp_path / "ranged-rem",
+        {"member.bin": (plaintext_start, len(plaintext), stored_start, stored_end)},
+    )
+    key_file = tmp_path / "root.key"
+    key_file.write_bytes(b"k" * 32)
+
+    with archive_restore_module._open_rao_aead_plaintext_stream(
+        backend=backend,
+        copy=copy,
+        locator=locator,
+        rem_bin=str(helper),
+        key_file=key_file,
+    ) as chunks:
+        restored = b"".join(chunks)
+
+    assert restored == plaintext
+    assert ByteRange(stored_start, stored_end) in backend.range_requests
+    assert ByteRange(0, len(stored)) not in backend.range_requests
+
+
+def test_encrypted_bundle_reads_sum_of_member_covering_ranges(tmp_path: Path) -> None:
+    members = [b"first encrypted member", b"second member", b"third payload"]
+    stored = bytearray(b"x" * 32_768)
+    prefix = _synthetic_rao_prefix()
+    stored[: len(prefix)] = prefix
+    query_ranges: dict[str, tuple[int, int, int, int]] = {}
+    locators: list[AssetLocator] = []
+    for index, plaintext in enumerate(members, start=1):
+        stored_start = 2048 * index
+        stored_end = stored_start + len(plaintext)
+        stored[stored_start:stored_end] = plaintext
+        member_path = f"member-{index}.bin"
+        plaintext_start = RAO_CHUNK_SIZE * index
+        query_ranges[member_path] = (
+            plaintext_start,
+            len(plaintext),
+            stored_start,
+            stored_end,
+        )
+        _copy, locator = _transient_member(
+            object_id="bundle-object",
+            stored_size=len(stored),
+            member_path=member_path,
+            plaintext_start=plaintext_start,
+            plaintext_len=len(plaintext),
+        )
+        locators.append(locator)
+    backend = _StreamingObjectBackend()
+    backend.add("bundle-object", bytes(stored))
+    copy, _unused = _transient_member(
+        object_id="bundle-object",
+        stored_size=len(stored),
+        member_path="unused",
+        plaintext_start=RAO_CHUNK_SIZE,
+        plaintext_len=1,
+    )
+    helper = _write_ranged_stream_helper(tmp_path / "bundle-rem", query_ranges)
+    key_file = tmp_path / "root.key"
+    key_file.write_bytes(b"k" * 32)
+
+    restored: list[bytes] = []
+    for locator in locators:
+        with archive_restore_module._open_rao_aead_plaintext_stream(
+            backend=backend,
+            copy=copy,
+            locator=locator,
+            rem_bin=str(helper),
+            key_file=key_file,
+        ) as chunks:
+            restored.append(b"".join(chunks))
+
+    covering_requests = [item for item in backend.range_requests if item.start >= 2048]
+    assert restored == members
+    assert len(covering_requests) == len(members)
+    assert sum(item.length for item in covering_requests) == sum(map(len, members))
+    assert sum(item.length for item in covering_requests) < len(stored)
 
 
 def _install_candidates(
