@@ -4,7 +4,7 @@ The internal vocabulary of Sutradhara, as the code actually uses it. Each
 entry names the defining module so you can check the source. Terms that
 appear in older design docs but not in the code are flagged as such.
 
-<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ 3d8310c -->
+<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ df8165b -->
 ## Receive and intake
 
 **bag / BagIt** — the on-disk form of a received intake: a BagIt 1.0 bag
@@ -52,7 +52,20 @@ on the CLI.
 `~/sutra-agent` name for offline card-to-external-disk offload; on this
 side it is just a normal receive whose landing arrives later.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py @ 3d8310c -->
+**disposition (content novelty)** — the per-`IngestItem` verdict on
+whether this occurrence's bytes were already known durable:
+`new`, `known_durable`, `known_under_durable`, `reverified`, or the
+reserved-but-currently-unassigned `legacy_unknown`
+(`IngestDisposition` in `catalog/types.py`, computed in
+`intake.py::_classify_disposition`). It is recorded with the policy
+generation and evidence it was computed against, plus a `prior_intake_id`
+pointing at the most recent earlier registered intake for the same
+asset. This is the durable half of the receive-time "nothing new"
+check — see "duplicate warning" under
+[Relay and enrollment](#relay-and-enrollment) for the live, pre-registration
+half computed by `receive_novelty.py`.
+
+<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py @ df8165b -->
 ## Catalog identities
 
 **logical asset** — content identity. One row per distinct SHA-256; the
@@ -61,7 +74,8 @@ the database is not a data-loss event" works because assets are keyed by
 their own bytes.
 
 **ingest item** — occurrence identity: one appearance of an asset within
-one intake, carrying the as-received path and provenance
+one intake, carrying the as-received path, provenance, and a content-novelty
+**disposition** (see [Receive and intake](#receive-and-intake))
 (`IngestItem`). The same bytes on two cards yield one logical asset and
 two ingest items. These are "the two identities" the design docs mention.
 
@@ -103,7 +117,7 @@ to override), never deletion or preservation. `sutra unreject` clears it.
 **tag** — a soft-deleted governance label on an asset (`AssetTag`);
 removal tombstones the row for audit.
 
-<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ 3d8310c -->
+<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ df8165b -->
 ## Policy and placement
 
 **artifactclass** — the policy class of a piece of content (e.g. masters
@@ -143,7 +157,7 @@ uploaded at registration to the `cloud-temp` backend/pool (an encrypted
 RAO of the whole intake). Temporary by design: the retention gate deletes
 it once durable copies are proven.
 
-<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys/registry.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys/registry.py @ df8165b -->
 ## Sealing
 
 **representation** — the stored form of a copy: `raw-bytes`,
@@ -162,14 +176,19 @@ opener, so no path can skip verification.
 **key epoch** — one named encryption key in the local `KeyRegistry`.
 Encrypted copies record their epoch; epochs are domain-tagged (`archive`
 vs `hdcache`); retiring an epoch stops new writes but never deletes key
-material.
+material. Root keys are only ever materialized to disk in short-lived
+`0600` files for the duration of one `rem` call, and are best-effort
+zeroized before removal.
 
-<!-- code-anchor: src/sutradhara/arrangement.py src/sutradhara/virtual_arrangement.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/arrangement.py src/sutradhara/virtual_arrangement.py @ df8165b -->
 ## Arrangement
 
 **arrangement** — the mutable pre-archive workspace: registered masters
 placed at archive paths, movable and excludable until submit
-(`Arrangement`, `ArrangementMember`).
+(`Arrangement`, `ArrangementMember`). One arrangement can be cloned from
+another (`sutra arrangement create --from-arrangement`); the clone
+records its lineage (`cloned_from_arrangement_id`) — this is how you
+revise a terminal submission's contents without touching the frozen one.
 
 **submission / source-map** — the frozen output of `arrangement submit`:
 an immutable, validated, ordered `source-map.tsv`
@@ -184,7 +203,7 @@ organizational view (`VirtualArrangement`). Members key on
 catalog-only. Older docs call this "virtual segregation" or "VS" — same
 thing, renamed 2026-06-27.
 
-<!-- code-anchor: src/sutradhara/jobs @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/jobs @ df8165b -->
 ## Jobs and reconciliation
 
 **job / job attempt** — a `Job` row is one unit of work dispatched by
@@ -202,8 +221,12 @@ the existing job.
 
 **reconciler / domain** — a registered observer-actor for one kind of
 desired state (`copy`, `bundle_copy`, `derivation`, `hdcache`,
-`log_pipeline`). Level-triggered: each bounded cycle re-observes reality
-and enqueues at most one live job per target.
+`log_pipeline`, `restore_open`). Level-triggered: each bounded cycle
+re-observes reality and enqueues at most one live job per target — except
+`log_pipeline` and `restore_open`, which are alarm/state-only and never
+call `submit` (`restore_open` reopens an agent-delivery restore item
+whose lease expired before the device finished; see "The restore path"
+in `architecture-overview.md`).
 
 **condition** — the durable `(domain, target_key)` row recording the gap
 between desired and observed (`ReconciliationCondition`). Two axes:
@@ -246,7 +269,7 @@ reading the whole stored object: a `pfr-index-v1` container-index sidecar
 plus Remanence byte-range reads, with a fallback ladder to whole-member
 restore (`pfr.py`, `sutra pfr`).
 
-<!-- code-anchor: src/sutradhara/hdcache @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/hdcache @ df8165b -->
 ## HD cache
 
 **hdcache** — the expendable disk cache tier: independent JBOD disks in
@@ -270,6 +293,17 @@ drill. `forget` tombstones a drained dead disk's id.
 **privacy level (`p2`/`p3`)** — an artifactclass's hdcache privacy tier.
 Restoring cached private material requires the mapped capability
 (`can_restore_p2`/`can_restore_p3`), fail-closed for unmapped levels.
+
+**verified cache producer** — the bounded, digest-and-size-reverifying
+chunk producer (`hdcache/manager.py::open_verified_cache_plaintext`)
+that both restore delivery modes read cache hits through, so a cache
+read is never less verified than an archival restore — see "The restore
+path" in `architecture-overview.md`.
+
+**disk circuit breaker** — a process-local, per-disk failure tripwire on
+the restore-serving path: after enough cache-read failures within a
+window, the disk is treated as down (skip straight to fallback) until a
+recovery probe succeeds, so a wedged disk isn't retried into the ground.
 
 <!-- code-anchor: src/sutradhara/grpc src/sutradhara/api/routes_devices.py @ 3d8310c -->
 ## Relay and enrollment

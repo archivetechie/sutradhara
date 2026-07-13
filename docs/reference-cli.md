@@ -11,7 +11,7 @@ the rest) see [`reference-config.md`](reference-config.md). For what the
 pieces mean, see [`reference-glossary.md`](reference-glossary.md) and
 [`architecture-overview.md`](architecture-overview.md).
 
-<!-- code-anchor: src/sutradhara/cli/main.py src/sutradhara/catalog/session.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/main.py src/sutradhara/catalog/session.py @ df8165b -->
 ## Conventions
 
 - The CLI lives in the project virtualenv: `.venv/bin/sutra`, or
@@ -104,7 +104,7 @@ Verify completed bags whose destination-verification sidecar is absent,
 mid-transfer, or failed. Flags: `--landing DIRECTORY` (required,
 repeatable), `--json`. Exits 4 when any bag fails.
 
-<!-- code-anchor: src/sutradhara/cli/intake.py src/sutradhara/intake.py @ 3d8310c -->
+<!-- code-anchor: src/sutradhara/cli/intake.py src/sutradhara/intake.py @ df8165b -->
 ## sutra intake and sutra prepare
 
 Landing intakes cross the acceptance boundary here: `inspect` validates
@@ -163,7 +163,7 @@ Record a prepare profile for the derivation reconciler. Flags:
 code registry in `src/sutradhara/jobs/reconcilers/profiles.py`; the
 derivation reconciler picks the desired state up on its next cycle.
 
-<!-- code-anchor: src/sutradhara/cli/arrangement.py src/sutradhara/arrangement.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/arrangement.py src/sutradhara/arrangement.py @ df8165b -->
 ## sutra arrangement
 
 Arrange registered masters into an archive namespace, then freeze the
@@ -181,7 +181,7 @@ workspaces; submissions are terminal (revise by cloning, not resubmitting).
 
 `create`, `list`, `show`, and `submit` accept `--json`.
 
-<!-- code-anchor: src/sutradhara/cli/archive.py src/sutradhara/archive_restore.py src/sutradhara/artifactclass_policy.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/archive.py src/sutradhara/archive_restore.py src/sutradhara/artifactclass_policy.py @ df8165b -->
 ## sutra archive
 
 Artifactclass policy, durable bundles, held-bundle review, archiving frozen
@@ -292,13 +292,15 @@ Catalog queries. Currently one subcommand:
 - `sutra list assets` — list logical assets. `--limit INTEGER` (default
   `50`, `0` = unlimited), `--json`.
 
-<!-- code-anchor: src/sutradhara/cli/reconcile.py src/sutradhara/jobs/reconcilers @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/reconcile.py src/sutradhara/jobs/reconcilers @ df8165b -->
 ## sutra reconcile DOMAIN
 
 Run one bounded reconcile cycle for DOMAIN: observe desired state, discover
 gaps, and enqueue the jobs that close them. The registered domains are
-`copy`, `bundle_copy`, `derivation`, `hdcache`, and `log_pipeline`. An
-unknown domain exits 2.
+`copy`, `bundle_copy`, `derivation`, `hdcache`, `log_pipeline`, and
+`restore_open` (reopens an agent-delivery restore item whose lease expired
+before the device finished — an alarm/state-only domain that never
+enqueues a job). An unknown domain exits 2.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -310,7 +312,7 @@ unknown domain exits 2.
 | `--reopen-blocked` | off | Reopen blocked conditions for DOMAIN. |
 | `--reason TEXT` | | Filter `--reopen-blocked` by reason. |
 
-<!-- code-anchor: src/sutradhara/cli/jobs.py src/sutradhara/cli/worker.py src/sutradhara/jobs @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/jobs.py src/sutradhara/cli/worker.py src/sutradhara/jobs @ df8165b -->
 ## sutra jobs and sutra worker
 
 Direct job control and the worker loop. Most jobs are created by
@@ -323,7 +325,7 @@ reconcilers; `jobs submit` exists for operators and tests.
 | `list` | | List jobs. `--status [pending\|queued\|running\|succeeded\|failed\|cancelled]`, `--limit INTEGER` (default `50`, `0` = unlimited), `--json`. |
 | `show` | `JOB_ID` | Print full detail for one job. |
 | `run` | | Run pending jobs synchronously. `--id INTEGER` runs one specific job; `--limit INTEGER` (default `1`, `0` = drain queue) otherwise. |
-| `submit` | `KIND` | Submit a new job. `-p/--param key=value` (repeatable, values JSON-decoded when possible), `--resource pool=count` (repeatable), `--prereq INTEGER` (prerequisite job id), `--not-before TEXT` (ISO-8601 UTC), `--priority INTEGER` (default `0`, lower runs earlier), `--dedupe-key TEXT` (idempotency key for submit retries). |
+| `submit` | `KIND` | Submit a new job. `-p/--param key=value` (repeatable, values JSON-decoded when possible), `--resource pool=count` (repeatable), `--prereq INTEGER` (prerequisite job id), `--not-before TEXT` (ISO-8601 UTC), `--priority INTEGER` (default `0`, lower runs earlier), `--dedupe-key TEXT` (idempotency key for submit retries). `KIND` must be a registered kind; `restore` is explicitly rejected here (exit 2, "restore jobs must be created from gated restore requests") — server-local restores are submitted only through `POST /api/ui/restores`, never directly. |
 
 ### sutra worker
 
@@ -368,7 +370,7 @@ are marked `MISSING`. Scrub never deletes. This is the working proof of the
 rebuildable-index principle. Flags: `--backend TEXT` (required, a
 registered backend name).
 
-<!-- code-anchor: src/sutradhara/cli/hdcache.py src/sutradhara/hdcache @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/hdcache.py src/sutradhara/hdcache @ df8165b -->
 ## sutra hdcache
 
 Manage the expendable HD cache disk tier: enrollment and lifecycle of

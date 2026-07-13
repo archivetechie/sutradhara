@@ -31,7 +31,7 @@ data-loss event.
 - Not a vendor product like Miria — it is first-party software designed to
   outlive its dependencies.
 
-<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 3d8310c -->
+<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ df8165b -->
 ## Status
 
 Beyond the v0.1 anchor spec (see [`docs/spec-v0.1.md`](docs/spec-v0.1.md) for
@@ -46,26 +46,43 @@ restore lifecycle is implemented end to end, including:
 - Post-archive organization via permanently-mutable virtual arrangements
   (`sutra virtual`, `sutra tag`).
 - A level-triggered reconciler spine driving copies, derivations, cache
-  fills, and bundle self-heal (`sutra reconcile`).
+  fills, bundle self-heal, and expired restore-lease reopening
+  (`sutra reconcile`).
 - Retention / deletion gating that only reclaims landing data once durable
   copies are verified and offsite-confirmed (`sutra retention`, `sutra offsite`).
 - Scrub and self-heal against live backend state (`sutra scrub`).
-- An expendable HD-cache disk tier in front of tape (`sutra hdcache`).
+- An expendable HD-cache disk tier in front of tape, including a
+  cache-first, bounded, digest-verified byte producer shared by both
+  restore delivery modes below (`sutra hdcache`).
 - Partial file restore: container-index sidecars and byte-range clip cuts
   with a whole-member fallback (`sutra pfr`).
 - A single-node lease-aware job worker with cgroup-based resource control
   (`sutra worker`).
 - An operator HTTP API + mTLS gRPC relay for browser/agent-driven intake and
-  restore (`sutra serve`), with a duplicate-card-receive handshake (a durable
-  receive-intent state machine warns on a repeat card before bytes move, with
-  an explicit operator override).
+  restore (`sutra serve`), with:
+  - a receive-time content-novelty check — a device receive is flagged for
+    operator confirmation only when nothing new is detected on the card
+    (not merely because the card has been seen before), backed by a
+    durable receive-intent state machine and per-file dedup evidence
+    recorded on every ingest item; and
+  - an agent-delivered restore protocol (gRPC `OpenRestore` /
+    `CommitRestore` / `WatchAssignments`, an exclusive lease per restore
+    item, and idempotent resume) alongside the original server-local
+    restore path, both converging on the same verified-chunk read/write
+    primitives. The receiving-device agent itself lives outside this
+    repository; sutradhara implements the shared protocol and the server
+    side only. Encrypted-tape reads that back the server-local path now
+    survive tape-mount latency (a long grace window before the first byte,
+    a much shorter one once streaming starts) and, for bundle members,
+    stream only the covering ciphertext range instead of the whole stored
+    object.
 
 `docs/INDEX.md` tracks every design doc's status (current / implemented /
 superseded / historical) and is the authoritative map of what's built versus
 still proposed. `docs/roadmap.md` and
 `docs/implementation-plan-ingest-v2.md` track what's next.
 
-<!-- code-anchor: pyproject.toml packages @ 3d8310c -->
+<!-- code-anchor: pyproject.toml packages @ df8165b -->
 ## Layout
 
 ```
@@ -76,7 +93,7 @@ sutradhara/
 │   └── sutradhara-receive/    # dependency-light receive contract (maturin: Python + Rust core)
 ├── src/
 │   └── sutradhara/            # server/orchestrator package (the `sutra` CLI)
-├── proto/                     # gRPC contracts (device, intake, Remanence layer5)
+├── proto/                     # gRPC contracts (device, intake, restore, Remanence layer5)
 ├── docs/
 │   ├── spec-v0.1.md           # original design — start here for the "why"
 │   └── INDEX.md               # status of every design/contract/prompt doc
@@ -88,7 +105,7 @@ The Rust workstation helper (`sutra-agent`, tray + headless binaries) lives
 in its own repository and links `packages/sutradhara-receive` as a crate;
 an earlier in-tree `packages/sutra-agent` was removed when it moved.
 
-<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ 3d8310c -->
+<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ df8165b -->
 ## Install & verify
 
 Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/).
@@ -115,7 +132,7 @@ init`. [`docs/guide-quickstart.md`](docs/guide-quickstart.md) walks a full
 local tour, including a catalog rebuild from a fixture backend and one
 receive → register pass, plus troubleshooting.
 
-<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 3d8310c -->
+<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ df8165b -->
 ## CLI overview
 
 `sutra --help` lists every command group; each group has its own `--help`,
@@ -150,7 +167,7 @@ CLI adapter for the legacy d2 tape library), `s3` (cloud), `ssh_disk`
 accepted by `backends add` (`rem_disk`, `plain_disk`, `gcs`, `azure_blob`)
 are reserved names without adapters yet.
 
-<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 3d8310c -->
+<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ df8165b -->
 ## Configuration
 
 Beyond `SUTRADHARA_DB_URL`, the environment variables most operators need:

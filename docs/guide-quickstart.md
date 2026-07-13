@@ -7,7 +7,7 @@ here mirrors an invocation the test suite runs (`tests/test_cli.py`,
 `tests/test_receive_front_door.py`), so it works on a machine with no
 tape library, no Remanence build, and no ffmpeg.
 
-<!-- code-anchor: pyproject.toml uv.lock @ 3d8310c -->
+<!-- code-anchor: pyproject.toml uv.lock @ df8165b -->
 ## Install
 
 Requires Python ≥ 3.11 and [`uv`](https://docs.astral.sh/uv/).
@@ -22,7 +22,7 @@ The CLI lands in the virtualenv as `.venv/bin/sutra`. The examples below
 assume `.venv/bin` is on your `PATH` or you prefix each command with
 `uv run`.
 
-<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/cli/db.py src/sutradhara/cli/admin.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/cli/db.py src/sutradhara/cli/admin.py @ df8165b -->
 ## A scratch catalog
 
 Without `SUTRADHARA_DB_URL`, sutra writes `./sutradhara.db` in whatever
@@ -37,7 +37,7 @@ sutra admin doctor   # readiness report; WARNs are fine for this tour
 `doctor` will warn that the `rem` binary and the key registry are missing
 unless you have Remanence built. Nothing in this quickstart needs them.
 
-<!-- code-anchor: src/sutradhara/cli/backends.py src/sutradhara/cli/scrub.py tests/test_cli.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/backends.py src/sutradhara/cli/scrub.py tests/test_cli.py @ df8165b -->
 ## Rebuild a catalog from a backend
 
 This is the system's founding claim — the catalog is derived state,
