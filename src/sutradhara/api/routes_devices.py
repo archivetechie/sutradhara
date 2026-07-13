@@ -103,6 +103,10 @@ class EnrollCsrRequest(BaseModel):
 
     csr_pem: str
     token: str
+    # The helper sends this field for parity with the CLI enrollment path.
+    # Rotation authority is carried by the one-time token; the endpoint does
+    # not use this value to authorize or select a certificate rotation.
+    reenroll: bool = False
 
 
 class SimpleRateLimiter:

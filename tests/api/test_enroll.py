@@ -376,6 +376,14 @@ def test_csr_redemption_rejects_bundle_only_scope_claim() -> None:
         EnrollCsrRequest.model_validate({"csr_pem": "pem", "token": "token", "scopes": ["restore"]})
 
 
+def test_csr_redemption_accepts_inert_reenroll_flag() -> None:
+    request = EnrollCsrRequest.model_validate(
+        {"csr_pem": "pem", "token": "token", "reenroll": False}
+    )
+
+    assert request.reenroll is False
+
+
 def test_enroll_bundle_loads_agent_bundle_from_env(
     api_engine: Engine,
     tmp_path: Path,
