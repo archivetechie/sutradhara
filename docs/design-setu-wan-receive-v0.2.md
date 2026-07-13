@@ -20,6 +20,39 @@ the ad-hoc portal through the same admission and writer, and Spec 3 adds an opaq
 relay only if Spec 0 proves that the direct route, rather than the endpoints, is the
 bottleneck.
 
+**Review — Claude diff-gate (2026-07-13): PASS, advance to panel.** All six of §1's
+code-grounded corrections were verified against the actual source and are accurate:
+the upload is entangled across `stream_file` + the 4-slot `mpsc` channel +
+`send_file_chunks`/`send_chunk` (`~/sutra-agent/src/relay/intake.rs:982,1040-1129`);
+the in-flight journal carries no chunk progress
+(`~/sutra-agent/src/relay/inflight.rs:17-29`) so resume is completed-file only; a
+failed intake unconditionally aborts and deletes its journal row
+(`~/sutra-agent/src/relay/intake.rs:544` after the bounded retry at `:634-644`);
+server-side stream coordination is process-local threading state
+(`~/sutradhara/src/sutradhara/grpc/servicer.py:61-70`); `CommitIntake` terminates at
+`assemble_committed_bag` with RAO/copy fanout happening later
+(`servicer.py:197-251`); and the current gRPC server actively rejects public binds
+(`server.py:94-108`). The design honors every standing constraint: the single landing
+seam `IntakeLandingWriter::accept_chunk` with only `assemble_committed_bag` publishing
+`intake.json` (the wrap-don't-copy / single-funnel discipline); no compat flags,
+legacy transport, or dormant POP (pre-production backout = `git revert`); mTLS identity
+reused for QUIC with the data ticket derived from it, not a second identity; one
+aggregate reservoir + token bucket bounding memory *and* bandwidth across all lanes,
+work-queue stealing, and parallelism bounded/reduced after the knee (the measured
+throughput physics); and an explicit TIO-6 reservoir/watermark reuse for
+disk↔socket backpressure. The receiver's durable cross-process session lock correctly
+retires the process-local `runtime.in_flight` gate, and the §7.3 phase barrier keeps
+verify/RAO off the socket reservoir.
+
+*Top risk to carry into the panel:* the parity thesis rests entirely on QUIC+BBR
+filling the pipe, and §15.3 flags `quinn`'s BBR as experimental — so "does `quinn`+BBR
+actually beat bounded parallel-TCP on the real link" should be an explicit **Spec-0
+go/no-go for building the QUIC engine at all**, not just a tuning label. The
+TCP-first build sequencing (S1.6 before S1.7) already hedges this well. Minor: the
+TCP-fallback path carries payload bytes through the Python receive + PyO3 hop (the
+QUIC path calls the Rust writer directly), so the fallback's ceiling may be lower —
+acceptable, as it is the degraded path. Not yet panel-reviewed; no prompts cut.
+
 ## 1. Corrections to v0.1 — load-bearing
 
 The v0.1 direction is sound, but several of its implementation premises are not true
