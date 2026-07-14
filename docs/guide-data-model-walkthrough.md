@@ -222,21 +222,28 @@ rules make this trustworthy:
   artifact's detail view. Primary membership means "original evidence," and only
   originals count.
 
-### Where the boundary comes from — propose, then confirm
+### Where the boundary comes from — seeded at receive, drawn at the organizing table
 
-Drawing the boundary is a two-step move on purpose. At receive, the system
-**proposes** artifacts from *explicit intent* — "receive this selected folder as one
-artifact," "take the whole card as one artifact." Then, before any expensive
-policy-bearing work, the boundary is **confirmed** (by a human, or by genuinely
-unambiguous intent), which freezes primary membership and writes durable definition
-evidence.
+Drawing the boundary is deliberately *not* done at the door. At receive, the
+system only **seeds a proposal** from whatever intent the gesture carried —
+"this selected folder," "this whole card" — a cheap, freely-editable draft that
+makes no promises. The real decision happens where the operator can actually
+*see* the material: in the arrangement session (the arranger's proxy
+projections, reorganized with ordinary Finder gestures), where carving the top
+level of the workspace *is* drawing the artifact boundaries. The **submit**
+gesture then does both solemn acts in one signature — it confirms the boundary
+(freezing primary membership, writing durable definition evidence) and freezes
+the arrangement. Routine cards whose structure is already right skip the
+session entirely with a one-click "archive as-is."
 
 *Why not just auto-adopt whatever folders are on the card?* Because an arbitrary
-top-level directory in an old intake is a **guess**, and a wrong boundary that gets
-baked in and lives for decades is exactly the mistake you can't cheaply undo.
-Selected-folder and whole-card intents are safe to auto-confirm; loose files are
-never silently dropped; mixed media kinds are allowed only if the class policy says
-so. The model would rather ask than assume.
+top-level directory is a **guess**, and a wrong boundary that gets baked in and
+lives for decades is exactly the mistake you can't cheaply undo. Proposals cost
+nothing to redraw; confirmed boundaries cost successor artifacts and audit
+trail. So the system keeps everything in pencil until the one moment the
+operator commits — and loose files are never silently dropped; mixed media
+kinds are allowed only if the class policy says so. The model would rather ask
+than assume.
 
 ### Artifacts live for decades — so they have lineage
 
