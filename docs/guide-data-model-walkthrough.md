@@ -296,9 +296,12 @@ namespace — and she does it in two moves: free editing, then a freeze.
 The free move is an **`arrangement`**: a **mutable naming/organization revision of
 exactly one artifact** (that scoping matters — you're arranging *a business object*,
 not a random pile of intake items). Each **`arrangement_member`** points at an
-**`artifact_member`** and proposes a `member_path`, with an `excluded` flag for
-"leave this one out." Meera drags, renames, excludes the corrupt clip — all cheap,
-all reversible. This is *pencil*.
+**`artifact_member`** and proposes a `member_path`. Meera drags, renames,
+reshuffles the folder layout — all cheap, all reversible. This is *pencil*. (The
+corrupt clip she worried about isn't here at all — it was quarantined at
+registration, before it could ever become a member; Chapter 6 tells that story.
+An arrangement can rename members but never drop them, because everything
+confirmed gets archived.)
 
 Then she **freezes** it into a **`submission`** — *ink*. A submission is an
 **immutable source-map**: it captures the artifact's id and definition digest, its
@@ -309,8 +312,14 @@ submitted path, and — importantly — a **`disposition`**:
 
 - `materialize` — write this one now;
 - `satisfied_existing` — already durably archived (from a prior receive), so it need
-  not be re-written;
-- `policy_excluded` — deliberately left out, with a recorded reason.
+  not be re-written.
+
+There are deliberately only these two. "Archive everything" is absolute here (a
+decision made explicitly, 2026-07-14): policy may never exclude a primary member,
+so every member of a confirmed artifact must carry one of these two dispositions —
+a card's stray junk files get archived with the card. Anything genuinely unwanted
+has to be dealt with *before* the boundary is confirmed (quarantine, or don't
+confirm), where the omission stays loud instead of becoming a silent gap.
 
 *Why record `satisfied_existing` instead of just omitting the member?* Because a
 missing row is **ambiguous** when you later rebuild the catalogue from evidence — did
