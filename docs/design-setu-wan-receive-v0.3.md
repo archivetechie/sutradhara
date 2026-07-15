@@ -1,10 +1,12 @@
-# Design — Setu WAN receive / Signiant replacement (v0.2)
+# Design — Setu WAN receive / Signiant replacement (v0.3)
 
-**Status:** detailed, code-grounded design for panel/owner review (2026-07-13).
-The owner-approved v0.1 product and engine decisions are carried forward. This
-document is the implementation design for Spec 1, includes the executable Spec 0
-measurement plan, and is the source from which the per-repository Codex prompts are
-to be cut. No implementation has landed.
+**Status:** detailed, code-grounded design. **v0.3 = panel-folded** (5-lens panel
+2026-07-14 — `panel-setu-2026-07-14.md` — SOUND-WITH-FIXES; 20/22 findings folded).
+Pending codex verify round → freeze. The owner-approved v0.1 product and engine
+decisions are carried forward; the v0.2 body below is the detailed design; **§0
+records the normative v0.3 fold resolutions and overrides the body wherever they
+differ.** This is the source from which the per-repository Codex prompts are cut
+(S1.1's complete proto is the gating first item). No implementation has landed.
 
 **Decision (one paragraph).** Build Setu to Signiant parity by retaining
 `sutra-agent`'s outbound, enrolled, mTLS control plane and Sutradhara's one receive
@@ -52,6 +54,116 @@ TCP-first build sequencing (S1.6 before S1.7) already hedges this well. Minor: t
 TCP-fallback path carries payload bytes through the Python receive + PyO3 hop (the
 QUIC path calls the Rust writer directly), so the fallback's ceiling may be lower —
 acceptable, as it is the degraded path. Not yet panel-reviewed; no prompts cut.
+
+## 0. v0.3 panel-fold resolutions (NORMATIVE — overrides the body where it differs)
+
+The 2026-07-14 panel (Fable transport/perf, codex gpt-5.6-sol security/contract, Kimi
+failure-modes, GLM cost/ops — `panel-setu-2026-07-14.md`) affirmed the direction and
+folded 20 findings. These resolutions are normative for the prompt set; the v0.2 body is
+retained for rationale.
+
+**0.1 Complete wire contract (S1.1 gate; resolves C3/C5/C4/F7).** Before any transport
+prompt, `proto/intake.proto` defines the *entire* data-session contract, tagged and
+fuzz/round-trip tested in both repos:
+- `OpenDataSessionResponse` includes `data_session_id`, `transport_generation` (uint64),
+  selected version, ticket hash id, expiry/renew deadlines, both authorities, and the
+  negotiated ceilings.
+- `DataPlaneFrame` oneof is complete and closed: `SessionHello`, `SessionAccepted`,
+  `FileBegin`, `DataChunk`, `DurableChunkAck`, `FileFinish`, `FileReceipt`, `Checkpoint`,
+  `Error`, `Goodbye` — every field defined, unknown tags/versions rejected.
+- `Error` carries a **closed code enum**; the client maps each code to
+  retry / fallback / terminal. The **fallback allowlist is network-reachability codes
+  only**; every auth/policy/ownership/protocol code is terminal (no silent fallback).
+- `file_generation` (uint64) and `force` ride `FileBegin`/`DataChunk`/`FileFinish`/
+  `FileReceipt` and the resume-plan rows; `GetDataResumePlan` is paginated by an opaque
+  cursor and returns the server `file_generation` per file. Ticket renewal is on the
+  data-session control channel only; `DeviceService.Connect` is untouched.
+
+**0.2 Generation state machine + crash-safe switch (new §4.4; resolves C4/C5/K2/K5).**
+The server owns a per-session transport CAS `UNBOUND → QUIC(n) → SWITCHING → TCP(n+1)`
+and a per-file generation. A transport switch (a) drains/fences the old generation at
+the writer *after* socket close, not on a flag flip, so a late old-generation frame is
+rejected by generation check, never interleaved; (b) is gated by a non-payload probe
+that must return a durable ack through the same writer. `session.lock` is a
+**kernel-released `flock`** so a QUIC-ingress `kill -9` releases it and TCP fallback
+proceeds — proven by SETU.4 (ingress kill → fallback completes) and a late-frame
+injection assertion. Commit-time reupload persists `reupload_used` + the bumped
+`file_generation` server-side and defines close→commit→reopen ordering; the second
+reupload request stays a hard error, now crash-safe across a client restart.
+
+**0.3 Split trust principals (resolves C1).** The Rust ingress runs as its **own uid**,
+distinct from the Python server/DB owner and the landing-root owner. Over the UDS it
+receives only **per-intake partial-directory fds** (SCM_RIGHTS) and does fd-relative
+`openat(..., O_NOFOLLOW)` writes; it can reach neither the database, the published
+`data/`, sentinels, nor any other intake. Confinement is open-fd-then-verify, closing
+the check-then-use symlink race. A compromised or buggy ingress can affect at most the
+one live intake it already holds an fd for — never the catalog or other intakes.
+
+**0.4 Durable admission + disjoint cross-process budget (resolves C2/C8).** At ticket
+issue the server **transactionally reserves** authorized byte, file-count, and inode
+ceilings persisted on the durable intake/intent row (not volatile progress), checked
+against free space + reserve. The "one global reservoir" becomes **two disjoint
+per-process reservoirs whose checked sum is the global ceiling**; because the session
+lock guarantees QUIC and TCP never serve the same intake concurrently, disjoint budgets
+are sound and need no live credit broker. Duplicate-chunk hashing and wire bytes are
+rate-limited so an enrolled client cannot exhaust CPU/metadata under the unique-byte cap.
+
+**0.5 Permit lifetime + sizing law (resolves F1/C9).** The reservoir permit stays
+attached to its `PreparedChunk` across **every** retry/requeue and releases **only** on
+durable ack or terminal buffer destruction (never on requeue) — closing the
+free-credit-while-buffer-queued memory bug. The reservoir/`max_transport_memory` is a
+**Spec-0-derived** parameter obeying `reservoir_high ≥ target_rate × (RTT_p95 +
+checkpoint_latency_p95)`; the 256 MiB ceiling is a floor to raise if the measured link
+needs it, so the memory bound never silently caps below the pipe. The retransmit source
+of truth is the source file (re-read), not the RAM buffer.
+
+**0.6 Fail-closed auth + progress-decoupled control (resolves C10/F2/K3/K6).** An
+independent ≤20 s timer revalidates enrollment/revocation regardless of write progress;
+revocation fences the active generation at the next tick. Lease loss becomes a **grace
+window** (retain partials, allow re-lease/re-open within the owner-configured interval) —
+terminal only on revocation/policy/operator-cancel, not on a transient partition. The
+soft-fallback trigger is computed on server **received-progress** (a new control frame
+distinguishing `received_bytes` from `durable_bytes`) scaled to the negotiated chunk
+size, so a genuinely slow-but-alive link and a landing-disk stall no longer misfire a
+transport switch, and the client can label `landing_disk` vs `network`.
+
+**0.7 Bound the public front door (resolves C6/C7/C11).** QUIC enables quinn stateless
+`Incoming::retry` address validation, handshake/idle deadlines, and global + per-source
+connection quotas, with **zero payload-stream credit before ticket acceptance**. The
+Setu TCP listener carries a **service allowlist** — `DeviceService.Connect`, Intake
+control/commit, `TransferChunks` — and **not** `RestoreService`; it caps concurrent RPCs,
+bounds lanes per ticket, and reserves control/heartbeat capacity so bulk lanes cannot
+starve commit. TLS 1.3 is an enforced+tested floor (TLS 1.2 rejected) on both sockets,
+and the **ingest** enrollment scope is required at Start/Open/UDS-renew and bound into
+the ticket (Intake/Device today resolve only a fingerprint).
+
+**0.8 Finish-hash without tail stall (resolves F3/K4).** The independent whole-file
+SHA-256 is computed incrementally over the contiguous durable **prefix** as checkpoints
+extend it, and runs outside the write semaphore under a bounded read budget; `FileFinish`
+re-reads only the out-of-order suffix. Full sequential re-read remains the degenerate
+fallback. Commit drains the landing submitter (**flush barrier**) then verifies ranges.
+
+**0.9 gRPC-over-UDS, not a bespoke protocol (resolves G1).** The four ingress↔server
+control calls (`authorize_ticket`, `renew_activity`, `release_session`,
+`report_transport_stats`) are a normal internal gRPC service carried over the
+filesystem-permission-gated `unix:` socket — standard generated stubs, no hand-rolled
+wire format, same no-TCP-listener posture.
+
+**0.10 Scope trims + test/impl notes (resolves G2/F4/F5/F6/K8/C12).** S1.11 ships
+structured JSON telemetry + a parity-report script vs the Signiant log; the operator-UI
+dashboard is a post-acceptance prompt. S1.2's done-condition requires PyO3 `accept_chunk`
+to **release the GIL** (+ a lane-parallelism throughput test). SETU exposes injectable
+clock, fault-proxy control, and checkpoint-cadence seams; **no sleep-based assertions**.
+Restart re-read cost is bounded (per-partial-file, overlapped with missing-range
+submission). Ticket deadlines are server-validated and client-side monotonic-relative
+(clock-skew safe). S1.3 migrates Scenario RDD's helper onto `TransferChunks`/the shared
+writer as the new RPC lands, so removing `UploadFile` orphans no acceptance test.
+
+**0.11 BBR production go/no-go (resolves F8).** §11.4 acceptance gains an explicit gate:
+if the QUIC+BBR Spec-0 spike does not materially beat the parallel-TCP spike on the real
+link, the production **primary** is parallel-TCP and S1.7's engine choice is re-reviewed.
+This gates the production-primary selection only; the TCP-first build order (S1.6 → S1.7)
+is unchanged.
 
 ## 1. Corrections to v0.1 — load-bearing
 
@@ -323,8 +435,9 @@ pub(crate) struct FinishDataFile {
 }
 ```
 
-`PreparedChunk` is an owned, fixed-size reservoir buffer. Its permit is released only
-when the durable ack arrives or the chunk is requeued after a connection failure.
+`PreparedChunk` is an owned, fixed-size reservoir buffer. Its permit stays attached
+across every retry/requeue and is released **only** on the durable ack or terminal
+buffer destruction — never on requeue, whose bytes still occupy the reservoir (§0.5).
 `QuicBbrTransport` and `ParallelTcpTransport` implement this trait and contain their
 own lane tasks, but use the same bounded MPMC work queue, cap, progress counters, and
 retry classification. There is no `LegacyGrpcTransport`, runtime compatibility flag,
