@@ -26,6 +26,7 @@ from sutradhara.sealing.rao import (
     inspect_rao,
     resolve_rem_bin,
 )
+from tests.key_helpers import registry_with_recovery
 
 
 def _rem_bin_or_skip() -> str:
@@ -55,6 +56,17 @@ def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 except ValueError:
                     return None
 
+            def opts(name):
+                return [sys.argv[index + 1] for index, value in enumerate(sys.argv) if value == name]
+
+            def recipient(path):
+                raw = Path(path).read_bytes()
+                label_len = raw[21]
+                return {
+                    "epoch_id": raw[5:21].hex(),
+                    "label": raw[22:22 + label_len].decode(),
+                }
+
             def emit(value):
                 print(json.dumps(value, sort_keys=True))
 
@@ -62,14 +74,14 @@ def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             if command == ["archive", "build"]:
                 source = Path(opt("--inputs"))
                 out = Path(opt("--out"))
-                encrypt = "--encrypt" in sys.argv
-                key_id = opt("--key-id")
+                recipients = [recipient(path) for path in opts("--recipient")]
+                encrypt = bool(recipients)
                 data = source.read_bytes()
                 body = {
                     "data_hex": data.hex(),
-                    "key_id": key_id,
                     "name": source.name,
                     "object_id": opt("--object-id"),
+                    "recipient_epochs": recipients,
                     "representation": "encrypted" if encrypt else "plaintext",
                 }
                 payload = json.dumps(body, sort_keys=True).encode()
@@ -88,7 +100,8 @@ def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                         "path": source.name,
                         "size_bytes": len(data),
                     }],
-                    "key_id": key_id,
+                    "format_version": 2 if encrypt else None,
+                    "recipient_epochs": recipients if encrypt else None,
                     "plaintext_digest": hashlib.sha256(b"inner:" + data).hexdigest(),
                     "representation": "encrypted" if encrypt else "plaintext",
                     "stored_digest": stored_digest,
@@ -101,7 +114,8 @@ def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                     "body_format": "rao-v1",
                     "chunk_size": int(opt("--chunk-size") or 262144),
                     "encryption": "RAO1" if encrypted else "none",
-                    "key_id": body["key_id"] if encrypted else None,
+                    "format_version": 2 if encrypted else None,
+                    "recipient_epochs": body["recipient_epochs"] if encrypted else None,
                     "keyed": False if encrypted else None,
                     "representation": body["representation"],
                     "stored_digest": hashlib.sha256(obj).hexdigest(),
@@ -109,8 +123,8 @@ def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             elif command == ["archive", "extract"]:
                 obj = Path(opt("--object")).read_bytes()
                 encrypted = obj.startswith(b"RAO1")
-                if encrypted and opt("--key-file") is None:
-                    print("error: encrypted RAO extract requires --key-file", file=sys.stderr)
+                if encrypted and opt("--private-key") is None:
+                    print("error: encrypted RAO extract requires --private-key", file=sys.stderr)
                     sys.exit(1)
                 body = json.loads((obj[4:] if encrypted else obj).decode())
                 dest = Path(opt("--dest"))
@@ -155,7 +169,8 @@ def test_rao_cli_sealer_plain_round_trip_with_fake_cli(
         assert result.stored_digest == _sha256(sealed_path)
         inspection = inspect_rao(sealed_path)
         assert inspection.representation is Representation.RAO_PLAIN_V1
-        assert inspection.key_id is None
+        assert inspection.format_version is None
+        assert inspection.recipient_epochs == ()
         assert inspection.report["chunk_size"] == RAO_CHUNK_SIZE
         with opener.open(sealed_path, Representation.RAO_PLAIN_V1) as opened:
             assert opened.read_bytes() == source.read_bytes()
@@ -188,7 +203,7 @@ def test_rao_cli_sealer_encrypted_round_trip_and_key_id_with_fake_cli(
     _fake_rem_bin(tmp_path, monkeypatch)
     source = tmp_path / "asset.bin"
     source.write_bytes(b"rao encrypted round trip")
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     sealer = RaoCliSealer(registry)
     opener = RaoCliOpener(registry)
@@ -199,11 +214,16 @@ def test_rao_cli_sealer_encrypted_round_trip_and_key_id_with_fake_cli(
         assert result.stored_digest == _sha256(sealed_path)
         inspection = inspect_rao(sealed_path)
         assert inspection.representation is Representation.RAO_AEAD_V1
-        assert inspection.key_id == epoch.key_id
+        assert inspection.format_version == 2
+        assert [item.label for item in inspection.recipient_epochs] == [
+            epoch.key_id,
+            recovery.key_id,
+        ]
+        assert result.recipient_epochs == (epoch.key_id, recovery.key_id)
         with opener.open(
             sealed_path,
             Representation.RAO_AEAD_V1,
-            key_epoch=epoch,
+            recipient_epochs=result.recipient_epochs,
         ) as opened:
             assert opened.read_bytes() == source.read_bytes()
 
@@ -248,11 +268,11 @@ def test_rao_cli_sealer_passes_through_d2tar_representation(tmp_path: Path) -> N
         assert opened == source
 
 
-def test_rao_real_binary_round_trips_and_deterministic_reseal(tmp_path: Path) -> None:
+def test_rao_real_binary_round_trips_and_v2_recipients(tmp_path: Path) -> None:
     rem_bin = _rem_bin_or_skip()
     source = tmp_path / "asset.bin"
     source.write_bytes(b"real remanence rao integration")
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     sealer = RaoCliSealer(registry)
     opener = RaoCliOpener(registry)
@@ -276,16 +296,18 @@ def test_rao_real_binary_round_trips_and_deterministic_reseal(tmp_path: Path) ->
         assert encrypted.stored_digest == _sha256(encrypted.sealed_path)
         inspection = inspect_rao(encrypted.sealed_path)
         assert inspection.representation is Representation.RAO_AEAD_V1
-        assert inspection.key_id == epoch.key_id
+        assert inspection.format_version == 2
+        assert encrypted.recipient_epochs == (epoch.key_id, recovery.key_id)
+        assert [item.epoch_id for item in inspection.recipient_epochs] == [
+            epoch.key_id.rsplit("-", 1)[1],
+            recovery.key_id.rsplit("-", 1)[1],
+        ]
         with opener.open(
             encrypted.sealed_path,
             Representation.RAO_AEAD_V1,
-            key_epoch=epoch,
+            recipient_epochs=encrypted.recipient_epochs,
         ) as opened:
             assert opened.read_bytes() == source.read_bytes()
-
-    with sealer.seal(source, Representation.RAO_AEAD_V1, key_epoch=epoch) as resealed_encrypted:
-        assert resealed_encrypted.sealed_path.read_bytes() == encrypted_bytes
 
     keyless = subprocess.run(
         [

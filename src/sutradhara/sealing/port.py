@@ -10,6 +10,7 @@ a stored copy before the missing placement is re-sealed.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -37,6 +38,7 @@ class SealResult:
     stored_digest: bytes
     plaintext_digest: bytes
     representation: Representation
+    recipient_epochs: tuple[str, ...] = ()
 
 
 class Sealer(Protocol):
@@ -62,7 +64,8 @@ class Opener(Protocol):
         source_path: Path | str,
         representation: Representation,
         *,
-        key_epoch: KeyEpoch | None = None,
+        recipient_epochs: Sequence[str] | None = None,
+        key_domain: str | None = None,
         work_dir: Path | str | None = None,
     ) -> AbstractContextManager[Path]:
         """Yield a local plaintext file, cleaning temporary files on exit."""

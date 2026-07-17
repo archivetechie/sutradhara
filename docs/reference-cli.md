@@ -483,4 +483,6 @@ Schema and local maintenance.
 |---|---|---|
 | `db init` | | Create all tables on the configured DB. Development convenience; production uses `alembic upgrade head` so the change history is tracked. `--echo` echoes SQL. |
 | `admin doctor` | | Report local operational readiness (rem binary, key registry, and related seams). `--strict` exits non-zero on any WARN. |
+| `admin keys mint-recovery` | `--public-key FILE --private-key FILE` | Offline-only mint of a recovery X25519 keypair to operator-selected RAOR/RAOP paths. The private output is escrow material and is never imported. Prints the serving-host import command. Refuses to overwrite either output. |
+| `admin keys import-public` | `--public-key FILE` | Import a canonical recovery RAOR public epoch into `SUTRADHARA_KEY_REGISTRY_DIR`; the previous recovery public epoch is retired for new seals. |
 | `admin reset` | | Drop and recreate the configured catalog database schema. Requires `--i-mean-it`. `--echo` echoes SQL. |

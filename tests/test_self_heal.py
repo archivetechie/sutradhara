@@ -13,7 +13,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -37,7 +37,7 @@ from sutradhara.catalog.types import (
     CopySource,
     content_hash,
 )
-from sutradhara.keys import KeyEpoch, KeyRegistry
+from sutradhara.keys import KeyEpoch
 from sutradhara.replication import (
     SelfHealUnavailable,
     replicate_asset,
@@ -46,6 +46,10 @@ from sutradhara.replication import (
 )
 from sutradhara.sealing.port import Representation, SealResult
 from sutradhara.sealing.rao import RaoCliOpener, RaoCliSealer, resolve_rem_bin
+from tests.key_helpers import registry_with_recovery
+
+ARCHIVE_EPOCH = "archive-" + "1" * 32
+RECOVERY_EPOCH = "recovery-" + "2" * 32
 
 
 @pytest.fixture
@@ -152,12 +156,13 @@ class _FakeSealer:
                 stored_digest,
                 plaintext_digest,
                 representation,
+                (key_id, RECOVERY_EPOCH) if key_id is not None else (),
             )
 
 
 class _FakeOpener:
     def __init__(self) -> None:
-        self.calls: list[tuple[Representation, str | None]] = []
+        self.calls: list[tuple[Representation, tuple[str, ...] | None]] = []
 
     @contextlib.contextmanager
     def open(
@@ -165,10 +170,13 @@ class _FakeOpener:
         source_path: Path | str,
         representation: Representation,
         *,
-        key_epoch: KeyEpoch | None = None,
+        recipient_epochs: Sequence[str] | None = None,
+        key_domain: str = "archive",
     ) -> Iterator[Path]:
-        key_id = key_epoch.key_id if key_epoch is not None else None
-        self.calls.append((representation, key_id))
+        del key_domain
+        self.calls.append(
+            (representation, None if recipient_epochs is None else tuple(recipient_epochs))
+        )
         source = Path(source_path)
         if representation is Representation.RAW_BYTES:
             yield source
@@ -238,8 +246,8 @@ def _metadata(
     key_epoch: str | None = None,
 ) -> dict[str, object]:
     metadata: dict[str, object] = {"representation": representation.value}
-    if representation is Representation.RAO_AEAD_V1 and key_epoch is not None:
-        metadata["key_epoch"] = key_epoch
+    if representation is Representation.RAO_AEAD_V1:
+        metadata["recipient_epochs"] = [key_epoch or ARCHIVE_EPOCH, RECOVERY_EPOCH]
     return metadata
 
 
@@ -283,7 +291,7 @@ def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
             asset_hash,
             "o-archive",
             backends={backend_id: backend},
-            key_epoch="1" * 32,
+            key_epoch=ARCHIVE_EPOCH,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
         )
@@ -303,7 +311,7 @@ def test_self_heal_raises_when_no_healthy_source_remains(engine: Engine) -> None
             asset_hash,
             "o-archive",
             backends={backend_id: _backend()},
-            key_epoch="1" * 32,
+            key_epoch=ARCHIVE_EPOCH,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
         )
@@ -319,7 +327,7 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
     backend = _backend()
     opener = _FakeOpener()
     sealer = _FakeSealer()
-    key_id = "1" * 32
+    key_id = ARCHIVE_EPOCH
 
     source_bytes = b"rao-plain-v1::" + data
     source_record = backend.put_object("o-copy-1-pool", source_bytes)
@@ -383,8 +391,8 @@ def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
     backend = _backend()
     opener = _FakeOpener()
     sealer = _FakeSealer()
-    old_key_id = "a" * 32
-    current_key_id = "b" * 32
+    old_key_id = "archive-" + "a" * 32
+    current_key_id = "archive-" + "b" * 32
 
     missing_record = backend.put_object("o-copy-1-pool", b"lost old copy")
     source_record = backend.put_object(
@@ -427,7 +435,7 @@ def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
 
     assert len(repaired) == 1
     assert repaired[0].native_locator["pool_id"] == "o-copy-1-pool"
-    assert opener.calls == [(Representation.RAO_AEAD_V1, old_key_id)]
+    assert opener.calls == [(Representation.RAO_AEAD_V1, (old_key_id, RECOVERY_EPOCH))]
     assert sealer.calls == [(Representation.RAO_PLAIN_V1, None)]
 
 
@@ -459,7 +467,7 @@ def test_self_heal_marks_bad_source_suspect_on_candidate_exhaustion(
                 asset_hash,
                 "o-archive",
                 backends={backend_id: backend},
-                key_epoch="1" * 32,
+                key_epoch=ARCHIVE_EPOCH,
                 opener=_FakeOpener(),
                 sealer=_FakeSealer(),
             )
@@ -476,7 +484,9 @@ def test_self_heal_falls_back_after_proven_bad_source(
     _add_o_archive_pools(engine, backend_id)
     backend = _backend()
     bad_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::tampered")
-    good_record = backend.put_object("o-copy-2-pool", b"rao-aead-v1:" + b"1" * 32 + b":" + data)
+    good_record = backend.put_object(
+        "o-copy-2-pool", b"rao-aead-v1:" + ARCHIVE_EPOCH.encode() + b":" + data
+    )
 
     with session_scope(engine) as s:
         s.add(
@@ -513,7 +523,7 @@ def test_self_heal_falls_back_after_proven_bad_source(
             integrity_hash=good_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-2-pool",
-            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch="1" * 32),
+            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=ARCHIVE_EPOCH),
             last_verified_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         )
 
@@ -522,7 +532,7 @@ def test_self_heal_falls_back_after_proven_bad_source(
             asset_hash,
             "o-archive",
             backends={backend_id: backend},
-            key_epoch="1" * 32,
+            key_epoch=ARCHIVE_EPOCH,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
         )
@@ -543,7 +553,7 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
     first_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::" + data)
     second_record = backend.put_object(
         "o-copy-2-pool",
-        b"rao-aead-v1:" + b"1" * 32 + b":" + data,
+        b"rao-aead-v1:" + ARCHIVE_EPOCH.encode() + b":" + data,
     )
 
     with session_scope(engine) as s:
@@ -581,7 +591,7 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             integrity_hash=second_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-2-pool",
-            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch="1" * 32),
+            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=ARCHIVE_EPOCH),
             last_verified_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         )
         backend.read_failures.add(str(first_record.native_locator["object_id"]))
@@ -591,7 +601,7 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             asset_hash,
             "o-archive",
             backends={backend_id: backend},
-            key_epoch="1" * 32,
+            key_epoch=ARCHIVE_EPOCH,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
         )
@@ -617,7 +627,7 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
     backend = _backend()
     source = tmp_path / "asset.bin"
     source.write_bytes(data)
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, _recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
 
     with session_scope(engine) as s:
@@ -655,6 +665,6 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
     with RaoCliOpener(registry).open(
         rebuilt_rao,
         Representation.RAO_AEAD_V1,
-        key_epoch=epoch,
+        recipient_epochs=(epoch.key_id, _recovery.key_id),
     ) as plaintext_path:
         assert plaintext_path.read_bytes() == data

@@ -46,6 +46,7 @@ from sutradhara.jobs.reconcilers.conditions import (
 )
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.rem_archive_cli import (
+    recipient_registry_ids,
     resolve_rem_bin,
     run_rem_archive_build,
     run_rem_archive_scan,
@@ -87,8 +88,7 @@ class TransientPoolFanoutError(BackendError, ArchiveFanoutError):
         self.backend_name = backend_name
         self.cause = cause
         super().__init__(
-            f"transient backend failure for pool {pool_id!r} "
-            f"on backend {backend_name!r}: {cause}"
+            f"transient backend failure for pool {pool_id!r} on backend {backend_name!r}: {cause}"
         )
 
 
@@ -192,6 +192,7 @@ class BuildArtifact:
     manifest_path: Path | None = None
     blob_roots: tuple[BuiltBlobRoot, ...] = ()
     exclusions: tuple[BuiltExclusion, ...] = ()
+    recipient_epochs: tuple[str, ...] = ()
 
 
 class ArchiveBuilder(Protocol):
@@ -278,6 +279,10 @@ class LocalArchiveBuilder:
     not RAO; production callers should use ``RemArchiveBuilder``.
     """
 
+    _TEST_RECOVERY_EPOCH = (
+        "recovery-" + hashlib.sha256(b"sutradhara-local-archive-builder-recovery").hexdigest()[:32]
+    )
+
     def scan(
         self,
         *,
@@ -344,6 +349,9 @@ class LocalArchiveBuilder:
             stored_digest=hashlib.sha256(archive_path.read_bytes()).digest(),
             members=tuple(built_members),
             manifest_path=manifest_path,
+            recipient_epochs=(key_epoch, self._TEST_RECOVERY_EPOCH)
+            if representation is Representation.RAO_AEAD_V1 and key_epoch is not None
+            else (),
         )
 
 
@@ -356,8 +364,14 @@ class RemArchiveBuilder:
     side without depending on rem internals.
     """
 
-    def __init__(self, rem_bin: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        rem_bin: str | Path | None = None,
+        *,
+        keys: KeyRegistry | None = None,
+    ) -> None:
         self._rem_bin = None if rem_bin is None else str(rem_bin)
+        self._keys = keys or KeyRegistry()
 
     def scan(
         self,
@@ -391,6 +405,7 @@ class RemArchiveBuilder:
         manifest_path = work_dir / f"{bundle.id}-{representation.value}.manifest.json"
         rem_ruleset: str | None = ruleset or None
         rem_inputs = _rem_input_paths(members) if map_path is None else None
+        expected_recipient_epochs: tuple[str, ...] = ()
         if map_path is not None and source_root is None:
             raise ArchiveFanoutError("map archive build requires source_root")
         if representation is Representation.RAO_AEAD_V1:
@@ -404,21 +419,23 @@ class RemArchiveBuilder:
                 )
             except ValueError as exc:
                 raise ArchiveFanoutError(str(exc)) from exc
-            with KeyRegistry().materialized_root_key(key_epoch) as key_file:
-                result = run_rem_archive_build(
-                    inputs=rem_inputs,
-                    ruleset=None if map_path is not None else rem_ruleset,
-                    map_path=map_path,
-                    source_root=source_root,
-                    map_sha256=map_sha256,
-                    output_path=output_path,
-                    manifest_path=manifest_path,
-                    rem_bin=self._rem_bin,
-                    encrypt=True,
-                    key_id=key_epoch,
-                    key_file=key_file,
-                    failure_label="rem archive build",
-                )
+            recipients = self._keys.recipients_for_seal(
+                key_epoch,
+                domain=KEY_DOMAIN_ARCHIVE,
+            )
+            expected_recipient_epochs = tuple(epoch.key_id for epoch in recipients)
+            result = run_rem_archive_build(
+                inputs=rem_inputs,
+                ruleset=None if map_path is not None else rem_ruleset,
+                map_path=map_path,
+                source_root=source_root,
+                map_sha256=map_sha256,
+                output_path=output_path,
+                manifest_path=manifest_path,
+                rem_bin=self._rem_bin,
+                recipients=tuple(self._keys.public_key_path(epoch.key_id) for epoch in recipients),
+                failure_label="rem archive build",
+            )
         else:
             result = run_rem_archive_build(
                 inputs=rem_inputs,
@@ -432,6 +449,18 @@ class RemArchiveBuilder:
                 failure_label="rem archive build",
             )
         manifest = _normalized_rem_build_report(result.stdout_report)
+        recipient_epochs = (
+            recipient_registry_ids(result.stdout_report, failure_label="rem archive build")
+            if representation is Representation.RAO_AEAD_V1
+            else ()
+        )
+        if (
+            representation is Representation.RAO_AEAD_V1
+            and recipient_epochs != expected_recipient_epochs
+        ):
+            raise ArchiveFanoutError(
+                "rem archive build recipient epochs differ from registry selection"
+            )
         return BuildArtifact(
             artifact_path=output_path,
             stored_digest=result.stored_digest,
@@ -439,6 +468,7 @@ class RemArchiveBuilder:
             manifest_path=manifest_path,
             blob_roots=tuple(_blob_roots_from_manifest(manifest)),
             exclusions=tuple(_exclusions_from_manifest(manifest)),
+            recipient_epochs=recipient_epochs,
         )
 
     def verify_member_copy(
@@ -485,9 +515,16 @@ class RemArchiveBuilder:
             cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
             _run_rem(cmd)
         else:
-            key_epoch = _metadata_key_epoch(storage_metadata)
-            with KeyRegistry().materialized_root_key(key_epoch) as key_file:
-                cmd.extend(["--key-file", str(key_file)])
+            recipient_epochs = _metadata_recipient_epochs(storage_metadata)
+            try:
+                selected = self._keys.select_private_epoch(
+                    recipient_epochs,
+                    domain=KEY_DOMAIN_ARCHIVE,
+                )
+            except (KeyError, ValueError) as exc:
+                raise ArchiveFanoutError(str(exc)) from exc
+            with self._keys.materialized_private_key(selected.key_id) as key_file:
+                cmd.extend(["--private-key", str(key_file)])
                 _run_rem(cmd)
         return _single_restored_member(dest, member.member_path)
 
@@ -652,12 +689,9 @@ def _record_bundle_copy_transient_backoff(
     bundle_id: str,
     failures: Sequence[TransientPoolFanoutError],
 ) -> str:
-    detail = "; ".join(
-        f"pool {failure.pool_id}: {failure.cause}" for failure in failures
-    )
+    detail = "; ".join(f"pool {failure.pool_id}: {failure.cause}" for failure in failures)
     message = (
-        f"bundle {bundle_id} sealed with partial fan-out; "
-        f"transient backend failure for {detail}"
+        f"bundle {bundle_id} sealed with partial fan-out; transient backend failure for {detail}"
     )
     record_observation(
         session,
@@ -748,7 +782,7 @@ def build_bundle_copy_for_pool(
         raise TransientPoolFanoutError(target.pool_id, target.backend_name, exc) from exc
     storage_metadata = _copy_storage_metadata(
         target.representation,
-        key_epoch=target.key_epoch,
+        recipient_epochs=artifact.recipient_epochs,
         stored_size_bytes=record.size_bytes,
     )
     copy, _ = add_bundle_copy(
@@ -885,7 +919,7 @@ def _require_key_epoch(
 def _copy_storage_metadata(
     representation: str,
     *,
-    key_epoch: str | None,
+    recipient_epochs: Sequence[str],
     stored_size_bytes: int,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
@@ -897,8 +931,10 @@ def _copy_storage_metadata(
         Representation.RAO_AEAD_V1.value,
     }:
         metadata["chunk_size"] = RAO_CHUNK_SIZE
-    if representation == Representation.RAO_AEAD_V1.value and key_epoch is not None:
-        metadata["key_epoch"] = key_epoch
+    if representation == Representation.RAO_AEAD_V1.value:
+        if not recipient_epochs:
+            raise ArchiveFanoutError("encrypted archive artifact is missing recipient epochs")
+        metadata["recipient_epochs"] = list(recipient_epochs)
     return metadata
 
 
@@ -1286,11 +1322,17 @@ def _member_first_chunk_lba(locator: Mapping[str, Any]) -> int:
         raise ArchiveFanoutError(str(exc)) from exc
 
 
-def _metadata_key_epoch(storage_metadata: Mapping[str, Any]) -> str:
-    value = storage_metadata.get("key_epoch")
-    if not isinstance(value, str) or not value:
-        raise ArchiveFanoutError("encrypted copy metadata is missing key_epoch")
-    return value
+def _metadata_recipient_epochs(storage_metadata: Mapping[str, Any]) -> tuple[str, ...]:
+    value = storage_metadata.get("recipient_epochs")
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(epoch, str) or not epoch for epoch in value)
+    ):
+        raise ArchiveFanoutError("encrypted copy metadata has invalid recipient_epochs")
+    if len(set(value)) != len(value):
+        raise ArchiveFanoutError("encrypted copy metadata has duplicate recipient_epochs")
+    return tuple(value)
 
 
 def _materialize_copy_to_path(

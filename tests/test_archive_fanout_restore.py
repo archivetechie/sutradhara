@@ -92,6 +92,7 @@ from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.handlers import bundle_repair
 from sutradhara.jobs.models import ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BACKOFF, OBSERVED_MISSING
+from sutradhara.keys import KeyEpoch
 from sutradhara.replication import target_pools
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
@@ -250,9 +251,14 @@ class _FakeKeyRegistry:
         self.seen: list[str] = []
 
     @contextmanager
-    def materialized_root_key(self, key_id: str) -> Iterator[Path]:
+    def materialized_private_key(self, key_id: str) -> Iterator[Path]:
         self.seen.append(key_id)
         yield self.key_path
+
+    def select_private_epoch(self, recipient_epochs: tuple[str, ...], *, domain: str) -> KeyEpoch:
+        assert domain == "archive"
+        selected = next(epoch for epoch in recipient_epochs if epoch.startswith("archive-"))
+        return KeyEpoch(key_id=selected, created_at="2026-07-17T00:00:00+00:00", active=True)
 
 
 def _digest(data: bytes) -> bytes:
@@ -720,7 +726,7 @@ def test_local_archive_builder_aead_offsets_verify_without_builder_fallback(
             bundle_id=bundle.id,
             backends={row.id: backend},
             builder=LocalArchiveBuilder(),
-            key_epoch="1" * 32,
+            key_epoch="archive-" + "1" * 32,
         )
 
     assert backend.writes == ["aead-pool"]
@@ -1504,14 +1510,15 @@ def test_bundle_member_mismatch_does_not_retry_group_or_mark_suspect(
         assert [copy.health for copy in copies] == [CopyHealth.OK, CopyHealth.OK]
 
 
-def test_encrypted_restore_plumbing_uses_key_epoch_and_rao_range_args(
+def test_encrypted_restore_plumbing_uses_recipient_epochs_and_rao_range_args(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
     restored = b"encrypted member"
     asset_hash = _digest(restored)
-    key_epoch = "a" * 32
-    key_file = tmp_path / "root.key"
+    key_epoch = "archive-" + "a" * 32
+    recovery_epoch = "recovery-" + "b" * 32
+    key_file = tmp_path / "private.raop"
     key_file.write_bytes(b"k" * 32)
     rem_script = tmp_path / "fake-rem"
     rem_script.write_text(
@@ -1521,7 +1528,7 @@ import pathlib
 import sys
 args = sys.argv[1:]
 if args[:2] == ["archive", "covering-range"]:
-    required = ["--range", "--key-file", "--object-id", "--file-id"]
+    required = ["--range", "--private-key", "--object-id", "--file-id"]
     if any(flag not in args for flag in required):
         raise SystemExit("missing covering-range args")
     if args[args.index("--range") + 1] != "1048576:16":
@@ -1540,7 +1547,7 @@ if args[:2] == ["archive", "covering-range"]:
         "authenticated_prefix_len": len(prefix),
     }))
 elif args[:2] == ["archive", "extract-stream"]:
-    required = ["--range", "--key-file", "--authenticated-prefix", "--stored-range-start"]
+    required = ["--range", "--private-key", "--authenticated-prefix", "--stored-range-start"]
     if any(flag not in args for flag in required):
         raise SystemExit("missing ranged extract args")
     if args[args.index("--range") + 1] != "1048576:16":
@@ -1615,7 +1622,7 @@ else:
             source=CopySource.INGEST,
             storage_metadata={
                 "representation": Representation.RAO_AEAD_V1.value,
-                "key_epoch": key_epoch,
+                "recipient_epochs": [key_epoch, recovery_epoch],
                 "stored_size_bytes": record.size_bytes,
             },
         )

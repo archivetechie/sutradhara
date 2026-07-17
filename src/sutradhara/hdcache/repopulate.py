@@ -829,7 +829,8 @@ def _read_entry_plaintext(
     with opener.open(
         sealed,
         Representation.RAO_AEAD_V1,
-        key_epoch=KeyEpoch(key_id=entry.key_epoch, created_at="", active=True),
+        recipient_epochs=(entry.key_epoch,),
+        key_domain=KEY_DOMAIN_HDCACHE,
         work_dir=config.scratch_root,
     ) as plaintext:
         digest = sha256_file(plaintext)

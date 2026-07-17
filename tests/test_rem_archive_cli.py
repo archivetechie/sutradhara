@@ -11,10 +11,31 @@ from typing import Any
 import pytest
 
 from sutradhara.rem_archive_cli import (
+    recipient_registry_ids,
     resolve_rem_bin,
     run_rem_archive_build,
     run_rem_archive_scan,
 )
+
+
+def test_recipient_registry_ids_requires_v2_and_reconstructs_registry_ids() -> None:
+    report = {
+        "format_version": 2,
+        "recipient_epochs": [
+            {"epoch_id": "1" * 32, "label": "archive"},
+            {"epoch_id": "2" * 32, "label": "recovery"},
+        ],
+    }
+
+    assert recipient_registry_ids(report, failure_label="test report") == (
+        "archive-" + "1" * 32,
+        "recovery-" + "2" * 32,
+    )
+    with pytest.raises(RuntimeError, match="format_version 2"):
+        recipient_registry_ids(
+            {**report, "format_version": 1},
+            failure_label="test report",
+        )
 
 
 def test_rem_bin_resolver_uses_env_override(
@@ -72,8 +93,9 @@ def test_run_rem_archive_build_uses_current_flags(
     rem = _write_executable(tmp_path / "rem")
     rules = tmp_path / "rules.rem"
     rules.write_text("blob **/\n", encoding="utf-8")
-    key_file = tmp_path / "root.key"
-    key_file.write_bytes(b"k" * 32)
+    recipients = [tmp_path / "archive.raor", tmp_path / "recovery.raor"]
+    for recipient in recipients:
+        recipient.write_bytes(b"public")
     inputs = [tmp_path / "intake"]
     inputs[0].mkdir()
     output = tmp_path / "out.rao"
@@ -105,9 +127,7 @@ def test_run_rem_archive_build_uses_current_flags(
         output_path=output,
         manifest_path=manifest,
         rem_bin=rem,
-        encrypt=True,
-        key_id="a" * 32,
-        key_file=key_file,
+        recipients=recipients,
         failure_label="test rem build",
     )
 
@@ -117,11 +137,12 @@ def test_run_rem_archive_build_uses_current_flags(
     assert "--output" not in cmd
     assert "--inputs" in cmd
     assert cmd[cmd.index("--inputs") + 1 :] == [str(inputs[0])]
-    assert "--key-file" in cmd
-    assert cmd[cmd.index("--key-file") + 1] == str(key_file)
-    assert "--key-id" in cmd
-    assert cmd[cmd.index("--key-id") + 1] == "a" * 32
-    assert "--key-epoch" not in cmd
+    assert [cmd[index + 1] for index, value in enumerate(cmd) if value == "--recipient"] == [
+        str(path) for path in recipients
+    ]
+    assert "--encrypt" not in cmd
+    assert "--key-file" not in cmd
+    assert "--key-id" not in cmd
     assert result.stored_digest == hashlib.sha256(b"rao bytes").digest()
 
 

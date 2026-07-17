@@ -1,8 +1,8 @@
 """Remanence RAO CLI implementation of the Sutradhara sealing port.
 
 This module wraps `rem archive build/inspect/extract` as Sutradhara's
-stateless file codec. It seals one local plaintext file into deterministic RAO
-objects for backend storage, opens stored RAO objects back to plaintext for
+stateless file codec. It seals one local plaintext file into RAO objects for
+backend storage, opens stored RAO objects back to plaintext for
 self-heal, and maps Remanence's JSON reports into the catalog representation
 strings used by the replication policy.
 """
@@ -15,17 +15,15 @@ import json
 import os
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sutradhara.keys import KeyEpoch, KeyRegistry
+from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyEpoch, KeyRegistry, key_domain
+from sutradhara.rem_archive_cli import recipient_registry_ids, run_rem_archive_build
 from sutradhara.rem_archive_cli import (
     resolve_rem_bin as _resolve_rem_bin,
-)
-from sutradhara.rem_archive_cli import (
-    run_rem_archive_build,
 )
 from sutradhara.resource_control import run_managed
 from sutradhara.sealing.port import Representation, SealResult
@@ -50,14 +48,25 @@ class RaoInspection:
     """Keyless Remanence RAO inspection mapped into Sutradhara vocabulary."""
 
     representation: Representation
-    key_id: str | None
+    format_version: int | None
+    recipient_epochs: tuple[RaoRecipientEpoch, ...]
     report: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RaoRecipientEpoch:
+    """One recipient identity parsed from a keyless Remanence report."""
+
+    epoch_id: str
+    label: str
 
 
 class RaoCliSealer:
     """Seal local files by shelling out to Remanence's RAO CLI."""
 
-    def __init__(self, keys: KeyRegistry | None = None, *, work_dir: Path | str | None = None) -> None:
+    def __init__(
+        self, keys: KeyRegistry | None = None, *, work_dir: Path | str | None = None
+    ) -> None:
         self._keys = keys or KeyRegistry()
         self._work_dir = None if work_dir is None else Path(work_dir)
 
@@ -90,6 +99,7 @@ class RaoCliSealer:
             temp_dir = Path(temp_dir_raw)
             os.chmod(temp_dir, 0o700)
             sealed_path = temp_dir / "sealed.rao"
+            recipient_ids: tuple[str, ...] = ()
 
             if representation is Representation.RAO_PLAIN_V1:
                 report = _build_rao(
@@ -101,15 +111,19 @@ class RaoCliSealer:
             elif representation is Representation.RAO_AEAD_V1:
                 if key_epoch is None:
                     raise ValueError("rao-aead-v1 sealing requires key_epoch")
-                with self._keys.materialized_root_key(key_epoch.key_id) as key_file:
-                    report = _build_rao(
-                        source,
-                        sealed_path,
-                        representation=representation,
-                        plaintext_digest=plaintext_digest,
-                        key_id=key_epoch.key_id,
-                        key_file=key_file,
-                    )
+                domain = key_domain(key_epoch.key_id)
+                recipients = self._keys.recipients_for_seal(key_epoch.key_id, domain=domain)
+                recipient_ids = tuple(epoch.key_id for epoch in recipients)
+                report = _build_rao(
+                    source,
+                    sealed_path,
+                    representation=representation,
+                    plaintext_digest=plaintext_digest,
+                    recipient_epochs=recipient_ids,
+                    recipient_files=tuple(
+                        self._keys.public_key_path(epoch.key_id) for epoch in recipients
+                    ),
+                )
             else:  # pragma: no cover - enum exhaustiveness
                 raise ValueError(f"unsupported representation: {representation}")
 
@@ -127,18 +141,31 @@ class RaoCliSealer:
                     "RAO build stored_digest differs from sealed bytes: "
                     f"{report_stored_digest.hex()} != {local_stored_digest.hex()}"
                 )
+            report_recipients = (
+                recipient_registry_ids(report, failure_label="RAO build")
+                if representation is Representation.RAO_AEAD_V1
+                else ()
+            )
+            if representation is Representation.RAO_AEAD_V1 and report_recipients != recipient_ids:
+                raise RuntimeError(
+                    "RAO build recipient epochs differ from registry selection: "
+                    f"{report_recipients!r} != {recipient_ids!r}"
+                )
             yield SealResult(
                 sealed_path=sealed_path,
                 stored_digest=local_stored_digest,
                 plaintext_digest=plaintext_digest,
                 representation=representation,
+                recipient_epochs=report_recipients,
             )
 
 
 class RaoCliOpener:
     """Open local Remanence RAO objects back to plaintext via the CLI."""
 
-    def __init__(self, keys: KeyRegistry | None = None, *, work_dir: Path | str | None = None) -> None:
+    def __init__(
+        self, keys: KeyRegistry | None = None, *, work_dir: Path | str | None = None
+    ) -> None:
         self._keys = keys or KeyRegistry()
         self._work_dir = None if work_dir is None else Path(work_dir)
 
@@ -148,7 +175,8 @@ class RaoCliOpener:
         source_path: Path | str,
         representation: Representation,
         *,
-        key_epoch: KeyEpoch | None = None,
+        recipient_epochs: Sequence[str] | None = None,
+        key_domain: str | None = None,
         work_dir: Path | str | None = None,
     ) -> Iterator[Path]:
         """Yield a local plaintext file for one stored representation."""
@@ -167,14 +195,18 @@ class RaoCliOpener:
             if representation is Representation.RAO_PLAIN_V1:
                 _extract_rao(source, temp_dir, representation=representation)
             elif representation is Representation.RAO_AEAD_V1:
-                if key_epoch is None:
-                    raise ValueError("rao-aead-v1 opening requires key_epoch")
-                with self._keys.materialized_root_key(key_epoch.key_id) as key_file:
+                if recipient_epochs is None:
+                    raise ValueError("rao-aead-v1 opening requires recipient_epochs")
+                selected = self._keys.select_private_epoch(
+                    recipient_epochs,
+                    domain=key_domain or KEY_DOMAIN_ARCHIVE,
+                )
+                with self._keys.materialized_private_key(selected.key_id) as key_file:
                     _extract_rao(
                         source,
                         temp_dir,
                         representation=representation,
-                        key_file=key_file,
+                        private_key=key_file,
                     )
             else:  # pragma: no cover - enum exhaustiveness
                 raise ValueError(f"unsupported representation: {representation}")
@@ -185,7 +217,7 @@ class RaoCliOpener:
 def inspect_rao(path: Path | str) -> RaoInspection:
     """Inspect a RAO object and recover its Sutradhara representation.
 
-    Encrypted RAO headers expose the key identifier without key material.
+    Encrypted RAO headers expose recipient identities without key material.
     Plaintext RAO inspection needs the contract chunk size because the stored
     object is a fixed-block tar stream.
     """
@@ -201,12 +233,30 @@ def inspect_rao(path: Path | str) -> RaoInspection:
         representation = _REM_REPRESENTATIONS[rem_representation]
     except KeyError as exc:
         raise RuntimeError(f"unknown RAO representation {rem_representation!r}") from exc
-    key_id = report.get("key_id")
     if representation is Representation.RAO_AEAD_V1:
-        if not isinstance(key_id, str) or not key_id:
-            raise RuntimeError(f"encrypted RAO inspect did not report key_id: {report!r}")
-        return RaoInspection(representation=representation, key_id=key_id, report=report)
-    return RaoInspection(representation=representation, key_id=None, report=report)
+        format_version = report.get("format_version")
+        if format_version != 2:
+            raise RuntimeError(
+                f"encrypted RAO inspect reported unexpected format_version: {report!r}"
+            )
+        labels = recipient_registry_ids(report, failure_label="RAO inspect")
+        raw_recipients = report["recipient_epochs"]
+        recipients = tuple(
+            RaoRecipientEpoch(epoch_id=str(value["epoch_id"]), label=label)
+            for value, label in zip(raw_recipients, labels, strict=True)
+        )
+        return RaoInspection(
+            representation=representation,
+            format_version=format_version,
+            recipient_epochs=recipients,
+            report=report,
+        )
+    return RaoInspection(
+        representation=representation,
+        format_version=None,
+        recipient_epochs=(),
+        report=report,
+    )
 
 
 def resolve_rem_bin() -> str:
@@ -229,20 +279,20 @@ def _build_rao(
     *,
     representation: Representation,
     plaintext_digest: bytes,
-    key_id: str | None = None,
-    key_file: Path | None = None,
+    recipient_epochs: Sequence[str] = (),
+    recipient_files: Sequence[Path] = (),
 ) -> dict[str, Any]:
     ids = _deterministic_ids(
         plaintext_digest=plaintext_digest,
         basename=source.name,
         representation=representation,
-        key_id=key_id,
+        recipient_epochs=recipient_epochs,
     )
     if representation is Representation.RAO_AEAD_V1:
-        if key_file is None or key_id is None:
-            raise ValueError("encrypted RAO build requires key_file and key_id")
-    elif key_file is not None or key_id is not None:
-        raise ValueError("key_file/key_id are only valid for encrypted RAO builds")
+        if len(recipient_epochs) != 2 or len(recipient_files) != 2:
+            raise ValueError("encrypted RAO build requires hot and recovery recipients")
+    elif recipient_epochs or recipient_files:
+        raise ValueError("recipients are only valid for encrypted RAO builds")
     result = run_rem_archive_build(
         inputs=[source],
         ruleset=None,
@@ -252,9 +302,7 @@ def _build_rao(
         caller_object_id=ids["caller_object_id"],
         manifest_file_id=ids["manifest_file_id"],
         timestamp=RAO_TIMESTAMP,
-        encrypt=representation is Representation.RAO_AEAD_V1,
-        key_id=key_id,
-        key_file=key_file,
+        recipients=recipient_files,
         failure_label="rem archive build",
     )
     return result.stdout_report
@@ -265,7 +313,7 @@ def _extract_rao(
     dest: Path,
     *,
     representation: Representation,
-    key_file: Path | None = None,
+    private_key: Path | None = None,
 ) -> dict[str, Any]:
     args = [
         "archive",
@@ -278,9 +326,9 @@ def _extract_rao(
     if representation is Representation.RAO_PLAIN_V1:
         args.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
     elif representation is Representation.RAO_AEAD_V1:
-        if key_file is None:
-            raise ValueError("encrypted RAO extract requires key_file")
-        args.extend(["--key-file", str(key_file)])
+        if private_key is None:
+            raise ValueError("encrypted RAO extract requires private_key")
+        args.extend(["--private-key", str(private_key)])
     else:
         raise ValueError(f"unsupported RAO representation: {representation}")
     return _json_report(_run_rem(args, role="high"))
@@ -291,7 +339,7 @@ def _deterministic_ids(
     plaintext_digest: bytes,
     basename: str,
     representation: Representation,
-    key_id: str | None,
+    recipient_epochs: Sequence[str],
 ) -> dict[str, str]:
     return {
         name: _uuid_from_contract_seed(
@@ -299,7 +347,7 @@ def _deterministic_ids(
             plaintext_digest=plaintext_digest,
             basename=basename,
             representation=representation,
-            key_id=key_id,
+            recipient_epochs=recipient_epochs,
         )
         for name, label in _ID_LABELS.items()
     }
@@ -311,7 +359,7 @@ def _uuid_from_contract_seed(
     plaintext_digest: bytes,
     basename: str,
     representation: Representation,
-    key_id: str | None,
+    recipient_epochs: Sequence[str],
 ) -> str:
     h = hashlib.sha256()
     h.update(label)
@@ -321,7 +369,7 @@ def _uuid_from_contract_seed(
     h.update(b"\0")
     h.update(representation.value.encode("ascii"))
     h.update(b"\0")
-    h.update((key_id or "").encode("ascii"))
+    h.update("\0".join(recipient_epochs).encode("ascii"))
     raw = bytearray(h.digest()[:16])
     raw[6] = (raw[6] & 0x0F) | 0x40
     raw[8] = (raw[8] & 0x3F) | 0x80

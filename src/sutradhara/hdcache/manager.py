@@ -74,7 +74,7 @@ from sutradhara.hdcache.store import (
     read_hmac_secret,
     verify_disk_identity_with_deadline,
 )
-from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
+from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import atomic_write_verified_file, restore_progress_context, sha256_file
 from sutradhara.sealing.port import Opener, Representation
 from sutradhara.sealing.rao import RaoCliOpener
@@ -1290,13 +1290,14 @@ def open_verified_cache_plaintext(
                 opener = final_config.opener or RaoCliOpener(
                     final_config.registry(), work_dir=final_config.scratch_root
                 )
-                key_epoch = _cache_key_epoch(entry)
+                recipient_epochs = _cache_recipient_epochs(entry)
                 with (
                     _optional_unheld_aead_slot(),
                     opener.open(
                         sealed,
                         Representation.RAO_AEAD_V1,
-                        key_epoch=key_epoch,
+                        recipient_epochs=recipient_epochs,
+                        key_domain=KEY_DOMAIN_HDCACHE,
                         work_dir=final_config.scratch_root,
                     ) as plaintext,
                 ):
@@ -1936,11 +1937,11 @@ def _publish_cache_plaintext(source: Path, destination: Path) -> None:
     atomic_write_verified_file(source, destination)
 
 
-def _cache_key_epoch(entry: CacheEntry) -> KeyEpoch:
+def _cache_recipient_epochs(entry: CacheEntry) -> tuple[str, ...]:
     if entry.key_epoch is None:
         raise StoreError("AEAD cache entry has no key_epoch")
     assert_key_epoch_domain(entry.key_epoch, KEY_DOMAIN_HDCACHE, context="hdcache serve")
-    return KeyEpoch(key_id=entry.key_epoch, created_at="", active=True)
+    return (entry.key_epoch,)
 
 
 def _destinations_from_env() -> dict[str, RestoreDestination]:

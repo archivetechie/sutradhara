@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sutradhara.keys import KEY_DOMAINS
 from sutradhara.resource_control import run_managed
 
 
@@ -66,9 +67,7 @@ def run_rem_archive_build(
     output_path: Path,
     manifest_path: Path | None = None,
     rem_bin: str | Path | None = None,
-    encrypt: bool = False,
-    key_id: str | None = None,
-    key_file: Path | None = None,
+    recipients: Sequence[Path | str] = (),
     chunk_size: int | None = None,
     object_id: str | None = None,
     caller_object_id: str | None = None,
@@ -93,10 +92,11 @@ def run_rem_archive_build(
         raise ValueError("source_root is only valid with rem archive build --map")
     if map_path is None and map_sha256 is not None:
         raise ValueError("map_sha256 is only valid with rem archive build --map")
-    if encrypt and (key_id is None or key_file is None):
-        raise ValueError("encrypted rem archive build requires key_id and key_file")
-    if not encrypt and (key_id is not None or key_file is not None):
-        raise ValueError("key_id/key_file are only valid for encrypted rem archive builds")
+    recipient_paths = tuple(Path(path) for path in recipients)
+    if recipient_paths and not 2 <= len(recipient_paths) <= 8:
+        raise ValueError("encrypted rem archive build requires 2 to 8 recipients")
+    if len({path.resolve(strict=False) for path in recipient_paths}) != len(recipient_paths):
+        raise ValueError("rem archive build recipients must be distinct")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if manifest_path is not None:
@@ -124,9 +124,8 @@ def run_rem_archive_build(
         cmd.extend(["--caller-object-id", caller_object_id])
     if manifest_file_id is not None:
         cmd.extend(["--manifest-file-id", manifest_file_id])
-    if encrypt:
-        cmd.append("--encrypt")
-        cmd.extend(["--key-file", str(key_file), "--key-id", str(key_id)])
+    for recipient in recipient_paths:
+        cmd.extend(["--recipient", str(recipient)])
     if timestamp is not None:
         cmd.extend(["--timestamp", timestamp])
     if map_path is None:
@@ -207,6 +206,42 @@ def sha256_file(path: Path) -> bytes:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.digest()
+
+
+def recipient_registry_ids(
+    report: dict[str, Any],
+    *,
+    failure_label: str,
+) -> tuple[str, ...]:
+    """Parse canonical registry ids from a Remanence v2 recipient report."""
+
+    if report.get("format_version") != 2:
+        raise RuntimeError(f"{failure_label} did not report format_version 2")
+    raw = report.get("recipient_epochs")
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError(f"{failure_label} did not report recipient_epochs")
+    labels: list[str] = []
+    for index, value in enumerate(raw):
+        if not isinstance(value, dict):
+            raise RuntimeError(f"{failure_label} recipient_epochs[{index}] is not an object")
+        epoch_id = value.get("epoch_id")
+        label = value.get("label")
+        if not isinstance(epoch_id, str) or len(epoch_id) != 32:
+            raise RuntimeError(f"{failure_label} recipient_epochs[{index}] has invalid epoch_id")
+        try:
+            decoded = bytes.fromhex(epoch_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{failure_label} recipient_epochs[{index}] epoch_id is not hex"
+            ) from exc
+        if len(decoded) != 16 or epoch_id != epoch_id.lower() or epoch_id == "0" * 32:
+            raise RuntimeError(f"{failure_label} recipient_epochs[{index}] has invalid epoch_id")
+        if not isinstance(label, str) or label not in KEY_DOMAINS:
+            raise RuntimeError(f"{failure_label} recipient_epochs[{index}] has invalid label")
+        labels.append(f"{label}-{epoch_id}")
+    if len(set(labels)) != len(labels):
+        raise RuntimeError(f"{failure_label} reported duplicate recipient epoch labels")
+    return tuple(labels)
 
 
 def _resolve_candidate(value: str, *, source: str) -> str:

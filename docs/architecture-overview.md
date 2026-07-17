@@ -371,17 +371,19 @@ plaintext and stored form; `RaoCliSealer`/`RaoCliOpener` implement them by
 shelling out to the Remanence `rem` CLI (`rem archive build/extract`) as
 a stateless local codec — by explicit decision there is no sealing daemon
 or service. RAO builds are deterministic: fixed chunk size (262144),
-fixed timestamp, and UUIDs derived from the plaintext digest, so the same
-input seals to the same object. `inspect_rao` recovers a stored object's
-representation and key id from its header without any key.
+fixed timestamp and UUIDs derived from the plaintext digest for plaintext
+RAO. Encrypted RAO v2 uses fresh envelope randomness. `inspect_rao` is
+keyless and reports format version plus every `{epoch_id, label}` recipient.
 
-Encrypted copies name a **key epoch** from the `KeyRegistry`
-(`keys/registry.py`): root keys live under the registry directory, are
-materialized into short-lived `0600` files (in `XDG_RUNTIME_DIR`,
-`/run/user/<uid>`, or `/dev/shm`) only for the duration of a `rem` call,
-best-effort zeroized on disk before removal, and never deleted by epoch
-retirement. Epochs are domain-tagged (`archive` vs `hdcache`) and the
-code asserts the domain at use.
+Encrypted copies record a **recipient epoch list** from the `KeyRegistry`
+(`keys/registry.py`). Each hot domain (`archive`, `hdcache`, or `backup`)
+has an OS-random X25519 keypair; every seal uses that domain's public epoch
+plus the active public-only `recovery` epoch. Public RAOR files persist for
+sealing. Opens select a matching locally held private epoch and materialize
+a canonical RAOP file as `0600` only for one `rem` call, then best-effort
+zeroize and unlink it. Recovery private keys are minted offline and never
+stored beneath the serving-host registry. Epoch IDs are explicitly
+domain-tagged and all seal/open sites assert their domain.
 
 <!-- code-anchor: src/sutradhara/hdcache @ df8165b -->
 ## The HD cache tier

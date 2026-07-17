@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, joinedload
 from sutradhara.backend.port import BackendError, CopyRecord, StorageBackend
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import ArtifactClassPool, Bundle, Copy, Pool
-from sutradhara.catalog.types import BackendKind, CopyHealth, CopySource
+from sutradhara.catalog.types import CopyHealth, CopySource
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import RestoreError, RestoreIntegrityError, restore_copy
 from sutradhara.sealing.port import Opener, Representation, Sealer, SealResult
@@ -207,7 +207,7 @@ def replicate_asset(
             health=CopyHealth.OK,
             storage_metadata=_copy_storage_metadata(
                 representation,
-                key_epoch=seal_epoch.key_id if seal_epoch is not None else None,
+                recipient_epochs=sealed.recipient_epochs,
             ),
         )
         _assert_copy_matches_pool(copy, target)
@@ -264,7 +264,7 @@ def repair(
             health=CopyHealth.OK,
             storage_metadata=_copy_storage_metadata(
                 representation,
-                key_epoch=seal_epoch.key_id if seal_epoch is not None else None,
+                recipient_epochs=sealed.recipient_epochs,
             ),
         )
         _assert_copy_matches_pool(copy, target)
@@ -318,9 +318,7 @@ def self_heal(
             continue
         source_backend = backends.get(source.backend_id)
         if source_backend is None:
-            errors.append(
-                f"copy id={source.id}: backend_id={source.backend_id} is not available"
-            )
+            errors.append(f"copy id={source.id}: backend_id={source.backend_id} is not available")
             continue
 
         source_target = _pool_for_copy(
@@ -670,13 +668,15 @@ def _epoch_for(
 def _copy_storage_metadata(
     representation: Representation,
     *,
-    key_epoch: str | None = None,
+    recipient_epochs: Sequence[str] = (),
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {"representation": representation.value}
     if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
         metadata["chunk_size"] = RAO_CHUNK_SIZE
-    if representation is Representation.RAO_AEAD_V1 and key_epoch is not None:
-        metadata["key_epoch"] = key_epoch
+    if representation is Representation.RAO_AEAD_V1:
+        if not recipient_epochs:
+            raise ReplicationInvariantError("encrypted copy is missing recipient epochs")
+        metadata["recipient_epochs"] = list(recipient_epochs)
     return metadata
 
 

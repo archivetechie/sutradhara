@@ -173,12 +173,13 @@ daemon.
 back (`sealing/port.py`). Every restore and self-heal goes through an
 opener, so no path can skip verification.
 
-**key epoch** — one named encryption key in the local `KeyRegistry`.
-Encrypted copies record their epoch; epochs are domain-tagged (`archive`
-vs `hdcache`); retiring an epoch stops new writes but never deletes key
-material. Root keys are only ever materialized to disk in short-lived
-`0600` files for the duration of one `rem` call, and are best-effort
-zeroized before removal.
+**key epoch / recipient epoch** — one domain-tagged X25519 recipient identity
+in the local `KeyRegistry`, encoded as `<domain>-<32hex>`. Encrypted copies
+record a list: the copy-domain hot epoch (`archive`, `hdcache`, or `backup`)
+and a public-only `recovery` epoch. Public RAOR files seal; locally held
+private material opens through a short-lived `0600` RAOP file that is
+best-effort zeroized before removal. Recovery private material stays offline.
+Retiring an epoch stops new seals but preserves its retained material.
 
 <!-- code-anchor: src/sutradhara/arrangement.py src/sutradhara/virtual_arrangement.py @ df8165b -->
 ## Arrangement
