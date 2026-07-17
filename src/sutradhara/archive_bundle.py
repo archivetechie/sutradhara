@@ -74,7 +74,16 @@ def get_or_create_open_bundle(
     """Return the durable open accumulator for an artifactclass."""
     existing = session.scalars(
         select(Bundle)
-        .where(Bundle.artifactclass == artifactclass, Bundle.status == "open")
+        .where(
+            Bundle.artifactclass == artifactclass,
+            Bundle.status == "open",
+            # Only true accumulators are adoptable. Externally-identified
+            # funnels (cloud-blob bundles) carry archive_id from creation and
+            # must never absorb ordinary archive enqueues — a failed cloud-blob
+            # job leaves its bundle open, and adopting it poisons the
+            # accumulator with the blob ruleset.
+            Bundle.archive_id.is_(None),
+        )
         .order_by(Bundle.opened_at, Bundle.id)
     ).first()
     if existing is not None:
