@@ -6,6 +6,7 @@ from sutradhara.sealing.rao import (
     RaoCliOpener,
     RaoCliSealer,
     RaoInspection,
+    RaoRecipientEpoch,
     inspect_rao,
     resolve_rem_bin,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "RaoCliOpener",
     "RaoCliSealer",
     "RaoInspection",
+    "RaoRecipientEpoch",
     "Representation",
     "SealResult",
     "Sealer",

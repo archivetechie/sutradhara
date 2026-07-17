@@ -43,7 +43,7 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
 from sutradhara.durability import locator_artifactclass_filter
-from sutradhara.keys import KeyRegistry
+from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry
 from sutradhara.resource_control import run_managed
 from sutradhara.restore import (
     RestoreIntegrityError as ChunkRestoreIntegrityError,
@@ -411,15 +411,15 @@ class RemArchiveExtractor(LocalArchiveExtractor):
     def open_aead_member_stream(self, member: PlannedMember) -> Iterator[Iterator[bytes]]:
         """Decrypt one planned AEAD member without materializing its stored object."""
 
-        key_epoch = _key_epoch(member.copy.storage_metadata)
+        selected = _select_private_epoch(self._keys, member.copy.storage_metadata)
         with (
-            self._keys.materialized_root_key(key_epoch) as key_file,
+            self._keys.materialized_private_key(selected) as private_key,
             _open_rao_aead_plaintext_stream(
                 backend=member.backend,
                 copy=member.copy,
                 locator=member.locator,
                 rem_bin=self._rem_bin,
-                key_file=key_file,
+                private_key=private_key,
             ) as chunks,
         ):
             yield chunks
@@ -1259,7 +1259,7 @@ def _open_rao_aead_plaintext_stream(
     copy: Copy,
     locator: AssetLocator,
     rem_bin: str,
-    key_file: Path,
+    private_key: Path,
 ) -> Iterator[Iterator[bytes]]:
     """Pipe a complete encrypted RAO object through ``extract-stream``.
 
@@ -1272,7 +1272,7 @@ def _open_rao_aead_plaintext_stream(
 
     if not isinstance(backend, StreamingStorageBackend):
         raise ArchiveRestoreError("RAO AEAD streaming restore requires a native streaming backend")
-    command = [rem_bin, "archive", "extract-stream", "--key-file", str(key_file)]
+    command = [rem_bin, "archive", "extract-stream", "--private-key", str(private_key)]
     native = dict(locator.native_locator)
     size = _size_bytes(native)
     plaintext_range: tuple[int, int] | None = None
@@ -1287,7 +1287,7 @@ def _open_rao_aead_plaintext_stream(
             copy=copy,
             locator=locator,
             rem_bin=rem_bin,
-            key_file=key_file,
+            private_key=private_key,
             plaintext_start=plaintext_range[0],
             plaintext_len=plaintext_range[1],
         )
@@ -1434,7 +1434,7 @@ def _query_covering_stored_range(
     copy: Copy,
     locator: AssetLocator,
     rem_bin: str,
-    key_file: Path,
+    private_key: Path,
     plaintext_start: int,
     plaintext_len: int,
 ) -> _RangedCiphertextPlan | None:
@@ -1456,8 +1456,8 @@ def _query_covering_stored_range(
                     rem_bin,
                     "archive",
                     "covering-range",
-                    "--key-file",
-                    str(key_file),
+                    "--private-key",
+                    str(private_key),
                     "--object-id",
                     object_id,
                     "--file-id",
@@ -1855,9 +1855,9 @@ def _extract_rao_materialized_member_to_path(
             cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
             _run_rem(cmd)
         elif representation is Representation.RAO_AEAD_V1:
-            key_epoch = _key_epoch(copy.storage_metadata)
-            with keys.materialized_root_key(key_epoch) as key_file:
-                cmd.extend(["--key-file", str(key_file)])
+            selected = _select_private_epoch(keys, copy.storage_metadata)
+            with keys.materialized_private_key(selected) as private_key:
+                cmd.extend(["--private-key", str(private_key)])
                 _run_rem(cmd)
         else:
             raise ArchiveRestoreError(f"unsupported RAO representation {representation.value!r}")
@@ -1897,11 +1897,25 @@ def _size_bytes(locator: dict[str, Any]) -> int:
     return result
 
 
-def _key_epoch(storage_metadata: dict[str, Any]) -> str:
-    value = storage_metadata.get("key_epoch")
-    if not isinstance(value, str) or not value:
-        raise ArchiveRestoreError("encrypted archive copy is missing key_epoch")
-    return value
+def _recipient_epochs(storage_metadata: dict[str, Any]) -> tuple[str, ...]:
+    value = storage_metadata.get("recipient_epochs")
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(epoch, str) or not epoch for epoch in value)
+    ):
+        raise ArchiveRestoreError("encrypted archive copy has invalid recipient_epochs")
+    if len(set(value)) != len(value):
+        raise ArchiveRestoreError("encrypted archive copy has duplicate recipient_epochs")
+    return tuple(value)
+
+
+def _select_private_epoch(keys: KeyRegistry, storage_metadata: dict[str, Any]) -> str:
+    recipients = _recipient_epochs(storage_metadata)
+    try:
+        return keys.select_private_epoch(recipients, domain=KEY_DOMAIN_ARCHIVE).key_id
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise ArchiveRestoreError(str(exc)) from exc
 
 
 def _format_plugin(storage_metadata: dict[str, Any]) -> str | None:

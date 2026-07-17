@@ -18,8 +18,12 @@ from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Backend, Bundle, Copy, IngestItem, Intake, Pool
 from sutradhara.catalog.types import CopyHealth, CopySource, RetentionState
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
-from sutradhara.keys import KeyRegistry
-from sutradhara.rem_archive_cli import run_rem_archive_build, sha256_file
+from sutradhara.keys import KEY_DOMAIN_BACKUP, KeyRegistry, assert_key_epoch_domain
+from sutradhara.rem_archive_cli import (
+    recipient_registry_ids,
+    run_rem_archive_build,
+    sha256_file,
+)
 from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job
 from sutradhara.sealing.port import Representation
 
@@ -89,7 +93,8 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
     blob_dir = cache_root / "intakes" / intake.intake_id / "cloud"
     blob_dir.mkdir(parents=True, exist_ok=True)
     blob_path = blob_dir / f"{intake.intake_id}.rao"
-    key_epoch = _cloud_key_epoch(params.get("key_epoch"))
+    registry = KeyRegistry()
+    key_epoch = _cloud_key_epoch(params.get("key_epoch"), registry=registry)
 
     members = _member_inputs_for_intake(ctx, intake, intake_root, payload_root)
     bundle = _upsert_cloud_bundle(
@@ -99,7 +104,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
         total_bytes=sum(member.size_bytes for member in members),
         member_count=len(members),
     )
-    stored_digest = _build_cloud_blob(
+    stored_digest, recipient_epochs = _build_cloud_blob(
         ctx=ctx,
         bundle=bundle,
         members=members,
@@ -108,6 +113,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
         destination=blob_path,
         representation=representation,
         key_epoch=key_epoch,
+        registry=registry,
     )
 
     backend = factory.backend_from_row(backend_row)
@@ -131,7 +137,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
         storage_metadata={
             **record.metadata,
             "representation": representation.value,
-            "key_epoch": key_epoch,
+            "recipient_epochs": list(recipient_epochs),
             "payload_root": str(payload_root),
             "intake_root": str(intake_root),
             "member_count": len(members),
@@ -166,14 +172,20 @@ def _build_cloud_blob(
     destination: Path,
     representation: Representation,
     key_epoch: str,
-) -> bytes:
+    registry: KeyRegistry,
+) -> tuple[bytes, tuple[str, ...]]:
+    try:
+        recipients = registry.recipients_for_seal(key_epoch, domain=KEY_DOMAIN_BACKUP)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    expected_recipient_epochs = tuple(epoch.key_id for epoch in recipients)
     if os.environ.get("SUTRADHARA_FAKE_CLOUD_BLOB") == "1":
         destination.unlink(missing_ok=True)
         payload = {
             "representation": representation.value,
             "intake_bundle_id": bundle.id,
             "payload_root": str(payload_root),
-            "key_epoch": key_epoch,
+            "recipient_epochs": list(expected_recipient_epochs),
             "members": [
                 {
                     "member_path": member.member_path,
@@ -184,28 +196,31 @@ def _build_cloud_blob(
             ],
         }
         destination.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        return sha256_file(destination)
+        return sha256_file(destination), expected_recipient_epochs
 
     with tempfile.TemporaryDirectory(prefix="sutradhara-cloud-blob-") as raw:
         work_dir = Path(raw)
         rules_path = work_dir / "rules.rem"
         manifest_path = work_dir / "manifest.json"
         rules_path.write_text("blob **/\n", encoding="utf-8")
-        with KeyRegistry().materialized_root_key(key_epoch) as key_file:
-            destination.unlink(missing_ok=True)
-            result = run_rem_archive_build(
-                inputs=[intake_root],
-                ruleset=rules_path,
-                output_path=destination,
-                manifest_path=manifest_path,
-                encrypt=True,
-                key_id=key_epoch,
-                key_file=key_file,
-                failure_label="rem archive build for cloud blob",
-                resource_role=resource_role_for_job(ctx.job.kind, ctx.job.params),
-                cpu_lease=cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources),
-            )
-        return result.stored_digest
+        destination.unlink(missing_ok=True)
+        result = run_rem_archive_build(
+            inputs=[intake_root],
+            ruleset=rules_path,
+            output_path=destination,
+            manifest_path=manifest_path,
+            recipients=tuple(registry.public_key_path(epoch.key_id) for epoch in recipients),
+            failure_label="rem archive build for cloud blob",
+            resource_role=resource_role_for_job(ctx.job.kind, ctx.job.params),
+            cpu_lease=cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources),
+        )
+        report_epochs = recipient_registry_ids(
+            result.stdout_report,
+            failure_label="rem archive build for cloud blob",
+        )
+        if report_epochs != expected_recipient_epochs:
+            raise RuntimeError("cloud blob recipient epochs differ from registry selection")
+        return result.stored_digest, report_epochs
 
 
 def _cloud_blob_representation(pool: Pool) -> Representation:
@@ -223,11 +238,13 @@ def _cloud_blob_representation(pool: Pool) -> Representation:
     return representation
 
 
-def _cloud_key_epoch(value: Any) -> str:
+def _cloud_key_epoch(value: Any, *, registry: KeyRegistry | None = None) -> str:
+    final_registry = registry or KeyRegistry()
     raw = _optional_str(value) or _optional_str(os.environ.get("SUTRADHARA_CLOUD_KEY_EPOCH"))
     if raw is not None:
+        assert_key_epoch_domain(raw, KEY_DOMAIN_BACKUP, context="cloud backup sealing")
         return raw
-    return KeyRegistry().create_epoch().key_id
+    return final_registry.create_epoch(domain=KEY_DOMAIN_BACKUP).key_id
 
 
 def _member_inputs_for_intake(

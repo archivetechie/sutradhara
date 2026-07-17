@@ -42,8 +42,12 @@ from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.reconcilers import derivation as _derivation_reconciler  # noqa: F401
 from sutradhara.jobs.reconcilers.spine import reconcile
+from sutradhara.keys import KeyEpoch
 from sutradhara.rem_archive_cli import RemArchiveBuildResult
 from sutradhara.sealing.port import Representation
+
+BACKUP_EPOCH = "backup-" + "1" * 32
+RECOVERY_EPOCH = "recovery-" + "2" * 32
 
 
 @pytest.fixture
@@ -54,6 +58,13 @@ def engine() -> Iterator[Engine]:
     eng.dispose()
 
 
+@pytest.fixture(autouse=True)
+def fake_cloud_key_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _FakeKeyRegistry:
+    registry = _FakeKeyRegistry(tmp_path / "fake-cloud-keys")
+    monkeypatch.setattr("sutradhara.jobs.handlers.cloud_blob.KeyRegistry", lambda: registry)
+    return registry
+
+
 def test_dispatch_runs_proxies_pfr_and_cloud_copy(
     engine: Engine,
     tmp_path: Path,
@@ -62,7 +73,7 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
     monkeypatch.setenv("SUTRADHARA_FAKE_TRANSCODE", "1")
     monkeypatch.setenv("SUTRADHARA_FAKE_FFPROBE", "1")
     monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
-    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", BACKUP_EPOCH)
     monkeypatch.setenv("SUTRADHARA_CACHE_ROOT", str(tmp_path / "cache"))
     fake_backend = _FakeObjectBackend("cloud-temp")
     monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: fake_backend)
@@ -121,7 +132,7 @@ def test_cloud_blob_handler_uses_ssh_disk_backend_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
-    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", BACKUP_EPOCH)
     remote_root = tmp_path / "remote"
     transport = _LocalObjectTransport(remote_root)
     monkeypatch.setattr(
@@ -157,7 +168,7 @@ def test_cloud_blob_fake_build_unlinks_stale_cache_artifact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
-    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", BACKUP_EPOCH)
     fake_backend = _FakeObjectBackend("cloud-temp")
     monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: fake_backend)
     landing = tmp_path / "landing"
@@ -191,7 +202,7 @@ def test_cloud_blob_refuses_pool_representation_it_cannot_produce(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
-    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", BACKUP_EPOCH)
     fake_backend = _FakeObjectBackend("cloud-temp")
     monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: fake_backend)
     landing = tmp_path / "landing"
@@ -223,7 +234,7 @@ def test_cloud_blob_real_build_unlinks_stale_cache_artifact(
 ) -> None:
     fake_backend = _FakeObjectBackend("cloud-temp")
     monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: fake_backend)
-    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", "1" * 32)
+    monkeypatch.setenv("SUTRADHARA_CLOUD_KEY_EPOCH", BACKUP_EPOCH)
     monkeypatch.setattr(
         "sutradhara.jobs.handlers.cloud_blob.KeyRegistry",
         lambda: _FakeKeyRegistry(tmp_path / "root.key"),
@@ -244,7 +255,13 @@ def test_cloud_blob_real_build_unlinks_stale_cache_artifact(
         return RemArchiveBuildResult(
             artifact_path=output_path,
             stored_digest=hashlib.sha256(build_payload).digest(),
-            stdout_report={},
+            stdout_report={
+                "format_version": 2,
+                "recipient_epochs": [
+                    {"epoch_id": "1" * 32, "label": "backup"},
+                    {"epoch_id": "2" * 32, "label": "recovery"},
+                ],
+            },
             manifest_path=Path(manifest_path) if manifest_path is not None else None,
         )
 
@@ -634,18 +651,16 @@ class _FakeKeyRegistry:
     def __init__(self, path: Path) -> None:
         self._path = path
 
-    def materialized_root_key(self, key_epoch: str) -> _FakeKeyFile:
-        return _FakeKeyFile(self._path)
+    def recipients_for_seal(self, key_epoch: str, *, domain: str) -> tuple[KeyEpoch, KeyEpoch]:
+        assert key_epoch == BACKUP_EPOCH
+        assert domain == "backup"
+        return (
+            KeyEpoch(BACKUP_EPOCH, "2026-07-17T00:00:00+00:00", True),
+            KeyEpoch(RECOVERY_EPOCH, "2026-07-17T00:00:00+00:00", True),
+        )
 
-
-class _FakeKeyFile:
-    def __init__(self, path: Path) -> None:
-        self._path = path
-
-    def __enter__(self) -> Path:
-        self._path.write_bytes(b"fake key")
-        return self._path
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
-        self._path.unlink(missing_ok=True)
-        return False
+    def public_key_path(self, key_epoch: str) -> Path:
+        path = self._path / f"{key_epoch}.raor"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fake public recipient")
+        return path

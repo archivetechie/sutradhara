@@ -53,6 +53,9 @@ from sutradhara.catalog.types import (
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 
+ARCHIVE_EPOCH = "archive-" + "a" * 32
+RECOVERY_EPOCH = "recovery-" + "b" * 32
+
 
 @pytest.fixture
 def engine() -> Iterator[Engine]:
@@ -189,6 +192,11 @@ class _MapArchiveBuilder:
             stored_digest=hashlib.sha256(object_bytes).digest(),
             members=tuple(built),
             manifest_path=None,
+            recipient_epochs=(
+                (key_epoch or ARCHIVE_EPOCH, RECOVERY_EPOCH)
+                if representation is Representation.RAO_AEAD_V1
+                else ()
+            ),
         )
 
     def verify_member_copy(
@@ -224,7 +232,7 @@ def test_archive_submission_fans_out_and_restores_arranged_member(
             setup.submission_id,
             backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
             builder=builder,
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
         assert result.archived is True
@@ -295,7 +303,7 @@ def test_archive_submission_noop_replay_writes_nothing(
             setup.submission_id,
             backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
             builder=_MapArchiveBuilder(),
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     with session_scope(engine) as session:
@@ -306,7 +314,7 @@ def test_archive_submission_noop_replay_writes_nothing(
             setup.submission_id,
             backends={},
             builder=_MapArchiveBuilder(),
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
         assert result.noop is True
         assert session.scalar(select(func.count()).select_from(Copy)) == copy_count
@@ -330,7 +338,7 @@ def test_partial_failure_rolls_back_catalog_and_retry_rearchives(
             setup.submission_id,
             backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
             builder=_MapArchiveBuilder(),
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     assert len(rem_backend.objects) == 1
@@ -349,7 +357,7 @@ def test_partial_failure_rolls_back_catalog_and_retry_rearchives(
             setup.submission_id,
             backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
             builder=_MapArchiveBuilder(),
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
         assert result.archived is True
         assert session.scalar(select(func.count()).select_from(Bundle)) == 1
@@ -371,7 +379,7 @@ def test_source_drift_fails_before_build_or_write(
             setup.submission_id,
             backends={setup.rem_backend_id: rem_backend},
             builder=builder,
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     assert builder.calls == []
@@ -403,7 +411,7 @@ def test_source_root_escape_fails_before_build_or_write(
             setup.submission_id,
             backends={setup.rem_backend_id: rem_backend},
             builder=builder,
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     assert builder.calls == []
@@ -440,7 +448,7 @@ def test_archive_refuses_tampered_source_map(
             setup.submission_id,
             backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
             builder=builder,
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     assert builder.calls == []
@@ -476,7 +484,7 @@ def test_archive_refuses_missing_source_map(
             setup.submission_id,
             backends={setup.rem_backend_id: rem_backend},
             builder=builder,
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     assert builder.calls == []
@@ -506,7 +514,7 @@ def test_resolve_member_rejects_valid_but_absent_name(
                 setup.d2_backend_id: _WriteBackend("d2"),
             },
             builder=_MapArchiveBuilder(),
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
         # The arranged member resolves to its asset hash...
         assert (
@@ -555,7 +563,7 @@ def test_identity_mismatch_fails_before_backend_write(
             setup.submission_id,
             backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
             builder=builder,
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     assert builder.calls
@@ -586,7 +594,7 @@ def test_long_paths_archive_through_widened_member_path_and_source_metadata(
                 setup.d2_backend_id: _WriteBackend("d2"),
             },
             builder=_MapArchiveBuilder(),
-            key_epoch="a" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
         assert result.archived is True
         bundle_member = session.scalar(select(Bundle).where(Bundle.id == result.bundle_id))

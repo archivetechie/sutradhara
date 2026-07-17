@@ -51,7 +51,7 @@ from sutradhara.hdcache.store import (
     verify_disk_identity_with_deadline,
 )
 from sutradhara.jobs.models import Job, LIVE_JOB_STATUS_VALUES
-from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
+from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import sha256_file
 from sutradhara.sealing.port import Opener, Representation
 from sutradhara.sealing.rao import RaoCliOpener
@@ -623,7 +623,8 @@ def _verify_aead_entry(disk: CacheDisk, entry: CacheEntry, *, config: HdcacheWal
         with opener.open(
             sealed,
             Representation.RAO_AEAD_V1,
-            key_epoch=KeyEpoch(key_id=entry.key_epoch, created_at="", active=True),
+            recipient_epochs=(entry.key_epoch,),
+            key_domain=KEY_DOMAIN_HDCACHE,
             work_dir=config.scratch_root,
         ) as plaintext:
             digest = sha256_file(plaintext)

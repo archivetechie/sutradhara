@@ -23,7 +23,6 @@ from sqlalchemy.orm import Session
 from sutradhara.backend.port import ByteRange, StorageBackend
 from sutradhara.catalog.models import Copy, LogicalAsset
 from sutradhara.catalog.types import CopyHealth
-from sutradhara.keys import KeyEpoch
 from sutradhara.sealing.port import Opener, Representation
 
 _PROGRESS_CALLBACK: contextvars.ContextVar[Callable[[int], None] | None] = contextvars.ContextVar(
@@ -71,7 +70,7 @@ def restore_copy(
     """
     expected_hash = _expected_asset_hash(session, copy)
     representation = _copy_representation(copy)
-    key_epoch = _copy_key_epoch(copy, representation)
+    recipient_epochs = _copy_recipient_epochs(copy, representation)
 
     with tempfile.TemporaryDirectory(prefix="sutradhara-restore-copy-") as temp_dir_raw:
         temp_dir = Path(temp_dir_raw)
@@ -85,7 +84,11 @@ def restore_copy(
                 f"for copy id={copy.id}: {stored_digest.hex()} != {copy.integrity_hash.hex()}"
             )
 
-        with opener.open(stored_path, representation, key_epoch=key_epoch) as plaintext_path:
+        with opener.open(
+            stored_path,
+            representation,
+            recipient_epochs=recipient_epochs,
+        ) as plaintext_path:
             plaintext_digest = sha256_file(plaintext_path)
             if plaintext_digest != expected_hash:
                 raise RestoreIntegrityError(
@@ -256,15 +259,23 @@ def _copy_representation(copy: Copy) -> Representation:
         ) from exc
 
 
-def _copy_key_epoch(copy: Copy, representation: Representation) -> KeyEpoch | None:
+def _copy_recipient_epochs(copy: Copy, representation: Representation) -> tuple[str, ...] | None:
     if representation is not Representation.RAO_AEAD_V1:
         return None
-    value = copy.storage_metadata.get("key_epoch")
-    if not isinstance(value, str) or not value:
+    value = copy.storage_metadata.get("recipient_epochs")
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(epoch, str) or not epoch for epoch in value)
+    ):
         raise RestoreUnsupported(
-            f"encrypted copy id={copy.id} has no recorded key_epoch; cannot restore"
+            f"encrypted copy id={copy.id} has no valid recipient_epochs; cannot restore"
         )
-    return KeyEpoch(key_id=value, created_at="", active=True)
+    if len(set(value)) != len(value):
+        raise RestoreUnsupported(
+            f"encrypted copy id={copy.id} has duplicate recipient_epochs; cannot restore"
+        )
+    return tuple(value)
 
 
 def _fsync_directory(path: Path) -> None:

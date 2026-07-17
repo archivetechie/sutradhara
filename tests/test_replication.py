@@ -27,6 +27,7 @@ from sutradhara.catalog.types import (
     CopySource,
     content_hash,
 )
+from sutradhara.durability import AssetTarget
 from sutradhara.keys import KeyEpoch
 from sutradhara.replication import (
     PoolRepresentationError,
@@ -34,13 +35,15 @@ from sutradhara.replication import (
     repair,
     replicate_asset,
     replication_status,
-    select_source,
     select_restore_source,
+    select_source,
     target_pools,
 )
-from sutradhara.durability import AssetTarget
 from sutradhara.sealing.port import Representation, SealResult
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+
+ARCHIVE_EPOCH = "archive-" + "1" * 32
+RECOVERY_EPOCH = "recovery-" + "2" * 32
 
 
 @pytest.fixture
@@ -177,6 +180,9 @@ class _FakeSealer:
             stored_digest=self._stored_digest_override or stored,
             plaintext_digest=self._plaintext_digest_override or plaintext,
             representation=representation,
+            recipient_epochs=(key_id, RECOVERY_EPOCH)
+            if representation is Representation.RAO_AEAD_V1 and key_id is not None
+            else (),
         )
         self.results.append(result)
         try:
@@ -272,7 +278,7 @@ def test_target_pools_reads_active_memberships_and_representations(
             s,
             "o-archive",
             {backend_id: backend},
-            key_epoch="1" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     assert [target.pool_id for _, target in targets] == [
@@ -283,7 +289,7 @@ def test_target_pools_reads_active_memberships_and_representations(
         Representation.RAO_PLAIN_V1.value,
         Representation.RAO_AEAD_V1.value,
     ]
-    assert [target.key_epoch for _, target in targets] == [None, "1" * 32]
+    assert [target.key_epoch for _, target in targets] == [None, ARCHIVE_EPOCH]
 
 
 def test_target_pools_excludes_write_fenced_by_default_but_status_keeps_it(
@@ -349,9 +355,12 @@ def test_pool_sealing_rejects_hdcache_key_epoch(
     )
     backend = _PoolWriteBackend("rem")
 
-    with session_scope(engine) as s, pytest.raises(
-        ReplicationInvariantError,
-        match="requires archive key epochs",
+    with (
+        session_scope(engine) as s,
+        pytest.raises(
+            ReplicationInvariantError,
+            match="requires archive key epochs",
+        ),
     ):
         replicate_asset(
             s,
@@ -458,13 +467,13 @@ def test_replicate_asset_records_stored_digest_for_rao_pool_copies(
             "o-archive",
             backends={backend_id: backend},
             sealer=sealer,
-            key_epoch="1" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     assert backend.writes == ["o-copy-1-pool", "o-copy-2-pool"]
     assert sealer.calls == [
         (Representation.RAO_PLAIN_V1, None),
-        (Representation.RAO_AEAD_V1, "1" * 32),
+        (Representation.RAO_AEAD_V1, ARCHIVE_EPOCH),
     ]
     assert len(copies) == 2
     with session_scope(engine) as s:
@@ -478,7 +487,7 @@ def test_replicate_asset_records_stored_digest_for_rao_pool_copies(
         assert rows["o-copy-2-pool"].storage_metadata == {
             "representation": Representation.RAO_AEAD_V1.value,
             "chunk_size": RAO_CHUNK_SIZE,
-            "key_epoch": "1" * 32,
+            "recipient_epochs": [ARCHIVE_EPOCH, RECOVERY_EPOCH],
         }
 
 
@@ -531,14 +540,14 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
             "n-archive",
             backends={rem_backend_id: rem_backend, d2_backend_id: d2_backend},
             sealer=sealer,
-            key_epoch="1" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
         status = replication_status(
             s,
             asset_hash,
             "n-archive",
             {rem_backend_id: rem_backend, d2_backend_id: d2_backend},
-            key_epoch="1" * 32,
+            key_epoch=ARCHIVE_EPOCH,
         )
 
     assert rem_backend.writes == ["n-copy-1", "n-copy-2"]
@@ -552,7 +561,7 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
     }
     assert sealer.calls == [
         (Representation.RAO_PLAIN_V1, None),
-        (Representation.RAO_AEAD_V1, "1" * 32),
+        (Representation.RAO_AEAD_V1, ARCHIVE_EPOCH),
         (Representation.D2TAR_RAW, None),
     ]
 

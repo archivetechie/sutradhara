@@ -40,10 +40,10 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
-from sutradhara.keys import KeyRegistry
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
+from tests.key_helpers import registry_with_recovery
 
 
 @pytest.fixture
@@ -188,7 +188,7 @@ if args[:2] == ["archive", "covering-range"]:
         "authenticated_prefix_len": len(prefix),
     }}))
 elif args[:2] == ["archive", "extract-stream"]:
-    required = ["--range", "--key-file", "--authenticated-prefix", "--stored-range-start"]
+    required = ["--range", "--private-key", "--authenticated-prefix", "--stored-range-start"]
     if any(flag not in args for flag in required):
         raise SystemExit("missing ranged extract arguments")
     prefix = pathlib.Path(args[args.index("--authenticated-prefix") + 1]).read_bytes()
@@ -269,15 +269,15 @@ def test_aead_member_reads_only_rust_covering_stored_range(tmp_path: Path) -> No
         tmp_path / "ranged-rem",
         {"member.bin": (plaintext_start, len(plaintext), stored_start, stored_end)},
     )
-    key_file = tmp_path / "root.key"
-    key_file.write_bytes(b"k" * 32)
+    private_key = tmp_path / "private.raop"
+    private_key.write_bytes(b"test-private-key")
 
     with archive_restore_module._open_rao_aead_plaintext_stream(
         backend=backend,
         copy=copy,
         locator=locator,
         rem_bin=str(helper),
-        key_file=key_file,
+        private_key=private_key,
     ) as chunks:
         restored = b"".join(chunks)
 
@@ -323,8 +323,8 @@ def test_encrypted_bundle_reads_sum_of_member_covering_ranges(tmp_path: Path) ->
         plaintext_len=1,
     )
     helper = _write_ranged_stream_helper(tmp_path / "bundle-rem", query_ranges)
-    key_file = tmp_path / "root.key"
-    key_file.write_bytes(b"k" * 32)
+    private_key = tmp_path / "private.raop"
+    private_key.write_bytes(b"test-private-key")
 
     restored: list[bytes] = []
     for locator in locators:
@@ -333,7 +333,7 @@ def test_encrypted_bundle_reads_sum_of_member_covering_ranges(tmp_path: Path) ->
             copy=copy,
             locator=locator,
             rem_bin=str(helper),
-            key_file=key_file,
+            private_key=private_key,
         ) as chunks:
             restored.append(b"".join(chunks))
 
@@ -350,7 +350,7 @@ def _install_candidates(
     *,
     logical: bytes,
     stored_candidates: list[bytes],
-    key_epoch: str,
+    recipient_epochs: tuple[str, ...],
 ) -> tuple[int, list[int]]:
     asset_hash = _sha(logical)
     with session_scope(engine) as session:
@@ -414,7 +414,7 @@ def _install_candidates(
                 native_locator_key=locator_key(native),
                 storage_metadata={
                     "representation": Representation.RAO_AEAD_V1.value,
-                    "key_epoch": key_epoch,
+                    "recipient_epochs": list(recipient_epochs),
                     "stored_size_bytes": len(stored),
                 },
                 integrity_hash=_sha(stored),
@@ -454,7 +454,7 @@ def test_real_encrypted_copy_round_trips_through_unbuffered_plan(
     source = tmp_path / "source.bin"
     logical = b"real encrypted streaming restore" * 4096
     source.write_bytes(logical)
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     backend = _StreamingObjectBackend()
     with RaoCliSealer(registry).seal(
@@ -468,7 +468,7 @@ def test_real_encrypted_copy_round_trips_through_unbuffered_plan(
         backend,
         logical=logical,
         stored_candidates=[stored],
-        key_epoch=epoch.key_id,
+        recipient_epochs=(epoch.key_id, recovery.key_id),
     )
 
     with session_scope(engine) as session:
@@ -504,14 +504,14 @@ def test_helper_failure_discards_stdout_and_leaves_no_destination(
 ) -> None:
     logical = b"verified fallback"
     backend = _StreamingObjectBackend()
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     backend_id, copy_ids = _install_candidates(
         engine,
         backend,
         logical=logical,
         stored_candidates=[broken],
-        key_epoch=epoch.key_id,
+        recipient_epochs=(epoch.key_id, recovery.key_id),
     )
     destination = tmp_path / "fallback.bin"
 
@@ -538,14 +538,14 @@ def test_helper_failure_discards_stdout_and_leaves_no_destination(
 def test_helper_failure_falls_through_to_next_candidate(engine: Engine, tmp_path: Path) -> None:
     logical = b"verified fallback"
     backend = _StreamingObjectBackend()
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     backend_id, copy_ids = _install_candidates(
         engine,
         backend,
         logical=logical,
         stored_candidates=[b"CORRUPT ciphertext", logical],
-        key_epoch=epoch.key_id,
+        recipient_epochs=(epoch.key_id, recovery.key_id),
     )
 
     with session_scope(engine) as session:
@@ -585,14 +585,14 @@ time.sleep(60)
     helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
     logical = b"must never appear"
     backend = _StreamingObjectBackend()
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     backend_id, _copy_ids = _install_candidates(
         engine,
         backend,
         logical=logical,
         stored_candidates=[logical],
-        key_epoch=epoch.key_id,
+        recipient_epochs=(epoch.key_id, recovery.key_id),
     )
     monkeypatch.setattr(archive_restore_module, "_REM_STREAM_INACTIVITY_TIMEOUT_SECONDS", 0.1)
     destination = tmp_path / "hung.bin"
@@ -623,14 +623,14 @@ def test_slow_mount_uses_mount_grace_before_streaming_timeout(
     # Longer than both the patched streaming watchdog and the reader's 250 ms
     # polling interval: the former single-clock implementation fails this case.
     backend = _StreamingObjectBackend(mount_delay_seconds=0.4)
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     backend_id, _copy_ids = _install_candidates(
         engine,
         backend,
         logical=logical,
         stored_candidates=[logical],
-        key_epoch=epoch.key_id,
+        recipient_epochs=(epoch.key_id, recovery.key_id),
     )
     monkeypatch.setattr(archive_restore_module, "_REM_STREAM_INACTIVITY_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(archive_restore_module, "_REM_STREAM_MOUNT_GRACE_SECONDS", 1.0)
@@ -657,14 +657,14 @@ def test_streaming_inactivity_timeout_still_fires_after_mount(
 ) -> None:
     logical = b"stream stalls after mount"
     backend = _StreamingObjectBackend(stream_delay_seconds=0.75)
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     backend_id, _copy_ids = _install_candidates(
         engine,
         backend,
         logical=logical,
         stored_candidates=[logical],
-        key_epoch=epoch.key_id,
+        recipient_epochs=(epoch.key_id, recovery.key_id),
     )
     monkeypatch.setattr(archive_restore_module, "_REM_STREAM_INACTIVITY_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(archive_restore_module, "_REM_STREAM_MOUNT_GRACE_SECONDS", 2.0)
@@ -695,14 +695,14 @@ def test_mount_error_fails_fast_without_waiting_for_grace(
 ) -> None:
     logical = b"mount must fail"
     backend = _StreamingObjectBackend(mount_error=RuntimeError("library mount failed"))
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     backend_id, _copy_ids = _install_candidates(
         engine,
         backend,
         logical=logical,
         stored_candidates=[logical],
-        key_epoch=epoch.key_id,
+        recipient_epochs=(epoch.key_id, recovery.key_id),
     )
     monkeypatch.setattr(archive_restore_module, "_REM_STREAM_INACTIVITY_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(archive_restore_module, "_REM_STREAM_MOUNT_GRACE_SECONDS", 10.0)
@@ -732,14 +732,14 @@ def test_large_duplex_restore_has_bounded_rss_and_does_not_deadlock(
 ) -> None:
     logical = b"z" * (16 * 1024 * 1024)
     backend = _StreamingObjectBackend()
-    registry = KeyRegistry(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
     backend_id, _copy_ids = _install_candidates(
         engine,
         backend,
         logical=logical,
         stored_candidates=[logical],
-        key_epoch=epoch.key_id,
+        recipient_epochs=(epoch.key_id, recovery.key_id),
     )
     baseline_rss = _rss_bytes()
     peak_rss = [baseline_rss]

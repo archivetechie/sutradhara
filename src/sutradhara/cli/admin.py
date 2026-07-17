@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
 import click
 
 from sutradhara.catalog.session import database_url, make_engine, reset_all
-from sutradhara.keys import KeyRegistry
+from sutradhara.keys import KeyRegistry, mint_recovery_keypair
 from sutradhara.sealing.rao import resolve_rem_bin
 
 
@@ -23,6 +24,72 @@ class _Diagnostic:
 @click.group("admin")
 def admin_group() -> None:
     """Dangerous local catalog maintenance."""
+
+
+@admin_group.group("keys")
+def admin_keys() -> None:
+    """Manage local recipient-key epochs and offline recovery keys."""
+
+
+@admin_keys.command("mint-recovery")
+@click.option(
+    "--public-key",
+    "public_key_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Operator-selected output path for the non-secret RAOR public key.",
+)
+@click.option(
+    "--private-key",
+    "private_key_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="Operator-selected escrow output path for the secret RAOP private key.",
+)
+def admin_keys_mint_recovery(public_key_path: Path, private_key_path: Path) -> None:
+    """Mint a recovery keypair offline; never place its private half in the registry."""
+
+    try:
+        epoch = mint_recovery_keypair(
+            public_key_path=public_key_path,
+            private_key_path=private_key_path,
+        )
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Minted recovery epoch {epoch.key_id}")
+    click.echo(f"Public key: {public_key_path}")
+    click.echo(f"Private key (escrow; do not import): {private_key_path}")
+    click.echo(
+        "Import on each serving host: "
+        + shlex.join(
+            [
+                "sutra",
+                "admin",
+                "keys",
+                "import-public",
+                "--public-key",
+                str(public_key_path),
+            ]
+        )
+    )
+
+
+@admin_keys.command("import-public")
+@click.option(
+    "--public-key",
+    "public_key_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False, readable=True),
+    required=True,
+    help="Canonical recovery RAOR public-key file to import.",
+)
+def admin_keys_import_public(public_key_path: Path) -> None:
+    """Import a recovery public epoch into the serving-host registry."""
+
+    try:
+        epoch = KeyRegistry().import_public_epoch(public_key_path)
+    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Imported active public-only recovery epoch {epoch.key_id}")
 
 
 @admin_group.command("reset")

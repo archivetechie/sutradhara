@@ -22,7 +22,6 @@ from sutradhara.backend.memory import MemoryBackend
 from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
-from sutradhara.keys import KeyEpoch
 from sutradhara.restore import (
     RestoreError,
     RestoreIntegrityError,
@@ -43,7 +42,7 @@ def engine() -> Iterator[Engine]:
 
 class _FakeOpener:
     def __init__(self) -> None:
-        self.calls: list[tuple[Representation, str | None]] = []
+        self.calls: list[tuple[Representation, tuple[str, ...] | None]] = []
 
     @contextlib.contextmanager
     def open(
@@ -51,12 +50,12 @@ class _FakeOpener:
         source_path: Path | str,
         representation: Representation,
         *,
-        key_epoch: KeyEpoch | None = None,
+        recipient_epochs: tuple[str, ...] | None = None,
+        key_domain: str | None = None,
         work_dir: Path | str | None = None,
     ) -> Iterator[Path]:
-        del work_dir
-        key_id = key_epoch.key_id if key_epoch is not None else None
-        self.calls.append((representation, key_id))
+        del key_domain, work_dir
+        self.calls.append((representation, recipient_epochs))
         source = Path(source_path)
         if representation in {Representation.RAW_BYTES, Representation.D2TAR_RAW}:
             yield source
@@ -68,7 +67,8 @@ class _FakeOpener:
             prefix, stored_key, payload = source.read_bytes().split(b":", 2)
             assert prefix.decode("ascii") == representation.value
             if representation is Representation.RAO_AEAD_V1:
-                assert stored_key.decode("ascii") == key_id
+                assert recipient_epochs is not None
+                assert stored_key.decode("ascii") == recipient_epochs[0]
             plaintext.write_bytes(payload)
             yield plaintext
 
@@ -139,7 +139,11 @@ def test_atomic_write_verified_chunks_deletes_temp_on_source_failure(tmp_path: P
     assert list(tmp_path.glob(".source-failed.bin.*.tmp")) == []
 
 
-def _stored_bytes(data: bytes, representation: Representation, key_epoch: str = "epoch-1") -> bytes:
+def _stored_bytes(
+    data: bytes,
+    representation: Representation,
+    key_epoch: str = "archive-" + "1" * 32,
+) -> bytes:
     if representation in {Representation.RAW_BYTES, Representation.D2TAR_RAW}:
         return data
     return representation.value.encode("ascii") + b":" + key_epoch.encode("ascii") + b":" + data
@@ -150,7 +154,7 @@ def _metadata(representation: Representation, *, key_epoch: str | None = None) -
     if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
         metadata["chunk_size"] = 262144
     if representation is Representation.RAO_AEAD_V1 and key_epoch is not None:
-        metadata["key_epoch"] = key_epoch
+        metadata["recipient_epochs"] = [key_epoch, "recovery-" + "2" * 32]
     return metadata
 
 
@@ -172,7 +176,7 @@ def _add_copy(
     *,
     data: bytes = b"restore payload",
     representation: Representation = Representation.RAW_BYTES,
-    key_epoch: str = "epoch-1",
+    key_epoch: str = "archive-" + "1" * 32,
     storage_metadata: dict[str, object] | None = None,
     health: CopyHealth = CopyHealth.OK,
     stored_bytes: bytes | None = None,
@@ -239,7 +243,12 @@ def test_restore_copy_round_trips_asset_per_representation(
     assert dest.read_bytes() == data
     assert result.sha256 == _sha(data)
     if representation is Representation.RAO_AEAD_V1:
-        assert opener.calls == [(representation, "epoch-1")]
+        expected_recipients = (
+            ("archive-" + "1" * 32, "recovery-" + "2" * 32)
+            if representation is Representation.RAO_AEAD_V1
+            else None
+        )
+        assert opener.calls == [(representation, expected_recipients)]
 
 
 def test_restore_copy_reads_suspect_direct_copy(

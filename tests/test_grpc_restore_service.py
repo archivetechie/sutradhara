@@ -8,7 +8,7 @@ import shutil
 import socket
 import struct
 import tracemalloc
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -74,10 +74,11 @@ from sutradhara.hdcache.store import (
 from sutradhara.jobs.models import Job
 from sutradhara.jobs.reconcilers import restore_open as restore_open_reconciler
 from sutradhara.jobs.reconcilers.spine import reconcile
-from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyRegistry
+from sutradhara.keys import KEY_DOMAIN_HDCACHE
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
+from tests.key_helpers import registry_with_recovery
 
 
 class _DiskArchiveBackend:
@@ -172,11 +173,13 @@ class _CacheTestOpener:
         source_path: Path | str,
         representation: Representation,
         *,
-        key_epoch: Any | None = None,
+        recipient_epochs: Sequence[str] | None = None,
+        key_domain: str | None = None,
         work_dir: Path | str | None = None,
     ) -> Iterator[Path]:
         assert representation is Representation.RAO_AEAD_V1
-        assert key_epoch is not None
+        assert recipient_epochs
+        assert key_domain == KEY_DOMAIN_HDCACHE
         root = Path(work_dir) if work_dir is not None else Path(source_path).parent
         plaintext = root / f"opened-{hashlib.sha256(Path(source_path).read_bytes()).hexdigest()}"
         stored = Path(source_path).read_bytes()
@@ -297,7 +300,7 @@ def rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Rig]:
             )
 
     rem_bin = resolve_rem_bin()
-    keys = KeyRegistry(root / "keys")
+    keys, _recovery = registry_with_recovery(root / "keys")
     cache_config = RestoreConfig(
         scratch_root=root / "cache-scratch",
         key_registry=keys,
@@ -401,7 +404,8 @@ def test_open_restore_real_socket_streams_rao_aead_plaintext(rig: _Rig, socket_p
     payload = b"authenticated encrypted restore\n" * 20_000
     source = rig.root / "encrypted-source.bin"
     source.write_bytes(payload)
-    registry = KeyRegistry(rig.root / "keys")
+    registry = rig.service_config.cache_config.key_registry
+    assert registry is not None
     epoch = registry.create_epoch()
     stored = rig.root / "encrypted-stored.rao"
     with RaoCliSealer(registry).seal(
@@ -410,6 +414,7 @@ def test_open_restore_real_socket_streams_rao_aead_plaintext(rig: _Rig, socket_p
         key_epoch=epoch,
     ) as sealed:
         shutil.copyfile(sealed.sealed_path, stored)
+        recipient_epochs = sealed.recipient_epochs
     item_id = _seed_item(
         rig,
         "aead",
@@ -417,7 +422,7 @@ def test_open_restore_real_socket_streams_rao_aead_plaintext(rig: _Rig, socket_p
         receiver="receiver",
         representation=Representation.RAO_AEAD_V1,
         stored_path=stored,
-        key_epoch=epoch.key_id,
+        recipient_epochs=recipient_epochs,
         member_path=source.name,
     )
 
@@ -1289,7 +1294,7 @@ def _seed_item(
     delivery_mode: str = "agent",
     representation: Representation = Representation.RAW_BYTES,
     stored_path: Path | None = None,
-    key_epoch: str | None = None,
+    recipient_epochs: Sequence[str] = (),
     member_path: str = "payload.bin",
     privacy_level: str = "none",
 ) -> int:
@@ -1365,7 +1370,7 @@ def _seed_item(
             storage_metadata={
                 "representation": representation.value,
                 "stored_size_bytes": stored_path.stat().st_size,
-                **({"key_epoch": key_epoch} if key_epoch is not None else {}),
+                **({"recipient_epochs": list(recipient_epochs)} if recipient_epochs else {}),
             },
             integrity_hash=stored_digest,
             source=CopySource.INGEST,

@@ -27,6 +27,7 @@ dependencies = [
     "format-anatomy",
     "cbor2>=5.6",
     "click>=8.1",
+    "cryptography>=41.0",
     "fastapi>=0.115",
     "httpx2>=0.28",
     "sqlalchemy>=2.0",
