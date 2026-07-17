@@ -32,7 +32,14 @@ def make_engine(url: str | None = None, *, echo: bool = False) -> Engine:
     is off by default in SQLite; the catalog model relies on it).
     """
     final_url = url or database_url()
-    engine = create_engine(final_url, echo=echo, future=True)
+    connect_args: dict[str, object] = {}
+    if final_url.startswith("sqlite"):
+        # Busy timeout: the live services (sutra-serve worker, intake-watch)
+        # and in-process harness/job engines share one SQLite file; without a
+        # timeout a concurrent writer surfaces as an immediate
+        # "database is locked" OperationalError instead of a short wait.
+        connect_args["timeout"] = 30
+    engine = create_engine(final_url, echo=echo, future=True, connect_args=connect_args)
 
     if final_url.startswith("sqlite"):
         _install_sqlite_pragmas(engine)
