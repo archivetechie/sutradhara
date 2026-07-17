@@ -124,7 +124,14 @@ class ConformanceScan:
 
     @property
     def has_deviations(self) -> bool:
-        return bool(self.clusters or self.exclusions)
+        # Mirror rem's is_noncompliant_reason (archive_ingest.rs): native
+        # entries, rule-driven exclusions, and rule-driven blob wraps are
+        # compliant informational clusters, not deviations — only reasons
+        # outside that set hold a compliant-expect bundle.
+        compliant = {"native", "exclude-rule", "blob-rule"}
+        return any(c.reason not in compliant for c in self.clusters) or bool(
+            self.exclusions
+        )
 
     def to_summary(self) -> dict[str, Any]:
         return {
