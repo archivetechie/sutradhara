@@ -7,6 +7,7 @@ whether incoming material is expected to be compliant or messy.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -137,12 +138,23 @@ _DURATION_MULTIPLIERS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def load_artifactclass_policy(path: Path | str) -> ArtifactClassPolicy:
-    """Parse and validate an artifactclass policy TOML file."""
+    """Parse and validate an artifactclass policy TOML file.
+
+    A relative `ruleset` resolves against the policy document's directory —
+    the ruleset file travels with the policy that names it, independent of
+    any consumer's working directory.
+    """
     policy_path = Path(path)
-    return parse_artifactclass_policy(
+    policy = parse_artifactclass_policy(
         policy_path.read_text(encoding="utf-8"),
         source=str(policy_path),
     )
+    ruleset_path = Path(policy.ruleset)
+    if not ruleset_path.is_absolute():
+        policy = dataclasses.replace(
+            policy, ruleset=str((policy_path.parent / ruleset_path).resolve())
+        )
+    return policy
 
 
 def get_artifactclass_policy(
@@ -423,14 +435,13 @@ def apply_artifactclass_policy_file(
 ) -> ArtifactClassPolicy:
     """Load, validate, and persist an artifactclass policy file."""
     policy_path = Path(path)
-    text = policy_path.read_text(encoding="utf-8")
-    policy = parse_artifactclass_policy(text, source=str(policy_path))
+    policy = load_artifactclass_policy(policy_path)
     apply_artifactclass_policy(
         session,
         artifactclass,
         policy,
         source=str(policy_path),
-        source_text=text,
+        source_text=policy_path.read_text(encoding="utf-8"),
     )
     return policy
 
