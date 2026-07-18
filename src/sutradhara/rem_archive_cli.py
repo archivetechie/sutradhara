@@ -213,7 +213,7 @@ def recipient_registry_ids(
     *,
     failure_label: str,
 ) -> tuple[str, ...]:
-    """Parse canonical registry ids from a Remanence v2 recipient report."""
+    """Parse canonical registry ids from a Remanence recipient report."""
 
     if report.get("format_version") != 2:
         raise RuntimeError(f"{failure_label} did not report format_version 2")
