@@ -13,6 +13,7 @@ from pathlib import Path
 from sutradhara.catalog.facts import record_validity
 from sutradhara.catalog.models import LogicalAsset
 from sutradhara.catalog.types import AssetValidity, is_content_hash
+from sutradhara.jobs.components import touch_asset, touch_tool
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 
 
@@ -39,11 +40,14 @@ def handle_validate(ctx: JobContext) -> JobResult:
     asset = ctx.session.get(LogicalAsset, asset_hash)
     if asset is None:
         raise ValueError(f"no LogicalAsset with content hash {raw_hash}")
+    touch_asset(ctx, asset_hash)
+    touch_tool(ctx, validator, "builtin")
 
     path = Path(path_raw)
     try:
         data = path.read_bytes()
     except OSError as exc:
+        ctx.observe({"path": str(path), "exception_type": type(exc).__name__, "text": str(exc)})
         return JobResult(
             ok=False,
             detail=f"read error: {exc}",
@@ -55,6 +59,14 @@ def handle_validate(ctx: JobContext) -> JobResult:
         if validator == "json":
             json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        ctx.observe(
+            {
+                "validator": validator,
+                "bytes_read": len(data),
+                "exception_type": type(exc).__name__,
+                "text": str(exc),
+            }
+        )
         note = f"decode error via {validator}: {exc}"
         record_validity(ctx.session, asset=asset, validity=AssetValidity.SUSPECT, note=note)
         return JobResult(
@@ -72,6 +84,7 @@ def handle_validate(ctx: JobContext) -> JobResult:
     record_validity(
         ctx.session, asset=asset, validity=AssetValidity.OK, note=f"validated via {validator}"
     )
+    ctx.observe({"validator": validator, "bytes_read": len(data)})
     return JobResult(
         ok=True,
         detail="validated ok",

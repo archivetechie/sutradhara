@@ -293,7 +293,7 @@ Catalog queries. Currently one subcommand:
   `50`, `0` = unlimited), `--json`.
 
 <!-- code-anchor: src/sutradhara/cli/reconcile.py src/sutradhara/jobs/reconcilers @ df8165b -->
-## sutra reconcile DOMAIN
+## sutra reconcile DOMAIN / record-fix
 
 Run one bounded reconcile cycle for DOMAIN: observe desired state, discover
 gaps, and enqueue the jobs that close them. The registered domains are
@@ -301,6 +301,12 @@ gaps, and enqueue the jobs that close them. The registered domains are
 `restore_open` (reopens an agent-delivery restore item whose lease expired
 before the device finished — an alarm/state-only domain that never
 enqueues a job). An unknown domain exits 2.
+
+After an operator fixes one recorded component, `sutra reconcile record-fix
+COMPONENT --note TEXT` reopens at most 100 matching blocked conditions by
+default. Matching is exact against the component snapshot captured when each
+condition parked; `--limit INTEGER` may select a batch from 1 through 1000.
+The reopen audit message records the local actor and supplied note.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -311,6 +317,7 @@ enqueues a job). An unknown domain exits 2.
 | `--list-blocked` | off | List blocked conditions for DOMAIN instead of reconciling. |
 | `--reopen-blocked` | off | Reopen blocked conditions for DOMAIN. |
 | `--reason TEXT` | | Filter `--reopen-blocked` by reason. |
+| `--note TEXT` | | Required with `record-fix`; audited operator note. |
 
 <!-- code-anchor: src/sutradhara/cli/jobs.py src/sutradhara/cli/worker.py src/sutradhara/jobs @ df8165b -->
 ## sutra jobs and sutra worker

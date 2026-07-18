@@ -19,6 +19,7 @@ from sutradhara.jobs.config import RetryPolicy, WorkerConfig
 from sutradhara.jobs.engine import apply_retry_policy, run_one, submit
 from sutradhara.jobs.models import Job, JobAttempt, JobStatus
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
+from sutradhara.jobs.runtime_observations import report_session_open
 
 
 @pytest.fixture
@@ -159,7 +160,7 @@ def test_attempts_record_unknown_handler_and_exception_paths(engine: Engine) -> 
 
     try:
         with session_scope(engine) as session:
-            unknown = submit(session, "missing_attempt_kind", {})
+            unknown = submit(session, "missing_attempt_kind", {"asset_hash": "ab" * 32})
             raised = submit(session, "_attempt_raises", {})
             unknown_result = run_one(session, unknown.id)
             raised_result = run_one(session, raised.id)
@@ -175,11 +176,95 @@ def test_attempts_record_unknown_handler_and_exception_paths(engine: Engine) -> 
             assert attempts["missing_attempt_kind"].outcome == JobStatus.FAILED
             assert attempts["missing_attempt_kind"].error is not None
             assert "no handler registered" in attempts["missing_attempt_kind"].error
+            assert (
+                "asset:sha256:" + "ab" * 32 in attempts["missing_attempt_kind"].detail["components"]
+            )
             assert attempts["_attempt_raises"].outcome == JobStatus.FAILED
             assert attempts["_attempt_raises"].error is not None
             assert "RuntimeError" in attempts["_attempt_raises"].error
     finally:
         _unregister("_attempt_raises")
+
+
+def test_tape_session_components_and_observations_persist_on_success(engine: Engine) -> None:
+    @register_handler("_attempt_tape_success")
+    def _attempt_tape_success(_ctx: JobContext) -> JobResult:
+        report_session_open(
+            session_id="session-read-17",
+            drive_element_address=257,
+            tape_uuid="L80012",
+            library="DEC1",
+        )
+        return JobResult(ok=True, detail="read completed")
+
+    try:
+        with session_scope(engine) as session:
+            job = submit(session, "_attempt_tape_success", {})
+            assert run_one(session, job.id).ok
+
+        with session_scope(engine) as session:
+            attempt = session.scalars(select(JobAttempt)).one()
+            assert "tape:L80012" in attempt.detail["components"]
+            assert "drive:257" in attempt.detail["components"]
+            assert "library:DEC1" in attempt.detail["components"]
+            assert attempt.detail["component_parents"] == [
+                {"component": "drive:257", "parent": "library:DEC1"}
+            ]
+            assert attempt.detail["observations"] == [
+                {"session_id": "session-read-17", "drive_element_address": 257}
+            ]
+    finally:
+        _unregister("_attempt_tape_success")
+
+
+def test_tape_session_observation_survives_handler_exception(engine: Engine) -> None:
+    @register_handler("_attempt_tape_raises")
+    def _attempt_tape_raises(_ctx: JobContext) -> JobResult:
+        report_session_open(
+            session_id=b"session-before-error",
+            drive_element_address=513,
+            tape_uuid="L80013",
+        )
+        raise RuntimeError("read stopped")
+
+    try:
+        with session_scope(engine) as session:
+            job = submit(session, "_attempt_tape_raises", {})
+            assert not run_one(session, job.id).ok
+
+        with session_scope(engine) as session:
+            attempt = session.scalars(select(JobAttempt)).one()
+            assert attempt.outcome == JobStatus.FAILED
+            assert "tape:L80013" in attempt.detail["components"]
+            assert "drive:513" in attempt.detail["components"]
+            assert attempt.detail["observations"] == [
+                {
+                    "session_id": b"session-before-error".hex(),
+                    "drive_element_address": 513,
+                }
+            ]
+    finally:
+        _unregister("_attempt_tape_raises")
+
+
+def test_observation_persists_when_handler_returns_failure(engine: Engine) -> None:
+    @register_handler("_attempt_returns_failure")
+    def _attempt_returns_failure(ctx: JobContext) -> JobResult:
+        ctx.observe({"exit_status": 9, "stderr_excerpt": "tool stopped\n"})
+        return JobResult(ok=False, detail="tool stopped")
+
+    try:
+        with session_scope(engine) as session:
+            job = submit(session, "_attempt_returns_failure", {})
+            assert not run_one(session, job.id).ok
+
+        with session_scope(engine) as session:
+            attempt = session.scalars(select(JobAttempt)).one()
+            assert attempt.detail["observations"] == [
+                {"exit_status": 9, "stderr_excerpt": "tool stopped\n"}
+            ]
+    finally:
+        _unregister("_attempt_returns_failure")
 
 
 def _aware_utc(value: dt.datetime) -> dt.datetime:

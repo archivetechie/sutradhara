@@ -26,7 +26,11 @@ from sutradhara.backend.port import (
     CopyRecord,
     StorageBackend,
 )
-from sutradhara.backend.remanence import RemanenceBackend
+from sutradhara.backend.remanence import (
+    RemanenceBackend,
+    RemanenceWriteResult,
+    RemanenceWriteSessionError,
+)
 from sutradhara.catalog.session import locator_key
 from sutradhara.catalog.types import content_hash
 
@@ -455,6 +459,14 @@ class _LostRaceReadClient(_QueueReadClient):
         )
 
 
+class _RangeFailureReadClient(_QueueReadClient):
+    def ReadObjectRange(
+        self, request: layer5_pb2.ReadObjectRangeRequest
+    ) -> Iterator[layer5_pb2.BytesChunk]:
+        raise _LostRaceError()
+        yield  # pragma: no cover - make this a streaming RPC-shaped method
+
+
 def _queue_backend(library: _QueueLibrary, client: _QueueReadClient) -> RemanenceBackend:
     backend = RemanenceBackend(
         "queued-rem-tape",
@@ -503,6 +515,21 @@ def test_busy_bay_queues_second_tape_restore_until_first_closes() -> None:
     assert client.open_count == 2
 
 
+def test_read_error_surfaces_opened_session_without_grpc_server() -> None:
+    library = _QueueLibrary()
+    client = _RangeFailureReadClient(library)
+    backend = _queue_backend(library, client)
+
+    with backend.open_read_session(_read_locator("11" * 32)) as reader:
+        assert reader.session_id == b"session-1"
+        assert reader.drive_element_address == 0x101
+        with pytest.raises(BackendError) as raised:
+            reader.read_range(ByteRange(0, 1))
+
+    assert raised.value.session_id == b"session-1"  # type: ignore[attr-defined]
+    assert raised.value.drive_element_address == 0x101  # type: ignore[attr-defined]
+
+
 def test_lost_open_read_session_race_requeues_instead_of_failing() -> None:
     library = _QueueLibrary()
     client = _LostRaceReadClient(library)
@@ -510,7 +537,8 @@ def test_lost_open_read_session_race_requeues_instead_of_failing() -> None:
     locator = _read_locator(hashlib.sha256(b"payload").hexdigest())
 
     with queued_backend.open_read_session(locator) as session:
-        assert session is not None
+        assert session.session_id == b"won-after-requeue"
+        assert session.drive_element_address == 0x101
 
     assert client.open_count == 2
 
@@ -788,6 +816,53 @@ class _WriteSession(layer5_pb2_grpc.WriteSessionServiceServicer):
         return layer5_pb2.WriteSession(session_id=self.session_id, tape_uuid=self.tape_uuid)
 
 
+class _DirectWriteError(grpc.RpcError):  # type: ignore[misc]
+    def code(self) -> grpc.StatusCode:
+        return grpc.StatusCode.INTERNAL
+
+    def details(self) -> str:
+        return "direct append stopped"
+
+
+class _DirectWriteClient:
+    """Protocol-shaped write client that needs no listening socket."""
+
+    def __init__(self, obj: layer5_pb2.ObjectRecord, *, raise_on_append: bool = False) -> None:
+        self.obj = obj
+        self.raise_on_append = raise_on_append
+        self.session_id = b"direct-write-session"
+        self.drive_element_address = 0x102
+        self.aborted = False
+
+    def OpenWriteSession(
+        self, request: layer5_pb2.OpenWriteSessionRequest
+    ) -> layer5_pb2.WriteSession:
+        return layer5_pb2.WriteSession(
+            session_id=self.session_id,
+            tape_uuid=self.obj.copies[0].tape_uuid,
+            drive_element_address=self.drive_element_address,
+        )
+
+    def AppendObject(
+        self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+    ) -> layer5_pb2.ObjectRecord:
+        list(request_iterator)
+        if self.raise_on_append:
+            raise _DirectWriteError()
+        return self.obj
+
+    def CloseWriteSession(
+        self, request: layer5_pb2.CloseWriteSessionRequest
+    ) -> layer5_pb2.WriteSession:
+        return layer5_pb2.WriteSession(session_id=request.session_id)
+
+    def AbortWriteSession(
+        self, request: layer5_pb2.AbortWriteSessionRequest
+    ) -> layer5_pb2.WriteSession:
+        self.aborted = True
+        return layer5_pb2.WriteSession(session_id=request.session_id)
+
+
 @contextmanager
 def _serve_write(servicer: _WriteSession) -> Iterator[str]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
@@ -816,6 +891,38 @@ def test_write_requires_live_mode(backend: RemanenceBackend, tmp_path: Path) -> 
         backend.write_object_to_pool(src, "scenario-a")
 
 
+def test_write_result_and_error_surface_opened_session_without_grpc_server(
+    proto_object: layer5_pb2.ObjectRecord,
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"data")
+    success_client = _DirectWriteClient(proto_object)
+    backend = RemanenceBackend(
+        "direct-rem",
+        endpoint="direct",
+        write_session=success_client,
+    )
+
+    result = backend.write_object_to_pool(src, "scenario-a")
+
+    assert result.session_id == success_client.session_id
+    assert result.drive_element_address == success_client.drive_element_address
+    assert result.copy_record.native_locator == result.native_locator
+
+    error_client = _DirectWriteClient(proto_object, raise_on_append=True)
+    backend = RemanenceBackend(
+        "direct-rem",
+        endpoint="direct",
+        write_session=error_client,
+    )
+    with pytest.raises(RemanenceWriteSessionError) as raised:
+        backend.write_object_to_pool(src, "scenario-a")
+    assert raised.value.session_id == error_client.session_id
+    assert raised.value.drive_element_address == error_client.drive_element_address
+    assert error_client.aborted
+
+
 def test_write_object_to_pool_success(
     write_server: tuple[str, _WriteSession],
     tmp_path: Path,
@@ -827,7 +934,10 @@ def test_write_object_to_pool_success(
     wb = RemanenceBackend.from_grpc("primary-tape", endpoint)
     record = wb.write_object_to_pool(src, "scenario-a")
 
-    assert isinstance(record, CopyRecord)
+    assert isinstance(record, RemanenceWriteResult)
+    assert isinstance(record.copy_record, CopyRecord)
+    assert record.session_id == servicer.session_id
+    assert record.drive_element_address == 0
     assert record.metadata["append_commit_info"]["append_mode"] == "fresh"
     assert record.metadata["append_commit_info"]["tape_file_number"] == 1
     assert servicer.opened
@@ -871,10 +981,12 @@ def test_write_aborts_on_stream_error(
 
     with _serve_write(servicer) as endpoint:
         backend = RemanenceBackend.from_grpc("primary-tape", endpoint)
-        with pytest.raises(BackendUnavailableError):
+        with pytest.raises(RemanenceWriteSessionError) as raised:
             backend.write_object_to_pool(src, "scenario-a")
 
     assert servicer.aborted is True
+    assert raised.value.session_id == servicer.session_id
+    assert raised.value.drive_element_address == 0
 
 
 def test_write_object_locator_parity_with_enumerate(
@@ -894,7 +1006,7 @@ def test_write_object_locator_parity_with_enumerate(
 
     assert written.native_locator == enumerated.native_locator
     assert locator_key(written.native_locator) == locator_key(enumerated.native_locator)
-    assert written == enumerated
+    assert written.copy_record == enumerated
 
 
 class _RoundTripStore:

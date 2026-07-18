@@ -27,6 +27,7 @@ from typing import cast
 from sutradhara.backend import factory
 from sutradhara.catalog.models import Copy
 from sutradhara.catalog.types import CopyHealth
+from sutradhara.jobs.components import touch_asset, touch_tape_locator
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 
 
@@ -43,8 +44,25 @@ def handle_verify(ctx: JobContext) -> JobResult:
     if copy.deleted_at is not None:
         raise ValueError(f"copy id={raw_copy_id} has been tombstoned by retention")
 
+    if copy.logical_asset_hash is not None:
+        touch_asset(ctx, copy.logical_asset_hash)
+    ctx.touch(f"backend:{copy.backend.name}")
+    backend_config = copy.backend.config or {}
+    library = backend_config.get("library_uuid")
+    touch_tape_locator(
+        ctx,
+        copy.native_locator,
+        library=library if isinstance(library, (bytes, str)) else None,
+    )
     backend = factory.backend_from_row(copy.backend)
     result = backend.verify(copy.native_locator)
+    ctx.observe(
+        {
+            "verify_ok": result.ok,
+            "actual_hash": (cast(bytes, result.actual_hash).hex() if result.actual_hash else None),
+            "detail": result.detail,
+        }
+    )
 
     copy.last_verified_at = dt.datetime.now(dt.UTC)
     if result.ok:

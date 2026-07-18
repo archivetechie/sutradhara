@@ -134,6 +134,14 @@ def _assert_worker_lease_invariants(db_path: Path) -> None:
     attempt_indexes = _index_columns(db_path, "job_attempt")
     assert ("job_id",) in attempt_indexes
     assert ("job_kind",) in attempt_indexes
+    assert "condition_component" in _tables(db_path)
+    component_sql = _table_sql(db_path, "condition_component")
+    assert "condition_id" in component_sql
+    assert "component VARCHAR(2048) NOT NULL" in component_sql
+    assert "ON DELETE CASCADE" in component_sql
+    component_indexes = _index_columns(db_path, "condition_component")
+    assert ("component",) in component_indexes
+    assert ("condition_id", "component") in _unique_index_columns(db_path, "condition_component")
 
 
 def _assert_intake_invariants(db_path: Path) -> None:

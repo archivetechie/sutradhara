@@ -615,7 +615,7 @@ live job row is pruned.
 | `started_at`, `finished_at`, `created_at` | time | Attempt timing and record time. |
 | `granted_leases` | json | Resources granted to this attempt. |
 | `worker_id`, `code_version` | text, optional | Executing worker and code identity. |
-| `detail` | json | Structured attempt result. |
+| `detail` | json | Structured attempt result, including context-accumulated `components`, optional `component_parents`, and raw `observations`. |
 
 ### `reconciliation_condition`
 
@@ -632,6 +632,18 @@ reality and the latest attempt so reconcilers do not scan the full job history.
 | `blocked_tool_name`, `blocked_tool_version` | text, optional | Tool evidence that can reopen a blocked condition after change. |
 | `last_attempt_id` | integer, optional FK -> `job_attempt.id` | Latest supporting attempt. |
 | `last_attempt_at`, `last_success_at`, `updated_at` | time | Attempt, success, and row-update times. |
+
+### `condition_component`
+
+An indexed, attempt-independent snapshot of exact component strings captured
+when a reconciliation condition transitions to `blocked`. Attempt pruning can
+null `reconciliation_condition.last_attempt_id` without removing this lookup.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Snapshot row identifier. |
+| `condition_id` | integer, FK -> `reconciliation_condition.id` | Parked condition; cascades on condition deletion. |
+| `component` | text, indexed | Exact component string used by `record-fix`; unique per condition. |
 
 ## HD cache and restore
 

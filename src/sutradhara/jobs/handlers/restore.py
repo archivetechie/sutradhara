@@ -12,10 +12,13 @@ from __future__ import annotations
 from sutradhara.hdcache.manager import (
     ITEM_DONE,
     RestoreAdmissionInvalid,
+    RestoreManagerError,
+    destination_for_request_item,
     restore_config_from_env,
     serve_restore_item,
 )
 from sutradhara.hdcache.models import RestoreRequestItem
+from sutradhara.jobs.components import touch_asset, touch_destination
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 
 
@@ -41,7 +44,14 @@ def handle_restore(ctx: JobContext) -> JobResult:
             "not-queued",
             f"restore request item id={item_id} is state={item.state!r}",
         )
+    touch_asset(ctx, item.content_sha256)
     config = restore_config_from_env()
+    try:
+        destination = destination_for_request_item(config, item.request.destination_id, item)
+    except RestoreManagerError:
+        destination = None
+    if destination is not None:
+        touch_destination(ctx, destination)
     try:
         result = serve_restore_item(
             ctx.session,
@@ -56,6 +66,16 @@ def handle_restore(ctx: JobContext) -> JobResult:
 
     if item.state != ITEM_DONE:
         return _failure("restore-failed", item.detail or f"item ended in state={item.state!r}")
+    touch_destination(ctx, result.output_path)
+    ctx.observe(
+        {
+            "restore_request_item_id": item_id,
+            "path": str(result.output_path),
+            "sha256": item.content_sha256.hex(),
+            "bytes": result.size_bytes,
+            "source": result.source,
+        }
+    )
     return JobResult(
         ok=True,
         detail=f"restored request item id={item_id} to {result.output_path}",

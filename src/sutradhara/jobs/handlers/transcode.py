@@ -11,6 +11,7 @@ from typing import Any
 from sutradhara.catalog.facts import record_derivation, record_validity
 from sutradhara.catalog.models import IngestItem, LogicalAsset
 from sutradhara.catalog.types import AssetValidity, MediaKind
+from sutradhara.jobs.components import touch_asset, touch_tool
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
 from sutradhara.jobs.tool_versions import current_tool_version
@@ -32,6 +33,7 @@ def handle_transcode(ctx: JobContext) -> JobResult:
     source_asset = ctx.session.get(LogicalAsset, item.logical_asset_hash)
     if source_asset is None:
         raise ValueError(f"no LogicalAsset for ingest_item id={item_id}")
+    touch_asset(ctx, source_asset.content_sha256)
     if not source_path.exists() or not source_path.is_file():
         return JobResult(
             ok=False,
@@ -58,8 +60,12 @@ def handle_transcode(ctx: JobContext) -> JobResult:
     preview_path = output_dir / "preview.mp4"
 
     if os.environ.get("SUTRADHARA_FAKE_TRANSCODE") == "1":
+        tool_version = "1"
+        touch_tool(ctx, "fake-transcode", tool_version)
         result = _fake_transcode(source_path, mezz_path, preview_path)
     else:
+        tool_version = current_tool_version("ffmpeg")
+        touch_tool(ctx, "ffmpeg", tool_version)
         threads = _granted_cpu_threads(ctx)
         result = _run_ffmpeg(
             source_path,
@@ -68,6 +74,7 @@ def handle_transcode(ctx: JobContext) -> JobResult:
             threads=threads,
             role=resource_role_for_job(ctx.job.kind, ctx.job.params),
         )
+    _observe_transcode_result(ctx, result, tool_version=tool_version)
 
     if result["kind"] == "stderr_pattern":
         # SUSPECT is a validity statement about the asset; a capability match
@@ -80,9 +87,7 @@ def handle_transcode(ctx: JobContext) -> JobResult:
                 validity=AssetValidity.SUSPECT,
                 note=str(result["detail"]),
             )
-        blocked_tool = (
-            ("ffmpeg", current_tool_version("ffmpeg")) if result["bucket"] == "capability" else None
-        )
+        blocked_tool = ("ffmpeg", tool_version) if result["bucket"] == "capability" else None
         return JobResult(
             ok=True,
             detail=str(result["detail"]),
@@ -126,6 +131,12 @@ def handle_transcode(ctx: JobContext) -> JobResult:
         artifactclass=output_class,
         media_kind=MediaKind.VIDEO,
         generated_by="transcode",
+    )
+    ctx.observe(
+        {
+            "mezz_sha256": mezz.logical_asset_hash.hex(),
+            "preview_sha256": preview.logical_asset_hash.hex(),
+        }
     )
     record_validity(
         ctx.session,
@@ -243,21 +254,26 @@ def _run_ffmpeg(
             "detail": "ffmpeg timed out; no proxy produced",
         }
     if completed.returncode == 0 and mezz.exists() and preview.exists():
-        return {"kind": "ok", "detail": "ffmpeg completed"}
+        return {"kind": "ok", "detail": "ffmpeg completed", "exit_status": completed.returncode}
     stderr = completed.stderr or ""
     stderr_pattern_result = _stderr_pattern_result(stderr)
     if stderr_pattern_result is not None:
+        stderr_pattern_result["exit_status"] = completed.returncode
         return stderr_pattern_result
     if completed.returncode in {137, -9} or "Cannot allocate memory" in stderr:
         return {
             "kind": "no_proxy",
             "reason": "ffmpeg-resource-failure",
             "detail": "ffmpeg resource failure; no proxy produced",
+            "exit_status": completed.returncode,
+            "stderr_excerpt": stderr,
         }
     return {
         "kind": "no_proxy",
         "reason": "ffmpeg-operational-failure",
         "detail": f"ffmpeg failed without decode classification: {stderr.strip()}",
+        "exit_status": completed.returncode,
+        "stderr_excerpt": stderr,
     }
 
 
@@ -309,6 +325,22 @@ def _stderr_pattern_result(stderr: str, *, origin: str = "ffmpeg-stderr") -> dic
 
 def _granted_cpu_threads(ctx: JobContext) -> int:
     return cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources) or 1
+
+
+def _observe_transcode_result(
+    ctx: JobContext,
+    result: dict[str, Any],
+    *,
+    tool_version: str,
+) -> None:
+    """Append only verbatim tool output and returned scalar values."""
+
+    facts: dict[str, Any] = {"tool_version": tool_version}
+    for key in ("exit_status", "stderr_excerpt", "matched_pattern", "origin"):
+        if key in result:
+            facts[key] = result[key]
+    if len(facts) > 1:
+        ctx.observe(facts)
 
 
 def _read_prefix(path: Path, size: int) -> bytes:

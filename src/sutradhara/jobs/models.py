@@ -189,6 +189,27 @@ class ReconciliationCondition(Base):
         )
 
 
+class ConditionComponent(Base):
+    """Indexed component snapshot retained independently of job attempts."""
+
+    __tablename__ = "condition_component"
+    __table_args__ = (
+        UniqueConstraint(
+            "condition_id",
+            "component",
+            name="uq_condition_component_condition_component",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    condition_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("reconciliation_condition.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    component: Mapped[str] = mapped_column(String(2048), nullable=False, index=True)
+
+
 Index(
     "uq_job_dedupe_key_live",
     Job.dedupe_key,

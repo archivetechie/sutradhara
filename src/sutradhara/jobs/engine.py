@@ -8,6 +8,7 @@ future Postgres ``SKIP LOCKED`` implementation can be swapped in one place.
 from __future__ import annotations
 
 import datetime as dt
+import socket
 import traceback
 from typing import Any, cast
 
@@ -38,6 +39,7 @@ from sutradhara.jobs.registry import (
     JobResult,
     get_handler,
 )
+from sutradhara.jobs.runtime_observations import bind_session_open_observer
 
 
 def _utcnow() -> dt.datetime:
@@ -118,13 +120,19 @@ def run_one(
     elif job.status != JobStatus.RUNNING:
         raise ValueError(f"job id={job_id} is {job.status}; cannot run")
 
+    ctx = job_context(session, job, granted_leases=granted_leases)
     try:
         handler = get_handler(job.kind)
     except HandlerNotRegistered as e:
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
         job.last_error = str(e)
-        attempt = record_attempt(session, job, granted_leases=granted_leases)
+        attempt = record_attempt(
+            session,
+            job,
+            granted_leases=granted_leases,
+            detail=attempt_detail(ctx),
+        )
         _record_reconciler_condition(
             session,
             job,
@@ -136,12 +144,18 @@ def run_one(
         return JobResult(ok=False, detail=str(e))
 
     try:
-        result = handler(JobContext(session=session, job=job, granted_leases=granted_leases or {}))
+        with bind_session_open_observer(ctx.observe_session_open):
+            result = handler(ctx)
     except NotImplementedError as e:
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
         job.last_error = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
-        attempt = record_attempt(session, job, granted_leases=granted_leases)
+        attempt = record_attempt(
+            session,
+            job,
+            granted_leases=granted_leases,
+            detail=attempt_detail(ctx),
+        )
         _record_reconciler_condition(
             session,
             job,
@@ -155,7 +169,12 @@ def run_one(
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
         job.last_error = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
-        attempt = record_attempt(session, job, granted_leases=granted_leases)
+        attempt = record_attempt(
+            session,
+            job,
+            granted_leases=granted_leases,
+            detail=attempt_detail(ctx),
+        )
         _record_reconciler_condition(
             session,
             job,
@@ -173,7 +192,12 @@ def run_one(
         # Merge over existing step_state so handlers can build up state
         # incrementally without clobbering.
         job.step_state = {**job.step_state, **result.step_state}
-    attempt = record_attempt(session, job, granted_leases=granted_leases)
+    attempt = record_attempt(
+        session,
+        job,
+        granted_leases=granted_leases,
+        detail=attempt_detail(ctx),
+    )
     if result.condition is not None:
         _record_projection_condition(session, job, attempt, result.condition)
     elif result.ok:
@@ -294,16 +318,94 @@ def claim_job_by_id(
 
 
 def reset_orphaned_running_jobs(session: Session) -> int:
-    """Reset RUNNING jobs to PENDING on single-worker startup."""
-    result = cast(
-        CursorResult[Any],
-        session.execute(
-            update(Job)
-            .where(Job.status == JobStatus.RUNNING)
-            .values(status=JobStatus.PENDING, started_at=None, not_before=_utcnow())
-        ),
+    """Reset RUNNING jobs and retain the startup-observed crash gap as a fact."""
+
+    now = _utcnow()
+    rows = list(session.scalars(select(Job).where(Job.status == JobStatus.RUNNING)))
+    marker = f"orphaned RUNNING at startup, reset to PENDING at {now.isoformat()}"
+    for job in rows:
+        prior = dict(job.step_state or {})
+        engine_observations = list(prior.get("engine_observations") or [])
+        engine_observations.append({"note": marker})
+        job.step_state = {**prior, "engine_observations": engine_observations}
+        job.last_error = marker
+        job.status = JobStatus.PENDING
+        job.started_at = None
+        job.not_before = now
+    session.flush(rows)
+    return len(rows)
+
+
+def job_context(
+    session: Session,
+    job: Job,
+    *,
+    granted_leases: dict[str, int] | None = None,
+) -> JobContext:
+    """Build and seed the context used by handlers and engine-side failures."""
+
+    ctx = JobContext(
+        session=session,
+        job=job,
+        granted_leases=dict(granted_leases or {}),
     )
-    return int(result.rowcount or 0)
+    ctx.touch(f"job:{job.kind}")
+    _touch_param_components(ctx, job.params or {})
+    return ctx
+
+
+def attempt_detail(ctx: JobContext) -> dict[str, Any]:
+    """Build the single engine-owned attempt payload from a job context."""
+
+    detail: dict[str, Any] = {
+        "step_state": dict(ctx.job.step_state or {}),
+        "components": list(dict.fromkeys(ctx.components)),
+        "observations": [dict(observation) for observation in ctx.observations],
+    }
+    if ctx.component_parents:
+        detail["component_parents"] = [dict(relation) for relation in ctx.component_parents]
+    return detail
+
+
+def _touch_param_components(ctx: JobContext, params: dict[str, Any]) -> None:
+    """Tag exact component identities visible before handler dispatch."""
+
+    for key in ("asset_hash", "content_sha256"):
+        value = _component_value(params.get(key))
+        if value is not None:
+            suffix = value if value.startswith("sha256:") else f"sha256:{value}"
+            ctx.touch(f"asset:{suffix}")
+    for key in ("tape", "tape_id", "tape_uuid", "media_id"):
+        value = _component_value(params.get(key))
+        if value is not None:
+            ctx.touch(f"tape:{value}")
+    for key in ("drive", "drive_id", "drive_element_address"):
+        value = _component_value(params.get(key))
+        if value is not None:
+            ctx.touch(f"drive:{value}")
+    for key in ("library", "library_id", "library_uuid"):
+        value = _component_value(params.get(key))
+        if value is not None:
+            ctx.touch(f"library:{value}")
+    for key in ("backend", "backend_name", "target_backend"):
+        value = _component_value(params.get(key))
+        if value is not None:
+            ctx.touch(f"backend:{value}")
+    for key in ("dest_path", "destination", "output_path"):
+        value = _component_value(params.get(key))
+        if value is not None:
+            destination = f"{socket.gethostname()}:{value}" if value.startswith("/") else value
+            ctx.touch(f"dest:{destination}")
+
+
+def _component_value(value: Any) -> str | None:
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None
 
 
 def apply_retry_policy(

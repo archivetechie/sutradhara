@@ -50,7 +50,11 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
                 "and 'fixture_path'; configure exactly one"
             )
         if isinstance(daemon_endpoint, str):
-            return RemanenceBackend.from_grpc(row.name, daemon_endpoint)
+            return RemanenceBackend.from_grpc(
+                row.name,
+                daemon_endpoint,
+                library_identity=_optional_str(cfg, "library_uuid"),
+            )
         if isinstance(fixture, str):
             return RemanenceBackend.from_fixture_file(row.name, fixture)
         raise BackendNotConfigured(

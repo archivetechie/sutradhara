@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.jobs.config import override_derivation_cache_root
-from sutradhara.jobs.models import ReconciliationCondition
+from sutradhara.jobs.models import ConditionComponent, ReconciliationCondition
 from sutradhara.jobs.reconcilers import bundle_copy as _bundle_copy_reconciler  # noqa: F401
 from sutradhara.jobs.reconcilers import copy as _copy_reconciler  # noqa: F401 -- register copy
 from sutradhara.jobs.reconcilers import (
@@ -29,6 +29,7 @@ from sutradhara.jobs.reconcilers.spine import reconcile
 
 @click.command("reconcile")
 @click.argument("domain")
+@click.argument("component", required=False)
 @click.option("--batch", type=int, default=1000, show_default=True, help="Discover batch size.")
 @click.option("--cursor", type=int, default=None, help="Ingest-item id cursor for discovery.")
 @click.option("--limit", type=int, default=100, show_default=True, help="Process work limit.")
@@ -41,8 +42,10 @@ from sutradhara.jobs.reconcilers.spine import reconcile
 @click.option("--list-blocked", is_flag=True, help="List blocked conditions for DOMAIN.")
 @click.option("--reopen-blocked", is_flag=True, help="Reopen blocked conditions for DOMAIN.")
 @click.option("--reason", "reason_filter", default=None, help="Filter --reopen-blocked by reason.")
+@click.option("--note", default=None, help="Operator note for record-fix.")
 def reconcile_cmd(
     domain: str,
+    component: str | None,
     batch: int,
     cursor: int | None,
     limit: int,
@@ -50,8 +53,31 @@ def reconcile_cmd(
     list_blocked: bool,
     reopen_blocked: bool,
     reason_filter: str | None,
+    note: str | None,
 ) -> None:
-    """Run one bounded reconcile cycle for DOMAIN."""
+    """Run one bounded reconcile cycle, or record-fix COMPONENT."""
+
+    if domain == "record-fix":
+        if component is None:
+            raise click.ClickException("record-fix requires COMPONENT")
+        if note is None or not note.strip():
+            raise click.ClickException("record-fix requires --note TEXT")
+        if list_blocked or reopen_blocked or reason_filter is not None or cache_root is not None:
+            raise click.ClickException(
+                "record-fix does not accept domain reconcile filters or --cache-root"
+            )
+        if limit < 1 or limit > 1000:
+            raise click.ClickException("record-fix --limit must be between 1 and 1000")
+        engine = make_engine()
+        with session_scope(engine) as session:
+            count = _record_fix(session, component, note=note.strip(), limit=limit)
+        click.echo(f"reopened {count} blocked condition(s) for component {component}")
+        return
+
+    if component is not None:
+        raise click.ClickException("unexpected COMPONENT; use 'reconcile record-fix COMPONENT'")
+    if note is not None:
+        raise click.ClickException("--note may only be used with record-fix")
 
     if list_blocked and reopen_blocked:
         raise click.ClickException("--list-blocked and --reopen-blocked are mutually exclusive")
@@ -126,3 +152,27 @@ def _reopen_blocked(session: Session, domain: str, *, reason_filter: str | None)
         )
         count += 1
     return count
+
+
+def _record_fix(session: Session, component: str, *, note: str, limit: int) -> int:
+    """Reopen one bounded batch of blocked rows with an exact component match."""
+
+    rows = list(
+        session.scalars(
+            select(ReconciliationCondition)
+            .join(
+                ConditionComponent,
+                ConditionComponent.condition_id == ReconciliationCondition.id,
+            )
+            .where(
+                ReconciliationCondition.condition == CONDITION_BLOCKED,
+                ConditionComponent.component == component,
+            )
+            .order_by(ReconciliationCondition.updated_at, ReconciliationCondition.id)
+            .limit(limit)
+        )
+    )
+    actor = getpass.getuser()
+    for row in rows:
+        reopen_condition(session, row, actor=actor, note=note)
+    return len(rows)
