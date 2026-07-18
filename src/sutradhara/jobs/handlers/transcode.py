@@ -69,12 +69,15 @@ def handle_transcode(ctx: JobContext) -> JobResult:
             role=resource_role_for_job(ctx.job.kind, ctx.job.params),
         )
 
-    if result["kind"] == "decode_error":
+    if result["kind"] == "stderr_pattern":
         record_validity(
             ctx.session,
             asset=source_asset,
             validity=AssetValidity.SUSPECT,
             note=str(result["detail"]),
+        )
+        blocked_tool = (
+            ("ffmpeg", current_tool_version("ffmpeg")) if result["bucket"] == "capability" else None
         )
         return JobResult(
             ok=True,
@@ -82,9 +85,9 @@ def handle_transcode(ctx: JobContext) -> JobResult:
             step_state={"transcode": result},
             condition=ConditionProjection(
                 condition=CONDITION_BLOCKED,
-                reason="unsupported-source",
+                reason=f"stderr-pattern:{result['bucket']}",
                 message=str(result["detail"]),
-                blocked_tool=("ffmpeg", current_tool_version("ffmpeg")),
+                blocked_tool=blocked_tool,
             ),
         )
     if result["kind"] == "no_proxy":
@@ -152,10 +155,9 @@ def _source_path(item: IngestItem) -> Path:
 def _fake_transcode(source: Path, mezz: Path, preview: Path) -> dict[str, Any]:
     marker = _read_prefix(source, 64)
     if marker.startswith(b"DECODE_FAIL"):
-        return {
-            "kind": "decode_error",
-            "detail": "decode error via fake transcode marker",
-        }
+        result = _stderr_pattern_result("invalid data found via fake transcode marker")
+        assert result is not None
+        return result
     source_digest = sha256_file(source).hex()
     mezz.write_bytes(f"fake mezzanine for {source_digest}\n".encode())
     preview.write_bytes(f"fake preview for {source_digest}\n".encode())
@@ -236,11 +238,9 @@ def _run_ffmpeg(
     if completed.returncode == 0 and mezz.exists() and preview.exists():
         return {"kind": "ok", "detail": "ffmpeg completed"}
     stderr = completed.stderr or ""
-    if _stderr_is_decode_error(stderr):
-        return {
-            "kind": "decode_error",
-            "detail": f"decode error via ffmpeg: {stderr.strip() or completed.returncode}",
-        }
+    stderr_pattern_result = _stderr_pattern_result(stderr)
+    if stderr_pattern_result is not None:
+        return stderr_pattern_result
     if completed.returncode in {137, -9} or "Cannot allocate memory" in stderr:
         return {
             "kind": "no_proxy",
@@ -254,16 +254,49 @@ def _run_ffmpeg(
     }
 
 
-def _stderr_is_decode_error(stderr: str) -> bool:
+_DAMAGE_STDERR_PATTERNS = (
+    "invalid data found",
+    "moov atom not found",
+    "error while decoding",
+    "corrupt",
+    "truncated",
+)
+_CAPABILITY_STDERR_PATTERNS = (
+    "unknown decoder",
+    "codec not currently supported",
+    "could not find codec parameters",
+)
+
+
+def _classify_ffmpeg_stderr(stderr: str) -> tuple[str, str] | None:
+    """Return the parking bucket and canonical pattern matched in ffmpeg stderr."""
+
     lowered = stderr.lower()
-    needles = (
-        "invalid data found",
-        "moov atom not found",
-        "error while decoding",
-        "corrupt",
-        "could not find codec parameters",
-    )
-    return any(needle in lowered for needle in needles)
+    for bucket, patterns in (
+        ("damage", _DAMAGE_STDERR_PATTERNS),
+        ("capability", _CAPABILITY_STDERR_PATTERNS),
+    ):
+        for pattern in patterns:
+            if pattern in lowered:
+                return bucket, pattern
+    return None
+
+
+def _stderr_pattern_result(stderr: str) -> dict[str, Any] | None:
+    """Build the factual job record for one classified ffmpeg stderr value."""
+
+    classification = _classify_ffmpeg_stderr(stderr)
+    if classification is None:
+        return None
+    bucket, matched_pattern = classification
+    stderr_excerpt = stderr.strip()
+    return {
+        "kind": "stderr_pattern",
+        "bucket": bucket,
+        "matched_pattern": matched_pattern,
+        "stderr_excerpt": stderr_excerpt,
+        "detail": f"ffmpeg stderr matched {matched_pattern!r}: {stderr_excerpt}",
+    }
 
 
 def _granted_cpu_threads(ctx: JobContext) -> int:
