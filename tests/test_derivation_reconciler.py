@@ -19,10 +19,11 @@ from sutradhara.catalog.models import (
     AssetDerivation,
     Backend,
     IngestItem,
+    LogicalAsset,
     Pool,
 )
 from sutradhara.catalog.session import create_all, make_engine, session_scope
-from sutradhara.catalog.types import BackendKind, BackendTier, MediaKind
+from sutradhara.catalog.types import AssetValidity, BackendKind, BackendTier, MediaKind
 from sutradhara.intake import prepare_intake, register_intake
 from sutradhara.jobs.config import override_derivation_cache_root
 from sutradhara.jobs.engine import run_one, submit
@@ -298,7 +299,17 @@ def test_ffmpeg_stderr_bucket_parking_records_factual_match(
             state = persisted_job.step_state["transcode"]
             assert state["bucket"] == bucket
             assert state["matched_pattern"] == matched_pattern
-            assert state["stderr_excerpt"] == stderr.strip()
+            assert state["stderr_excerpt"] == stderr
+            assert state["origin"] == "ffmpeg-stderr"
+
+            item = session.get(IngestItem, item_id)
+            assert item is not None
+            source_asset = session.get(LogicalAsset, item.logical_asset_hash)
+            assert source_asset is not None
+            if bucket == "damage":
+                assert source_asset.validity == AssetValidity.SUSPECT
+            else:
+                assert source_asset.validity != AssetValidity.SUSPECT
 
             condition = _condition(session, target_key)
             assert condition.condition == CONDITION_BLOCKED

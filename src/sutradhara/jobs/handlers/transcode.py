@@ -70,12 +70,16 @@ def handle_transcode(ctx: JobContext) -> JobResult:
         )
 
     if result["kind"] == "stderr_pattern":
-        record_validity(
-            ctx.session,
-            asset=source_asset,
-            validity=AssetValidity.SUSPECT,
-            note=str(result["detail"]),
-        )
+        # SUSPECT is a validity statement about the asset; a capability match
+        # says nothing adverse about the asset, and marking it would deny
+        # restore/hdcache admission for intact bytes (diff gate on a5f6fe5).
+        if result["bucket"] == "damage":
+            record_validity(
+                ctx.session,
+                asset=source_asset,
+                validity=AssetValidity.SUSPECT,
+                note=str(result["detail"]),
+            )
         blocked_tool = (
             ("ffmpeg", current_tool_version("ffmpeg")) if result["bucket"] == "capability" else None
         )
@@ -155,7 +159,10 @@ def _source_path(item: IngestItem) -> Path:
 def _fake_transcode(source: Path, mezz: Path, preview: Path) -> dict[str, Any]:
     marker = _read_prefix(source, 64)
     if marker.startswith(b"DECODE_FAIL"):
-        result = _stderr_pattern_result("invalid data found via fake transcode marker")
+        result = _stderr_pattern_result(
+            "invalid data found via fake transcode marker",
+            origin="fake-transcode-marker",
+        )
         assert result is not None
         return result
     source_digest = sha256_file(source).hex()
@@ -282,20 +289,21 @@ def _classify_ffmpeg_stderr(stderr: str) -> tuple[str, str] | None:
     return None
 
 
-def _stderr_pattern_result(stderr: str) -> dict[str, Any] | None:
-    """Build the factual job record for one classified ffmpeg stderr value."""
+def _stderr_pattern_result(stderr: str, *, origin: str = "ffmpeg-stderr") -> dict[str, Any] | None:
+    """Build the factual job record for one classified stderr value."""
 
     classification = _classify_ffmpeg_stderr(stderr)
     if classification is None:
         return None
     bucket, matched_pattern = classification
-    stderr_excerpt = stderr.strip()
     return {
         "kind": "stderr_pattern",
         "bucket": bucket,
         "matched_pattern": matched_pattern,
-        "stderr_excerpt": stderr_excerpt,
-        "detail": f"ffmpeg stderr matched {matched_pattern!r}: {stderr_excerpt}",
+        "origin": origin,
+        # Verbatim, unmodified — the record is the fact (design Part A).
+        "stderr_excerpt": stderr,
+        "detail": f"{origin} matched {matched_pattern!r}: {stderr.strip()}",
     }
 
 
