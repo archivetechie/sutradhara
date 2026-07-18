@@ -28,7 +28,7 @@ from sutradhara.intake import prepare_intake, register_intake
 from sutradhara.jobs.config import override_derivation_cache_root
 from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.handlers.transcode import handle_transcode
-from sutradhara.jobs.models import Job, ReconciliationCondition
+from sutradhara.jobs.models import Job, JobAttempt, ReconciliationCondition
 from sutradhara.jobs.reconcilers import copy as _copy_reconciler  # noqa: F401
 from sutradhara.jobs.reconcilers import derivation as derivation_reconciler
 from sutradhara.jobs.reconcilers.conditions import (
@@ -301,6 +301,13 @@ def test_ffmpeg_stderr_bucket_parking_records_factual_match(
             assert state["matched_pattern"] == matched_pattern
             assert state["stderr_excerpt"] == stderr
             assert state["origin"] == "ffmpeg-stderr"
+            attempt = session.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
+            assert attempt.outcome == "succeeded"
+            assert "tool:ffmpeg@fixture-ffmpeg-1" in attempt.detail["components"]
+            assert any(
+                observation.get("stderr_excerpt") == stderr and observation.get("exit_status") == 1
+                for observation in attempt.detail["observations"]
+            )
 
             item = session.get(IngestItem, item_id)
             assert item is not None

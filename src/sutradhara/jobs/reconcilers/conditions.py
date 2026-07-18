@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from sutradhara.jobs.config import DEFAULT_MAX_BACKOFF_SECONDS, jittered_backoff_seconds
-from sutradhara.jobs.models import JobAttempt, JobStatus, ReconciliationCondition
+from sutradhara.jobs.models import (
+    ConditionComponent,
+    JobAttempt,
+    JobStatus,
+    ReconciliationCondition,
+)
 
 CONDITION_OPEN = "open"
 CONDITION_BACKOFF = "backoff"
@@ -122,6 +127,7 @@ def record_condition(
         )
 
     now = _utcnow()
+    was_blocked = row.condition == CONDITION_BLOCKED
     _link_attempt(row, attempt, now=now)
 
     if condition is None:
@@ -139,6 +145,8 @@ def record_condition(
             row.reason = reason or "give-up"
             row.message = message
             row.next_eligible_at = None
+            if not was_blocked:
+                _snapshot_blocked_components(session, row, attempt)
         else:
             row.condition = CONDITION_BACKOFF
             row.reason = reason
@@ -155,6 +163,8 @@ def record_condition(
         row.message = message
         row.next_eligible_at = None
         _set_blocked_tool(row, blocked_tool)
+        if not was_blocked:
+            _snapshot_blocked_components(session, row, attempt)
         row.updated_at = now
         session.flush([row])
         return row
@@ -236,6 +246,27 @@ def _set_blocked_tool(
         row.blocked_tool_version = None
         return
     row.blocked_tool_name, row.blocked_tool_version = blocked_tool
+
+
+def _snapshot_blocked_components(
+    session: Session,
+    row: ReconciliationCondition,
+    attempt: JobAttempt | None,
+) -> None:
+    """Replace the parked condition's indexed component snapshot."""
+
+    session.flush([row])
+    session.execute(delete(ConditionComponent).where(ConditionComponent.condition_id == row.id))
+    raw_components = [] if attempt is None else attempt.detail.get("components", [])
+    if not isinstance(raw_components, list):
+        raw_components = []
+    components = sorted(
+        {component for component in raw_components if isinstance(component, str) and component}
+    )
+    session.add_all(
+        [ConditionComponent(condition_id=row.id, component=component) for component in components]
+    )
+    session.flush()
 
 
 def _default_backoff_due(now: dt.datetime, attempt_count: int) -> dt.datetime:

@@ -671,6 +671,9 @@ def test_worker_startup_resets_orphaned_running_jobs(engine: Engine) -> None:
         assert row is not None
         assert row.status == JobStatus.PENDING
         assert row.started_at is None
+        assert row.last_error is not None
+        assert "orphaned RUNNING at startup, reset to PENDING at" in row.last_error
+        assert row.step_state["engine_observations"] == [{"note": row.last_error}]
 
 
 def test_validate_handler_marks_clean_and_decode_invalid_assets(

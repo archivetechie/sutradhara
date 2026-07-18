@@ -29,6 +29,7 @@ from sutradhara.backend.port import BackendError
 from sutradhara.catalog.models import ArtifactClassPool, AssetLocator, Backend, Bundle, Pool
 from sutradhara.catalog.types import CopyHealth
 from sutradhara.durability import BundleTarget, bundle_replication_status
+from sutradhara.jobs.components import touch_asset, touch_tape_locator
 from sutradhara.jobs.reconcilers import bundle_copy
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
@@ -62,6 +63,8 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
         raise ValueError(f"bundle-repair params.rem_bin must be a string; got {rem_bin!r}")
 
     bundle = _load_sealed_bundle(ctx, bundle_id)
+    for member in bundle.members:
+        touch_asset(ctx, member.logical_asset_hash)
     backends = _target_backends(ctx, bundle.artifactclass)
     targets = target_pools(ctx.session, bundle.artifactclass, backends, key_epoch=key_epoch)
     missing = _missing_pool_ids(ctx, bundle.id)
@@ -90,6 +93,12 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
         if source_backend is None:
             errors.append(f"copy id={source.id}: backend_id={source.backend_id} unavailable")
             continue
+        library = (source.backend.config or {}).get("library_uuid")
+        touch_tape_locator(
+            ctx,
+            source.native_locator,
+            library=library if isinstance(library, (bytes, str)) else None,
+        )
         try:
             with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-repair-{bundle.id}-") as raw:
                 temp_root = Path(raw)
@@ -208,6 +217,7 @@ def _target_backends(ctx: JobContext, artifactclass: str) -> dict[int, WritableS
     )
     result: dict[int, WritableStorageBackend] = {}
     for row in rows:
+        ctx.touch(f"backend:{row.name}")
         backend = factory.backend_from_row(row)
         if not hasattr(backend, "write_object_to_pool"):
             raise ArchiveFanoutError(

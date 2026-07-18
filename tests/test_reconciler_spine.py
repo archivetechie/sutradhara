@@ -18,8 +18,14 @@ from sqlalchemy import Engine, func, select, text
 from sutradhara.catalog.session import create_all, make_engine, make_session_factory, session_scope
 from sutradhara.cli.main import cli
 from sutradhara.jobs.config import RetryPolicy, WorkerConfig
-from sutradhara.jobs.engine import submit
-from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
+from sutradhara.jobs.engine import run_one, submit
+from sutradhara.jobs.models import (
+    ConditionComponent,
+    Job,
+    JobAttempt,
+    JobStatus,
+    ReconciliationCondition,
+)
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
     CONDITION_BLOCKED,
@@ -32,6 +38,12 @@ from sutradhara.jobs.reconcilers.conditions import (
     record_observation,
 )
 from sutradhara.jobs.reconcilers.spine import reopen_version_bumped
+from sutradhara.jobs.registry import (
+    ConditionProjection,
+    JobContext,
+    JobResult,
+    register_handler,
+)
 from sutradhara.jobs.tool_versions import register_tool_version, unregister_tool_version
 from sutradhara.jobs.worker import JobWorker
 
@@ -219,6 +231,90 @@ def test_reconcile_cli_lists_and_reopens_blocked_conditions(
             assert held_row.condition == CONDITION_BLOCKED
             assert held_row.reason == "drive-error"
     finally:
+        engine.dispose()
+
+
+def test_record_fix_reopens_only_exact_component_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @register_handler("_component_block")
+    def _component_block(ctx: JobContext) -> JobResult:
+        component = str(ctx.job.params["component"])
+        ctx.touch(component)
+        return JobResult(
+            ok=True,
+            detail="park requested",
+            condition=ConditionProjection(
+                condition=CONDITION_BLOCKED,
+                reason="fixture-block",
+                message="park requested",
+            ),
+        )
+
+    db_url = f"sqlite:///{tmp_path / 'record-fix.db'}"
+    monkeypatch.setenv("SUTRADHARA_DB_URL", db_url)
+    monkeypatch.setattr("sutradhara.cli.reconcile.getpass.getuser", lambda: "operator-a")
+    engine = make_engine(db_url)
+    create_all(engine)
+    target_components = {
+        "match-a": "tape:L80012",
+        "other": "tape:L800120",
+    }
+    try:
+        with session_scope(engine) as session:
+            jobs: dict[str, Job] = {}
+            for target_key, component in target_components.items():
+                record_observation(
+                    session,
+                    domain="copy",
+                    target_key=target_key,
+                    desired=True,
+                    observed_state=OBSERVED_MISSING,
+                )
+                jobs[target_key] = submit(
+                    session,
+                    "_component_block",
+                    {"component": component},
+                    recon_domain="copy",
+                    recon_target_key=target_key,
+                )
+            for job in jobs.values():
+                assert run_one(session, job.id).ok
+
+            matching = session.scalars(
+                select(ConditionComponent).where(ConditionComponent.component == "tape:L80012")
+            ).one()
+            assert matching.condition_id is not None
+            matching_attempt = session.scalars(
+                select(JobAttempt).where(JobAttempt.job_id == jobs["match-a"].id)
+            ).one()
+            session.delete(matching_attempt)
+
+        result = CliRunner().invoke(
+            cli,
+            ["reconcile", "record-fix", "tape:L80012", "--note", "tape replaced"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "reopened 1 blocked condition(s)" in result.output
+
+        with session_scope(engine) as session:
+            rows = {
+                row.target_key: row
+                for row in session.scalars(
+                    select(ReconciliationCondition).order_by(ReconciliationCondition.target_key)
+                )
+            }
+            assert rows["match-a"].condition == CONDITION_OPEN
+            assert rows["match-a"].last_attempt_id is None
+            assert "reopened by operator-a" in (rows["match-a"].message or "")
+            assert "tape replaced" in (rows["match-a"].message or "")
+            assert rows["match-a"].attempt_count == 0
+            assert rows["other"].condition == CONDITION_BLOCKED
+    finally:
+        from sutradhara.jobs import registry as _registry
+
+        _registry._HANDLERS.pop("_component_block", None)
         engine.dispose()
 
 

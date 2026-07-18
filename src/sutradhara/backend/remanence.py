@@ -47,6 +47,7 @@ from sutradhara.backend.port import (
     VerifyResult,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
+from sutradhara.jobs.runtime_observations import report_session_open
 
 _WRITE_CHUNK_BYTES = 1024 * 1024
 _DRIVE_ASSIGNMENT_POLL_SECONDS = 0.1
@@ -86,6 +87,50 @@ class _RemanenceObject:
     # Fixture-mode only: the actual bytes, so read_range can slice. In gRPC
     # mode this is None and reads go to Remanence.
     content: bytes | None = None
+
+
+@dataclass(frozen=True)
+class RemanenceWriteResult:
+    """A committed copy plus the identity of its Remanence write session."""
+
+    copy_record: CopyRecord
+    session_id: bytes
+    drive_element_address: int
+
+    @property
+    def logical_id(self) -> ContentHash:
+        return self.copy_record.logical_id
+
+    @property
+    def native_locator(self) -> BackendLocator:
+        return self.copy_record.native_locator
+
+    @property
+    def integrity_hash(self) -> ContentHash:
+        return self.copy_record.integrity_hash
+
+    @property
+    def size_bytes(self) -> int:
+        return self.copy_record.size_bytes
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self.copy_record.metadata
+
+
+class RemanenceWriteSessionError(BackendUnavailableError):
+    """A write failed after Remanence returned an opened session identity."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        session_id: bytes,
+        drive_element_address: int,
+    ) -> None:
+        super().__init__(message)
+        self.session_id = session_id
+        self.drive_element_address = drive_element_address
 
 
 class _CatalogClient(Protocol):
@@ -283,6 +328,7 @@ class RemanenceBackend:
         write_session: _WriteSessionClient | None = None,
         read_session: _ReadSessionClient | None = None,
         library: _LibraryClient | None = None,
+        library_identity: bytes | str | None = None,
         channel: grpc.Channel | None = None,
     ) -> None:
         self._name = name
@@ -291,6 +337,7 @@ class RemanenceBackend:
         self._write_session = write_session
         self._read_session = read_session
         self._library = library
+        self._library_identity = library_identity
         self._channel = channel
         self._drive_queue = (
             _drive_queue_for_endpoint(endpoint, library)
@@ -346,7 +393,13 @@ class RemanenceBackend:
         return cls(name, list(objects))
 
     @classmethod
-    def from_grpc(cls, name: str, endpoint: str | None = None) -> RemanenceBackend:
+    def from_grpc(
+        cls,
+        name: str,
+        endpoint: str | None = None,
+        *,
+        library_identity: bytes | str | None = None,
+    ) -> RemanenceBackend:
         """Construct a live adapter targeting a Remanence daemon Catalog.
 
         Prefer `from_grpc(name, endpoint)`. `from_grpc(endpoint)` is accepted for
@@ -382,6 +435,7 @@ class RemanenceBackend:
             write_session=write_session,
             read_session=read_session,
             library=library,
+            library_identity=library_identity,
             channel=channel,
         )
 
@@ -500,10 +554,17 @@ class RemanenceBackend:
                     lease.release()
                 raise
             break
+        report_session_open(
+            session_id=session.session_id,
+            drive_element_address=session.drive_element_address,
+            tape_uuid=session.tape_uuid,
+            library=self._library_identity,
+        )
         return RemanenceReadSession.live(
             backend=self,
             client=client,
             session_id=session.session_id,
+            drive_element_address=session.drive_element_address,
             object_id=object_id,
             drive_queue_lease=lease,
         )
@@ -564,11 +625,11 @@ class RemanenceBackend:
             detail=f"expected {obj.content_sha256.hex()[:12]}…, got {actual.hex()[:12]}…",
         )
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str) -> RemanenceWriteResult:
         """Write a local file into a tape pool via WriteSessionService.
 
-        Returns the committed copy using the same proto-to-CopyRecord mapping as
-        enumerate(), so a later scrub derives the same locator_key.
+        The result wraps the committed copy, mapped through the same path as
+        ``enumerate()``, plus the opened session and selected drive identities.
         """
         client = self._require_write_session()
         source = Path(source)
@@ -587,6 +648,12 @@ class RemanenceBackend:
                 f"Remanence OpenWriteSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
             ) from e
 
+        report_session_open(
+            session_id=session.session_id,
+            drive_element_address=session.drive_element_address,
+            tape_uuid=session.tape_uuid,
+            library=self._library_identity,
+        )
         try:
             obj = client.AppendObject(self._append_messages(session.session_id, source))
             client.CloseWriteSession(
@@ -594,14 +661,24 @@ class RemanenceBackend:
             )
         except grpc.RpcError as e:
             self._safe_abort(client, session.session_id, _rpc_error_text(e))
-            raise BackendUnavailableError(
-                f"Remanence write session at {self._endpoint!r} failed: {_rpc_error_text(e)}"
+            raise RemanenceWriteSessionError(
+                f"Remanence write session at {self._endpoint!r} failed: {_rpc_error_text(e)}",
+                session_id=session.session_id,
+                drive_element_address=session.drive_element_address,
             ) from e
         except Exception as e:
             self._safe_abort(client, session.session_id, str(e))
-            raise
+            raise RemanenceWriteSessionError(
+                f"Remanence write session at {self._endpoint!r} failed: {e}",
+                session_id=session.session_id,
+                drive_element_address=session.drive_element_address,
+            ) from e
 
-        return _copy_record_from_proto(obj, _select_written_copy(obj, session.tape_uuid))
+        return RemanenceWriteResult(
+            copy_record=_copy_record_from_proto(obj, _select_written_copy(obj, session.tape_uuid)),
+            session_id=session.session_id,
+            drive_element_address=session.drive_element_address,
+        )
 
     # --- helpers ---------------------------------------------------------
 
@@ -712,6 +789,7 @@ class RemanenceReadSession:
         backend: RemanenceBackend,
         client: _ReadSessionClient | None,
         session_id: bytes | None,
+        drive_element_address: int | None,
         object_id: bytes | None,
         fixture_locator: BackendLocator | None = None,
         drive_queue_lease: _DriveQueueLease | None = None,
@@ -719,6 +797,7 @@ class RemanenceReadSession:
         self._backend = backend
         self._client = client
         self._session_id = session_id
+        self._drive_element_address = drive_element_address
         self._object_id = object_id
         self._fixture_locator = fixture_locator
         self._drive_queue_lease = drive_queue_lease
@@ -731,6 +810,7 @@ class RemanenceReadSession:
         backend: RemanenceBackend,
         client: _ReadSessionClient,
         session_id: bytes,
+        drive_element_address: int,
         object_id: bytes,
         drive_queue_lease: _DriveQueueLease | None = None,
     ) -> RemanenceReadSession:
@@ -738,6 +818,7 @@ class RemanenceReadSession:
             backend=backend,
             client=client,
             session_id=session_id,
+            drive_element_address=drive_element_address,
             object_id=object_id,
             drive_queue_lease=drive_queue_lease,
         )
@@ -748,12 +829,25 @@ class RemanenceReadSession:
             backend=backend,
             client=None,
             session_id=None,
+            drive_element_address=None,
             object_id=None,
             fixture_locator=dict(locator),
         )
 
     def __enter__(self) -> RemanenceReadSession:
         return self
+
+    @property
+    def session_id(self) -> bytes | None:
+        """Return the opened Remanence session id, or ``None`` in fixture mode."""
+
+        return self._session_id
+
+    @property
+    def drive_element_address(self) -> int | None:
+        """Return the drive element address selected for this live session."""
+
+        return self._drive_element_address
 
     def __exit__(
         self,
@@ -784,6 +878,7 @@ class RemanenceReadSession:
             return obj.content[byte_range.start : byte_range.end]
 
         assert self._session_id is not None
+        assert self._drive_element_address is not None
         assert self._object_id is not None
         try:
             stream = self._client.ReadObjectRange(
@@ -796,7 +891,12 @@ class RemanenceReadSession:
             )
             return b"".join(chunk.data for chunk in stream)
         except grpc.RpcError as e:
-            raise _read_object_range_error(self._backend._endpoint, e) from e
+            raise _read_object_range_error(
+                self._backend._endpoint,
+                e,
+                session_id=self._session_id,
+                drive_element_address=self._drive_element_address,
+            ) from e
 
     @contextmanager
     def open_range_chunks(
@@ -816,6 +916,7 @@ class RemanenceReadSession:
             return
 
         assert self._session_id is not None
+        assert self._drive_element_address is not None
         assert self._object_id is not None
         try:
             call = self._client.ReadObjectRange(
@@ -827,7 +928,12 @@ class RemanenceReadSession:
                 )
             )
         except grpc.RpcError as e:
-            raise _read_object_range_error(self._backend._endpoint, e) from e
+            raise _read_object_range_error(
+                self._backend._endpoint,
+                e,
+                session_id=self._session_id,
+                drive_element_address=self._drive_element_address,
+            ) from e
         try:
             yield self._grpc_range_chunks(call)
         finally:
@@ -860,11 +966,18 @@ class RemanenceReadSession:
             position = next_position
 
     def _grpc_range_chunks(self, call: _ReadRangeCall) -> Iterator[bytes]:
+        assert self._session_id is not None
+        assert self._drive_element_address is not None
         try:
             for chunk in call:
                 yield chunk.data
         except grpc.RpcError as e:
-            raise _read_object_range_error(self._backend._endpoint, e) from e
+            raise _read_object_range_error(
+                self._backend._endpoint,
+                e,
+                session_id=self._session_id,
+                drive_element_address=self._drive_element_address,
+            ) from e
 
     def close(self) -> None:
         if self._closed:
@@ -1142,7 +1255,13 @@ def _grpc_channel_options(endpoint: str) -> tuple[tuple[str, str], ...]:
     return ()
 
 
-def _read_object_range_error(endpoint: str | None, error: grpc.RpcError) -> BackendError:
+def _read_object_range_error(
+    endpoint: str | None,
+    error: grpc.RpcError,
+    *,
+    session_id: bytes,
+    drive_element_address: int,
+) -> BackendError:
     text = f"Remanence ReadObjectRange at {endpoint!r} failed: {_rpc_error_text(error)}"
     code = error.code()
     if code in {
@@ -1150,15 +1269,19 @@ def _read_object_range_error(endpoint: str | None, error: grpc.RpcError) -> Back
         grpc.StatusCode.DEADLINE_EXCEEDED,
         grpc.StatusCode.DATA_LOSS,
     }:
-        return BackendTransientError(text)
-    if code in {
+        result: BackendError = BackendTransientError(text)
+    elif code in {
         grpc.StatusCode.NOT_FOUND,
         grpc.StatusCode.FAILED_PRECONDITION,
         grpc.StatusCode.ABORTED,
         grpc.StatusCode.INVALID_ARGUMENT,
     }:
-        return BackendSessionInvalidatedError(text)
-    return BackendUnavailableError(text)
+        result = BackendSessionInvalidatedError(text)
+    else:
+        result = BackendUnavailableError(text)
+    result.session_id = session_id  # type: ignore[attr-defined]
+    result.drive_element_address = drive_element_address  # type: ignore[attr-defined]
+    return result
 
 
 def _is_active_read_session_race(error: grpc.RpcError) -> bool:

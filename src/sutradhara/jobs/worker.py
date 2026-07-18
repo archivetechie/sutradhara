@@ -22,7 +22,9 @@ from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.engine import (
     _record_reconciler_condition,
     apply_retry_policy,
+    attempt_detail,
     claim_job_by_id,
+    job_context,
     pending_candidates,
     reset_orphaned_running_jobs,
     run_one,
@@ -140,7 +142,8 @@ def _mark_never_fits(
     job.status = JobStatus.FAILED
     job.finished_at = now
     job.last_error = f"required resources {required!r} exceed worker capacities {capacities!r}"
-    attempt = record_attempt(session, job, granted_leases={})
+    ctx = job_context(session, job)
+    attempt = record_attempt(session, job, granted_leases={}, detail=attempt_detail(ctx))
     _record_reconciler_condition(
         session,
         job,
