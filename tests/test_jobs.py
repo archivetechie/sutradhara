@@ -964,6 +964,26 @@ def test_verify_happy_marks_copy_ok_and_records_timestamp(
         assert job.step_state["copy_health_after"] == "ok"
 
 
+def test_verify_handler_attempt_records_d2_tape_component(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copy_id, _ = _seed_memory_backend(engine, b"d2 verify bytes", monkeypatch)
+    barcode = "D2VERIFY01"
+
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        assert copy is not None
+        copy.backend.kind = BackendKind.D2_TAPE
+        copy.native_locator = {**copy.native_locator, "barcode": barcode}
+        copy.native_locator_key = locator_key(copy.native_locator)
+        job = submit(session, "verify", {"copy_id": copy_id})
+        assert run_one(session, job.id).ok
+
+        attempt = session.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
+        assert f"tape:{barcode}" in attempt.detail["components"]
+
+
 def test_verify_detects_corruption_marks_suspect_and_succeeds(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1403,16 +1423,18 @@ def _register_restorable_copy(
     content: bytes = b"restore-me",
     backend_name: str = "tape-1",
     health: CopyHealth = CopyHealth.OK,
+    locator_extra: dict[str, object] | None = None,
+    backend_kind: BackendKind = BackendKind.REM_TAPE,
 ) -> int:
     """Register an asset + backend + one Copy; return the copy's id."""
     asset_hash = hashlib.sha256(content).digest()
-    locator = {"hash_hex": asset_hash.hex()}
+    locator = {"hash_hex": asset_hash.hex(), **(locator_extra or {})}
     with session_scope(engine) as s:
         if s.get(LogicalAsset, asset_hash) is None:
             s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(content)))
         backend = Backend(
             name=backend_name,
-            kind=BackendKind.REM_TAPE,
+            kind=backend_kind,
             tier=BackendTier.SELF_DESCRIBING,
         )
         s.add(backend)
@@ -1603,6 +1625,12 @@ def test_restore_handler_runs_gated_request_item(
     import sutradhara.jobs.handlers.restore as restore_handler
     from sutradhara.hdcache.manager import ITEM_DONE, RestoreConfig, ServeResult
 
+    barcode = "D2RESTORE01"
+    copy_id = _register_restorable_copy(
+        engine,
+        locator_extra={"barcode": barcode},
+        backend_kind=BackendKind.D2_TAPE,
+    )
     item_id = _register_restore_request_item(engine)
     output = tmp_path / "restored.bin"
 
@@ -1614,7 +1642,7 @@ def test_restore_handler_runs_gated_request_item(
         assert gates_already_admitted is True
         item.state = ITEM_DONE
         item.detail = None
-        return ServeResult(item.id, "tape", output, 12)
+        return ServeResult(item.id, "tape", output, 12, copy_id=copy_id)
 
     monkeypatch.setattr(restore_handler, "restore_config_from_env", fake_config)
     monkeypatch.setattr(restore_handler, "serve_restore_item", fake_serve)
@@ -1626,3 +1654,5 @@ def test_restore_handler_runs_gated_request_item(
         assert job.status == JobStatus.SUCCEEDED
         assert job.step_state["restore"]["restore_request_item_id"] == item_id
         assert job.step_state["restore"]["source"] == "tape"
+        attempt = s.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
+        assert f"tape:{barcode}" in attempt.detail["components"]

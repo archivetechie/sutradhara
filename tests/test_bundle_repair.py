@@ -52,7 +52,7 @@ from sutradhara.durability import bundle_replication_status
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register bundle-repair
 from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.handlers import bundle_repair
-from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
+from sutradhara.jobs.models import Job, JobAttempt, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers import bundle_copy
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
@@ -73,7 +73,8 @@ def engine() -> Iterator[Engine]:
 
 
 class _Backend:
-    def __init__(self) -> None:
+    def __init__(self, *, kind: BackendKind = BackendKind.REM_TAPE) -> None:
+        self.kind = kind
         self._counter = 0
         self.objects: dict[str, bytes] = {}
         self.writes: list[str] = []
@@ -91,14 +92,19 @@ class _Backend:
         object_id = f"obj-{self._counter}"
         self.objects[object_id] = data
         self.writes.append(pool)
+        media_locator = (
+            {"barcode": f"D2BAR{self._counter:06d}"}
+            if self.kind == BackendKind.D2_TAPE
+            else {"tape_uuid": f"{self._counter:032x}"}
+        )
         return CopyRecord(
             logical_id=digest,
             native_locator={
                 "pool_id": pool,
                 "object_id": object_id,
                 "content_sha256": digest.hex(),
-                "tape_uuid": f"{self._counter:032x}",
                 "tape_file_number": self._counter,
+                **media_locator,
             },
             integrity_hash=digest,
             size_bytes=len(data),
@@ -153,7 +159,7 @@ def test_bundle_repair_rebuilds_missing_pool_after_staging_purge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend = _Backend()
+    backend = _Backend(kind=BackendKind.D2_TAPE)
     bundle_id, _backend_id, assets = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
 
     with session_scope(engine) as s:
@@ -186,6 +192,8 @@ def test_bundle_repair_rebuilds_missing_pool_after_staging_purge(
             assert read_member_bytes(backend, repaired, locator, work_dir=tmp_path) == assets[
                 locator.logical_asset_hash
             ]
+        attempt = s.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
+        assert "tape:D2BAR000003" in attempt.detail["components"]
 
 
 def test_bundle_repair_marks_corrupt_source_suspect_and_falls_back(
@@ -471,7 +479,7 @@ def _flushed_bundle(
         "nested/b.bin": b"beta",
     }
     with session_scope(engine) as s:
-        row = Backend(name="rem", kind=BackendKind.REM_TAPE, tier=BackendTier.SELF_DESCRIBING)
+        row = Backend(name="rem", kind=backend.kind, tier=BackendTier.SELF_DESCRIBING)
         s.add(row)
         s.flush()
         for pool_id in pool_ids:

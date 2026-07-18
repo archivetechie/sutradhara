@@ -44,6 +44,7 @@ from sutradhara.jobs.reconcilers.conditions import (
     record_condition,
     record_observation,
 )
+from sutradhara.jobs.runtime_observations import report_tape_locator
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.rem_archive_cli import (
     recipient_registry_ids,
@@ -787,6 +788,7 @@ def build_bundle_copy_for_pool(
         record = backend.write_object_to_pool(artifact.artifact_path, target.pool_id)
     except (BackendError, OSError) as exc:
         raise TransientPoolFanoutError(target.pool_id, target.backend_name, exc) from exc
+    report_tape_locator(record.native_locator)
     storage_metadata = _copy_storage_metadata(
         target.representation,
         recipient_epochs=artifact.recipient_epochs,

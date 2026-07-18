@@ -29,7 +29,7 @@ from sutradhara.backend.port import BackendError
 from sutradhara.catalog.models import ArtifactClassPool, AssetLocator, Backend, Bundle, Pool
 from sutradhara.catalog.types import CopyHealth
 from sutradhara.durability import BundleTarget, bundle_replication_status
-from sutradhara.jobs.components import touch_asset, touch_tape_locator
+from sutradhara.jobs.components import touch_asset, touch_copy_tape
 from sutradhara.jobs.reconcilers import bundle_copy
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
@@ -40,7 +40,6 @@ from sutradhara.jobs.reconcilers.conditions import (
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
 from sutradhara.replication import (
     PoolTargetEntry,
-    SelfHealUnavailable,
     WritableStorageBackend,
     select_source_candidates,
     target_pools,
@@ -93,12 +92,7 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
         if source_backend is None:
             errors.append(f"copy id={source.id}: backend_id={source.backend_id} unavailable")
             continue
-        library = (source.backend.config or {}).get("library_uuid")
-        touch_tape_locator(
-            ctx,
-            source.native_locator,
-            library=library if isinstance(library, (bytes, str)) else None,
-        )
+        touch_copy_tape(ctx, source)
         try:
             with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-repair-{bundle.id}-") as raw:
                 temp_root = Path(raw)
@@ -123,7 +117,7 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
             source.health = CopyHealth.SUSPECT
             errors.append(f"copy id={source.id}: {exc}")
             continue
-        except (ArchiveRestoreError, BackendError, OSError) as exc:
+        except (ArchiveFanoutError, ArchiveRestoreError, BackendError, OSError) as exc:
             errors.append(f"copy id={source.id}: {exc}")
             continue
 
@@ -175,7 +169,7 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
         )
 
     detail = "; ".join(errors) if errors else "no healthy source copy"
-    raise SelfHealUnavailable(f"cannot repair bundle {bundle.id}: {detail}")
+    return JobResult(ok=False, detail=f"cannot repair bundle {bundle.id}: {detail}")
 
 
 def make_archive_builder(*, rem_bin: str | None = None) -> ArchiveBuilder:
@@ -330,7 +324,7 @@ def _repair_missing_targets(
     for backend, target in targets:
         if target.pool_id not in _missing_pool_ids(ctx, bundle.id):
             continue
-        build_bundle_copy_for_pool(
+        copy = build_bundle_copy_for_pool(
             ctx.session,
             bundle=bundle,
             target=target,
@@ -340,6 +334,7 @@ def _repair_missing_targets(
             key_epoch=key_epoch,
             work_dir=work_dir,
         )
+        touch_copy_tape(ctx, copy)
         repaired.add(target.pool_id)
     return repaired
 

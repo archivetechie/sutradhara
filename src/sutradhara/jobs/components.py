@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from sutradhara.catalog.models import Copy
 from sutradhara.jobs.registry import JobContext
 
 
@@ -51,6 +52,18 @@ def touch_tape_locator(
     else:
         parent = library.hex() if isinstance(library, bytes) else library
         ctx.touch(f"drive:{drive}", parent=f"library:{parent}")
+
+
+def touch_copy_tape(ctx: JobContext, copy: Copy) -> None:
+    """Record tape identities from a catalog copy and its backend configuration."""
+
+    config = copy.backend.config or {}
+    library = config.get("library_uuid")
+    touch_tape_locator(
+        ctx,
+        copy.native_locator,
+        library=library if isinstance(library, (bytes, str)) else None,
+    )
 
 
 def touch_destination(ctx: JobContext, destination: Path | str) -> str:

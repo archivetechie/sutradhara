@@ -863,6 +863,21 @@ class _DirectWriteClient:
         return layer5_pb2.WriteSession(session_id=request.session_id)
 
 
+class _MalformedCommittedWriteClient(_DirectWriteClient):
+    """Return a committed response whose written copy cannot be selected."""
+
+    def AppendObject(
+        self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+    ) -> layer5_pb2.ObjectRecord:
+        list(request_iterator)
+        return layer5_pb2.ObjectRecord(
+            object_id=bytes.fromhex("20" * 16),
+            content_sha256=bytes.fromhex("30" * 32),
+            logical_size_bytes=4,
+            body_format="raw-bytes",
+        )
+
+
 @contextmanager
 def _serve_write(servicer: _WriteSession) -> Iterator[str]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
@@ -921,6 +936,27 @@ def test_write_result_and_error_surface_opened_session_without_grpc_server(
     assert raised.value.session_id == error_client.session_id
     assert raised.value.drive_element_address == error_client.drive_element_address
     assert error_client.aborted
+
+
+def test_malformed_committed_write_response_keeps_opened_session_identity(
+    proto_object: layer5_pb2.ObjectRecord,
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "obj.bin"
+    src.write_bytes(b"data")
+    client = _MalformedCommittedWriteClient(proto_object)
+    backend = RemanenceBackend(
+        "direct-rem",
+        endpoint="direct",
+        write_session=client,
+    )
+
+    with pytest.raises(RemanenceWriteSessionError, match="returned 0 copies") as raised:
+        backend.write_object_to_pool(src, "scenario-a")
+
+    assert raised.value.session_id == client.session_id
+    assert raised.value.drive_element_address == client.drive_element_address
+    assert client.aborted
 
 
 def test_write_object_to_pool_success(

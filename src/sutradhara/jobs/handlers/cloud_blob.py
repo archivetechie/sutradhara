@@ -17,6 +17,7 @@ from sutradhara.backend.port import CopyRecord
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Backend, Bundle, Copy, IngestItem, Intake, Pool
 from sutradhara.catalog.types import CopyHealth, CopySource, RetentionState
+from sutradhara.jobs.components import touch_tape_locator
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 from sutradhara.keys import KEY_DOMAIN_BACKUP, KeyRegistry, assert_key_epoch_domain
 from sutradhara.rem_archive_cli import (
@@ -124,6 +125,12 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
         record = backend.write_object_to_pool(blob_path, pool_id)
     else:
         raise ValueError(f"backend {backend_name!r} does not support object writes")
+    library = (backend_row.config or {}).get("library_uuid")
+    touch_tape_locator(
+        ctx,
+        record.native_locator,
+        library=library if isinstance(library, (bytes, str)) else None,
+    )
 
     copy, created = add_bundle_copy(
         ctx.session,

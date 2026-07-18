@@ -9,6 +9,7 @@ it from cache or tape fallback.
 
 from __future__ import annotations
 
+from sutradhara.catalog.models import Copy
 from sutradhara.hdcache.manager import (
     ITEM_DONE,
     RestoreAdmissionInvalid,
@@ -18,7 +19,7 @@ from sutradhara.hdcache.manager import (
     serve_restore_item,
 )
 from sutradhara.hdcache.models import RestoreRequestItem
-from sutradhara.jobs.components import touch_asset, touch_destination
+from sutradhara.jobs.components import touch_asset, touch_copy_tape, touch_destination
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 
 
@@ -66,6 +67,10 @@ def handle_restore(ctx: JobContext) -> JobResult:
 
     if item.state != ITEM_DONE:
         return _failure("restore-failed", item.detail or f"item ended in state={item.state!r}")
+    if result.copy_id is not None:
+        source_copy = ctx.session.get(Copy, result.copy_id)
+        if source_copy is not None:
+            touch_copy_tape(ctx, source_copy)
     touch_destination(ctx, result.output_path)
     ctx.observe(
         {
