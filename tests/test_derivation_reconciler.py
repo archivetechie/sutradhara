@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from sutradhara.jobs.reconcilers.profiles import (
 )
 from sutradhara.jobs.reconcilers.spine import process, reconcile
 from sutradhara.jobs.registry import JobContext
+from sutradhara.jobs.tool_versions import register_tool_version, unregister_tool_version
 from sutradhara.sealing.port import Representation
 
 
@@ -250,7 +252,141 @@ def test_profile_clear_closes_due_derivation_condition_without_new_enqueue(
         assert session.scalar(select(func.count()).select_from(Job)) == job_count
 
 
-def test_decode_error_blocks_but_missing_toolchain_backs_off_then_gives_up(
+@pytest.mark.parametrize(
+    ("fixture_name", "bucket", "matched_pattern", "blocked_on_ffmpeg"),
+    [
+        ("ffmpeg_damage.stderr", "damage", "moov atom not found", False),
+        ("ffmpeg_capability.stderr", "capability", "unknown decoder", True),
+    ],
+)
+def test_ffmpeg_stderr_bucket_parking_records_factual_match(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_name: str,
+    bucket: str,
+    matched_pattern: str,
+    blocked_on_ffmpeg: bool,
+) -> None:
+    stderr = _ffmpeg_stderr_fixture(fixture_name)
+    previous_provider = register_tool_version("ffmpeg", lambda: "fixture-ffmpeg-1")
+    monkeypatch.setattr("sutradhara.jobs.handlers.transcode.shutil.which", lambda _tool: "/ffmpeg")
+    monkeypatch.setattr(
+        "sutradhara.jobs.handlers.transcode.run_managed",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 1, stdout="", stderr=stderr),
+    )
+    try:
+        item_id = _register_prepared_video(
+            engine,
+            tmp_path,
+            f"card-{bucket}",
+            profile="proxy-review",
+        )
+        target_key = derivation_reconciler.make_target_key(item_id, "transcode")
+
+        with (
+            override_derivation_cache_root(tmp_path / "cache"),
+            session_scope(engine) as session,
+        ):
+            reconcile(session, "derivation")
+            job = _transcode_job_for_item(session, item_id)
+            result = run_one(session, job.id, granted_leases={"cpu": 8})
+
+            assert result.ok
+            persisted_job = session.get(Job, job.id)
+            assert persisted_job is not None
+            state = persisted_job.step_state["transcode"]
+            assert state["bucket"] == bucket
+            assert state["matched_pattern"] == matched_pattern
+            assert state["stderr_excerpt"] == stderr.strip()
+
+            condition = _condition(session, target_key)
+            assert condition.condition == CONDITION_BLOCKED
+            assert condition.reason == f"stderr-pattern:{bucket}"
+            assert condition.message == state["detail"]
+            message = condition.message
+            assert message is not None
+            assert matched_pattern in message
+            assert stderr.strip() in message
+            assert condition.blocked_tool_name == ("ffmpeg" if blocked_on_ffmpeg else None)
+            assert condition.blocked_tool_version == (
+                "fixture-ffmpeg-1" if blocked_on_ffmpeg else None
+            )
+    finally:
+        if previous_provider is None:
+            unregister_tool_version("ffmpeg")
+        else:
+            register_tool_version("ffmpeg", previous_provider)
+
+
+def test_ffmpeg_version_bump_reopens_capability_but_not_damage(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stderr_by_intake = {
+        "card-damage-reopen": _ffmpeg_stderr_fixture("ffmpeg_damage.stderr"),
+        "card-capability-reopen": _ffmpeg_stderr_fixture("ffmpeg_capability.stderr"),
+    }
+    version = ["fixture-ffmpeg-1"]
+    previous_provider = register_tool_version("ffmpeg", lambda: version[0])
+    monkeypatch.setattr("sutradhara.jobs.handlers.transcode.shutil.which", lambda _tool: "/ffmpeg")
+
+    def fail_for_source(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        source = command[command.index("-i") + 1]
+        stderr = next(text for intake, text in stderr_by_intake.items() if intake in source)
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr("sutradhara.jobs.handlers.transcode.run_managed", fail_for_source)
+    try:
+        damage_id = _register_prepared_video(
+            engine,
+            tmp_path,
+            "card-damage-reopen",
+            profile="proxy-review",
+        )
+        capability_id = _register_prepared_video(
+            engine,
+            tmp_path,
+            "card-capability-reopen",
+            profile="proxy-review",
+        )
+        damage_key = derivation_reconciler.make_target_key(damage_id, "transcode")
+        capability_key = derivation_reconciler.make_target_key(capability_id, "transcode")
+
+        with (
+            override_derivation_cache_root(tmp_path / "cache"),
+            session_scope(engine) as session,
+        ):
+            reconcile(session, "derivation")
+            run_one(
+                session,
+                _transcode_job_for_item(session, damage_id).id,
+                granted_leases={"cpu": 8},
+            )
+            run_one(
+                session,
+                _transcode_job_for_item(session, capability_id).id,
+                granted_leases={"cpu": 8},
+            )
+            assert _condition(session, damage_key).blocked_tool_name is None
+            assert _condition(session, capability_key).blocked_tool_name == "ffmpeg"
+
+            version[0] = "fixture-ffmpeg-2"
+            reconcile(session, "derivation")
+
+            assert _condition(session, capability_key).condition == CONDITION_OPEN
+            assert _condition(session, capability_key).blocked_tool_name is None
+            assert _condition(session, damage_key).condition == CONDITION_BLOCKED
+            assert _condition(session, damage_key).reason == "stderr-pattern:damage"
+    finally:
+        if previous_provider is None:
+            unregister_tool_version("ffmpeg")
+        else:
+            register_tool_version("ffmpeg", previous_provider)
+
+
+def test_damage_pattern_blocks_but_missing_toolchain_backs_off_then_gives_up(
     engine: Engine,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -265,15 +401,18 @@ def test_decode_error_blocks_but_missing_toolchain_backs_off_then_gives_up(
     )
     damaged_key = derivation_reconciler.make_target_key(damaged_id, "transcode")
 
-    with session_scope(engine) as session:
+    with (
+        override_derivation_cache_root(tmp_path / "cache"),
+        session_scope(engine) as session,
+    ):
         reconcile(session, "derivation")
         job = session.scalars(select(Job).where(Job.kind == "transcode")).one()
         result = run_one(session, job.id, granted_leases={"cpu": 8})
         assert result.ok
         condition = _condition(session, damaged_key)
         assert condition.condition == CONDITION_BLOCKED
-        assert condition.reason == "unsupported-source"
-        assert condition.blocked_tool_name == "ffmpeg"
+        assert condition.reason == "stderr-pattern:damage"
+        assert condition.blocked_tool_name is None
 
     monkeypatch.delenv("SUTRADHARA_FAKE_TRANSCODE", raising=False)
     monkeypatch.setattr("sutradhara.jobs.handlers.transcode.shutil.which", lambda _tool: None)
@@ -285,7 +424,10 @@ def test_decode_error_blocks_but_missing_toolchain_backs_off_then_gives_up(
     )
     missing_tool_key = derivation_reconciler.make_target_key(missing_tool_id, "transcode")
 
-    with session_scope(engine) as session:
+    with (
+        override_derivation_cache_root(tmp_path / "cache"),
+        session_scope(engine) as session,
+    ):
         reconcile(session, "derivation")
         job = session.scalars(
             select(Job)
@@ -384,6 +526,10 @@ def _register_prepared_video(
                 IngestItem.as_received_path == "clip.mov",
             )
         ).one()
+
+
+def _ffmpeg_stderr_fixture(name: str) -> str:
+    return (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8")
 
 
 def _write_intake(landing: Path, intake_id: str, files: dict[str, bytes]) -> Path:
