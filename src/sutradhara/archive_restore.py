@@ -43,6 +43,7 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
 from sutradhara.durability import locator_artifactclass_filter
+from sutradhara.jobs.runtime_observations import report_tape_locator
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry
 from sutradhara.resource_control import run_managed
 from sutradhara.restore import (
@@ -218,6 +219,12 @@ class RestorePlan:
 
         if member not in self._members:
             raise ValueError("planned member does not belong to this restore plan")
+        backend_config = member.copy.backend.config or {}
+        library = backend_config.get("library_uuid")
+        report_tape_locator(
+            member.copy.native_locator,
+            library=library if isinstance(library, (bytes, str)) else None,
+        )
         with self._open_stored_stream(member) as stored_chunks:
             identity_is_logical = not any(item.reversible for item in member.transforms) and (
                 member.expected_stored_sha256 == member.asset_hash

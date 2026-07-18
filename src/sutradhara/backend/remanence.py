@@ -648,16 +648,24 @@ class RemanenceBackend:
                 f"Remanence OpenWriteSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
             ) from e
 
-        report_session_open(
-            session_id=session.session_id,
-            drive_element_address=session.drive_element_address,
-            tape_uuid=session.tape_uuid,
-            library=self._library_identity,
-        )
         try:
+            report_session_open(
+                session_id=session.session_id,
+                drive_element_address=session.drive_element_address,
+                tape_uuid=session.tape_uuid,
+                library=self._library_identity,
+            )
             obj = client.AppendObject(self._append_messages(session.session_id, source))
             client.CloseWriteSession(
                 layer5_pb2.CloseWriteSessionRequest(session_id=session.session_id)
+            )
+            return RemanenceWriteResult(
+                copy_record=_copy_record_from_proto(
+                    obj,
+                    _select_written_copy(obj, session.tape_uuid),
+                ),
+                session_id=session.session_id,
+                drive_element_address=session.drive_element_address,
             )
         except grpc.RpcError as e:
             self._safe_abort(client, session.session_id, _rpc_error_text(e))
@@ -673,12 +681,6 @@ class RemanenceBackend:
                 session_id=session.session_id,
                 drive_element_address=session.drive_element_address,
             ) from e
-
-        return RemanenceWriteResult(
-            copy_record=_copy_record_from_proto(obj, _select_written_copy(obj, session.tape_uuid)),
-            session_id=session.session_id,
-            drive_element_address=session.drive_element_address,
-        )
 
     # --- helpers ---------------------------------------------------------
 

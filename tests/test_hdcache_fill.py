@@ -16,7 +16,7 @@ from sqlalchemy import Engine, func, select
 
 import sutradhara.hdcache.fill as fill_module
 import sutradhara.jobs.handlers as _handlers  # noqa: F401
-import sutradhara.jobs.reconcilers.hdcache as _hdcache_reconciler  # noqa: F401
+import sutradhara.jobs.reconcilers.hdcache as _hdcache_reconciler
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
@@ -29,7 +29,7 @@ from sutradhara.catalog.models import (
     LogicalAsset,
     Pool,
 )
-from sutradhara.catalog.session import create_all, make_engine, session_scope
+from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
 from sutradhara.hdcache.fill import (
     DOMAIN,
@@ -58,7 +58,7 @@ from sutradhara.hdcache.store import (
 )
 from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.engine import run_one, submit
-from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
+from sutradhara.jobs.models import Job, JobAttempt, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BLOCKED,
     OBSERVED_MISSING,
@@ -119,6 +119,54 @@ def test_hdcache_fill_from_landing_and_restore_fallback(
         assert restored.source == "restore"
         assert session.get(CacheEntry, landing_target.content_sha256).state == "present"
         assert session.get(CacheEntry, fallback_target.content_sha256).state == "present"
+
+
+def test_hdcache_fill_handler_attempt_records_d2_tape_fallback(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sutradhara.jobs.handlers.hdcache_fill as hdcache_fill_handler
+
+    data = b"d2 fallback bytes"
+    memory = MemoryBackend("d2-stub")
+    barcode = "D2CACHE01"
+    config = _config(tmp_path)
+
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "d001")
+        target = _seed_archived_asset(
+            session,
+            data=data,
+            artifactclass="s-masters",
+            source_path=tmp_path / "purged.mov",
+            memory=memory,
+        )
+        copy = session.scalars(select(Copy).where(Copy.bundle_id == target.bundle_key)).one()
+        copy.backend.kind = BackendKind.D2_TAPE
+        copy.native_locator = {
+            **copy.native_locator,
+            "barcode": barcode,
+            "volume_uuid": "d2-volume-1",
+        }
+        copy.native_locator_key = locator_key(copy.native_locator)
+        monkeypatch.setattr(fill_module, "backend_from_row", lambda _row: memory)
+        monkeypatch.setattr(hdcache_fill_handler, "fill_config_from_env", lambda: config)
+        record_observation(
+            session,
+            domain=DOMAIN,
+            target_key=target.sha_hex,
+            desired=True,
+            observed_state=OBSERVED_MISSING,
+        )
+
+        job = submit_hdcache_fill(session, target, config=config)
+        assert job is not None
+        result = run_one(session, job.id)
+
+        assert result.ok, result.detail
+        attempt = session.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
+        assert f"tape:{barcode}" in attempt.detail["components"]
 
 
 def test_hdcache_aead_fill_records_hdcache_epoch_and_stored_digest(
@@ -561,7 +609,7 @@ def test_hung_lost_mark_delete_returns_within_deadline_and_preserves_accounting(
             artifactclass="private-timeout",
             hdcache_config={"enabled": True, "privacy_level": "p2"},
         )
-        entry = _seed_present_cache_entry(
+        _seed_present_cache_entry(
             session,
             tmp_path / "d-timeout",
             target.content_sha256,

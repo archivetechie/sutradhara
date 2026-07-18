@@ -27,7 +27,7 @@ from typing import cast
 from sutradhara.backend import factory
 from sutradhara.catalog.models import Copy
 from sutradhara.catalog.types import CopyHealth
-from sutradhara.jobs.components import touch_asset, touch_tape_locator
+from sutradhara.jobs.components import touch_asset, touch_copy_tape
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 
 
@@ -47,13 +47,7 @@ def handle_verify(ctx: JobContext) -> JobResult:
     if copy.logical_asset_hash is not None:
         touch_asset(ctx, copy.logical_asset_hash)
     ctx.touch(f"backend:{copy.backend.name}")
-    backend_config = copy.backend.config or {}
-    library = backend_config.get("library_uuid")
-    touch_tape_locator(
-        ctx,
-        copy.native_locator,
-        library=library if isinstance(library, (bytes, str)) else None,
-    )
+    touch_copy_tape(ctx, copy)
     backend = factory.backend_from_row(copy.backend)
     result = backend.verify(copy.native_locator)
     ctx.observe(

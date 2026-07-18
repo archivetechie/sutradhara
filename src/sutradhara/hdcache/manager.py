@@ -354,6 +354,7 @@ class ServeResult:
     source: SourceKind
     output_path: Path
     size_bytes: int
+    copy_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -901,7 +902,13 @@ def serve_restore_item(
         return ServeResult(item.id, "tape", plan.destination, 0)
     _set_item_state(item, ITEM_DONE, None)
     _finish_item_progress(item, tape_result.size_bytes, source="tape")
-    return ServeResult(item.id, "tape", tape_result.output_path, tape_result.size_bytes)
+    return ServeResult(
+        item.id,
+        "tape",
+        tape_result.output_path,
+        tape_result.size_bytes,
+        copy_id=tape_result.copy_id,
+    )
 
 
 def restore_to_path(
@@ -1000,7 +1007,13 @@ def restore_to_path(
         force_suspect=force_suspect,
         force_rejected=force_rejected,
     )
-    return ServeResult(None, "tape", tape_result.output_path, tape_result.size_bytes)
+    return ServeResult(
+        None,
+        "tape",
+        tape_result.output_path,
+        tape_result.size_bytes,
+        copy_id=tape_result.copy_id,
+    )
 
 
 def destination_for_request_item(

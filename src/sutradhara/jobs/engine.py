@@ -10,6 +10,8 @@ from __future__ import annotations
 import datetime as dt
 import socket
 import traceback
+from collections.abc import Sequence
+from functools import partial
 from typing import Any, cast
 
 from sqlalchemy import select, update
@@ -18,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sutradhara.jobs.attempts import record_attempt
+from sutradhara.jobs.components import touch_tape_locator
 from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.leases import LeaseManager, normalize_required_resources
 from sutradhara.jobs.models import (
@@ -36,14 +39,32 @@ from sutradhara.jobs.registry import (
     ConditionProjection,
     HandlerNotRegistered,
     JobContext,
+    JobHandler,
     JobResult,
     get_handler,
 )
-from sutradhara.jobs.runtime_observations import bind_session_open_observer
+from sutradhara.jobs.runtime_observations import (
+    bind_session_open_observer,
+    bind_tape_locator_observer,
+)
 
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+class _HandlerSession(Session):
+    """Session whose handler-visible commits keep a joined transaction open."""
+
+    def flush(self, objects: Sequence[Any] | None = None) -> None:
+        retained = self.info.setdefault("handler_flushed_objects", set())
+        retained.update(self.new)
+        retained.update(self.dirty)
+        super().flush(objects)
+
+    def commit(self) -> None:
+        super().commit()
+        self.begin()
 
 
 def submit(
@@ -144,8 +165,11 @@ def run_one(
         return JobResult(ok=False, detail=str(e))
 
     try:
-        with bind_session_open_observer(ctx.observe_session_open):
-            result = handler(ctx)
+        with (
+            bind_session_open_observer(ctx.observe_session_open),
+            bind_tape_locator_observer(partial(touch_tape_locator, ctx)),
+        ):
+            result = _invoke_handler_in_savepoint(session, ctx, handler)
     except NotImplementedError as e:
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
@@ -212,6 +236,57 @@ def run_one(
             message=result.detail,
         )
     return result
+
+
+def _invoke_handler_in_savepoint(
+    session: Session,
+    ctx: JobContext,
+    handler: JobHandler,
+) -> JobResult:
+    """Run a handler behind a savepoint while tolerating handler-local commits.
+
+    The handler session joins the engine connection through its own short-lived
+    savepoints. Its ``commit()`` calls can therefore release progress points
+    without closing the outer savepoint owned here. An exception rolls that
+    outer savepoint back before the engine records the failed attempt.
+    """
+
+    engine_job = ctx.job
+    session.flush()
+    connection_savepoint = session.connection().begin_nested()
+    handler_session = _HandlerSession(
+        bind=session.connection(),
+        join_transaction_mode="create_savepoint",
+        expire_on_commit=False,
+    )
+    handler_job = handler_session.get(Job, engine_job.id)
+    if handler_job is None:
+        handler_session.close()
+        connection_savepoint.rollback()
+        raise ValueError(f"job id={engine_job.id} disappeared before handler dispatch")
+    ctx.session = handler_session
+    ctx.job = handler_job
+    try:
+        result = handler(ctx)
+        Session.commit(handler_session)
+        handled_objects = list(handler_session.info.get("handler_flushed_objects", ()))
+        connection_savepoint.commit()
+    except BaseException:
+        handler_session.rollback()
+        if connection_savepoint.is_active:
+            connection_savepoint.rollback()
+        raise
+    else:
+        session.expire_all()
+        merged_objects: set[object] = set()
+        for instance in handled_objects:
+            merged_objects.add(session.merge(instance, load=False))
+        session.info["handler_merged_objects"] = merged_objects
+        return result
+    finally:
+        handler_session.close()
+        ctx.session = session
+        ctx.job = engine_job
 
 
 def _record_projection_condition(
