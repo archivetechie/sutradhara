@@ -11,10 +11,13 @@
 - [Database schema reference](reference-database-schema.md) — authoritative tables,
   constraints, evidence projections, retention receipts, and compatibility
   downgrade export policy.
+- [Retention evidence journal](reference-retention-journal.md) — locked chained
+  export, append-only DR shipping, checking, corrections, and ops alarms.
 - [Glossary](reference-glossary.md) — project terminology.
 - [Arrangement ARC guide](arrangement-arc-guide.md) — arrangement review workflow.
 - [Examples](examples/README.md) — example configuration and agent bundles.
 
-The deletion-evidence prompt-1 implementation is documented in the architecture,
-CLI, and database-schema references above. Its frozen design and implementation
-prompt remain in the external system journal rather than being copied here.
+The deletion-evidence prompt-1 gate and prompt-2 journal implementations are
+documented in the architecture, CLI, database-schema, configuration, and journal
+references above. Their frozen design and implementation prompts remain in the
+external system journal rather than being copied here.

@@ -423,6 +423,10 @@ limit.
 | `retention status` | | Show per-pool release holds and purge disposition. `--intake TEXT`, `--held`, `--grace-days INTEGER` (default `30`), `--json`. |
 | `retention sweep-staging` | | Re-gate and purge released landing bytes after the grace period. `--intake TEXT`, `--actor TEXT`, `--grace-days INTEGER` (default `30`), `--break-glass` for a shorter grace, `--batch-limit INTEGER`, `--dry-run`, `--json`. |
 | `retention abandon` | | Terminally exclude one held or released intake from deletion while preserving its staging bytes. Requires `--intake TEXT` and `--reason TEXT`; accepts `--actor TEXT`, `--json`. |
+| `retention journal export` | | Run the exclusive chained exporter, checkpoint the published footer, then append segments and head anchors to the configured `ssh_disk` DR target. `--json`. |
+| `retention journal check` | | Walk sequence/checksum/hash continuity, compare DR copies/head, and compare the current copy projection with verification receipts. Breaks alarm, print the runbook, and exit nonzero. `--json`. |
+| `retention journal correct` | | Append an attributed superseding correction targeting `--source verify_receipt\|retention_event --event-id INTEGER`; requires `--reason`, accepts `--actor`, `--json`. |
+| `retention sitrep` | | Print standing purge holds plus pending journal count, age, and staleness alarm state. `--json`. |
 | `offsite confirm` | | Confirm one known media id as offsite. `--tape TEXT` or `--media-id TEXT`, `--shipment TEXT`, `--actor TEXT`, `--json`. |
 | `offsite revoke` | | Revoke an offsite confirmation without deleting its history. `--tape TEXT` or `--media-id TEXT`, `--reason TEXT`, `--actor TEXT`, `--json`. |
 

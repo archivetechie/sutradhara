@@ -234,6 +234,13 @@ The intended flow, each step naming the code that implements it:
    external-delete-before-DB and tombstone the `Copy` row rather than
    dropping it. Nothing else in the system deletes bytes.
 
+   The separate emit-only journal (`retention_journal.py`) exports verification
+   and decision receipts after commit. Its locked, source-ranked JSONL chain is
+   resumed from published footers, checkpointed only as an optimization, and
+   shipped with head anchors to dated append-only `ssh_disk` destinations.
+   Export, shipping, staleness, or check failures are operator alarms and are
+   intentionally absent from every retention-gate input.
+
 Continuously, in the background: **scrub** (`scrub.py`) re-enumerates a
 backend and reconciles it against the catalog (bump `last_checked_at`,
 insert unknown objects, mark absentees `missing`, flag hash conflicts

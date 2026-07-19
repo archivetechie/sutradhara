@@ -547,11 +547,12 @@ Append-only record of an intake, media, or batch retention decision.
 |---|---|---|
 | `event_id` | integer, PK | Event identifier. |
 | `intake_id` | text, optional FK -> `intake.intake_id`, `ON DELETE RESTRICT` | Relational intake target for intake-subject events. |
-| `subject_type`, `subject_id` | text | Explicit `intake`, `media`, or `batch` subject identity. |
+| `subject_type`, `subject_id` | text | Explicit `intake`, `media`, `batch`, or correction-only `receipt` subject identity. |
 | `action` | text | Closed action vocabulary for attempts, outcomes, holds, tripwires, and corrections. |
 | `operation_id` | required text | Correlation key shared by an attempt and its outcomes. |
 | `actor`, `at` | text / time | Who acted and when. |
 | `detail` | json, optional | Action evidence/details. |
+| `supersedes_source`, `supersedes_event_id` | optional source enum / integer pair | Immutable receipt target for `correction_recorded`; both are null for ordinary events. |
 
 The retention recorder strictly validates the payload keys for each action
 before appending an event.
@@ -569,6 +570,20 @@ measurement projection or measurement invalidation.
 | `backend_ok`, `failure_kind`, `failure_detail` | boolean / optional text | Backend verdict and separate failure facts. |
 | `source`, `execution_id` | enum / text | `fanout`, `verify-job`, `restore`, or scrub invalidation plus its retry-deduplication identity. |
 | `producer_process`, `actor`, `at` | text / optional text / time | Producer and attribution metadata. |
+
+### `retention_journal_checkpoint`
+
+Singleton optimization mirror of the latest authoritative published journal
+footer. The exporter always resumes from files, so this row can be stale after a
+crash without causing duplicate or omitted receipts.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK constrained to `1` | Singleton identity. |
+| `envelope_id`, `hash_algorithm_id` | text | Versioned encoding and hash identifiers. |
+| `global_sequence`, `head_hash` | integer / hash | Latest published sequence and chain head. |
+| `verify_receipt_cursor`, `retention_event_cursor` | non-negative integers | Inclusive source-table cursors. |
+| `published_filename`, `published_at` | text / time | Authoritative segment/footer mirrored by this checkpoint. |
 
 Downgrading through the deletion-evidence revision uses an export-then-transform
 policy. Events and receipts that the legacy schema cannot represent are written

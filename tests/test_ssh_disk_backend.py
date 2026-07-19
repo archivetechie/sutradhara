@@ -202,6 +202,32 @@ def test_rsync_ssh_transport_constructs_safe_commands(tmp_path: Path) -> None:
     assert "-printf '%P\\n'" in calls[0][-1]
 
 
+def test_rsync_ssh_transport_append_only_publication_uses_atomic_link(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        shell: bool,
+    ) -> CompletedProcess[str]:
+        del timeout, shell
+        calls.append(list(argv))
+        collision = argv[0] == "ssh" and "if ln " in argv[-1]
+        return _completed(argv, returncode=43 if collision else 0)
+
+    source = tmp_path / "segment.jsonl"
+    source.write_bytes(b"immutable")
+    transport = RsyncSshTransport("backup.example", "/journal", runner=runner)
+
+    assert not transport.put_if_absent(source, "2026-07-20/segment.jsonl")
+    assert [call[0] for call in calls] == ["ssh", "rsync", "ssh"]
+    assert "if ln " in calls[-1][-1]
+    assert "mv -f" not in calls[-1][-1]
+
+
 def test_rsync_ssh_transport_classifies_failures(tmp_path: Path) -> None:
     source = tmp_path / "object.rao"
     source.write_bytes(b"payload")

@@ -320,6 +320,18 @@ def revoke_offsite(
         raise RetentionError(f"offsite confirmation {media_id!r} does not exist")
     if row.revoked_at is not None:
         return row, False
+    confirmation_receipt = session.scalars(
+        select(RetentionEvent)
+        .where(
+            RetentionEvent.subject_type == "media",
+            RetentionEvent.subject_id == media_id,
+            RetentionEvent.action == "offsite_confirmed",
+        )
+        .order_by(RetentionEvent.event_id.desc())
+        .limit(1)
+    ).first()
+    if confirmation_receipt is None:
+        raise RetentionError(f"offsite confirmation {media_id!r} has no receipt to supersede")
     now = _utcnow()
     row.revoked_at = now
     row.revoked_by = actor
@@ -332,6 +344,8 @@ def revoke_offsite(
         actor=actor,
         at=now,
         detail={"kind": "offsite-revocation", "reason": reason},
+        supersedes_source="retention_event",
+        supersedes_event_id=confirmation_receipt.event_id,
     )
     session.flush()
     return row, True
@@ -1806,6 +1820,8 @@ def _add_event(
     detail: dict[str, object],
     intake_id: str | None = None,
     at: dt.datetime | None = None,
+    supersedes_source: str | None = None,
+    supersedes_event_id: int | None = None,
 ) -> RetentionEvent:
     _validate_event_detail(action, detail)
     row = RetentionEvent(
@@ -1817,6 +1833,8 @@ def _add_event(
         actor=actor,
         at=at or _utcnow(),
         detail=detail,
+        supersedes_source=supersedes_source,
+        supersedes_event_id=supersedes_event_id,
     )
     session.add(row)
     return row

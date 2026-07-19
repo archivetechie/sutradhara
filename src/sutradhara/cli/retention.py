@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import json
 import os
+from contextlib import suppress
 from typing import Any
 
 import click
-from sqlalchemy import select
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from sutradhara.catalog.models import Copy, Intake
 from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.catalog.types import RetentionState
 from sutradhara.replication import _copy_media_id
 from sutradhara.retention import (
     DEFAULT_STAGING_GRACE_DAYS,
@@ -24,6 +27,16 @@ from sutradhara.retention import (
     revoke_offsite,
     run_retention_batch,
     sweep_staging_batch,
+)
+from sutradhara.retention_journal import (
+    RUNBOOK_TEXT,
+    JournalError,
+    check_journal,
+    configured_dr_destination,
+    export_journal,
+    project_journal_alarm,
+    record_journal_correction,
+    refresh_staleness_alarm,
 )
 
 
@@ -57,6 +70,7 @@ def offsite_confirm(
                 confirmed_by=operator,
                 shipment_id=shipment_id,
             )
+        _export_after_mutation(engine)
     except (RetentionError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     payload = {"media_id": row.media_id, "confirmed": created, "actor": operator}
@@ -92,6 +106,7 @@ def offsite_revoke(
                 actor=operator,
                 reason=reason,
             )
+        _export_after_mutation(engine)
     except (RetentionError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     payload = {
@@ -137,6 +152,7 @@ def retention_run_cmd(
                 batch_limit=batch_limit,
                 dry_run=dry_run,
             )
+        _export_after_mutation(engine)
     except (RetentionError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     _emit_batch(result, as_json=as_json)
@@ -184,6 +200,7 @@ def retention_sweep_cmd(
                 grace_days=grace_days,
                 break_glass=break_glass,
             )
+        _export_after_mutation(engine)
     except (RetentionError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     _emit_batch(result, as_json=as_json)
@@ -257,6 +274,7 @@ def retention_abandon_cmd(
                 actor=_actor(actor),
                 reason=reason,
             )
+        _export_after_mutation(engine)
     except (RetentionError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     payload = {"intake_id": intake_id, "abandoned": changed, "reason": reason}
@@ -264,6 +282,187 @@ def retention_abandon_cmd(
         payload,
         as_json=as_json,
         human=f"{intake_id}: {'abandoned' if changed else 'already-abandoned'}",
+    )
+
+
+@retention_group.group("journal")
+def retention_journal_group() -> None:
+    """Export, verify, and correct the emit-only receipt journal."""
+
+
+@retention_journal_group.command("export")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def retention_journal_export_cmd(as_json: bool) -> None:
+    """Run the singleton exporter and append-only DR shipment."""
+
+    engine = make_engine()
+    try:
+        destination = configured_dr_destination(engine)
+        result = export_journal(engine, destination=destination)
+    except Exception as exc:
+        _record_export_failure(engine, exc)
+        raise click.ClickException(str(exc)) from exc
+    payload = dataclasses.asdict(result)
+    human = (
+        f"journal export: entries={result.entry_count} published={result.published} "
+        f"sequence={result.state.global_sequence} shipped={result.shipped_segments}"
+    )
+    if result.shipping_error:
+        human += f" ALARM shipping-failed={result.shipping_error}"
+    _emit_one(payload, as_json=as_json, human=human)
+    if result.shipping_error:
+        raise click.exceptions.Exit(1)
+
+
+@retention_journal_group.command("check")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def retention_journal_check_cmd(as_json: bool) -> None:
+    """Walk the journal chain and compare its off-box head and DB projection."""
+
+    engine = make_engine()
+    destination = None
+    destination_error: str | None = None
+    try:
+        destination = configured_dr_destination(engine)
+    except JournalError as exc:
+        destination_error = str(exc)
+    try:
+        result = check_journal(engine, destination=destination)
+    except Exception as exc:
+        result_error = str(exc)
+        with suppress(Exception):
+            project_journal_alarm(
+                engine,
+                target_key="check-failed",
+                active=True,
+                reason="check-failed",
+                message=result_error,
+            )
+        if as_json:
+            click.echo(json.dumps({"ok": False, "issues": [result_error], "runbook": RUNBOOK_TEXT}))
+        else:
+            click.echo(f"journal check: FAIL\n  {result_error}\n{RUNBOOK_TEXT}")
+        raise click.exceptions.Exit(1) from exc
+    issues = list(result.issues)
+    if destination_error:
+        issues.append(f"offbox-head-read-failed: {destination_error}")
+    ok = result.ok and not destination_error
+    try:
+        project_journal_alarm(
+            engine,
+            target_key="check-failed",
+            active=not ok,
+            reason="check-failed",
+            message="; ".join([*issues, *result.projection_mismatches]) or "journal check passed",
+        )
+    except Exception as exc:
+        issues.append(f"alarm-write-failed: {exc}")
+        ok = False
+    if as_json:
+        payload = dataclasses.asdict(result)
+        payload["ok"] = ok
+        payload["issues"] = issues
+        payload["runbook"] = None if ok else RUNBOOK_TEXT
+        click.echo(json.dumps(payload, indent=2, default=str))
+    else:
+        click.echo(
+            f"journal check: {'PASS' if ok else 'FAIL'} files={result.file_count} "
+            f"entries={result.entry_count} sequence={result.state.global_sequence}"
+        )
+        for issue in issues:
+            click.echo(f"  break: {issue}")
+        for mismatch in result.projection_mismatches:
+            click.echo(f"  break: {mismatch}")
+        if not ok:
+            click.echo(RUNBOOK_TEXT)
+    if not ok:
+        raise click.exceptions.Exit(1)
+
+
+@retention_journal_group.command("correct")
+@click.option(
+    "--source",
+    type=click.Choice(["verify_receipt", "retention_event"]),
+    required=True,
+)
+@click.option("--event-id", type=int, required=True, help="Receipt event_id to supersede.")
+@click.option("--reason", required=True, help="Why the immutable receipt is incorrect.")
+@click.option("--actor", default=None, help="Operator recording the correction.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def retention_journal_correct_cmd(
+    source: str,
+    event_id: int,
+    reason: str,
+    actor: str | None,
+    as_json: bool,
+) -> None:
+    """Append a superseding correction; never rewrite a published receipt."""
+
+    engine = make_engine()
+    try:
+        with session_scope(engine) as session:
+            row = record_journal_correction(
+                session,
+                source=source,
+                event_id=event_id,
+                actor=_actor(actor),
+                reason=reason,
+            )
+        _export_after_mutation(engine)
+    except (JournalError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    _emit_one(
+        {
+            "event_id": row.event_id,
+            "supersedes_source": source,
+            "supersedes_event_id": event_id,
+            "reason": reason,
+        },
+        as_json=as_json,
+        human=f"correction event {row.event_id} supersedes {source}:{event_id}",
+    )
+
+
+@retention_group.command("sitrep")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def retention_sitrep_cmd(as_json: bool) -> None:
+    """Print standing purge holds and receipt-export staleness for ops sitrep."""
+
+    engine = make_engine()
+    now = dt.datetime.now(dt.UTC)
+    standing: dict[str, list[str]] = {}
+    with session_scope(engine) as session:
+        for intake in _status_intakes(session, None):
+            if intake.retention_state != RetentionState.RELEASED or intake.released_at is None:
+                continue
+            released_at = intake.released_at
+            if released_at.tzinfo is None:
+                released_at = released_at.replace(tzinfo=dt.UTC)
+            if released_at + dt.timedelta(days=DEFAULT_STAGING_GRACE_DAYS) >= now:
+                continue
+            status = retention_status(session, intake)
+            if status.purge_status.status.startswith("blocked:"):
+                standing.setdefault(intake.intake_id, []).append(status.purge_status.status)
+    export_status = refresh_staleness_alarm(engine, now=now)
+    payload = {
+        "standing_holds": [
+            {"intake_id": intake_id, "reasons": sorted(set(reasons))}
+            for intake_id, reasons in sorted(standing.items())
+        ],
+        "export": dataclasses.asdict(export_status),
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, default=str))
+        return
+    if standing:
+        for intake_id, reasons in sorted(standing.items()):
+            click.echo(f"retention hold: {intake_id}: {', '.join(sorted(set(reasons)))}")
+    else:
+        click.echo("retention holds: none")
+    age = f"{export_status.stale_seconds}s" if export_status.oldest_pending_at else "current"
+    click.echo(
+        f"retention journal: pending={export_status.pending_entries} age={age} "
+        f"status={'STALE' if export_status.stale else 'ok'}"
     )
 
 
@@ -346,3 +545,34 @@ def _emit_batch(result: RetentionBatchResult, *, as_json: bool) -> None:
 
 def _emit_one(payload: dict[str, Any], *, as_json: bool, human: str) -> None:
     click.echo(json.dumps(payload, indent=2, default=str) if as_json else human)
+
+
+def _export_after_mutation(engine: Engine) -> None:
+    """Best-effort post-commit hook: alarm on failure, never change gate outcome."""
+
+    try:
+        destination = configured_dr_destination(engine)
+        result = export_journal(engine, destination=destination)
+        if result.shipping_error:
+            click.echo(
+                f"warning: retention journal shipping alarm: {result.shipping_error}",
+                err=True,
+            )
+    except Exception as exc:
+        _record_export_failure(engine, exc)
+        click.echo(f"warning: retention journal export alarm: {exc}", err=True)
+
+
+def _record_export_failure(engine: Engine, exc: Exception) -> None:
+    try:
+        project_journal_alarm(
+            engine,
+            target_key="export-failed",
+            active=True,
+            reason="export-failed",
+            message=str(exc),
+        )
+    except Exception:
+        # The catalog itself may be the failing component.  The CLI warning is
+        # still emitted by the caller; journal trouble never rewrites a gate result.
+        return

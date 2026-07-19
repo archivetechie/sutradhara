@@ -1,0 +1,15 @@
+[Unit]
+Description=Export and ship the Sutradhara retention evidence journal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=replica
+Group=replica
+EnvironmentFile=-/etc/sutradhara/sutradhara.env
+ExecStart=/usr/bin/env sutra retention journal export
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+

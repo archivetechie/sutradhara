@@ -173,8 +173,12 @@ def test_retention_help_surfaces_expected_verbs(cli_env: dict[str, str]) -> None
     assert "confirm" in offsite.output
 
     retention = _run(["retention", "--help"])
-    for cmd in ("run", "status", "sweep-staging"):
+    for cmd in ("run", "status", "sweep-staging", "journal", "sitrep"):
         assert cmd in retention.output
+
+    journal = _run(["retention", "journal", "--help"])
+    for cmd in ("export", "check", "correct"):
+        assert cmd in journal.output
 
 
 def test_intake_help_replaces_scan_with_explicit_verbs(cli_env: dict[str, str]) -> None:

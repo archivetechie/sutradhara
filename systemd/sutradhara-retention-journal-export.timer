@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly Sutradhara retention evidence journal export
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+Unit=sutradhara-retention-journal-export.service
+
+[Install]
+WantedBy=timers.target
