@@ -47,6 +47,10 @@ def record_measured(
     if not is_content_hash(measured):
         raise ValueError("measured digest must be a 32-byte SHA-256 hash")
 
+    receipt = _receipt_for_execution(session, copy, source, execution_id)
+    if receipt is not None:
+        return receipt
+
     at = measured_at or _utcnow()
     copy.last_checked_at = at
     copy.last_measured_digest = measured
@@ -61,23 +65,21 @@ def record_measured(
         copy.health = CopyHealth.OK
         failure_kind = None
 
-    receipt = _receipt_for_execution(session, copy, source, execution_id)
-    if receipt is None:
-        receipt = VerifyReceipt(
-            copy_id=copy.id,
-            backend_id=copy.backend_id,
-            expected_digest=copy.integrity_hash,
-            measured_digest=measured,
-            backend_ok=result.ok,
-            failure_kind=failure_kind,
-            failure_detail=result.detail or None,
-            source=source,
-            execution_id=execution_id,
-            producer_process=_producer_process(),
-            actor=actor,
-            at=at,
-        )
-        session.add(receipt)
+    receipt = VerifyReceipt(
+        copy_id=copy.id,
+        backend_id=copy.backend_id,
+        expected_digest=copy.integrity_hash,
+        measured_digest=measured,
+        backend_ok=result.ok,
+        failure_kind=failure_kind,
+        failure_detail=result.detail or None,
+        source=source,
+        execution_id=execution_id,
+        producer_process=_producer_process(),
+        actor=actor,
+        at=at,
+    )
+    session.add(receipt)
     session.flush()
     return receipt
 
@@ -103,28 +105,35 @@ def record_unmeasured_promotion(
     if not result.ok:
         raise ValueError("unmeasured promotion requires a successful backend check")
 
+    receipt = _receipt_for_execution(session, copy, source, execution_id)
+    if receipt is not None:
+        job = _verify_job_for_copy(session, copy)
+        if job is None:
+            raise RuntimeError(
+                "an invalidation receipt exists without its transactionally enqueued verify job"
+            )
+        return receipt, job
+
     at = checked_at or _utcnow()
     copy.last_checked_at = at
     copy.last_measured_digest = None
     copy.last_measured_at = None
     copy.health = CopyHealth.OK
-    receipt = _receipt_for_execution(session, copy, source, execution_id)
-    if receipt is None:
-        receipt = VerifyReceipt(
-            copy_id=copy.id,
-            backend_id=copy.backend_id,
-            expected_digest=copy.integrity_hash,
-            measured_digest=None,
-            backend_ok=True,
-            failure_kind="measurement-invalidated",
-            failure_detail=result.detail or None,
-            source=source,
-            execution_id=execution_id,
-            producer_process=_producer_process(),
-            actor=actor,
-            at=at,
-        )
-        session.add(receipt)
+    receipt = VerifyReceipt(
+        copy_id=copy.id,
+        backend_id=copy.backend_id,
+        expected_digest=copy.integrity_hash,
+        measured_digest=None,
+        backend_ok=True,
+        failure_kind="measurement-invalidated",
+        failure_detail=result.detail or None,
+        source=source,
+        execution_id=execution_id,
+        producer_process=_producer_process(),
+        actor=actor,
+        at=at,
+    )
+    session.add(receipt)
     job = _enqueue_verify(session, copy)
     session.flush()
     return receipt, job
@@ -139,6 +148,14 @@ def _enqueue_verify(session: Session, copy: Copy) -> Job:
         {"copy_id": copy.id},
         dedupe_key=f"verify:remeasure:{copy.id}",
     )
+
+
+def _verify_job_for_copy(session: Session, copy: Copy) -> Job | None:
+    return session.scalars(
+        select(Job)
+        .where(Job.dedupe_key == f"verify:remeasure:{copy.id}")
+        .order_by(Job.id.desc())
+    ).first()
 
 
 def _receipt_for_execution(

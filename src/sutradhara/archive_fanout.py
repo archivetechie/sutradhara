@@ -838,7 +838,7 @@ def build_bundle_copy_for_pool(
             source="fanout",
             execution_id=execution_id,
         )
-    else:
+    elif verify_result.ok:
         record_unmeasured_promotion(
             session,
             copy,
@@ -846,6 +846,10 @@ def build_bundle_copy_for_pool(
             source="fanout",
             execution_id=execution_id,
         )
+    else:
+        copy.health = CopyHealth.SUSPECT
+    if not verify_result.ok:
+        raise ArchiveFanoutError(f"backend verify failed: {verify_result.detail}")
     if artifact_observer is not None:
         artifact_observer(artifact)
     return copy
@@ -936,7 +940,7 @@ def _build_for_target(
 
 def _require_key_epoch(
     targets: Sequence[tuple[WritableStorageBackend, PoolTarget]],
-) -> VerifyResult:
+) -> None:
     for _, target in targets:
         if target.representation == Representation.RAO_AEAD_V1.value and target.key_epoch is None:
             raise ArchiveFanoutError(f"encrypted pool {target.pool_id!r} requires key_epoch")
@@ -1078,10 +1082,10 @@ def _verify_members_from_copy(
     storage_metadata: Mapping[str, Any],
     builder: ArchiveBuilder,
     work_dir: Path,
-) -> None:
+) -> VerifyResult:
     result = backend.verify(copy_locator)
     if not result.ok:
-        raise ArchiveFanoutError(f"backend verify failed: {result.detail}")
+        return result
     cached_container: bytes | None = None
     for member in members:
         data, cached_container = _verified_member_bytes(

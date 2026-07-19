@@ -20,7 +20,16 @@ from sutradhara.backend.port import (
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_copy
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset, Pool
+from sutradhara.catalog.models import (
+    ArtifactClassPool,
+    Backend,
+    Copy,
+    IngestItem,
+    Intake,
+    LogicalAsset,
+    Pool,
+    VerifyReceipt,
+)
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import (
     BackendKind,
@@ -28,8 +37,14 @@ from sutradhara.catalog.types import (
     ContentHash,
     CopyHealth,
     CopySource,
+    IntakeSourceKind,
+    IntakeStatus,
+    RetentionState,
     content_hash,
 )
+from sutradhara.jobs.models import Job
+from sutradhara.jobs.reconcilers import copy as copy_reconciler
+from sutradhara.jobs.reconcilers.conditions import OBSERVED_PRESENT
 from sutradhara.scrub import scrub_backend
 from sutradhara.sealing.port import Representation
 
@@ -181,11 +196,107 @@ def test_scrub_verified_good_clears_suspect_copy(engine: Engine) -> None:
             source=CopySource.INGEST,
             health=CopyHealth.SUSPECT,
         )
+        copy.last_measured_digest = data_hash
+        copy.last_measured_at = now - dt.timedelta(days=1)
 
-        report = scrub_backend(s, row, _GoodBackend(), now=now)
+        report = scrub_backend(s, row, _GoodBackend(), now=now, run_id="scrub-good-1")
 
         assert report.copies_updated == 1
         assert copy.health == CopyHealth.OK
+        assert copy.last_measured_digest is None
+        assert copy.last_measured_at is None
+        receipt = s.scalars(
+            select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)
+        ).one()
+        assert receipt.source == "scrub"
+        assert receipt.execution_id == "scrub-good-1"
+        assert receipt.failure_kind == "measurement-invalidated"
+        verify_job = s.scalars(select(Job).where(Job.kind == "verify")).one()
+        assert verify_job.params == {"copy_id": copy.id}
+
+
+def test_scrub_discovery_is_satisfied_pending_until_verify_runs(engine: Engine) -> None:
+    """A newly discovered OK copy must not launch a duplicate repair loop."""
+
+    data_hash = _hash(b"scrub-discovered pending verification")
+    pool_id = "scrub-pool"
+    locator = {"pool_id": pool_id, "hash_hex": data_hash.hex()}
+
+    class _DiscoveredBackend:
+        @property
+        def name(self) -> str:
+            return "scrub-discovered"
+
+        def enumerate(self) -> Iterator[CopyRecord]:
+            yield CopyRecord(
+                logical_id=data_hash,
+                native_locator=locator,
+                integrity_hash=data_hash,
+                size_bytes=37,
+            )
+
+        def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+            raise AssertionError("scrub discovery must not read bytes")
+
+        def verify(self, locator: BackendLocator) -> VerifyResult:
+            raise AssertionError("the queued verify job owns read-back")
+
+    with session_scope(engine) as session:
+        backend = Backend(
+            name="scrub-discovered",
+            kind=BackendKind.MEMORY,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        session.add(backend)
+        session.flush()
+        session.add(
+            Pool(
+                id=pool_id,
+                backend_id=backend.id,
+                representation=Representation.RAW_BYTES.value,
+            )
+        )
+        session.add(ArtifactClassPool(artifactclass="masters", pool_id=pool_id))
+        session.add(LogicalAsset(content_sha256=data_hash, size_bytes=37))
+        session.add(
+            Intake(
+                intake_id="scrub-intake",
+                operator="tester",
+                source_kind=IntakeSourceKind.CARD,
+                source_ref="card",
+                artifactclass="masters",
+                status=IntakeStatus.REGISTERED,
+                retention_state=RetentionState.HELD,
+            )
+        )
+        session.flush()
+        session.add(
+            IngestItem(
+                intake_id="scrub-intake",
+                logical_asset_hash=data_hash,
+                as_received_path="asset.bin",
+                virtual_path="asset.bin",
+                size_bytes=37,
+                artifactclass="masters",
+            )
+        )
+        session.flush()
+
+        report = scrub_backend(
+            session,
+            backend,
+            _DiscoveredBackend(),
+            run_id="scrub-discovery-1",
+        )
+        copy = session.scalars(select(Copy)).one()
+        assert report.copies_added == 1
+        assert copy.last_measured_digest is None
+        assert session.scalars(select(Job).where(Job.kind == "verify")).one().params == {
+            "copy_id": copy.id
+        }
+        target_key = copy_reconciler.make_target_key(data_hash, pool_id)
+        observation = copy_reconciler.observe(session, target_key)
+        assert observation.observed_state == OBSERVED_PRESENT
 
 
 def test_scrub_quarantines_recognizable_bundle_container_unknown(engine: Engine) -> None:

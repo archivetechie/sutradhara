@@ -139,6 +139,7 @@ def upgrade() -> None:
         batch.alter_column("intake_id", existing_type=sa.String(128), nullable=True)
         batch.alter_column("subject_type", existing_type=sa.String(16), nullable=False)
         batch.alter_column("subject_id", existing_type=sa.String(256), nullable=False)
+        batch.alter_column("operation_id", existing_type=sa.String(512), nullable=False)
         batch.create_foreign_key(
             "fk_retention_event_intake_id_intake",
             "intake",
@@ -240,6 +241,7 @@ def downgrade() -> None:
             ondelete="CASCADE",
         )
         batch.alter_column("intake_id", existing_type=sa.String(128), nullable=False)
+        batch.alter_column("operation_id", existing_type=sa.String(512), nullable=True)
         batch.create_check_constraint(
             "ck_retention_event_action",
             "action IN ('released', 'cloud_blob_deleted', 'staging_deleted')",

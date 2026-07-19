@@ -522,6 +522,239 @@ def test_release_freezes_new_work_and_sweep_staging_after_grace(
         assert session.scalar(select(func.count()).select_from(RetentionEvent)) == 7
 
 
+def test_release_attempt_survives_crash_and_outcomes_deduplicate(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash after external deletion leaves one durable attempt for retry."""
+
+    fake_cloud = _DeleteBackend()
+    monkeypatch.setattr(retention_module.factory, "backend_from_row", lambda _row: fake_cloud)
+    original_delete = retention_module._delete_copy_object
+
+    with session_scope(engine) as session:
+        pool = _add_pool(session, artifactclass="s-masters", pool_id="attempt-pool")
+        item = _add_intake_with_item(
+            session,
+            tmp_path,
+            "attempt-crash",
+            artifactclass="s-masters",
+        )
+        _add_asset_copy(
+            session,
+            item,
+            backend_id=pool.backend_id,
+            pool_id=pool.id,
+            verified=True,
+        )
+        _add_cloud_copy(session, "attempt-crash", fake_cloud.add("attempt-cloud"))
+
+        def crash_after_delete(copy: Copy) -> str:
+            original_delete(copy)
+            raise RuntimeError("simulated crash after external delete")
+
+        monkeypatch.setattr(retention_module, "_delete_copy_object", crash_after_delete)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            run_retention(session, "attempt-crash", actor="ops")
+
+    with session_scope(engine) as session:
+        intake = session.get(Intake, "attempt-crash")
+        assert intake is not None
+        assert intake.retention_state == RetentionState.HELD
+        actions = list(
+            session.scalars(
+                select(RetentionEvent.action)
+                .where(RetentionEvent.intake_id == "attempt-crash")
+                .order_by(RetentionEvent.event_id)
+            )
+        )
+        assert actions == ["release_attempted"]
+
+    monkeypatch.setattr(retention_module, "_delete_copy_object", original_delete)
+    with session_scope(engine) as session:
+        result = run_retention(session, "attempt-crash", actor="ops")
+        assert result.released
+        events = list(
+            session.scalars(
+                select(RetentionEvent)
+                .where(RetentionEvent.intake_id == "attempt-crash")
+                .order_by(RetentionEvent.event_id)
+            )
+        )
+        assert [event.action for event in events] == [
+            "release_attempted",
+            "cloud_blob_deleted",
+            "released",
+        ]
+        assert {event.operation_id for event in events} == {"release:attempt-crash"}
+        cloud_event = next(event for event in events if event.action == "cloud_blob_deleted")
+        assert cloud_event.detail["outcome"] == "already-absent"
+
+
+def test_tombstone_commit_survives_crash_before_garbage_collection(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TOMBSTONED commits while bytes remain, and retry alone records deletion."""
+
+    original_resume = retention_module._resume_tombstone_gc
+    with session_scope(engine) as session:
+        intake_root = _seed_released_intake_for_purge(
+            session,
+            tmp_path,
+            "tombstone-gc-crash",
+        )
+
+        def crash_before_gc(
+            crash_session: Session,
+            row: Intake,
+            *,
+            actor: str,
+        ) -> Any:
+            del actor
+            assert row.retention_state == RetentionState.TOMBSTONED
+            assert row.staging_tombstone_path is not None
+            assert Path(row.staging_tombstone_path).exists()
+            actions = list(
+                crash_session.scalars(
+                    select(RetentionEvent.action).where(
+                        RetentionEvent.intake_id == row.intake_id
+                    )
+                )
+            )
+            assert "staging_tombstoned" in actions
+            assert "staging_deleted" not in actions
+            raise RuntimeError("simulated crash before tombstone GC")
+
+        monkeypatch.setattr(retention_module, "_resume_tombstone_gc", crash_before_gc)
+        with pytest.raises(RuntimeError, match="before tombstone GC"):
+            sweep_staging(session, "tombstone-gc-crash", actor="ops")
+        assert not intake_root.exists()
+
+    with session_scope(engine) as session:
+        intake = session.get(Intake, "tombstone-gc-crash")
+        assert intake is not None
+        assert intake.retention_state == RetentionState.TOMBSTONED
+        assert intake.staging_tombstone_path is not None
+        assert Path(intake.staging_tombstone_path).exists()
+
+    monkeypatch.setattr(retention_module, "_resume_tombstone_gc", original_resume)
+    with session_scope(engine) as session:
+        result = sweep_staging(session, "tombstone-gc-crash", actor="ops")
+        assert result.purged
+        intake = session.get(Intake, "tombstone-gc-crash")
+        assert intake is not None
+        assert intake.retention_state == RetentionState.PURGED
+        assert intake.staging_tombstone_path is not None
+        assert not Path(intake.staging_tombstone_path).exists()
+        actions = list(
+            session.scalars(
+                select(RetentionEvent.action)
+                .where(RetentionEvent.intake_id == intake.intake_id)
+                .order_by(RetentionEvent.event_id)
+            )
+        )
+        assert actions.count("purge_attempted") == 1
+        assert actions.count("staging_tombstoned") == 1
+        assert actions.count("staging_deleted") == 1
+
+
+def test_rename_marker_recovers_when_crash_precedes_tombstoned_commit(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rename with a rolled-back state transition is recognized on retry."""
+
+    original_atomic = retention_module._atomic_tombstone
+    intake_root = tmp_path / "rename-marker-crash"
+
+    def crash_during_sweep() -> None:
+        with session_scope(engine) as session:
+            _seed_released_intake_for_purge(
+                session,
+                tmp_path,
+                "rename-marker-crash",
+            )
+
+            def crash_after_rename(source: Path, destination: Path, intake_id: str) -> None:
+                original_atomic(source, destination, intake_id)
+                raise RuntimeError("simulated crash after tombstone rename")
+
+            monkeypatch.setattr(retention_module, "_atomic_tombstone", crash_after_rename)
+            sweep_staging(session, "rename-marker-crash", actor="ops")
+
+    with pytest.raises(RuntimeError, match="after tombstone rename"):
+        crash_during_sweep()
+
+    assert not intake_root.exists()
+    with session_scope(engine) as session:
+        intake = session.get(Intake, "rename-marker-crash")
+        assert intake is not None
+        assert intake.retention_state == RetentionState.RELEASED
+        assert intake.staging_tombstoned_at is None
+        assert intake.staging_tombstone_path is None
+        assert list(
+            session.scalars(
+                select(RetentionEvent.action).where(
+                    RetentionEvent.intake_id == intake.intake_id,
+                    RetentionEvent.action == "purge_attempted",
+                )
+            )
+        ) == ["purge_attempted"]
+
+    monkeypatch.setattr(retention_module, "_atomic_tombstone", original_atomic)
+    with session_scope(engine) as session:
+        result = sweep_staging(session, "rename-marker-crash", actor="ops")
+        assert result.purged
+        intake = session.get(Intake, "rename-marker-crash")
+        assert intake is not None
+        assert intake.retention_state == RetentionState.PURGED
+        actions = list(
+            session.scalars(
+                select(RetentionEvent.action).where(
+                    RetentionEvent.intake_id == intake.intake_id
+                )
+            )
+        )
+        assert actions.count("purge_attempted") == 1
+        assert actions.count("staging_tombstoned") == 1
+        assert actions.count("staging_deleted") == 1
+
+
+def _seed_released_intake_for_purge(
+    session: Session,
+    tmp_path: Path,
+    intake_id: str,
+) -> Path:
+    pool = _add_pool(
+        session,
+        artifactclass="s-masters",
+        pool_id=f"{intake_id}-pool",
+    )
+    item = _add_intake_with_item(
+        session,
+        tmp_path,
+        intake_id,
+        artifactclass="s-masters",
+    )
+    _add_asset_copy(
+        session,
+        item,
+        backend_id=pool.backend_id,
+        pool_id=pool.id,
+        verified=True,
+    )
+    assert run_retention(session, intake_id, actor="ops").released
+    intake = session.get(Intake, intake_id)
+    assert intake is not None
+    intake.released_at = _now() - dt.timedelta(days=31)
+    assert intake.manifest_path is not None
+    return Path(intake.manifest_path).parent
+
+
 def _add_pool(
     session: Session,
     *,

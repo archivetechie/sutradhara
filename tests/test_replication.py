@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import Engine, select
+from sqlalchemy.orm import object_session
 
 from sutradhara.backend.port import (
     BackendLocator,
@@ -28,7 +29,9 @@ from sutradhara.catalog.types import (
     content_hash,
 )
 from sutradhara.durability import AssetTarget
+from sutradhara.evidence_recorder import record_measured
 from sutradhara.jobs.engine import submit
+from sutradhara.jobs.models import Job
 from sutradhara.keys import KeyEpoch
 from sutradhara.replication import (
     PoolRepresentationError,
@@ -259,10 +262,16 @@ def _qualify_fixture_copy(
 ) -> None:
     """Populate explicit read-back evidence for catalog-only fixture copies."""
 
-    at = measured_at or dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
-    copy.last_checked_at = at
-    copy.last_measured_digest = copy.integrity_hash
-    copy.last_measured_at = at
+    session = object_session(copy)
+    assert session is not None
+    record_measured(
+        session,
+        copy,
+        VerifyResult(ok=True, measured=True, actual_hash=copy.integrity_hash),
+        source="fanout",
+        execution_id=f"fixture-fanout:{copy.id}",
+        measured_at=measured_at or dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
 
 
 def test_target_pools_reads_active_memberships_and_representations(
@@ -437,6 +446,9 @@ def test_replicate_asset_fans_out_and_records_each_pool_copy(
             "1" * 32,
             "2" * 32,
         }
+        assert all(row.last_measured_digest is None for row in rows)
+        verify_jobs = list(s.scalars(select(Job).where(Job.kind == "verify")))
+        assert {job.params["copy_id"] for job in verify_jobs} == {row.id for row in rows}
         assert list(s.scalars(select(ArtifactClassPool))).pop().artifactclass == "video-priv"
 
 
@@ -810,10 +822,13 @@ def test_repair_writes_only_missing_pools(
             sealer=_FakeSealer(tmp_path),
         )
         status = replication_status(s, asset_hash, "video-priv", {backend_id: backend})
+        verify_jobs = list(s.scalars(select(Job).where(Job.kind == "verify")))
 
     assert backend.writes == ["private-copy-2"]
     assert len(repaired) == 1
     assert repaired[0].pool_id == "private-copy-2"
+    assert repaired[0].last_measured_digest is None
+    assert [job.params["copy_id"] for job in verify_jobs] == [repaired[0].id]
     assert status["complete"] is True
 
 

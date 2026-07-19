@@ -67,6 +67,28 @@ POLICY_FINGERPRINT_VERSION = "v1"
 TOMBSTONE_BASENAME_VERSION = "v1"
 TERMINAL_DERIVATION_CONDITIONS = {CONDITION_SATISFIED, CONDITION_BLOCKED}
 
+_EVENT_DETAIL_KEYS: dict[str, frozenset[str]] = {
+    "released": frozenset({"copy_ids"}),
+    "cloud_blob_deleted": frozenset(
+        {"bundle_id", "copy_ids", "outcome", "copy_outcomes"}
+    ),
+    "staging_deleted": frozenset({"path"}),
+    "release_attempted": frozenset({"policy_fingerprint"}),
+    "purge_attempted": frozenset({"path", "grace_days"}),
+    "staging_tombstoned": frozenset({"source_path", "tombstone_path"}),
+    "staging_purge_held": frozenset({"reasons"}),
+    "batch_invoked": frozenset(
+        {"action", "limit", "candidate_count", "dry_run", "refused"}
+    ),
+    "batch_refused": frozenset(
+        {"action", "limit", "candidate_count", "dry_run", "refused", "reason"}
+    ),
+    "grace_overridden": frozenset({"grace_days", "default_grace_days"}),
+    "abandoned": frozenset({"reason", "previous_state"}),
+    "correction_recorded": frozenset({"kind", "reason"}),
+    "offsite_confirmed": frozenset({"shipment_id", "confirmed_by"}),
+}
+
 PurgeStatusValue = Literal[
     "not-applicable",
     "grace-active",
@@ -771,7 +793,12 @@ def _assess_intake(
 ) -> _GateAssessment:
     row = _get_intake(session, intake)
     items = tuple(_intake_items(session, row))
-    witnesses = _collect_witness_answers(session, items)
+    witnesses = (
+        {}
+        if row.retention_state
+        in (RetentionState.TOMBSTONED, RetentionState.ABANDONED, RetentionState.PURGED)
+        else _collect_witness_answers(session, items)
+    )
     status = _local_gate_status(session, row, witnesses, require_held=True, grace_days=grace_days)
     return _GateAssessment(status, witnesses)
 
@@ -1209,6 +1236,7 @@ def _atomic_tombstone(source: Path, destination: Path, intake_id: str) -> None:
         raise RetentionError("staging path disappeared before tombstone rename")
     os.replace(source, destination)
     _fsync_if_exists(destination.parent)
+    _fsync_if_exists(source.parent)
     _validate_sentinel(destination, intake_id)
 
 
@@ -1527,6 +1555,7 @@ def _add_event(
     intake_id: str | None = None,
     at: dt.datetime | None = None,
 ) -> RetentionEvent:
+    _validate_event_detail(action, detail)
     row = RetentionEvent(
         intake_id=intake_id,
         subject_type=subject_type,
@@ -1539,6 +1568,25 @@ def _add_event(
     )
     session.add(row)
     return row
+
+
+def _validate_event_detail(action: str, detail: dict[str, object]) -> None:
+    """Enforce the canonical payload shape for every audit action."""
+    expected = _EVENT_DETAIL_KEYS.get(action)
+    if expected is None:
+        raise ValueError(f"unknown retention event action: {action}")
+    actual = frozenset(detail)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        raise ValueError(
+            f"invalid {action} detail keys: missing={missing!r} unknown={unknown!r}"
+        )
+    if action == "cloud_blob_deleted" and detail["outcome"] not in {
+        "deleted",
+        "already-absent",
+    }:
+        raise ValueError("cloud_blob_deleted outcome must be deleted or already-absent")
 
 
 def _batch_limit(value: int | None) -> int:

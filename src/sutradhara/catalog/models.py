@@ -810,7 +810,7 @@ class RetentionEvent(Base):
     subject_type: Mapped[str] = mapped_column(String(16), nullable=False)
     subject_id: Mapped[str] = mapped_column(String(256), nullable=False)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
-    operation_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    operation_id: Mapped[str] = mapped_column(String(512), nullable=False)
     actor: Mapped[str] = mapped_column(String(256), nullable=False)
     at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow

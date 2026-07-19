@@ -19,7 +19,7 @@ from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from sutradhara.backend.memory import MemoryBackend
-from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset
+from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset, VerifyReceipt
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
 from sutradhara.restore import (
@@ -237,8 +237,20 @@ def test_restore_copy_round_trips_asset_per_representation(
     with session_scope(engine) as s:
         copy = s.get(Copy, copy_id)
         assert copy is not None
-        with restore_copy(s, copy, backend=backend, opener=opener) as result:
+        with restore_copy(
+            s,
+            copy,
+            backend=backend,
+            opener=opener,
+            execution_id=f"restore-request:{representation.value}",
+        ) as result:
             atomic_write_verified_file(result.path, dest)
+        assert copy.last_measured_digest == copy.integrity_hash
+        receipt = s.scalars(
+            select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)
+        ).one()
+        assert receipt.source == "restore"
+        assert receipt.execution_id == f"restore-request:{representation.value}"
 
     assert dest.read_bytes() == data
     assert result.sha256 == _sha(data)
