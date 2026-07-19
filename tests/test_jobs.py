@@ -21,7 +21,7 @@ from sutradhara.api.identity import parse_identity
 from sutradhara.backend import factory as backend_factory
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.backend.port import StorageBackend
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset
+from sutradhara.catalog.models import Backend, Copy, LogicalAsset, VerifyReceipt
 from sutradhara.catalog.session import (
     create_all,
     locator_key,
@@ -984,10 +984,10 @@ def test_verify_handler_attempt_records_d2_tape_component(
         assert f"tape:{barcode}" in attempt.detail["components"]
 
 
-def test_verify_detects_corruption_marks_suspect_and_succeeds(
+def test_verify_detects_corruption_marks_corrupt_and_succeeds(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify on a corrupted copy: handler still succeeds; copy.health → SUSPECT."""
+    """A measured digest mismatch succeeds as work and marks the copy CORRUPT."""
     from sutradhara.backend.port import (
         BackendLocator,
         ByteRange,
@@ -1055,10 +1055,10 @@ def test_verify_detects_corruption_marks_suspect_and_succeeds(
 
             refreshed = s.get(Copy, copy_id)
             assert refreshed is not None
-            assert refreshed.health == CopyHealth.SUSPECT
+            assert refreshed.health == CopyHealth.CORRUPT
             assert refreshed.last_checked_at is not None
             assert job.step_state["verify_result"]["ok"] is False
-            assert job.step_state["copy_health_after"] == "suspect"
+            assert job.step_state["copy_health_after"] == "corrupt"
 
 
 def test_verify_with_missing_copy_id_marks_failed(engine: Engine) -> None:
@@ -1098,6 +1098,61 @@ def test_verify_recovers_a_previously_missing_copy(
         refreshed = s.get(Copy, copy_id)
         assert refreshed is not None
         assert refreshed.health == CopyHealth.OK
+
+
+def test_trust_verify_promotion_clears_stale_measurement_and_enqueues_remeasure(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trust-only success cannot requalify a previously suspect copy."""
+
+    from sutradhara.backend.port import BackendLocator, ByteRange, VerifyResult
+
+    copy_id, _ = _seed_memory_backend(engine, b"trust-only", monkeypatch)
+
+    class _TrustOnlyBackend:
+        @property
+        def name(self) -> str:
+            return "trust-only"
+
+        def enumerate(self) -> Iterator[object]:
+            return iter(())
+
+        def read_range(self, _locator: BackendLocator, _range: ByteRange) -> bytes:
+            raise AssertionError("trust-only verification must not read bytes")
+
+        def verify(self, _locator: BackendLocator) -> VerifyResult:
+            return VerifyResult(ok=True, measured=False, detail="catalog echo")
+
+    monkeypatch.setattr(backend_factory, "backend_from_row", lambda _row: _TrustOnlyBackend())
+    old = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        assert copy is not None
+        copy.health = CopyHealth.SUSPECT
+        copy.last_measured_digest = copy.integrity_hash
+        copy.last_measured_at = old
+
+    with session_scope(engine) as session:
+        job = submit(session, "verify", {"copy_id": copy_id})
+        assert run_one(session, job.id).ok
+        copy = session.get(Copy, copy_id)
+        assert copy is not None
+        assert copy.health == CopyHealth.OK
+        assert copy.last_measured_digest is None
+        assert copy.last_measured_at is None
+        receipt = session.scalars(
+            select(VerifyReceipt).where(VerifyReceipt.copy_id == copy_id)
+        ).one()
+        assert receipt.source == "verify-job"
+        assert receipt.measured_digest is None
+        assert receipt.failure_kind == "measurement-invalidated"
+        pending = list(
+            session.scalars(
+                select(Job).where(Job.kind == "verify", Job.status == JobStatus.PENDING)
+            )
+        )
+        assert [row.params for row in pending] == [{"copy_id": copy_id}]
 
 
 # -------------------------------------------------------------------------
@@ -1367,7 +1422,7 @@ def test_jobs_run_drains_queue_with_limit_zero(cli_env: dict[str, str]) -> None:
     )
     _run_cli(["scrub", "--backend", "tape-primary"])
 
-    # Submit one verify per copy.
+    # Scrub discovery durably submits one verify per copy.
     from sqlalchemy import select as _sel
 
     from sutradhara.catalog.models import Copy as _C
@@ -1376,17 +1431,14 @@ def test_jobs_run_drains_queue_with_limit_zero(cli_env: dict[str, str]) -> None:
     with session_scope(eng) as s:
         copy_ids = list(s.scalars(_sel(_C.id)))
 
-    for cid in copy_ids:
-        _run_cli(["jobs", "submit", "verify", "-p", f"copy_id={cid}"])
-
     list_pending = _run_cli(["jobs", "list", "--status", "pending"])
     assert list_pending.output.count("verify") == len(copy_ids)
 
     run_all = _run_cli(["jobs", "run", "--limit", "0"])
-    assert run_all.output.count("verified ok") == len(copy_ids)
+    assert run_all.output.count("verified ok") >= len(copy_ids)
 
-    list_succeeded = _run_cli(["jobs", "list", "--status", "succeeded"])
-    assert list_succeeded.output.count("verify") == len(copy_ids)
+    list_pending_after = _run_cli(["jobs", "list", "--status", "pending"])
+    assert "verify" not in list_pending_after.output
 
 
 def test_jobs_submit_with_string_param(cli_env: dict[str, str]) -> None:

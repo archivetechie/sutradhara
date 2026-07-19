@@ -28,7 +28,7 @@ from sutradhara.catalog.models import (
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register production copy stub
-from sutradhara.jobs.engine import run_one
+from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.models import Job, ReconciliationCondition
 from sutradhara.jobs.reconcilers import copy as copy_reconciler
 from sutradhara.jobs.reconcilers.conditions import (
@@ -361,7 +361,7 @@ def _record_healthy_copy(ctx: JobContext) -> JobResult:
     backend = ctx.session.scalars(
         select(Backend).where(Backend.name == params["target_backend"])
     ).one()
-    add_copy(
+    copy, created = add_copy(
         ctx.session,
         logical_asset_hash=asset_hash,
         backend_id=backend.id,
@@ -372,6 +372,13 @@ def _record_healthy_copy(ctx: JobContext) -> JobResult:
         health=CopyHealth.OK,
         storage_metadata={"representation": Representation.RAW_BYTES.value},
     )
+    if created:
+        submit(
+            ctx.session,
+            "verify",
+            {"copy_id": copy.id},
+            dedupe_key=f"verify:copy:{copy.id}",
+        )
     return JobResult(ok=True, detail="copied")
 
 

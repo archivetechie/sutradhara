@@ -140,10 +140,12 @@ fences change.
 `(logical_asset_hash, artifactclass)`), `VirtualArrangementHistory`
 (append-only move audit), and `AssetTag` (soft-deleted governance tags).
 
-**Retention and audit**: `OffsiteConfirmation` (one row per confirmed
-media id), `RetentionEvent` (append-only: `released`,
-`cloud_blob_deleted`, `staging_deleted`), `ExclusionRecord` and
-`ReviewDecision` (held-bundle review).
+**Retention and audit**: `Copy.last_measured_digest` plus
+`last_measured_at` is the current read-back evidence projection;
+`VerifyReceipt` records each measurement or invalidation.
+`OffsiteConfirmation` keeps attributed confirmation/revocation state, and
+`RetentionEvent` records release, purge, tripwire, and correction decisions.
+`ExclusionRecord` and `ReviewDecision` cover held-bundle review.
 
 The job tables (`job`, `job_attempt`, `reconciliation_condition`) live in
 `jobs/models.py`. The hdcache tables — `cache_disk`, `cache_entry`, and
@@ -233,7 +235,7 @@ The intended flow, each step naming the code that implements it:
    dropping it. Nothing else in the system deletes bytes.
 
 Continuously, in the background: **scrub** (`scrub.py`) re-enumerates a
-   backend and reconciles it against the catalog (bump `last_checked_at`,
+backend and reconciles it against the catalog (bump `last_checked_at`,
 insert unknown objects, mark absentees `missing`, flag hash conflicts
 `suspect` — never delete), and **self-heal** (`replication.py`) re-seals
 missing placements from a healthy copy.

@@ -84,7 +84,6 @@ def test_add_copy_inserts_new_copy_and_reports_created(engine: Engine) -> None:
             native_locator=locator,
             integrity_hash=integrity,
             source=CopySource.INGEST,
-            last_checked_at=now,
             first_observed_at=now,
         )
         assert created is True
@@ -96,7 +95,9 @@ def test_add_copy_inserts_new_copy_and_reports_created(engine: Engine) -> None:
         assert copy.integrity_hash == integrity
         assert copy.source == CopySource.INGEST
         assert copy.health == CopyHealth.OK
-        assert copy.last_checked_at == now
+        assert copy.last_checked_at is None
+        assert copy.last_measured_digest is None
+        assert copy.last_measured_at is None
         assert copy.first_observed_at == now
 
     with session_scope(engine) as s:

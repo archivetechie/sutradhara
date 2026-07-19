@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import json
 from pathlib import Path
 
@@ -11,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from sutradhara.api import store as api_store
 from sutradhara.arrangement import create_from_intake
+from sutradhara.backend.port import VerifyResult
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
@@ -29,6 +29,7 @@ from sutradhara.catalog.types import (
     CopySource,
     IngestDisposition,
 )
+from sutradhara.evidence_recorder import record_measured
 from sutradhara.intake import register_intake
 from sutradhara.receive_novelty import ListingEntry, estimate_listing_novelty, novelty_summary
 from sutradhara.sealing.port import Representation
@@ -96,8 +97,8 @@ def test_registration_classifies_all_authoritative_dispositions_and_suppression(
                 integrity_hash=item.logical_asset_hash,
                 source=CopySource.INGEST,
                 health=CopyHealth.OK,
-                last_checked_at=dt.datetime.now(dt.UTC),
             )
+            _qualify_fixture_copy(session, copy)
             assert copy.last_checked_at is not None
 
         with session_scope(engine) as session:
@@ -170,7 +171,7 @@ def test_estimate_and_nothing_new_handshake_are_content_based(tmp_path: Path) ->
                 select(IngestItem).where(IngestItem.intake_id == "prior")
             ).one()
             pool = _add_pool(session, "archive", "masters")
-            add_copy(
+            copy, _ = add_copy(
                 session,
                 logical_asset_hash=item.logical_asset_hash,
                 backend_id=pool.backend_id,
@@ -179,8 +180,8 @@ def test_estimate_and_nothing_new_handshake_are_content_based(tmp_path: Path) ->
                 integrity_hash=item.logical_asset_hash,
                 source=CopySource.INGEST,
                 health=CopyHealth.OK,
-                last_checked_at=dt.datetime.now(dt.UTC),
             )
+            _qualify_fixture_copy(session, copy)
             same = estimate_listing_novelty(
                 session,
                 card_identity="card-1",
@@ -310,6 +311,18 @@ def test_under_durable_prior_does_not_block_repair_receive(tmp_path: Path) -> No
         assert decision.state == "authorized"
     finally:
         engine.dispose()
+
+
+def _qualify_fixture_copy(session: Session, copy: Copy) -> None:
+    """Record explicit read-back evidence for a catalog-only fixture copy."""
+
+    record_measured(
+        session,
+        copy,
+        VerifyResult(ok=True, measured=True, actual_hash=copy.integrity_hash),
+        source="fanout",
+        execution_id=f"fixture-fanout:{copy.id}",
+    )
 
 
 def _write_intake(root: Path, intake_id: str, files: dict[str, bytes]) -> Path:

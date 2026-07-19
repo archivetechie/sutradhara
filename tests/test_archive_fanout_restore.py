@@ -76,6 +76,7 @@ from sutradhara.catalog.models import (
     LogicalAsset,
     Pool,
     StagingTransform,
+    VerifyReceipt,
 )
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import (
@@ -666,6 +667,13 @@ def test_build_bundle_copy_for_pool_records_copy_locators_blob_roots_but_no_excl
         assert copy.bundle_id == bundle.id
         assert copy.pool_id == "o-copy-1-pool"
         assert copy.last_checked_at is not None
+        assert copy.last_measured_digest == copy.integrity_hash
+        assert copy.last_measured_at == copy.last_checked_at
+        receipt = s.scalars(
+            select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)
+        ).one()
+        assert receipt.source == "fanout"
+        assert receipt.measured_digest == copy.integrity_hash
         assert bundle.status == "open"
         assert (
             len(list(s.scalars(select(AssetLocator).where(AssetLocator.copy_id == copy.id)))) == 2

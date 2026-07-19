@@ -100,8 +100,10 @@ as evidence but creates no registered `ingest_item` rows.
 | `status` | enum | `receiving`, `verifying`, `quarantined`, or `registered`; defaults to `receiving`. |
 | `created_at`, `updated_at` | time | Creation and last state-update times. |
 | `registered_at`, `quarantined_at` | time, optional | Terminal acceptance or quarantine time. |
-| `retention_state` | enum | Landing-byte lifecycle: `held`, `released`, or `purged`; defaults to `held`. |
+| `retention_state` | enum | Landing-byte lifecycle: `held`, `released`, `tombstoned`, `abandoned`, or `purged`; defaults to `held`. |
 | `released_at` | time, optional | When policy made source staging releasable. |
+| `release_policy_fingerprint` | text, optional | Versioned digest of the gate-relevant policy snapshot frozen at release. |
+| `staging_tombstoned_at`, `staging_tombstone_path` | time/text, optional pair | Atomic-rename recovery marker committed before tombstone garbage collection. |
 | `staging_deleted_at` | time, optional | When temporary landing bytes were actually deleted. |
 
 ### `ingest_item`
@@ -429,7 +431,9 @@ an individual-file copy.
 | `native_locator_key` | text | Canonical indexed locator; unique with `backend_id`. |
 | `storage_metadata` | json | Representation-specific facts, such as RAO metadata. |
 | `integrity_hash` | hash | Required digest of the stored representation. |
+| `integrity_hash_provenance` | enum | `locally_computed` or `backend_discovered`. |
 | `health` | enum | `ok`, `suspect`, `corrupt`, or `missing`; defaults to `ok`. |
+| `health_changed_at` | time | Transition clock maintained by a SQLite trigger for ORM and raw-SQL updates. |
 | `last_checked_at` | time, optional | Last backend check, measured or trust-based. |
 | `last_measured_digest` / `last_measured_at` | hash/time, optional pair | Last byte read-back measurement; both fields are null or both are set. |
 | `deleted_at` | time, optional | Tombstone time after physical deletion. |
@@ -533,18 +537,38 @@ this before it releases landing bytes.
 | `media_id` | text, PK | Confirmed medium identity. |
 | `confirmed_at`, `confirmed_by` | time / text | Confirmation audit. |
 | `shipment_id` | text, optional | Shipment or transfer reference. |
+| `revoked_at`, `revoked_by` | time / text, optional pair | Attributed revocation; active gates require both to be null. |
 
 ### `retention_event`
 
-Append-only record of a retention action for an intake.
+Append-only record of an intake, media, or batch retention decision.
 
 | Field | Type / key | Meaning |
 |---|---|---|
-| `id` | integer, PK | Event identifier. |
-| `intake_id` | text, FK -> `intake.intake_id` | Intake affected. |
-| `action` | text | Action such as release or staging deletion. |
+| `event_id` | integer, PK | Event identifier. |
+| `intake_id` | text, optional FK -> `intake.intake_id`, `ON DELETE RESTRICT` | Relational intake target for intake-subject events. |
+| `subject_type`, `subject_id` | text | Explicit `intake`, `media`, or `batch` subject identity. |
+| `action` | text | Closed action vocabulary for attempts, outcomes, holds, tripwires, and corrections. |
+| `operation_id` | required text | Correlation key shared by an attempt and its outcomes. |
 | `actor`, `at` | text / time | Who acted and when. |
 | `detail` | json, optional | Action evidence/details. |
+
+The retention recorder strictly validates the payload keys for each action
+before appending an event.
+
+### `verify_receipt`
+
+Append-only audit receipt written in the same transaction as a copy's current
+measurement projection or measurement invalidation.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `event_id` | integer, PK | Receipt identifier. |
+| `copy_id`, `backend_id` | integer, restricted FKs | Copy and backend measured. |
+| `expected_digest`, `measured_digest` | hash / optional hash | Catalog expectation and actual read-back result; null measured digest means invalidation. |
+| `backend_ok`, `failure_kind`, `failure_detail` | boolean / optional text | Backend verdict and separate failure facts. |
+| `source`, `execution_id` | enum / text | `fanout`, `verify-job`, `restore`, or scrub invalidation plus its retry-deduplication identity. |
+| `producer_process`, `actor`, `at` | text / optional text / time | Producer and attribution metadata. |
 
 ### `exclusion_record`
 

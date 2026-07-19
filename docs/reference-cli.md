@@ -49,8 +49,8 @@ pieces mean, see [`reference-glossary.md`](reference-glossary.md) and
 | `sutra backends` | Register and inspect storage backends. |
 | `sutra scrub` | Re-enumerate a backend and reconcile against the catalog. |
 | `sutra hdcache` | Manage the expendable HD cache disk tier. |
-| `sutra retention` | Run the retention release gate and staging sweep. |
-| `sutra offsite` | Record offsite media confirmations. |
+| `sutra retention` | Run the evidence-gated release/sweep funnel and corrections. |
+| `sutra offsite` | Record or revoke offsite media confirmations. |
 | `sutra pfr` | Partial file restore sidecars and cuts. |
 | `sutra serve` | Serve the operator HTTP API and mTLS gRPC relay in one process. |
 | `sutra serve-api` | Serve the operator API alone (Unix socket by default). |
@@ -409,17 +409,22 @@ operation is reversible from the archive.
 <!-- code-anchor: src/sutradhara/cli/retention.py src/sutradhara/retention.py @ 5c44b85 -->
 ## sutra retention and sutra offsite
 
-The only place in the system that deletes bytes. The release gate proves
-every durable copy is verified (and offsite-confirmed where the pool
-requires it) before an intake's temporary copies become deletable; the
-staging sweep enforces a grace period on top.
+The only place in the system that deletes bytes. Both stages require current
+read-back digest agreement, offsite confirmation where configured, and a
+Remanence catalog witness for Remanence copies. The staging sweep re-runs the
+full gate, checks the frozen policy fingerprint, and atomically renames the
+landing tree to a recovery tombstone before garbage collection. Batch entry
+points stop above 25 candidates unless an operator supplies a deliberate
+limit.
 
 | Command | Arguments | Purpose |
 |---|---|---|
-| `retention run` | | Release held intakes whose durable copies pass the gate. `--intake TEXT` restricts to one intake, `--actor TEXT`, `--json`. |
-| `retention status` | | Show the retention gate truth for intakes. `--intake TEXT`, `--grace-days INTEGER` (default `30`), `--json`. |
-| `retention sweep-staging` | | Delete released intake landing bytes after the grace period. `--intake TEXT`, `--actor TEXT`, `--grace-days INTEGER` (default `30`), `--json`. |
-| `offsite confirm` | | Confirm one media id as offsite. `--tape TEXT` (tape UUID/barcode) or `--media-id TEXT` (exact media id recorded on Copy locators), `--shipment TEXT`, `--confirmed-by TEXT`. |
+| `retention run` | | Release held intakes whose durable copies pass the gate. `--intake TEXT`, `--actor TEXT`, `--batch-limit INTEGER`, `--dry-run`, `--json`. |
+| `retention status` | | Show per-pool release holds and purge disposition. `--intake TEXT`, `--held`, `--grace-days INTEGER` (default `30`), `--json`. |
+| `retention sweep-staging` | | Re-gate and purge released landing bytes after the grace period. `--intake TEXT`, `--actor TEXT`, `--grace-days INTEGER` (default `30`), `--break-glass` for a shorter grace, `--batch-limit INTEGER`, `--dry-run`, `--json`. |
+| `retention abandon` | | Terminally exclude one held or released intake from deletion while preserving its staging bytes. Requires `--intake TEXT` and `--reason TEXT`; accepts `--actor TEXT`, `--json`. |
+| `offsite confirm` | | Confirm one known media id as offsite. `--tape TEXT` or `--media-id TEXT`, `--shipment TEXT`, `--actor TEXT`, `--json`. |
+| `offsite revoke` | | Revoke an offsite confirmation without deleting its history. `--tape TEXT` or `--media-id TEXT`, `--reason TEXT`, `--actor TEXT`, `--json`. |
 
 <!-- code-anchor: src/sutradhara/cli/pfr.py src/sutradhara/pfr.py @ 5c44b85 -->
 ## sutra pfr

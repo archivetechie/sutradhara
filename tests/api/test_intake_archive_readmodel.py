@@ -51,6 +51,7 @@ INTAKE_KEYS = {
     "label",
     "status",
     "retention_state",
+    "purge_status",
     "created_at",
     "updated_at",
     "registered_at",
@@ -416,6 +417,7 @@ def test_intake_archive_state_none_partial_complete_and_empty(api_engine: Engine
         )
         by_id = {
             intake.intake_id: _intake_payload(
+                session,
                 intake,
                 item_count=len(intake.items),
                 bytes_total=sum(item.size_bytes for item in intake.items),

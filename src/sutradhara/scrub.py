@@ -27,7 +27,7 @@ from pathlib import PurePosixPath
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.backend.port import CopyRecord, StorageBackend
+from sutradhara.backend.port import CopyRecord, StorageBackend, VerifyResult
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import Backend, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import locator_key
@@ -37,7 +37,6 @@ from sutradhara.catalog.types import (
     CopySource,
     IntegrityHashProvenance,
 )
-from sutradhara.backend.port import VerifyResult
 from sutradhara.evidence_recorder import record_unmeasured_promotion
 from sutradhara.jobs.engine import submit
 from sutradhara.sealing.port import Representation

@@ -63,6 +63,15 @@ def _table_sql(db_path: Path, table: str) -> str:
     return str(row[0])
 
 
+def _trigger_sql(db_path: Path, trigger_name: str) -> str | None:
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "select sql from sqlite_master where type='trigger' and name=?",
+            (trigger_name,),
+        ).fetchone()
+    return None if row is None else str(row[0])
+
+
 def _foreign_key_delete_actions(db_path: Path, table: str) -> dict[tuple[str, str], str]:
     with sqlite3.connect(db_path) as conn:
         return {
@@ -230,15 +239,51 @@ def _assert_retention_invariants(db_path: Path) -> None:
     assert "DEFAULT 'held'" in intake_sql
     assert "released_at" in intake_sql
     assert "staging_deleted_at" in intake_sql
+    assert "release_policy_fingerprint" in intake_sql
+    assert "staging_tombstoned_at" in intake_sql
+    assert "staging_tombstone_path" in intake_sql
     assert "ck_intake_retention_state" in intake_sql
-    assert "deleted_at" in _table_sql(db_path, "copy")
+    assert "ck_intake_tombstone_pair" in intake_sql
+    assert "ck_intake_tombstoned_state" in intake_sql
+    assert "ck_intake_purged_state" in intake_sql
+    copy_sql = _table_sql(db_path, "copy")
+    assert "deleted_at" in copy_sql
+    assert "last_checked_at" in copy_sql
+    assert "last_verified_at" not in copy_sql
+    assert "last_measured_digest" in copy_sql
+    assert "last_measured_at" in copy_sql
+    assert "health_changed_at" in copy_sql
+    assert "integrity_hash_provenance" in copy_sql
+    assert "ck_copy_health" in copy_sql
+    assert "ck_copy_measurement_pair" in copy_sql
+    assert _trigger_sql(db_path, "trg_copy_health_changed_at") is not None
     assert "offsite_confirmation" in _tables(db_path)
-    assert "media_id" in _table_sql(db_path, "offsite_confirmation")
+    offsite_sql = _table_sql(db_path, "offsite_confirmation")
+    assert "media_id" in offsite_sql
+    assert "revoked_at" in offsite_sql
+    assert "revoked_by" in offsite_sql
+    assert "ck_offsite_confirmation_revocation_pair" in offsite_sql
     assert "retention_event" in _tables(db_path)
     event_sql = _table_sql(db_path, "retention_event")
     assert "ck_retention_event_action" in event_sql
+    assert "ck_retention_event_subject" in event_sql
+    assert "event_id" in event_sql
+    assert "subject_type" in event_sql
+    assert "subject_id" in event_sql
+    assert "operation_id" in event_sql
+    assert "operation_id VARCHAR(512) NOT NULL" in event_sql
     assert "detail" in event_sql
     assert ("intake_id",) in _index_columns(db_path, "retention_event")
+    assert _foreign_key_delete_actions(db_path, "retention_event")[("intake_id", "intake")] == (
+        "RESTRICT"
+    )
+    assert "verify_receipt" in _tables(db_path)
+    receipt_sql = _table_sql(db_path, "verify_receipt")
+    assert "ck_verify_receipt_source" in receipt_sql
+    assert "ck_verify_receipt_scrub_unmeasured" in receipt_sql
+    assert ("source", "execution_id", "copy_id") in _unique_index_columns(
+        db_path, "verify_receipt"
+    )
 
 
 def _assert_grpc_relay_invariants(db_path: Path) -> None:
@@ -403,6 +448,106 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     _assert_retention_invariants(db_path)
     _assert_grpc_relay_invariants(db_path)
     _assert_hdcache_invariants(db_path)
+
+
+def test_deletion_evidence_migration_recreates_raw_sql_health_trigger(
+    tmp_path: Path,
+) -> None:
+    """The copy-table batch rebuild must leave raw SQL health flips timestamped."""
+
+    import datetime as dt
+    import hashlib
+
+    from sutradhara.catalog.models import Backend, Copy, LogicalAsset
+    from sutradhara.catalog.session import locator_key, make_engine, session_scope
+    from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
+
+    db_path = tmp_path / "deletion-evidence-trigger.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+
+    digest = hashlib.sha256(b"raw-sql-health-trigger").digest()
+    locator = {"object": "raw-sql-health-trigger"}
+    engine = make_engine(env["SUTRADHARA_DB_URL"])
+    try:
+        with session_scope(engine) as session:
+            backend = Backend(
+                name="trigger-memory",
+                kind=BackendKind.MEMORY,
+                tier=BackendTier.SELF_DESCRIBING,
+            )
+            session.add_all([backend, LogicalAsset(content_sha256=digest, size_bytes=22)])
+            session.flush()
+            copy = Copy(
+                logical_asset_hash=digest,
+                backend_id=backend.id,
+                native_locator=locator,
+                native_locator_key=locator_key(locator),
+                integrity_hash=digest,
+                health=CopyHealth.OK,
+                health_changed_at=dt.datetime(2000, 1, 1, tzinfo=dt.UTC),
+                source=CopySource.INGEST,
+            )
+            session.add(copy)
+            session.flush()
+            copy_id = copy.id
+    finally:
+        engine.dispose()
+
+    with sqlite3.connect(db_path) as conn:
+        before = conn.execute(
+            "SELECT health_changed_at FROM copy WHERE id=?", (copy_id,)
+        ).fetchone()
+        conn.execute("UPDATE copy SET health='suspect' WHERE id=?", (copy_id,))
+        conn.commit()
+        after = conn.execute(
+            "SELECT health, health_changed_at FROM copy WHERE id=?", (copy_id,)
+        ).fetchone()
+    assert before is not None
+    assert after is not None
+    assert after[0] == "suspect"
+    assert after[1] != before[0]
+    assert _trigger_sql(db_path, "trg_copy_health_changed_at") is not None
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "c8d2e4f6a1b3"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(copy)")}
+    assert "last_verified_at" in columns
+    assert "last_checked_at" not in columns
+    assert _trigger_sql(db_path, "trg_copy_health_changed_at") is None
+
+
+def test_retention_event_payload_validation_is_per_action() -> None:
+    from sutradhara.retention import _validate_event_detail
+
+    _validate_event_detail("released", {"copy_ids": []})
+
+    with pytest.raises(ValueError, match=r"missing=.*copy_ids"):
+        _validate_event_detail("released", {})
+    with pytest.raises(ValueError, match=r"unknown=.*typo"):
+        _validate_event_detail("released", {"copy_ids": [], "typo": True})
+    with pytest.raises(ValueError, match="outcome must be"):
+        _validate_event_detail(
+            "cloud_blob_deleted",
+            {
+                "bundle_id": "cloud-blob:intake-1",
+                "copy_ids": [],
+                "outcome": "maybe",
+                "copy_outcomes": [],
+            },
+        )
 
 
 def test_alembic_archive_migration_round_trips(tmp_path: Path) -> None:
