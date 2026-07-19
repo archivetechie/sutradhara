@@ -20,6 +20,7 @@ import pytest
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
+import sutradhara.replicate as replicate_wrapper
 from sutradhara.backend.port import (
     BackendError,
     BackendLocator,
@@ -28,7 +29,14 @@ from sutradhara.backend.port import (
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_copy
-from sutradhara.catalog.models import ArtifactClassPool, Backend, Copy, LogicalAsset, Pool
+from sutradhara.catalog.models import (
+    ArtifactClassPool,
+    Backend,
+    Copy,
+    LogicalAsset,
+    Pool,
+    VerifyReceipt,
+)
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import (
     BackendKind,
@@ -321,6 +329,101 @@ def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
 
     assert repaired == []
     assert backend.writes == []
+
+
+def test_wrapper_reuses_repair_identity_for_retry_but_not_later_execution(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper threads the repair id so only a true retry deduplicates."""
+
+    asset_hash = _add_asset(engine, b"execution-scoped repair evidence")
+    backend_id = _add_backend(engine)
+    with session_scope(engine) as session:
+        copy, _ = add_copy(
+            session,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator={"object_id": "execution-source"},
+            integrity_hash=asset_hash,
+            source=CopySource.INGEST,
+            health=CopyHealth.OK,
+        )
+        copy_id = copy.id
+
+    observed_execution_ids: list[str] = []
+    measured_results = iter(
+        (
+            VerifyResult(True, measured=True, actual_hash=asset_hash),
+            VerifyResult(True, measured=True, actual_hash=asset_hash),
+            VerifyResult(False, measured=True, actual_hash=b"x" * 32),
+        )
+    )
+
+    def fake_self_heal(
+        session: Session,
+        observed_hash: bytes,
+        artifactclass: str,
+        *,
+        backends: dict[int, object],
+        execution_id: str,
+    ) -> list[Copy]:
+        del observed_hash, artifactclass, backends
+        observed_execution_ids.append(execution_id)
+        source = session.get(Copy, copy_id)
+        assert source is not None
+        record_measured(
+            session,
+            source,
+            next(measured_results),
+            source="restore",
+            execution_id=execution_id,
+        )
+        return []
+
+    monkeypatch.setattr(replicate_wrapper, "replication_self_heal", fake_self_heal)
+    with session_scope(engine) as session:
+        with pytest.raises(ValueError, match="repair_id"):
+            replicate_wrapper.self_heal(
+                session,
+                asset_hash,
+                "s-masters",
+                backends={},
+                repair_id="",
+            )
+        replicate_wrapper.self_heal(
+            session,
+            asset_hash,
+            "s-masters",
+            backends={},
+            repair_id="repair-job-17",
+        )
+        replicate_wrapper.self_heal(
+            session,
+            asset_hash,
+            "s-masters",
+            backends={},
+            repair_id="repair-job-17",
+        )
+        assert session.get(Copy, copy_id).health == CopyHealth.OK
+        replicate_wrapper.self_heal(
+            session,
+            asset_hash,
+            "s-masters",
+            backends={},
+            repair_id="repair-job-18",
+        )
+        assert session.get(Copy, copy_id).health == CopyHealth.CORRUPT
+        receipts = list(
+            session.scalars(
+                select(VerifyReceipt)
+                .where(VerifyReceipt.copy_id == copy_id)
+                .order_by(VerifyReceipt.event_id)
+            )
+        )
+
+    assert observed_execution_ids == ["repair-job-17", "repair-job-17", "repair-job-18"]
+    assert [receipt.execution_id for receipt in receipts] == ["repair-job-17", "repair-job-18"]
 
 
 def test_self_heal_raises_when_no_healthy_source_remains(engine: Engine) -> None:

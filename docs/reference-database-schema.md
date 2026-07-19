@@ -570,6 +570,14 @@ measurement projection or measurement invalidation.
 | `source`, `execution_id` | enum / text | `fanout`, `verify-job`, `restore`, or scrub invalidation plus its retry-deduplication identity. |
 | `producer_process`, `actor`, `at` | text / optional text / time | Producer and attribution metadata. |
 
+Downgrading through the deletion-evidence revision uses an export-then-transform
+policy. Events and receipts that the legacy schema cannot represent are written
+to a JSON sidecar beside the SQLite catalog, and Alembic prints that path.
+`staging_tombstoned` maps to the legacy `staging_deleted` action; other new
+actions or non-intake subjects are removed after export. Intake states map
+`abandoned` to `held` and `tombstoned` to `purged` without discarding their
+existing timestamps.
+
 ### `exclusion_record`
 
 Persistent explanation for material excluded from a bundle or policy result.

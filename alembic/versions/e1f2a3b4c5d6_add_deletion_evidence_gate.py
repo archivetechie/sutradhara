@@ -7,7 +7,13 @@ Create Date: 2026-07-19
 
 from __future__ import annotations
 
+import datetime as dt
+import json
+import os
+import uuid
 from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 import sqlalchemy as sa
 from alembic import op
@@ -38,6 +44,14 @@ _ONCE_ACTIONS = (
 )
 _FK_NAMING = {
     "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+}
+_LEGACY_ACTION_SQL = "'released', 'cloud_blob_deleted', 'staging_deleted'"
+_DOWNGRADE_ACTION_MAP = {
+    # A tombstone rename is the design's logical deletion point.  The legacy
+    # schema has no intermediate GC state, so staging_deleted is its exact
+    # compatibility projection.  Attempts, holds, and corrections have no
+    # honest legacy action and remain available only in the export sidecar.
+    "staging_tombstoned": "staging_deleted",
 }
 
 
@@ -220,7 +234,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Remove deletion evidence after explicit compatibility transformations."""
 
-    _assert_legacy_retention_events()
+    _export_incompatible_deletion_evidence()
+    _transform_retention_events_for_legacy()
     # TOMBSTONED has crossed the stage-2 point of no return, so the closest
     # legacy state is PURGED.  ABANDONED still has its bytes and must map to
     # HELD so the legacy sweep cannot select it.
@@ -310,31 +325,96 @@ def _create_health_trigger() -> None:
     )
 
 
-def _assert_legacy_retention_events() -> None:
-    """Refuse lossy downgrade when an event has no honest legacy encoding."""
+def _export_incompatible_deletion_evidence() -> Path | None:
+    """Export rows the legacy event schema cannot represent before transforming."""
 
-    rows = (
-        op.get_bind()
-        .execute(
+    bind = op.get_bind()
+    events = list(
+        bind.execute(
             sa.text(
-                "SELECT event_id, action, subject_type, subject_id, intake_id "
-                "FROM retention_event WHERE "
-                "action NOT IN ('released', 'cloud_blob_deleted', 'staging_deleted') "
+                "SELECT * FROM retention_event WHERE "
+                f"action NOT IN ({_LEGACY_ACTION_SQL}) "
                 "OR subject_type != 'intake' OR intake_id IS NULL OR subject_id != intake_id "
                 "ORDER BY event_id"
             )
+        ).mappings()
+    )
+    receipts = list(
+        bind.execute(sa.text("SELECT * FROM verify_receipt ORDER BY event_id")).mappings()
+    )
+    if not events and not receipts:
+        return None
+
+    sidecar = _downgrade_sidecar_path()
+    temporary = sidecar.with_name(f".{sidecar.name}.tmp")
+    payload = {
+        "format": "sutradhara-deletion-evidence-downgrade-v1",
+        "revision": revision,
+        "exported_at": dt.datetime.now(dt.UTC).isoformat(),
+        "retention_events": [_json_row(row) for row in events],
+        "verify_receipts": [_json_row(row) for row in receipts],
+    }
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, sidecar)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    print(f"deletion-evidence downgrade export: {sidecar}", flush=True)
+    return sidecar
+
+
+def _transform_retention_events_for_legacy() -> None:
+    """Map exact legacy equivalents and remove sidecar-exported-only events."""
+
+    bind = op.get_bind()
+    for current, legacy in _DOWNGRADE_ACTION_MAP.items():
+        bind.execute(
+            sa.text(
+                "UPDATE retention_event SET action = :legacy "
+                "WHERE action = :current AND subject_type = 'intake' "
+                "AND intake_id IS NOT NULL AND subject_id = intake_id"
+            ),
+            {"current": current, "legacy": legacy},
         )
-        .mappings()
+    bind.execute(
+        sa.text(
+            "DELETE FROM retention_event WHERE "
+            f"action NOT IN ({_LEGACY_ACTION_SQL}) "
+            "OR subject_type != 'intake' OR intake_id IS NULL OR subject_id != intake_id"
+        )
     )
-    offenders = list(rows)
-    if not offenders:
-        return
-    rendered = "; ".join(
-        "event_id={event_id} action={action!r} subject={subject_type}:{subject_id!r} "
-        "intake_id={intake_id!r}".format(**row)
-        for row in offenders
+
+
+def _downgrade_sidecar_path() -> Path:
+    """Choose a unique sidecar beside the SQLite catalog when possible."""
+
+    database = op.get_bind().engine.url.database
+    base = (
+        Path(database).expanduser().resolve()
+        if database and database != ":memory:"
+        else (Path.cwd() / "sutradhara.db").resolve()
     )
-    raise RuntimeError(
-        "cannot downgrade deletion-evidence schema without losing unsupported "
-        f"retention events; offending rows: {rendered}"
-    )
+    return base.with_name(f"{base.name}.deletion-evidence-downgrade-{uuid.uuid4().hex}.json")
+
+
+def _json_row(row: Any) -> dict[str, Any]:
+    """Render one SQLAlchemy mapping with durable encodings for binary values."""
+
+    return {str(key): _json_value(value) for key, value in row.items()}
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {"encoding": "hex", "value": value.hex()}
+    if isinstance(value, (dt.datetime, dt.date, dt.time)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
