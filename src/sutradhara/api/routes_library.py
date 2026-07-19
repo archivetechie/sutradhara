@@ -18,6 +18,7 @@ import grpc
 from fastapi import APIRouter, Request
 from google.protobuf.empty_pb2 import Empty
 from sqlalchemy import case, func, select
+from sqlalchemy.orm import contains_eager
 
 from sutradhara._proto import layer5_pb2, layer5_pb2_grpc
 from sutradhara.api.console import iso_utc, raise_console_error, require_view, sanitize_text
@@ -28,6 +29,7 @@ from sutradhara.catalog.session import session_scope
 from sutradhara.catalog.types import BackendKind, CopyHealth
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.repopulate import DrillStatus, drill_status
+from sutradhara.replication import _copy_media_id
 
 router = APIRouter()
 
@@ -56,6 +58,7 @@ class _TapeGroup:
     backend_kind: str
     pool_id: str | None
     media_id: str
+    display_label: str | None
     library: str | None
     copy_ids: set[int]
     health_by_copy: dict[int, str]
@@ -155,11 +158,16 @@ def get_library_tapes(request: Request, limit: str | None = None) -> dict[str, o
     is_admin = identity.has_capability("can_admin")
     catalog = _tape_catalog(request)
     with session_scope(request.app.state.engine) as session:
-        confirmed_media_ids = set(session.scalars(select(OffsiteConfirmation.media_id)))
+        confirmed_media_ids = set(
+            session.scalars(
+                select(OffsiteConfirmation.media_id).where(OffsiteConfirmation.revoked_at.is_(None))
+            )
+        )
         copy_rows = list(
             session.execute(
                 select(Copy, Backend)
                 .join(Backend, Copy.backend_id == Backend.id)
+                .options(contains_eager(Copy.backend))
                 .where(Backend.kind.in_(TAPE_BACKENDS), Copy.deleted_at.is_(None))
                 .order_by(Backend.name, Copy.pool_id, Copy.id)
             )
@@ -205,14 +213,14 @@ def get_library_drives(request: Request) -> dict[str, object]:
             state_library = _effective_library(state.library, listed_library)
             if state_library.product_revision not in VTL_REVISIONS:
                 continue
-            libraries.append(
-                _library_payload(state, library=state_library, is_admin=is_admin)
-            )
+            libraries.append(_library_payload(state, library=state_library, is_admin=is_admin))
     except grpc.RpcError:
         raise_console_error(503, "unavailable", "remanence library service unreachable")
     finally:
         clients.close()
-    libraries.sort(key=lambda row: (_revision_rank(str(row["changer_revision"])), str(row["library"])))
+    libraries.sort(
+        key=lambda row: (_revision_rank(str(row["changer_revision"])), str(row["library"]))
+    )
     return {"libraries": libraries}
 
 
@@ -269,9 +277,14 @@ def _group_tape_copies(
     groups: dict[tuple[str, str, str | None, str], _TapeGroup] = {}
     for copy, backend in rows:
         backend_kind = _value(backend.kind)
-        media_id, library = _media_identity(copy, backend_kind=backend_kind, catalog=catalog)
+        media_id = _copy_media_id(copy)
         if media_id is None:
             media_id = _fallback_media_id(copy)
+        display_label, library = _media_display(
+            copy,
+            backend_kind=backend_kind,
+            catalog=catalog,
+        )
         key = (_text(backend.name), backend_kind, copy.pool_id, media_id)
         group = groups.setdefault(
             key,
@@ -280,6 +293,7 @@ def _group_tape_copies(
                 backend_kind=backend_kind,
                 pool_id=None if copy.pool_id is None else _text(copy.pool_id),
                 media_id=media_id,
+                display_label=display_label,
                 library=library,
                 copy_ids=set(),
                 health_by_copy={},
@@ -296,12 +310,14 @@ def _group_tape_copies(
     return list(groups.values())
 
 
-def _media_identity(
+def _media_display(
     copy: Copy,
     *,
     backend_kind: str,
     catalog: _TapeCatalog,
 ) -> tuple[str | None, str | None]:
+    """Return operator-facing media labeling, separate from canonical identity."""
+
     locator = copy.native_locator or {}
     uuid_keys = ("tape_uuid", "volume_uuid")
     for key in uuid_keys:
@@ -336,6 +352,7 @@ def _tape_payload(
     return {
         "tape_key": _tape_key(group),
         "media_id": media_id if is_admin else None,
+        "display_label": group.display_label if is_admin else None,
         "backend_name": group.backend_name,
         "backend_kind": group.backend_kind,
         "pool_id": group.pool_id,
@@ -359,13 +376,7 @@ def _tape_key(group: _TapeGroup) -> str:
 
 
 def _is_offsite_confirmed(media_id: str, confirmed_media_ids: set[str]) -> bool:
-    return _canonical_offsite_media_id(media_id) in confirmed_media_ids
-
-
-def _canonical_offsite_media_id(media_id: str) -> str:
-    """Return the OffsiteConfirmation.media_id form written by offsite confirm."""
-
-    return f"tape:{media_id}"
+    return media_id in confirmed_media_ids
 
 
 def _health_rollup(health_by_copy: dict[int, str]) -> str:

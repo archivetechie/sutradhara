@@ -154,7 +154,7 @@ def _insert_intake(
             operator=operator,
             device_id=device_id,
             idempotency_key=f"key-{intake_id}",
-            source_plan_digest=f"{intake_id}".encode("utf-8").hex().ljust(64, "0")[:64],
+            source_plan_digest=f"{intake_id}".encode().hex().ljust(64, "0")[:64],
             artifactclass=artifactclass,
             source_kind=source_kind,
             source_ref=source_ref,

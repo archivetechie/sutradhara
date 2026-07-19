@@ -14,8 +14,8 @@ from sqlalchemy import Engine, select
 import sutradhara.hdcache.repopulate as repop_module
 import sutradhara.jobs.handlers as _handlers  # noqa: F401
 from sutradhara.archive_restore import restore_assets_from_bundle
-from sutradhara.backend.port import ByteRange
 from sutradhara.backend.memory import MemoryBackend
+from sutradhara.backend.port import ByteRange
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     ArtifactClassPool,

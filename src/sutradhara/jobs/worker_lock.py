@@ -58,10 +58,7 @@ def worker_lock(engine_or_url: Engine | str) -> Iterator[Path]:
 
 
 def _lockfile_for(engine_or_url: Engine | str) -> Path:
-    if isinstance(engine_or_url, Engine):
-        url = engine_or_url.url
-    else:
-        url = make_url(engine_or_url)
+    url = engine_or_url.url if isinstance(engine_or_url, Engine) else make_url(engine_or_url)
     if url.drivername.startswith("sqlite") and url.database not in {None, "", ":memory:"}:
         db_path = Path(url.database).expanduser()
         if not db_path.is_absolute():

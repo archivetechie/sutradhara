@@ -44,7 +44,6 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.types import (
     ArrangementStatus,
-    BackendKind,
     IntakeStatus,
     RetentionState,
     SubmissionStatus,
@@ -56,12 +55,19 @@ from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED, CONDITION_
 from sutradhara.jobs.reconcilers.derivation import DOMAIN as DERIVATION_DOMAIN
 from sutradhara.jobs.reconcilers.derivation import make_target_key
 from sutradhara.jobs.reconcilers.profiles import entries_for
-from sutradhara.replication import PoolTarget, _copy_media_id, target_pools
+from sutradhara.replication import (
+    PoolTarget,
+    ReplicationError,
+    ReplicationPolicyMissing,
+    _copy_media_id,
+    target_pools,
+)
 from sutradhara.restore import _fsync_directory
 
 DEFAULT_STAGING_GRACE_DAYS = 30
 DEFAULT_BATCH_LIMIT = 25
 RECENT_FLIP_WINDOW = dt.timedelta(hours=24)
+WITNESS_MAX_AGE = dt.timedelta(seconds=5)
 CLOUD_BLOB_PREFIX = "cloud-blob:"
 POLICY_FINGERPRINT_VERSION = "v1"
 TOMBSTONE_BASENAME_VERSION = "v1"
@@ -69,17 +75,13 @@ TERMINAL_DERIVATION_CONDITIONS = {CONDITION_SATISFIED, CONDITION_BLOCKED}
 
 _EVENT_DETAIL_KEYS: dict[str, frozenset[str]] = {
     "released": frozenset({"copy_ids"}),
-    "cloud_blob_deleted": frozenset(
-        {"bundle_id", "copy_ids", "outcome", "copy_outcomes"}
-    ),
+    "cloud_blob_deleted": frozenset({"bundle_id", "copy_ids", "outcome", "copy_outcomes"}),
     "staging_deleted": frozenset({"path"}),
     "release_attempted": frozenset({"policy_fingerprint"}),
     "purge_attempted": frozenset({"path", "grace_days"}),
     "staging_tombstoned": frozenset({"source_path", "tombstone_path"}),
     "staging_purge_held": frozenset({"reasons"}),
-    "batch_invoked": frozenset(
-        {"action", "limit", "candidate_count", "dry_run", "refused"}
-    ),
+    "batch_invoked": frozenset({"action", "limit", "candidate_count", "dry_run", "refused"}),
     "batch_refused": frozenset(
         {"action", "limit", "candidate_count", "dry_run", "refused", "reason"}
     ),
@@ -173,6 +175,7 @@ class BatchCandidate:
     """Read-only tripwire evidence for one intake."""
 
     intake_id: str
+    release_condition: str
     evidence: tuple[str, ...]
     recent_flip: bool
 
@@ -208,7 +211,9 @@ class RetentionBatchResult:
 
 @dataclass(frozen=True)
 class _WitnessEvidence:
-    result: WitnessResult
+    eligible: bool
+    result: WitnessResult | None
+    observed_at: dt.datetime
 
 
 WitnessAnswers = dict[int, _WitnessEvidence]
@@ -401,15 +406,17 @@ def run_retention(
     if row.retention_state != RetentionState.HELD:
         return RetentionRunResult(intake_id, False, (), f"state={row.retention_state}")
 
-    witnesses = _witness_answers
-    if witnesses is None:
-        witnesses = _collect_witness_answers(session, tuple(_intake_items(session, row)))
+    items = tuple(_intake_items(session, row))
+    witnesses = _fresh_witness_answers(session, items, _witness_answers)
     precheck = _local_gate_status(session, row, witnesses, require_held=True)
     if not precheck.releasable:
         return RetentionRunResult(intake_id, False, (), _hold_reason(precheck))
 
     operation_id = f"release:{intake_id}"
     session.commit()
+    row = _require_intake(session, intake_id)
+    items = tuple(_intake_items(session, row))
+    witnesses = _fresh_witness_answers(session, items, witnesses)
     _begin_immediate(session)
     row = _require_intake(session, intake_id)
     reserved = _local_gate_status(session, row, witnesses, require_held=True)
@@ -509,9 +516,8 @@ def sweep_staging(
     if row.retention_state != RetentionState.RELEASED or row.released_at is None:
         return StagingSweepResult(intake_id, False, None, f"state={row.retention_state}")
 
-    witnesses = _witness_answers
-    if witnesses is None:
-        witnesses = _collect_witness_answers(session, tuple(_intake_items(session, row)))
+    items = tuple(_intake_items(session, row))
+    witnesses = _fresh_witness_answers(session, items, _witness_answers)
     precheck_holds = _purge_holds(
         session,
         row,
@@ -533,6 +539,9 @@ def sweep_staging(
 
     operation_id = f"purge:{intake_id}"
     session.commit()
+    row = _require_intake(session, intake_id)
+    items = tuple(_intake_items(session, row))
+    witnesses = _fresh_witness_answers(session, items, witnesses)
     _begin_immediate(session)
     row = _require_intake(session, intake_id)
     reservation_holds = _purge_holds(
@@ -556,6 +565,11 @@ def sweep_staging(
     )
     session.commit()
 
+    # Transaction A's commit releases the reservation.  Re-observe any stale
+    # remote evidence before transaction B makes the irreversible rename.
+    row = _require_intake(session, intake_id)
+    items = tuple(_intake_items(session, row))
+    witnesses = _fresh_witness_answers(session, items, witnesses)
     _begin_immediate(session)
     row = _require_intake(session, intake_id)
     commitment_holds = _purge_holds(
@@ -603,7 +617,11 @@ def run_retention_batch(
     rows = _candidate_intakes(session, intake_id, (RetentionState.HELD,))
     assessments = [(_assess_intake(session, row), row.intake_id) for row in rows]
     candidates = tuple(
-        _batch_candidate(session, assessment.status)
+        _batch_candidate(
+            session,
+            assessment.status,
+            release_condition="release:full-gate-satisfied",
+        )
         for assessment, _ in assessments
         if assessment.status.releasable
     )
@@ -640,7 +658,9 @@ def run_retention_batch(
                         _witness_answers=assessment.witnesses,
                     )
                 )
-    all_held = not candidates
+    all_held = (
+        not candidates if dry_run or refused else not any(result.released for result in results)
+    )
     reason = (
         "batch-limit-exceeded"
         if refused
@@ -723,7 +743,15 @@ def sweep_staging_batch(
         (_assess_intake(session, row, grace_days=grace_days), row.intake_id) for row in rows
     ]
     candidates = tuple(
-        _batch_candidate(session, assessment.status)
+        _batch_candidate(
+            session,
+            assessment.status,
+            release_condition=(
+                "purge:tombstone-gc-pending"
+                if assessment.status.purge_status.status == "tombstone-gc-pending"
+                else "purge:full-gate-satisfied-and-grace-expired"
+            ),
+        )
         for assessment, _ in assessments
         if assessment.status.purge_status.status in ("eligible", "tombstone-gc-pending")
     )
@@ -760,7 +788,9 @@ def sweep_staging_batch(
                         _grace_override_evented=True,
                     )
                 )
-    all_held = not candidates
+    all_held = (
+        not candidates if dry_run or refused else not any(result.purged for result in results)
+    )
     reason = (
         "batch-limit-exceeded"
         if refused
@@ -965,6 +995,26 @@ def _asset_gate_status(
     witnesses: WitnessAnswers | None = None,
 ) -> AssetGateStatus:
     """Existing per-item gate, extended with cached independent witnesses."""
+    try:
+        targets = _policy_targets(session, item.artifactclass)
+    except (ReplicationError, ValueError) as exc:
+        reason = _policy_expansion_hold(exc)
+        return AssetGateStatus(
+            ingest_item_id=item.id,
+            logical_asset_hash=item.logical_asset_hash.hex(),
+            artifactclass=item.artifactclass,
+            releasable=False,
+            pools=(
+                PoolGateStatus(
+                    pool_id="<policy>",
+                    offsite_gate=False,
+                    satisfied=False,
+                    copy_id=None,
+                    media_id=None,
+                    reason=reason,
+                ),
+            ),
+        )
     pool_statuses = tuple(
         _pool_gate_status(
             session,
@@ -972,7 +1022,7 @@ def _asset_gate_status(
             target,
             witnesses=witnesses or {},
         )
-        for target in _policy_targets(session, item.artifactclass)
+        for target in targets
     )
     return AssetGateStatus(
         ingest_item_id=item.id,
@@ -1016,14 +1066,19 @@ def _pool_gate_status(
         )
     confirmed = _confirmed_media_ids(session) if target.offsite_gate else set()
     saw_missing_media = False
-    saw_rem_hold = False
+    saw_witness_hold = False
     for copy in candidates:
         witness = witnesses.get(copy.id)
-        if witness is not None and not witness.result.confirmed:
-            saw_rem_hold = True
-            continue
-        if copy.backend.kind == BackendKind.REM_TAPE and witness is None:
-            saw_rem_hold = True
+        if witness is None:
+            try:
+                witness_eligible = factory.backend_declares_retention_witness(copy.backend)
+            except Exception:
+                witness_eligible = True
+            if witness_eligible:
+                saw_witness_hold = True
+                continue
+        elif witness.eligible and (witness.result is None or not witness.result.confirmed):
+            saw_witness_hold = True
             continue
         media_id = _copy_media_id(copy)
         if target.offsite_gate:
@@ -1041,7 +1096,7 @@ def _pool_gate_status(
         )
     reason = (
         "rem-unconfirmed"
-        if saw_rem_hold
+        if saw_witness_hold
         else "missing-media-id"
         if saw_missing_media
         else "offsite-unconfirmed"
@@ -1081,7 +1136,11 @@ def _collect_witness_answers(
     answers: WitnessAnswers = {}
     seen: set[int] = set()
     for item in items:
-        for target in _policy_targets(session, item.artifactclass):
+        try:
+            targets = _policy_targets(session, item.artifactclass)
+        except (ReplicationError, ValueError):
+            continue
+        for target in targets:
             for copy in _qualifying_copies_for_pool(
                 session,
                 item.logical_asset_hash,
@@ -1092,24 +1151,75 @@ def _collect_witness_answers(
                     continue
                 seen.add(copy.id)
                 try:
+                    eligible = factory.backend_declares_retention_witness(copy.backend)
+                except Exception as exc:
+                    answers[copy.id] = _WitnessEvidence(
+                        eligible=True,
+                        result=WitnessResult(
+                            False,
+                            f"witness capability unavailable: {exc}",
+                        ),
+                        observed_at=_utcnow(),
+                    )
+                    continue
+                if not eligible:
+                    answers[copy.id] = _WitnessEvidence(
+                        eligible=False,
+                        result=None,
+                        observed_at=_utcnow(),
+                    )
+                    continue
+                try:
                     adapter = factory.backend_from_row(copy.backend)
                     if not isinstance(adapter, RetentionWitnessBackend):
-                        if copy.backend.kind == BackendKind.REM_TAPE:
-                            answers[copy.id] = _WitnessEvidence(
-                                WitnessResult(False, "rem adapter lacks witness capability")
-                            )
+                        answers[copy.id] = _WitnessEvidence(
+                            eligible=True,
+                            result=WitnessResult(
+                                False,
+                                "adapter declares but does not implement witness capability",
+                            ),
+                            observed_at=_utcnow(),
+                        )
                         continue
                     result = adapter.witness_copy(
                         copy.native_locator,
                         expected_hash=copy.integrity_hash,
                     )
-                    answers[copy.id] = _WitnessEvidence(result)
+                    answers[copy.id] = _WitnessEvidence(
+                        eligible=True,
+                        result=result,
+                        observed_at=_utcnow(),
+                    )
                 except Exception as exc:
-                    if copy.backend.kind == BackendKind.REM_TAPE:
-                        answers[copy.id] = _WitnessEvidence(
-                            WitnessResult(False, f"witness unavailable: {exc}")
-                        )
+                    answers[copy.id] = _WitnessEvidence(
+                        eligible=True,
+                        result=WitnessResult(False, f"witness unavailable: {exc}"),
+                        observed_at=_utcnow(),
+                    )
     return answers
+
+
+def _fresh_witness_answers(
+    session: Session,
+    items: tuple[IngestItem, ...],
+    answers: WitnessAnswers | None,
+) -> WitnessAnswers:
+    """Reuse witness evidence only while every observation remains fresh."""
+
+    if answers is None:
+        return _collect_witness_answers(session, items)
+    now = _utcnow()
+    if any(now - _as_utc(answer.observed_at) > WITNESS_MAX_AGE for answer in answers.values()):
+        return _collect_witness_answers(session, items)
+    return answers
+
+
+def _policy_expansion_hold(exc: Exception) -> str:
+    """Turn policy expansion failures into stable fail-closed gate evidence."""
+
+    if isinstance(exc, ReplicationPolicyMissing):
+        return "policy-missing"
+    return f"policy-invalid:{type(exc).__name__}:{exc}"
 
 
 def _policy_targets(session: Session, artifactclass: str) -> list[PoolTarget]:
@@ -1158,7 +1268,7 @@ def _policy_fingerprint(session: Session, items: tuple[IngestItem, ...]) -> str:
                     "backend_name": backend.name,
                     "backend_kind": str(backend.kind),
                     "offsite_gate": pool.offsite_gate,
-                    "witness_eligible": backend.kind == BackendKind.REM_TAPE,
+                    "witness_eligible": factory.backend_declares_retention_witness(backend),
                 }
             )
         snapshot.append({"artifactclass": artifactclass, "pools": pools})
@@ -1416,7 +1526,14 @@ def _hold_reason(status: IntakeGateStatus) -> str:
     return f"state={status.retention_state}"
 
 
-def _batch_candidate(session: Session, status: IntakeGateStatus) -> BatchCandidate:
+def _batch_candidate(
+    session: Session,
+    status: IntakeGateStatus,
+    *,
+    release_condition: str,
+) -> BatchCandidate:
+    """Capture one candidate under the explicit condition that releases it."""
+
     selected = [pool for asset in status.assets for pool in asset.pools if pool.satisfied]
     evidence = tuple(
         f"asset:{asset.ingest_item_id}:pool:{pool.pool_id}:copy:{pool.copy_id}"
@@ -1431,7 +1548,7 @@ def _batch_candidate(session: Session, status: IntakeGateStatus) -> BatchCandida
         if pool.copy_id is not None
         for copy in (session.get(Copy, pool.copy_id),)
     )
-    return BatchCandidate(status.intake_id, evidence, recent)
+    return BatchCandidate(status.intake_id, release_condition, evidence, recent)
 
 
 def _record_batch_invocation(
@@ -1579,9 +1696,7 @@ def _validate_event_detail(action: str, detail: dict[str, object]) -> None:
     if actual != expected:
         missing = sorted(expected - actual)
         unknown = sorted(actual - expected)
-        raise ValueError(
-            f"invalid {action} detail keys: missing={missing!r} unknown={unknown!r}"
-        )
+        raise ValueError(f"invalid {action} detail keys: missing={missing!r} unknown={unknown!r}")
     if action == "cloud_blob_deleted" and detail["outcome"] not in {
         "deleted",
         "already-absent",

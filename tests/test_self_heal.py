@@ -316,6 +316,7 @@ def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
             key_epoch=ARCHIVE_EPOCH,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
+            execution_id="self-heal:noop",
         )
 
     assert repaired == []
@@ -336,6 +337,7 @@ def test_self_heal_raises_when_no_healthy_source_remains(engine: Engine) -> None
             key_epoch=ARCHIVE_EPOCH,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
+            execution_id="self-heal:no-source",
         )
 
 
@@ -386,6 +388,7 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
             key_epoch=key_id,
             opener=opener,
             sealer=sealer,
+            execution_id="self-heal:rebuild-encrypted",
         )
         status = replication_status(
             s,
@@ -453,6 +456,7 @@ def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
             key_epoch=current_key_id,
             opener=opener,
             sealer=sealer,
+            execution_id="self-heal:rotated-key",
         )
 
     assert len(repaired) == 1
@@ -492,9 +496,52 @@ def test_self_heal_marks_bad_source_suspect_on_candidate_exhaustion(
                 key_epoch=ARCHIVE_EPOCH,
                 opener=_FakeOpener(),
                 sealer=_FakeSealer(),
+                execution_id="self-heal:content-corrupt",
             )
         copy = s.scalars(select(Copy)).one()
         assert copy.health == CopyHealth.SUSPECT
+
+
+def test_self_heal_preserves_corrupt_for_measured_stored_byte_mismatch(
+    engine: Engine,
+) -> None:
+    """Self-heal must not downgrade recorder-proven CORRUPT to SUSPECT."""
+
+    data = b"stored bytes originally sound"
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
+    backend = _backend()
+    source_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::" + data)
+
+    with session_scope(engine) as session:
+        copy, _ = add_copy(
+            session,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=source_record.native_locator,
+            integrity_hash=source_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-1-pool",
+            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+        )
+        _record_fixture_measurement(session, copy, backend)
+        backend._objects[str(source_record.native_locator["object_id"])] = b"tampered stored"
+
+        with pytest.raises(SelfHealUnavailable, match="stored-corrupt"):
+            self_heal(
+                session,
+                asset_hash,
+                "o-archive",
+                backends={backend_id: backend},
+                key_epoch=ARCHIVE_EPOCH,
+                opener=_FakeOpener(),
+                sealer=_FakeSealer(),
+                execution_id="self-heal:stored-corrupt",
+            )
+
+        assert copy.health == CopyHealth.CORRUPT
+        assert copy.last_measured_digest != copy.integrity_hash
 
 
 def test_self_heal_falls_back_after_proven_bad_source(
@@ -567,6 +614,7 @@ def test_self_heal_falls_back_after_proven_bad_source(
             key_epoch=ARCHIVE_EPOCH,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
+            execution_id="self-heal:fallback-corrupt",
         )
 
         assert bad_copy.health == CopyHealth.SUSPECT
@@ -646,6 +694,7 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             key_epoch=ARCHIVE_EPOCH,
             opener=_FakeOpener(),
             sealer=_FakeSealer(),
+            execution_id="self-heal:fallback-transport",
         )
 
         assert first_copy.health == CopyHealth.OK
@@ -698,6 +747,7 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
             opener=RaoCliOpener(registry),
             sealer=RaoCliSealer(registry),
             key_epoch=epoch.key_id,
+            execution_id="self-heal:rao",
         )
         [rebuilt] = repaired
         stored = backend.read_range(rebuilt.native_locator, ByteRange(0, 0))

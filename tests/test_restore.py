@@ -215,7 +215,13 @@ def _restore_to_destination(
     opener: _FakeOpener,
     destination: Path,
 ) -> None:
-    with restore_copy(session, copy, backend=backend, opener=opener) as result:
+    with restore_copy(
+        session,
+        copy,
+        backend=backend,
+        opener=opener,
+        execution_id=f"restore-test:{copy.id}:{destination.name}",
+    ) as result:
         atomic_write_verified_file(result.path, destination)
 
 
@@ -246,9 +252,7 @@ def test_restore_copy_round_trips_asset_per_representation(
         ) as result:
             atomic_write_verified_file(result.path, dest)
         assert copy.last_measured_digest == copy.integrity_hash
-        receipt = s.scalars(
-            select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)
-        ).one()
+        receipt = s.scalars(select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)).one()
         assert receipt.source == "restore"
         assert receipt.execution_id == f"restore-request:{representation.value}"
 
@@ -276,7 +280,13 @@ def test_restore_copy_reads_suspect_direct_copy(
     with session_scope(engine) as s:
         copy = s.get(Copy, copy_id)
         assert copy is not None
-        with restore_copy(s, copy, backend=backend, opener=opener) as result:
+        with restore_copy(
+            s,
+            copy,
+            backend=backend,
+            opener=opener,
+            execution_id="restore-test:suspect",
+        ) as result:
             atomic_write_verified_file(result.path, dest)
 
     assert dest.read_bytes() == data
@@ -385,7 +395,13 @@ def test_restore_copy_temp_lifetime(engine: Engine) -> None:
     with session_scope(engine) as s:
         copy = s.get(Copy, copy_id)
         assert copy is not None
-        with restore_copy(s, copy, backend=backend, opener=opener) as restored:
+        with restore_copy(
+            s,
+            copy,
+            backend=backend,
+            opener=opener,
+            execution_id="restore-test:temp-lifetime",
+        ) as restored:
             temp_path = restored.path
             assert temp_path.exists()
             assert temp_path.read_bytes() == b"temp lifetime"

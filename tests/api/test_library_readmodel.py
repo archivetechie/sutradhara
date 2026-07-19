@@ -17,6 +17,7 @@ from sutradhara.catalog.models import Backend, Copy, LogicalAsset, OffsiteConfir
 from sutradhara.catalog.session import locator_key, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, MediaKind
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
+from sutradhara.retention import confirm_offsite
 from tests.api.conftest import auth_headers, make_api_app
 
 DISK_PUBLIC_KEYS = {
@@ -40,6 +41,7 @@ DISK_ADMIN_KEYS = {
 TAPE_KEYS = {
     "tape_key",
     "media_id",
+    "display_label",
     "backend_name",
     "backend_kind",
     "pool_id",
@@ -182,16 +184,18 @@ def test_library_tapes_grouping_opacity_admin_shaping_and_offsite_match(
         )
         session.add(
             OffsiteConfirmation(
-                media_id="tape:VOL001",
+                media_id=f"tape:{tape_uuid}",
                 confirmed_by="ops",
                 confirmed_at=verified,
             )
         )
         session.add(
             OffsiteConfirmation(
-                media_id="D2T001L7",
+                media_id=f"d2tape:{d2_uuid}",
                 confirmed_by="ops",
                 confirmed_at=verified,
+                revoked_at=verified + dt.timedelta(hours=1),
+                revoked_by="reviewer",
             )
         )
     app = make_api_app(api_engine)
@@ -213,23 +217,41 @@ def test_library_tapes_grouping_opacity_admin_shaping_and_offsite_match(
     assert viewer_body["truncated"] is False
     assert all(set(row) == TAPE_KEYS for row in viewer_body["tapes"])
     assert all(row["media_id"] is None for row in viewer_body["tapes"])
+    assert all(row["display_label"] is None for row in viewer_body["tapes"])
     assert "VOL001" not in json.dumps(viewer_body)
     assert "D2T001L7" not in json.dumps(viewer_body)
 
     admin_by_media = {row["media_id"]: row for row in admin_body["tapes"]}
-    assert set(admin_by_media) == {"VOL001", "D2T001L7"}
-    rem_row = admin_by_media["VOL001"]
+    assert set(admin_by_media) == {f"tape:{tape_uuid}", f"d2tape:{d2_uuid}"}
+    rem_row = admin_by_media[f"tape:{tape_uuid}"]
+    assert rem_row["display_label"] == "VOL001"
     assert rem_row["object_count"] == 2
     assert rem_row["health_rollup"] == "suspect"
     assert rem_row["library"] == "mainlib"
     assert rem_row["last_checked_at"] == (verified + dt.timedelta(minutes=5)).isoformat()
     assert rem_row["offsite_confirmed"] is True
-    assert admin_by_media["D2T001L7"]["offsite_confirmed"] is False
+    d2_row = admin_by_media[f"d2tape:{d2_uuid}"]
+    assert d2_row["display_label"] == "D2T001L7"
+    assert d2_row["offsite_confirmed"] is False
     assert rem_row["tape_key"].startswith("tape_")
     assert "VOL001" not in rem_row["tape_key"]
     viewer_keys = {row["backend_name"]: row["tape_key"] for row in viewer_body["tapes"]}
     admin_keys = {row["backend_name"]: row["tape_key"] for row in admin_body["tapes"]}
     assert viewer_keys == admin_keys
+
+    with session_scope(api_engine) as session:
+        row, changed = confirm_offsite(
+            session,
+            media_id=f"d2tape:{d2_uuid}",
+            confirmed_by="ops-2",
+        )
+        assert changed is True
+        assert row.revoked_at is None
+        assert row.revoked_by is None
+    reconfirmed = client.get("/api/ui/library/tapes", headers=auth_headers("admin"))
+    assert reconfirmed.status_code == 200
+    reconfirmed_by_media = {row["media_id"]: row for row in reconfirmed.json()["tapes"]}
+    assert reconfirmed_by_media[f"d2tape:{d2_uuid}"]["offsite_confirmed"] is True
 
 
 def test_library_drives_two_vtl_filter_and_admin_shaping(api_engine: Engine) -> None:
@@ -349,7 +371,9 @@ class _FakeLibraryClient:
     def __init__(self, states: dict[bytes, layer5_pb2.LibraryState]) -> None:
         self.states = states
 
-    def ListLibraries(self, request: object, timeout: float | None = None) -> layer5_pb2.ListLibrariesResponse:
+    def ListLibraries(
+        self, request: object, timeout: float | None = None
+    ) -> layer5_pb2.ListLibrariesResponse:
         del request, timeout
         return layer5_pb2.ListLibrariesResponse(
             libraries=[state.library for state in self.states.values()]

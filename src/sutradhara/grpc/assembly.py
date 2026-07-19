@@ -22,14 +22,15 @@ from sutradhara_receive import (
     BAG_PROFILE,
     CANONICALIZATION_VERSION,
     PACKAGE_INDEX_NAME,
-    PACKAGE_PROFILE_HASH,
     PACKAGE_PROFILE_VERSION,
     ReceiveError,
     bag_info_metadata,
     build_package_index,
     canonicalize_manifest_path,
-    manifest_digest as receive_manifest_digest,
     write_bagit_files,
+)
+from sutradhara_receive import (
+    manifest_digest as receive_manifest_digest,
 )
 
 

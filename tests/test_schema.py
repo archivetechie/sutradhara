@@ -281,9 +281,7 @@ def _assert_retention_invariants(db_path: Path) -> None:
     receipt_sql = _table_sql(db_path, "verify_receipt")
     assert "ck_verify_receipt_source" in receipt_sql
     assert "ck_verify_receipt_scrub_unmeasured" in receipt_sql
-    assert ("source", "execution_id", "copy_id") in _unique_index_columns(
-        db_path, "verify_receipt"
-    )
+    assert ("source", "execution_id", "copy_id") in _unique_index_columns(db_path, "verify_receipt")
 
 
 def _assert_grpc_relay_invariants(db_path: Path) -> None:
@@ -527,6 +525,178 @@ def test_deletion_evidence_migration_recreates_raw_sql_health_trigger(
     assert "last_verified_at" in columns
     assert "last_checked_at" not in columns
     assert _trigger_sql(db_path, "trg_copy_health_changed_at") is None
+
+
+def test_retention_event_subject_constraint_rejects_raw_sql_mispairing(
+    tmp_path: Path,
+) -> None:
+    """Every raw-SQL subject class enforces its intake-FK pairing contract."""
+
+    db_path = tmp_path / "retention-event-subjects.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    now = "2026-07-19 00:00:00"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO intake "
+            "(intake_id, operator, source_kind, artifactclass, status, created_at, "
+            "updated_at, retention_state) VALUES "
+            "('subject-intake', 'ops', 'card', 'masters', 'registered', ?, ?, 'held')",
+            (now, now),
+        )
+        valid_rows = (
+            (
+                "subject-intake",
+                "intake",
+                "subject-intake",
+                "staging_purge_held",
+                "subject:intake",
+            ),
+            (None, "media", "tape:abc", "offsite_confirmed", "subject:media"),
+            (None, "batch", "batch:1", "batch_invoked", "subject:batch"),
+        )
+        for intake_id, subject_type, subject_id, action, operation_id in valid_rows:
+            conn.execute(
+                "INSERT INTO retention_event "
+                "(intake_id, subject_type, subject_id, action, operation_id, actor, at) "
+                "VALUES (?, ?, ?, ?, ?, 'ops', ?)",
+                (intake_id, subject_type, subject_id, action, operation_id, now),
+            )
+        conn.commit()
+
+        invalid_rows = (
+            (None, "intake", "subject-intake", "staging_purge_held", "bad:intake"),
+            (
+                "subject-intake",
+                "media",
+                "tape:abc",
+                "offsite_confirmed",
+                "bad:media",
+            ),
+            (
+                "subject-intake",
+                "batch",
+                "batch:1",
+                "batch_invoked",
+                "bad:batch",
+            ),
+        )
+        for row in invalid_rows:
+            with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+                conn.execute(
+                    "INSERT INTO retention_event "
+                    "(intake_id, subject_type, subject_id, action, operation_id, actor, at) "
+                    "VALUES (?, ?, ?, ?, ?, 'ops', ?)",
+                    (*row, now),
+                )
+            conn.rollback()
+
+        assert conn.execute("SELECT count(*) FROM retention_event").fetchone() == (3,)
+
+
+def test_deletion_evidence_downgrade_transforms_new_intake_states(
+    tmp_path: Path,
+) -> None:
+    """TOMBSTONED/ABANDONED rows survive a clean head/down/up cycle."""
+
+    db_path = tmp_path / "deletion-evidence-state-roundtrip.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    now = "2026-07-19 00:00:00"
+    with sqlite3.connect(db_path) as conn:
+        base = (
+            "INSERT INTO intake "
+            "(intake_id, operator, source_kind, artifactclass, status, created_at, "
+            "updated_at, retention_state, staging_tombstoned_at, staging_tombstone_path) "
+            "VALUES (?, 'ops', 'card', 'masters', 'registered', ?, ?, ?, ?, ?)"
+        )
+        conn.execute(
+            base,
+            ("state-tombstoned", now, now, "tombstoned", now, "/tmp/tombstone"),
+        )
+        conn.execute(
+            base,
+            ("state-abandoned", now, now, "abandoned", None, None),
+        )
+        conn.commit()
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "c8d2e4f6a1b3"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        states = dict(conn.execute("SELECT intake_id, retention_state FROM intake"))
+        deleted_at = conn.execute(
+            "SELECT staging_deleted_at FROM intake WHERE intake_id='state-tombstoned'"
+        ).fetchone()
+    assert states == {"state-tombstoned": "purged", "state-abandoned": "held"}
+    assert deleted_at is not None
+    assert deleted_at[0] is not None
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        assert dict(conn.execute("SELECT intake_id, retention_state FROM intake")) == states
+
+
+def test_deletion_evidence_downgrade_lists_unrepresentable_events(
+    tmp_path: Path,
+) -> None:
+    """Downgrade refuses audit rows that cannot be encoded honestly in v0."""
+
+    db_path = tmp_path / "deletion-evidence-downgrade-refusal.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO retention_event "
+            "(subject_type, subject_id, action, operation_id, actor, at) VALUES "
+            "('batch', 'batch:refuse', 'batch_invoked', 'batch:refuse', 'ops', "
+            "'2026-07-19 00:00:00')"
+        )
+        event_id = conn.execute("SELECT event_id FROM retention_event").fetchone()[0]
+        conn.commit()
+
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "c8d2e4f6a1b3"],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "cannot downgrade deletion-evidence schema" in output
+    assert f"event_id={event_id}" in output
+    assert "action='batch_invoked'" in output
 
 
 def test_retention_event_payload_validation_is_per_action() -> None:

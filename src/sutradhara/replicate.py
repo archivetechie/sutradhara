@@ -71,12 +71,14 @@ def self_heal(
     backends: WritableBackendMap,
 ) -> list[Copy]:
     """Rebuild missing copies through catalog pool membership policy."""
+    execution_id = f"self-heal:{content_type}:{asset_hash.hex()}"
     if content_type not in {"o-archive", "n-archive"}:
         return replication_self_heal(
             session,
             asset_hash,
             content_type,
             backends=backends,
+            execution_id=execution_id,
         )
 
     registry = KeyRegistry()
@@ -89,4 +91,5 @@ def self_heal(
         opener=RaoCliOpener(registry),
         sealer=RaoCliSealer(registry),
         key_epoch=epoch.key_id,
+        execution_id=execution_id,
     )

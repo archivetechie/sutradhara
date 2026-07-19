@@ -253,7 +253,13 @@ def test_reject_gates_restore_globally_and_preservation_is_ungated(
 
         copy = session.get(Copy, copy_id)
         assert copy is not None
-        with restore_copy(session, copy, backend=memory_backend, opener=_RawOpener()) as restored:
+        with restore_copy(
+            session,
+            copy,
+            backend=memory_backend,
+            opener=_RawOpener(),
+            execution_id="restore-test:rejected-asset",
+        ) as restored:
             assert restored.path.read_bytes() == b"reject me"
 
         asset = session.get(LogicalAsset, asset_hash)

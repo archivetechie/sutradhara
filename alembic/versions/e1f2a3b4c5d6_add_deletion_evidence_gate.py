@@ -156,7 +156,8 @@ def upgrade() -> None:
         )
         batch.create_check_constraint(
             "ck_retention_event_subject",
-            "(subject_type = 'intake' AND intake_id = subject_id AND action IN "
+            "(subject_type = 'intake' AND intake_id IS NOT NULL AND "
+            "intake_id = subject_id AND action IN "
             "('released', 'cloud_blob_deleted', 'staging_deleted', 'release_attempted', "
             "'purge_attempted', 'staging_tombstoned', 'staging_purge_held', 'abandoned', "
             "'correction_recorded')) OR "
@@ -217,7 +218,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Remove the deletion-evidence recording schema."""
+    """Remove deletion evidence after explicit compatibility transformations."""
+
+    _assert_legacy_retention_events()
+    # TOMBSTONED has crossed the stage-2 point of no return, so the closest
+    # legacy state is PURGED.  ABANDONED still has its bytes and must map to
+    # HELD so the legacy sweep cannot select it.
+    op.execute(
+        "UPDATE intake SET retention_state = 'purged', "
+        "staging_deleted_at = COALESCE(staging_deleted_at, staging_tombstoned_at, "
+        "CURRENT_TIMESTAMP) WHERE retention_state = 'tombstoned'"
+    )
+    op.execute("UPDATE intake SET retention_state = 'held' WHERE retention_state = 'abandoned'")
 
     op.drop_index("ix_verify_receipt_copy_id", table_name="verify_receipt")
     op.drop_table("verify_receipt")
@@ -295,4 +307,34 @@ def _create_health_trigger() -> None:
         "AFTER UPDATE OF health ON copy "
         "FOR EACH ROW WHEN NEW.health IS NOT OLD.health "
         "BEGIN UPDATE copy SET health_changed_at = CURRENT_TIMESTAMP WHERE id = NEW.id; END"
+    )
+
+
+def _assert_legacy_retention_events() -> None:
+    """Refuse lossy downgrade when an event has no honest legacy encoding."""
+
+    rows = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                "SELECT event_id, action, subject_type, subject_id, intake_id "
+                "FROM retention_event WHERE "
+                "action NOT IN ('released', 'cloud_blob_deleted', 'staging_deleted') "
+                "OR subject_type != 'intake' OR intake_id IS NULL OR subject_id != intake_id "
+                "ORDER BY event_id"
+            )
+        )
+        .mappings()
+    )
+    offenders = list(rows)
+    if not offenders:
+        return
+    rendered = "; ".join(
+        "event_id={event_id} action={action!r} subject={subject_type}:{subject_id!r} "
+        "intake_id={intake_id!r}".format(**row)
+        for row in offenders
+    )
+    raise RuntimeError(
+        "cannot downgrade deletion-evidence schema without losing unsupported "
+        f"retention events; offending rows: {rendered}"
     )

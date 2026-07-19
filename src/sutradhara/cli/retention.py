@@ -11,8 +11,9 @@ import click
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.catalog.models import Intake
+from sutradhara.catalog.models import Copy, Intake
 from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.replication import _copy_media_id
 from sutradhara.retention import (
     DEFAULT_STAGING_GRACE_DAYS,
     RetentionBatchResult,
@@ -46,10 +47,10 @@ def offsite_confirm(
 ) -> None:
     """Confirm one known media id as offsite."""
     try:
-        resolved = _resolve_media_id(tape=tape, media_id=media_id)
         operator = _actor(actor)
         engine = make_engine()
         with session_scope(engine) as session:
+            resolved = _resolve_media_id(session, tape=tape, media_id=media_id)
             row, created = confirm_offsite(
                 session,
                 media_id=resolved,
@@ -81,10 +82,10 @@ def offsite_revoke(
 ) -> None:
     """Revoke an incorrect offsite confirmation without deleting its row."""
     try:
-        resolved = _resolve_media_id(tape=tape, media_id=media_id)
         operator = _actor(actor)
         engine = make_engine()
         with session_scope(engine) as session:
+            resolved = _resolve_media_id(session, tape=tape, media_id=media_id)
             row, changed = revoke_offsite(
                 session,
                 media_id=resolved,
@@ -218,7 +219,7 @@ def retention_status_cmd(
     except RetentionError as exc:
         raise click.ClickException(str(exc)) from exc
     if held:
-        rows = [row for row in rows if row.holds]
+        rows = [row for row in rows if row.holds or row.purge_status.status.startswith("blocked:")]
     if as_json:
         payload = [dataclasses.asdict(row) for row in rows]
         click.echo(json.dumps(payload[0] if len(payload) == 1 else payload, indent=2, default=str))
@@ -231,6 +232,8 @@ def retention_status_cmd(
         )
         for reason in row.holds:
             click.echo(f"  hold: {reason}")
+        if row.purge_status.status.startswith("blocked:"):
+            click.echo(f"  hold: purge:{row.purge_status.status.removeprefix('blocked:')}")
 
 
 @retention_group.command("abandon")
@@ -271,13 +274,39 @@ def _status_intakes(session: Session, intake_id: str | None) -> list[Intake]:
     return list(session.scalars(query))
 
 
-def _resolve_media_id(*, tape: str | None, media_id: str | None) -> str:
+def _resolve_media_id(
+    session: Session,
+    *,
+    tape: str | None,
+    media_id: str | None,
+) -> str:
+    """Resolve an operator label to one known canonical copy-media identity."""
+
     if bool(tape) == bool(media_id):
         raise ValueError("provide exactly one of --tape or --media-id")
     if media_id:
         return media_id
     assert tape is not None
-    return tape if ":" in tape else f"tape:{tape}"
+    matches: set[str] = set()
+    for copy in session.scalars(select(Copy).where(Copy.deleted_at.is_(None))):
+        canonical = _copy_media_id(copy)
+        if canonical is None:
+            continue
+        locator_labels = {
+            value
+            for value in (copy.native_locator or {}).values()
+            if isinstance(value, str) and value
+        }
+        if tape == canonical or tape in locator_labels:
+            matches.add(canonical)
+    if not matches:
+        raise RetentionError(f"tape label {tape!r} matches no known canonical media identity")
+    if len(matches) > 1:
+        choices = ", ".join(sorted(matches))
+        raise RetentionError(
+            f"tape label {tape!r} is ambiguous; matching canonical media ids: {choices}"
+        )
+    return matches.pop()
 
 
 def _actor(value: str | None) -> str:
@@ -292,11 +321,16 @@ def _emit_batch(result: RetentionBatchResult, *, as_json: bool) -> None:
         f"batch {result.action}: candidates={result.candidate_count} "
         f"limit={result.limit} reason={result.reason}"
     )
-    for candidate in result.candidates:
-        recent = " recent-health-flip" if candidate.recent_flip else ""
-        click.echo(f"  candidate {candidate.intake_id}:{recent}")
-        for evidence in candidate.evidence:
-            click.echo(f"    evidence: {evidence}")
+    conditions = sorted({candidate.release_condition for candidate in result.candidates})
+    for condition in conditions:
+        click.echo(f"  releasing-condition {condition}:")
+        for candidate in result.candidates:
+            if candidate.release_condition != condition:
+                continue
+            recent = " recent-health-flip" if candidate.recent_flip else ""
+            click.echo(f"    candidate {candidate.intake_id}:{recent}")
+            for evidence in candidate.evidence:
+                click.echo(f"      evidence: {evidence}")
     for held in result.holds:
         click.echo(f"  held {held.intake_id}:")
         for reason in held.reasons:

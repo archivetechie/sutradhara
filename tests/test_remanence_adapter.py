@@ -120,7 +120,38 @@ def test_verify_happy(backend: RemanenceBackend) -> None:
     first = next(r for r in records if r.metadata["caller_object_id"] == "asset-000")
     result = backend.verify(first.native_locator)
     assert result.ok
+    assert result.measured is True
     assert result.actual_hash is not None
+
+
+def test_verify_byte_less_fixture_is_explicitly_unmeasured() -> None:
+    """A fixture catalog hash without readable bytes cannot qualify as measured."""
+
+    digest = content_hash(hashlib.sha256(b"catalog-only").digest())
+    backend = RemanenceBackend.from_object_dicts(
+        "catalog-only",
+        [
+            {
+                "object_id": "1" * 32,
+                "content_sha256": digest.hex(),
+                "logical_size_bytes": 12,
+                "copies": [
+                    {
+                        "tape_uuid": "2" * 32,
+                        "tape_file_number": 1,
+                        "health": "ok",
+                    }
+                ],
+            }
+        ],
+    )
+    [record] = list(backend.enumerate())
+
+    result = backend.verify(record.native_locator)
+
+    assert result.ok is True
+    assert result.measured is False
+    assert result.actual_hash == digest
 
 
 def test_verify_detects_mismatch_when_fixture_lies() -> None:

@@ -21,12 +21,12 @@ from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopySource
 from sutradhara.jobs.models import ReconciliationCondition
 from sutradhara.pools import (
-    PoolRetirementHasLiveLocators,
     PoolRepresentationImmutable,
+    PoolRetirementHasLiveLocators,
     PoolWriteFenceWouldBreakDurability,
     UnknownPool,
-    set_pool_retired,
     set_pool_representation,
+    set_pool_retired,
     set_pool_write_fence,
 )
 from sutradhara.sealing.port import Representation

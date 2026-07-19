@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
+import sutradhara.cli.retention as retention_cli
 import sutradhara.retention as retention_module
 from sutradhara.arrangement import ArrangementError, create_from_intake
 from sutradhara.backend.port import ByteRange, VerifyResult, WitnessResult
@@ -40,6 +42,7 @@ from sutradhara.catalog.types import (
     IntakeStatus,
     RetentionState,
 )
+from sutradhara.cli.retention import _resolve_media_id
 from sutradhara.intake import prepare_intake
 from sutradhara.jobs.models import ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
@@ -179,6 +182,40 @@ def test_gate_truth_table_offsite_and_proxy_only(engine: Engine, tmp_path: Path)
         assert releasable(session, "intake-proxy")
 
 
+def test_cli_tape_label_resolves_unique_d2_canonical_identity(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """A d2 barcode resolves to its stable volume UUID, never tape:<barcode>."""
+
+    volume_uuid = "00000000-0000-4000-8000-00000000000f"
+    with session_scope(engine) as session:
+        pool = _add_pool(
+            session,
+            artifactclass="s-masters",
+            pool_id="d2-pool",
+            kind=BackendKind.D2_TAPE,
+        )
+        item = _add_intake_with_item(session, tmp_path, "d2-label", artifactclass="s-masters")
+        _add_asset_copy(
+            session,
+            item,
+            backend_id=pool.backend_id,
+            pool_id=pool.id,
+            native_locator={"barcode": "D2T001L7", "volume_uuid": volume_uuid},
+            verified=True,
+        )
+
+        assert (
+            _resolve_media_id(
+                session,
+                tape="D2T001L7",
+                media_id=None,
+            )
+            == f"d2tape:{volume_uuid}"
+        )
+
+
 def test_bundle_asset_locator_copy_counts_for_durability(
     engine: Engine,
     tmp_path: Path,
@@ -246,7 +283,9 @@ def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
             pool_id="wrong-pool",
             kind=BackendKind.REM_TAPE,
         )
-        item = _add_intake_with_item(session, tmp_path, "intake-mismatch", artifactclass="s-masters")
+        item = _add_intake_with_item(
+            session, tmp_path, "intake-mismatch", artifactclass="s-masters"
+        )
         bundle = Bundle(id="submission-mismatch", artifactclass="s-masters", status="sealed")
         session.add(bundle)
         session.flush()
@@ -522,6 +561,217 @@ def test_release_freezes_new_work_and_sweep_staging_after_grace(
         assert session.scalar(select(func.count()).select_from(RetentionEvent)) == 7
 
 
+def test_sweep_refreshes_stale_witness_between_reservations(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transaction-B rename never relies on stale transaction-A evidence."""
+
+    witness_calls: list[str] = []
+
+    def witness(
+        _self: object,
+        locator: dict[str, Any],
+        *,
+        expected_hash: bytes,
+    ) -> WitnessResult:
+        del expected_hash
+        witness_calls.append(str(locator["object_id"]))
+        return WitnessResult(True)
+
+    monkeypatch.setattr(
+        "sutradhara.backend.remanence.RemanenceBackend.witness_copy",
+        witness,
+    )
+    with session_scope(engine) as session:
+        pool = _add_pool(
+            session,
+            artifactclass="s-masters",
+            pool_id="witness-pool",
+            kind=BackendKind.REM_TAPE,
+        )
+        item = _add_intake_with_item(
+            session,
+            tmp_path,
+            "witness-refresh",
+            artifactclass="s-masters",
+        )
+        _add_asset_copy(
+            session,
+            item,
+            backend_id=pool.backend_id,
+            pool_id=pool.id,
+            native_locator={"object_id": "a" * 32, "tape_uuid": "b" * 32},
+            verified=True,
+        )
+        assert run_retention(session, "witness-refresh", actor="ops").released
+        intake = session.get(Intake, "witness-refresh")
+        assert intake is not None
+        intake.released_at = _now() - dt.timedelta(days=31)
+
+    witness_calls.clear()
+    monkeypatch.setattr(retention_module, "WITNESS_MAX_AGE", dt.timedelta(0))
+    with session_scope(engine) as session:
+        result = sweep_staging(session, "witness-refresh", actor="ops")
+
+    assert result.purged
+    assert witness_calls == ["a" * 32, "a" * 32, "a" * 32]
+
+
+def test_sole_pool_removal_is_policy_hold_and_remains_visible_in_held_cli(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing expansion is a hold while the release fingerprint catches removal."""
+
+    with session_scope(engine) as session:
+        intake_root = _seed_released_intake_for_purge(
+            session,
+            tmp_path,
+            "sole-pool-removed",
+        )
+        membership = session.scalars(
+            select(ArtifactClassPool).where(ArtifactClassPool.artifactclass == "s-masters")
+        ).one()
+        membership.active = False
+
+    with session_scope(engine) as session:
+        status = retention_module.retention_status(session, "sole-pool-removed")
+        assert any("policy-missing" in hold for hold in status.holds)
+        assert status.purge_status.status == "blocked:policy-changed"
+        result = sweep_staging(session, "sole-pool-removed", actor="ops")
+        assert result.purged is False
+        assert "policy-missing" in result.reason
+    assert intake_root.exists()
+
+    monkeypatch.setattr(retention_cli, "make_engine", lambda: engine)
+    cli_result = CliRunner().invoke(
+        retention_cli.retention_status_cmd,
+        ["--held", "--intake", "sole-pool-removed"],
+    )
+    assert cli_result.exit_code == 0
+    assert "sole-pool-removed" in cli_result.output
+    assert "hold: purge:policy-changed" in cli_result.output
+
+
+def test_release_batch_act_race_sets_all_held_exit_two_and_groups_condition(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pre-pass winner that becomes held during act is still an all-held run."""
+
+    with session_scope(engine) as session:
+        pool = _add_pool(session, artifactclass="s-masters", pool_id="race-pool")
+        item = _add_intake_with_item(
+            session,
+            tmp_path,
+            "act-race",
+            artifactclass="s-masters",
+        )
+        copy = _add_asset_copy(
+            session,
+            item,
+            backend_id=pool.backend_id,
+            pool_id=pool.id,
+            verified=True,
+        )
+        original_run = retention_module.run_retention
+
+        def race_run(
+            race_session: Session,
+            intake: Intake | str,
+            *,
+            actor: str,
+            _witness_answers: retention_module.WitnessAnswers | None = None,
+        ) -> retention_module.RetentionRunResult:
+            raced_copy = race_session.get(Copy, copy.id)
+            assert raced_copy is not None
+            raced_copy.health = CopyHealth.SUSPECT
+            race_session.flush()
+            return original_run(
+                race_session,
+                intake,
+                actor=actor,
+                _witness_answers=_witness_answers,
+            )
+
+        monkeypatch.setattr(retention_module, "run_retention", race_run)
+        batch = retention_module.run_retention_batch(session, actor="ops")
+
+    assert batch.candidate_count == 1
+    assert batch.results[0].released is False
+    assert batch.all_held is True
+    assert batch.exit_code == 2
+    assert batch.candidates[0].release_condition == "release:full-gate-satisfied"
+    retention_cli._emit_batch(batch, as_json=False)
+    output = capsys.readouterr().out
+    assert "releasing-condition release:full-gate-satisfied:" in output
+    assert "candidate act-race:" in output
+
+
+def test_non_rem_witness_capability_fails_closed_and_changes_fingerprint(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Witness behavior follows adapter capability, not BackendKind.REM_TAPE."""
+
+    class _FutureWitnessBackend(_DeleteBackend):
+        def witness_copy(
+            self,
+            locator: dict[str, Any],
+            *,
+            expected_hash: bytes,
+        ) -> WitnessResult:
+            del locator, expected_hash
+            return WitnessResult(False, "future witness unavailable")
+
+    with session_scope(engine) as session:
+        pool = _add_pool(session, artifactclass="s-masters", pool_id="future-witness")
+        item = _add_intake_with_item(
+            session,
+            tmp_path,
+            "future-witness",
+            artifactclass="s-masters",
+        )
+        _add_asset_copy(
+            session,
+            item,
+            backend_id=pool.backend_id,
+            pool_id=pool.id,
+            verified=True,
+        )
+        monkeypatch.setattr(
+            retention_module.factory,
+            "backend_declares_retention_witness",
+            lambda _row: True,
+        )
+        monkeypatch.setattr(
+            retention_module.factory,
+            "backend_from_row",
+            lambda _row: _FutureWitnessBackend(),
+        )
+
+        status = retention_module.retention_status(session, "future-witness")
+        assert any("rem-unconfirmed" in hold for hold in status.holds)
+        intake = session.get(Intake, status.intake_id)
+        assert intake is not None
+        items = tuple(retention_module._intake_items(session, intake))
+        capable_fingerprint = retention_module._policy_fingerprint(session, items)
+        monkeypatch.setattr(
+            retention_module.factory,
+            "backend_declares_retention_witness",
+            lambda _row: False,
+        )
+        incapable_fingerprint = retention_module._policy_fingerprint(session, items)
+
+    assert capable_fingerprint != incapable_fingerprint
+
+
 def test_release_attempt_survives_crash_and_outcomes_deduplicate(
     engine: Engine,
     tmp_path: Path,
@@ -619,9 +869,7 @@ def test_tombstone_commit_survives_crash_before_garbage_collection(
             assert Path(row.staging_tombstone_path).exists()
             actions = list(
                 crash_session.scalars(
-                    select(RetentionEvent.action).where(
-                        RetentionEvent.intake_id == row.intake_id
-                    )
+                    select(RetentionEvent.action).where(RetentionEvent.intake_id == row.intake_id)
                 )
             )
             assert "staging_tombstoned" in actions
@@ -714,9 +962,7 @@ def test_rename_marker_recovers_when_crash_precedes_tombstoned_commit(
         assert intake.retention_state == RetentionState.PURGED
         actions = list(
             session.scalars(
-                select(RetentionEvent.action).where(
-                    RetentionEvent.intake_id == intake.intake_id
-                )
+                select(RetentionEvent.action).where(RetentionEvent.intake_id == intake.intake_id)
             )
         )
         assert actions.count("purge_attempted") == 1
