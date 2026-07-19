@@ -40,8 +40,10 @@ from sutradhara.retention import confirm_offsite
 from sutradhara.retention_journal import (
     ALARM_DOMAIN,
     GENESIS_HASH,
+    JournalError,
     JournalExportAlreadyRunning,
     LocalAppendOnlyDestination,
+    SshDiskJournalDestination,
     check_journal,
     export_journal,
     journal_operational_status,
@@ -65,7 +67,9 @@ def test_chain_sequence_cross_file_link_and_interleaved_source_resume(
     dr_dir = tmp_path / "dr"
     destination = LocalAppendOnlyDestination(dr_dir)
     copy_id = _seed_copy(engine)
-    _append_pair(engine, copy_id, ordinal=1, at=_time(1))
+    for ordinal in (1, 2, 3):
+        _append_verify_receipt(engine, copy_id, ordinal=ordinal, at=_time(1))
+    _append_retention_event(engine, ordinal=1, at=_time(1))
 
     first = export_journal(
         engine,
@@ -74,17 +78,28 @@ def test_chain_sequence_cross_file_link_and_interleaved_source_resume(
         now=_time(2),
     )
     assert first.published
-    assert first.entry_count == 2
-    assert first.state.global_sequence == 2
+    assert first.entry_count == 4
+    assert first.state.global_sequence == 4
+    assert first.state.verify_receipt_cursor == 3
+    assert first.state.retention_event_cursor == 1
     first_lines = _json_lines(first.segment)
-    assert [line["source"] for line in first_lines[:-1]] == [
-        "verify_receipt",
-        "retention_event",
+    assert _entry_identities(first.segment) == [
+        ("verify_receipt", 1),
+        ("verify_receipt", 2),
+        ("verify_receipt", 3),
+        ("retention_event", 1),
     ]
     assert first_lines[0]["sequence"] == 1
     assert first_lines[0]["prev_hash"] == GENESIS_HASH
+    assert first_lines[-1]["cursors"] == {
+        "verify_receipt": 3,
+        "retention_event": 1,
+    }
 
-    _append_pair(engine, copy_id, ordinal=2, at=_time(3))
+    for ordinal in (4, 5):
+        _append_verify_receipt(engine, copy_id, ordinal=ordinal, at=_time(3))
+    for ordinal in (2, 3, 4):
+        _append_retention_event(engine, ordinal=ordinal, at=_time(3))
     second = export_journal(
         engine,
         journal_dir=journal_dir,
@@ -92,22 +107,44 @@ def test_chain_sequence_cross_file_link_and_interleaved_source_resume(
         now=_time(4),
     )
     assert second.published
-    assert second.entry_count == 2
-    assert second.state.global_sequence == 4
+    assert second.entry_count == 5
+    assert second.state.global_sequence == 9
     second_lines = _json_lines(second.segment)
-    assert [line["source"] for line in second_lines[:-1]] == [
-        "verify_receipt",
-        "retention_event",
+    assert _entry_identities(second.segment) == [
+        ("verify_receipt", 4),
+        ("verify_receipt", 5),
+        ("retention_event", 2),
+        ("retention_event", 3),
+        ("retention_event", 4),
     ]
-    assert second_lines[0]["sequence"] == 3
+    assert second_lines[0]["sequence"] == 5
     assert second_lines[0]["prev_hash"] == first.state.head_hash
-    assert second.state.verify_receipt_cursor == 2
-    assert second.state.retention_event_cursor == 2
+    assert second.state.verify_receipt_cursor == 5
+    assert second.state.retention_event_cursor == 4
+    assert second_lines[-1]["cursors"] == {
+        "verify_receipt": 5,
+        "retention_event": 4,
+    }
+    assert [
+        identity
+        for segment in sorted(journal_dir.glob("????-??-??/*.jsonl"))
+        for identity in _entry_identities(segment)
+    ] == [
+        ("verify_receipt", 1),
+        ("verify_receipt", 2),
+        ("verify_receipt", 3),
+        ("retention_event", 1),
+        ("verify_receipt", 4),
+        ("verify_receipt", 5),
+        ("retention_event", 2),
+        ("retention_event", 3),
+        ("retention_event", 4),
+    ]
 
     checked = check_journal(engine, journal_dir=journal_dir, destination=destination)
     assert checked.ok, checked.issues + checked.projection_mismatches
     assert checked.file_count == 2
-    assert checked.entry_count == 4
+    assert checked.entry_count == 9
     assert checked.offbox_compared
 
 
@@ -117,7 +154,9 @@ def test_resume_uses_published_footer_after_crash_before_checkpoint(
     journal_dir = tmp_path / "journal"
     destination = LocalAppendOnlyDestination(tmp_path / "dr")
     copy_id = _seed_copy(engine)
-    _append_pair(engine, copy_id, ordinal=1, at=_time(1))
+    for ordinal in (1, 2):
+        _append_verify_receipt(engine, copy_id, ordinal=ordinal, at=_time(1))
+    _append_retention_event(engine, ordinal=1, at=_time(1))
 
     def crash(point: str) -> None:
         assert point == "after_publish_before_checkpoint"
@@ -133,23 +172,56 @@ def test_resume_uses_published_footer_after_crash_before_checkpoint(
         )
     with session_scope(engine) as session:
         assert session.get(RetentionJournalCheckpoint, 1) is None
+    [crash_segment] = journal_dir.glob("????-??-??/*.jsonl")
+    assert _entry_identities(crash_segment) == [
+        ("verify_receipt", 1),
+        ("verify_receipt", 2),
+        ("retention_event", 1),
+    ]
+    assert _json_lines(crash_segment)[-1]["cursors"] == {
+        "verify_receipt": 2,
+        "retention_event": 1,
+    }
 
-    _append_pair(engine, copy_id, ordinal=2, at=_time(3))
+    _append_verify_receipt(engine, copy_id, ordinal=3, at=_time(3))
+    for ordinal in (2, 3, 4):
+        _append_retention_event(engine, ordinal=ordinal, at=_time(3))
     resumed = export_journal(
         engine,
         journal_dir=journal_dir,
         destination=destination,
         now=_time(4),
     )
-    assert resumed.entry_count == 2
-    assert resumed.state.global_sequence == 4
+    assert resumed.entry_count == 4
+    assert resumed.state.global_sequence == 7
+    assert resumed.state.verify_receipt_cursor == 3
+    assert resumed.state.retention_event_cursor == 4
+    assert _entry_identities(resumed.segment) == [
+        ("verify_receipt", 3),
+        ("retention_event", 2),
+        ("retention_event", 3),
+        ("retention_event", 4),
+    ]
     assert len(list(journal_dir.glob("????-??-??/*.jsonl"))) == 2
+    assert [
+        identity
+        for segment in sorted(journal_dir.glob("????-??-??/*.jsonl"))
+        for identity in _entry_identities(segment)
+    ] == [
+        ("verify_receipt", 1),
+        ("verify_receipt", 2),
+        ("retention_event", 1),
+        ("verify_receipt", 3),
+        ("retention_event", 2),
+        ("retention_event", 3),
+        ("retention_event", 4),
+    ]
     with session_scope(engine) as session:
         checkpoint = session.get(RetentionJournalCheckpoint, 1)
         assert checkpoint is not None
-        assert checkpoint.global_sequence == 4
-        assert checkpoint.verify_receipt_cursor == 2
-        assert checkpoint.retention_event_cursor == 2
+        assert checkpoint.global_sequence == 7
+        assert checkpoint.verify_receipt_cursor == 3
+        assert checkpoint.retention_event_cursor == 4
     assert check_journal(engine, journal_dir=journal_dir, destination=destination).ok
 
 
@@ -279,6 +351,48 @@ def test_append_only_destination_rejects_different_existing_bytes(tmp_path: Path
     assert not destination.publish_file(first, "2026-07-20/segment")
     with pytest.raises(RuntimeError, match="append-only DR collision"):
         destination.publish_file(second, "2026-07-20/segment")
+
+
+def test_ssh_journal_destination_exports_only_append_only_dated_objects(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The production SSH destination must never overwrite or delete DR evidence."""
+
+    transport = _SpyAppendOnlyTransport()
+    destination = SshDiskJournalDestination(transport, prefix="audit/journal")  # type: ignore[arg-type]
+    copy_id = _seed_copy(engine)
+    _append_pair(engine, copy_id, ordinal=1, at=_time(1))
+
+    exported = export_journal(
+        engine,
+        journal_dir=tmp_path / "journal",
+        destination=destination,
+        now=_time(2),
+    )
+
+    assert exported.shipping_error is None
+    assert exported.shipped_segments == 1
+    segment_key = (
+        "audit/journal/2026-07-20/"
+        "retention-journal-00000000000000000001-00000000000000000002.jsonl"
+    )
+    head_key = f"{segment_key}.head.json"
+    assert set(transport.objects) == {segment_key, head_key}
+    assert [call for call in transport.calls if call[0] in {"put", "put_if_absent"}] == [
+        ("put_if_absent", segment_key),
+        ("put_if_absent", head_key),
+    ]
+
+    assert exported.segment is not None
+    assert not destination.publish_file(exported.segment, segment_key.removeprefix("audit/journal/"))
+    head_bytes = transport.objects[head_key]
+    assert not destination.publish_bytes(head_bytes, head_key.removeprefix("audit/journal/"))
+
+    collision = tmp_path / "collision.jsonl"
+    collision.write_bytes(b"different immutable bytes")
+    with pytest.raises(JournalError, match="append-only DR collision"):
+        destination.publish_file(collision, segment_key.removeprefix("audit/journal/"))
+    assert not any(call[0] in {"put", "remove"} for call in transport.calls)
 
 
 def test_staleness_projects_alarm_and_clears_after_export(engine: Engine, tmp_path: Path) -> None:
@@ -440,6 +554,17 @@ def _seed_copy(engine: Engine) -> int:
 
 
 def _append_pair(engine: Engine, copy_id: int, *, ordinal: int, at: dt.datetime) -> None:
+    _append_verify_receipt(engine, copy_id, ordinal=ordinal, at=at)
+    _append_retention_event(engine, ordinal=ordinal, at=at)
+
+
+def _append_verify_receipt(
+    engine: Engine,
+    copy_id: int,
+    *,
+    ordinal: int,
+    at: dt.datetime,
+) -> None:
     with session_scope(engine) as session:
         copy = session.get(Copy, copy_id)
         assert copy is not None
@@ -451,6 +576,10 @@ def _append_pair(engine: Engine, copy_id: int, *, ordinal: int, at: dt.datetime)
             execution_id=f"verify-{ordinal}",
             measured_at=at,
         )
+
+
+def _append_retention_event(engine: Engine, *, ordinal: int, at: dt.datetime) -> None:
+    with session_scope(engine) as session:
         session.add(
             RetentionEvent(
                 subject_type="batch",
@@ -470,9 +599,53 @@ def _append_pair(engine: Engine, copy_id: int, *, ordinal: int, at: dt.datetime)
         )
 
 
+class _SpyAppendOnlyTransport:
+    """In-memory spy implementing the SSH transport surface used by journal DR."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.calls: list[tuple[str, str]] = []
+
+    def put_if_absent(self, local: Path, relpath: str) -> bool:
+        self.calls.append(("put_if_absent", relpath))
+        if relpath in self.objects:
+            return False
+        self.objects[relpath] = local.read_bytes()
+        return True
+
+    def put(self, local: Path, relpath: str) -> None:
+        del local
+        self.calls.append(("put", relpath))
+        raise AssertionError("journal DR must not use overwriting put")
+
+    def get(self, relpath: str, local: Path) -> None:
+        self.calls.append(("get", relpath))
+        if relpath not in self.objects:
+            raise FileNotFoundError(relpath)
+        local.write_bytes(self.objects[relpath])
+
+    def sha256(self, relpath: str) -> str | None:
+        self.calls.append(("sha256", relpath))
+        content = self.objects.get(relpath)
+        return None if content is None else hashlib.sha256(content).hexdigest()
+
+    def size(self, relpath: str) -> int | None:
+        self.calls.append(("size", relpath))
+        content = self.objects.get(relpath)
+        return None if content is None else len(content)
+
+    def remove(self, relpath: str) -> None:
+        self.calls.append(("remove", relpath))
+        raise AssertionError("journal DR must not delete final objects")
+
+
 def _json_lines(path: Path | None) -> list[dict[str, Any]]:
     assert path is not None
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _entry_identities(path: Path | None) -> list[tuple[str, int]]:
+    return [(line["source"], line["event_id"]) for line in _json_lines(path)[:-1]]
 
 
 def _time(hour: int) -> dt.datetime:
