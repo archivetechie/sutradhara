@@ -956,8 +956,8 @@ def test_verify_happy_marks_copy_ok_and_records_timestamp(
         copy = s.get(Copy, copy_id)
         assert copy is not None
         assert copy.health == CopyHealth.OK
-        assert copy.last_verified_at is not None
-        assert copy.last_verified_at.tzinfo is dt.UTC
+        assert copy.last_checked_at is not None
+        assert copy.last_checked_at.tzinfo is dt.UTC
 
         # step_state captures the verify answer for inspection.
         assert job.step_state["verify_result"]["ok"] is True
@@ -1055,7 +1055,7 @@ def test_verify_detects_corruption_marks_suspect_and_succeeds(
             refreshed = s.get(Copy, copy_id)
             assert refreshed is not None
             assert refreshed.health == CopyHealth.SUSPECT
-            assert refreshed.last_verified_at is not None
+            assert refreshed.last_checked_at is not None
             assert job.step_state["verify_result"]["ok"] is False
             assert job.step_state["copy_health_after"] == "suspect"
 

@@ -167,23 +167,48 @@ class S3Backend:
         data = self.read_range(locator, ByteRange(0, 0))
         actual = content_hash(hashlib.sha256(data).digest())
         if not isinstance(expected_hex, str):
-            return VerifyResult(ok=True, actual_hash=actual, detail="no expected hash in locator")
+            return VerifyResult(
+                ok=True,
+                measured=True,
+                actual_hash=actual,
+                detail="no expected hash in locator",
+            )
         try:
             expected = content_hash(bytes.fromhex(expected_hex))
         except ValueError:
-            return VerifyResult(ok=False, actual_hash=actual, detail="invalid expected hash")
+            return VerifyResult(
+                ok=False,
+                measured=True,
+                actual_hash=actual,
+                detail="invalid expected hash",
+            )
         if actual == expected:
-            return VerifyResult(ok=True, actual_hash=actual)
+            return VerifyResult(ok=True, measured=True, actual_hash=actual)
         return VerifyResult(
             ok=False,
+            measured=True,
             actual_hash=actual,
             detail=f"expected {expected.hex()[:12]}..., got {actual.hex()[:12]}...",
         )
 
-    def delete_object(self, locator: BackendLocator) -> None:
+    def delete_object(self, locator: BackendLocator) -> bool:
         """Delete an object, using S3's idempotent delete semantics."""
         bucket, key = self._bucket_key(locator)
+        existed = True
+        try:
+            self._client.head_object(Bucket=bucket, Key=key)
+        except KeyError:
+            existed = False
+        except Exception as exc:
+            response = getattr(exc, "response", {})
+            status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            code = response.get("Error", {}).get("Code")
+            if status == 404 or code in ("404", "NoSuchKey", "NotFound"):
+                existed = False
+            else:
+                raise
         self._client.delete_object(Bucket=bucket, Key=key)
+        return existed
 
     def _join_key(self, *parts: str) -> str:
         key_parts = [self._prefix, *parts] if self._prefix else list(parts)

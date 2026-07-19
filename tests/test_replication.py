@@ -873,7 +873,7 @@ def test_replication_status_counts_fresh_unverified_copy(
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAW_BYTES),
         )
-        assert copy.last_verified_at is None
+        assert copy.last_checked_at is None
 
         status = replication_status(
             s,
@@ -1043,7 +1043,7 @@ def test_select_source_self_heal_prefers_fresh_aead_over_stale_plain(
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
-            last_verified_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+            last_checked_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         )
         fresh_aead, _ = add_copy(
             s,
@@ -1054,7 +1054,7 @@ def test_select_source_self_heal_prefers_fresh_aead_over_stale_plain(
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAO_AEAD_V1),
-            last_verified_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+            last_checked_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
         )
 
         selected = select_source(

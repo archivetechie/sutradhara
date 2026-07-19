@@ -513,7 +513,7 @@ def test_self_heal_falls_back_after_proven_bad_source(
             source=CopySource.INGEST,
             pool_id="o-copy-1-pool",
             storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
-            last_verified_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+            last_checked_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
         )
         good_copy, _ = add_copy(
             s,
@@ -524,7 +524,7 @@ def test_self_heal_falls_back_after_proven_bad_source(
             source=CopySource.INGEST,
             pool_id="o-copy-2-pool",
             storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=ARCHIVE_EPOCH),
-            last_verified_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+            last_checked_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         )
 
         repaired = self_heal(
@@ -581,7 +581,7 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             source=CopySource.INGEST,
             pool_id="o-copy-1-pool",
             storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
-            last_verified_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+            last_checked_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
         )
         second_copy, _ = add_copy(
             s,
@@ -592,7 +592,7 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             source=CopySource.INGEST,
             pool_id="o-copy-2-pool",
             storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=ARCHIVE_EPOCH),
-            last_verified_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+            last_checked_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         )
         backend.read_failures.add(str(first_record.native_locator["object_id"]))
 

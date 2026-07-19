@@ -14,8 +14,22 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from sutradhara.catalog.models import ArtifactClassPolicyRecord, ArtifactClassPool, Backend, Bundle, Pool
-from sutradhara.durability import BundleCopyAggregate, bundle_copy_aggregates_by_bundle
+from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
+    ArtifactClassPool,
+    Backend,
+    Bundle,
+    Copy,
+    Pool,
+)
+from sutradhara.catalog.types import CopyHealth
+from sutradhara.durability import (
+    BundleCopyAggregate,
+    DurabilityMediaIdentityError,
+    bundle_copy_aggregates_by_bundle,
+    copy_media_identity,
+    pending_verification_copy_ids,
+)
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
@@ -54,7 +68,7 @@ def enumerate_targets(
     classes = {artifactclass for _bundle_id, artifactclass in rows}
     desired_by_class = _desired_targets_by_class(session, classes)
     floors_by_class = _floors_for_classes(session, classes)
-    placement_aggregates = bundle_copy_aggregates_by_bundle(session, bundle_ids)
+    placement_aggregates = _reconciler_aggregates(session, bundle_ids)
 
     observations: list[TargetObservation] = []
     for bundle_id, artifactclass in rows:
@@ -92,7 +106,7 @@ def observe(session: Session, target_key: str) -> TargetObservation:
             desired=False,
             observed_state=OBSERVED_MISSING,
         )
-    aggregate = bundle_copy_aggregates_by_bundle(session, [bundle.id])[bundle.id]
+    aggregate = _reconciler_aggregates(session, [bundle.id])[bundle.id]
     return _observation_for_bundle(
         bundle_id=bundle.id,
         desired_targets=desired_targets,
@@ -125,7 +139,7 @@ def blocked_projection_for_bundle(session: Session, bundle_id: str) -> tuple[str
     bundle = session.get(Bundle, bundle_id)
     if bundle is None or bundle.status != "sealed":
         return None
-    aggregate = bundle_copy_aggregates_by_bundle(session, [bundle.id])[bundle.id]
+    aggregate = _reconciler_aggregates(session, [bundle.id])[bundle.id]
     duplicate_message = _duplicate_message(bundle.id, aggregate)
     if duplicate_message is not None:
         return "duplicate-copy", duplicate_message
@@ -291,7 +305,7 @@ def classify_condition(
         {},
     )
     floor = _floor_for_class(session, bundle.artifactclass)
-    aggregate = bundle_copy_aggregates_by_bundle(session, [bundle.id])[bundle.id]
+    aggregate = _reconciler_aggregates(session, [bundle.id])[bundle.id]
     duplicate_message = _duplicate_message(bundle.id, aggregate)
     if duplicate_message is not None:
         _record_blocked_alarm(
@@ -335,6 +349,63 @@ def _media_identities_are_distinct(
             return False
         seen[media_key] = key
     return True
+
+
+def _reconciler_aggregates(
+    session: Session,
+    bundle_ids: list[str],
+) -> dict[str, BundleCopyAggregate]:
+    """Count measured copies plus OK copies whose deep verification is pending."""
+
+    aggregates = bundle_copy_aggregates_by_bundle(
+        session,
+        bundle_ids,
+        require_verified=True,
+    )
+    pending_ids = pending_verification_copy_ids(session)
+    if not pending_ids:
+        return aggregates
+    errors = {bundle_id: list(aggregate.media_errors) for bundle_id, aggregate in aggregates.items()}
+    pending = session.scalars(
+        select(Copy)
+        .options(joinedload(Copy.backend))
+        .where(
+            Copy.bundle_id.in_(bundle_ids),
+            Copy.id.in_(pending_ids),
+            Copy.health == CopyHealth.OK,
+            Copy.deleted_at.is_(None),
+            Copy.pool_id.is_not(None),
+        )
+        .order_by(Copy.id)
+    )
+    for copy in pending:
+        if copy.bundle_id is None or copy.pool_id is None:
+            continue
+        if (
+            copy.last_measured_digest is not None
+            and copy.last_measured_digest == copy.integrity_hash
+        ):
+            continue
+        aggregate = aggregates[copy.bundle_id]
+        key = (copy.backend_id, copy.pool_id)
+        aggregate.counts[key] = aggregate.counts.get(key, 0) + 1
+        aggregate.family_by_key.setdefault(key, str(copy.backend.implementation_family))
+        try:
+            identity = copy_media_identity(copy)
+        except DurabilityMediaIdentityError as exc:
+            errors[copy.bundle_id].append(str(exc))
+        else:
+            if identity is not None:
+                aggregate.media_identity_by_key.setdefault(key, identity)
+    return {
+        bundle_id: BundleCopyAggregate(
+            counts=aggregate.counts,
+            family_by_key=aggregate.family_by_key,
+            media_identity_by_key=aggregate.media_identity_by_key,
+            media_errors=tuple(errors[bundle_id]),
+        )
+        for bundle_id, aggregate in aggregates.items()
+    }
 
 
 def _structural_floor_message(

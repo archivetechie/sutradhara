@@ -107,6 +107,13 @@ class CopySource(StrEnum):
     MANUAL_IMPORT = "manual_import"
 
 
+class IntegrityHashProvenance(StrEnum):
+    """Origin of the expected digest for the exact bytes in a copy locator."""
+
+    LOCALLY_COMPUTED = "locally_computed"
+    BACKEND_DISCOVERED = "backend_discovered"
+
+
 class MediaKind(StrEnum):
     """Coarse classification of asset content. Derivable, non-authoritative."""
 
@@ -169,4 +176,6 @@ class RetentionState(StrEnum):
 
     HELD = "held"
     RELEASED = "released"
+    TOMBSTONED = "tombstoned"
+    ABANDONED = "abandoned"
     PURGED = "purged"

@@ -14,15 +14,17 @@ import contextvars
 import hashlib
 import os
 import tempfile
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from sutradhara.backend.port import ByteRange, StorageBackend
+from sutradhara.backend.port import ByteRange, StorageBackend, VerifyResult
 from sutradhara.catalog.models import Copy, LogicalAsset
-from sutradhara.catalog.types import CopyHealth
+from sutradhara.catalog.types import CopyHealth, content_hash
+from sutradhara.evidence_recorder import record_measured
 from sutradhara.sealing.port import Opener, Representation
 
 _PROGRESS_CALLBACK: contextvars.ContextVar[Callable[[int], None] | None] = contextvars.ContextVar(
@@ -61,6 +63,8 @@ def restore_copy(
     *,
     backend: StorageBackend,
     opener: Opener,
+    execution_id: str | None = None,
+    actor: str | None = None,
 ) -> Iterator[RestoreResult]:
     """Yield a verified plaintext temp file for one asset-scoped copy.
 
@@ -78,6 +82,24 @@ def restore_copy(
         stored_path.write_bytes(backend.read_range(copy.native_locator, ByteRange(0, 0)))
 
         stored_digest = sha256_file(stored_path)
+        measured = content_hash(stored_digest)
+        record_measured(
+            session,
+            copy,
+            VerifyResult(
+                ok=stored_digest == copy.integrity_hash,
+                measured=True,
+                actual_hash=measured,
+                detail=(
+                    ""
+                    if stored_digest == copy.integrity_hash
+                    else "stored bytes differ from Copy.integrity_hash"
+                ),
+            ),
+            source="restore",
+            execution_id=execution_id or f"restore-{uuid.uuid4()}",
+            actor=actor,
+        )
         if stored_digest != copy.integrity_hash:
             raise RestoreIntegrityError(
                 "stored-corrupt: stored bytes digest differs from Copy.integrity_hash "

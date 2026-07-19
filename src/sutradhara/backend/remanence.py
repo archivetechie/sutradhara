@@ -45,6 +45,7 @@ from sutradhara.backend.port import (
     CopyRecord,
     StreamKind,
     VerifyResult,
+    WitnessResult,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
 from sutradhara.jobs.runtime_observations import report_session_open
@@ -602,9 +603,10 @@ class RemanenceBackend:
             actual = content_hash(hashlib.sha256(data).digest())
             expected = _hash_from_locator_required(locator)
             if actual == expected:
-                return VerifyResult(ok=True, actual_hash=actual)
+                return VerifyResult(ok=True, measured=True, actual_hash=actual)
             return VerifyResult(
                 ok=False,
+                measured=True,
                 actual_hash=actual,
                 detail=f"expected {expected.hex()[:12]}…, got {actual.hex()[:12]}…",
             )
@@ -613,17 +615,56 @@ class RemanenceBackend:
             # Fixture without bytes: trust the declared hash.
             return VerifyResult(
                 ok=True,
+                measured=False,
                 actual_hash=obj.content_sha256,
                 detail="fixture mode: bytes not available; declared hash assumed",
             )
         actual = content_hash(hashlib.sha256(obj.content).digest())
         if actual == obj.content_sha256:
-            return VerifyResult(ok=True, actual_hash=actual)
+            return VerifyResult(ok=True, measured=True, actual_hash=actual)
         return VerifyResult(
             ok=False,
+            measured=True,
             actual_hash=actual,
             detail=f"expected {obj.content_sha256.hex()[:12]}…, got {actual.hex()[:12]}…",
         )
+
+    def witness_copy(
+        self,
+        locator: BackendLocator,
+        *,
+        expected_hash: ContentHash,
+    ) -> WitnessResult:
+        """Cross-check one tape locator through Catalog.GetObject by object id."""
+
+        if self._catalog is None:
+            return WitnessResult(False, "Remanence live catalog unavailable")
+        object_id = _uuid_bytes_from_locator(locator, "object_id")
+        tape_uuid = _uuid_bytes_from_locator(locator, "tape_uuid")
+        request = layer5_pb2.GetObjectRequest(object_id=object_id)
+        last_error = "unknown catalog failure"
+        for attempt in range(2):
+            try:
+                try:
+                    obj = self._catalog.GetObject(request, timeout=1.0)  # type: ignore[call-arg]
+                except TypeError:
+                    # Lightweight test stubs may not model gRPC call options.
+                    obj = self._catalog.GetObject(request)
+                break
+            except grpc.RpcError as exc:
+                last_error = _rpc_error_text(exc)
+                if attempt == 0:
+                    time.sleep(0.05)
+        else:
+            return WitnessResult(False, f"Catalog.GetObject unavailable: {last_error}")
+        if bytes(obj.content_sha256) != bytes(expected_hash):
+            return WitnessResult(False, "catalog digest disagreement")
+        matching = [copy for copy in obj.copies if bytes(copy.tape_uuid) == tape_uuid]
+        if not matching:
+            return WitnessResult(False, "catalog object does not include locator tape")
+        if not any(copy.health == layer5_pb2.ObjectCopy.OBJECT_COPY_HEALTH_OK for copy in matching):
+            return WitnessResult(False, "locator tape health is not OK")
+        return WitnessResult(True)
 
     def write_object_to_pool(self, source: Path | str, pool: str) -> RemanenceWriteResult:
         """Write a local file into a tape pool via WriteSessionService.

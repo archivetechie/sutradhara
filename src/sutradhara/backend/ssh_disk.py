@@ -365,28 +365,32 @@ class SshDiskBackend:
         key = _locator_key(locator)
         digest_value: object = self._transport.sha256(key)
         if digest_value is None:
-            return VerifyResult(ok=False, detail="absent")
+            return VerifyResult(ok=False, measured=False, detail="absent")
         if not isinstance(digest_value, str):
-            return VerifyResult(ok=False, detail="invalid hash")
+            return VerifyResult(ok=False, measured=False, detail="invalid hash")
         digest_hex = digest_value
         expected_hex = locator.get("sha256")
         if not isinstance(expected_hex, str):
-            return VerifyResult(ok=False, detail="invalid hash")
+            return VerifyResult(ok=False, measured=False, detail="invalid hash")
         try:
             actual = _content_hash_from_hex(digest_hex)
             expected = _content_hash_from_hex(expected_hex)
         except ValueError:
-            return VerifyResult(ok=False, detail="invalid hash")
+            return VerifyResult(ok=False, measured=False, detail="invalid hash")
         if actual == expected:
-            return VerifyResult(ok=True, actual_hash=actual)
+            return VerifyResult(ok=True, measured=True, actual_hash=actual)
         return VerifyResult(
             ok=False,
+            measured=True,
             actual_hash=actual,
             detail=f"expected {expected.hex()[:12]}..., got {actual.hex()[:12]}...",
         )
 
-    def delete_object(self, locator: BackendLocator) -> None:
-        self._transport.remove(_locator_key(locator))
+    def delete_object(self, locator: BackendLocator) -> bool:
+        key = _locator_key(locator)
+        existed = self._transport.sha256(key) is not None
+        self._transport.remove(key)
+        return existed
 
     def _download(self, key: str, destination: Path) -> None:
         try:

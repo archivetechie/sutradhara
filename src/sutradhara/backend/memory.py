@@ -114,21 +114,24 @@ class MemoryBackend:
         data = self._objects[h]
         actual = content_hash(hashlib.sha256(data).digest())
         if actual == h:
-            return VerifyResult(ok=True, actual_hash=actual)
+            return VerifyResult(ok=True, measured=True, actual_hash=actual)
         return VerifyResult(
             ok=False,
+            measured=True,
             actual_hash=actual,
             detail=f"expected {h.hex()[:12]}…, got {actual.hex()[:12]}…",
         )
 
-    def delete_object(self, locator: BackendLocator) -> None:
+    def delete_object(self, locator: BackendLocator) -> bool:
         """Remove an object, treating an already-missing object as success."""
         try:
             h = self._locator_to_hash(locator)
         except BackendNotFoundError:
-            return
+            return False
+        existed = h in self._objects
         self._objects.pop(h, None)
         self._extra_metadata.pop(h, None)
+        return existed
 
     # --- helpers ---------------------------------------------------------
 

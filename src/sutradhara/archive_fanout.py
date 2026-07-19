@@ -33,10 +33,11 @@ from sutradhara.archive_bundle import (
     record_exclusion,
 )
 from sutradhara.archive_restore import ArchiveRestoreError, member_byte_base, read_member_bytes
-from sutradhara.backend.port import BackendError, ByteRange
+from sutradhara.backend.port import BackendError, ByteRange, VerifyResult
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Bundle, BundleMember, Copy
 from sutradhara.catalog.types import CopyHealth, CopySource
+from sutradhara.evidence_recorder import record_measured, record_unmeasured_promotion
 from sutradhara.hdcache.fill import enqueue_post_flush_hdcache_fills
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
@@ -813,7 +814,7 @@ def build_bundle_copy_for_pool(
         artifact=artifact,
     )
     try:
-        _verify_members_from_copy(
+        verify_result = _verify_members_from_copy(
             backend=backend,
             copy_locator=copy.native_locator,
             members=artifact.members,
@@ -828,7 +829,23 @@ def build_bundle_copy_for_pool(
     except Exception:
         copy.health = CopyHealth.SUSPECT
         raise
-    copy.last_verified_at = dt.datetime.now(dt.UTC)
+    execution_id = f"{bundle.id}:{target.pool_id}:{copy.native_locator_key}"
+    if verify_result.measured and verify_result.actual_hash is not None:
+        record_measured(
+            session,
+            copy,
+            verify_result,
+            source="fanout",
+            execution_id=execution_id,
+        )
+    else:
+        record_unmeasured_promotion(
+            session,
+            copy,
+            verify_result,
+            source="fanout",
+            execution_id=execution_id,
+        )
     if artifact_observer is not None:
         artifact_observer(artifact)
     return copy
@@ -919,7 +936,7 @@ def _build_for_target(
 
 def _require_key_epoch(
     targets: Sequence[tuple[WritableStorageBackend, PoolTarget]],
-) -> None:
+) -> VerifyResult:
     for _, target in targets:
         if target.representation == Representation.RAO_AEAD_V1.value and target.key_epoch is None:
             raise ArchiveFanoutError(f"encrypted pool {target.pool_id!r} requires key_epoch")
@@ -1083,6 +1100,7 @@ def _verify_members_from_copy(
                 f"member verification failed for {member.member_path!r}: "
                 f"{digest.hex()} != {member.file_sha256.hex()}"
             )
+    return result
 
 
 def _verified_member_bytes(

@@ -211,9 +211,9 @@ def test_bundle_repair_marks_corrupt_source_suspect_and_falls_back(
         ).first()
         assert p1_locator is not None
         backend.corrupt_member(p1_copy, p1_locator)
-        p1_copy.last_verified_at = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+        p1_copy.last_checked_at = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
         p2_copy = s.scalars(select(Copy).where(Copy.pool_id == "p2")).one()
-        p2_copy.last_verified_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        p2_copy.last_checked_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
         p3_copy = s.scalars(select(Copy).where(Copy.pool_id == "p3")).one()
         p3_copy.health = CopyHealth.MISSING
 
@@ -243,9 +243,9 @@ def test_bundle_repair_transport_error_falls_back_without_suspect_latch(
 
     with session_scope(engine) as s:
         p1_copy = s.scalars(select(Copy).where(Copy.pool_id == "p1")).one()
-        p1_copy.last_verified_at = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+        p1_copy.last_checked_at = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
         p2_copy = s.scalars(select(Copy).where(Copy.pool_id == "p2")).one()
-        p2_copy.last_verified_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        p2_copy.last_checked_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
         p3_copy = s.scalars(select(Copy).where(Copy.pool_id == "p3")).one()
         p3_copy.health = CopyHealth.MISSING
         backend.read_failures.add(str(p1_copy.native_locator["object_id"]))
@@ -293,7 +293,7 @@ def test_bundle_repair_failed_target_verification_commits_suspect_copy_then_reru
         suspect = s.scalars(
             select(Copy).where(Copy.pool_id == "p2", Copy.health == CopyHealth.SUSPECT)
         ).one()
-        assert suspect.last_verified_at is None
+        assert suspect.last_checked_at is None
         status = bundle_replication_status(s, bundle_id)
         assert status["complete"] is False
         assert {target.pool_id for target in status["missing"]} == {"p2"}

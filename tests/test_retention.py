@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 
 import sutradhara.retention as retention_module
 from sutradhara.arrangement import ArrangementError, create_from_intake
+from sutradhara.backend.port import ByteRange, VerifyResult, WitnessResult
 from sutradhara.catalog.models import (
     Arrangement,
     ArtifactClassPool,
@@ -67,6 +69,19 @@ def engine() -> Iterator[Engine]:
     eng.dispose()
 
 
+@pytest.fixture(autouse=True)
+def retention_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUTRADHARA_RETENTION_LANDING_ROOTS", str(tmp_path))
+    monkeypatch.setenv(
+        "SUTRADHARA_RETENTION_TOMBSTONE_ROOT",
+        str(tmp_path / ".retention-tombstones"),
+    )
+    monkeypatch.setattr(
+        "sutradhara.backend.remanence.RemanenceBackend.witness_copy",
+        lambda _self, _locator, *, expected_hash: WitnessResult(True),
+    )
+
+
 def _copy_by_id(session: Session, copy_id: int) -> Copy:
     copy = session.get(Copy, copy_id)
     assert copy is not None
@@ -75,6 +90,7 @@ def _copy_by_id(session: Session, copy_id: int) -> Copy:
 
 class _DeleteBackend:
     def __init__(self) -> None:
+        self.name = "test-delete"
         self.objects: set[str] = set()
         self.deleted: list[dict[str, Any]] = []
 
@@ -82,10 +98,29 @@ class _DeleteBackend:
         self.objects.add(key)
         return {"key": key}
 
-    def delete_object(self, locator: dict[str, Any]) -> None:
+    def enumerate(self) -> Iterator[Any]:
+        return iter(())
+
+    def read_range(self, locator: dict[str, Any], byte_range: ByteRange) -> bytes:
+        raise NotImplementedError
+
+    def verify(self, locator: dict[str, Any]) -> VerifyResult:
+        raise NotImplementedError
+
+    def witness_copy(
+        self,
+        locator: dict[str, Any],
+        *,
+        expected_hash: bytes,
+    ) -> WitnessResult:
+        return WitnessResult(True)
+
+    def delete_object(self, locator: dict[str, Any]) -> bool:
         key = str(locator["key"])
+        existed = key in self.objects
         self.objects.discard(key)
         self.deleted.append(dict(locator))
+        return existed
 
 
 def test_gate_truth_table_offsite_and_proxy_only(engine: Engine, tmp_path: Path) -> None:
@@ -109,10 +144,13 @@ def test_gate_truth_table_offsite_and_proxy_only(engine: Engine, tmp_path: Path)
 
         assert not releasable(session, "intake-a")
 
-        copy.last_verified_at = _now()
+        copy.last_checked_at = _now()
         assert not releasable(session, "intake-a")
 
         confirm_offsite(session, media_id="tape:tape-a", confirmed_by="ops")
+        assert not releasable(session, "intake-a")
+        copy.last_measured_digest = copy.integrity_hash
+        copy.last_measured_at = _now()
         assert releasable(session, "intake-a")
 
         proxy_pool = _add_pool(
@@ -167,7 +205,9 @@ def test_bundle_asset_locator_copy_counts_for_durability(
             storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
             integrity_hash=item.logical_asset_hash,
             health=CopyHealth.OK,
-            last_verified_at=_now(),
+            last_checked_at=_now(),
+            last_measured_digest=item.logical_asset_hash,
+            last_measured_at=_now(),
             source=CopySource.INGEST,
         )
         session.add(copy)
@@ -220,7 +260,9 @@ def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
             storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
             integrity_hash=item.logical_asset_hash,
             health=CopyHealth.OK,
-            last_verified_at=_now(),
+            last_checked_at=_now(),
+            last_measured_digest=item.logical_asset_hash,
+            last_measured_at=_now(),
             source=CopySource.INGEST,
         )
         session.add(copy)
@@ -343,8 +385,7 @@ def test_run_retention_deletes_cloud_after_gate_and_is_idempotent(
 ) -> None:
     fake_cloud = _DeleteBackend()
 
-    def _backend_from_row(row: Backend) -> _DeleteBackend:
-        assert row.name == "cloud-temp"
+    def _backend_from_row(_row: Backend) -> _DeleteBackend:
         return fake_cloud
 
     monkeypatch.setattr("sutradhara.retention.factory.backend_from_row", _backend_from_row)
@@ -385,7 +426,7 @@ def test_run_retention_deletes_cloud_after_gate_and_is_idempotent(
         assert intake.retention_state == RetentionState.RELEASED
         assert intake.released_at is not None
         assert Path(str(intake.manifest_path)).parent.exists()
-        assert session.scalar(select(func.count()).select_from(RetentionEvent)) == 2
+        assert session.scalar(select(func.count()).select_from(RetentionEvent)) == 4
 
         again = run_retention(session, "intake-e", actor="ops")
         assert not again.released
@@ -478,7 +519,7 @@ def test_release_freezes_new_work_and_sweep_staging_after_grace(
 
         again = sweep_staging(session, "intake-f", actor="ops", grace_days=30)
         assert not again.purged
-        assert session.scalar(select(func.count()).select_from(RetentionEvent)) == 3
+        assert session.scalar(select(func.count()).select_from(RetentionEvent)) == 7
 
 
 def _add_pool(
@@ -523,7 +564,12 @@ def _add_intake_with_item(
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(data)
     manifest = intake_root / "manifest-sha256.txt"
-    manifest.write_text("manifest\n", encoding="utf-8")
+    manifest_bytes = b"manifest\n"
+    manifest.write_bytes(manifest_bytes)
+    (intake_root / "intake.json").write_text(
+        json.dumps({"intake_id": intake_id}),
+        encoding="utf-8",
+    )
     digest = hashlib.sha256(data).digest()
     intake = Intake(
         intake_id=intake_id,
@@ -532,7 +578,7 @@ def _add_intake_with_item(
         source_ref="card",
         artifactclass=artifactclass,
         manifest_path=str(manifest),
-        manifest_digest="manifest",
+        manifest_digest=hashlib.sha256(manifest_bytes).hexdigest(),
         status=IntakeStatus.REGISTERED,
         registered_at=_now(),
         retention_state=RetentionState.HELD,
@@ -565,7 +611,12 @@ def _add_empty_intake(
     intake_root = tmp_path / intake_id
     intake_root.mkdir(parents=True, exist_ok=True)
     manifest = intake_root / "manifest-sha256.txt"
-    manifest.write_text("manifest\n", encoding="utf-8")
+    manifest_bytes = b"manifest\n"
+    manifest.write_bytes(manifest_bytes)
+    (intake_root / "intake.json").write_text(
+        json.dumps({"intake_id": intake_id}),
+        encoding="utf-8",
+    )
     intake = Intake(
         intake_id=intake_id,
         operator="tester",
@@ -573,7 +624,7 @@ def _add_empty_intake(
         source_ref="card",
         artifactclass=artifactclass,
         manifest_path=str(manifest),
-        manifest_digest="manifest",
+        manifest_digest=hashlib.sha256(manifest_bytes).hexdigest(),
         status=status,
         registered_at=_now() if status == IntakeStatus.REGISTERED else None,
         quarantined_at=_now() if status == IntakeStatus.QUARANTINED else None,
@@ -606,7 +657,9 @@ def _add_asset_copy(
         storage_metadata={"representation": Representation.RAW_BYTES.value},
         integrity_hash=item.logical_asset_hash,
         health=CopyHealth.OK,
-        last_verified_at=_now() if verified else None,
+        last_checked_at=_now() if verified else None,
+        last_measured_digest=item.logical_asset_hash if verified else None,
+        last_measured_at=_now() if verified else None,
         source=CopySource.INGEST,
     )
     session.add(copy)
@@ -645,7 +698,7 @@ def _add_cloud_copy(session: Session, intake_id: str, locator: dict[str, str]) -
         storage_metadata={"representation": Representation.RAO_AEAD_V1.value},
         integrity_hash=b"0" * 32,
         health=CopyHealth.OK,
-        last_verified_at=_now(),
+        last_checked_at=_now(),
         source=CopySource.INGEST,
     )
     session.add(copy)

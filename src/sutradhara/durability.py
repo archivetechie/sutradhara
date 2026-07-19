@@ -142,7 +142,7 @@ def durable_placements(
         if pool_id is not None:
             query = query.where(Copy.pool_id == pool_id)
         if require_verified:
-            query = query.where(Copy.last_verified_at.is_not(None))
+            query = _measurement_filter(query)
         return list(session.scalars(query.order_by(Copy.id)))
 
     asset_query = _copy_health_filter(
@@ -173,19 +173,21 @@ def durable_placements(
     return _dedupe_by_copy_id([*asset_copies, *bundle_copies])
 
 
-def direct_copies(session: Session, asset_hash: bytes) -> list[Copy]:
+def direct_copies(
+    session: Session,
+    asset_hash: bytes,
+    *,
+    require_verified: bool = False,
+) -> list[Copy]:
     """Return healthy asset-grain copies that whole-copy restore can use today."""
-    return list(
-        session.scalars(
-            select(Copy)
-            .where(
-                Copy.logical_asset_hash == asset_hash,
-                Copy.health == CopyHealth.OK,
-                Copy.deleted_at.is_(None),
-            )
-            .order_by(Copy.id)
-        )
+    query = select(Copy).where(
+        Copy.logical_asset_hash == asset_hash,
+        Copy.health == CopyHealth.OK,
+        Copy.deleted_at.is_(None),
     )
+    if require_verified:
+        query = _measurement_filter(query)
+    return list(session.scalars(query.order_by(Copy.id)))
 
 
 def placement_status(
@@ -203,7 +205,11 @@ def placement_status(
     artifactclass = _artifactclass_for_target(session, target)
     targets = [target for _, target in _policy_targets(session, artifactclass)]
     if isinstance(target, BundleTarget):
-        counts_by_key = bundle_copy_counts_by_pool(session, [target.bundle_id])[target.bundle_id]
+        counts_by_key = bundle_copy_counts_by_pool(
+            session,
+            [target.bundle_id],
+            require_verified=require_verified,
+        )[target.bundle_id]
     else:
         counts_by_key: dict[tuple[int, str], int] = {}
         for copy in durable_placements(
@@ -236,9 +242,18 @@ def placement_status(
     }
 
 
-def bundle_replication_status(session: Session, bundle_id: str) -> PlacementStatus:
+def bundle_replication_status(
+    session: Session,
+    bundle_id: str,
+    *,
+    require_verified: bool = True,
+) -> PlacementStatus:
     """Return replication-style status for one sealed bundle target."""
-    return placement_status(session, BundleTarget(bundle_id))
+    return placement_status(
+        session,
+        BundleTarget(bundle_id),
+        require_verified=require_verified,
+    )
 
 
 def bundle_copy_counts_by_pool(
@@ -266,7 +281,7 @@ def bundle_copy_counts_by_pool(
         .group_by(Copy.bundle_id, Copy.backend_id, Copy.pool_id)
     )
     if require_verified:
-        query = query.where(Copy.last_verified_at.is_not(None))
+        query = _measurement_filter(query)
     counts: BundlePlacementCounts = {bundle_id: {} for bundle_id in bundle_ids}
     for bundle_id, backend_id, pool_id, count in session.execute(query):
         if bundle_id is None or pool_id is None:
@@ -302,7 +317,7 @@ def bundle_copy_aggregates_by_bundle(
         .order_by(Copy.bundle_id, Copy.backend_id, Copy.pool_id, Copy.id)
     )
     if require_verified:
-        query = query.where(Copy.last_verified_at.is_not(None))
+        query = _measurement_filter(query)
     for copy in session.scalars(query):
         if copy.bundle_id is None or copy.pool_id is None:
             continue
@@ -423,8 +438,35 @@ def _copy_health_filter(query: Any, *, require_verified: bool) -> Any:
         Copy.deleted_at.is_(None),
     )
     if require_verified:
-        query = query.where(Copy.last_verified_at.is_not(None))
+        query = _measurement_filter(query)
     return query
+
+
+def _measurement_filter(query: Any) -> Any:
+    """Apply the one meaning of ``require_verified`` at every copy grain."""
+
+    return query.where(
+        Copy.last_measured_digest.is_not(None),
+        Copy.last_measured_digest == Copy.integrity_hash,
+    )
+
+
+def pending_verification_copy_ids(session: Session) -> set[int]:
+    """Return copies with a live verification job in the caller's transaction."""
+
+    from sutradhara.jobs.models import LIVE_JOB_STATUSES, Job
+
+    ids: set[int] = set()
+    for params in session.scalars(
+        select(Job.params).where(
+            Job.kind == "verify",
+            Job.status.in_(LIVE_JOB_STATUSES),
+        )
+    ):
+        copy_id = params.get("copy_id") if isinstance(params, dict) else None
+        if isinstance(copy_id, int):
+            ids.add(copy_id)
+    return ids
 
 
 def _locator_artifactclass_filter(

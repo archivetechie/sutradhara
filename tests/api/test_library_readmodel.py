@@ -46,7 +46,7 @@ TAPE_KEYS = {
     "library",
     "object_count",
     "health_rollup",
-    "last_verified_at",
+    "last_checked_at",
     "offsite_confirmed",
 }
 DRIVE_PUBLIC_KEYS = {"bay", "status"}
@@ -161,7 +161,7 @@ def test_library_tapes_grouping_opacity_admin_shaping_and_offsite_match(
             "asset-a",
             locator={"tape_uuid": tape_uuid, "tape_file_number": 1},
             health=CopyHealth.OK,
-            last_verified_at=verified,
+            last_checked_at=verified,
         )
         _add_copy(
             session,
@@ -170,7 +170,7 @@ def test_library_tapes_grouping_opacity_admin_shaping_and_offsite_match(
             "asset-b",
             locator={"tape_uuid": tape_uuid, "tape_file_number": 2},
             health=CopyHealth.SUSPECT,
-            last_verified_at=verified + dt.timedelta(minutes=5),
+            last_checked_at=verified + dt.timedelta(minutes=5),
         )
         _add_copy(
             session,
@@ -222,7 +222,7 @@ def test_library_tapes_grouping_opacity_admin_shaping_and_offsite_match(
     assert rem_row["object_count"] == 2
     assert rem_row["health_rollup"] == "suspect"
     assert rem_row["library"] == "mainlib"
-    assert rem_row["last_verified_at"] == (verified + dt.timedelta(minutes=5)).isoformat()
+    assert rem_row["last_checked_at"] == (verified + dt.timedelta(minutes=5)).isoformat()
     assert rem_row["offsite_confirmed"] is True
     assert admin_by_media["D2T001L7"]["offsite_confirmed"] is False
     assert rem_row["tape_key"].startswith("tape_")
@@ -481,7 +481,7 @@ def _add_copy(
     *,
     locator: dict[str, Any],
     health: CopyHealth,
-    last_verified_at: dt.datetime | None = None,
+    last_checked_at: dt.datetime | None = None,
 ) -> Copy:
     digest = _add_asset(session, label, 100)
     copy = Copy(
@@ -494,7 +494,7 @@ def _add_copy(
         integrity_hash=_digest(f"copy-{label}"),
         health=health,
         source=CopySource.INGEST,
-        last_verified_at=last_verified_at,
+        last_checked_at=last_checked_at,
     )
     session.add(copy)
     session.flush([copy])

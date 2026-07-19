@@ -150,7 +150,6 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
             "member_count": len(members),
             "stored_digest": stored_digest.hex(),
         },
-        last_verified_at=dt.datetime.now(dt.UTC),
     )
     bundle.status = "sealed"
     bundle.sealed_at = bundle.sealed_at or dt.datetime.now(dt.UTC)

@@ -5,7 +5,7 @@ against what the backend actually holds. See docs/spec-v0.1.md §7
 (reconciliation scrub).
 
 Day-1 reconciliation policy (a subset of the full §7 policy):
-  - Copy found on backend AND in catalog       → update `last_verified_at`.
+  - Copy found on backend AND in catalog       → update `last_checked_at`.
   - Copy found on backend BUT NOT in catalog   → insert; insert the logical
     asset row too if it's the first time we've seen this content hash.
   - Copy in catalog BUT NOT on backend         → mark `health = MISSING`.
@@ -19,6 +19,7 @@ that's a `health = SUSPECT` event for human attention.
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -34,7 +35,11 @@ from sutradhara.catalog.types import (
     BackendKind,
     CopyHealth,
     CopySource,
+    IntegrityHashProvenance,
 )
+from sutradhara.backend.port import VerifyResult
+from sutradhara.evidence_recorder import record_unmeasured_promotion
+from sutradhara.jobs.engine import submit
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 
@@ -67,6 +72,7 @@ def scrub_backend(
     backend: StorageBackend,
     *,
     now: dt.datetime | None = None,
+    run_id: str | None = None,
 ) -> ScrubReport:
     """Reconcile `backend.enumerate()` against the catalog under `session`.
 
@@ -74,6 +80,7 @@ def scrub_backend(
     only flushes the work into the session.
     """
     now = now or dt.datetime.now(dt.UTC)
+    execution_id = run_id or f"scrub-{uuid.uuid4()}"
     report = ScrubReport(backend_name=backend_row.name)
 
     # Snapshot every catalog copy on this backend up front, so we can find
@@ -91,6 +98,7 @@ def scrub_backend(
             catalog_copies=catalog_copies,
             now=now,
             report=report,
+            run_id=execution_id,
         )
 
     # Anything still in catalog_copies wasn't returned by enumerate(): mark
@@ -111,6 +119,7 @@ def _ingest_record(
     catalog_copies: dict[str, Copy],
     now: dt.datetime,
     report: ScrubReport,
+    run_id: str,
 ) -> None:
     key = locator_key(record.native_locator)
     existing = catalog_copies.pop(key, None)
@@ -127,6 +136,8 @@ def _ingest_record(
             pool=pool,
             now=now,
             report=report,
+            session=session,
+            run_id=run_id,
         )
         return
 
@@ -149,7 +160,7 @@ def _ingest_record(
         report.assets_added += 1
         session.flush()  # so the FK on Copy is satisfiable
 
-    _, created = add_copy(
+    copy, created = add_copy(
         session,
         logical_asset_hash=record.logical_id,
         backend_id=backend_row.id,
@@ -158,11 +169,18 @@ def _ingest_record(
         integrity_hash=record.integrity_hash,
         source=CopySource.SCRUB,
         health=record_health,
-        last_verified_at=now,
+        integrity_hash_provenance=IntegrityHashProvenance.BACKEND_DISCOVERED,
         first_observed_at=now,
         storage_metadata=storage_metadata,
     )
     if created:
+        copy.last_checked_at = now
+        submit(
+            session,
+            "verify",
+            {"copy_id": copy.id},
+            dedupe_key=f"verify:copy:{copy.id}",
+        )
         report.copies_added += 1
 
 
@@ -175,6 +193,8 @@ def _update_existing_copy(
     pool: Pool | None,
     now: dt.datetime,
     report: ScrubReport,
+    session: Session,
+    run_id: str,
 ) -> None:
     """Refresh a cataloged copy found again by backend-native locator."""
     if pool is not None:
@@ -184,7 +204,7 @@ def _update_existing_copy(
                 f"but backend enumerated pool {pool.id!r}"
             )
         _assert_copy_representation_matches_pool(existing, pool)
-    existing.last_verified_at = now
+    existing.last_checked_at = now
     if existing.integrity_hash != record.integrity_hash:
         existing.health = CopyHealth.SUSPECT
         report.integrity_warnings.append(
@@ -192,12 +212,28 @@ def _update_existing_copy(
             f"recorded integrity_hash={existing.integrity_hash.hex()[:12]}… "
             f"but enumerate returned {record.integrity_hash.hex()[:12]}…"
         )
+    elif existing.health == CopyHealth.MISSING and record_health == CopyHealth.OK:
+        record_unmeasured_promotion(
+            session,
+            existing,
+            VerifyResult(ok=True, measured=False, detail="scrub rediscovery"),
+            source="scrub",
+            execution_id=run_id,
+            checked_at=now,
+        )
     elif existing.health == CopyHealth.MISSING:
         existing.health = record_health
     elif record_health == CopyHealth.SUSPECT:
         existing.health = CopyHealth.SUSPECT
     elif existing.health == CopyHealth.SUSPECT and record_health == CopyHealth.OK:
-        existing.health = CopyHealth.OK
+        record_unmeasured_promotion(
+            session,
+            existing,
+            VerifyResult(ok=True, measured=False, detail="scrub enumerate refresh"),
+            source="scrub",
+            execution_id=run_id,
+            checked_at=now,
+        )
     report.copies_updated += 1
 
 

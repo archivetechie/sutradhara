@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.catalog.models import ArtifactClassPool, IngestItem, Intake, Pool
 from sutradhara.catalog.types import IntakeStatus
+from sutradhara.durability import direct_copies, pending_verification_copy_ids
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, OBSERVED_PRESENT
 from sutradhara.jobs.reconcilers.registry import Reconciler, TargetObservation, register_reconciler
@@ -167,8 +168,15 @@ def _active_pool_ids_for_class(session: Session, artifactclass: str) -> set[str]
 
 
 def _observed_pool_ids(session: Session, asset_hash: bytes) -> set[str]:
+    measured = direct_copies(session, asset_hash, require_verified=True)
+    pending_ids = pending_verification_copy_ids(session)
+    pending = [
+        copy
+        for copy in _healthy_copies(session, asset_hash)
+        if copy.id in pending_ids
+    ]
     return {
-        copy.pool_id for copy in _healthy_copies(session, asset_hash) if copy.pool_id is not None
+        copy.pool_id for copy in [*measured, *pending] if copy.pool_id is not None
     }
 
 
