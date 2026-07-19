@@ -9,7 +9,8 @@
   offsite confirmation, revocation, and correction surfaces.
 - [Configuration reference](reference-config.md) — environment and backend settings.
 - [Database schema reference](reference-database-schema.md) — authoritative tables,
-  constraints, evidence projections, and retention receipts.
+  constraints, evidence projections, retention receipts, and compatibility
+  downgrade export policy.
 - [Glossary](reference-glossary.md) — project terminology.
 - [Arrangement ARC guide](arrangement-arc-guide.md) — arrangement review workflow.
 - [Examples](examples/README.md) — example configuration and agent bundles.

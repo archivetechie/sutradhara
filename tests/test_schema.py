@@ -6,6 +6,7 @@ model imports that can be hidden by pytest's already-imported modules.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -659,12 +660,12 @@ def test_deletion_evidence_downgrade_transforms_new_intake_states(
         assert dict(conn.execute("SELECT intake_id, retention_state FROM intake")) == states
 
 
-def test_deletion_evidence_downgrade_lists_unrepresentable_events(
+def test_deletion_evidence_downgrade_exports_and_transforms_used_database(
     tmp_path: Path,
 ) -> None:
-    """Downgrade refuses audit rows that cannot be encoded honestly in v0."""
+    """A fully used evidence schema exports incompatibilities and round-trips."""
 
-    db_path = tmp_path / "deletion-evidence-downgrade-refusal.db"
+    db_path = tmp_path / "deletion-evidence-used.db"
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
@@ -674,14 +675,86 @@ def test_deletion_evidence_downgrade_lists_unrepresentable_events(
         env=env,
         check=True,
     )
+    now = "2026-07-19 12:00:00"
+    released_at = "2026-06-01 08:30:00"
+    intake_actions = (
+        "release_attempted",
+        "purge_attempted",
+        "staging_tombstoned",
+        "staging_purge_held",
+        "abandoned",
+        "correction_recorded",
+    )
+    batch_actions = ("batch_invoked", "batch_refused", "grace_overridden")
+    digest = bytes.fromhex("ab" * 32)
     with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO intake "
+            "(intake_id, operator, source_kind, artifactclass, status, created_at, "
+            "updated_at, retention_state, released_at, staging_tombstoned_at, "
+            "staging_tombstone_path) VALUES "
+            "('used-tombstoned', 'ops', 'card', 'masters', 'registered', ?, ?, "
+            "'tombstoned', ?, ?, '/tmp/used-tombstone')",
+            (now, now, released_at, now),
+        )
+        conn.execute(
+            "INSERT INTO intake "
+            "(intake_id, operator, source_kind, artifactclass, status, created_at, "
+            "updated_at, retention_state, released_at) VALUES "
+            "('used-abandoned', 'ops', 'card', 'masters', 'registered', ?, ?, "
+            "'abandoned', ?)",
+            (now, now, released_at),
+        )
+        for action in intake_actions:
+            intake_id = "used-abandoned" if action == "abandoned" else "used-tombstoned"
+            conn.execute(
+                "INSERT INTO retention_event "
+                "(intake_id, subject_type, subject_id, action, operation_id, actor, at) "
+                "VALUES (?, 'intake', ?, ?, ?, 'ops', ?)",
+                (intake_id, intake_id, action, f"used:{action}", now),
+            )
+        for action in batch_actions:
+            conn.execute(
+                "INSERT INTO retention_event "
+                "(subject_type, subject_id, action, operation_id, actor, at) "
+                "VALUES ('batch', 'batch:used', ?, ?, 'ops', ?)",
+                (action, f"used:{action}", now),
+            )
         conn.execute(
             "INSERT INTO retention_event "
             "(subject_type, subject_id, action, operation_id, actor, at) VALUES "
-            "('batch', 'batch:refuse', 'batch_invoked', 'batch:refuse', 'ops', "
-            "'2026-07-19 00:00:00')"
+            "('media', 'tape:used', 'offsite_confirmed', 'used:offsite_confirmed', "
+            "'ops', ?)",
+            (now,),
         )
-        event_id = conn.execute("SELECT event_id FROM retention_event").fetchone()[0]
+        conn.execute(
+            "INSERT INTO backend "
+            "(id, name, kind, implementation_family, config, tier, added_at) VALUES "
+            "(1, 'used-memory', 'memory', 'memory', '{}', 'self_describing', ?) ",
+            (now,),
+        )
+        conn.execute(
+            "INSERT INTO logical_asset "
+            "(content_sha256, size_bytes, first_seen_at, validity) VALUES (?, 1, ?, "
+            "'unvalidated')",
+            (digest, now),
+        )
+        conn.execute(
+            "INSERT INTO copy "
+            "(id, logical_asset_hash, backend_id, native_locator, native_locator_key, "
+            "integrity_hash, health, last_checked_at, first_observed_at, source, "
+            "storage_metadata, last_measured_digest, last_measured_at) VALUES "
+            "(1, ?, 1, '{\"object\":\"used\"}', 'used-object', ?, 'ok', ?, ?, "
+            "'ingest', '{}', ?, ?)",
+            (digest, digest, now, now, digest, now),
+        )
+        conn.execute(
+            "INSERT INTO verify_receipt "
+            "(copy_id, backend_id, expected_digest, measured_digest, backend_ok, source, "
+            "execution_id, producer_process, actor, at) VALUES "
+            "(1, 1, ?, ?, 1, 'restore', 'used-restore-request', 'used-host:1', 'ops', ?)",
+            (digest, digest, now),
+        )
         conn.commit()
 
     result = subprocess.run(
@@ -693,10 +766,55 @@ def test_deletion_evidence_downgrade_lists_unrepresentable_events(
         check=False,
     )
     output = result.stdout + result.stderr
-    assert result.returncode != 0
-    assert "cannot downgrade deletion-evidence schema" in output
-    assert f"event_id={event_id}" in output
-    assert "action='batch_invoked'" in output
+    assert result.returncode == 0, output
+    marker = "deletion-evidence downgrade export: "
+    export_line = next(line for line in output.splitlines() if marker in line)
+    sidecar = Path(export_line.split(marker, 1)[1].strip())
+    assert sidecar.exists()
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["format"] == "sutradhara-deletion-evidence-downgrade-v1"
+    assert {row["action"] for row in payload["retention_events"]} == {
+        *intake_actions,
+        *batch_actions,
+        "offsite_confirmed",
+    }
+    assert {row["subject_type"] for row in payload["retention_events"]} == {
+        "intake",
+        "batch",
+        "media",
+    }
+    assert len(payload["verify_receipts"]) == 1
+    [receipt] = payload["verify_receipts"]
+    assert receipt["execution_id"] == "used-restore-request"
+    assert receipt["expected_digest"] == {"encoding": "hex", "value": digest.hex()}
+
+    with sqlite3.connect(db_path) as conn:
+        assert list(
+            conn.execute("SELECT intake_id, action, at FROM retention_event ORDER BY id")
+        ) == [("used-tombstoned", "staging_deleted", now)]
+        states = dict(conn.execute("SELECT intake_id, retention_state FROM intake"))
+        timestamps = dict(conn.execute("SELECT intake_id, released_at FROM intake"))
+        tombstoned_deleted_at = conn.execute(
+            "SELECT staging_deleted_at FROM intake WHERE intake_id='used-tombstoned'"
+        ).fetchone()
+    assert states == {"used-tombstoned": "purged", "used-abandoned": "held"}
+    assert timestamps == {
+        "used-tombstoned": released_at,
+        "used-abandoned": released_at,
+    }
+    assert tombstoned_deleted_at == (now,)
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        assert dict(conn.execute("SELECT intake_id, retention_state FROM intake")) == states
+        assert conn.execute(
+            "SELECT subject_type, subject_id, action FROM retention_event"
+        ).fetchone() == ("intake", "used-tombstoned", "staging_deleted")
 
 
 def test_retention_event_payload_validation_is_per_action() -> None:

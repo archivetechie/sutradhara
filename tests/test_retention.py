@@ -561,14 +561,16 @@ def test_release_freezes_new_work_and_sweep_staging_after_grace(
         assert session.scalar(select(func.count()).select_from(RetentionEvent)) == 7
 
 
-def test_sweep_refreshes_stale_witness_between_reservations(
+def test_sweep_rejects_witness_that_turns_negative_after_transaction_b_expiry(
     engine: Engine,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The transaction-B rename never relies on stale transaction-A evidence."""
+    """Expiry inside B refreshes once outside a transaction and preserves staging."""
 
     witness_calls: list[str] = []
+    witness_transaction_states: list[bool] = []
+    active_session: Session | None = None
 
     def witness(
         _self: object,
@@ -578,13 +580,17 @@ def test_sweep_refreshes_stale_witness_between_reservations(
     ) -> WitnessResult:
         del expected_hash
         witness_calls.append(str(locator["object_id"]))
-        return WitnessResult(True)
+        witness_transaction_states.append(
+            active_session.in_transaction() if active_session is not None else False
+        )
+        return WitnessResult(len(witness_calls) < 3, "newly rejected")
 
     monkeypatch.setattr(
         "sutradhara.backend.remanence.RemanenceBackend.witness_copy",
         witness,
     )
     with session_scope(engine) as session:
+        active_session = session
         pool = _add_pool(
             session,
             artifactclass="s-masters",
@@ -609,14 +615,31 @@ def test_sweep_refreshes_stale_witness_between_reservations(
         intake = session.get(Intake, "witness-refresh")
         assert intake is not None
         intake.released_at = _now() - dt.timedelta(days=31)
+        staging_root = Path(str(intake.manifest_path)).parent
 
     witness_calls.clear()
+    witness_transaction_states.clear()
     monkeypatch.setattr(retention_module, "WITNESS_MAX_AGE", dt.timedelta(0))
     with session_scope(engine) as session:
+        active_session = session
         result = sweep_staging(session, "witness-refresh", actor="ops")
+        event = session.scalars(
+            select(RetentionEvent)
+            .where(
+                RetentionEvent.intake_id == "witness-refresh",
+                RetentionEvent.action == "staging_purge_held",
+            )
+            .order_by(RetentionEvent.event_id.desc())
+        ).first()
+        event_reasons = () if event is None else tuple(event.detail["reasons"])
 
-    assert result.purged
+    assert not result.purged
+    assert "rem-unconfirmed" in result.reason
+    assert staging_root.exists()
     assert witness_calls == ["a" * 32, "a" * 32, "a" * 32]
+    assert witness_transaction_states[-1] is False
+    assert event is not None
+    assert any("rem-unconfirmed" in reason for reason in event_reasons)
 
 
 def test_sole_pool_removal_is_policy_hold_and_remains_visible_in_held_cli(
@@ -653,6 +676,44 @@ def test_sole_pool_removal_is_policy_hold_and_remains_visible_in_held_cli(
     )
     assert cli_result.exit_code == 0
     assert "sole-pool-removed" in cli_result.output
+    assert "hold: purge:policy-changed" in cli_result.output
+
+
+def test_fingerprint_only_purge_block_is_visible_in_held_cli(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--held includes a policy-fingerprint refusal even with no gate holds."""
+
+    with session_scope(engine) as session:
+        intake_root = _seed_released_intake_for_purge(
+            session,
+            tmp_path,
+            "fingerprint-only-hold",
+        )
+        pool = session.get(Pool, "fingerprint-only-hold-pool")
+        assert pool is not None
+        backend = session.get(Backend, pool.backend_id)
+        assert backend is not None
+        backend.name = "backend-fingerprint-only-hold-reidentified"
+
+    with session_scope(engine) as session:
+        status = retention_module.retention_status(session, "fingerprint-only-hold")
+        assert status.holds == ()
+        assert status.purge_status.status == "blocked:policy-changed"
+        result = sweep_staging(session, "fingerprint-only-hold", actor="ops")
+        assert not result.purged
+        assert result.reason == "policy-changed"
+    assert intake_root.exists()
+
+    monkeypatch.setattr(retention_cli, "make_engine", lambda: engine)
+    cli_result = CliRunner().invoke(
+        retention_cli.retention_status_cmd,
+        ["--held", "--intake", "fingerprint-only-hold"],
+    )
+    assert cli_result.exit_code == 0
+    assert "fingerprint-only-hold" in cli_result.output
     assert "hold: purge:policy-changed" in cli_result.output
 
 
@@ -706,11 +767,102 @@ def test_release_batch_act_race_sets_all_held_exit_two_and_groups_condition(
     assert batch.results[0].released is False
     assert batch.all_held is True
     assert batch.exit_code == 2
-    assert batch.candidates[0].release_condition == "release:full-gate-satisfied"
+    assert batch.candidates[0].release_condition == "verified:race-pool"
     retention_cli._emit_batch(batch, as_json=False)
     output = capsys.readouterr().out
-    assert "releasing-condition release:full-gate-satisfied:" in output
+    assert "releasing-condition verified:race-pool:" in output
     assert "candidate act-race:" in output
+
+
+def test_release_batch_groups_by_latest_enabling_evidence_and_collates(
+    engine: Engine,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Candidates partition by actual evidence, including a shared condition."""
+
+    old = _now() - dt.timedelta(days=2)
+    with session_scope(engine) as session:
+        shared_pool = _add_pool(
+            session,
+            artifactclass="s-masters",
+            pool_id="shared-condition-pool",
+        )
+        for intake_id in ("condition-shared-a", "condition-shared-b"):
+            item = _add_intake_with_item(
+                session,
+                tmp_path,
+                intake_id,
+                artifactclass="s-masters",
+                data=intake_id.encode("utf-8"),
+            )
+            copy = _add_asset_copy(
+                session,
+                item,
+                backend_id=shared_pool.backend_id,
+                pool_id=shared_pool.id,
+                verified=True,
+            )
+            if intake_id.endswith("-a"):
+                copy.health_changed_at = old
+
+        offsite_pool = _add_pool(
+            session,
+            artifactclass="s-offsite",
+            pool_id="offsite-condition-pool",
+            offsite_gate=True,
+            kind=BackendKind.REM_TAPE,
+        )
+        offsite_item = _add_intake_with_item(
+            session,
+            tmp_path,
+            "condition-offsite",
+            artifactclass="s-offsite",
+        )
+        offsite_copy = _add_asset_copy(
+            session,
+            offsite_item,
+            backend_id=offsite_pool.backend_id,
+            pool_id=offsite_pool.id,
+            tape_uuid="condition-tape",
+            verified=True,
+        )
+        offsite_copy.last_measured_at = old
+        confirm_offsite(
+            session,
+            media_id="tape:condition-tape",
+            confirmed_by="ops",
+            confirmed_at=_now(),
+        )
+
+        batch = retention_module.run_retention_batch(session, actor="ops", dry_run=True)
+
+    assert batch.candidate_count == 3
+    grouped = {
+        condition: [
+            candidate.intake_id
+            for candidate in batch.candidates
+            if candidate.release_condition == condition
+        ]
+        for condition in {candidate.release_condition for candidate in batch.candidates}
+    }
+    assert grouped == {
+        "verified:shared-condition-pool": ["condition-shared-a", "condition-shared-b"],
+        "offsite-confirmed:tape:condition-tape": ["condition-offsite"],
+    }
+    recent = {candidate.intake_id: candidate.recent_flip for candidate in batch.candidates}
+    assert recent == {
+        "condition-offsite": True,
+        "condition-shared-a": False,
+        "condition-shared-b": True,
+    }
+
+    retention_cli._emit_batch(batch, as_json=False)
+    output = capsys.readouterr().out
+    assert output.count("releasing-condition verified:shared-condition-pool:") == 1
+    assert "releasing-condition offsite-confirmed:tape:condition-tape:" in output
+    assert "candidate condition-shared-a:" in output
+    assert "candidate condition-shared-b: recent-health-flip" in output
 
 
 def test_non_rem_witness_capability_fails_closed_and_changes_fingerprint(

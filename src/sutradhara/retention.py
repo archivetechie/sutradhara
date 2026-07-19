@@ -216,6 +216,18 @@ class _WitnessEvidence:
     observed_at: dt.datetime
 
 
+@dataclass(frozen=True)
+class _WitnessRequest:
+    """Detached witness input prepared without making a remote call."""
+
+    copy_id: int
+    eligible: bool
+    adapter: RetentionWitnessBackend | None
+    locator: BackendLocator
+    expected_hash: bytes
+    error: str | None = None
+
+
 WitnessAnswers = dict[int, _WitnessEvidence]
 
 
@@ -565,41 +577,65 @@ def sweep_staging(
     )
     session.commit()
 
-    # Transaction A's commit releases the reservation.  Re-observe any stale
-    # remote evidence before transaction B makes the irreversible rename.
-    row = _require_intake(session, intake_id)
-    items = tuple(_intake_items(session, row))
-    witnesses = _fresh_witness_answers(session, items, witnesses)
-    _begin_immediate(session)
-    row = _require_intake(session, intake_id)
-    commitment_holds = _purge_holds(
-        session,
-        row,
-        witnesses,
-        grace_days=grace_days,
-        now=_utcnow(),
-    )
-    if commitment_holds:
-        _record_purge_hold(session, row, actor=actor, reasons=commitment_holds)
+    # Transaction B owns the point-of-no-return decision.  Check witness ages
+    # only after its local re-gate and path hashing, immediately before rename.
+    # A stale observation rolls B back; the one allowed remote refresh executes
+    # with no transaction open, then a new B re-derives every local predicate.
+    refreshed_after_stale = False
+    while True:
+        _begin_immediate(session)
+        row = _require_intake(session, intake_id)
+        commitment_holds = _purge_holds(
+            session,
+            row,
+            witnesses,
+            grace_days=grace_days,
+            now=_utcnow(),
+        )
+        if commitment_holds:
+            _record_purge_hold(session, row, actor=actor, reasons=commitment_holds)
+            session.commit()
+            return StagingSweepResult(intake_id, False, None, commitment_holds[0])
+        staging_root, tombstone_path = _preflight_staging_paths(row)
+        if _witness_answers_stale(witnesses):
+            requests = (
+                None
+                if refreshed_after_stale
+                else _prepare_witness_requests(
+                    session,
+                    tuple(_intake_items(session, row)),
+                )
+            )
+            session.rollback()
+            if refreshed_after_stale:
+                row = _require_intake(session, intake_id)
+                reasons = ["rem-unconfirmed"]
+                _record_purge_hold(session, row, actor=actor, reasons=reasons)
+                session.commit()
+                return StagingSweepResult(intake_id, False, None, reasons[0])
+            assert requests is not None
+            if session.in_transaction():
+                raise RuntimeError("witness refresh must run outside a transaction")
+            witnesses = _execute_witness_requests(requests)
+            refreshed_after_stale = True
+            continue
+
+        _atomic_tombstone(staging_root, tombstone_path, row.intake_id)
+        now = _utcnow()
+        row.retention_state = RetentionState.TOMBSTONED
+        row.staging_tombstoned_at = now
+        row.staging_tombstone_path = str(tombstone_path)
+        _add_once_event(
+            session,
+            intake_id=intake_id,
+            action="staging_tombstoned",
+            operation_id=operation_id,
+            actor=actor,
+            at=now,
+            detail={"source_path": str(staging_root), "tombstone_path": str(tombstone_path)},
+        )
         session.commit()
-        return StagingSweepResult(intake_id, False, None, commitment_holds[0])
-    staging_root, tombstone_path = _preflight_staging_paths(row)
-    _atomic_tombstone(staging_root, tombstone_path, row.intake_id)
-    now = _utcnow()
-    row.retention_state = RetentionState.TOMBSTONED
-    row.staging_tombstoned_at = now
-    row.staging_tombstone_path = str(tombstone_path)
-    _add_once_event(
-        session,
-        intake_id=intake_id,
-        action="staging_tombstoned",
-        operation_id=operation_id,
-        actor=actor,
-        at=now,
-        detail={"source_path": str(staging_root), "tombstone_path": str(tombstone_path)},
-    )
-    session.commit()
-    return _resume_tombstone_gc(session, row, actor=actor)
+        return _resume_tombstone_gc(session, row, actor=actor)
 
 
 def run_retention_batch(
@@ -620,7 +656,7 @@ def run_retention_batch(
         _batch_candidate(
             session,
             assessment.status,
-            release_condition="release:full-gate-satisfied",
+            release_condition=_release_condition(session, assessment.status),
         )
         for assessment, _ in assessments
         if assessment.status.releasable
@@ -749,7 +785,7 @@ def sweep_staging_batch(
             release_condition=(
                 "purge:tombstone-gc-pending"
                 if assessment.status.purge_status.status == "tombstone-gc-pending"
-                else "purge:full-gate-satisfied-and-grace-expired"
+                else _release_condition(session, assessment.status)
             ),
         )
         for assessment, _ in assessments
@@ -1133,7 +1169,17 @@ def _collect_witness_answers(
     items: tuple[IngestItem, ...],
 ) -> WitnessAnswers:
     """Perform bounded adapter witness calls before any write reservation."""
-    answers: WitnessAnswers = {}
+
+    return _execute_witness_requests(_prepare_witness_requests(session, items))
+
+
+def _prepare_witness_requests(
+    session: Session,
+    items: tuple[IngestItem, ...],
+) -> tuple[_WitnessRequest, ...]:
+    """Resolve witness adapters and copy inputs without contacting a backend."""
+
+    requests: list[_WitnessRequest] = []
     seen: set[int] = set()
     for item in items:
         try:
@@ -1153,49 +1199,100 @@ def _collect_witness_answers(
                 try:
                     eligible = factory.backend_declares_retention_witness(copy.backend)
                 except Exception as exc:
-                    answers[copy.id] = _WitnessEvidence(
-                        eligible=True,
-                        result=WitnessResult(
-                            False,
-                            f"witness capability unavailable: {exc}",
-                        ),
-                        observed_at=_utcnow(),
+                    requests.append(
+                        _WitnessRequest(
+                            copy_id=copy.id,
+                            eligible=True,
+                            adapter=None,
+                            locator=dict(copy.native_locator),
+                            expected_hash=bytes(copy.integrity_hash),
+                            error=f"witness capability unavailable: {exc}",
+                        )
                     )
                     continue
                 if not eligible:
-                    answers[copy.id] = _WitnessEvidence(
-                        eligible=False,
-                        result=None,
-                        observed_at=_utcnow(),
+                    requests.append(
+                        _WitnessRequest(
+                            copy_id=copy.id,
+                            eligible=False,
+                            adapter=None,
+                            locator=dict(copy.native_locator),
+                            expected_hash=bytes(copy.integrity_hash),
+                        )
                     )
                     continue
                 try:
                     adapter = factory.backend_from_row(copy.backend)
-                    if not isinstance(adapter, RetentionWitnessBackend):
-                        answers[copy.id] = _WitnessEvidence(
-                            eligible=True,
-                            result=WitnessResult(
-                                False,
-                                "adapter declares but does not implement witness capability",
-                            ),
-                            observed_at=_utcnow(),
-                        )
-                        continue
-                    result = adapter.witness_copy(
-                        copy.native_locator,
-                        expected_hash=copy.integrity_hash,
-                    )
-                    answers[copy.id] = _WitnessEvidence(
-                        eligible=True,
-                        result=result,
-                        observed_at=_utcnow(),
-                    )
                 except Exception as exc:
-                    answers[copy.id] = _WitnessEvidence(
-                        eligible=True,
-                        result=WitnessResult(False, f"witness unavailable: {exc}"),
-                        observed_at=_utcnow(),
+                    requests.append(
+                        _WitnessRequest(
+                            copy_id=copy.id,
+                            eligible=True,
+                            adapter=None,
+                            locator=dict(copy.native_locator),
+                            expected_hash=bytes(copy.integrity_hash),
+                            error=f"witness unavailable: {exc}",
+                        )
                     )
+                    continue
+                if not isinstance(adapter, RetentionWitnessBackend):
+                    requests.append(
+                        _WitnessRequest(
+                            copy_id=copy.id,
+                            eligible=True,
+                            adapter=None,
+                            locator=dict(copy.native_locator),
+                            expected_hash=bytes(copy.integrity_hash),
+                            error="adapter declares but does not implement witness capability",
+                        )
+                    )
+                    continue
+                requests.append(
+                    _WitnessRequest(
+                        copy_id=copy.id,
+                        eligible=True,
+                        adapter=adapter,
+                        locator=dict(copy.native_locator),
+                        expected_hash=bytes(copy.integrity_hash),
+                    )
+                )
+    return tuple(requests)
+
+
+def _execute_witness_requests(
+    requests: tuple[_WitnessRequest, ...],
+) -> WitnessAnswers:
+    """Execute already-detached witness calls without consulting the database."""
+
+    answers: WitnessAnswers = {}
+    for request in requests:
+        if not request.eligible:
+            answers[request.copy_id] = _WitnessEvidence(
+                eligible=False,
+                result=None,
+                observed_at=_utcnow(),
+            )
+            continue
+        if request.error is not None:
+            answers[request.copy_id] = _WitnessEvidence(
+                eligible=True,
+                result=WitnessResult(False, request.error),
+                observed_at=_utcnow(),
+            )
+            continue
+        assert request.adapter is not None
+        try:
+            result = request.adapter.witness_copy(
+                request.locator,
+                expected_hash=request.expected_hash,
+            )
+        except Exception as exc:
+            result = WitnessResult(False, f"witness unavailable: {exc}")
+        answers[request.copy_id] = _WitnessEvidence(
+            eligible=True,
+            result=result,
+            observed_at=_utcnow(),
+        )
     return answers
 
 
@@ -1208,10 +1305,19 @@ def _fresh_witness_answers(
 
     if answers is None:
         return _collect_witness_answers(session, items)
-    now = _utcnow()
-    if any(now - _as_utc(answer.observed_at) > WITNESS_MAX_AGE for answer in answers.values()):
+    if _witness_answers_stale(answers):
         return _collect_witness_answers(session, items)
     return answers
+
+
+def _witness_answers_stale(answers: WitnessAnswers) -> bool:
+    """Return whether any release-authorizing remote observation has expired."""
+
+    now = _utcnow()
+    return any(
+        answer.eligible and now - _as_utc(answer.observed_at) > WITNESS_MAX_AGE
+        for answer in answers.values()
+    )
 
 
 def _policy_expansion_hold(exc: Exception) -> str:
@@ -1549,6 +1655,35 @@ def _batch_candidate(
         for copy in (session.get(Copy, pool.copy_id),)
     )
     return BatchCandidate(status.intake_id, release_condition, evidence, recent)
+
+
+def _release_condition(session: Session, status: IntakeGateStatus) -> str:
+    """Name the latest concrete evidence item that completed the gate."""
+
+    evidence: list[tuple[dt.datetime, str]] = []
+    for asset in status.assets:
+        for pool in asset.pools:
+            if not pool.satisfied or pool.copy_id is None:
+                continue
+            copy = session.get(Copy, pool.copy_id)
+            if copy is None or copy.last_measured_at is None:
+                continue
+            evidence.append((_as_utc(copy.last_measured_at), f"verified:{pool.pool_id}"))
+            if not pool.offsite_gate or pool.media_id is None:
+                continue
+            confirmation = session.get(OffsiteConfirmation, pool.media_id)
+            if confirmation is not None and confirmation.revoked_at is None:
+                evidence.append(
+                    (
+                        _as_utc(confirmation.confirmed_at),
+                        f"offsite-confirmed:{pool.media_id}",
+                    )
+                )
+    if not evidence:
+        raise RetentionError(
+            f"releasable intake {status.intake_id!r} has no release-enabling evidence"
+        )
+    return max(evidence, key=lambda item: (item[0], item[1]))[1]
 
 
 def _record_batch_invocation(
