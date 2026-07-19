@@ -373,6 +373,21 @@ def _transform_retention_events_for_legacy() -> None:
 
     bind = op.get_bind()
     for current, legacy in _DOWNGRADE_ACTION_MAP.items():
+        # A completed purge records both the mapped action and its legacy
+        # twin under one operation id (staging_tombstoned + staging_deleted).
+        # Mapping would then collide with the once-only unique index, so the
+        # pair collapses to the legacy row: the redundant mapped-action row
+        # is removed here (it is already captured in the export sidecar).
+        bind.execute(
+            sa.text(
+                "DELETE FROM retention_event WHERE action = :current "
+                "AND operation_id IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM retention_event twin "
+                "WHERE twin.action = :legacy "
+                "AND twin.operation_id = retention_event.operation_id)"
+            ),
+            {"current": current, "legacy": legacy},
+        )
         bind.execute(
             sa.text(
                 "UPDATE retention_event SET action = :legacy "

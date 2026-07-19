@@ -713,6 +713,17 @@ def test_deletion_evidence_downgrade_exports_and_transforms_used_database(
                 "VALUES (?, 'intake', ?, ?, ?, 'ops', ?)",
                 (intake_id, intake_id, action, f"used:{action}", now),
             )
+        # A COMPLETED purge records staging_tombstoned and staging_deleted
+        # under one operation id — the realistic pair whose downgrade mapping
+        # would collide with the once-only unique index unless the pair
+        # collapses to the single legacy row.
+        conn.execute(
+            "INSERT INTO retention_event "
+            "(intake_id, subject_type, subject_id, action, operation_id, actor, at) "
+            "VALUES ('used-tombstoned', 'intake', 'used-tombstoned', "
+            "'staging_deleted', 'used:staging_tombstoned', 'ops', ?)",
+            (now,),
+        )
         for action in batch_actions:
             conn.execute(
                 "INSERT INTO retention_event "
