@@ -7,7 +7,7 @@
 - `https://127.0.0.1:50051` is the SSH local forward to the Sutradhara gRPC port.
 - `https://system-ui.dvarapala.internal/api/enroll/csr` is the dvarapala-routed
   enrollment endpoint.
-- `/home/user/dvarapala/enroll-ca.crt` is the exported Caddy internal root CA for
+- `/etc/sutra/enroll-ca.crt` is the exported Caddy internal root CA for
   `system-ui.dvarapala.internal`.
 
 Export the dvarapala CA before starting `sutra serve`:

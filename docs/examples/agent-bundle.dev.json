@@ -5,6 +5,6 @@
     }
   ],
   "enroll_url": "https://system-ui.dvarapala.internal/api/enroll/csr",
-  "enroll_ca_path": "/home/user/dvarapala/enroll-ca.crt",
+  "enroll_ca_path": "/etc/sutra/enroll-ca.crt",
   "console_url": "https://system-ui.dvarapala.internal/"
 }
