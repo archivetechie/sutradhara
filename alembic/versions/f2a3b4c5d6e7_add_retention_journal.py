@@ -155,6 +155,24 @@ def _backfill_offsite_confirmation_receipts_and_targets() -> None:
                 ),
                 {"operation_id": operation_id},
             ).scalar_one()
+            row_synthetic_id = receipt_id
+        else:
+            # Idempotent re-upgrade: recognize this media's deterministic
+            # row synthetic from an earlier run of this migration.
+            row_synthetic_id = bind.execute(
+                sa.text(
+                    "SELECT event_id FROM retention_event "
+                    "WHERE action = 'offsite_confirmed' AND operation_id = :op"
+                ),
+                {"op": f"migration:{revision}:offsite-confirm:{media_id}"},
+            ).scalar_one_or_none()
+        lead_receipt_id = bind.execute(
+            sa.text(
+                "SELECT event_id FROM retention_event "
+                "WHERE action = 'offsite_confirmed' AND operation_id = :op"
+            ),
+            {"op": f"migration:{revision}:offsite-confirm:{media_id}:legacy-lead"},
+        ).scalar_one_or_none()
 
         corrections = bind.execute(
             sa.text(
@@ -175,19 +193,56 @@ def _backfill_offsite_confirmation_receipts_and_targets() -> None:
                 ),
                 {"media_id": media_id, "correction_id": correction_id},
             ).scalar_one_or_none()
+            if preceding_receipt_id is not None:
+                target_id = preceding_receipt_id
+            elif row_synthetic_id is not None:
+                # Single-cycle legacy media: the row synthetic IS the
+                # leading confirmation.
+                target_id = row_synthetic_id
+            else:
+                # Multi-cycle history: this correction precedes every stored
+                # receipt, so the leading legacy confirmation gets its own
+                # deterministic synthetic receipt — targeting the LATEST
+                # receipt would make an early-cycle correction falsely
+                # supersede a later re-confirmation.
+                if lead_receipt_id is None:
+                    lead_operation_id = (
+                        f"migration:{revision}:offsite-confirm:{media_id}:legacy-lead"
+                    )
+                    correction_at = bind.execute(
+                        sa.text("SELECT at FROM retention_event WHERE event_id = :cid"),
+                        {"cid": correction_id},
+                    ).scalar_one()
+                    bind.execute(
+                        event_table.insert().values(
+                            subject_type="media",
+                            subject_id=media_id,
+                            action="offsite_confirmed",
+                            operation_id=lead_operation_id,
+                            actor=confirmation["confirmed_by"],
+                            at=_datetime_value(correction_at),
+                            detail={
+                                "shipment_id": confirmation["shipment_id"],
+                                "confirmed_by": confirmation["confirmed_by"],
+                                "synthesized": "legacy-lead-confirmation",
+                            },
+                        )
+                    )
+                    lead_receipt_id = bind.execute(
+                        sa.text(
+                            "SELECT event_id FROM retention_event "
+                            "WHERE action = 'offsite_confirmed' "
+                            "AND operation_id = :operation_id"
+                        ),
+                        {"operation_id": lead_operation_id},
+                    ).scalar_one()
+                target_id = lead_receipt_id
             bind.execute(
                 sa.text(
                     "UPDATE retention_event SET supersedes_source = 'retention_event', "
                     "supersedes_event_id = :receipt_id WHERE event_id = :correction_id"
                 ),
-                {
-                    "receipt_id": (
-                        preceding_receipt_id
-                        if preceding_receipt_id is not None
-                        else receipt_id
-                    ),
-                    "correction_id": correction_id,
-                },
+                {"receipt_id": target_id, "correction_id": correction_id},
             )
 
 

@@ -1376,3 +1376,93 @@ def test_copygrain_m3_migration_backfills_and_preserves_constraints(tmp_path: Pa
             "WHERE artifactclass='existing'"
         ).fetchone() == (3, 2)
     _assert_archive_invariants(db_path)
+
+
+def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
+    tmp_path: Path,
+) -> None:
+    """An early-cycle correction must never supersede a later re-confirmation.
+
+    History under prompt 1: legacy confirmation (no receipt) -> correction E1
+    (its revocation) -> re-confirmation receipt E2 -> correction E3.  The
+    upgrade backfill must synthesize a leading receipt for the legacy
+    confirmation and target E1 at it, while E3 targets E2 exactly.
+    """
+
+    db_path = tmp_path / "retention-journal-two-cycle.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "e1f2a3b4c5d6"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    cycle1_revoked_at = "2026-07-18 09:30:00"
+    cycle2_confirmed_at = "2026-07-19 11:00:00"
+    cycle2_revoked_at = "2026-07-19 12:00:00"
+    with sqlite3.connect(db_path) as conn:
+        # The confirmation row holds the CURRENT (cycle-2) state.
+        conn.execute(
+            "INSERT INTO offsite_confirmation "
+            "(media_id, confirmed_at, confirmed_by, shipment_id, revoked_at, revoked_by) "
+            "VALUES ('legacy:two-cycle', ?, 'cycle2-operator', 'shipment-2', ?, "
+            "'cycle2-revoker')",
+            (cycle2_confirmed_at, cycle2_revoked_at),
+        )
+        # E1: cycle-1 revocation correction (no receipt existed yet).
+        conn.execute(
+            "INSERT INTO retention_event "
+            "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
+            "('media', 'legacy:two-cycle', 'correction_recorded', "
+            "'offsite-revoke:two-cycle:c1', 'cycle1-revoker', ?, "
+            "'{\"kind\":\"offsite-revocation\",\"reason\":\"wrong tape\"}')",
+            (cycle1_revoked_at,),
+        )
+        # E2: cycle-2 re-confirmation receipt.
+        conn.execute(
+            "INSERT INTO retention_event "
+            "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
+            "('media', 'legacy:two-cycle', 'offsite_confirmed', "
+            "'offsite-confirm:two-cycle:c2', 'cycle2-operator', ?, "
+            "'{\"shipment_id\":\"shipment-2\",\"confirmed_by\":\"cycle2-operator\"}')",
+            (cycle2_confirmed_at,),
+        )
+        # E3: cycle-2 revocation correction.
+        conn.execute(
+            "INSERT INTO retention_event "
+            "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
+            "('media', 'legacy:two-cycle', 'correction_recorded', "
+            "'offsite-revoke:two-cycle:c2', 'cycle2-revoker', ?, "
+            "'{\"kind\":\"offsite-revocation\",\"reason\":\"failed audit\"}')",
+            (cycle2_revoked_at,),
+        )
+        conn.commit()
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        receipts = dict(
+            conn.execute(
+                "SELECT operation_id, event_id FROM retention_event "
+                "WHERE action='offsite_confirmed' AND subject_id='legacy:two-cycle'"
+            )
+        )
+        corrections = dict(
+            conn.execute(
+                "SELECT operation_id, supersedes_event_id FROM retention_event "
+                "WHERE action='correction_recorded' AND subject_id='legacy:two-cycle'"
+            )
+        )
+    lead_op = "migration:f2a3b4c5d6e7:offsite-confirm:legacy:two-cycle:legacy-lead"
+    assert set(receipts) == {lead_op, "offsite-confirm:two-cycle:c2"}
+    # Each correction targets its OWN cycle's receipt, by correction identity.
+    assert corrections["offsite-revoke:two-cycle:c1"] == receipts[lead_op]
+    assert corrections["offsite-revoke:two-cycle:c2"] == (
+        receipts["offsite-confirm:two-cycle:c2"]
+    )
