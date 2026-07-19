@@ -122,7 +122,7 @@ class _StreamingObjectBackend:
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
         del locator
-        return VerifyResult(ok=True)
+        return VerifyResult(ok=True, measured=False)
 
 
 def _sha(data: bytes) -> bytes:

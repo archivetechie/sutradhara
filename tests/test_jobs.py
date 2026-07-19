@@ -1011,6 +1011,7 @@ def test_verify_detects_corruption_marks_suspect_and_succeeds(
         def verify(self, _l: BackendLocator) -> VerifyResult:
             return VerifyResult(
                 ok=False,
+                measured=True,
                 actual_hash=content_hash(hashlib.sha256(b"tampered").digest()),
                 detail="hash mismatch",
             )

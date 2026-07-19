@@ -111,7 +111,7 @@ class _ArchiveBackend:
         data = self.read_range(locator, ByteRange(0, 0))
         actual = content_hash(hashlib.sha256(data).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
-        return VerifyResult(ok=actual == expected, actual_hash=actual)
+        return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)
 
 
 class _RawOpener:

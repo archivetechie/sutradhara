@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import Engine, select
+from sqlalchemy.orm import Session
 
 from sutradhara.backend.port import (
     BackendError,
@@ -37,6 +38,7 @@ from sutradhara.catalog.types import (
     CopySource,
     content_hash,
 )
+from sutradhara.evidence_recorder import record_measured
 from sutradhara.keys import KeyEpoch
 from sutradhara.replication import (
     SelfHealUnavailable,
@@ -118,7 +120,7 @@ class _ReadableTaggedWriteBackend:
     def verify(self, locator: BackendLocator) -> VerifyResult:
         actual = content_hash(hashlib.sha256(self.read_range(locator, ByteRange(0, 0))).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
-        return VerifyResult(ok=actual == expected, actual_hash=actual)
+        return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)
 
 
 class _FakeSealer:
@@ -261,6 +263,25 @@ def _backend() -> _ReadableTaggedWriteBackend:
     )
 
 
+def _record_fixture_measurement(
+    session: Session,
+    copy: Copy,
+    backend: _ReadableTaggedWriteBackend,
+    *,
+    measured_at: dt.datetime | None = None,
+) -> None:
+    """Qualify a fixture copy through the same read-back recorder as production."""
+
+    record_measured(
+        session,
+        copy,
+        backend.verify(copy.native_locator),
+        source="fanout",
+        execution_id=f"fixture-fanout:{copy.id}",
+        measured_at=measured_at,
+    )
+
+
 def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
     data = b"complete asset"
     asset_hash = _add_asset(engine, data)
@@ -272,7 +293,7 @@ def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
 
     with session_scope(engine) as s:
         for record in (copy1, copy2):
-            add_copy(
+            copy, _ = add_copy(
                 s,
                 logical_asset_hash=asset_hash,
                 backend_id=backend_id,
@@ -286,6 +307,7 @@ def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
                     else Representation.RAO_AEAD_V1
                 ),
             )
+            _record_fixture_measurement(s, copy, backend)
         repaired = self_heal(
             s,
             asset_hash,
@@ -513,7 +535,12 @@ def test_self_heal_falls_back_after_proven_bad_source(
             source=CopySource.INGEST,
             pool_id="o-copy-1-pool",
             storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
-            last_checked_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+        )
+        _record_fixture_measurement(
+            s,
+            bad_copy,
+            backend,
+            measured_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
         )
         good_copy, _ = add_copy(
             s,
@@ -524,7 +551,12 @@ def test_self_heal_falls_back_after_proven_bad_source(
             source=CopySource.INGEST,
             pool_id="o-copy-2-pool",
             storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=ARCHIVE_EPOCH),
-            last_checked_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        )
+        _record_fixture_measurement(
+            s,
+            good_copy,
+            backend,
+            measured_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         )
 
         repaired = self_heal(
@@ -581,7 +613,12 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             source=CopySource.INGEST,
             pool_id="o-copy-1-pool",
             storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
-            last_checked_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+        )
+        _record_fixture_measurement(
+            s,
+            first_copy,
+            backend,
+            measured_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
         )
         second_copy, _ = add_copy(
             s,
@@ -592,7 +629,12 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             source=CopySource.INGEST,
             pool_id="o-copy-2-pool",
             storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=ARCHIVE_EPOCH),
-            last_checked_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        )
+        _record_fixture_measurement(
+            s,
+            second_copy,
+            backend,
+            measured_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         )
         backend.read_failures.add(str(first_record.native_locator["object_id"]))
 

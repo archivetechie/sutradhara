@@ -125,10 +125,10 @@ class _Backend:
     def verify(self, locator: BackendLocator) -> VerifyResult:
         if self.fail_next_verify:
             self.fail_next_verify = False
-            return VerifyResult(ok=False, detail="forced verify failure")
+            return VerifyResult(ok=False, measured=False, detail="forced verify failure")
         actual = content_hash(hashlib.sha256(self.read_range(locator, ByteRange(0, 0))).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
-        return VerifyResult(ok=actual == expected, actual_hash=actual)
+        return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)
 
     def corrupt_member(self, copy: Copy, locator: AssetLocator) -> None:
         object_id = str(copy.native_locator["object_id"])
@@ -211,9 +211,9 @@ def test_bundle_repair_marks_corrupt_source_suspect_and_falls_back(
         ).first()
         assert p1_locator is not None
         backend.corrupt_member(p1_copy, p1_locator)
-        p1_copy.last_checked_at = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+        p1_copy.last_measured_at = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
         p2_copy = s.scalars(select(Copy).where(Copy.pool_id == "p2")).one()
-        p2_copy.last_checked_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        p2_copy.last_measured_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
         p3_copy = s.scalars(select(Copy).where(Copy.pool_id == "p3")).one()
         p3_copy.health = CopyHealth.MISSING
 
@@ -243,9 +243,9 @@ def test_bundle_repair_transport_error_falls_back_without_suspect_latch(
 
     with session_scope(engine) as s:
         p1_copy = s.scalars(select(Copy).where(Copy.pool_id == "p1")).one()
-        p1_copy.last_checked_at = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+        p1_copy.last_measured_at = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
         p2_copy = s.scalars(select(Copy).where(Copy.pool_id == "p2")).one()
-        p2_copy.last_checked_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        p2_copy.last_measured_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
         p3_copy = s.scalars(select(Copy).where(Copy.pool_id == "p3")).one()
         p3_copy.health = CopyHealth.MISSING
         backend.read_failures.add(str(p1_copy.native_locator["object_id"]))
@@ -439,7 +439,7 @@ def test_bundle_copy_duplicate_alarm_logs_once(
 
     with session_scope(engine) as s:
         existing = s.scalars(select(Copy).where(Copy.bundle_id == bundle_id, Copy.pool_id == "p1")).one()
-        add_bundle_copy(
+        duplicate, _ = add_bundle_copy(
             s,
             bundle_id=bundle_id,
             backend_id=backend_id,
@@ -453,6 +453,12 @@ def test_bundle_copy_duplicate_alarm_logs_once(
             source=CopySource.INGEST,
             health=CopyHealth.OK,
             storage_metadata=existing.storage_metadata,
+        )
+        submit(
+            s,
+            "verify",
+            {"copy_id": duplicate.id},
+            dedupe_key=f"verify:copy:{duplicate.id}",
         )
         s.flush()
         caplog.set_level("ERROR", logger="sutradhara.jobs.reconcilers.bundle_copy")

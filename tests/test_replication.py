@@ -28,6 +28,7 @@ from sutradhara.catalog.types import (
     content_hash,
 )
 from sutradhara.durability import AssetTarget
+from sutradhara.jobs.engine import submit
 from sutradhara.keys import KeyEpoch
 from sutradhara.replication import (
     PoolRepresentationError,
@@ -251,6 +252,19 @@ def _metadata(representation: Representation) -> dict[str, object]:
     return metadata
 
 
+def _qualify_fixture_copy(
+    copy: Copy,
+    *,
+    measured_at: dt.datetime | None = None,
+) -> None:
+    """Populate explicit read-back evidence for catalog-only fixture copies."""
+
+    at = measured_at or dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    copy.last_checked_at = at
+    copy.last_measured_digest = copy.integrity_hash
+    copy.last_measured_at = at
+
+
 def test_target_pools_reads_active_memberships_and_representations(
     engine: Engine,
 ) -> None:
@@ -318,7 +332,7 @@ def test_target_pools_excludes_write_fenced_by_default_but_status_keeps_it(
     backend = _PoolWriteBackend("rem")
 
     with session_scope(engine) as s:
-        add_copy(
+        active_copy, _ = add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
@@ -329,6 +343,7 @@ def test_target_pools_excludes_write_fenced_by_default_but_status_keeps_it(
             health=CopyHealth.OK,
             storage_metadata=_metadata(Representation.RAW_BYTES),
         )
+        _qualify_fixture_copy(active_copy)
         write_targets = target_pools(s, "o-archive", {backend_id: backend})
         status = replication_status(s, asset_hash, "o-archive", {backend_id: backend})
 
@@ -738,7 +753,7 @@ def test_replication_status_rejects_copy_representation_mismatch(
     )
 
     with session_scope(engine) as s:
-        add_copy(
+        copy, _ = add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
@@ -748,6 +763,7 @@ def test_replication_status_rejects_copy_representation_mismatch(
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAW_BYTES),
         )
+        _qualify_fixture_copy(copy)
 
         with pytest.raises(PoolRepresentationError, match="requires"):
             replication_status(s, asset_hash, "o-archive", {backend_id: _PoolWriteBackend("rem")})
@@ -774,7 +790,7 @@ def test_repair_writes_only_missing_pools(
     backend = _PoolWriteBackend("rem", tape_by_pool={"private-copy-2": "2" * 32})
 
     with session_scope(engine) as s:
-        add_copy(
+        existing, _ = add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
@@ -784,6 +800,7 @@ def test_repair_writes_only_missing_pools(
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAW_BYTES),
         )
+        _qualify_fixture_copy(existing)
         repaired = repair(
             s,
             asset_hash,
@@ -818,7 +835,7 @@ def test_replication_status_reports_missing_and_complete(
     backend = _PoolWriteBackend("rem")
 
     with session_scope(engine) as s:
-        add_copy(
+        first, _ = add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
@@ -828,12 +845,13 @@ def test_replication_status_reports_missing_and_complete(
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAW_BYTES),
         )
+        _qualify_fixture_copy(first)
         status = replication_status(s, asset_hash, "video-priv", {backend_id: backend})
         assert status["complete"] is False
         assert {p.pool_id for p in status["have"]} == {"private-copy-1"}
         assert {p.pool_id for p in status["missing"]} == {"private-copy-2"}
 
-        add_copy(
+        second, _ = add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
@@ -843,6 +861,7 @@ def test_replication_status_reports_missing_and_complete(
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAW_BYTES),
         )
+        _qualify_fixture_copy(second)
         status = replication_status(s, asset_hash, "video-priv", {backend_id: backend})
         assert status["complete"] is True
         assert status["missing"] == set()
@@ -874,6 +893,13 @@ def test_replication_status_counts_fresh_unverified_copy(
             storage_metadata=_metadata(Representation.RAW_BYTES),
         )
         assert copy.last_checked_at is None
+        assert copy.last_measured_digest is None
+        submit(
+            s,
+            "verify",
+            {"copy_id": copy.id},
+            dedupe_key=f"verify:copy:{copy.id}",
+        )
 
         status = replication_status(
             s,
@@ -904,7 +930,7 @@ def test_replication_status_rejects_same_tape_for_multiple_pools(
 
     with session_scope(engine) as s:
         for pool in ("private-copy-1", "private-copy-2"):
-            add_copy(
+            copy, _ = add_copy(
                 s,
                 logical_asset_hash=asset_hash,
                 backend_id=backend_id,
@@ -917,6 +943,7 @@ def test_replication_status_rejects_same_tape_for_multiple_pools(
                 source=CopySource.INGEST,
                 storage_metadata=_metadata(Representation.RAW_BYTES),
             )
+            _qualify_fixture_copy(copy)
 
         with pytest.raises(ReplicationInvariantError, match="distinct tape_uuid"):
             replication_status(
@@ -942,7 +969,7 @@ def test_replication_status_rejects_missing_tape_uuid(
     )
 
     with session_scope(engine) as s:
-        add_copy(
+        copy, _ = add_copy(
             s,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
@@ -952,6 +979,7 @@ def test_replication_status_rejects_missing_tape_uuid(
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAW_BYTES),
         )
+        _qualify_fixture_copy(copy)
 
         with pytest.raises(ReplicationInvariantError, match="missing tape_uuid"):
             replication_status(
@@ -1043,7 +1071,10 @@ def test_select_source_self_heal_prefers_fresh_aead_over_stale_plain(
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
-            last_checked_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        )
+        _qualify_fixture_copy(
+            stale_plain,
+            measured_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         )
         fresh_aead, _ = add_copy(
             s,
@@ -1054,7 +1085,10 @@ def test_select_source_self_heal_prefers_fresh_aead_over_stale_plain(
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
             storage_metadata=_metadata(Representation.RAO_AEAD_V1),
-            last_checked_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+        )
+        _qualify_fixture_copy(
+            fresh_aead,
+            measured_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
         )
 
         selected = select_source(
