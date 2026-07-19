@@ -59,7 +59,7 @@ class _TapeGroup:
     library: str | None
     copy_ids: set[int]
     health_by_copy: dict[int, str]
-    last_verified_at: dt.datetime | None = None
+    last_checked_at: dt.datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -289,10 +289,10 @@ def _group_tape_copies(
             group.library = library
         group.copy_ids.add(copy.id)
         group.health_by_copy[copy.id] = _value(copy.health)
-        if copy.last_verified_at is not None and (
-            group.last_verified_at is None or copy.last_verified_at > group.last_verified_at
+        if copy.last_checked_at is not None and (
+            group.last_checked_at is None or copy.last_checked_at > group.last_checked_at
         ):
-            group.last_verified_at = copy.last_verified_at
+            group.last_checked_at = copy.last_checked_at
     return list(groups.values())
 
 
@@ -342,7 +342,7 @@ def _tape_payload(
         "library": group.library,
         "object_count": len(group.copy_ids),
         "health_rollup": _health_rollup(group.health_by_copy),
-        "last_verified_at": _optional_iso(group.last_verified_at),
+        "last_checked_at": _optional_iso(group.last_checked_at),
         "offsite_confirmed": _is_offsite_confirmed(media_id, confirmed_media_ids),
     }
 

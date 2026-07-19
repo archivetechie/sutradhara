@@ -79,10 +79,19 @@ class CopyRecord:
 
 @dataclass(frozen=True)
 class VerifyResult:
-    """Outcome of a backend.verify() call."""
+    """Outcome of a backend check, with explicit read-back provenance."""
 
     ok: bool
+    measured: bool
     actual_hash: ContentHash | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class WitnessResult:
+    """Independent catalog evidence for one backend-native copy locator."""
+
+    confirmed: bool
     detail: str = ""
 
 
@@ -138,12 +147,28 @@ class StorageBackend(Protocol):
 class DeletableStorageBackend(StorageBackend, Protocol):
     """Storage backend capability for idempotent object deletion."""
 
-    def delete_object(self, locator: BackendLocator) -> None:
+    def delete_object(self, locator: BackendLocator) -> bool:
         """Delete one backend object.
 
         Implementations must treat an already-absent object as success so
         callers can safely retry after a delete-before-DB crash window.
+        Return ``True`` when bytes existed and were deleted, ``False`` when
+        the locator was already absent.
         """
+        ...
+
+
+@runtime_checkable
+class RetentionWitnessBackend(StorageBackend, Protocol):
+    """Optional adapter capability used by both irreversible retention gates."""
+
+    def witness_copy(
+        self,
+        locator: BackendLocator,
+        *,
+        expected_hash: ContentHash,
+    ) -> WitnessResult:
+        """Cross-check one locator against an independent backend catalog."""
         ...
 
 

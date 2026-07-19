@@ -47,6 +47,7 @@ from sutradhara.catalog.types import (
     is_content_hash,
 )
 from sutradhara.receive_novelty import novelty_summaries, novelty_summary
+from sutradhara.retention import purge_status
 
 router = APIRouter()
 
@@ -83,7 +84,7 @@ class _CatalogPair:
 class _CopyRollup:
     copy_ids: set[int]
     health_by_copy: dict[int, str]
-    last_verified_at: dt.datetime | None = None
+    last_checked_at: dt.datetime | None = None
 
 
 @router.get("/api/ui/intakes")
@@ -132,6 +133,7 @@ def get_intakes(
         summaries = novelty_summaries(session, [row[0].intake_id for row in rows])
         intakes = [
             _intake_payload(
+                session,
                 row[0],
                 item_count=int(row[1] or 0),
                 bytes_total=int(row[2] or 0),
@@ -157,6 +159,7 @@ def get_intake(request: Request, intake_id: str) -> dict[str, object]:
             raise_console_error(404, "not_found", f"unknown intake {intake_id!r}")
         intake, item_count, bytes_total, archive_state, archived = row
         payload = _intake_payload(
+            session,
             intake,
             item_count=item_count,
             bytes_total=bytes_total,
@@ -363,6 +366,7 @@ def _intake_row(
 
 
 def _intake_payload(
+    session: Any,
     intake: Intake,
     *,
     item_count: int,
@@ -371,6 +375,7 @@ def _intake_payload(
     archived: bool,
     novelty: dict[str, int] | None = None,
 ) -> dict[str, object]:
+    purge = purge_status(session, intake)
     payload: dict[str, object] = {
         "intake_id": _text(intake.intake_id),
         "operator": _text(intake.operator),
@@ -379,6 +384,10 @@ def _intake_payload(
         "label": None if intake.label is None else _text(intake.label),
         "status": _value(intake.status),
         "retention_state": _value(intake.retention_state),
+        "purge_status": {
+            "status": purge.status,
+            "assessed_at": iso_utc(purge.assessed_at),
+        },
         "created_at": iso_utc(intake.created_at),
         "updated_at": iso_utc(intake.updated_at),
         "registered_at": _optional_iso(intake.registered_at),
@@ -391,7 +400,8 @@ def _intake_payload(
         "source_release_safe": (
             intake.source_kind == "card" and intake.status == IntakeStatus.REGISTERED
         ),
-        "novelty": novelty or {
+        "novelty": novelty
+        or {
             "total": 0,
             "new": 0,
             "known_durable": 0,
@@ -482,7 +492,7 @@ def _asset_copy_payload(
         "health": _value(copy.health),
         "source": _value(copy.source),
         "representation": _text(locator.representation),
-        "last_verified_at": _optional_iso(copy.last_verified_at),
+        "last_checked_at": _optional_iso(copy.last_checked_at),
     }
     if is_admin:
         payload["locator_summary"] = _locator_summary(
@@ -587,20 +597,20 @@ def _copy_rollups_by_hash(session: Any, hashes: list[bytes]) -> dict[bytes, _Cop
     if not hashes:
         return {}
     rollups: dict[bytes, _CopyRollup] = {}
-    for content_hash, copy_id, health, last_verified_at in session.execute(
-        select(Copy.logical_asset_hash, Copy.id, Copy.health, Copy.last_verified_at).where(
+    for content_hash, copy_id, health, last_checked_at in session.execute(
+        select(Copy.logical_asset_hash, Copy.id, Copy.health, Copy.last_checked_at).where(
             Copy.logical_asset_hash.in_(hashes),
             Copy.deleted_at.is_(None),
         )
     ):
         if content_hash is not None:
-            _add_rollup_copy(rollups, content_hash, copy_id, _value(health), last_verified_at)
-    for content_hash, copy_id, health, last_verified_at in session.execute(
+            _add_rollup_copy(rollups, content_hash, copy_id, _value(health), last_checked_at)
+    for content_hash, copy_id, health, last_checked_at in session.execute(
         select(
             AssetLocator.logical_asset_hash,
             Copy.id,
             Copy.health,
-            Copy.last_verified_at,
+            Copy.last_checked_at,
         )
         .join(Copy, AssetLocator.copy_id == Copy.id)
         .where(
@@ -609,7 +619,7 @@ def _copy_rollups_by_hash(session: Any, hashes: list[bytes]) -> dict[bytes, _Cop
             Copy.deleted_at.is_(None),
         )
     ):
-        _add_rollup_copy(rollups, content_hash, copy_id, _value(health), last_verified_at)
+        _add_rollup_copy(rollups, content_hash, copy_id, _value(health), last_checked_at)
     return rollups
 
 
@@ -618,7 +628,7 @@ def _add_rollup_copy(
     content_hash: bytes,
     copy_id: int,
     health: str,
-    last_verified_at: dt.datetime | None,
+    last_checked_at: dt.datetime | None,
 ) -> None:
     rollup = rollups.setdefault(
         content_hash,
@@ -626,10 +636,10 @@ def _add_rollup_copy(
     )
     rollup.copy_ids.add(copy_id)
     rollup.health_by_copy[copy_id] = health
-    if last_verified_at is not None and (
-        rollup.last_verified_at is None or last_verified_at > rollup.last_verified_at
+    if last_checked_at is not None and (
+        rollup.last_checked_at is None or last_checked_at > rollup.last_checked_at
     ):
-        rollup.last_verified_at = last_verified_at
+        rollup.last_checked_at = last_checked_at
 
 
 def _catalog_asset_payload(
@@ -644,7 +654,7 @@ def _catalog_asset_payload(
         "size_bytes": asset.size_bytes,
         "copy_count": 0 if rollup is None else len(rollup.copy_ids),
         "health_rollup": _health_rollup(rollup),
-        "last_verified_at": None if rollup is None else _optional_iso(rollup.last_verified_at),
+        "last_checked_at": None if rollup is None else _optional_iso(rollup.last_checked_at),
     }
 
 

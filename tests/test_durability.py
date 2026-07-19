@@ -221,7 +221,7 @@ def test_bundle_replication_status_reports_complete_and_missing(engine: Engine) 
         pool_b = _add_pool(session, "pool-b", artifactclass="masters", sort_order=1)
         session.add(Bundle(id="bundle-1", artifactclass="masters", status="sealed"))
         session.flush()
-        add_bundle_copy(
+        copy_a, _ = add_bundle_copy(
             session,
             bundle_id="bundle-1",
             backend_id=pool_a.backend_id,
@@ -232,9 +232,10 @@ def test_bundle_replication_status_reports_complete_and_missing(engine: Engine) 
             health=CopyHealth.OK,
             storage_metadata=_metadata(),
         )
+        _qualify_copy(copy_a)
 
         missing = bundle_replication_status(session, "bundle-1")
-        add_bundle_copy(
+        copy_b, _ = add_bundle_copy(
             session,
             bundle_id="bundle-1",
             backend_id=pool_b.backend_id,
@@ -245,6 +246,7 @@ def test_bundle_replication_status_reports_complete_and_missing(engine: Engine) 
             health=CopyHealth.OK,
             storage_metadata=_metadata(),
         )
+        _qualify_copy(copy_b)
         complete = bundle_replication_status(session, "bundle-1")
 
     assert missing["complete"] is False
@@ -451,8 +453,9 @@ def _add_bundle_copy_with_locator(
         source=CopySource.INGEST,
         health=CopyHealth.OK,
         storage_metadata=_metadata(),
-        last_verified_at=_now() if verified else None,
     )
+    if verified:
+        _qualify_copy(copy)
     _add_locator(
         session,
         copy=copy,
@@ -462,6 +465,12 @@ def _add_bundle_copy_with_locator(
         member_path=f"{locator_id}.bin",
     )
     return copy
+
+
+def _qualify_copy(copy: Copy) -> None:
+    copy.last_checked_at = _now()
+    copy.last_measured_digest = copy.integrity_hash
+    copy.last_measured_at = _now()
 
 
 def _add_locator(

@@ -123,7 +123,7 @@ objects and per-member transforms), and the two grains of stored truth:
   backend (a check constraint enforces the XOR). Unique on
   `(backend_id, native_locator_key)`; carries `health`
   (`ok`/`suspect`/`corrupt`/`missing`), `integrity_hash`,
-  `storage_metadata` (representation, key epoch), `last_verified_at`, and
+  `storage_metadata` (representation, key epoch), `last_checked_at`, and
   the retention tombstone `deleted_at`.
 - **`AssetLocator`** — the per-asset pointer that lets a bundle-scoped
   `Copy` count as durable coverage for one asset, with the member path
@@ -233,7 +233,7 @@ The intended flow, each step naming the code that implements it:
    dropping it. Nothing else in the system deletes bytes.
 
 Continuously, in the background: **scrub** (`scrub.py`) re-enumerates a
-backend and reconciles it against the catalog (bump `last_verified_at`,
+   backend and reconciles it against the catalog (bump `last_checked_at`,
 insert unknown objects, mark absentees `missing`, flag hash conflicts
 `suspect` — never delete), and **self-heal** (`replication.py`) re-seals
 missing placements from a healthy copy.

@@ -24,6 +24,7 @@ from sutradhara.backend.port import BackendError, CopyRecord, StorageBackend
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import ArtifactClassPool, Bundle, Copy, Pool
 from sutradhara.catalog.types import CopyHealth, CopySource
+from sutradhara.jobs.engine import submit
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import RestoreError, RestoreIntegrityError, restore_copy
 from sutradhara.sealing.port import Opener, Representation, Sealer, SealResult
@@ -196,7 +197,7 @@ def replicate_asset(
         ) as sealed:
             record = backend.write_object_to_pool(sealed.sealed_path, target.pool_id)
             _assert_copy_integrity(asset_hash, record, sealed, target)
-        copy, _ = add_copy(
+        copy, created = add_copy(
             session,
             logical_asset_hash=asset_hash,
             backend_id=target.backend_id,
@@ -210,6 +211,8 @@ def replicate_asset(
                 recipient_epochs=sealed.recipient_epochs,
             ),
         )
+        if created:
+            _enqueue_copy_verify(session, copy)
         _assert_copy_matches_pool(copy, target)
         copies.append(copy)
     return copies
@@ -253,7 +256,7 @@ def repair(
         ) as sealed:
             record = backend.write_object_to_pool(sealed.sealed_path, target.pool_id)
             _assert_copy_integrity(asset_hash, record, sealed, target)
-        copy, _ = add_copy(
+        copy, created = add_copy(
             session,
             logical_asset_hash=asset_hash,
             backend_id=target.backend_id,
@@ -267,6 +270,8 @@ def repair(
                 recipient_epochs=sealed.recipient_epochs,
             ),
         )
+        if created:
+            _enqueue_copy_verify(session, copy)
         _assert_copy_matches_pool(copy, target)
         repaired.append(copy)
     return repaired
@@ -375,7 +380,7 @@ def replication_status(
     key_epoch: str | None = None,
 ) -> ReplicationStatus:
     """Report whether an asset has healthy copies in all active pools."""
-    from sutradhara.durability import direct_copies
+    from sutradhara.durability import direct_copies, pending_verification_copy_ids
 
     targets = target_pools(
         session,
@@ -389,7 +394,14 @@ def replication_status(
     have: set[PoolTarget] = set()
     media_id_by_target: dict[PoolTarget, str] = {}
 
-    for copy in direct_copies(session, asset_hash):
+    measured = direct_copies(session, asset_hash, require_verified=True)
+    pending_ids = pending_verification_copy_ids(session)
+    pending = [
+        copy
+        for copy in direct_copies(session, asset_hash)
+        if copy.id in pending_ids and copy not in measured
+    ]
+    for copy in [*measured, *pending]:
         key = _copy_pool_key(copy)
         if key is None:
             continue
@@ -560,7 +572,7 @@ def _self_heal_candidates(session: Session, target: Any) -> list[Copy]:
 
 
 def _self_heal_sort_key(copy: Copy) -> tuple[int, float, int, int, int]:
-    verified = _timestamp_sort_value(copy.last_verified_at)
+    verified = _timestamp_sort_value(copy.last_measured_at)
     return (
         0 if copy.health == CopyHealth.OK else 1,
         -verified,
@@ -597,6 +609,15 @@ def _location_cost(copy: Copy) -> int:
 
 def _mark_copy_suspect(copy: Copy) -> None:
     copy.health = CopyHealth.SUSPECT
+
+
+def _enqueue_copy_verify(session: Session, copy: Copy) -> None:
+    submit(
+        session,
+        "verify",
+        {"copy_id": copy.id},
+        dedupe_key=f"verify:copy:{copy.id}",
+    )
 
 
 def _is_proven_digest_mismatch(exc: RestoreIntegrityError) -> bool:

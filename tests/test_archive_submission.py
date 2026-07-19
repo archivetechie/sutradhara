@@ -246,7 +246,7 @@ def test_archive_submission_fans_out_and_restores_arranged_member(
         assert bundle.status == "sealed"
         copies = list(session.scalars(select(Copy).where(Copy.bundle_id == result.bundle_id)))
         assert copies
-        assert all(copy.last_verified_at is not None for copy in copies)
+        assert all(copy.last_checked_at is not None for copy in copies)
         assert bundle.scan_summary == {
             "mode": "map",
             "source_map_path": str(Path(submission.source_map_path)),

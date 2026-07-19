@@ -20,7 +20,12 @@ from sqlalchemy.orm import Session
 
 from sutradhara.catalog.models import Bundle, Copy, LogicalAsset
 from sutradhara.catalog.session import locator_key
-from sutradhara.catalog.types import CopyHealth, CopySource, is_content_hash
+from sutradhara.catalog.types import (
+    CopyHealth,
+    CopySource,
+    IntegrityHashProvenance,
+    is_content_hash,
+)
 
 
 class CatalogError(Exception):
@@ -61,8 +66,8 @@ def add_copy(
     integrity_hash: bytes,
     source: CopySource,
     health: CopyHealth = CopyHealth.OK,
+    integrity_hash_provenance: IntegrityHashProvenance = IntegrityHashProvenance.LOCALLY_COMPUTED,
     storage_metadata: dict[str, Any] | None = None,
-    last_verified_at: dt.datetime | None = None,
     first_observed_at: dt.datetime | None = None,
 ) -> tuple[Copy, bool]:
     """Record one Copy of an existing asset on a backend.
@@ -75,8 +80,8 @@ def add_copy(
     Backend selection is the caller's job - pass a resolved `backend_id`.
     `source` is required (declare provenance); `health` defaults to OK. Extra
     `storage_metadata` is non-authoritative representation/geometry context,
-    not part of the locator identity. `first_observed_at` / `last_verified_at`
-    fall back to the model defaults when None.
+    not part of the locator identity. `first_observed_at` falls back to the
+    model default when None. Copy creation never claims a check or measurement.
 
     Raises `UnknownLogicalAsset` if `logical_asset_hash` names no asset.
     Does not commit; the caller owns the transaction.
@@ -106,11 +111,10 @@ def add_copy(
         native_locator_key=key,
         storage_metadata=storage_metadata or {},
         integrity_hash=integrity_hash,
+        integrity_hash_provenance=integrity_hash_provenance,
         source=source,
         health=health,
     )
-    if last_verified_at is not None:
-        copy.last_verified_at = last_verified_at
     if first_observed_at is not None:
         copy.first_observed_at = first_observed_at
 
@@ -129,8 +133,8 @@ def add_bundle_copy(
     integrity_hash: bytes,
     source: CopySource,
     health: CopyHealth = CopyHealth.OK,
+    integrity_hash_provenance: IntegrityHashProvenance = IntegrityHashProvenance.LOCALLY_COMPUTED,
     storage_metadata: dict[str, Any] | None = None,
-    last_verified_at: dt.datetime | None = None,
     first_observed_at: dt.datetime | None = None,
 ) -> tuple[Copy, bool]:
     """Record one materialized bundle copy on a backend pool.
@@ -170,11 +174,10 @@ def add_bundle_copy(
         native_locator_key=key,
         storage_metadata=storage_metadata or {},
         integrity_hash=integrity_hash,
+        integrity_hash_provenance=integrity_hash_provenance,
         source=source,
         health=health,
     )
-    if last_verified_at is not None:
-        copy.last_verified_at = last_verified_at
     if first_observed_at is not None:
         copy.first_observed_at = first_observed_at
 

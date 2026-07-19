@@ -7,7 +7,7 @@ Behavior:
     1. Load the Copy row + its Backend row.
     2. Instantiate the backend via the factory.
     3. Call `backend.verify(copy.native_locator)`.
-    4. Update `copy.health` (OK / SUSPECT / CORRUPT) and `copy.last_verified_at`.
+    4. Atomically update check/measurement projections and append a receipt.
     5. Return JobResult(ok=True) regardless of integrity outcome — the
        JOB succeeded; the verify ANSWER is captured in catalog state and
        in `step_state` for inspection.
@@ -27,6 +27,7 @@ from typing import cast
 from sutradhara.backend import factory
 from sutradhara.catalog.models import Copy
 from sutradhara.catalog.types import CopyHealth
+from sutradhara.evidence_recorder import record_measured, record_unmeasured_promotion
 from sutradhara.jobs.components import touch_asset, touch_copy_tape
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 
@@ -53,20 +54,32 @@ def handle_verify(ctx: JobContext) -> JobResult:
     ctx.observe(
         {
             "verify_ok": result.ok,
+            "measured": result.measured,
             "actual_hash": (cast(bytes, result.actual_hash).hex() if result.actual_hash else None),
             "detail": result.detail,
         }
     )
 
-    copy.last_verified_at = dt.datetime.now(dt.UTC)
-    if result.ok:
-        # If this copy was previously suspect/missing/corrupt and now
-        # verifies clean, restore it to OK.
-        copy.health = CopyHealth.OK
+    execution_id = str(ctx.job.id)
+    if result.measured and result.actual_hash is not None:
+        record_measured(
+            ctx.session,
+            copy,
+            result,
+            source="verify-job",
+            execution_id=execution_id,
+        )
+    elif result.ok:
+        record_unmeasured_promotion(
+            ctx.session,
+            copy,
+            result,
+            source="verify-job",
+            execution_id=execution_id,
+        )
     else:
-        # Distinguish corruption (hash known and wrong) from suspect
-        # (hash unknown or hash matched but other signal off). Day-1:
-        # any non-ok verify result is SUSPECT.
+        # An unmeasured negative signal cannot prove corruption.
+        copy.last_checked_at = dt.datetime.now(dt.UTC)
         copy.health = CopyHealth.SUSPECT
 
     return JobResult(
@@ -75,6 +88,7 @@ def handle_verify(ctx: JobContext) -> JobResult:
         step_state={
             "verify_result": {
                 "ok": result.ok,
+                "measured": result.measured,
                 "actual_hash": (
                     cast(bytes, result.actual_hash).hex() if result.actual_hash else None
                 ),

@@ -96,9 +96,9 @@ def test_registration_classifies_all_authoritative_dispositions_and_suppression(
                 integrity_hash=item.logical_asset_hash,
                 source=CopySource.INGEST,
                 health=CopyHealth.OK,
-                last_verified_at=dt.datetime.now(dt.UTC),
+                last_checked_at=dt.datetime.now(dt.UTC),
             )
-            assert copy.last_verified_at is not None
+            assert copy.last_checked_at is not None
 
         with session_scope(engine) as session:
             durable = register_intake(session, durable_root, artifactclass="masters")
@@ -179,7 +179,7 @@ def test_estimate_and_nothing_new_handshake_are_content_based(tmp_path: Path) ->
                 integrity_hash=item.logical_asset_hash,
                 source=CopySource.INGEST,
                 health=CopyHealth.OK,
-                last_verified_at=dt.datetime.now(dt.UTC),
+                last_checked_at=dt.datetime.now(dt.UTC),
             )
             same = estimate_listing_novelty(
                 session,

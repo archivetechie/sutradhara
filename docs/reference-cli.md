@@ -371,7 +371,7 @@ Register and inspect storage backends and manage pool write fences.
 ## sutra scrub
 
 Re-enumerate a backend and reconcile it against the catalog: matching
-copies get `last_verified_at` bumped, objects on the backend but missing
+copies get `last_checked_at` bumped, objects on the backend but missing
 from the catalog are inserted, and catalog copies missing from the backend
 are marked `MISSING`. Scrub never deletes. This is the working proof of the
 rebuildable-index principle. Flags: `--backend TEXT` (required, a

@@ -15,7 +15,7 @@
         "tape_file_number": 1,
         "first_body_lba": 0,
         "health": "ok",
-        "last_verified_at": "2026-05-27T12:00:00+00:00"
+        "last_checked_at": "2026-05-27T12:00:00+00:00"
       }
     ]
   },
@@ -35,7 +35,7 @@
         "tape_file_number": 3,
         "first_body_lba": 0,
         "health": "ok",
-        "last_verified_at": "2026-05-27T12:00:00+00:00"
+        "last_checked_at": "2026-05-27T12:00:00+00:00"
       }
     ]
   },
@@ -55,14 +55,14 @@
         "tape_file_number": 5,
         "first_body_lba": 0,
         "health": "ok",
-        "last_verified_at": "2026-05-27T12:00:00+00:00"
+        "last_checked_at": "2026-05-27T12:00:00+00:00"
       },
       {
         "tape_uuid": "bbbb00021234567890abcdef12345678",
         "tape_file_number": 99,
         "first_body_lba": 0,
         "health": "ok",
-        "last_verified_at": "2026-05-27T13:00:00+00:00"
+        "last_checked_at": "2026-05-27T13:00:00+00:00"
       }
     ]
   }

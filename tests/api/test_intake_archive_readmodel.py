@@ -107,7 +107,7 @@ COPY_KEYS = {
     "health",
     "source",
     "representation",
-    "last_verified_at",
+    "last_checked_at",
 }
 CATALOG_KEYS = {
     "content_sha256",
@@ -116,7 +116,7 @@ CATALOG_KEYS = {
     "size_bytes",
     "copy_count",
     "health_rollup",
-    "last_verified_at",
+    "last_checked_at",
 }
 
 
@@ -700,7 +700,7 @@ def test_archive_asset_uses_asset_locator_origin_rule_and_locator_shaping(
             pool,
             locator={"media_id": "VOL001", "object_path": "/var/lib/replica/private/bundle.rao"},
             health=CopyHealth.SUSPECT,
-            last_verified_at=base + dt.timedelta(hours=2),
+            last_checked_at=base + dt.timedelta(hours=2),
         )
         session.add(
             AssetLocator(
@@ -796,7 +796,7 @@ def test_catalog_assets_are_asset_class_pairs_with_offset_paging(api_engine: Eng
             pool,
             locator={"key": "/srv/disk/private/proxy-bundle"},
             health=CopyHealth.OK,
-            last_verified_at=base + dt.timedelta(minutes=3),
+            last_checked_at=base + dt.timedelta(minutes=3),
         )
         session.add(
             AssetLocator(
@@ -1047,7 +1047,7 @@ def _add_bundle_copy(
     *,
     locator: dict[str, Any],
     health: CopyHealth = CopyHealth.OK,
-    last_verified_at: dt.datetime | None = None,
+    last_checked_at: dt.datetime | None = None,
 ) -> Copy:
     copy = Copy(
         bundle_id=bundle.id,
@@ -1059,7 +1059,7 @@ def _add_bundle_copy(
         integrity_hash=_digest(f"copy-{bundle.id}-{pool.id}"),
         health=health,
         source=CopySource.INGEST,
-        last_verified_at=last_verified_at,
+        last_checked_at=last_checked_at,
     )
     session.add(copy)
     session.flush([copy])

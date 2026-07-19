@@ -430,7 +430,8 @@ an individual-file copy.
 | `storage_metadata` | json | Representation-specific facts, such as RAO metadata. |
 | `integrity_hash` | hash | Required digest of the stored representation. |
 | `health` | enum | `ok`, `suspect`, `corrupt`, or `missing`; defaults to `ok`. |
-| `last_verified_at` | time, optional | Last successful verification time. |
+| `last_checked_at` | time, optional | Last backend check, measured or trust-based. |
+| `last_measured_digest` / `last_measured_at` | hash/time, optional pair | Last byte read-back measurement; both fields are null or both are set. |
 | `deleted_at` | time, optional | Tombstone time after physical deletion. |
 | `first_observed_at` | time | When the catalogue first learned of it. |
 | `source` | enum | Discovery path: `ingest`, `scrub`, or `manual_import`. |

@@ -198,7 +198,8 @@ class D2TapeBackend:
         artifact = self._artifact_for_locator(locator)
         expected = content_hash(bytes.fromhex(_required_str(artifact, "integrity_hash")))
         with tempfile.TemporaryDirectory(prefix="sutradhara-d2tape-verify-") as raw:
-            hashes_path = Path(raw) / "hashes.json"
+            scratch = Path(raw)
+            hashes_path = scratch / "hashes.json"
             hashes_path.write_text(
                 json.dumps(_required_dict(artifact, "hashes"), sort_keys=True) + "\n"
             )
@@ -218,10 +219,21 @@ class D2TapeBackend:
                 ],
                 device,
             )
-        if report.get("ok") is True and _per_file_ok(report):
-            return VerifyResult(ok=True, actual_hash=expected)
+            if report.get("ok") is True and _per_file_ok(report):
+                actual = content_hash(_sha256_file(self._restore_payload(locator, scratch)))
+                if actual == expected:
+                    return VerifyResult(ok=True, measured=True, actual_hash=actual)
+                return VerifyResult(
+                    ok=False,
+                    measured=True,
+                    actual_hash=actual,
+                    detail=(
+                        f"expected {expected.hex()[:12]}..., got {actual.hex()[:12]}..."
+                    ),
+                )
         return VerifyResult(
             ok=False,
+            measured=False,
             actual_hash=None,
             detail=f"d2tape verify reported failure for {_required_str(locator, 'artifact_name')}",
         )

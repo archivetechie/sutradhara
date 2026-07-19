@@ -15,6 +15,7 @@ import datetime as dt
 from typing import Any
 
 from sqlalchemy import (
+    DDL,
     JSON,
     BigInteger,
     Boolean,
@@ -28,6 +29,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     event,
+    text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -46,6 +48,7 @@ from sutradhara.catalog.types import (
     IngestDisposition,
     IntakeSourceKind,
     IntakeStatus,
+    IntegrityHashProvenance,
     MediaKind,
     RetentionState,
     SubmissionStatus,
@@ -135,8 +138,22 @@ class Intake(Base):
             name="ck_intake_status",
         ),
         CheckConstraint(
-            "retention_state IN ('held', 'released', 'purged')",
+            "retention_state IN ('held', 'released', 'tombstoned', 'abandoned', 'purged')",
             name="ck_intake_retention_state",
+        ),
+        CheckConstraint(
+            "(staging_tombstoned_at IS NULL AND staging_tombstone_path IS NULL) OR "
+            "(staging_tombstoned_at IS NOT NULL AND staging_tombstone_path IS NOT NULL)",
+            name="ck_intake_tombstone_pair",
+        ),
+        CheckConstraint(
+            "retention_state != 'tombstoned' OR "
+            "(staging_tombstoned_at IS NOT NULL AND staging_tombstone_path IS NOT NULL)",
+            name="ck_intake_tombstoned_state",
+        ),
+        CheckConstraint(
+            "retention_state != 'purged' OR staging_deleted_at IS NOT NULL",
+            name="ck_intake_purged_state",
         ),
     )
 
@@ -170,6 +187,11 @@ class Intake(Base):
         String(32), nullable=False, default=RetentionState.HELD, server_default="held"
     )
     released_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    release_policy_fingerprint: Mapped[str | None] = mapped_column(String(67), nullable=True)
+    staging_tombstoned_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    staging_tombstone_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     staging_deleted_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -242,9 +264,7 @@ class IngestItem(Base):
     disposition_evaluated_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    disposition_policy_generation: Mapped[str | None] = mapped_column(
-        String(128), nullable=True
-    )
+    disposition_policy_generation: Mapped[str | None] = mapped_column(String(128), nullable=True)
     disposition_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     prior_intake_id: Mapped[str | None] = mapped_column(
         String(128),
@@ -733,6 +753,13 @@ class OffsiteConfirmation(Base):
     """Operator confirmation that one tape/media id is durably offsite."""
 
     __tablename__ = "offsite_confirmation"
+    __table_args__ = (
+        CheckConstraint(
+            "(revoked_at IS NULL AND revoked_by IS NULL) OR "
+            "(revoked_at IS NOT NULL AND revoked_by IS NOT NULL AND length(revoked_by) > 0)",
+            name="ck_offsite_confirmation_revocation_pair",
+        ),
+    )
 
     media_id: Mapped[str] = mapped_column(String(256), primary_key=True)
     confirmed_at: Mapped[dt.datetime] = mapped_column(
@@ -740,6 +767,8 @@ class OffsiteConfirmation(Base):
     )
     confirmed_by: Mapped[str] = mapped_column(String(256), nullable=False)
     shipment_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     def __repr__(self) -> str:
         return f"<OffsiteConfirmation media_id={self.media_id!r}>"
@@ -751,29 +780,75 @@ class RetentionEvent(Base):
     __tablename__ = "retention_event"
     __table_args__ = (
         CheckConstraint(
-            "action IN ('released', 'cloud_blob_deleted', 'staging_deleted')",
+            "action IN ('released', 'cloud_blob_deleted', 'staging_deleted', "
+            "'release_attempted', 'purge_attempted', 'staging_tombstoned', "
+            "'staging_purge_held', 'batch_invoked', 'batch_refused', "
+            "'grace_overridden', 'abandoned', 'correction_recorded', "
+            "'offsite_confirmed')",
             name="ck_retention_event_action",
+        ),
+        CheckConstraint(
+            "(subject_type = 'intake' AND intake_id = subject_id AND action IN "
+            "('released', 'cloud_blob_deleted', 'staging_deleted', 'release_attempted', "
+            "'purge_attempted', 'staging_tombstoned', 'staging_purge_held', 'abandoned', "
+            "'correction_recorded')) OR "
+            "(subject_type = 'media' AND intake_id IS NULL AND action IN "
+            "('offsite_confirmed', 'correction_recorded')) OR "
+            "(subject_type = 'batch' AND intake_id IS NULL AND action IN "
+            "('batch_invoked', 'batch_refused', 'grace_overridden'))",
+            name="ck_retention_event_subject",
         ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    intake_id: Mapped[str] = mapped_column(
+    event_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    intake_id: Mapped[str | None] = mapped_column(
         String(128),
-        ForeignKey("intake.intake_id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("intake.intake_id", ondelete="RESTRICT"),
+        nullable=True,
         index=True,
     )
+    subject_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(256), nullable=False)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     actor: Mapped[str] = mapped_column(String(256), nullable=False)
     at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    intake: Mapped[Intake] = relationship()
+    intake: Mapped[Intake | None] = relationship()
 
     def __repr__(self) -> str:
         return f"<RetentionEvent intake={self.intake_id!r} action={self.action!r}>"
+
+
+Index(
+    "uq_retention_event_action_operation_once",
+    RetentionEvent.action,
+    RetentionEvent.operation_id,
+    unique=True,
+    sqlite_where=RetentionEvent.action.in_(
+        (
+            "release_attempted",
+            "cloud_blob_deleted",
+            "released",
+            "purge_attempted",
+            "staging_tombstoned",
+            "staging_deleted",
+        )
+    ),
+    postgresql_where=RetentionEvent.action.in_(
+        (
+            "release_attempted",
+            "cloud_blob_deleted",
+            "released",
+            "purge_attempted",
+            "staging_tombstoned",
+            "staging_deleted",
+        )
+    ),
+)
 
 
 class Pool(Base):
@@ -1224,6 +1299,19 @@ class Copy(Base):
             "(logical_asset_hash IS NULL AND bundle_id IS NOT NULL)",
             name="ck_copy_asset_xor_bundle",
         ),
+        CheckConstraint(
+            "health IN ('ok', 'suspect', 'corrupt', 'missing')",
+            name="ck_copy_health",
+        ),
+        CheckConstraint(
+            "(last_measured_digest IS NULL AND last_measured_at IS NULL) OR "
+            "(last_measured_digest IS NOT NULL AND last_measured_at IS NOT NULL)",
+            name="ck_copy_measurement_pair",
+        ),
+        CheckConstraint(
+            "integrity_hash_provenance IN ('locally_computed', 'backend_discovered')",
+            name="ck_copy_integrity_hash_provenance",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -1262,8 +1350,24 @@ class Copy(Base):
     storage_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
     integrity_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    integrity_hash_provenance: Mapped[IntegrityHashProvenance] = mapped_column(
+        String(32),
+        nullable=False,
+        default=IntegrityHashProvenance.LOCALLY_COMPUTED,
+        server_default=IntegrityHashProvenance.LOCALLY_COMPUTED.value,
+    )
     health: Mapped[CopyHealth] = mapped_column(String(16), nullable=False, default=CopyHealth.OK)
-    last_verified_at: Mapped[dt.datetime | None] = mapped_column(
+    health_changed_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+    )
+    last_checked_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_measured_digest: Mapped[bytes | None] = mapped_column(LargeBinary(32), nullable=True)
+    last_measured_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1283,3 +1387,65 @@ class Copy(Base):
             f"hash={self.logical_asset_hash.hex()[:12] if self.logical_asset_hash else None}… "
             f"backend={self.backend_id} health={self.health}>"
         )
+
+
+class VerifyReceipt(Base):
+    """Append-only audit receipt emitted atomically with measurement projection changes."""
+
+    __tablename__ = "verify_receipt"
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('fanout', 'verify-job', 'restore', 'scrub')",
+            name="ck_verify_receipt_source",
+        ),
+        CheckConstraint(
+            "source != 'scrub' OR measured_digest IS NULL",
+            name="ck_verify_receipt_scrub_unmeasured",
+        ),
+        UniqueConstraint(
+            "source",
+            "execution_id",
+            "copy_id",
+            name="uq_verify_receipt_execution_copy",
+        ),
+    )
+
+    event_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    copy_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("copy.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    backend_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("backend.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    expected_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    measured_digest: Mapped[bytes | None] = mapped_column(LargeBinary(32), nullable=True)
+    backend_ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    failure_kind: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    execution_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    producer_process: Mapped[str] = mapped_column(String(512), nullable=False)
+    actor: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    copy: Mapped[Copy] = relationship()
+    backend: Mapped[Backend] = relationship()
+
+
+event.listen(
+    Copy.__table__,
+    "after_create",
+    DDL(
+        "CREATE TRIGGER trg_copy_health_changed_at "
+        "AFTER UPDATE OF health ON copy "
+        "FOR EACH ROW WHEN NEW.health IS NOT OLD.health "
+        "BEGIN UPDATE copy SET health_changed_at = CURRENT_TIMESTAMP WHERE id = NEW.id; END"
+    ).execute_if(dialect="sqlite"),
+)
