@@ -32,11 +32,33 @@ class WorkerAlreadyRunning(RuntimeError):
         super().__init__(f"worker already running; holder pid={pid_text}")
 
 
+class ProcessLockHeld(RuntimeError):
+    """Raised when an exclusive process lock is already owned."""
+
+    def __init__(self, lockfile: Path, holder_pid: int | None, purpose: str) -> None:
+        self.lockfile = lockfile
+        self.holder_pid = holder_pid
+        self.purpose = purpose
+        pid_text = "unknown" if holder_pid is None else str(holder_pid)
+        super().__init__(f"{purpose} already running; holder pid={pid_text}")
+
+
 @contextmanager
 def worker_lock(engine_or_url: Engine | str) -> Iterator[Path]:
     """Acquire the non-blocking worker singleton lock for a database URL."""
 
-    lockfile = _lockfile_for(engine_or_url)
+    lockfile = process_lockfile_for(engine_or_url, namespace="worker")
+    try:
+        with exclusive_process_lock(lockfile, purpose="worker"):
+            yield lockfile
+    except ProcessLockHeld as exc:
+        raise WorkerAlreadyRunning(exc.lockfile, exc.holder_pid) from exc
+
+
+@contextmanager
+def exclusive_process_lock(lockfile: Path, *, purpose: str) -> Iterator[Path]:
+    """Acquire the worker-pattern non-blocking flock for another singleton job."""
+
     lockfile.parent.mkdir(parents=True, exist_ok=True)
     with lockfile.open("a+", encoding="utf-8") as fh:
         try:
@@ -45,11 +67,11 @@ def worker_lock(engine_or_url: Engine | str) -> Iterator[Path]:
             if exc.errno not in {errno.EACCES, errno.EAGAIN}:
                 raise
             fh.seek(0)
-            raise WorkerAlreadyRunning(lockfile, _holder_pid(fh.read())) from exc
+            raise ProcessLockHeld(lockfile, _holder_pid(fh.read()), purpose) from exc
         fh.seek(0)
         fh.truncate()
         pid = os.getpid()
-        fh.write(f"{socket.gethostname()}:{pid}\npid={pid}\n")
+        fh.write(f"{socket.gethostname()}:{pid}\npid={pid}\npurpose={purpose}\n")
         fh.flush()
         try:
             yield lockfile
@@ -57,16 +79,23 @@ def worker_lock(engine_or_url: Engine | str) -> Iterator[Path]:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
-def _lockfile_for(engine_or_url: Engine | str) -> Path:
+def process_lockfile_for(engine_or_url: Engine | str, *, namespace: str) -> Path:
+    """Return one database-scoped singleton lock path for a safe namespace."""
+
+    if not namespace or any(
+        char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in namespace
+    ):
+        raise ValueError("lock namespace must contain only lowercase letters, digits, and hyphens")
     url = engine_or_url.url if isinstance(engine_or_url, Engine) else make_url(engine_or_url)
     if url.drivername.startswith("sqlite") and url.database not in {None, "", ":memory:"}:
+        assert isinstance(url.database, str)
         db_path = Path(url.database).expanduser()
         if not db_path.is_absolute():
             db_path = Path.cwd() / db_path
-        return db_path.resolve(strict=False).with_name(db_path.name + ".worker.lock")
+        return db_path.resolve(strict=False).with_name(db_path.name + f".{namespace}.lock")
     rendered = url.render_as_string(hide_password=False)
     digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:32]
-    return _state_dir() / f"worker-{digest}.lock"
+    return _state_dir() / f"{namespace}-{digest}.lock"
 
 
 def _state_dir() -> Path:

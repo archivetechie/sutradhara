@@ -796,8 +796,16 @@ class RetentionEvent(Base):
             "(subject_type = 'media' AND intake_id IS NULL AND action IN "
             "('offsite_confirmed', 'correction_recorded')) OR "
             "(subject_type = 'batch' AND intake_id IS NULL AND action IN "
-            "('batch_invoked', 'batch_refused', 'grace_overridden'))",
+            "('batch_invoked', 'batch_refused', 'grace_overridden')) OR "
+            "(subject_type = 'receipt' AND intake_id IS NULL AND "
+            "action = 'correction_recorded')",
             name="ck_retention_event_subject",
+        ),
+        CheckConstraint(
+            "(supersedes_source IS NULL AND supersedes_event_id IS NULL) OR "
+            "(supersedes_source IN ('verify_receipt', 'retention_event') AND "
+            "supersedes_event_id IS NOT NULL AND action = 'correction_recorded')",
+            name="ck_retention_event_supersession",
         ),
     )
 
@@ -817,6 +825,8 @@ class RetentionEvent(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    supersedes_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    supersedes_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     intake: Mapped[Intake | None] = relationship()
 
@@ -850,6 +860,30 @@ Index(
         )
     ),
 )
+
+
+class RetentionJournalCheckpoint(Base):
+    """Optimization mirror of the last authoritative published journal footer."""
+
+    __tablename__ = "retention_journal_checkpoint"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_retention_journal_checkpoint_singleton"),
+        CheckConstraint("global_sequence >= 0", name="ck_retention_journal_sequence"),
+        CheckConstraint(
+            "verify_receipt_cursor >= 0 AND retention_event_cursor >= 0",
+            name="ck_retention_journal_cursors",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    envelope_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    hash_algorithm_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    global_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    head_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    verify_receipt_cursor: Mapped[int] = mapped_column(Integer, nullable=False)
+    retention_event_cursor: Mapped[int] = mapped_column(Integer, nullable=False)
+    published_filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    published_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class Pool(Base):

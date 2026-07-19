@@ -12,6 +12,7 @@ import posixpath
 import shlex
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -31,6 +32,7 @@ from sutradhara.backend.port import (
 from sutradhara.catalog.types import ContentHash, content_hash
 
 _ABSENT_SENTINEL = 42
+_EXISTS_SENTINEL = 43
 _SSH_UNAVAILABLE = 255
 _DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 _DEFAULT_COMMAND_TIMEOUT_SECONDS = 300.0
@@ -113,6 +115,47 @@ class RsyncSshTransport:
             f"mv -f {shlex.quote(partial_path)} {shlex.quote(final_path)}",
             operation=f"rename {relpath!r}",
         )
+
+    def put_if_absent(self, local: Path, relpath: str) -> bool:
+        """Atomically publish one remote file without ever replacing a name.
+
+        Returns ``True`` when this call published the name and ``False`` when
+        the destination already existed.  The hard-link publication step is
+        same-filesystem and atomic; unlike ``mv -n``, its status distinguishes
+        a collision from success.
+        """
+
+        final_path = self._remote_path(relpath)
+        parent = posixpath.dirname(final_path) or self._root
+        partial_path = f"{final_path}.{uuid.uuid4().hex}.partial"
+        self._run_checked_ssh(
+            f"mkdir -p {shlex.quote(parent)}",
+            operation=f"mkdir for {relpath!r}",
+        )
+        self._run_checked(
+            [
+                "rsync",
+                "-a",
+                "--partial",
+                "--protect-args",
+                "-e",
+                shlex.join(self._ssh_base_args()),
+                str(local),
+                self._remote_spec(partial_path),
+            ],
+            operation=f"rsync append-only put {relpath!r}",
+        )
+        result = self._run_ssh(
+            f"if ln {shlex.quote(partial_path)} {shlex.quote(final_path)} 2>/dev/null; "
+            f"then rm -f {shlex.quote(partial_path)}; "
+            f"else rc=$?; rm -f {shlex.quote(partial_path)}; "
+            f"if test -e {shlex.quote(final_path)}; then exit {_EXISTS_SENTINEL}; "
+            "else exit $rc; fi; fi"
+        )
+        if result.returncode == _EXISTS_SENTINEL:
+            return False
+        self._check_result(result, operation=f"publish append-only {relpath!r}")
+        return True
 
     def get(self, relpath: str, local: Path) -> None:
         if self.size(relpath) is None:
