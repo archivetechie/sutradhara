@@ -148,7 +148,7 @@ class _DiskArchiveBackend:
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
         del locator
-        return VerifyResult(ok=True)
+        return VerifyResult(ok=True, measured=False)
 
 
 class _CacheIdentityProbe:
