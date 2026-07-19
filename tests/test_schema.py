@@ -828,6 +828,236 @@ def test_deletion_evidence_downgrade_exports_and_transforms_used_database(
         ).fetchone() == ("intake", "used-tombstoned", "staging_deleted")
 
 
+def test_retention_journal_downgrade_exports_and_removes_used_receipt_correction(
+    tmp_path: Path,
+) -> None:
+    """A used verify-receipt correction survives downgrade in the sidecar only."""
+
+    db_path = tmp_path / "retention-journal-used-correction.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    now = "2026-07-20 12:00:00"
+    digest = bytes.fromhex("cd" * 32)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO backend "
+            "(id, name, kind, implementation_family, config, tier, added_at) VALUES "
+            "(1, 'correction-memory', 'memory', 'memory', '{}', 'self_describing', ?)",
+            (now,),
+        )
+        conn.execute(
+            "INSERT INTO logical_asset "
+            "(content_sha256, size_bytes, first_seen_at, validity) VALUES (?, 1, ?, "
+            "'unvalidated')",
+            (digest, now),
+        )
+        conn.execute(
+            "INSERT INTO copy "
+            "(id, logical_asset_hash, backend_id, native_locator, native_locator_key, "
+            "integrity_hash, health, first_observed_at, source, storage_metadata) VALUES "
+            "(1, ?, 1, '{\"object\":\"correction\"}', 'correction-object', ?, 'ok', ?, "
+            "'ingest', '{}')",
+            (digest, digest, now),
+        )
+        conn.execute(
+            "INSERT INTO verify_receipt "
+            "(event_id, copy_id, backend_id, expected_digest, measured_digest, backend_ok, "
+            "source, execution_id, producer_process, actor, at) VALUES "
+            "(1, 1, 1, ?, ?, 1, 'verify-job', 'used-correction-verify', 'host:1', "
+            "'ops', ?)",
+            (digest, digest, now),
+        )
+        conn.execute(
+            "INSERT INTO retention_event "
+            "(subject_type, subject_id, action, operation_id, actor, at, detail, "
+            "supersedes_source, supersedes_event_id) VALUES "
+            "('receipt', 'verify_receipt:1', 'correction_recorded', "
+            "'journal-correction:verify_receipt:1:used', 'ops', ?, "
+            "'{\"kind\":\"receipt-supersession\",\"reason\":\"wrong read\"}', "
+            "'verify_receipt', 1)",
+            (now,),
+        )
+        conn.commit()
+
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "e1f2a3b4c5d6"],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    marker = "retention-journal downgrade export: "
+    export_line = next(line for line in output.splitlines() if marker in line)
+    sidecar = Path(export_line.split(marker, 1)[1].strip())
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["format"] == "sutradhara-retention-journal-downgrade-v1"
+    assert payload["retention_events"] == [
+        {
+            "action": "correction_recorded",
+            "actor": "ops",
+            "at": now,
+            "detail": '{"kind":"receipt-supersession","reason":"wrong read"}',
+            "event_id": 1,
+            "intake_id": None,
+            "operation_id": "journal-correction:verify_receipt:1:used",
+            "subject_id": "verify_receipt:1",
+            "subject_type": "receipt",
+            "supersedes_event_id": 1,
+            "supersedes_source": "verify_receipt",
+        }
+    ]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT count(*) FROM retention_event").fetchone() == (0,)
+        assert conn.execute("SELECT count(*) FROM verify_receipt").fetchone() == (1,)
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT count(*) FROM retention_event").fetchone() == (0,)
+        assert conn.execute("SELECT count(*) FROM verify_receipt").fetchone() == (1,)
+
+
+def test_retention_journal_upgrade_backfills_confirmation_receipts_and_targets(
+    tmp_path: Path,
+) -> None:
+    """Legacy active and revoked confirmations remain safely revocable after upgrade."""
+
+    from sutradhara.catalog.session import make_engine, session_scope
+    from sutradhara.retention import revoke_offsite
+
+    db_path = tmp_path / "retention-journal-confirmation-backfill.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "e1f2a3b4c5d6"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    confirmed_at = "2026-07-19 09:00:00"
+    revoked_at = "2026-07-19 10:00:00"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO offsite_confirmation "
+            "(media_id, confirmed_at, confirmed_by, shipment_id) VALUES "
+            "('legacy:active', ?, 'active-operator', 'shipment-active')",
+            (confirmed_at,),
+        )
+        conn.execute(
+            "INSERT INTO offsite_confirmation "
+            "(media_id, confirmed_at, confirmed_by, shipment_id, revoked_at, revoked_by) "
+            "VALUES ('legacy:revoked', ?, 'confirming-operator', 'shipment-revoked', ?, "
+            "'revoking-operator')",
+            (confirmed_at, revoked_at),
+        )
+        conn.execute(
+            "INSERT INTO retention_event "
+            "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
+            "('media', 'legacy:revoked', 'correction_recorded', "
+            "'offsite-revoke:legacy:revoked:prompt-1', 'revoking-operator', ?, "
+            "'{\"kind\":\"offsite-revocation\",\"reason\":\"wrong shipment\"}')",
+            (revoked_at,),
+        )
+        conn.commit()
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+
+    def assert_backfill() -> dict[str, int]:
+        with sqlite3.connect(db_path) as conn:
+            receipt_rows = list(
+                conn.execute(
+                    "SELECT event_id, subject_id, operation_id FROM retention_event "
+                    "WHERE action='offsite_confirmed' ORDER BY subject_id"
+                )
+            )
+            receipts = {subject_id: event_id for event_id, subject_id, _ in receipt_rows}
+            corrections = {
+                subject_id: (source, event_id)
+                for subject_id, source, event_id in conn.execute(
+                    "SELECT subject_id, supersedes_source, supersedes_event_id "
+                    "FROM retention_event WHERE action='correction_recorded' "
+                    "ORDER BY subject_id"
+                )
+            }
+        assert receipt_rows == [
+            (
+                receipts["legacy:active"],
+                "legacy:active",
+                "migration:f2a3b4c5d6e7:offsite-confirm:legacy:active",
+            ),
+            (
+                receipts["legacy:revoked"],
+                "legacy:revoked",
+                "migration:f2a3b4c5d6e7:offsite-confirm:legacy:revoked",
+            ),
+        ]
+        assert corrections == {
+            "legacy:active": ("retention_event", receipts["legacy:active"]),
+            "legacy:revoked": ("retention_event", receipts["legacy:revoked"]),
+        }
+        return receipts
+
+    with sqlite3.connect(db_path) as conn:
+        revoked_receipt_id = conn.execute(
+            "SELECT event_id FROM retention_event WHERE subject_id='legacy:revoked' "
+            "AND action='offsite_confirmed'"
+        ).fetchone()
+        revoked_target = conn.execute(
+            "SELECT supersedes_source, supersedes_event_id FROM retention_event "
+            "WHERE subject_id='legacy:revoked' AND action='correction_recorded'"
+        ).fetchone()
+    assert revoked_receipt_id is not None
+    assert revoked_target == ("retention_event", revoked_receipt_id[0])
+
+    engine = make_engine(f"sqlite:///{db_path.as_posix()}")
+    try:
+        with session_scope(engine) as session:
+            _row, changed = revoke_offsite(
+                session,
+                media_id="legacy:active",
+                actor="new-revoker",
+                reason="confirmation was mistaken",
+            )
+            assert changed
+    finally:
+        engine.dispose()
+    initial_receipts = assert_backfill()
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "e1f2a3b4c5d6"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    assert assert_backfill() == initial_receipts
+
+
 def test_retention_event_payload_validation_is_per_action() -> None:
     from sutradhara.retention import _validate_event_detail
 
