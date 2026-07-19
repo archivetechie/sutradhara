@@ -287,8 +287,11 @@ def self_heal(
     sealer: Sealer | None = None,
     key_epoch: str | None = None,
     chooser: Callable[[Sequence[Copy]], Copy] | None = None,
+    execution_id: str,
 ) -> list[Copy]:
     """Rebuild missing pool copies from a surviving healthy copy."""
+    if not execution_id:
+        raise ValueError("execution_id must be non-empty")
     from sutradhara.durability import AssetTarget
 
     status = replication_status(
@@ -339,7 +342,13 @@ def self_heal(
 
         _assert_copy_matches_pool(source, source_target)
         try:
-            restored = restore_copy(session, source, backend=source_backend, opener=opener)
+            restored = restore_copy(
+                session,
+                source,
+                backend=source_backend,
+                opener=opener,
+                execution_id=execution_id,
+            )
             with restored as result:
                 if result.sha256 != asset_hash:
                     _mark_copy_suspect(source)
@@ -359,7 +368,7 @@ def self_heal(
                     key_epoch=key_epoch,
                 )
         except RestoreIntegrityError as exc:
-            if _is_proven_digest_mismatch(exc):
+            if _is_content_digest_mismatch(exc):
                 _mark_copy_suspect(source)
             errors.append(f"copy id={source.id}: {exc}")
             continue
@@ -620,9 +629,10 @@ def _enqueue_copy_verify(session: Session, copy: Copy) -> None:
     )
 
 
-def _is_proven_digest_mismatch(exc: RestoreIntegrityError) -> bool:
-    message = str(exc)
-    return message.startswith(("stored-corrupt:", "content-corrupt:"))
+def _is_content_digest_mismatch(exc: RestoreIntegrityError) -> bool:
+    """Return whether opening, rather than stored-byte measurement, failed."""
+
+    return str(exc).startswith("content-corrupt:")
 
 
 def _pool_key(target: PoolTarget) -> tuple[int, str]:

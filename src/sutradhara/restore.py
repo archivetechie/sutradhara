@@ -14,7 +14,6 @@ import contextvars
 import hashlib
 import os
 import tempfile
-import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,7 +62,7 @@ def restore_copy(
     *,
     backend: StorageBackend,
     opener: Opener,
-    execution_id: str | None = None,
+    execution_id: str,
     actor: str | None = None,
 ) -> Iterator[RestoreResult]:
     """Yield a verified plaintext temp file for one asset-scoped copy.
@@ -72,6 +71,8 @@ def restore_copy(
     ``copy.storage_metadata``. The yielded path is valid only while the context
     is open; callers that need a durable file must copy it before exit.
     """
+    if not execution_id:
+        raise ValueError("execution_id must be non-empty")
     expected_hash = _expected_asset_hash(session, copy)
     representation = _copy_representation(copy)
     recipient_epochs = _copy_recipient_epochs(copy, representation)
@@ -97,7 +98,7 @@ def restore_copy(
                 ),
             ),
             source="restore",
-            execution_id=execution_id or f"restore-{uuid.uuid4()}",
+            execution_id=execution_id,
             actor=actor,
         )
         if stored_digest != copy.integrity_hash:

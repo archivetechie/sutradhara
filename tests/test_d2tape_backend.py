@@ -83,7 +83,9 @@ def test_write_read_verify_round_trip_and_sidecar_progression(
             assert list(chunks) == [b"rst", b" pa", b"ylo"]
         verify = backend.verify(first_record.native_locator)
     assert verify.ok
+    assert verify.measured is True
     assert verify.actual_hash == first_hash
+    assert any(call["verb"] == "restore" for call in _calls(log_path))
     assert len(touched_locators) == 6
     assert all(locator["barcode"] == "D2T002L7" for locator in touched_locators)
 
@@ -92,6 +94,21 @@ def test_write_read_verify_round_trip_and_sidecar_progression(
     assert [artifact["start_block"] for artifact in state["artifacts"]] == [2, 9]
     assert [artifact["end_block"] for artifact in state["artifacts"]] == [5, 12]
     assert all(artifact["verified"] is True for artifact in state["artifacts"])
+
+    # The d2 sidecar remains truthful to the original write while restored
+    # bytes are corrupted.  Verification must measure those bytes, not echo
+    # the unchanged sidecar digest.
+    sidecar_before = json.loads((tmp_path / "state" / "D2T002L7.json").read_text())
+    store_path = tmp_path / "d2tape-store.json"
+    store = json.loads(store_path.read_text())
+    store[first_record.native_locator["artifact_name"]]["payload_hex"] = b"corrupt".hex()
+    store_path.write_text(json.dumps(store, sort_keys=True) + "\n")
+    corrupt_verify = backend.verify(first_record.native_locator)
+    assert corrupt_verify.ok is False
+    assert corrupt_verify.measured is True
+    assert corrupt_verify.actual_hash != first_hash
+    assert json.loads((tmp_path / "state" / "D2T002L7.json").read_text()) == sidecar_before
+    assert [call["verb"] for call in _calls(log_path)[-2:]] == ["verify", "restore"]
 
     records = list(backend.enumerate())
     assert [record.logical_id for record in records] == [first_hash, second_hash]

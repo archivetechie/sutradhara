@@ -1435,10 +1435,12 @@ def test_jobs_run_drains_queue_with_limit_zero(cli_env: dict[str, str]) -> None:
     assert list_pending.output.count("verify") == len(copy_ids)
 
     run_all = _run_cli(["jobs", "run", "--limit", "0"])
-    assert run_all.output.count("verified ok") >= len(copy_ids)
+    assert run_all.output.count("verified ok") == len(copy_ids)
 
+    list_succeeded = _run_cli(["jobs", "list", "--status", "succeeded"])
+    assert list_succeeded.output.count("verify") == len(copy_ids)
     list_pending_after = _run_cli(["jobs", "list", "--status", "pending"])
-    assert "verify" not in list_pending_after.output
+    assert list_pending_after.output == "(no jobs)\n"
 
 
 def test_jobs_submit_with_string_param(cli_env: dict[str, str]) -> None:
@@ -1612,9 +1614,12 @@ def test_dispatch_restore_rejects_agent_delivery_item(engine: Engine) -> None:
 
     item_id = _register_restore_request_item(engine, admitted=False, delivery_mode="agent")
 
-    with session_scope(engine) as s, pytest.raises(
-        RestoreRequestItemNotRunnable,
-        match="agent-delivery",
+    with (
+        session_scope(engine) as s,
+        pytest.raises(
+            RestoreRequestItemNotRunnable,
+            match="agent-delivery",
+        ),
     ):
         dispatch_restore(s, item_id)
 
@@ -1624,14 +1629,19 @@ def test_dispatch_restore_rejects_queued_item_without_admission_inputs(engine: E
 
     item_id = _register_restore_request_item(engine, admitted=False)
 
-    with session_scope(engine) as s, pytest.raises(
-        RestoreRequestItemNotRunnable,
-        match="missing admission inputs",
+    with (
+        session_scope(engine) as s,
+        pytest.raises(
+            RestoreRequestItemNotRunnable,
+            match="missing admission inputs",
+        ),
     ):
         dispatch_restore(s, item_id)
 
 
-def test_jobs_submit_refuses_public_restore_kind(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_jobs_submit_refuses_public_restore_kind(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("SUTRADHARA_DB_URL", "sqlite:///:memory:")
     runner = CliRunner()
     result = runner.invoke(cli, ["jobs", "submit", "restore", "-p", "restore_request_item_id=1"])

@@ -8,7 +8,11 @@ from typing import Any
 import pytest
 
 from sutradhara.backend.d2tape import D2TapeBackend
-from sutradhara.backend.factory import BackendNotConfigured, backend_from_row
+from sutradhara.backend.factory import (
+    BackendNotConfigured,
+    backend_declares_retention_witness,
+    backend_from_row,
+)
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.backend.remanence import RemanenceBackend
 from sutradhara.catalog.models import Backend
@@ -47,6 +51,14 @@ def test_memory_backend_ignores_empty_config() -> None:
 
     assert isinstance(backend, MemoryBackend)
     assert backend.name == "mem"
+
+
+def test_retention_witness_capability_follows_registered_adapter_class() -> None:
+    assert backend_declares_retention_witness(
+        _rem_tape_row({"daemon_endpoint": "http://localhost:50051"})
+    )
+    assert not backend_declares_retention_witness(_memory_row({}))
+    assert not backend_declares_retention_witness(_d2_tape_row({}))
 
 
 def test_obsolete_placements_config_is_rejected() -> None:

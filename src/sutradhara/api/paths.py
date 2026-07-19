@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from sutradhara_receive import (
     ReceiveError,
+)
+from sutradhara_receive import (
     canonical_device_rel_path as _receive_canonical_device_rel_path,
 )
 

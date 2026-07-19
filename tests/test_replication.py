@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import object_session
 
+from sutradhara.backend import factory as backend_factory
 from sutradhara.backend.port import (
     BackendLocator,
     ByteRange,
@@ -19,7 +20,14 @@ from sutradhara.backend.port import (
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_copy
-from sutradhara.catalog.models import ArtifactClassPool, Backend, Copy, LogicalAsset, Pool
+from sutradhara.catalog.models import (
+    ArtifactClassPool,
+    Backend,
+    Copy,
+    LogicalAsset,
+    Pool,
+    VerifyReceipt,
+)
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import (
     BackendKind,
@@ -30,8 +38,9 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.durability import AssetTarget
 from sutradhara.evidence_recorder import record_measured
-from sutradhara.jobs.engine import submit
-from sutradhara.jobs.models import Job
+from sutradhara.jobs.engine import run_one, submit
+from sutradhara.jobs.handlers import verify as _verify_handler  # noqa: F401
+from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.keys import KeyEpoch
 from sutradhara.replication import (
     PoolRepresentationError,
@@ -68,6 +77,7 @@ class _PoolWriteBackend:
         self._name = name
         self._tape_by_pool = tape_by_pool or {}
         self.writes: list[str] = []
+        self._payload_by_object_id: dict[str, bytes] = {}
 
     @property
     def name(self) -> str:
@@ -78,13 +88,15 @@ class _PoolWriteBackend:
         digest = content_hash(hashlib.sha256(data).digest())
         self.writes.append(pool)
         tape_uuid = self._tape_by_pool.get(pool, f"{len(self.writes):032x}")
+        object_id = f"{len(self.writes):032x}"
+        self._payload_by_object_id[object_id] = data
         return CopyRecord(
             logical_id=digest,
             native_locator={
                 "pool_id": pool,
                 "tape_uuid": tape_uuid,
                 "tape_file_number": len(self.writes),
-                "object_id": f"{len(self.writes):032x}",
+                "object_id": object_id,
                 "content_sha256": digest.hex(),
                 "body_format": "rem-tar-v1",
             },
@@ -96,10 +108,18 @@ class _PoolWriteBackend:
         return iter(())
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
-        raise NotImplementedError
+        data = self._payload_by_object_id[str(locator["object_id"])]
+        return data if byte_range.is_whole_object else data[byte_range.start : byte_range.end]
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
-        raise NotImplementedError
+        data = self.read_range(locator, ByteRange(0, 0))
+        actual = content_hash(hashlib.sha256(data).digest())
+        expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
+        return VerifyResult(
+            ok=actual == expected,
+            measured=True,
+            actual_hash=actual,
+        )
 
 
 class _WrongHashBackend(_PoolWriteBackend):
@@ -400,6 +420,7 @@ def test_pool_sealing_rejects_hdcache_key_epoch(
 def test_replicate_asset_fans_out_and_records_each_pool_copy(
     engine: Engine,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data = b"multi-pool asset"
     source = tmp_path / "asset.bin"
@@ -449,6 +470,19 @@ def test_replicate_asset_fans_out_and_records_each_pool_copy(
         assert all(row.last_measured_digest is None for row in rows)
         verify_jobs = list(s.scalars(select(Job).where(Job.kind == "verify")))
         assert {job.params["copy_id"] for job in verify_jobs} == {row.id for row in rows}
+        monkeypatch.setattr(backend_factory, "backend_from_row", lambda _row: backend)
+        for job in verify_jobs:
+            assert run_one(s, job.id).ok
+        receipts = list(s.scalars(select(VerifyReceipt).order_by(VerifyReceipt.copy_id)))
+        assert {receipt.source for receipt in receipts} == {"verify-job"}
+        assert {receipt.execution_id for receipt in receipts} == {
+            str(job.id) for job in verify_jobs
+        }
+        assert {receipt.measured_digest for receipt in receipts} == {
+            row.integrity_hash for row in rows
+        }
+        assert all(row.status == JobStatus.SUCCEEDED for row in verify_jobs)
+        assert all(row.last_measured_digest == row.integrity_hash for row in rows)
         assert list(s.scalars(select(ArtifactClassPool))).pop().artifactclass == "video-priv"
 
 
@@ -784,6 +818,7 @@ def test_replication_status_rejects_copy_representation_mismatch(
 def test_repair_writes_only_missing_pools(
     engine: Engine,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data = b"repair me"
     source = tmp_path / "asset.bin"
@@ -823,11 +858,21 @@ def test_repair_writes_only_missing_pools(
         )
         status = replication_status(s, asset_hash, "video-priv", {backend_id: backend})
         verify_jobs = list(s.scalars(select(Job).where(Job.kind == "verify")))
+        [verify_job] = verify_jobs
+        monkeypatch.setattr(backend_factory, "backend_from_row", lambda _row: backend)
+        assert run_one(s, verify_job.id).ok
+        receipt = s.scalars(
+            select(VerifyReceipt).where(VerifyReceipt.copy_id == repaired[0].id)
+        ).one()
+        assert receipt.source == "verify-job"
+        assert receipt.execution_id == str(verify_job.id)
+        assert receipt.measured_digest == repaired[0].integrity_hash
+        assert verify_job.status == JobStatus.SUCCEEDED
 
     assert backend.writes == ["private-copy-2"]
     assert len(repaired) == 1
     assert repaired[0].pool_id == "private-copy-2"
-    assert repaired[0].last_measured_digest is None
+    assert repaired[0].last_measured_digest == repaired[0].integrity_hash
     assert [job.params["copy_id"] for job in verify_jobs] == [repaired[0].id]
     assert status["complete"] is True
 

@@ -13,6 +13,7 @@ from collections.abc import Iterator
 import pytest
 from sqlalchemy import Engine, select
 
+from sutradhara.backend import factory as backend_factory
 from sutradhara.backend.port import (
     BackendLocator,
     ByteRange,
@@ -42,7 +43,9 @@ from sutradhara.catalog.types import (
     RetentionState,
     content_hash,
 )
-from sutradhara.jobs.models import Job
+from sutradhara.jobs.engine import run_one
+from sutradhara.jobs.handlers import verify as _verify_handler  # noqa: F401
+from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.reconcilers import copy as copy_reconciler
 from sutradhara.jobs.reconcilers.conditions import OBSERVED_PRESENT
 from sutradhara.scrub import scrub_backend
@@ -205,9 +208,7 @@ def test_scrub_verified_good_clears_suspect_copy(engine: Engine) -> None:
         assert copy.health == CopyHealth.OK
         assert copy.last_measured_digest is None
         assert copy.last_measured_at is None
-        receipt = s.scalars(
-            select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)
-        ).one()
+        receipt = s.scalars(select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)).one()
         assert receipt.source == "scrub"
         assert receipt.execution_id == "scrub-good-1"
         assert receipt.failure_kind == "measurement-invalidated"
@@ -215,10 +216,14 @@ def test_scrub_verified_good_clears_suspect_copy(engine: Engine) -> None:
         assert verify_job.params == {"copy_id": copy.id}
 
 
-def test_scrub_discovery_is_satisfied_pending_until_verify_runs(engine: Engine) -> None:
+def test_scrub_discovery_is_satisfied_pending_until_verify_runs(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A newly discovered OK copy must not launch a duplicate repair loop."""
 
-    data_hash = _hash(b"scrub-discovered pending verification")
+    payload = b"scrub-discovered pending verification"
+    data_hash = _hash(payload)
     pool_id = "scrub-pool"
     locator = {"pool_id": pool_id, "hash_hex": data_hash.hex()}
 
@@ -232,14 +237,24 @@ def test_scrub_discovery_is_satisfied_pending_until_verify_runs(engine: Engine) 
                 logical_id=data_hash,
                 native_locator=locator,
                 integrity_hash=data_hash,
-                size_bytes=37,
+                size_bytes=len(payload),
             )
 
         def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
-            raise AssertionError("scrub discovery must not read bytes")
+            del locator
+            return (
+                payload
+                if byte_range.is_whole_object
+                else payload[byte_range.start : byte_range.end]
+            )
 
         def verify(self, locator: BackendLocator) -> VerifyResult:
-            raise AssertionError("the queued verify job owns read-back")
+            actual = _hash(self.read_range(locator, ByteRange(0, 0)))
+            return VerifyResult(
+                ok=actual == data_hash,
+                measured=True,
+                actual_hash=actual,
+            )
 
     with session_scope(engine) as session:
         backend = Backend(
@@ -257,7 +272,7 @@ def test_scrub_discovery_is_satisfied_pending_until_verify_runs(engine: Engine) 
             )
         )
         session.add(ArtifactClassPool(artifactclass="masters", pool_id=pool_id))
-        session.add(LogicalAsset(content_sha256=data_hash, size_bytes=37))
+        session.add(LogicalAsset(content_sha256=data_hash, size_bytes=len(payload)))
         session.add(
             Intake(
                 intake_id="scrub-intake",
@@ -276,7 +291,7 @@ def test_scrub_discovery_is_satisfied_pending_until_verify_runs(engine: Engine) 
                 logical_asset_hash=data_hash,
                 as_received_path="asset.bin",
                 virtual_path="asset.bin",
-                size_bytes=37,
+                size_bytes=len(payload),
                 artifactclass="masters",
             )
         )
@@ -291,12 +306,27 @@ def test_scrub_discovery_is_satisfied_pending_until_verify_runs(engine: Engine) 
         copy = session.scalars(select(Copy)).one()
         assert report.copies_added == 1
         assert copy.last_measured_digest is None
-        assert session.scalars(select(Job).where(Job.kind == "verify")).one().params == {
-            "copy_id": copy.id
-        }
+        verify_job = session.scalars(select(Job).where(Job.kind == "verify")).one()
+        assert verify_job.params == {"copy_id": copy.id}
         target_key = copy_reconciler.make_target_key(data_hash, pool_id)
         observation = copy_reconciler.observe(session, target_key)
         assert observation.observed_state == OBSERVED_PRESENT
+
+        measuring_backend = _DiscoveredBackend()
+        monkeypatch.setattr(
+            backend_factory,
+            "backend_from_row",
+            lambda _row: measuring_backend,
+        )
+        assert run_one(session, verify_job.id).ok
+        receipt = session.scalars(
+            select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)
+        ).one()
+        assert receipt.source == "verify-job"
+        assert receipt.execution_id == str(verify_job.id)
+        assert receipt.measured_digest == data_hash
+        assert copy.last_measured_digest == data_hash
+        assert verify_job.status == JobStatus.SUCCEEDED
 
 
 def test_scrub_quarantines_recognizable_bundle_container_unknown(engine: Engine) -> None:

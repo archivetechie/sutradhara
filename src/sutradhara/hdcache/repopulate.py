@@ -461,7 +461,7 @@ def drill_status(
         if current is None or entry.lost_drill_id > current:
             latest_by_disk[entry.lost_origin_disk_id] = entry.lost_drill_id
     local_now = _as_utc(now or dt.datetime.now(dt.UTC))
-    statuses = [
+    return [
         _status_for_drill(
             disk,
             drill_id,
@@ -470,7 +470,6 @@ def drill_status(
         )
         for disk, drill_id in sorted(latest_by_disk.items())
     ]
-    return statuses
 
 
 def repopulation_batch_payload(batch: RepopulationBatch) -> dict[str, Any]:

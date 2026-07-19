@@ -15,15 +15,14 @@ from typing import Any
 import grpc
 import pytest
 from click.testing import CliRunner
-from sqlalchemy import Engine, select
-
-import sutradhara.jobs.handlers  # noqa: F401 -- register built-in handlers
 from pfr_core import PFRSidecar
 from pfr_core.cut import CutRefusal
 from pfr_core.failure import ReasonId, ScrapeFailure
 from pfr_core.schema import BlobRef, CapabilitySnapshot
 from pfr_core.source import SourceChanged
+from sqlalchemy import Engine, select
 
+import sutradhara.jobs.handlers  # noqa: F401 -- register built-in handlers
 from sutradhara._proto import layer5_pb2, layer5_pb2_grpc
 from sutradhara.backend.port import (
     BackendSessionInvalidatedError,
@@ -33,11 +32,11 @@ from sutradhara.backend.port import (
 from sutradhara.backend.remanence import RemanenceBackend
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
-    CopySource,
     ArtifactClassPool,
     AssetLocator,
     Backend,
     Copy,
+    CopySource,
     IngestItem,
     Intake,
     LogicalAsset,
@@ -361,9 +360,10 @@ def test_remanence_read_range_maps_grpc_codes_to_typed_errors() -> None:
         catalog = _Catalog(object_id=object_id, member_size=1)
         with _serve_remanence(read, catalog) as endpoint:
             backend = RemanenceBackend.from_grpc("primary-tape", endpoint)
-            with backend.open_read_session(_rem_locator(object_id)) as session:
-                with pytest.raises(expected):
-                    session.read_range(ByteRange(0, 1))
+            with backend.open_read_session(_rem_locator(object_id)) as session, pytest.raises(
+                expected
+            ):
+                session.read_range(ByteRange(0, 1))
 
 
 def test_pfr_retryables_never_auto_promote_but_parse_determination_blocks_after_restart(
@@ -638,14 +638,14 @@ def test_cut_regenerates_missing_blobs_and_protects_them_from_trim(
     class Backend:
         has_live_catalog = False
 
-        def open_read_session(self, locator: dict[str, Any]) -> "_Session":
+        def open_read_session(self, locator: dict[str, Any]) -> _Session:
             return _Session(member)
 
     class _Session:
         def __init__(self, data: bytes) -> None:
             self.data = data
 
-        def __enter__(self) -> "_Session":
+        def __enter__(self) -> _Session:
             return self
 
         def __exit__(self, *args: object) -> None:

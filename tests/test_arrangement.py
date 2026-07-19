@@ -22,8 +22,8 @@ from sutradhara.arrangement import (
     include_member,
     move_member,
     show_arrangement,
-    summarize_arrangement,
     submit_arrangement,
+    summarize_arrangement,
 )
 from sutradhara.catalog.models import (
     Arrangement,

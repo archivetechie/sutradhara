@@ -219,14 +219,13 @@ def test_device_reenrollment_refuses_different_operator_without_mutation(engine:
             operator="ada",
         )
 
-    with session_scope(engine) as session:
-        with pytest.raises(store.DeviceOwnershipError):
-            store.record_device_enrollment(
-                session,
-                device_id="mac-1",
-                cert_fingerprint="CC" * 32,
-                operator="other",
-            )
+    with session_scope(engine) as session, pytest.raises(store.DeviceOwnershipError):
+        store.record_device_enrollment(
+            session,
+            device_id="mac-1",
+            cert_fingerprint="CC" * 32,
+            operator="other",
+        )
 
     with session_scope(engine) as session:
         assert _active_enrollment_count(session, "mac-1") == 1

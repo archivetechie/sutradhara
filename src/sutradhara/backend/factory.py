@@ -22,6 +22,18 @@ class UnsupportedBackendKind(Exception):
     """The backend's `kind` has no factory registered yet."""
 
 
+def backend_declares_retention_witness(row: BackendRow) -> bool:
+    """Return whether the registered adapter class declares witness support.
+
+    Capability detection deliberately lives beside the backend registry.  The
+    retention gate must not duplicate a list of witness-capable backend kinds:
+    adding the capability to any adapter class automatically makes its copies
+    fail closed unless a witness answer is collected.
+    """
+
+    return callable(getattr(_adapter_class(row.kind), "witness_copy", None))
+
+
 def backend_from_row(row: BackendRow) -> StorageBackend:
     """Instantiate a `StorageBackend` from a persisted `Backend` row.
 
@@ -110,6 +122,26 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
         )
 
     raise UnsupportedBackendKind(f"backend {row.name!r}: kind={row.kind} has no factory yet")
+
+
+def _adapter_class(kind: BackendKind | str) -> type[object]:
+    """Resolve a catalog kind to its adapter class without constructing it."""
+
+    if kind == BackendKind.MEMORY:
+        return MemoryBackend
+    if kind == BackendKind.REM_TAPE:
+        return RemanenceBackend
+    if kind == BackendKind.D2_TAPE:
+        return D2TapeBackend
+    if kind == BackendKind.S3:
+        from sutradhara.backend.s3 import S3Backend
+
+        return S3Backend
+    if kind == BackendKind.SSH_DISK:
+        from sutradhara.backend.ssh_disk import SshDiskBackend
+
+        return SshDiskBackend
+    raise UnsupportedBackendKind(f"backend kind={kind!r} has no factory registered")
 
 
 def _optional_str(cfg: dict[str, object], key: str) -> str | None:

@@ -788,7 +788,8 @@ class RetentionEvent(Base):
             name="ck_retention_event_action",
         ),
         CheckConstraint(
-            "(subject_type = 'intake' AND intake_id = subject_id AND action IN "
+            "(subject_type = 'intake' AND intake_id IS NOT NULL AND "
+            "intake_id = subject_id AND action IN "
             "('released', 'cloud_blob_deleted', 'staging_deleted', 'release_attempted', "
             "'purge_attempted', 'staging_tombstoned', 'staging_purge_held', 'abandoned', "
             "'correction_recorded')) OR "

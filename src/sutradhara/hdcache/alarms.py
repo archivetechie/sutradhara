@@ -12,8 +12,7 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Engine
-from sqlalchemy import func, select
+from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
 from sutradhara.catalog.session import make_engine, session_scope
@@ -21,7 +20,7 @@ from sutradhara.hdcache.fill import JOB_KIND
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.placement import DiskState, placement_config_from_env
 from sutradhara.hdcache.walker import HdcacheWalkerEvent
-from sutradhara.jobs.models import Job, LIVE_JOB_STATUS_VALUES, ReconciliationCondition
+from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_OPEN,
     OBSERVED_MISSING,

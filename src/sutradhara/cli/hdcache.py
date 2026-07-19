@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import dataclasses
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -12,13 +12,13 @@ import click
 from sqlalchemy import Engine
 
 from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.hdcache.alarms import walker_event_alarm_sink
 from sutradhara.hdcache.fill import (
     HdcacheFillPlan,
     enqueue_requested_fill,
     fill_config_from_env,
     top_up_lost_entries,
 )
-from sutradhara.hdcache.alarms import walker_event_alarm_sink
 from sutradhara.hdcache.lifecycle import (
     BlockDeviceCandidate,
     HdcacheLifecycleManager,

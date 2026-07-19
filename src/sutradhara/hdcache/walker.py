@@ -50,7 +50,7 @@ from sutradhara.hdcache.store import (
     tmp_root,
     verify_disk_identity_with_deadline,
 )
-from sutradhara.jobs.models import Job, LIVE_JOB_STATUS_VALUES
+from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import sha256_file
 from sutradhara.sealing.port import Opener, Representation
@@ -196,10 +196,11 @@ def walk_disk(
 ) -> HdcacheWalkResult:
     """Walk one cache disk according to the design §8.2 matrix."""
 
-    if disk.state == "absent":
-        if not _probe_absent_disk_recovery(session, disk, config=config):
-            _emit(config, "walker-disk-absent", "info", disk.disk_id, detail="disk state is absent")
-            return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False)
+    if disk.state == "absent" and not _probe_absent_disk_recovery(
+        session, disk, config=config
+    ):
+        _emit(config, "walker-disk-absent", "info", disk.disk_id, detail="disk state is absent")
+        return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False)
 
     try:
         identity = _verify_identity(disk, config)
@@ -416,13 +417,13 @@ def rebuild_hdcache(
             entries = _disk_io(
                 disk,
                 config,
-                lambda: enumerate_entries(mount),
+                lambda mount=mount: enumerate_entries(mount),
                 "rebuild entry enumeration deadline exceeded",
             )
             rejected_entries = _disk_io(
                 disk,
                 config,
-                lambda: enumerate_rejected_entry_files(mount),
+                lambda mount=mount: enumerate_rejected_entry_files(mount),
                 "rebuild rejected-entry enumeration deadline exceeded",
             )
         except StoreReadTimeout as exc:

@@ -192,9 +192,7 @@ def _failure_result(
 def _is_retryable_failure(failure: ScrapeFailure) -> bool:
     if failure.reason_id in _PARSE_DETERMINATION_REASON_IDS:
         return False
-    if failure.reason_id in _RETRYABLE_REASON_IDS and not _is_parse_determination(failure):
-        return True
-    return False
+    return failure.reason_id in _RETRYABLE_REASON_IDS and not _is_parse_determination(failure)
 
 
 def _is_parse_determination(failure: ScrapeFailure) -> bool:
