@@ -29,7 +29,6 @@ from sutradhara.archive_bundle import (
     close_bundle,
     hold_bundle,
     record_asset_locator,
-    record_blob_root,
     record_exclusion,
 )
 from sutradhara.archive_restore import ArchiveRestoreError, member_byte_base, read_member_bytes
@@ -45,7 +44,6 @@ from sutradhara.jobs.reconcilers.conditions import (
     record_condition,
     record_observation,
 )
-from sutradhara.jobs.runtime_observations import report_tape_locator
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.rem_archive_cli import (
     recipient_registry_ids,
@@ -131,9 +129,7 @@ class ConformanceScan:
         # compliant informational clusters, not deviations — only reasons
         # outside that set hold a compliant-expect bundle.
         compliant = {"native", "exclude-rule", "blob-rule"}
-        return any(c.reason not in compliant for c in self.clusters) or bool(
-            self.exclusions
-        )
+        return any(c.reason not in compliant for c in self.clusters) or bool(self.exclusions)
 
     def to_summary(self) -> dict[str, Any]:
         return {
@@ -173,14 +169,6 @@ class _ReadAssetLocatorView:
 
 
 @dataclass(frozen=True)
-class BuiltBlobRoot:
-    """A coarse blob-root locator emitted by an archive builder."""
-
-    root_path: str
-    native_locator: dict[str, Any]
-
-
-@dataclass(frozen=True)
 class BuiltExclusion:
     """An exclusion emitted by an archive builder."""
 
@@ -199,7 +187,6 @@ class BuildArtifact:
     stored_digest: bytes
     members: tuple[BuiltMember, ...]
     manifest_path: Path | None = None
-    blob_roots: tuple[BuiltBlobRoot, ...] = ()
     exclusions: tuple[BuiltExclusion, ...] = ()
     recipient_epochs: tuple[str, ...] = ()
 
@@ -475,7 +462,6 @@ class RemArchiveBuilder:
             stored_digest=result.stored_digest,
             members=tuple(_members_from_manifest(manifest, members)),
             manifest_path=manifest_path,
-            blob_roots=tuple(_blob_roots_from_manifest(manifest)),
             exclusions=tuple(_exclusions_from_manifest(manifest)),
             recipient_epochs=recipient_epochs,
         )
@@ -765,8 +751,8 @@ def build_bundle_copy_for_pool(
 ) -> Copy:
     """Build, write, verify, and record one pool's bundle copy.
 
-    This primitive records the bundle ``Copy`` plus its ``AssetLocator`` and
-    ``BlobRoot`` rows only. Bundle lifecycle, conformance gates, customer
+    This primitive records the bundle ``Copy`` plus its ``AssetLocator`` rows.
+    Bundle lifecycle, conformance gates, customer
     manifests, and ``ExclusionRecord`` rows stay with ``flush_bundle``.
     Optional map/validator/observer arguments exist so ``flush_bundle`` can use
     the same write path without changing its current behavior.
@@ -789,7 +775,6 @@ def build_bundle_copy_for_pool(
         record = backend.write_object_to_pool(artifact.artifact_path, target.pool_id)
     except (BackendError, OSError) as exc:
         raise TransientPoolFanoutError(target.pool_id, target.backend_name, exc) from exc
-    report_tape_locator(record.native_locator)
     storage_metadata = _copy_storage_metadata(
         target.representation,
         recipient_epochs=artifact.recipient_epochs,
@@ -1040,16 +1025,6 @@ def _record_build_locators_and_roots(
             copy_id=copy_id,
             bundle_id=bundle.id,
             member_path=member.member_path,
-        )
-    for root in artifact.blob_roots:
-        record_blob_root(
-            session,
-            bundle_id=bundle.id,
-            copy_id=copy_id,
-            pool_id=target.pool_id,
-            root_path=root.root_path,
-            native_locator=root.native_locator,
-            archive_id=bundle.archive_id,
         )
 
 
@@ -1305,8 +1280,7 @@ def _members_from_manifest(
         reported_size = item.get("size_bytes")
         if reported_size != source.size_bytes:
             raise ArchiveFanoutError(
-                f"rem manifest resized member {path!r}: "
-                f"{reported_size!r} != {source.size_bytes}"
+                f"rem manifest resized member {path!r}: {reported_size!r} != {source.size_bytes}"
             )
         reported_sha256 = item.get("sha256")
         try:
@@ -1343,19 +1317,6 @@ def _members_from_manifest(
     if omitted:
         raise ArchiveFanoutError(f"rem manifest omitted member paths: {omitted!r}")
     return built
-
-
-def _blob_roots_from_manifest(manifest: dict[str, Any]) -> Sequence[BuiltBlobRoot]:
-    roots = []
-    for item in manifest.get("blob_roots", []):
-        if isinstance(item, dict):
-            roots.append(
-                BuiltBlobRoot(
-                    root_path=str(item.get("root_path", "")),
-                    native_locator=dict(item.get("native_locator", item)),
-                )
-            )
-    return roots
 
 
 def _exclusions_from_manifest(manifest: dict[str, Any]) -> Sequence[BuiltExclusion]:

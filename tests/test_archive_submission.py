@@ -93,6 +93,11 @@ class _WriteBackend:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
         object_id = f"{self._name}-{self._counter}"
+        media_locator = (
+            {"volume_uuid": object_id}
+            if self._name == "d2"
+            else {"tape_uuid": object_id}
+        )
         self.objects[object_id] = data
         self.writes.append(pool)
         return CopyRecord(
@@ -100,6 +105,7 @@ class _WriteBackend:
             native_locator={
                 "object_id": object_id,
                 "content_sha256": digest.hex(),
+                **media_locator,
             },
             integrity_hash=digest,
             size_bytes=len(data),
@@ -683,7 +689,7 @@ def _create_submission(
             submission_id="submit-a",
         )
         source_paths = {
-            relpath: Path(str(item.item_metadata["source_path"])) for relpath, item in items.items()
+            relpath: Path(str(item.source_path)) for relpath, item in items.items()
         }
         asset_hashes = {
             member.archive_path: member.sha256
@@ -764,7 +770,8 @@ def _add_item(
         st_ino=source.stat().st_ino,
         size_bytes=len(data),
         artifactclass="s-masters",
-        item_metadata={"source_path": str(source)},
+        source_path=str(source),
+        item_metadata={},
     )
     session.add(item)
     session.flush()

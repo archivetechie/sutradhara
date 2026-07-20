@@ -35,6 +35,8 @@ from sutradhara.catalog.models import (
     ArtifactClassPool,
     AssetLocator,
     Backend,
+    Bundle,
+    BundleMember,
     Copy,
     CopySource,
     IngestItem,
@@ -64,7 +66,6 @@ from sutradhara.jobs.reconcilers.conditions import (
 )
 from sutradhara.jobs.registry import JobContext
 from sutradhara.pfr import (
-    PFR_SIDECAR_METADATA_KEY,
     RaoObject,
     atomic_write_sidecar,
     cut_pfr_asset,
@@ -360,8 +361,9 @@ def test_remanence_read_range_maps_grpc_codes_to_typed_errors() -> None:
         catalog = _Catalog(object_id=object_id, member_size=1)
         with _serve_remanence(read, catalog) as endpoint:
             backend = RemanenceBackend.from_grpc("primary-tape", endpoint)
-            with backend.open_read_session(_rem_locator(object_id)) as session, pytest.raises(
-                expected
+            with (
+                backend.open_read_session(_rem_locator(object_id)) as session,
+                pytest.raises(expected),
             ):
                 session.read_range(ByteRange(0, 1))
 
@@ -686,6 +688,7 @@ def test_cut_regenerates_missing_blobs_and_protects_them_from_trim(
             backends={1: Backend()},
             t_in=0,
             t_out=1,
+            cache_root=tmp_path / "cache",
         )
 
     assert result.rung == 1
@@ -748,7 +751,9 @@ def _failure(
         plugin=plugin,
         stage=stage,
         reason_id=reason,
-        exception_class="MXFParseError" if reason is ReasonId.EXCEPTION and plugin == "mxf" else None,
+        exception_class="MXFParseError"
+        if reason is ReasonId.EXCEPTION and plugin == "mxf"
+        else None,
         source_identity={"kind": "test"},
         message=f"{reason.value} message",
     )
@@ -802,6 +807,21 @@ def _add_ingest_item(
 ) -> IngestItem:
     digest = hashlib.sha256(source.read_bytes()).digest()
     session.add(
+        ArtifactClassPolicyRecord(
+            artifactclass="video-master",
+            ruleset="test",
+            expect="compliant",
+            target_bytes=1,
+            max_age_seconds=1,
+            restore_preference=[],
+            min_copies=1,
+            min_impl_families=1,
+            staging_config={},
+            hdcache_config={},
+        )
+    )
+    session.flush()
+    session.add(
         LogicalAsset(
             content_sha256=digest,
             size_bytes=source.stat().st_size,
@@ -819,9 +839,6 @@ def _add_ingest_item(
             registered_at=dt.datetime.now(dt.UTC),
         )
     )
-    metadata = {"source_path": str(source)}
-    if sidecar_path is not None:
-        metadata[PFR_SIDECAR_METADATA_KEY] = str(sidecar_path)
     item = IngestItem(
         intake_id="card-pfr",
         logical_asset_hash=digest,
@@ -829,7 +846,9 @@ def _add_ingest_item(
         virtual_path=source.name,
         size_bytes=source.stat().st_size,
         artifactclass="video-master",
-        item_metadata=metadata,
+        source_path=str(source),
+        pfr_sidecar_path=str(sidecar_path) if sidecar_path is not None else None,
+        item_metadata={},
     )
     session.add(item)
     session.flush()
@@ -846,6 +865,21 @@ def _add_catalog_rows(
     object_id: bytes,
     first_chunk_lba: int,
 ) -> None:
+    session.add(
+        ArtifactClassPolicyRecord(
+            artifactclass="video-master",
+            ruleset="test",
+            expect="compliant",
+            target_bytes=1,
+            max_age_seconds=1,
+            restore_preference=["primary-pool"],
+            min_copies=1,
+            min_impl_families=1,
+            staging_config={},
+            hdcache_config={},
+        )
+    )
+    session.flush()
     session.add(
         LogicalAsset(
             content_sha256=asset_hash,
@@ -872,7 +906,8 @@ def _add_catalog_rows(
             virtual_path="clip.mxf",
             size_bytes=member_size,
             artifactclass="video-master",
-            item_metadata={PFR_SIDECAR_METADATA_KEY: str(sidecar_path)},
+            pfr_sidecar_path=str(sidecar_path),
+            item_metadata={},
         )
     )
     backend = Backend(
@@ -899,23 +934,25 @@ def _add_catalog_rows(
             sort_order=0,
         )
     )
+    bundle = Bundle(
+        id="pfr-bundle",
+        artifactclass="video-master",
+        status="sealed",
+    )
+    session.add(bundle)
+    session.flush()
     session.add(
-        ArtifactClassPolicyRecord(
-            artifactclass="video-master",
-            ruleset="test",
-            expect="compliant",
-            target_bytes=1,
-            max_age_seconds=1,
-            restore_preference=["primary-pool"],
-            min_copies=1,
-            min_impl_families=1,
-            staging_config={},
-            hdcache_config={},
+        BundleMember(
+            bundle_id=bundle.id,
+            logical_asset_hash=asset_hash,
+            member_path="clip.mxf",
+            size_bytes=member_size,
+            file_sha256=asset_hash,
         )
     )
     native = _rem_locator(object_id)
     copy = Copy(
-        logical_asset_hash=asset_hash,
+        bundle_id=bundle.id,
         backend_id=1,
         pool_id="primary-pool",
         native_locator=native,
@@ -932,8 +969,8 @@ def _add_catalog_rows(
             logical_asset_hash=asset_hash,
             pool_id="primary-pool",
             copy_id=copy.id,
+            bundle_id=bundle.id,
             native_locator={
-                "member_path": "clip.mxf",
                 "first_chunk_lba": first_chunk_lba,
                 "size_bytes": member_size,
             },
@@ -957,6 +994,8 @@ def _copy_and_locator(
         pool_id="primary-pool",
         native_locator=_rem_locator(bytes.fromhex("1cd8ebd3d70a4998a02ab868b8aafbf3")),
         native_locator_key="{}",
+        media_id="tape:b8f6123456784e90aabbccddeeff0011",
+        media_family="tape",
         storage_metadata={},
         integrity_hash=digest,
         health=CopyHealth.OK,
@@ -968,7 +1007,6 @@ def _copy_and_locator(
         pool_id="primary-pool",
         copy_id=1,
         native_locator={
-            "member_path": "clip.mxf",
             "first_chunk_lba": first_chunk_lba,
             "size_bytes": member_size,
         },

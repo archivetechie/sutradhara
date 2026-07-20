@@ -15,6 +15,7 @@ from sqlalchemy import Engine, select
 
 from sutradhara._proto import device_pb2
 from sutradhara.api import store as api_store
+from sutradhara.catalog.models import ArtifactClassPolicyRecord
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.grpc import store as grpc_store
 from sutradhara.grpc.device_service import DeviceService, DeviceServiceConfig
@@ -25,6 +26,17 @@ from sutradhara.grpc.registry import ConnectedDeviceRegistry
 def engine(tmp_path: Path) -> Iterator[Engine]:
     eng = make_engine(f"sqlite:///{tmp_path / 'device-service.db'}")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add(
+            ArtifactClassPolicyRecord(
+                artifactclass="s-masters",
+                ruleset="test.s-masters.v1",
+                expect="compliant",
+                target_bytes=0,
+                max_age_seconds=0,
+                restore_preference=[],
+            )
+        )
     yield eng
     eng.dispose()
 
@@ -426,7 +438,7 @@ def test_device_service_ack_does_not_complete_when_card_correlation_fails(
         )
     )
     assert pending.future.result(timeout=2).intake_id == "missing-intake"
-    _eventually(lambda: _idempotency_status(engine) == "started")
+    _eventually(lambda: _idempotency_status(engine) == "failed")
     assert _idempotency_response(engine) is None
     messages.close()
     responses.close()

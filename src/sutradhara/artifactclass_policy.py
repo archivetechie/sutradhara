@@ -308,9 +308,7 @@ def apply_artifactclass_policy(
     pools = {
         pool.id: pool
         for pool in session.scalars(
-            select(Pool)
-            .options(joinedload(Pool.backend))
-            .where(Pool.id.in_(referenced_pool_ids))
+            select(Pool).options(joinedload(Pool.backend)).where(Pool.id.in_(referenced_pool_ids))
         )
     }
     missing = sorted(set(pool_ids) - set(pools))
@@ -322,6 +320,27 @@ def apply_artifactclass_policy(
     _validate_write_eligible_floor(policy, pools, artifactclass=artifactclass)
     _validate_hdcache_privacy_mapping(policy)
     _warn_if_appledouble_ruleset_preservation_is_unproven(policy)
+
+    record = session.get(ArtifactClassPolicyRecord, artifactclass)
+    if record is None:
+        record = ArtifactClassPolicyRecord(artifactclass=artifactclass)
+        session.add(record)
+    record.ruleset = policy.ruleset
+    record.expect = policy.expect
+    record.target_bytes = policy.bundling.target_bytes
+    record.max_age_seconds = policy.bundling.max_age_seconds
+    record.restore_preference = list(policy.restore_preference)
+    record.min_copies = policy.durability.min_copies
+    record.min_impl_families = policy.durability.min_impl_families
+    record.staging_config = policy.staging.to_json()
+    record.hdcache_config = policy.hdcache.to_json()
+    record.policy_source = source
+    record.policy_sha256 = (
+        hashlib.sha256(source_text.encode("utf-8")).hexdigest() if source_text is not None else None
+    )
+    # The policy-row insert hook is the sole production registry writer. Flush
+    # it before creating dependent placement memberships.
+    session.flush([record])
 
     existing = {
         membership.pool_id: membership
@@ -345,24 +364,6 @@ def apply_artifactclass_policy(
     for pool_id, membership in existing.items():
         if pool_id not in active_pool_ids:
             membership.active = False
-
-    record = session.get(ArtifactClassPolicyRecord, artifactclass)
-    if record is None:
-        record = ArtifactClassPolicyRecord(artifactclass=artifactclass)
-        session.add(record)
-    record.ruleset = policy.ruleset
-    record.expect = policy.expect
-    record.target_bytes = policy.bundling.target_bytes
-    record.max_age_seconds = policy.bundling.max_age_seconds
-    record.restore_preference = list(policy.restore_preference)
-    record.min_copies = policy.durability.min_copies
-    record.min_impl_families = policy.durability.min_impl_families
-    record.staging_config = policy.staging.to_json()
-    record.hdcache_config = policy.hdcache.to_json()
-    record.policy_source = source
-    record.policy_sha256 = (
-        hashlib.sha256(source_text.encode("utf-8")).hexdigest() if source_text is not None else None
-    )
     session.flush()
 
 
@@ -480,7 +481,9 @@ def _parse_hdcache(raw: object, label: str) -> HdcachePolicy:
     enabled = table.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ArtifactClassPolicyError(f"{label}.enabled must be a boolean")
-    privacy_level = _optional_str(table.get("privacy_level"), f"{label}.privacy_level", default="none")
+    privacy_level = _optional_str(
+        table.get("privacy_level"), f"{label}.privacy_level", default="none"
+    )
     if privacy_level != "none" and re.fullmatch(r"p[1-9][0-9]*", privacy_level) is None:
         raise ArtifactClassPolicyError(f"{label}.privacy_level must be 'none' or a p<N> level")
     return HdcachePolicy(enabled=enabled, privacy_level=privacy_level)

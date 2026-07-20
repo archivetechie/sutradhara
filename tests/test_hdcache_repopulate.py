@@ -17,6 +17,7 @@ from sutradhara.archive_restore import restore_assets_from_bundle
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.backend.port import ByteRange
 from sutradhara.catalog.models import (
+    ArtifactClass,
     ArtifactClassPolicyRecord,
     ArtifactClassPool,
     AssetLocator,
@@ -59,6 +60,8 @@ from sutradhara.sealing.port import Representation
 def engine(tmp_path: Path) -> Iterator[Engine]:
     eng = make_engine(f"sqlite:///{tmp_path / 'hdcache-m6.db'}")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add(ArtifactClass(name="s-masters"))
     yield eng
     eng.dispose()
 
@@ -935,6 +938,7 @@ def _seed_bundle(
                 file_sha256=digest,
             )
         )
+        session.flush()
         session.add(
             AssetLocator(
                 logical_asset_hash=digest,
@@ -942,7 +946,6 @@ def _seed_bundle(
                 copy_id=copy.id,
                 bundle_id=bundle_id,
                 native_locator={
-                    "member_path": member_path,
                     "offset": offsets[index],
                     "size_bytes": len(data),
                 },

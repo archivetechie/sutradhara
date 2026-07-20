@@ -7,6 +7,7 @@ the same dedupe, live-cap, source fallback, and policy-conformance rules.
 
 from __future__ import annotations
 
+from sutradhara.catalog.models import Copy
 from sutradhara.hdcache.fill import (
     HdcacheFillBlocked,
     HdcacheFillError,
@@ -15,6 +16,7 @@ from sutradhara.hdcache.fill import (
     fill_target_from_params,
 )
 from sutradhara.hdcache.repopulate import RepopulationError, execute_repopulation_batch
+from sutradhara.jobs.components import touch_copy_tape
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BACKOFF, CONDITION_BLOCKED
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
 
@@ -26,6 +28,11 @@ def handle_hdcache_fill(ctx: JobContext) -> JobResult:
     try:
         if ctx.job.params.get("repopulate_batch") is True:
             results = execute_repopulation_batch(ctx.session, ctx.job.params)
+            for result in results:
+                if result.source_copy_id is not None:
+                    copy = ctx.session.get(Copy, result.source_copy_id)
+                    if copy is not None:
+                        touch_copy_tape(ctx, copy)
             return JobResult(
                 ok=True,
                 detail=f"hdcache repopulation batch filled {len(results)} entries",
@@ -48,6 +55,10 @@ def handle_hdcache_fill(ctx: JobContext) -> JobResult:
             )
         target = fill_target_from_params(ctx.session, ctx.job.params)
         result = fill_target(ctx.session, target, config=fill_config_from_env())
+        if result.source_copy_id is not None:
+            copy = ctx.session.get(Copy, result.source_copy_id)
+            if copy is not None:
+                touch_copy_tape(ctx, copy)
     except HdcacheFillBlocked as exc:
         return JobResult(
             ok=False,

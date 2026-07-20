@@ -18,7 +18,6 @@ from sutradhara.archive_bundle import bundle_due, enqueue_artifact
 from sutradhara.archive_fanout import (
     ArchiveFanoutError,
     BuildArtifact,
-    BuiltBlobRoot,
     BuiltExclusion,
     BundleHeld,
     BundleOversize,
@@ -70,8 +69,8 @@ from sutradhara.catalog.models import (
     ArtifactClassPool,
     AssetLocator,
     Backend,
-    BlobRoot,
     Bundle,
+    BundleMember,
     Copy,
     ExclusionRecord,
     LogicalAsset,
@@ -147,6 +146,7 @@ class _ArchiveWriteBackend:
                 "object_id": object_id,
                 "content_sha256": digest.hex(),
                 "tape_uuid": f"{self._counter:032x}",
+                "volume_uuid": f"d2-{self._counter:032x}",
                 "tape_file_number": self._counter,
             },
             integrity_hash=digest,
@@ -237,12 +237,6 @@ class _OutputsBuilder(LocalArchiveBuilder):
         artifact = super().build(**kwargs)
         return replace(
             artifact,
-            blob_roots=(
-                BuiltBlobRoot(
-                    root_path="blob-root",
-                    native_locator={"member_path": "blob-root", "offset": 0},
-                ),
-            ),
             exclusions=(BuiltExclusion(path="ignored.tmp", reason="test-exclusion"),),
         )
 
@@ -389,8 +383,18 @@ def _create_rao_plain_copy(
 
     with session_scope(engine) as s:
         s.add(Bundle(id="bundle-plain", artifactclass="o-archive", status="sealed"))
-        for asset_hash, data in assets.items():
+        for member_path, data, _first_lba in members:
+            asset_hash = _digest(data)
             s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(data)))
+            s.add(
+                BundleMember(
+                    bundle_id="bundle-plain",
+                    logical_asset_hash=asset_hash,
+                    member_path=member_path,
+                    size_bytes=len(data),
+                    file_sha256=asset_hash,
+                )
+            )
         s.flush()
         record = backend.write_object_to_pool(object_path, "o-copy-1-pool")
         copy, _ = add_bundle_copy(
@@ -410,7 +414,6 @@ def _create_rao_plain_copy(
         )
         for member_path, data, first_lba in members:
             native_locator: dict[str, object] = {
-                "member_path": member_path,
                 "size_bytes": len(data),
             }
             if first_lba is not None:
@@ -448,6 +451,15 @@ def _create_raw_bytes_copy(
         pool.representation = Representation.RAW_BYTES.value
         s.add(Bundle(id="bundle-raw", artifactclass="o-archive", status="sealed"))
         s.add(LogicalAsset(content_sha256=_digest(payload), size_bytes=len(payload)))
+        s.add(
+            BundleMember(
+                bundle_id="bundle-raw",
+                logical_asset_hash=_digest(payload),
+                member_path="large.raw",
+                size_bytes=len(payload),
+                file_sha256=_digest(payload),
+            )
+        )
         s.flush()
         record = backend.write_object_to_pool(object_path, "d2-shelf-pool")
         copy, _ = add_bundle_copy(
@@ -472,7 +484,6 @@ def _create_raw_bytes_copy(
                 bundle_id="bundle-raw",
                 member_path="large.raw",
                 native_locator={
-                    "member_path": "large.raw",
                     "size_bytes": len(payload),
                     "block_range": [len(prefix), len(prefix) + len(payload)],
                 },
@@ -622,7 +633,7 @@ def test_flush_bundle_transient_partial_seals_and_repair_heals(
         assert d2_backend.writes == ["d2-shelf-pool"]
 
 
-def test_build_bundle_copy_for_pool_records_copy_locators_blob_roots_but_no_exclusions(
+def test_build_bundle_copy_for_pool_records_copy_locators_but_no_exclusions(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -679,7 +690,6 @@ def test_build_bundle_copy_for_pool_records_copy_locators_blob_roots_but_no_excl
         assert (
             len(list(s.scalars(select(AssetLocator).where(AssetLocator.copy_id == copy.id)))) == 2
         )
-        assert len(list(s.scalars(select(BlobRoot).where(BlobRoot.copy_id == copy.id)))) == 1
         assert list(s.scalars(select(ExclusionRecord))) == []
 
 
@@ -1662,9 +1672,6 @@ else:
                 representation=Representation.RAO_AEAD_V1.value,
             )
         )
-        s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(restored)))
-        s.add(Bundle(id="bundle-enc", artifactclass="o-archive", status="sealed"))
-        s.flush()
         apply_artifactclass_policy(
             s,
             "o-archive",
@@ -1677,6 +1684,18 @@ else:
                 durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
             ),
         )
+        s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(restored)))
+        s.add(Bundle(id="bundle-enc", artifactclass="o-archive", status="sealed"))
+        s.add(
+            BundleMember(
+                bundle_id="bundle-enc",
+                logical_asset_hash=asset_hash,
+                member_path="nested/encrypted.bin",
+                size_bytes=len(restored),
+                file_sha256=asset_hash,
+            )
+        )
+        s.flush()
         record = backend.write_object_to_pool(object_path, "encrypted-pool")
         copy, _ = add_bundle_copy(
             s,
@@ -1700,7 +1719,6 @@ else:
                 bundle_id="bundle-enc",
                 member_path="nested/encrypted.bin",
                 native_locator={
-                    "member_path": "nested/encrypted.bin",
                     "first_chunk_lba": 4,
                     "size_bytes": len(restored),
                 },

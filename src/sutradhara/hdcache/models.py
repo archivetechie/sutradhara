@@ -26,6 +26,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from sutradhara.catalog.models import Base
+from sutradhara.schema_conventions import vocabulary_check_sql
 
 
 def _utcnow() -> dt.datetime:
@@ -38,11 +39,11 @@ class CacheDisk(Base):
     __tablename__ = "cache_disk"
     __table_args__ = (
         CheckConstraint(
-            "state IN ('active', 'absent', 'retiring', 'dead')",
+            vocabulary_check_sql("state", "cache_disk_state"),
             name="ck_cache_disk_state",
         ),
         CheckConstraint(
-            "capacity_state IN ('ok', 'over_reserve')",
+            vocabulary_check_sql("capacity_state", "cache_capacity_state"),
             name="ck_cache_disk_capacity_state",
         ),
         Index("ix_cache_disk_state", "state"),
@@ -79,11 +80,11 @@ class CacheEntry(Base):
     __tablename__ = "cache_entry"
     __table_args__ = (
         CheckConstraint(
-            "state IN ('filling', 'present', 'lost')",
+            vocabulary_check_sql("state", "cache_entry_state"),
             name="ck_cache_entry_state",
         ),
         CheckConstraint(
-            "representation IN ('raw-bytes', 'rao-aead-v1')",
+            vocabulary_check_sql("representation", "cache_entry_representation"),
             name="ck_cache_entry_representation",
         ),
         Index("ix_cache_entry_bundle_key", "bundle_key"),
@@ -94,10 +95,12 @@ class CacheEntry(Base):
 
     content_sha256: Mapped[bytes] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         primary_key=True,
     )
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128), ForeignKey("artifactclass.name", ondelete="RESTRICT"), nullable=False
+    )
     bundle_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     group_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
     disk_id: Mapped[str] = mapped_column(
@@ -130,11 +133,11 @@ class RestoreRequest(Base):
     __tablename__ = "restore_request"
     __table_args__ = (
         CheckConstraint(
-            "state IN ('pending', 'active', 'completed', 'completed_with_errors')",
+            vocabulary_check_sql("state", "restore_request_state"),
             name="ck_restore_request_state",
         ),
         CheckConstraint(
-            "delivery_mode IN ('server_local', 'agent')",
+            vocabulary_check_sql("delivery_mode", "restore_delivery_mode"),
             name="ck_restore_request_delivery_mode",
         ),
         CheckConstraint(
@@ -181,20 +184,15 @@ class RestoreRequestItem(Base):
     __tablename__ = "restore_request_item"
     __table_args__ = (
         CheckConstraint(
-            "state IN ("
-            "'queued', 'waking_disk', 'streaming', 'sent', 'done', "
-            "'fell_back_to_tape', 'denied', 'failed'"
-            ")",
+            vocabulary_check_sql("state", "restore_item_state"),
             name="ck_restore_request_item_state",
         ),
         CheckConstraint(
-            "denial_kind IS NULL OR denial_kind IN ("
-            "'capability', 'privacy_unmapped', 'suspect', 'rejected'"
-            ")",
+            vocabulary_check_sql("denial_kind", "restore_item_denial_kind"),
             name="ck_restore_request_item_denial_kind",
         ),
         CheckConstraint(
-            "source IS NULL OR source IN ('cache', 'tape')",
+            vocabulary_check_sql("source", "restore_item_source"),
             name="ck_restore_request_item_source",
         ),
         Index("ix_restore_request_item_request_id", "request_id"),
@@ -210,10 +208,12 @@ class RestoreRequestItem(Base):
     )
     content_sha256: Mapped[bytes] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         nullable=False,
     )
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128), ForeignKey("artifactclass.name", ondelete="RESTRICT"), nullable=False
+    )
     final_rel_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -224,7 +224,7 @@ class RestoreRequestItem(Base):
     admitted_force_suspect: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     admitted_force_rejected: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
     request: Mapped[RestoreRequest] = relationship(back_populates="items")
@@ -269,7 +269,7 @@ class RestoreItemCheckpoint(Base):
     committed_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     revealed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
     item: Mapped[RestoreRequestItem] = relationship(back_populates="checkpoint")
@@ -308,7 +308,7 @@ class RestoreOpenSession(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
     item: Mapped[RestoreRequestItem] = relationship(back_populates="open_session")

@@ -84,7 +84,7 @@ def record_measured(
         execution_id=execution_id,
         producer_process=_producer_process(),
         actor=actor,
-        at=at,
+        recorded_at=at,
     )
     session.add(receipt)
     session.flush()
@@ -138,7 +138,7 @@ def record_unmeasured_promotion(
         execution_id=execution_id,
         producer_process=_producer_process(),
         actor=actor,
-        at=at,
+        recorded_at=at,
     )
     session.add(receipt)
     job = _enqueue_verify(session, copy)

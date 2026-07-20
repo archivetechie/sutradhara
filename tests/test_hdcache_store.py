@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import Engine, select
 
 from sutradhara.catalog.models import (
+    ArtifactClass,
     ArtifactClassPolicyRecord,
     Backend,
     Copy,
@@ -43,6 +44,8 @@ from sutradhara.hdcache.store import (
 def engine(tmp_path: Path) -> Iterator[Engine]:
     eng = make_engine(f"sqlite:///{tmp_path / 'hdcache.db'}")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add(ArtifactClass(name="s-masters"))
     yield eng
     eng.dispose()
 

@@ -20,7 +20,9 @@ from sutradhara.backend.port import (
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_copy
+from sutradhara.catalog.media_identity import CopyMediaIdentityError
 from sutradhara.catalog.models import (
+    ArtifactClass,
     ArtifactClassPool,
     Backend,
     Copy,
@@ -244,6 +246,8 @@ def _add_pool(
     accepts_writes: bool = True,
 ) -> None:
     with session_scope(engine) as s:
+        if s.get(ArtifactClass, artifactclass) is None:
+            s.add(ArtifactClass(name=artifactclass))
         s.add(
             Pool(
                 id=pool_id,
@@ -560,7 +564,7 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
     source = tmp_path / "asset.bin"
     source.write_bytes(data)
     asset_hash = _add_asset(engine, data)
-    rem_backend_id = _add_backend(engine, name="mem-rem", kind=BackendKind.MEMORY)
+    rem_backend_id = _add_backend(engine, name="mem-rem", kind=BackendKind.REM_TAPE)
     d2_backend_id = _add_backend(engine, name="d2-tape", kind=BackendKind.D2_TAPE)
     _add_pool(
         engine,
@@ -1014,7 +1018,7 @@ def test_replication_status_rejects_same_tape_for_multiple_pools(
             )
 
 
-def test_replication_status_rejects_missing_tape_uuid(
+def test_copy_registration_rejects_missing_tape_uuid(
     engine: Engine,
 ) -> None:
     data = b"missing tape"
@@ -1029,25 +1033,18 @@ def test_replication_status_rejects_missing_tape_uuid(
     )
 
     with session_scope(engine) as s:
-        copy, _ = add_copy(
-            s,
-            logical_asset_hash=asset_hash,
-            backend_id=backend_id,
-            pool_id="private-copy-1",
-            native_locator={"pool_id": "private-copy-1"},
-            integrity_hash=asset_hash,
-            source=CopySource.INGEST,
-            storage_metadata=_metadata(Representation.RAW_BYTES),
-        )
-        _qualify_fixture_copy(copy)
-
-        with pytest.raises(ReplicationInvariantError, match="missing tape_uuid"):
-            replication_status(
+        with pytest.raises(CopyMediaIdentityError, match="missing tape_uuid"):
+            add_copy(
                 s,
-                asset_hash,
-                "video-priv",
-                {backend_id: _PoolWriteBackend("rem")},
+                logical_asset_hash=asset_hash,
+                backend_id=backend_id,
+                pool_id="private-copy-1",
+                native_locator={"pool_id": "private-copy-1"},
+                integrity_hash=asset_hash,
+                source=CopySource.INGEST,
+                storage_metadata=_metadata(Representation.RAW_BYTES),
             )
+        s.rollback()
 
 
 def test_select_restore_source_picks_first_healthy_copy(

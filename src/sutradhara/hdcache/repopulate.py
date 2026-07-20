@@ -288,6 +288,7 @@ def execute_repopulation_batch(
                             current_target,
                             source_path=result.output_path,
                             source_kind="restore-batch",
+                            source_copy_id=result.copy_id,
                             config=final_config.fill_config,
                             key_registry=final_config.key_registry,
                             sealer=final_config.sealer,
@@ -303,7 +304,12 @@ def execute_repopulation_batch(
             if current_target is None:
                 continue
             restored_path = root / target.sha_hex
-            _restore_single_target(session, current_target, restored_path, config=final_config)
+            restore_result = _restore_single_target(
+                session,
+                current_target,
+                restored_path,
+                config=final_config,
+            )
             current_target = _revalidate_repopulation_item(
                 session,
                 items_by_sha[target.content_sha256],
@@ -316,6 +322,7 @@ def execute_repopulation_batch(
                     current_target,
                     source_path=restored_path,
                     source_kind="restore",
+                    source_copy_id=restore_result.copy_id,
                     config=final_config.fill_config,
                     key_registry=final_config.key_registry,
                     sealer=final_config.sealer,

@@ -73,9 +73,9 @@ class PoolTarget:
     backend_name: str
     representation: str
     key_epoch: str | None = None
-    location: str = ""
+    location: str | None = None
     offsite_gate: bool = False
-    tier: str = ""
+    storage_class: str | None = None
     sort_order: int = 0
 
 
@@ -157,7 +157,7 @@ def target_pools(
                     ),
                     location=pool.location,
                     offsite_gate=pool.offsite_gate,
-                    tier=pool.tier,
+                    storage_class=pool.storage_class,
                     sort_order=membership.sort_order,
                 ),
             )
@@ -419,7 +419,7 @@ def replication_status(
             continue
         _assert_copy_matches_pool(copy, target)
         have.add(target)
-        media_id = _copy_media_id(copy)
+        media_id = copy.media_id
         if media_id:
             media_id_by_target[target] = media_id
 
@@ -667,12 +667,13 @@ def _pool_for_copy(
 
 
 def _copy_media_id(copy: Copy) -> str | None:
-    from sutradhara.durability import DurabilityMediaIdentityError, copy_media_id
+    """Return the materialized media id for compatibility callers.
 
-    try:
-        return copy_media_id(copy)
-    except DurabilityMediaIdentityError:
-        return None
+    Registration and the Wave 1 backfill remain the only derivation sites;
+    this legacy helper is intentionally only a column reader.
+    """
+
+    return copy.media_id
 
 
 def _epoch_for(

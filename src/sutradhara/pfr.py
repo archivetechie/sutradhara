@@ -59,7 +59,6 @@ from sutradhara.sealing.port import Representation
 
 PFR_INDEX_KIND = "pfr-index-v1"
 PFR_RECIPE_METADATA_KEY = "pfr_recipe_version"
-PFR_SIDECAR_METADATA_KEY = "pfr_sidecar_path"
 PFR_SCRAPE_WALL_CLOCK_SECONDS = 120.0
 DEFAULT_PFR_BLOB_CACHE_BYTES = 20 * 1024 * 1024 * 1024
 
@@ -82,8 +81,7 @@ class PFRCutRefused(PFRUnavailable):
     def __init__(self, refusal: CutRefusal) -> None:
         self.failure = refusal.failure
         super().__init__(
-            f"{refusal.failure.reason_id.value}: "
-            f"{refusal.failure.message or 'cut refused'}"
+            f"{refusal.failure.reason_id.value}: {refusal.failure.message or 'cut refused'}"
         )
 
 
@@ -165,7 +163,8 @@ class RaoObject(ByteRangeSource):
             "representation": locator.representation,
             "member_path": locator.member_path,
             "object_id": dict(copy.native_locator).get("object_id"),
-            "tape_uuid": dict(copy.native_locator).get("tape_uuid"),
+            "media_id": copy.media_id,
+            "media_family": copy.media_family,
             "member_byte_base": self._base,
             "size_bytes": self._size,
         }
@@ -492,9 +491,7 @@ def enforce_blob_lru(
         return
     protected = _protected_blob_paths(protect_sidecar, blob_dir=blob_dir)
     all_files = [
-        path
-        for path in blob_dir.rglob("*")
-        if path.is_file() and not path.name.endswith(".tmp")
+        path for path in blob_dir.rglob("*") if path.is_file() and not path.name.endswith(".tmp")
     ]
     files = [path for path in all_files if path.resolve() not in protected]
     total = sum(path.stat().st_size for path in all_files)
@@ -547,7 +544,7 @@ def sidecar_for_asset(session: Session, asset_hash: bytes) -> SidecarRecord | No
         )
     )
     for item in items:
-        raw = (item.item_metadata or {}).get(PFR_SIDECAR_METADATA_KEY)
+        raw = item.pfr_sidecar_path
         if not isinstance(raw, str) or not raw:
             continue
         path = Path(raw)

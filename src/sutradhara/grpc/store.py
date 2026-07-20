@@ -29,6 +29,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from sutradhara.catalog.models import Base
+from sutradhara.schema_conventions import vocabulary_check_sql
 
 GrpcIntakeState = Literal["streaming", "committing", "committed", "aborted"]
 RotationAuthority = Literal["self", "admin"]
@@ -43,7 +44,7 @@ class GrpcIntake(Base):
     __tablename__ = "grpc_intake"
     __table_args__ = (
         CheckConstraint(
-            "state IN ('streaming', 'committing', 'committed', 'aborted')",
+            vocabulary_check_sql("state", "grpc_intake_state"),
             name="ck_grpc_intake_state",
         ),
         Index("ix_grpc_intake_owner", "operator", "device_id"),
@@ -58,7 +59,9 @@ class GrpcIntake(Base):
     card_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     source_plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128), ForeignKey("artifactclass.name", ondelete="RESTRICT"), nullable=False
+    )
     source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     source_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     label: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -67,7 +70,8 @@ class GrpcIntake(Base):
         DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
+        DateTime(timezone=True), nullable=False, default=lambda: _utcnow(),
+        onupdate=lambda: _utcnow()
     )
 
 
@@ -88,7 +92,8 @@ class GrpcLogicalDevice(Base):
         DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
+        DateTime(timezone=True), nullable=False, default=lambda: _utcnow(),
+        onupdate=lambda: _utcnow()
     )
 
 

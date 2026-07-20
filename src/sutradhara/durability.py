@@ -347,42 +347,19 @@ def bundle_copy_aggregates_by_bundle(
 
 
 def copy_media_identity(copy: Copy) -> CopyMediaIdentity | None:
-    """Return the per-family media identity for one copy, or None when exempt."""
+    """Read the materialized per-family media identity, or None when exempt."""
 
-    family = _copy_implementation_family(copy)
-    if family == "memory":
+    if copy.media_family == "memory":
         return None
-    if family == "tape":
-        value = copy.native_locator.get("tape_uuid")
-        if isinstance(value, str) and value:
-            return CopyMediaIdentity(family=family, media_id=value)
-        raise DurabilityMediaIdentityError(
-            f"copy id={copy.id} on backend_id={copy.backend_id} is missing tape_uuid"
-        )
-    if family == "d2tape":
-        value = copy.native_locator.get("volume_uuid")
-        if isinstance(value, str) and value:
-            return CopyMediaIdentity(family=family, media_id=value)
-        value = copy.native_locator.get("barcode")
-        if isinstance(value, str) and value:
-            return CopyMediaIdentity(family=family, media_id=value)
-        raise DurabilityMediaIdentityError(
-            f"copy id={copy.id} on backend_id={copy.backend_id} is missing volume_uuid/barcode"
-        )
-    if family in {"disk", "cloud"}:
-        return CopyMediaIdentity(family=family, media_id=f"backend:{copy.backend_id}")
-    raise DurabilityMediaIdentityError(
-        f"copy id={copy.id} uses unsupported implementation_family={family!r}"
-    )
+    if copy.media_family and copy.media_id:
+        return CopyMediaIdentity(family=copy.media_family, media_id=copy.media_id)
+    raise DurabilityMediaIdentityError(f"copy id={copy.id} has no materialized media identity")
 
 
 def copy_media_id(copy: Copy) -> str | None:
-    """Return a stable string media id for compatibility with replication status."""
+    """Read the canonical materialized media id."""
 
-    identity = copy_media_identity(copy)
-    if identity is None:
-        return f"memory:exempt:{copy.id}"
-    return f"{identity.family}:{identity.media_id}"
+    return copy.media_id
 
 
 def asset_has_artifactclass_membership(
@@ -519,7 +496,7 @@ def _placement_entry(target: PoolTarget, duplicate_count: int) -> PlacementTarge
         key_epoch=target.key_epoch,
         location=target.location,
         offsite_gate=target.offsite_gate,
-        tier=target.tier,
+        storage_class=target.storage_class,
         sort_order=target.sort_order,
         have=duplicate_count > 0,
         duplicate_count=duplicate_count,
@@ -539,9 +516,6 @@ def _dedupe_by_copy_id(copies: list[Copy]) -> list[Copy]:
 
 
 def _copy_implementation_family(copy: Copy) -> str:
-    family = copy.backend.implementation_family
-    if isinstance(family, str) and family:
-        return family
-    from sutradhara.catalog.types import implementation_family_for_kind
-
-    return implementation_family_for_kind(copy.backend.kind)
+    if not copy.media_family:
+        raise DurabilityMediaIdentityError(f"copy id={copy.id} has no media_family")
+    return copy.media_family

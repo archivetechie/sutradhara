@@ -97,10 +97,10 @@ as evidence but creates no registered `ingest_item` rows.
 | `manifest_path` | text, optional | Landing manifest location. |
 | `manifest_digest` | text, optional | SHA-256 digest of that manifest, rendered as hex. |
 | `requested_profile` | text, optional | Requested derivation/prepare profile. |
-| `status` | enum | `receiving`, `verifying`, `quarantined`, or `registered`; defaults to `receiving`. |
+| `status` | enum | `verifying`, `quarantined`, or `registered`; defaults to `verifying`. |
 | `created_at`, `updated_at` | time | Creation and last state-update times. |
 | `registered_at`, `quarantined_at` | time, optional | Terminal acceptance or quarantine time. |
-| `retention_state` | enum | Landing-byte lifecycle: `held`, `released`, `tombstoned`, `abandoned`, or `purged`; defaults to `held`. |
+| `retention_state` | enum | Landing-byte lifecycle: `not_applicable`, `held`, `released`, `tombstoned`, `abandoned`, or `purged`; non-registered rows must be `not_applicable`, and registered rows must use an applicable state. |
 | `released_at` | time, optional | When policy made source staging releasable. |
 | `release_policy_fingerprint` | text, optional | Versioned digest of the gate-relevant policy snapshot frozen at release. |
 | `staging_tombstoned_at`, `staging_tombstone_path` | time/text, optional pair | Atomic-rename recovery marker committed before tombstone garbage collection. |
@@ -126,7 +126,8 @@ can preserve their own provenance even when their bytes deduplicate.
 | `disposition_policy_generation` | text, optional | Policy SHA/generation used for the evaluated-at verdict. |
 | `disposition_evidence` | json, optional | Immutable server hash and policy-qualified durability facts supporting the verdict. |
 | `prior_intake_id` | text, optional FK -> `intake.intake_id`, indexed | Most recent prior verified occurrence linked by the server hash. |
-| `metadata` | json | Per-occurrence metadata captured at registration. |
+| `source_path`, `pfr_sidecar_path` | text, optional | Typed staging and PFR-sidecar paths captured by registration/fact writers. |
+| `metadata` | json | Non-identity per-occurrence metadata; it cannot mirror the typed paths or SHA-256. |
 | `created_at` | time | Registration time. |
 
 ### `asset_derivation`
@@ -139,7 +140,7 @@ the same kind of edge being recorded twice for one source/derived pair.
 | `id` | integer, PK | Edge identifier. |
 | `derived_item_id` | integer, FK -> `ingest_item.id` | Derived occurrence. |
 | `source_item_id` | integer, FK -> `ingest_item.id` | Source occurrence. |
-| `kind` | text | Derivation kind, such as a transcode profile. |
+| `kind` | enum | Closed derivation kind: `mezz` or `preview`. |
 | `created_at` | time | When the provenance edge was recorded. |
 
 ## Receive API and device relay
@@ -242,10 +243,11 @@ only after the arrangement is frozen.
 | `label` | text | Human workspace label. |
 | `intake_id` | text, FK -> `intake.intake_id` | Source intake. |
 | `artifactclass` | text, indexed | Policy class the workspace targets. |
-| `status` | enum | `draft`, `pending_derivatives`, `ready`, `submitted`, or `abandoned`. |
+| `status` | enum | `draft`, `submitted`, or `abandoned`. |
 | `submission_id` | text, optional, FK -> `submission.id` | Frozen submission produced from this workspace. |
 | `cloned_from_arrangement_id` | integer, optional, FK -> `arrangement.id` | Earlier workspace copied to revise it. |
 | `created_at`, `updated_at`, `submitted_at` | time | Creation, last edit, and freeze times; `submitted_at` is optional. |
+| `abandoned_at`, `abandoned_by`, `abandonment_reason` | time / text, optional triple | Immutable attribution recorded by the explicit abandon verb. |
 
 ### `arrangement_member`
 
@@ -287,7 +289,7 @@ The immutable member rows represented by a submission's source map.
 |---|---|---|
 | `id` | integer, PK | Member identifier. |
 | `submission_id` | text, FK -> `submission.id` | Parent submission. |
-| `ingest_item_id` | integer, optional FK -> `ingest_item.id` | Original occurrence, when retained. |
+| `ingest_item_id` | integer, FK -> `ingest_item.id`, `ON DELETE RESTRICT` | Original occurrence retained as immutable provenance. |
 | `archive_path` | text | Frozen archive path; unique within the submission. |
 | `source_path` | text | Original source path used at archive time. |
 | `sha256` | hash | Content hash expected for this member. |
@@ -323,13 +325,24 @@ talk to storage; a pool describes where a policy is allowed to place data.
 | `id` | text, PK | Pool identifier. |
 | `backend_id` | integer, FK -> `backend.id` | Owning backend. |
 | `representation` | text | Stored representation, for example raw bytes or RAO. |
-| `location` | text | Operator-defined location label. |
+| `location` | text, optional | Operator-defined location label. |
 | `offsite_gate` | boolean | Whether offsite confirmation gates retention. |
-| `tier` | text | Policy tier label. |
+| `storage_class` | text, optional | Policy storage-class label. |
 | `accepts_writes` | boolean | Write fence; false prevents new placements. |
 | `retired` | boolean | Whether the pool is retired from ordinary selection. |
 | `media_generation` | text, optional | Media-generation or compatibility label. |
 | `created_at` | time | Creation time. |
+
+### `artifactclass`
+
+Registry of valid policy classes. Rows are introduced only by policy
+administration; every artifactclass-bearing table references this registry and
+therefore rejects unknown class values at write time.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `name` | text, PK | Registered policy-class name. |
+| `created_at` | time | First policy-administration registration time. |
 
 ### `artifactclass_policy`
 
@@ -372,7 +385,7 @@ keeps individual-file restoration possible.
 |---|---|---|
 | `id` | text, PK | Bundle identifier. |
 | `artifactclass` | text, indexed | Bundle policy class. |
-| `status` | text | Lifecycle state; starts `open`, then may be flushed, sealed, or held. |
+| `status` | enum | `open`, `flushing`, `sealed`, `held`, or `aborted`. |
 | `total_bytes`, `member_count` | bigint / integer | Current aggregate size and member count. |
 | `target_bytes`, `max_age_seconds` | bigint / integer | Policy thresholds captured for this bundle. |
 | `ruleset`, `expect` | text, optional | Captured policy descriptors. |
@@ -429,6 +442,7 @@ an individual-file copy.
 | `pool_id` | text, optional FK -> `pool.id` | Policy pool when the copy is policy-routed; null for legacy or discovered copies without one. |
 | `native_locator` | json | Adapter-specific address for read, verify, and delete. |
 | `native_locator_key` | text | Canonical indexed locator; unique with `backend_id`. |
+| `media_id`, `media_family` | text, indexed | Canonical physical-medium identity and implementation family, materialized by the single copy-identity derivation. |
 | `storage_metadata` | json | Representation-specific facts, such as RAO metadata. |
 | `integrity_hash` | hash | Required digest of the stored representation. |
 | `integrity_hash_provenance` | enum | `locally_computed` or `backend_discovered`. |
@@ -450,25 +464,11 @@ between an object on storage and the file a restore operator asked for.
 | `id` | integer, PK | Locator identifier. |
 | `logical_asset_hash` | hash, FK -> `logical_asset.content_sha256` | Restorable asset. |
 | `pool_id` | text, FK -> `pool.id` | Policy pool containing the pointer. |
-| `copy_id` | integer, optional FK -> `copy.id` | Stored copy that contains the asset. |
-| `bundle_id` | text, optional FK -> `bundle.id` | Bundle context for the member. |
-| `native_locator` | json | Adapter-native location details. |
+| `copy_id` | integer, FK -> `copy.id` | Stored copy that contains the asset; constrained with `pool_id` and `bundle_id` to one copy identity. |
+| `bundle_id` | text, FK -> `bundle.id` | Bundle context; constrained with asset hash and member path to one bundle-member identity. |
+| `native_locator` | json | Adapter-native location details; never duplicates `member_path`. |
 | `member_path` | text | Path of the member in the stored object. |
 | `representation` | text | Representation needed to open it. |
-| `created_at` | time | Creation time. |
-
-### `blob_root`
-
-Root-level metadata for blob-style bundle storage, separate from member-level
-`asset_locator` rows.
-
-| Field | Type / key | Meaning |
-|---|---|---|
-| `id` | integer, PK | Root record identifier. |
-| `bundle_id`, `copy_id`, `pool_id` | FK | Bundle, its stored copy, and policy pool. |
-| `root_path` | text | Root path; unique with `copy_id`. |
-| `native_locator` | json | Native root location. |
-| `archive_id` | text, optional | Backend archive identifier. |
 | `created_at` | time | Creation time. |
 
 ## Organization, retention, and review
@@ -550,7 +550,7 @@ Append-only record of an intake, media, or batch retention decision.
 | `subject_type`, `subject_id` | text | Explicit `intake`, `media`, `batch`, or correction-only `receipt` subject identity. |
 | `action` | text | Closed action vocabulary for attempts, outcomes, holds, tripwires, and corrections. |
 | `operation_id` | required text | Correlation key shared by an attempt and its outcomes. |
-| `actor`, `at` | text / time | Who acted and when. |
+| `actor`, `occurred_at` | text / time | Who acted and when the event occurred. |
 | `detail` | json, optional | Action evidence/details. |
 | `supersedes_source`, `supersedes_event_id` | optional source enum / integer pair | Immutable receipt target for `correction_recorded`; both are null for ordinary events. |
 
@@ -569,7 +569,7 @@ measurement projection or measurement invalidation.
 | `expected_digest`, `measured_digest` | hash / optional hash | Catalog expectation and actual read-back result; null measured digest means invalidation. |
 | `backend_ok`, `failure_kind`, `failure_detail` | boolean / optional text | Backend verdict and separate failure facts. |
 | `source`, `execution_id` | enum / text | `fanout`, `verify-job`, `restore`, or scrub invalidation plus its retry-deduplication identity. |
-| `producer_process`, `actor`, `at` | text / optional text / time | Producer and attribution metadata. |
+| `producer_process`, `actor`, `recorded_at` | text / optional text / time | Producer, attribution, and receipt-recording metadata. |
 
 ### `retention_journal_checkpoint`
 
@@ -625,6 +625,18 @@ applies only to this ingest or becomes a persisted rule.
 | `persisted_rule` | json, optional | Rule created for future matching input. |
 | `decided_at` | time | Decision time. |
 
+### `asset_review_event`
+
+Append-only reject/unreject decision history. The nullable rejection fields on
+`logical_asset` are only the current-state projection.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Event identifier. |
+| `logical_asset_hash` | hash, FK -> `logical_asset.content_sha256`, `ON DELETE RESTRICT` | Reviewed asset retained with its history. |
+| `action` | enum | `reject` or `unreject`. |
+| `actor`, `reason`, `decided_at` | text / optional text / time | Immutable attribution and rationale. |
+
 ## Jobs and reconciliation
 
 ### `job`
@@ -658,6 +670,8 @@ live job row is pruned.
 |---|---|---|
 | `id` | integer, PK | Attempt identifier. |
 | `job_id` | integer, optional FK -> `job.id` | Original job; null after job-row deletion. |
+| `subject_job_id`, `subject_domain`, `subject_key` | optional integer / text | Durable subject snapshot retained after job-row pruning; only a pre-Wave-1 attempt whose job was already pruned can have an unknown subject id. |
+| `params_snapshot` | json, optional | Immutable handler-input snapshot retained after job-row pruning; null only when a pre-Wave-1 attempt had already lost its job row before backfill. |
 | `job_kind`, `attempt_number`, `outcome` | text / integer / enum | Handler kind, ordinal, and terminal status. |
 | `error` | text, optional | Failure text. |
 | `started_at`, `finished_at`, `created_at` | time | Attempt timing and record time. |
@@ -679,7 +693,11 @@ reality and the latest attempt so reconcilers do not scan the full job history.
 | `attempt_count`, `next_eligible_at` | integer / time | Retry count and next allowable attempt. |
 | `blocked_tool_name`, `blocked_tool_version` | text, optional | Tool evidence that can reopen a blocked condition after change. |
 | `last_attempt_id` | integer, optional FK -> `job_attempt.id` | Latest supporting attempt. |
-| `last_attempt_at`, `last_success_at`, `updated_at` | time | Attempt, success, and row-update times. |
+| `last_attempt_at`, `last_success_at` | time, optional | Latest attempt and success times. |
+| `observed_at` | time | Latest observation look; every observation writer advances it. |
+| `condition_changed_at` | time | Latest actual `condition` value transition. |
+| `reopened_by`, `reopened_at` | text / time, optional pair | Immutable attribution for the latest explicit reopen event. |
+| `updated_at` | time | Projection-mutation clock maintained by ORM `onupdate`. |
 
 ### `condition_component`
 
@@ -774,6 +792,11 @@ Besides the primary and foreign keys shown above, the implementation enforces
 state-value checks, unique path/identity pairs, the `copy` asset-or-bundle XOR,
 and partial unique indexes for active tags and live job deduplication. Those
 are part of the application contract, not mere performance hints.
+
+The executable cross-table convention manifest, including the one-source
+closed vocabularies, per-FK roles, and persistent-field writer/reader
+declarations, is documented in
+[`reference-schema-conventions.md`](reference-schema-conventions.md).
 
 For a production database, apply changes with `alembic upgrade head` under the
 deployment procedure. `sutra db init` is a local-development convenience only.

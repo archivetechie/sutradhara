@@ -203,7 +203,7 @@ def _source_has_derivations(session: Session, item_id: int, kinds: set[str]) -> 
 
 
 def _has_pfr_sidecar(item: IngestItem) -> bool:
-    path = item.item_metadata.get("pfr_sidecar_path") if item.item_metadata else None
+    path = item.pfr_sidecar_path
     return isinstance(path, str) and pfr_sidecar_complete(Path(path))
 
 

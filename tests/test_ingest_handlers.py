@@ -20,6 +20,7 @@ from sutradhara.catalog.facts import (
     record_validity,
 )
 from sutradhara.catalog.models import (
+    ArtifactClass,
     AssetDerivation,
     Backend,
     Bundle,
@@ -54,6 +55,11 @@ RECOVERY_EPOCH = "recovery-" + "2" * 32
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add_all(
+            ArtifactClass(name=name)
+            for name in ("proxy", "s-masters", "s-proxy", "video-master")
+        )
     yield eng
     eng.dispose()
 
@@ -111,7 +117,9 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
         source_item = session.scalars(
             select(IngestItem).where(IngestItem.as_received_path == "clip.mov")
         ).one()
-        assert Path(source_item.item_metadata["pfr_sidecar_path"]).exists()
+        assert source_item.pfr_sidecar_path is not None
+        assert Path(source_item.pfr_sidecar_path).exists()
+        assert "pfr_sidecar_path" not in source_item.item_metadata
         source_asset = session.get(LogicalAsset, source_item.logical_asset_hash)
         assert source_asset is not None
         assert source_asset.validity == AssetValidity.OK
@@ -359,7 +367,8 @@ def test_pfr_index_fact_is_idempotent_and_preserves_metadata(
     with session_scope(engine) as session:
         fetched_item = session.get(IngestItem, item_id)
         assert fetched_item is not None
-        assert fetched_item.item_metadata["pfr_sidecar_path"] == first_path
+        assert fetched_item.pfr_sidecar_path == first_path
+        assert "pfr_sidecar_path" not in fetched_item.item_metadata
         assert fetched_item.item_metadata["operator_note"] == "keep me"
         assert Path(first_path).exists()
 
@@ -477,7 +486,7 @@ def test_fact_recording_api_does_not_commit(engine: Engine, tmp_path: Path) -> N
             source_item=tx_item,
             output_path=derived_path,
             relpath="derived/rollback/test.mp4",
-            kind="rollback-test",
+            kind="preview",
             artifactclass="proxy",
             media_kind=MediaKind.VIDEO,
             generated_by="test",
@@ -593,7 +602,7 @@ def _add_cloud_backend(session: Any) -> None:
             backend_id=backend.id,
             representation="rao-aead-v1",
             location="s3://test-bucket",
-            tier="cloud",
+            storage_class="cloud",
         )
     )
 
@@ -613,7 +622,7 @@ def _add_ssh_cloud_backend(session: Any) -> None:
             backend_id=backend.id,
             representation="rao-aead-v1",
             location="ssh://backup.example/remote-root",
-            tier="lan",
+            storage_class="lan",
         )
     )
 

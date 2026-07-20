@@ -11,7 +11,7 @@ import pytest
 from click.testing import CliRunner
 from sqlalchemy import Engine, delete, event, select
 
-from sutradhara.catalog.models import LogicalAsset
+from sutradhara.catalog.models import ArtifactClass, LogicalAsset
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.cli.hdcache import hdcache_group, set_manager_factory
 from sutradhara.hdcache.lifecycle import (
@@ -26,6 +26,8 @@ from sutradhara.hdcache.models import CacheDisk, CacheEntry
 def engine(tmp_path: Path) -> Iterator[Engine]:
     eng = make_engine(f"sqlite:///{tmp_path / 'hdcache-cli.db'}")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add(ArtifactClass(name="s-masters"))
     yield eng
     eng.dispose()
 

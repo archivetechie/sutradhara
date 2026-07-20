@@ -197,7 +197,7 @@ def test_attempts_record_unknown_handler_and_exception_paths(engine: Engine) -> 
         _unregister("_attempt_raises")
 
 
-def test_tape_session_components_and_observations_persist_on_success(engine: Engine) -> None:
+def test_tape_session_observations_do_not_invent_copy_media_components(engine: Engine) -> None:
     @register_handler("_attempt_tape_success")
     def _attempt_tape_success(_ctx: JobContext) -> JobResult:
         report_session_open(
@@ -215,14 +215,21 @@ def test_tape_session_components_and_observations_persist_on_success(engine: Eng
 
         with session_scope(engine) as session:
             attempt = session.scalars(select(JobAttempt)).one()
-            assert "tape:L80012" in attempt.detail["components"]
+            assert not any(
+                component.startswith("tape:") for component in attempt.detail["components"]
+            )
             assert "drive:257" in attempt.detail["components"]
             assert "library:DEC1" in attempt.detail["components"]
             assert attempt.detail["component_parents"] == [
                 {"component": "drive:257", "parent": "library:DEC1"}
             ]
             assert attempt.detail["observations"] == [
-                {"session_id": "session-read-17", "drive_element_address": 257}
+                {
+                    "session_id": "session-read-17",
+                    "drive_element_address": 257,
+                    "tape_uuid": "L80012",
+                    "library": "DEC1",
+                }
             ]
     finally:
         _unregister("_attempt_tape_success")
@@ -246,12 +253,15 @@ def test_tape_session_observation_survives_handler_exception(engine: Engine) -> 
         with session_scope(engine) as session:
             attempt = session.scalars(select(JobAttempt)).one()
             assert attempt.outcome == JobStatus.FAILED
-            assert "tape:L80013" in attempt.detail["components"]
+            assert not any(
+                component.startswith("tape:") for component in attempt.detail["components"]
+            )
             assert "drive:513" in attempt.detail["components"]
             assert attempt.detail["observations"] == [
                 {
                     "session_id": b"session-before-error".hex(),
                     "drive_element_address": 513,
+                    "tape_uuid": "L80013",
                 }
             ]
     finally:
@@ -357,12 +367,15 @@ def test_real_adapter_session_facts_reach_attempt_on_success_and_failure(
             ):
                 attempt = attempts[kind]
                 assert attempt.outcome == outcome
-                assert f"tape:{client.tape_uuid.hex()}" in attempt.detail["components"]
+                assert not any(
+                    component.startswith("tape:") for component in attempt.detail["components"]
+                )
                 assert f"drive:{client.drive_element_address}" in attempt.detail["components"]
                 assert attempt.detail["observations"] == [
                     {
                         "session_id": client.session_id.hex(),
                         "drive_element_address": client.drive_element_address,
+                        "tape_uuid": client.tape_uuid.hex(),
                     }
                 ]
     finally:

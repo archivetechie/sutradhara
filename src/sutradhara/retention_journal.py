@@ -370,12 +370,12 @@ def journal_operational_status(
         )
         for value in (
             session.scalar(
-                select(func.min(VerifyReceipt.at)).where(
+                select(func.min(VerifyReceipt.recorded_at)).where(
                     VerifyReceipt.event_id > state.verify_receipt_cursor
                 )
             ),
             session.scalar(
-                select(func.min(RetentionEvent.at)).where(
+                select(func.min(RetentionEvent.occurred_at)).where(
                     RetentionEvent.event_id > state.retention_event_cursor
                 )
             ),
@@ -471,7 +471,7 @@ def record_journal_correction(
         action="correction_recorded",
         operation_id=f"journal-correction:{source}:{event_id}:{uuid.uuid4()}",
         actor=actor,
-        at=dt.datetime.now(dt.UTC),
+        occurred_at=dt.datetime.now(dt.UTC),
         detail={"kind": "receipt-supersession", "reason": reason},
         supersedes_source=source,
         supersedes_event_id=event_id,
@@ -993,7 +993,7 @@ def _verify_receipt_payload(row: VerifyReceipt) -> dict[str, object]:
         "execution_id": row.execution_id,
         "producer_process": row.producer_process,
         "actor": row.actor,
-        "at": _isoformat(row.at),
+        "at": _isoformat(row.recorded_at),
     }
 
 
@@ -1006,7 +1006,7 @@ def _retention_event_payload(row: RetentionEvent) -> dict[str, object]:
         "action": row.action,
         "operation_id": row.operation_id,
         "actor": row.actor,
-        "at": _isoformat(row.at),
+        "at": _isoformat(row.occurred_at),
         "detail": _json_value(row.detail),
         "supersedes_source": row.supersedes_source,
         "supersedes_event_id": row.supersedes_event_id,
@@ -1042,7 +1042,7 @@ def _projection_mismatches(engine: Engine) -> Iterable[str]:
                 yield f"projection: copy {copy.id} expected digest differs from receipt {receipt.event_id}"
             if copy.last_measured_digest != receipt.measured_digest:
                 yield f"projection: copy {copy.id} measured digest differs from receipt {receipt.event_id}"
-            expected_at = receipt.at if receipt.measured_digest is not None else None
+            expected_at = receipt.recorded_at if receipt.measured_digest is not None else None
             if not _same_datetime(copy.last_measured_at, expected_at):
                 yield f"projection: copy {copy.id} measured time differs from receipt {receipt.event_id}"
         unreceipted = session.scalars(

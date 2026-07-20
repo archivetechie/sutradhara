@@ -16,7 +16,6 @@ from sutradhara.archive_bundle import (
     enqueue_artifact,
     get_or_create_open_bundle,
     record_asset_locator,
-    record_blob_root,
     record_exclusion,
 )
 from sutradhara.catalog.copies import add_bundle_copy
@@ -24,7 +23,6 @@ from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     AssetLocator,
     Backend,
-    BlobRoot,
     BundleMember,
     ExclusionRecord,
     LogicalAsset,
@@ -47,7 +45,7 @@ def _hash(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
 
-def test_bundle_helpers_record_members_locators_roots_and_exclusions(
+def test_bundle_helpers_record_members_locators_and_exclusions(
     engine: Engine,
 ) -> None:
     asset_hash = _hash(b"member")
@@ -104,7 +102,11 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
             bundle_id=bundle.id,
             backend_id=backend.id,
             pool_id="archive-pool",
-            native_locator={"pool_id": "archive-pool", "object_id": "bundle-test"},
+            native_locator={
+                "pool_id": "archive-pool",
+                "object_id": "bundle-test",
+                "tape_uuid": "tape-test",
+            },
             integrity_hash=_hash(b"stored-bundle"),
             source=CopySource.INGEST,
             storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
@@ -116,19 +118,11 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
             native_locator={
                 "pool_id": "archive-pool",
                 "object_id": "bundle-test",
-                "member_path": "member.bin",
             },
             representation=Representation.RAO_PLAIN_V1.value,
             copy_id=copy.id,
             bundle_id=bundle.id,
-        )
-        root = record_blob_root(
-            s,
-            bundle_id=bundle.id,
-            copy_id=copy.id,
-            pool_id="archive-pool",
-            root_path="member.bin",
-            native_locator={"tree": "sha256-tree-v1"},
+            member_path="member.bin",
         )
         exclusion = record_exclusion(
             s,
@@ -146,12 +140,11 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
         assert member.bundle_id == "bundle-test"
         assert bundle.total_bytes == 6
         assert locator.bundle_id == "bundle-test"
-        assert root.root_path == "member.bin"
+        assert "member_path" not in locator.native_locator
         assert exclusion.reason == "unsupported-entry"
 
         assert len(list(s.scalars(select(BundleMember)))) == 1
         assert len(list(s.scalars(select(AssetLocator)))) == 1
-        assert len(list(s.scalars(select(BlobRoot)))) == 1
         assert len(list(s.scalars(select(ExclusionRecord)))) == 1
 
 
@@ -169,6 +162,7 @@ def test_record_asset_locator_rejects_unknown_pool(engine: Engine) -> None:
                 representation=Representation.RAW_BYTES.value,
                 copy_id=0,
                 bundle_id="bundle-missing",
+                member_path="member.bin",
             )
 
 

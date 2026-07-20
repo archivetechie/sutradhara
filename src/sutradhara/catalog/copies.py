@@ -44,6 +44,10 @@ class CopyPoolMismatch(CatalogError):
     """An existing backend locator is already associated with another pool."""
 
 
+class CopyIdentityConflict(CatalogError):
+    """An idempotent locator replay disagrees with its immutable copy facts."""
+
+
 class CopyLookup(TypedDict):
     locator: dict[str, Any]
     integrity_hash: bytes
@@ -96,11 +100,16 @@ def add_copy(
         )
     ).one_or_none()
     if existing is not None:
-        if pool_id is not None and existing.pool_id != pool_id:
-            raise CopyPoolMismatch(
-                f"copy id={existing.id} locator already belongs to pool "
-                f"{existing.pool_id!r}, not {pool_id!r}"
-            )
+        _assert_idempotent_replay(
+            existing,
+            logical_asset_hash=logical_asset_hash,
+            bundle_id=None,
+            pool_id=pool_id,
+            native_locator=native_locator,
+            integrity_hash=integrity_hash,
+            integrity_hash_provenance=integrity_hash_provenance,
+            source=source,
+        )
         return existing, False
 
     copy = Copy(
@@ -154,16 +163,16 @@ def add_bundle_copy(
         )
     ).one_or_none()
     if existing is not None:
-        if existing.bundle_id != bundle_id:
-            raise CopyPoolMismatch(
-                f"copy id={existing.id} locator already belongs to bundle "
-                f"{existing.bundle_id!r}, not {bundle_id!r}"
-            )
-        if existing.pool_id != pool_id:
-            raise CopyPoolMismatch(
-                f"copy id={existing.id} locator already belongs to pool "
-                f"{existing.pool_id!r}, not {pool_id!r}"
-            )
+        _assert_idempotent_replay(
+            existing,
+            logical_asset_hash=None,
+            bundle_id=bundle_id,
+            pool_id=pool_id,
+            native_locator=native_locator,
+            integrity_hash=integrity_hash,
+            integrity_hash_provenance=integrity_hash_provenance,
+            source=source,
+        )
         return existing, False
 
     copy = Copy(
@@ -223,6 +232,54 @@ def _require_logical_asset(
             "register the asset before recording or looking up copies"
         )
     return asset
+
+
+def _assert_idempotent_replay(
+    existing: Copy,
+    *,
+    logical_asset_hash: bytes | None,
+    bundle_id: str | None,
+    pool_id: str | None,
+    native_locator: dict[str, Any],
+    integrity_hash: bytes,
+    integrity_hash_provenance: IntegrityHashProvenance,
+    source: CopySource,
+) -> None:
+    """Reject any disagreement hidden behind a backend-locator replay."""
+
+    expected = {
+        "logical_asset_hash": logical_asset_hash,
+        "bundle_id": bundle_id,
+        "pool_id": pool_id,
+        "native_locator": native_locator,
+        "integrity_hash": integrity_hash,
+        "integrity_hash_provenance": integrity_hash_provenance.value,
+        "source": source.value,
+    }
+    actual = {
+        "logical_asset_hash": existing.logical_asset_hash,
+        "bundle_id": existing.bundle_id,
+        "pool_id": existing.pool_id,
+        "native_locator": existing.native_locator,
+        "integrity_hash": existing.integrity_hash,
+        "integrity_hash_provenance": _enum_value(existing.integrity_hash_provenance),
+        "source": _enum_value(existing.source),
+    }
+    disagreements = [name for name, value in expected.items() if actual[name] != value]
+    if disagreements:
+        if disagreements == ["pool_id"]:
+            raise CopyPoolMismatch(
+                f"copy id={existing.id} locator already belongs to pool "
+                f"{existing.pool_id!r}, not {pool_id!r}"
+            )
+        raise CopyIdentityConflict(
+            f"copy id={existing.id} locator replay disagrees on: "
+            + ", ".join(disagreements)
+        )
+
+
+def _enum_value(value: object) -> object:
+    return getattr(value, "value", value)
 
 
 def _health_value(health: CopyHealth | str) -> str:

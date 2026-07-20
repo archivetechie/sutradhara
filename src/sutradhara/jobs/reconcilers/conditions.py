@@ -67,9 +67,14 @@ def record_observation(
             target_key=target_key,
             observed_state=observed_state,
             condition=CONDITION_SATISFIED,
+            observed_at=now,
+            condition_changed_at=now,
             updated_at=now,
         )
         session.add(row)
+
+    row.observed_state = observed_state
+    row.observed_at = now
 
     if not desired:
         _mark_satisfied(row, observed_state=observed_state, now=now)
@@ -78,8 +83,7 @@ def record_observation(
 
     if observed_state == OBSERVED_PRESENT:
         if row.condition == CONDITION_SUPPRESSED:
-            row.observed_state = observed_state
-            row.updated_at = now
+            pass
         else:
             _mark_satisfied(row, observed_state=observed_state, now=now)
         session.flush([row])
@@ -89,13 +93,11 @@ def record_observation(
         session.flush([row])
         return row
 
-    row.observed_state = observed_state
-    row.condition = CONDITION_OPEN
+    _set_condition(row, CONDITION_OPEN, now)
     row.reason = reason
     row.message = message
     if row.next_eligible_at is None:
         row.next_eligible_at = now
-    row.updated_at = now
     session.flush([row])
     return row
 
@@ -133,7 +135,6 @@ def record_condition(
     if condition is None:
         if attempt is not None and attempt.outcome == JobStatus.SUCCEEDED:
             row.last_success_at = attempt.finished_at
-        row.updated_at = now
         session.flush([row])
         return row
 
@@ -141,31 +142,29 @@ def record_condition(
         next_count = row.attempt_count + 1
         row.attempt_count = next_count
         if auto_block and next_count >= DEFAULT_BACKOFF_GIVE_UP_ATTEMPTS:
-            row.condition = CONDITION_BLOCKED
+            _set_condition(row, CONDITION_BLOCKED, now)
             row.reason = reason or "give-up"
             row.message = message
             row.next_eligible_at = None
             if not was_blocked:
                 _snapshot_blocked_components(session, row, attempt)
         else:
-            row.condition = CONDITION_BACKOFF
+            _set_condition(row, CONDITION_BACKOFF, now)
             row.reason = reason
             row.message = message
             row.next_eligible_at = next_eligible_at or _default_backoff_due(now, next_count)
         _set_blocked_tool(row, blocked_tool)
-        row.updated_at = now
         session.flush([row])
         return row
 
     if condition == CONDITION_BLOCKED:
-        row.condition = CONDITION_BLOCKED
+        _set_condition(row, CONDITION_BLOCKED, now)
         row.reason = reason
         row.message = message
         row.next_eligible_at = None
         _set_blocked_tool(row, blocked_tool)
         if not was_blocked:
             _snapshot_blocked_components(session, row, attempt)
-        row.updated_at = now
         session.flush([row])
         return row
 
@@ -182,15 +181,15 @@ def reopen_condition(
     """Reopen a blocked condition and make it immediately workable."""
 
     now = _utcnow()
-    old_reason = row.reason or "unspecified"
-    row.condition = CONDITION_OPEN
+    _set_condition(row, CONDITION_OPEN, now)
     row.reason = None
-    row.message = f"reopened by {actor} at {now.isoformat()} (was blocked: {old_reason}); {note}"
+    row.message = note
     row.blocked_tool_name = None
     row.blocked_tool_version = None
     row.attempt_count = 0
     row.next_eligible_at = now
-    row.updated_at = now
+    row.reopened_by = actor
+    row.reopened_at = now
     session.flush([row])
     return row
 
@@ -215,14 +214,25 @@ def _mark_satisfied(
     now: dt.datetime,
 ) -> None:
     row.observed_state = observed_state
-    row.condition = CONDITION_SATISFIED
+    _set_condition(row, CONDITION_SATISFIED, now)
     row.reason = None
     row.message = None
     row.attempt_count = 0
     row.next_eligible_at = None
     row.blocked_tool_name = None
     row.blocked_tool_version = None
-    row.updated_at = now
+
+
+def _set_condition(
+    row: ReconciliationCondition,
+    value: str,
+    now: dt.datetime,
+) -> None:
+    """Advance the condition clock only for a real value transition."""
+
+    if row.condition != value:
+        row.condition = value
+        row.condition_changed_at = now
 
 
 def _link_attempt(

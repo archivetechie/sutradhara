@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from sutradhara.catalog.media_identity import _copy_media_id
+
 
 def _tables(db_path: Path) -> set[str]:
     with sqlite3.connect(db_path) as conn:
@@ -99,14 +101,9 @@ def _assert_archive_invariants(db_path: Path) -> None:
         "logical_asset_hash",
         "member_path",
     ) in _unique_index_columns(db_path, "asset_locator")
-    assert (
-        "copy_id",
-        "root_path",
-    ) in _unique_index_columns(db_path, "blob_root")
     assert "ck_copy_asset_xor_bundle" in _table_sql(db_path, "copy")
     assert ("backend_id", "native_locator_key") in _unique_index_columns(db_path, "copy")
     assert _foreign_key_delete_actions(db_path, "asset_locator")[("pool_id", "pool")] == "RESTRICT"
-    assert _foreign_key_delete_actions(db_path, "blob_root")[("pool_id", "pool")] == "RESTRICT"
     assert (
         "bundle_member_id",
         "step_order",
@@ -223,7 +220,7 @@ def _assert_virtual_arrangement_invariants(db_path: Path) -> None:
     assert "va_member_id" in history_sql
     assert "logical_asset_hash" in history_sql
     assert "artifactclass" in history_sql
-    assert "ON DELETE SET NULL" in history_sql
+    assert "ON DELETE RESTRICT" in history_sql
 
     tag_sql = _table_sql(db_path, "asset_tag")
     assert "removed_at" in tag_sql
@@ -237,7 +234,8 @@ def _assert_virtual_arrangement_invariants(db_path: Path) -> None:
 def _assert_retention_invariants(db_path: Path) -> None:
     intake_sql = _table_sql(db_path, "intake")
     assert "retention_state" in intake_sql
-    assert "DEFAULT 'held'" in intake_sql
+    assert "DEFAULT 'not_applicable'" in intake_sql
+    assert "ck_intake_retention_ordering" in intake_sql
     assert "released_at" in intake_sql
     assert "staging_deleted_at" in intake_sql
     assert "release_policy_fingerprint" in intake_sql
@@ -269,6 +267,7 @@ def _assert_retention_invariants(db_path: Path) -> None:
     assert "ck_retention_event_action" in event_sql
     assert "ck_retention_event_subject" in event_sql
     assert "event_id" in event_sql
+    assert "occurred_at" in event_sql
     assert "subject_type" in event_sql
     assert "subject_id" in event_sql
     assert "operation_id" in event_sql
@@ -364,7 +363,7 @@ engine.dispose()
     assert "bundle" in tables
     assert "bundle_member" in tables
     assert "asset_locator" in tables
-    assert "blob_root" in tables
+    assert "blob_root" not in tables
     assert "exclusion_record" in tables
     assert "review_decision" in tables
     assert "staging_transform" in tables
@@ -417,7 +416,7 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     assert "bundle" in tables
     assert "bundle_member" in tables
     assert "asset_locator" in tables
-    assert "blob_root" in tables
+    assert "blob_root" not in tables
     assert "exclusion_record" in tables
     assert "review_decision" in tables
     assert "staging_transform" in tables
@@ -447,6 +446,210 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     _assert_retention_invariants(db_path)
     _assert_grpc_relay_invariants(db_path)
     _assert_hdcache_invariants(db_path)
+
+
+def test_media_identity_backfill_matches_registration_derivation_for_every_copy(
+    tmp_path: Path,
+) -> None:
+    """The migration and registration funnel derive identical copy identities."""
+
+    db_path = tmp_path / "media-identity-backfill.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "f2a3b4c5d6e7"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+
+    now = "2026-07-20 00:00:00"
+    fixtures = (
+        (1, "rem", "rem_tape", "tape", {"tape_uuid": "a" * 32}),
+        (2, "d2", "d2_tape", "d2tape", {"volume_uuid": "d2-volume"}),
+        (3, "disk", "plain_disk", "disk", {"path": "/archive/a"}),
+        (4, "cloud", "s3", "cloud", {"key": "archive/a"}),
+        (5, "memory", "memory", "memory", {"hash_hex": "e" * 64}),
+    )
+    with sqlite3.connect(db_path) as conn:
+        for backend_id, name, kind, family, locator in fixtures:
+            digest = bytes([backend_id]) * 32
+            conn.execute(
+                "INSERT INTO backend "
+                "(id, name, kind, implementation_family, config, tier, added_at) "
+                "VALUES (?, ?, ?, ?, '{}', 'self_describing', ?)",
+                (backend_id, name, kind, family, now),
+            )
+            conn.execute(
+                "INSERT INTO logical_asset "
+                "(content_sha256, size_bytes, first_seen_at, validity) "
+                "VALUES (?, 1, ?, 'unvalidated')",
+                (digest, now),
+            )
+            conn.execute(
+                "INSERT INTO copy "
+                "(id, logical_asset_hash, backend_id, native_locator, native_locator_key, "
+                "integrity_hash, health, first_observed_at, source, storage_metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'ok', ?, 'ingest', '{}')",
+                (
+                    backend_id,
+                    digest,
+                    backend_id,
+                    json.dumps(locator, sort_keys=True),
+                    f"locator-{backend_id}",
+                    digest,
+                    now,
+                ),
+            )
+        conn.commit()
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    with sqlite3.connect(db_path) as conn:
+        rows = list(
+            conn.execute(
+                "SELECT copy.backend_id, backend.implementation_family, "
+                "copy.native_locator, copy.media_id, copy.media_family "
+                "FROM copy JOIN backend ON backend.id = copy.backend_id ORDER BY copy.id"
+            )
+        )
+
+    assert len(rows) == len(fixtures)
+    for backend_id, family, raw_locator, media_id, media_family in rows:
+        expected = _copy_media_id(family, json.loads(raw_locator), backend_id)
+        assert (media_id, media_family) == (expected.media_id, expected.media_family)
+
+
+def test_attempt_snapshot_backfill_does_not_invent_already_lost_legacy_facts(
+    tmp_path: Path,
+) -> None:
+    """A pre-Wave-1 pruned attempt records unknown snapshots as null, not sentinels."""
+
+    db_path = tmp_path / "attempt-snapshot-backfill.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "f2a3b4c5d6e7"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+
+    now = "2026-07-20 00:00:00"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO job_attempt "
+            "(job_id, job_kind, attempt_number, outcome, started_at, finished_at, "
+            "granted_leases, detail, created_at) "
+            "VALUES (NULL, 'verify', 1, 'succeeded', ?, ?, '{}', '{}', ?)",
+            (now, now, now),
+        )
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        snapshot = conn.execute(
+            "SELECT subject_job_id, params_snapshot FROM job_attempt"
+        ).fetchone()
+    assert snapshot == (None, None)
+
+
+def test_ingest_typed_path_promotion_round_trips_legacy_json_without_loss(
+    tmp_path: Path,
+) -> None:
+    """Up/down/up preserves typed paths while removing aliases at Wave 1 head."""
+
+    db_path = tmp_path / "typed-path-roundtrip.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "f2a3b4c5d6e7"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+
+    now = "2026-07-20 00:00:00"
+    digest = b"p" * 32
+    legacy_metadata = {
+        "camera": "A",
+        "source_path": "/landing/card/A.mov",
+        "pfr_sidecar_path": "/landing/card/A.mov.pfr.json",
+        "sha256": digest.hex(),
+    }
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO logical_asset "
+            "(content_sha256, size_bytes, first_seen_at, validity) "
+            "VALUES (?, 1, ?, 'unvalidated')",
+            (digest, now),
+        )
+        conn.execute(
+            "INSERT INTO intake "
+            "(intake_id, operator, source_kind, artifactclass, status, created_at, "
+            "updated_at, retention_state) "
+            "VALUES ('typed-paths', 'operator', 'card', 'masters', 'verifying', ?, ?, 'held')",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO ingest_item "
+            "(intake_id, logical_asset_hash, as_received_path, virtual_path, size_bytes, "
+            "artifactclass, disposition, metadata, created_at) "
+            "VALUES ('typed-paths', ?, 'A.mov', 'A.mov', 1, 'masters', "
+            "'legacy_unknown', ?, ?)",
+            (digest, json.dumps(legacy_metadata), now),
+        )
+
+    def migrate(revision: str) -> None:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "alembic",
+                "upgrade" if revision == "head" else "downgrade",
+                revision,
+            ],
+            cwd=repo_root,
+            env=env,
+            check=True,
+        )
+
+    migrate("head")
+    with sqlite3.connect(db_path) as conn:
+        source_path, sidecar_path, raw_metadata = conn.execute(
+            "SELECT source_path, pfr_sidecar_path, metadata FROM ingest_item"
+        ).fetchone()
+    assert source_path == legacy_metadata["source_path"]
+    assert sidecar_path == legacy_metadata["pfr_sidecar_path"]
+    assert json.loads(raw_metadata) == {"camera": "A"}
+
+    migrate("f2a3b4c5d6e7")
+    with sqlite3.connect(db_path) as conn:
+        downgraded = json.loads(conn.execute("SELECT metadata FROM ingest_item").fetchone()[0])
+    assert downgraded == legacy_metadata
+
+    migrate("head")
+    with sqlite3.connect(db_path) as conn:
+        source_path, sidecar_path, raw_metadata = conn.execute(
+            "SELECT source_path, pfr_sidecar_path, metadata FROM ingest_item"
+        ).fetchone()
+    assert (source_path, sidecar_path, json.loads(raw_metadata)) == (
+        legacy_metadata["source_path"],
+        legacy_metadata["pfr_sidecar_path"],
+        {"camera": "A"},
+    )
 
 
 def test_deletion_evidence_migration_recreates_raw_sql_health_trigger(
@@ -566,7 +769,7 @@ def test_retention_event_subject_constraint_rejects_raw_sql_mispairing(
         for intake_id, subject_type, subject_id, action, operation_id in valid_rows:
             conn.execute(
                 "INSERT INTO retention_event "
-                "(intake_id, subject_type, subject_id, action, operation_id, actor, at) "
+                "(intake_id, subject_type, subject_id, action, operation_id, actor, occurred_at) "
                 "VALUES (?, ?, ?, ?, ?, 'ops', ?)",
                 (intake_id, subject_type, subject_id, action, operation_id, now),
             )
@@ -593,7 +796,7 @@ def test_retention_event_subject_constraint_rejects_raw_sql_mispairing(
             with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
                 conn.execute(
                     "INSERT INTO retention_event "
-                    "(intake_id, subject_type, subject_id, action, operation_id, actor, at) "
+                    "(intake_id, subject_type, subject_id, action, operation_id, actor, occurred_at) "
                     "VALUES (?, ?, ?, ?, ?, 'ops', ?)",
                     (*row, now),
                 )
@@ -709,7 +912,7 @@ def test_deletion_evidence_downgrade_exports_and_transforms_used_database(
             intake_id = "used-abandoned" if action == "abandoned" else "used-tombstoned"
             conn.execute(
                 "INSERT INTO retention_event "
-                "(intake_id, subject_type, subject_id, action, operation_id, actor, at) "
+                "(intake_id, subject_type, subject_id, action, operation_id, actor, occurred_at) "
                 "VALUES (?, 'intake', ?, ?, ?, 'ops', ?)",
                 (intake_id, intake_id, action, f"used:{action}", now),
             )
@@ -719,7 +922,7 @@ def test_deletion_evidence_downgrade_exports_and_transforms_used_database(
         # collapses to the single legacy row.
         conn.execute(
             "INSERT INTO retention_event "
-            "(intake_id, subject_type, subject_id, action, operation_id, actor, at) "
+            "(intake_id, subject_type, subject_id, action, operation_id, actor, occurred_at) "
             "VALUES ('used-tombstoned', 'intake', 'used-tombstoned', "
             "'staging_deleted', 'used:staging_tombstoned', 'ops', ?)",
             (now,),
@@ -727,13 +930,13 @@ def test_deletion_evidence_downgrade_exports_and_transforms_used_database(
         for action in batch_actions:
             conn.execute(
                 "INSERT INTO retention_event "
-                "(subject_type, subject_id, action, operation_id, actor, at) "
+                "(subject_type, subject_id, action, operation_id, actor, occurred_at) "
                 "VALUES ('batch', 'batch:used', ?, ?, 'ops', ?)",
                 (action, f"used:{action}", now),
             )
         conn.execute(
             "INSERT INTO retention_event "
-            "(subject_type, subject_id, action, operation_id, actor, at) VALUES "
+            "(subject_type, subject_id, action, operation_id, actor, occurred_at) VALUES "
             "('media', 'tape:used', 'offsite_confirmed', 'used:offsite_confirmed', "
             "'ops', ?)",
             (now,),
@@ -754,15 +957,16 @@ def test_deletion_evidence_downgrade_exports_and_transforms_used_database(
             "INSERT INTO copy "
             "(id, logical_asset_hash, backend_id, native_locator, native_locator_key, "
             "integrity_hash, health, last_checked_at, first_observed_at, source, "
-            "storage_metadata, last_measured_digest, last_measured_at) VALUES "
+            "storage_metadata, last_measured_digest, last_measured_at, media_id, "
+            "media_family) VALUES "
             "(1, ?, 1, '{\"object\":\"used\"}', 'used-object', ?, 'ok', ?, ?, "
-            "'ingest', '{}', ?, ?)",
+            "'ingest', '{}', ?, ?, 'memory:backend:1', 'memory')",
             (digest, digest, now, now, digest, now),
         )
         conn.execute(
             "INSERT INTO verify_receipt "
             "(copy_id, backend_id, expected_digest, measured_digest, backend_ok, source, "
-            "execution_id, producer_process, actor, at) VALUES "
+            "execution_id, producer_process, actor, recorded_at) VALUES "
             "(1, 1, ?, ?, 1, 'restore', 'used-restore-request', 'used-host:1', 'ops', ?)",
             (digest, digest, now),
         )
@@ -861,26 +1065,27 @@ def test_retention_journal_downgrade_exports_and_removes_used_receipt_correction
         conn.execute(
             "INSERT INTO copy "
             "(id, logical_asset_hash, backend_id, native_locator, native_locator_key, "
-            "integrity_hash, health, first_observed_at, source, storage_metadata) VALUES "
+            "integrity_hash, health, first_observed_at, source, storage_metadata, media_id, "
+            "media_family) VALUES "
             "(1, ?, 1, '{\"object\":\"correction\"}', 'correction-object', ?, 'ok', ?, "
-            "'ingest', '{}')",
+            "'ingest', '{}', 'memory:backend:1', 'memory')",
             (digest, digest, now),
         )
         conn.execute(
             "INSERT INTO verify_receipt "
             "(event_id, copy_id, backend_id, expected_digest, measured_digest, backend_ok, "
-            "source, execution_id, producer_process, actor, at) VALUES "
+            "source, execution_id, producer_process, actor, recorded_at) VALUES "
             "(1, 1, 1, ?, ?, 1, 'verify-job', 'used-correction-verify', 'host:1', "
             "'ops', ?)",
             (digest, digest, now),
         )
         conn.execute(
             "INSERT INTO retention_event "
-            "(subject_type, subject_id, action, operation_id, actor, at, detail, "
+            "(subject_type, subject_id, action, operation_id, actor, occurred_at, detail, "
             "supersedes_source, supersedes_event_id) VALUES "
             "('receipt', 'verify_receipt:1', 'correction_recorded', "
             "'journal-correction:verify_receipt:1:used', 'ops', ?, "
-            "'{\"kind\":\"receipt-supersession\",\"reason\":\"wrong read\"}', "
+            '\'{"kind":"receipt-supersession","reason":"wrong read"}\', '
             "'verify_receipt', 1)",
             (now,),
         )
@@ -970,7 +1175,7 @@ def test_retention_journal_upgrade_backfills_confirmation_receipts_and_targets(
             "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
             "('media', 'legacy:revoked', 'correction_recorded', "
             "'offsite-revoke:legacy:revoked:prompt-1', 'revoking-operator', ?, "
-            "'{\"kind\":\"offsite-revocation\",\"reason\":\"wrong shipment\"}')",
+            '\'{"kind":"offsite-revocation","reason":"wrong shipment"}\')',
             (revoked_at,),
         )
         conn.commit()
@@ -1417,7 +1622,7 @@ def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
             "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
             "('media', 'legacy:two-cycle', 'correction_recorded', "
             "'offsite-revoke:two-cycle:c1', 'cycle1-revoker', ?, "
-            "'{\"kind\":\"offsite-revocation\",\"reason\":\"wrong tape\"}')",
+            '\'{"kind":"offsite-revocation","reason":"wrong tape"}\')',
             (cycle1_revoked_at,),
         )
         # E2: cycle-2 re-confirmation receipt.
@@ -1426,7 +1631,7 @@ def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
             "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
             "('media', 'legacy:two-cycle', 'offsite_confirmed', "
             "'offsite-confirm:two-cycle:c2', 'cycle2-operator', ?, "
-            "'{\"shipment_id\":\"shipment-2\",\"confirmed_by\":\"cycle2-operator\"}')",
+            '\'{"shipment_id":"shipment-2","confirmed_by":"cycle2-operator"}\')',
             (cycle2_confirmed_at,),
         )
         # E3: cycle-2 revocation correction.
@@ -1435,7 +1640,7 @@ def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
             "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
             "('media', 'legacy:two-cycle', 'correction_recorded', "
             "'offsite-revoke:two-cycle:c2', 'cycle2-revoker', ?, "
-            "'{\"kind\":\"offsite-revocation\",\"reason\":\"failed audit\"}')",
+            '\'{"kind":"offsite-revocation","reason":"failed audit"}\')',
             (cycle2_revoked_at,),
         )
         conn.commit()
@@ -1463,6 +1668,4 @@ def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
     assert set(receipts) == {lead_op, "offsite-confirm:two-cycle:c2"}
     # Each correction targets its OWN cycle's receipt, by correction identity.
     assert corrections["offsite-revoke:two-cycle:c1"] == receipts[lead_op]
-    assert corrections["offsite-revoke:two-cycle:c2"] == (
-        receipts["offsite-confirm:two-cycle:c2"]
-    )
+    assert corrections["offsite-revoke:two-cycle:c2"] == (receipts["offsite-confirm:two-cycle:c2"])

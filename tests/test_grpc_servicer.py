@@ -14,7 +14,7 @@ from sqlalchemy import Engine, select
 
 from sutradhara._proto import intake_pb2
 from sutradhara.api import store as api_store
-from sutradhara.catalog.models import Intake
+from sutradhara.catalog.models import ArtifactClass, Intake
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.grpc import store
 from sutradhara.grpc.assembly import manifest_digest
@@ -28,6 +28,10 @@ from sutradhara.intake_watch import process_landing_once
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add_all(
+            [ArtifactClass(name="video-master"), ArtifactClass(name="other-class")]
+        )
     yield eng
     eng.dispose()
 

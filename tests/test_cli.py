@@ -77,6 +77,23 @@ def _run(args: list[str], expect_exit: int = 0) -> Any:
     return result
 
 
+def _install_artifactclass_policy_record(artifactclass: str) -> None:
+    """Model the policy-administration step required before catalog writes."""
+
+    with session_scope(make_engine()) as session:
+        if session.get(ArtifactClassPolicyRecord, artifactclass) is None:
+            session.add(
+                ArtifactClassPolicyRecord(
+                    artifactclass=artifactclass,
+                    ruleset=f"test.{artifactclass}.v1",
+                    expect="compliant",
+                    target_bytes=0,
+                    max_age_seconds=0,
+                    restore_preference=[],
+                )
+            )
+
+
 def test_version(cli_env: dict[str, str]) -> None:
     result = _run(["--version"])
     assert "0.0.1" in result.output
@@ -195,6 +212,7 @@ def test_intake_register_and_accept_cli_publish_markers_post_commit(
     tmp_path: Path,
 ) -> None:
     _run(["db", "init"])
+    _install_artifactclass_policy_record("video-master")
     source = tmp_path / "source"
     source.mkdir()
     (source / "clip.mov").write_bytes(b"video")
@@ -237,6 +255,7 @@ def test_intake_watch_cli_once_registers_prepares_and_surfaces_quarantine(
     tmp_path: Path,
 ) -> None:
     _run(["db", "init"])
+    _install_artifactclass_policy_record("video-master")
     source = tmp_path / "watch-source"
     source.mkdir()
     (source / "clip.mov").write_bytes(b"video")
@@ -508,6 +527,7 @@ def test_top_level_review_shows_and_records_held_bundle(
     cli_env: dict[str, str],
 ) -> None:
     _run(["db", "init"])
+    _install_artifactclass_policy_record("o-archive")
     engine = make_engine()
     with session_scope(engine) as session:
         session.add(
@@ -846,6 +866,7 @@ def _seed_registered_intake(
     relpath: str,
     payload: bytes,
 ) -> None:
+    _install_artifactclass_policy_record("s-masters")
     source = tmp_path / intake_id / "data" / relpath
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(payload)
@@ -880,6 +901,7 @@ def _seed_registered_intake(
                 st_ino=stat_result.st_ino,
                 size_bytes=len(payload),
                 artifactclass="s-masters",
-                item_metadata={"source_path": str(source)},
+                source_path=str(source),
+                item_metadata={},
             )
         )

@@ -342,6 +342,7 @@ def register_intake(
         _register_payload_record(session, intake, ctx.payload_root, record)
     intake.manifest_digest = validated.manifest_digest
     intake.status = IntakeStatus.REGISTERED
+    intake.retention_state = RetentionState.HELD
     intake.registered_at = _utcnow()
     intake.quarantined_at = None
     intake.updated_at = intake.registered_at
@@ -806,6 +807,7 @@ def _upsert_intake(
             label=_optional_str(metadata.get("label")),
             manifest_path=str(manifest_path) if manifest_path else None,
             status=status,
+            retention_state=RetentionState.NOT_APPLICABLE,
             created_at=now,
             updated_at=now,
         )
@@ -818,6 +820,8 @@ def _upsert_intake(
         intake.label = _optional_str(metadata.get("label"))
         intake.manifest_path = str(manifest_path) if manifest_path else None
         intake.status = status
+        if status != IntakeStatus.REGISTERED:
+            intake.retention_state = RetentionState.NOT_APPLICABLE
         intake.updated_at = now
     if status == IntakeStatus.QUARANTINED:
         intake.quarantined_at = now
@@ -888,9 +892,7 @@ def _register_payload_record(
     if asset.media_kind is None:
         asset.media_kind = media_kind_for_path(as_received_path)
     metadata = {
-        "source_path": str(record.source_path),
         "payload_root": str(payload_root),
-        "sha256": record.sha256_hex,
         "stored_member_path": stored_member_path,
     }
     if record.logical_relpath is not None:
@@ -922,6 +924,7 @@ def _register_payload_record(
             disposition_policy_generation=policy_generation,
             disposition_evidence=evidence,
             prior_intake_id=None if prior_intake is None else prior_intake.intake_id,
+            source_path=str(record.source_path),
             item_metadata=metadata,
         )
         session.add(item)
@@ -932,6 +935,7 @@ def _register_payload_record(
         item.st_ino = record.st_ino
         item.size_bytes = record.size_bytes
         item.artifactclass = intake.artifactclass
+        item.source_path = str(record.source_path)
         item.item_metadata = {**(item.item_metadata or {}), **metadata}
     return item
 

@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import Engine, func, select
 
 import sutradhara.intake as intake_module
-from sutradhara.catalog.models import IngestItem, Intake, LogicalAsset
+from sutradhara.catalog.models import ArtifactClass, IngestItem, Intake, LogicalAsset
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.intake import (
@@ -39,6 +39,10 @@ from sutradhara_receive import (
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add_all(
+            ArtifactClass(name=name) for name in ("camera-original", "other-class", "video-master")
+        )
     yield eng
     eng.dispose()
 
@@ -171,9 +175,9 @@ def test_register_receive_package_registers_one_logical_item(
         assert item.item_metadata["package_index_path"] == str(
             result.intake_dir / PACKAGE_INDEX_NAME
         )
-        assert item.item_metadata["source_path"] == str(
-            result.intake_dir / "data" / "A001.fcpbundle.tar"
-        )
+        assert item.source_path == str(result.intake_dir / "data" / "A001.fcpbundle.tar")
+        assert "source_path" not in item.item_metadata
+        assert "sha256" not in item.item_metadata
         assert asset.media_info is not None
         assert asset.media_info["path"] == "A001.fcpbundle"
         assert asset.media_info["stored_member_path"] == "A001.fcpbundle.tar"

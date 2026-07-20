@@ -19,6 +19,7 @@ import sutradhara.jobs.handlers as _handlers  # noqa: F401
 import sutradhara.jobs.reconcilers.hdcache as _hdcache_reconciler
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.catalog.models import (
+    ArtifactClass,
     ArtifactClassPolicyRecord,
     ArtifactClassPool,
     AssetLocator,
@@ -78,6 +79,18 @@ TEST_HDCACHE_HMAC_SECRET = b"hdcache-fill-test-secret"
 def engine(tmp_path: Path) -> Iterator[Engine]:
     eng = make_engine(f"sqlite:///{tmp_path / 'hdcache-fill.db'}")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add_all(
+            ArtifactClass(name=name)
+            for name in (
+                "private",
+                "private-timeout",
+                "race",
+                "raise",
+                "retired",
+                "s-masters",
+            )
+        )
     yield eng
     eng.dispose()
 
@@ -141,15 +154,9 @@ def test_hdcache_fill_handler_attempt_records_d2_tape_fallback(
             artifactclass="s-masters",
             source_path=tmp_path / "purged.mov",
             memory=memory,
+            backend_kind=BackendKind.D2_TAPE,
+            copy_locator_extra={"barcode": barcode, "volume_uuid": barcode},
         )
-        copy = session.scalars(select(Copy).where(Copy.bundle_id == target.bundle_key)).one()
-        copy.backend.kind = BackendKind.D2_TAPE
-        copy.native_locator = {
-            **copy.native_locator,
-            "barcode": barcode,
-            "volume_uuid": "d2-volume-1",
-        }
-        copy.native_locator_key = locator_key(copy.native_locator)
         monkeypatch.setattr(fill_module, "backend_from_row", lambda _row: memory)
         monkeypatch.setattr(hdcache_fill_handler, "fill_config_from_env", lambda: config)
         record_observation(
@@ -166,7 +173,7 @@ def test_hdcache_fill_handler_attempt_records_d2_tape_fallback(
 
         assert result.ok, result.detail
         attempt = session.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
-        assert f"tape:{barcode}" in attempt.detail["components"]
+        assert f"tape:d2tape:{barcode}" in attempt.detail["components"]
 
 
 def test_hdcache_aead_fill_records_hdcache_epoch_and_stored_digest(
@@ -976,6 +983,8 @@ def _seed_archived_asset(
     source_path: Path | None = None,
     memory: MemoryBackend | None = None,
     hdcache_config: dict[str, object] | None = None,
+    backend_kind: BackendKind = BackendKind.MEMORY,
+    copy_locator_extra: dict[str, object] | None = None,
 ) -> HdcacheFillTarget:
     digest = hashlib.sha256(data).digest()
     source_text = None if source_path is None else str(source_path)
@@ -984,7 +993,7 @@ def _seed_archived_asset(
     if backend is None:
         backend = Backend(
             name="mem",
-            kind=BackendKind.MEMORY,
+            kind=backend_kind,
             tier=BackendTier.SELF_DESCRIBING,
         )
         session.add(backend)
@@ -1052,12 +1061,13 @@ def _seed_archived_asset(
     )
     if memory is not None:
         memory.add(data)
+    copy_locator = {"hash_hex": digest.hex(), **(copy_locator_extra or {})}
     copy = Copy(
         bundle_id=bundle_id,
         backend_id=backend.id,
         pool_id="mem-pool",
-        native_locator={"hash_hex": digest.hex()},
-        native_locator_key=f'{{"hash_hex":"{digest.hex()}"}}',
+        native_locator=copy_locator,
+        native_locator_key=locator_key(copy_locator),
         storage_metadata={"representation": Representation.RAW_BYTES.value},
         integrity_hash=digest,
         health=CopyHealth.OK,
@@ -1072,7 +1082,6 @@ def _seed_archived_asset(
             copy_id=copy.id,
             bundle_id=bundle_id,
             native_locator={
-                "member_path": f"{digest.hex()}.mov",
                 "offset": 0,
                 "size_bytes": len(data),
             },

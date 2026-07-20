@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -25,6 +26,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sutradhara.catalog.models import Base
+from sutradhara.schema_conventions import vocabulary_check_sql
 
 
 def _utcnow() -> dt.datetime:
@@ -50,6 +52,12 @@ class Job(Base):
     """One unit of work tracked by the job engine."""
 
     __tablename__ = "job"
+    __table_args__ = (
+        CheckConstraint(
+            vocabulary_check_sql("status", "job_status"),
+            name="ck_job_status",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
@@ -108,6 +116,12 @@ class JobAttempt(Base):
     """
 
     __tablename__ = "job_attempt"
+    __table_args__ = (
+        CheckConstraint(
+            vocabulary_check_sql("outcome", "job_attempt_outcome"),
+            name="ck_job_attempt_outcome",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int | None] = mapped_column(
@@ -117,6 +131,10 @@ class JobAttempt(Base):
         index=True,
     )
     job_kind: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    subject_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    subject_domain: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    subject_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    params_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     outcome: Mapped[JobStatus] = mapped_column(String(16), nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -151,6 +169,14 @@ class ReconciliationCondition(Base):
 
     __tablename__ = "reconciliation_condition"
     __table_args__ = (
+        CheckConstraint(
+            vocabulary_check_sql("observed_state", "observed_state"),
+            name="ck_reconciliation_condition_observed_state",
+        ),
+        CheckConstraint(
+            vocabulary_check_sql("condition", "derivation_condition"),
+            name="ck_reconciliation_condition_condition",
+        ),
         UniqueConstraint("domain", "target_key", name="uq_recon_condition_domain_target"),
     )
 
@@ -178,8 +204,16 @@ class ReconciliationCondition(Base):
     last_success_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    updated_at: Mapped[dt.datetime] = mapped_column(
+    observed_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    condition_changed_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    reopened_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    reopened_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
     def __repr__(self) -> str:

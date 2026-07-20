@@ -2,7 +2,7 @@
 
 This module owns the sutradhara-side accumulator state: an open bundle per
 artifactclass, its pending member set, flush thresholds copied from the applied
-artifactclass policy, per-copy asset locators, blob-root pointers, exclusion
+artifactclass policy, per-copy asset locators, exclusion
 records, and held-bundle review decisions.
 """
 
@@ -21,7 +21,6 @@ from sqlalchemy.orm import Session
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     AssetLocator,
-    BlobRoot,
     Bundle,
     BundleMember,
     Copy,
@@ -72,6 +71,10 @@ def get_or_create_open_bundle(
     now: dt.datetime | None = None,
 ) -> tuple[Bundle, bool]:
     """Return the durable open accumulator for an artifactclass."""
+    if policy.artifactclass != artifactclass:
+        raise ArchiveBundleError(
+            f"policy for {policy.artifactclass!r} cannot create bundle for {artifactclass!r}"
+        )
     existing = session.scalars(
         select(Bundle)
         .where(
@@ -247,7 +250,7 @@ def record_asset_locator(
     representation: str,
     copy_id: int,
     bundle_id: str,
-    member_path: str | None = None,
+    member_path: str,
 ) -> AssetLocator:
     """Record a concrete per-copy locator for an asset in a bundle."""
     _require_asset(session, logical_asset_hash)
@@ -256,14 +259,29 @@ def record_asset_locator(
     copy = session.get(Copy, copy_id)
     if copy is None:
         raise UnknownBundleCopy(f"no Copy with id={copy_id}")
-    resolved_member_path = member_path or native_locator.get("member_path")
-    if not isinstance(resolved_member_path, str) or not resolved_member_path:
+    if (copy.pool_id, copy.bundle_id) != (pool_id, bundle_id):
+        raise AssetLocatorError(
+            f"copy id={copy_id} belongs to pool/bundle "
+            f"{copy.pool_id!r}/{copy.bundle_id!r}, not {pool_id!r}/{bundle_id!r}"
+        )
+    if not member_path:
         raise AssetLocatorError("asset locator requires a non-empty member_path")
+    member = session.scalars(
+        select(BundleMember).where(
+            BundleMember.bundle_id == bundle_id,
+            BundleMember.logical_asset_hash == logical_asset_hash,
+            BundleMember.member_path == member_path,
+        )
+    ).one_or_none()
+    if member is None:
+        raise AssetLocatorError("asset locator does not identify a registered bundle member")
+    typed_locator = dict(native_locator)
+    typed_locator.pop("member_path", None)
     locator = AssetLocator(
         logical_asset_hash=logical_asset_hash,
         pool_id=pool_id,
-        native_locator=native_locator,
-        member_path=resolved_member_path,
+        native_locator=typed_locator,
+        member_path=member_path,
         representation=representation,
         copy_id=copy_id,
         bundle_id=bundle_id,
@@ -271,36 +289,6 @@ def record_asset_locator(
     session.add(locator)
     session.flush()
     return locator
-
-
-def record_blob_root(
-    session: Session,
-    *,
-    bundle_id: str,
-    copy_id: int,
-    pool_id: str,
-    root_path: str,
-    native_locator: dict[str, Any],
-    archive_id: str | None = None,
-) -> BlobRoot:
-    """Record a coarse blob-root pointer for single-file restore from blobs."""
-    if session.get(Bundle, bundle_id) is None:
-        raise BundleStateError(f"no Bundle with id {bundle_id!r}")
-    if session.get(Copy, copy_id) is None:
-        raise UnknownBundleCopy(f"no Copy with id={copy_id}")
-    if session.get(Pool, pool_id) is None:
-        raise UnknownBundlePool(f"no Pool with id {pool_id!r}")
-    root = BlobRoot(
-        bundle_id=bundle_id,
-        copy_id=copy_id,
-        pool_id=pool_id,
-        root_path=root_path,
-        native_locator=native_locator,
-        archive_id=archive_id,
-    )
-    session.add(root)
-    session.flush()
-    return root
 
 
 def record_staging_transform(

@@ -194,6 +194,7 @@ class HdcacheFillResult:
     key_epoch: str | None
     stored_digest: bytes | None
     source: str
+    source_copy_id: int | None = None
     already_present: bool = False
 
 
@@ -668,12 +669,14 @@ def fill_target(
                     sealer=sealer,
                 )
                 source_kind = source.kind
+                source_copy_id = source.copy_id
             finalized = _finalize_filling_entry(
                 session,
                 target,
                 reservation=reservation,
                 write_result=write_result,
                 source_kind=source_kind,
+                source_copy_id=source_copy_id,
                 key_registry=registry,
                 config=final_config,
             )
@@ -705,6 +708,7 @@ def fill_target_from_plaintext(
     *,
     source_path: Path,
     source_kind: str,
+    source_copy_id: int | None = None,
     config: HdcacheFillConfig | None = None,
     key_registry: KeyRegistry | None = None,
     sealer: RaoCliSealer | None = None,
@@ -796,6 +800,7 @@ def fill_target_from_plaintext(
                 reservation=reservation,
                 write_result=write_result,
                 source_kind=source_kind,
+                source_copy_id=source_copy_id,
                 key_registry=registry,
                 config=final_config,
             )
@@ -886,6 +891,7 @@ def _finalize_filling_entry(
     reservation: _FillReservation,
     write_result: EntryWriteResult,
     source_kind: str,
+    source_copy_id: int | None,
     key_registry: KeyRegistry,
     config: HdcacheFillConfig,
 ) -> HdcacheFillResult | None:
@@ -955,6 +961,7 @@ def _finalize_filling_entry(
         key_epoch=entry.key_epoch,
         stored_digest=entry.stored_digest,
         source=source_kind,
+        source_copy_id=source_copy_id,
     )
 
 
@@ -1286,6 +1293,7 @@ def _usable_existing_disk(session: Session, entry: CacheEntry | None) -> str | N
 class _PlaintextSource:
     path: Path
     kind: str
+    copy_id: int | None = None
 
 
 @contextlib.contextmanager
@@ -1316,7 +1324,7 @@ def _plaintext_source(
                 f"no restore backend is available for {target.sha_hex}",
             )
         try:
-            restore_asset(
+            restore_result = restore_asset(
                 session,
                 asset_hash=target.content_sha256,
                 artifactclass=target.artifactclass,
@@ -1330,7 +1338,7 @@ def _plaintext_source(
                 "restore-integrity",
                 f"restore fallback produced wrong digest for {target.sha_hex}",
             )
-        yield _PlaintextSource(restored, "restore")
+        yield _PlaintextSource(restored, "restore", restore_result.copy_id)
 
 
 def _write_source_to_disk(

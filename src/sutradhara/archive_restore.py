@@ -43,7 +43,6 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
 from sutradhara.durability import locator_artifactclass_filter
-from sutradhara.jobs.runtime_observations import report_tape_locator
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry
 from sutradhara.resource_control import run_managed
 from sutradhara.restore import (
@@ -219,12 +218,6 @@ class RestorePlan:
 
         if member not in self._members:
             raise ValueError("planned member does not belong to this restore plan")
-        backend_config = member.copy.backend.config or {}
-        library = backend_config.get("library_uuid")
-        report_tape_locator(
-            member.copy.native_locator,
-            library=library if isinstance(library, (bytes, str)) else None,
-        )
         with self._open_stored_stream(member) as stored_chunks:
             identity_is_logical = not any(item.reversible for item in member.transforms) and (
                 member.expected_stored_sha256 == member.asset_hash
@@ -1832,7 +1825,7 @@ def _extract_rao_materialized_member_to_path(
     rem_bin: str | Path,
     keys: KeyRegistry,
 ) -> None:
-    member_path = _member_path(locator.native_locator)
+    member_path = locator.member_path
     size = _size_bytes(locator.native_locator)
     with tempfile.TemporaryDirectory(prefix="sutradhara-rem-member-") as raw:
         dest_dir = Path(raw) / "out"
@@ -1869,13 +1862,6 @@ def _extract_rao_materialized_member_to_path(
         else:
             raise ArchiveRestoreError(f"unsupported RAO representation {representation.value!r}")
         _copy_restored_member(dest_dir, member_path, destination)
-
-
-def _member_path(locator: dict[str, Any]) -> str:
-    value = locator.get("member_path")
-    if not isinstance(value, str) or not value:
-        raise ArchiveRestoreError("asset locator is missing member_path")
-    return value
 
 
 def member_byte_base(locator: dict[str, Any] | Mapping[str, Any]) -> int:

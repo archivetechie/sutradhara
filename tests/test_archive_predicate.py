@@ -16,6 +16,7 @@ from sutradhara.archive_predicate import (
 )
 from sutradhara.catalog.models import (
     Arrangement,
+    ArtifactClass,
     Bundle,
     BundleMember,
     IngestItem,
@@ -49,6 +50,7 @@ def test_audit_reports_partial_retention_passed_intakes_without_mutating(tmp_pat
     missing_hash = _digest("missing")
     now = dt.datetime(2026, 7, 11, 9, 0, tzinfo=dt.UTC)
     with session_scope(engine) as session:
+        session.add(ArtifactClass(name="s-masters"))
         for digest in (archived_hash, missing_hash):
             session.add(LogicalAsset(content_sha256=digest, size_bytes=10))
         intake = Intake(
@@ -157,6 +159,7 @@ def test_audit_catches_released_partial_from_cross_intake_submission_evidence(tm
     missing_hash = _digest("cross-intake-missing")
     now = dt.datetime(2026, 7, 11, 9, 0, tzinfo=dt.UTC)
     with session_scope(engine) as session:
+        session.add(ArtifactClass(name="s-masters"))
         for digest in (shared_hash, missing_hash):
             session.add(LogicalAsset(content_sha256=digest, size_bytes=10))
         victim = Intake(
@@ -285,6 +288,10 @@ def test_all_predicate_uses_indexes_in_one_query_at_pilot_scale(tmp_path) -> Non
     archived_hash = _digest("pilot-archived")
     missing_hash = _digest("pilot-missing")
     with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO artifactclass (name, created_at) VALUES "
+            "('s-masters', CURRENT_TIMESTAMP)"
+        )
         connection.exec_driver_sql(
             "INSERT INTO logical_asset "
             "(content_sha256, size_bytes, first_seen_at, validity) VALUES "

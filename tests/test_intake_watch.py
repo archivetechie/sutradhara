@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine
 
-from sutradhara.catalog.models import Intake
+from sutradhara.catalog.models import ArtifactClass, Intake
 from sutradhara.catalog.session import create_all, make_engine, make_session_factory, session_scope
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.intake import register_intake
@@ -23,6 +23,8 @@ from sutradhara_receive import receive_source
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add(ArtifactClass(name="video-master"))
     yield eng
     eng.dispose()
 

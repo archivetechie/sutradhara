@@ -61,7 +61,6 @@ def record_derivation(
         )
     ).one_or_none()
     metadata = {
-        "source_path": str(output_path),
         "generated_by": generated_by,
         "source_item_id": source_item.id,
         "kind": kind,
@@ -76,6 +75,7 @@ def record_derivation(
             st_ino=getattr(stat, "st_ino", None),
             size_bytes=stat.st_size,
             artifactclass=artifactclass,
+            source_path=str(output_path),
             item_metadata=metadata,
         )
         session.add(item)
@@ -86,6 +86,7 @@ def record_derivation(
         item.st_ino = getattr(stat, "st_ino", None)
         item.size_bytes = stat.st_size
         item.artifactclass = artifactclass
+        item.source_path = str(output_path)
         item.item_metadata = {**(item.item_metadata or {}), **metadata}
 
     edge = session.scalars(
@@ -113,18 +114,16 @@ def record_index(
     item: IngestItem,
     index_kind: str,
     sidecar_path: Path,
-    metadata_key: str = "pfr_sidecar_path",
 ) -> None:
     """Record a sidecar index pointer for an ingest item without creating a Copy.
 
-    ``index_kind`` is part of the domain fact contract. P0.1 preserves the
-    existing v1 metadata shape, so the kind is validated here but not yet
-    persisted; P4.1's typed sidecar/index representation should record it.
+    ``index_kind`` is part of the domain fact contract. The sidecar path is a
+    promoted typed fact and is never duplicated into occurrence metadata.
     """
 
     if not index_kind:
         raise ValueError("index_kind must be non-empty")
-    item.item_metadata = {**(item.item_metadata or {}), metadata_key: str(sidecar_path)}
+    item.pfr_sidecar_path = str(sidecar_path)
 
 
 def record_validity(

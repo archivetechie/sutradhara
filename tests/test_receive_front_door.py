@@ -18,7 +18,7 @@ import pytest
 from click.testing import CliRunner
 from sqlalchemy import Engine, func, select
 
-from sutradhara.catalog.models import IngestItem
+from sutradhara.catalog.models import ArtifactClassPolicyRecord, IngestItem
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import IntakeStatus
 from sutradhara.cli.main import cli
@@ -58,6 +58,24 @@ from sutradhara_receive.cli import main as receive_cli_main
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add_all(
+            [
+                ArtifactClassPolicyRecord(
+                    artifactclass=artifactclass,
+                    ruleset="rules",
+                    expect="messy",
+                    target_bytes=1,
+                    max_age_seconds=60,
+                    restore_preference=[],
+                    min_copies=1,
+                    min_impl_families=1,
+                    staging_config={},
+                    hdcache_config={},
+                )
+                for artifactclass in ("default", "camera-original")
+            ]
+        )
     yield eng
     eng.dispose()
 

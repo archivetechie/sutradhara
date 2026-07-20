@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session
 
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset, Pool
+from sutradhara.catalog.models import ArtifactClass, Backend, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.placement import (
@@ -33,6 +33,8 @@ from sutradhara.hdcache.placement import (
 def engine(tmp_path: Path) -> Iterator[Engine]:
     eng = make_engine(f"sqlite:///{tmp_path / 'hdcache-placement.db'}")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add(ArtifactClass(name="s-masters"))
     yield eng
     eng.dispose()
 

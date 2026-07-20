@@ -9,18 +9,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sutradhara.archive_restore import restore_asset
-from sutradhara.artifactclass_policy import ArtifactClassPolicyRecord
 from sutradhara.backend.port import BackendLocator, ByteRange, VerifyResult
 from sutradhara.catalog.copies import add_bundle_copy, add_copy
 from sutradhara.catalog.models import (
+    ArtifactClass,
+    ArtifactClassPolicyRecord,
     ArtifactClassPool,
     AssetLocator,
     Backend,
     Bundle,
+    BundleMember,
     Copy,
     IngestItem,
     Intake,
@@ -53,6 +56,9 @@ from sutradhara.sealing.port import Representation
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        for artifactclass in ("masters", "proxies"):
+            session.add(ArtifactClass(name=artifactclass))
     yield eng
     eng.dispose()
 
@@ -347,9 +353,8 @@ def test_restore_asset_filters_cross_class_bundle_locators(engine: Engine, tmp_p
     assert restored.output_path.read_bytes() == payload
 
 
-def test_restore_asset_admits_null_bundle_locator_via_ingest_membership(
+def test_asset_locator_rejects_null_bundle_even_with_ingest_membership(
     engine: Engine,
-    tmp_path: Path,
 ) -> None:
     payload = b"legacy locator bytes"
     asset_hash = _digest(payload)
@@ -368,27 +373,16 @@ def test_restore_asset_admits_null_bundle_locator_via_ingest_membership(
             health=CopyHealth.OK,
             storage_metadata=_metadata(),
         )
-        _add_locator(
-            session,
-            copy=asset_copy,
-            asset_hash=asset_hash,
-            pool_id=pool.id,
-            bundle_id=None,
-            member_path="legacy.bin",
-        )
-        extractor = _StaticExtractor({asset_copy.id: payload})
-        restored = restore_asset(
-            session,
-            asset_hash=asset_hash,
-            artifactclass="masters",
-            destination=tmp_path / "legacy.bin",
-            backends={pool.backend_id: _NoReadBackend("legacy")},
-            extractor=extractor,
-        )
-
-    assert restored.copy_id == asset_copy.id
-    assert extractor.calls == [asset_copy.id]
-    assert restored.output_path.read_bytes() == payload
+        with pytest.raises(IntegrityError):
+            _add_locator(
+                session,
+                copy=asset_copy,
+                asset_hash=asset_hash,
+                pool_id=pool.id,
+                bundle_id=None,
+                member_path="legacy.bin",
+            )
+        session.rollback()
 
 
 def _digest(data: bytes) -> bytes:
@@ -482,13 +476,32 @@ def _add_locator(
     bundle_id: str | None,
     member_path: str,
 ) -> None:
+    if bundle_id is not None:
+        existing_member = session.scalar(
+            select(BundleMember).where(
+                BundleMember.bundle_id == bundle_id,
+                BundleMember.logical_asset_hash == asset_hash,
+                BundleMember.member_path == member_path,
+            )
+        )
+        if existing_member is None:
+            session.add(
+                BundleMember(
+                    bundle_id=bundle_id,
+                    logical_asset_hash=asset_hash,
+                    member_path=member_path,
+                    size_bytes=1,
+                    file_sha256=asset_hash,
+                )
+            )
+            session.flush()
     session.add(
         AssetLocator(
             logical_asset_hash=asset_hash,
             pool_id=pool_id,
             copy_id=copy.id,
             bundle_id=bundle_id,
-            native_locator={"size_bytes": 1, "member_path": member_path},
+            native_locator={"size_bytes": 1},
             member_path=member_path,
             representation=Representation.RAW_BYTES.value,
         )
@@ -536,8 +549,9 @@ def _add_policy_record(
     artifactclass: str,
     restore_preference: list[str],
 ) -> None:
-    session.add(
-        ArtifactClassPolicyRecord(
+    record = session.get(ArtifactClassPolicyRecord, artifactclass)
+    if record is None:
+        record = ArtifactClassPolicyRecord(
             artifactclass=artifactclass,
             ruleset="test.rules",
             expect="messy",
@@ -547,5 +561,7 @@ def _add_policy_record(
             staging_config={"appledouble": {"action": "off"}, "compression": {"codec": "off"}},
             hdcache_config={"enabled": False, "privacy_level": "none"},
         )
-    )
+        session.add(record)
+    else:
+        record.restore_preference = restore_preference
     session.flush()

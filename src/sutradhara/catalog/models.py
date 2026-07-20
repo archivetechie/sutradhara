@@ -22,6 +22,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     LargeBinary,
@@ -29,8 +30,10 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     event,
+    select,
     text,
 )
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -54,6 +57,7 @@ from sutradhara.catalog.types import (
     SubmissionStatus,
     implementation_family_for_kind,
 )
+from sutradhara.schema_conventions import vocabulary_check_sql
 
 
 def _utcnow() -> dt.datetime:
@@ -75,8 +79,12 @@ class LogicalAsset(Base):
     __tablename__ = "logical_asset"
     __table_args__ = (
         CheckConstraint(
-            "validity IN ('ok', 'suspect', 'unvalidated')",
+            vocabulary_check_sql("validity", "asset_validity"),
             name="ck_logical_asset_validity",
+        ),
+        CheckConstraint(
+            vocabulary_check_sql("media_kind", "media_kind"),
+            name="ck_logical_asset_media_kind",
         ),
     )
 
@@ -100,8 +108,8 @@ class LogicalAsset(Base):
 
     copies: Mapped[list[Copy]] = relationship(
         back_populates="logical_asset",
-        cascade="all, delete-orphan",
         lazy="selectin",
+        passive_deletes=True,
     )
     ingest_items: Mapped[list[IngestItem]] = relationship(
         back_populates="logical_asset",
@@ -119,6 +127,17 @@ class LogicalAsset(Base):
         )
 
 
+class ArtifactClass(Base):
+    """Policy-administered registry of valid artifactclass names."""
+
+    __tablename__ = "artifactclass"
+
+    name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
 class Intake(Base):
     """A completed landing batch admitted through explicit intake registration.
 
@@ -130,16 +149,21 @@ class Intake(Base):
     __tablename__ = "intake"
     __table_args__ = (
         CheckConstraint(
-            "source_kind IN ('card', 'drive', 'upload', 'handoff', 'download', 'other')",
+            vocabulary_check_sql("source_kind", "intake_source_kind"),
             name="ck_intake_source_kind",
         ),
         CheckConstraint(
-            "status IN ('receiving', 'verifying', 'quarantined', 'registered')",
+            vocabulary_check_sql("status", "intake_status"),
             name="ck_intake_status",
         ),
         CheckConstraint(
-            "retention_state IN ('held', 'released', 'tombstoned', 'abandoned', 'purged')",
+            vocabulary_check_sql("retention_state", "retention_state"),
             name="ck_intake_retention_state",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND retention_state != 'not_applicable') OR "
+            "(status != 'registered' AND retention_state = 'not_applicable')",
+            name="ck_intake_retention_ordering",
         ),
         CheckConstraint(
             "(staging_tombstoned_at IS NULL AND staging_tombstone_path IS NULL) OR "
@@ -163,19 +187,24 @@ class Intake(Base):
     source_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     card_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     device_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     label: Mapped[str | None] = mapped_column(String(512), nullable=True)
     manifest_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     manifest_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     requested_profile: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[IntakeStatus] = mapped_column(
-        String(32), nullable=False, default=IntakeStatus.RECEIVING
+        String(32), nullable=False, default=IntakeStatus.VERIFYING
     )
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
     registered_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -184,7 +213,10 @@ class Intake(Base):
         DateTime(timezone=True), nullable=True
     )
     retention_state: Mapped[RetentionState] = mapped_column(
-        String(32), nullable=False, default=RetentionState.HELD, server_default="held"
+        String(32),
+        nullable=False,
+        default=RetentionState.NOT_APPLICABLE,
+        server_default=RetentionState.NOT_APPLICABLE.value,
     )
     released_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     release_policy_fingerprint: Mapped[str | None] = mapped_column(String(67), nullable=True)
@@ -220,8 +252,7 @@ class IngestItem(Base):
     __tablename__ = "ingest_item"
     __table_args__ = (
         CheckConstraint(
-            "disposition IN ('new', 'known_durable', 'known_under_durable', "
-            "'reverified', 'legacy_unknown')",
+            vocabulary_check_sql("disposition", "ingest_disposition"),
             name="ck_ingest_item_disposition",
         ),
         UniqueConstraint(
@@ -245,7 +276,7 @@ class IngestItem(Base):
     )
     logical_asset_hash: Mapped[bytes] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -254,7 +285,12 @@ class IngestItem(Base):
     st_dev: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     st_ino: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     disposition: Mapped[IngestDisposition] = mapped_column(
         String(32),
         nullable=False,
@@ -268,7 +304,7 @@ class IngestItem(Base):
     disposition_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     prior_intake_id: Mapped[str | None] = mapped_column(
         String(128),
-        ForeignKey("intake.intake_id"),
+        ForeignKey("intake.intake_id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -278,6 +314,8 @@ class IngestItem(Base):
         nullable=False,
         default=dict,
     )
+    source_path: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    pfr_sidecar_path: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -286,19 +324,37 @@ class IngestItem(Base):
     logical_asset: Mapped[LogicalAsset] = relationship(back_populates="ingest_items")
     derived_from_edges: Mapped[list[AssetDerivation]] = relationship(
         back_populates="derived_item",
-        cascade="all, delete-orphan",
         foreign_keys="AssetDerivation.derived_item_id",
         lazy="selectin",
+        passive_deletes=True,
     )
     source_for_edges: Mapped[list[AssetDerivation]] = relationship(
         back_populates="source_item",
-        cascade="all, delete-orphan",
         foreign_keys="AssetDerivation.source_item_id",
         lazy="selectin",
+        passive_deletes=True,
     )
 
     def __repr__(self) -> str:
         return f"<IngestItem id={self.id} intake={self.intake_id!r} path={self.as_received_path!r}>"
+
+
+@event.listens_for(Intake, "before_insert")
+def _initialize_intake_retention_state(
+    mapper: object,
+    connection: Connection,
+    target: Intake,
+) -> None:
+    """Initialize retention only after the registration boundary is known."""
+
+    del mapper, connection
+    if target.status == IntakeStatus.REGISTERED and target.retention_state in (
+        None,
+        RetentionState.NOT_APPLICABLE,
+    ):
+        target.retention_state = RetentionState.HELD
+    elif target.retention_state is None:
+        target.retention_state = RetentionState.NOT_APPLICABLE
 
 
 class AssetDerivation(Base):
@@ -306,6 +362,10 @@ class AssetDerivation(Base):
 
     __tablename__ = "asset_derivation"
     __table_args__ = (
+        CheckConstraint(
+            vocabulary_check_sql("kind", "asset_derivation_kind"),
+            name="ck_asset_derivation_kind",
+        ),
         UniqueConstraint(
             "derived_item_id",
             "source_item_id",
@@ -317,13 +377,13 @@ class AssetDerivation(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     derived_item_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("ingest_item.id", ondelete="CASCADE"),
+        ForeignKey("ingest_item.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
     source_item_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("ingest_item.id", ondelete="CASCADE"),
+        ForeignKey("ingest_item.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -354,8 +414,14 @@ class Arrangement(Base):
     __tablename__ = "arrangement"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('draft', 'pending_derivatives', 'ready', 'submitted', 'abandoned')",
+            vocabulary_check_sql("status", "arrangement_status"),
             name="ck_arrangement_status",
+        ),
+        CheckConstraint(
+            "(status = 'abandoned' AND abandoned_at IS NOT NULL AND abandoned_by IS NOT NULL) OR "
+            "(status != 'abandoned' AND abandoned_at IS NULL AND abandoned_by IS NULL "
+            "AND abandonment_reason IS NULL)",
+            name="ck_arrangement_abandonment",
         ),
     )
 
@@ -367,7 +433,12 @@ class Arrangement(Base):
         nullable=False,
         index=True,
     )
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     status: Mapped[ArrangementStatus] = mapped_column(
         String(32), nullable=False, default=ArrangementStatus.DRAFT, index=True
     )
@@ -397,9 +468,12 @@ class Arrangement(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
     submitted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    abandoned_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    abandoned_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    abandonment_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     intake: Mapped[Intake] = relationship()
     members: Mapped[list[ArrangementMember]] = relationship(
@@ -427,7 +501,7 @@ class ArrangementMember(Base):
     )
     ingest_item_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("ingest_item.id", ondelete="CASCADE"),
+        ForeignKey("ingest_item.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -437,7 +511,7 @@ class ArrangementMember(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
     arrangement: Mapped[Arrangement] = relationship(back_populates="members")
@@ -456,7 +530,7 @@ class Submission(Base):
     __tablename__ = "submission"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending_archive', 'archived')",
+            vocabulary_check_sql("status", "submission_status"),
             name="ck_submission_status",
         ),
         UniqueConstraint("arrangement_id", name="uq_submission_arrangement_id"),
@@ -469,7 +543,12 @@ class Submission(Base):
         nullable=False,
         index=True,
     )
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     source_map_path: Mapped[str] = mapped_column(String(4096), nullable=False)
     manifest_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     member_count: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -515,10 +594,10 @@ class SubmissionMember(Base):
         nullable=False,
         index=True,
     )
-    ingest_item_id: Mapped[int | None] = mapped_column(
+    ingest_item_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("ingest_item.id", ondelete="SET NULL"),
-        nullable=True,
+        ForeignKey("ingest_item.id", ondelete="RESTRICT"),
+        nullable=False,
         index=True,
     )
     archive_path: Mapped[str] = mapped_column(String(2048), nullable=False)
@@ -528,7 +607,7 @@ class SubmissionMember(Base):
     ord: Mapped[int] = mapped_column(Integer, nullable=False)
 
     submission: Mapped[Submission] = relationship(back_populates="members")
-    ingest_item: Mapped[IngestItem | None] = relationship()
+    ingest_item: Mapped[IngestItem] = relationship()
 
 
 Index(
@@ -554,7 +633,7 @@ class VirtualArrangement(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
     members: Mapped[list[VirtualArrangementMember]] = relationship(
@@ -594,11 +673,16 @@ class VirtualArrangementMember(Base):
     )
     logical_asset_hash: Mapped[bytes] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     path: Mapped[str] = mapped_column(String(2048), nullable=False)
     excluded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     added_by: Mapped[str] = mapped_column(String(256), nullable=False)
@@ -606,7 +690,7 @@ class VirtualArrangementMember(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
     view: Mapped[VirtualArrangement] = relationship(back_populates="members")
@@ -632,23 +716,28 @@ class VirtualArrangementHistory(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     va_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("virtual_arrangement.id", ondelete="CASCADE"),
+        ForeignKey("virtual_arrangement.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
     va_member_id: Mapped[int | None] = mapped_column(
         Integer,
-        ForeignKey("virtual_arrangement_member.id", ondelete="SET NULL"),
+        ForeignKey("virtual_arrangement_member.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
     logical_asset_hash: Mapped[bytes] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     old_path: Mapped[str] = mapped_column(String(2048), nullable=False)
     new_path: Mapped[str] = mapped_column(String(2048), nullable=False)
     actor: Mapped[str] = mapped_column(String(256), nullable=False)
@@ -669,7 +758,7 @@ class AssetTag(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     logical_asset_hash: Mapped[bytes] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -707,6 +796,12 @@ class Backend(Base):
     """A registered storage backend (one row per backend instance)."""
 
     __tablename__ = "backend"
+    __table_args__ = (
+        CheckConstraint(
+            vocabulary_check_sql("tier", "backend_tier"),
+            name="ck_backend_tier",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
@@ -720,8 +815,8 @@ class Backend(Base):
 
     copies: Mapped[list[Copy]] = relationship(
         back_populates="backend",
-        cascade="all, delete-orphan",
         lazy="selectin",
+        passive_deletes=True,
     )
     pools: Mapped[list[Pool]] = relationship(
         back_populates="backend",
@@ -740,7 +835,7 @@ class Backend(Base):
 @event.listens_for(Backend, "before_update")
 def _set_backend_implementation_family(
     mapper: object,
-    connection: object,
+    connection: Connection,
     target: Backend,
 ) -> None:
     """Populate the required durability family from the backend kind registry."""
@@ -780,11 +875,7 @@ class RetentionEvent(Base):
     __tablename__ = "retention_event"
     __table_args__ = (
         CheckConstraint(
-            "action IN ('released', 'cloud_blob_deleted', 'staging_deleted', "
-            "'release_attempted', 'purge_attempted', 'staging_tombstoned', "
-            "'staging_purge_held', 'batch_invoked', 'batch_refused', "
-            "'grace_overridden', 'abandoned', 'correction_recorded', "
-            "'offsite_confirmed')",
+            vocabulary_check_sql("action", "retention_action"),
             name="ck_retention_event_action",
         ),
         CheckConstraint(
@@ -821,7 +912,7 @@ class RetentionEvent(Base):
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     operation_id: Mapped[str] = mapped_column(String(512), nullable=False)
     actor: Mapped[str] = mapped_column(String(256), nullable=False)
-    at: Mapped[dt.datetime] = mapped_column(
+    occurred_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -894,14 +985,6 @@ class Pool(Base):
     """
 
     __tablename__ = "pool"
-    __table_args__ = (
-        UniqueConstraint(
-            "backend_id",
-            "id",
-            name="uq_pool_backend_id",
-        ),
-    )
-
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     backend_id: Mapped[int] = mapped_column(
         Integer,
@@ -910,9 +993,9 @@ class Pool(Base):
         index=True,
     )
     representation: Mapped[str] = mapped_column(String(64), nullable=False)
-    location: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    location: Mapped[str | None] = mapped_column(String(256), nullable=True)
     offsite_gate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    tier: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    storage_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
     accepts_writes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     retired: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     media_generation: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -951,7 +1034,12 @@ class ArtifactClassPool(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     pool_id: Mapped[str] = mapped_column(
         String(128),
         ForeignKey("pool.id", ondelete="CASCADE"),
@@ -979,7 +1067,9 @@ class ArtifactClassPolicyRecord(Base):
 
     __tablename__ = "artifactclass_policy"
 
-    artifactclass: Mapped[str] = mapped_column(String(128), primary_key=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128), ForeignKey("artifactclass.name", ondelete="RESTRICT"), primary_key=True
+    )
     ruleset: Mapped[str] = mapped_column(String(256), nullable=False)
     expect: Mapped[str] = mapped_column(String(32), nullable=False)
     target_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -992,7 +1082,7 @@ class ArtifactClassPolicyRecord(Base):
     policy_source: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     policy_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
     def __repr__(self) -> str:
@@ -1002,13 +1092,45 @@ class ArtifactClassPolicyRecord(Base):
         )
 
 
+@event.listens_for(ArtifactClassPolicyRecord, "before_insert")
+def _register_policy_artifactclass(
+    mapper: object,
+    connection: Connection,
+    target: ArtifactClassPolicyRecord,
+) -> None:
+    """Make policy administration the sole artifactclass-registry writer."""
+
+    del mapper
+    exists = connection.scalar(
+        select(ArtifactClass.name).where(ArtifactClass.name == target.artifactclass)
+    )
+    if exists is None:
+        connection.execute(
+            ArtifactClass.__table__.insert().values(
+                name=target.artifactclass,
+                created_at=_utcnow(),
+            )
+        )
+
+
 class Bundle(Base):
     """A synthetic archive object containing one or more logical assets."""
 
     __tablename__ = "bundle"
+    __table_args__ = (
+        CheckConstraint(
+            vocabulary_check_sql("status", "bundle_status"),
+            name="ck_bundle_status",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     member_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -1042,8 +1164,8 @@ class Bundle(Base):
     )
     review_decisions: Mapped[list[ReviewDecision]] = relationship(
         back_populates="bundle",
-        cascade="all, delete-orphan",
         lazy="selectin",
+        passive_deletes=True,
     )
 
     def __repr__(self) -> str:
@@ -1062,6 +1184,18 @@ class BundleMember(Base):
             "member_path",
             name="uq_bundle_member_bundle_path",
         ),
+        UniqueConstraint(
+            "id",
+            "bundle_id",
+            "logical_asset_hash",
+            name="uq_bundle_member_id_bundle_asset",
+        ),
+        UniqueConstraint(
+            "bundle_id",
+            "logical_asset_hash",
+            "member_path",
+            name="uq_bundle_member_bundle_asset_path",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -1073,7 +1207,7 @@ class BundleMember(Base):
     )
     logical_asset_hash: Mapped[bytes] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -1090,9 +1224,9 @@ class BundleMember(Base):
     logical_asset: Mapped[LogicalAsset] = relationship()
     transforms: Mapped[list[StagingTransform]] = relationship(
         back_populates="bundle_member",
-        cascade="all, delete-orphan",
         lazy="selectin",
         order_by="StagingTransform.step_order",
+        passive_deletes=True,
     )
 
 
@@ -1118,12 +1252,17 @@ class StagingTransform(Base):
             "step_order",
             name="uq_staging_transform_bundle_stored_step",
         ),
+        ForeignKeyConstraint(
+            ("bundle_member_id", "bundle_id", "logical_asset_hash"),
+            ("bundle_member.id", "bundle_member.bundle_id", "bundle_member.logical_asset_hash"),
+            ondelete="RESTRICT",
+            name="fk_staging_transform_member_identity",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bundle_member_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("bundle_member.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -1135,11 +1274,16 @@ class StagingTransform(Base):
     )
     logical_asset_hash: Mapped[bytes] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     step_order: Mapped[int] = mapped_column(Integer, nullable=False)
     kind: Mapped[str] = mapped_column(String(64), nullable=False)
     reversible: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -1155,9 +1299,11 @@ class StagingTransform(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
-    bundle_member: Mapped[BundleMember] = relationship(back_populates="transforms")
-    logical_asset: Mapped[LogicalAsset] = relationship()
-    bundle: Mapped[Bundle] = relationship()
+    bundle_member: Mapped[BundleMember] = relationship(
+        back_populates="transforms", foreign_keys=[bundle_member_id]
+    )
+    logical_asset: Mapped[LogicalAsset] = relationship(overlaps="transforms")
+    bundle: Mapped[Bundle] = relationship(overlaps="transforms")
 
 
 class AssetLocator(Base):
@@ -1171,12 +1317,28 @@ class AssetLocator(Base):
             "member_path",
             name="uq_asset_locator_copy_asset_member",
         ),
+        ForeignKeyConstraint(
+            ("copy_id", "pool_id", "bundle_id"),
+            ("copy.id", "copy.pool_id", "copy.bundle_id"),
+            ondelete="RESTRICT",
+            name="fk_asset_locator_copy_pool_bundle",
+        ),
+        ForeignKeyConstraint(
+            ("bundle_id", "logical_asset_hash", "member_path"),
+            (
+                "bundle_member.bundle_id",
+                "bundle_member.logical_asset_hash",
+                "bundle_member.member_path",
+            ),
+            ondelete="RESTRICT",
+            name="fk_asset_locator_bundle_member",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     logical_asset_hash: Mapped[bytes] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -1186,16 +1348,15 @@ class AssetLocator(Base):
         nullable=False,
         index=True,
     )
-    copy_id: Mapped[int | None] = mapped_column(
+    copy_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("copy.id", ondelete="SET NULL"),
-        nullable=True,
+        nullable=False,
         index=True,
     )
-    bundle_id: Mapped[str | None] = mapped_column(
+    bundle_id: Mapped[str] = mapped_column(
         String(128),
-        ForeignKey("bundle.id", ondelete="SET NULL"),
-        nullable=True,
+        ForeignKey("bundle.id", ondelete="RESTRICT"),
+        nullable=False,
         index=True,
     )
     native_locator: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
@@ -1205,53 +1366,14 @@ class AssetLocator(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
-    logical_asset: Mapped[LogicalAsset] = relationship()
-    pool: Mapped[Pool] = relationship()
-    copy: Mapped[Copy | None] = relationship()
-    bundle: Mapped[Bundle | None] = relationship(back_populates="locators")
-
-
-class BlobRoot(Base):
-    """A coarse pointer to a blob entry inside one archive copy."""
-
-    __tablename__ = "blob_root"
-    __table_args__ = (
-        UniqueConstraint(
-            "copy_id",
-            "root_path",
-            name="uq_blob_root_copy_root",
-        ),
+    logical_asset: Mapped[LogicalAsset] = relationship(foreign_keys=[logical_asset_hash])
+    pool: Mapped[Pool] = relationship(foreign_keys=[pool_id])
+    copy: Mapped[Copy] = relationship(
+        foreign_keys=[copy_id, pool_id, bundle_id], overlaps="pool,locators"
     )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    bundle_id: Mapped[str] = mapped_column(
-        String(128),
-        ForeignKey("bundle.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
+    bundle: Mapped[Bundle] = relationship(
+        back_populates="locators", foreign_keys=[bundle_id], overlaps="copy"
     )
-    copy_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("copy.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    pool_id: Mapped[str] = mapped_column(
-        String(128),
-        ForeignKey("pool.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    root_path: Mapped[str] = mapped_column(String(1024), nullable=False)
-    native_locator: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    archive_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
-    )
-
-    bundle: Mapped[Bundle] = relationship()
-    copy: Mapped[Copy] = relationship()
-    pool: Mapped[Pool] = relationship()
 
 
 class ExclusionRecord(Base):
@@ -1266,7 +1388,12 @@ class ExclusionRecord(Base):
         nullable=True,
         index=True,
     )
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifactclass: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("artifactclass.name", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     logical_asset_hash: Mapped[bytes | None] = mapped_column(
         LargeBinary(32),
         ForeignKey("logical_asset.content_sha256", ondelete="SET NULL"),
@@ -1292,11 +1419,21 @@ class ReviewDecision(Base):
     """A recorded held-bundle review decision."""
 
     __tablename__ = "review_decision"
+    __table_args__ = (
+        CheckConstraint(
+            vocabulary_check_sql("action", "review_action"),
+            name="ck_review_decision_action",
+        ),
+        CheckConstraint(
+            vocabulary_check_sql("scope", "review_scope"),
+            name="ck_review_decision_scope",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bundle_id: Mapped[str] = mapped_column(
         String(128),
-        ForeignKey("bundle.id", ondelete="CASCADE"),
+        ForeignKey("bundle.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -1311,6 +1448,32 @@ class ReviewDecision(Base):
     )
 
     bundle: Mapped[Bundle] = relationship(back_populates="review_decisions")
+
+
+class AssetReviewEvent(Base):
+    """Append-only reject/unreject decision history for one logical asset."""
+
+    __tablename__ = "asset_review_event"
+    __table_args__ = (
+        CheckConstraint(
+            vocabulary_check_sql("action", "asset_review_action"),
+            name="ck_asset_review_event_action",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    logical_asset_hash: Mapped[bytes] = mapped_column(
+        LargeBinary(32),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor: Mapped[str] = mapped_column(String(256), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
 
 
 class Copy(Base):
@@ -1329,13 +1492,14 @@ class Copy(Base):
             "native_locator_key",
             name="uq_copy_backend_locator",
         ),
+        UniqueConstraint("id", "pool_id", "bundle_id", name="uq_copy_id_pool_bundle"),
         CheckConstraint(
             "(logical_asset_hash IS NOT NULL AND bundle_id IS NULL) OR "
             "(logical_asset_hash IS NULL AND bundle_id IS NOT NULL)",
             name="ck_copy_asset_xor_bundle",
         ),
         CheckConstraint(
-            "health IN ('ok', 'suspect', 'corrupt', 'missing')",
+            vocabulary_check_sql("health", "copy_health"),
             name="ck_copy_health",
         ),
         CheckConstraint(
@@ -1344,8 +1508,12 @@ class Copy(Base):
             name="ck_copy_measurement_pair",
         ),
         CheckConstraint(
-            "integrity_hash_provenance IN ('locally_computed', 'backend_discovered')",
+            vocabulary_check_sql("integrity_hash_provenance", "integrity_hash_provenance"),
             name="ck_copy_integrity_hash_provenance",
+        ),
+        CheckConstraint(
+            vocabulary_check_sql("source", "copy_source"),
+            name="ck_copy_source",
         ),
     )
 
@@ -1353,25 +1521,25 @@ class Copy(Base):
 
     logical_asset_hash: Mapped[bytes | None] = mapped_column(
         LargeBinary(32),
-        ForeignKey("logical_asset.content_sha256", ondelete="CASCADE"),
+        ForeignKey("logical_asset.content_sha256", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
     bundle_id: Mapped[str | None] = mapped_column(
         String(128),
-        ForeignKey("bundle.id", ondelete="CASCADE"),
+        ForeignKey("bundle.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
     backend_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("backend.id", ondelete="CASCADE"),
+        ForeignKey("backend.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
     pool_id: Mapped[str | None] = mapped_column(
         String(128),
-        ForeignKey("pool.id", ondelete="SET NULL"),
+        ForeignKey("pool.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -1382,6 +1550,8 @@ class Copy(Base):
     # and ordering of dict keys in JSON storage is implementation-defined).
     native_locator: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     native_locator_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    media_id: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    media_family: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     storage_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
     integrity_hash: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
@@ -1395,7 +1565,6 @@ class Copy(Base):
     health_changed_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
-        default=_utcnow,
         server_default=text("CURRENT_TIMESTAMP"),
     )
     last_checked_at: Mapped[dt.datetime | None] = mapped_column(
@@ -1424,13 +1593,34 @@ class Copy(Base):
         )
 
 
+@event.listens_for(Copy, "before_insert")
+def _materialize_copy_media_identity(
+    mapper: object,
+    connection: Connection,
+    target: Copy,
+) -> None:
+    """Write canonical media columns at the copy-registration boundary."""
+
+    from sutradhara.catalog.media_identity import _copy_media_id
+
+    del mapper
+    family = connection.execute(
+        select(Backend.implementation_family).where(Backend.id == target.backend_id)
+    ).scalar_one_or_none()
+    if family is None:
+        return
+    identity = _copy_media_id(family, target.native_locator, target.backend_id)
+    target.media_id = identity.media_id
+    target.media_family = identity.media_family
+
+
 class VerifyReceipt(Base):
     """Append-only audit receipt emitted atomically with measurement projection changes."""
 
     __tablename__ = "verify_receipt"
     __table_args__ = (
         CheckConstraint(
-            "source IN ('fanout', 'verify-job', 'restore', 'scrub')",
+            vocabulary_check_sql("source", "verify_receipt_source"),
             name="ck_verify_receipt_source",
         ),
         CheckConstraint(
@@ -1466,7 +1656,7 @@ class VerifyReceipt(Base):
     execution_id: Mapped[str] = mapped_column(String(512), nullable=False)
     producer_process: Mapped[str] = mapped_column(String(512), nullable=False)
     actor: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    at: Mapped[dt.datetime] = mapped_column(
+    recorded_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 

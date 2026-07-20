@@ -29,7 +29,6 @@ from sutradhara.catalog.session import session_scope
 from sutradhara.catalog.types import BackendKind, CopyHealth
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.repopulate import DrillStatus, drill_status
-from sutradhara.replication import _copy_media_id
 
 router = APIRouter()
 
@@ -277,9 +276,7 @@ def _group_tape_copies(
     groups: dict[tuple[str, str, str | None, str], _TapeGroup] = {}
     for copy, backend in rows:
         backend_kind = _value(backend.kind)
-        media_id = _copy_media_id(copy)
-        if media_id is None:
-            media_id = _fallback_media_id(copy)
+        media_id = copy.media_id
         display_label, library = _media_display(
             copy,
             backend_kind=backend_kind,
@@ -334,12 +331,6 @@ def _media_display(
         return None, None
     catalog_entry = catalog.by_media_id.get(media_id)
     return media_id, None if catalog_entry is None else catalog_entry.library
-
-
-def _fallback_media_id(copy: Copy) -> str:
-    locator = copy.native_locator or {}
-    encoded = json.dumps(locator, sort_keys=True, default=str, separators=(",", ":"))
-    return f"unknown:{copy.backend_id}:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:12]}"
 
 
 def _tape_payload(

@@ -118,7 +118,7 @@ def _blocked_query(domain: str) -> Any:
             ReconciliationCondition.domain == domain,
             ReconciliationCondition.condition == CONDITION_BLOCKED,
         )
-        .order_by(ReconciliationCondition.updated_at, ReconciliationCondition.id)
+        .order_by(ReconciliationCondition.condition_changed_at, ReconciliationCondition.id)
     )
 
 
@@ -131,7 +131,7 @@ def _list_blocked(session: Session, domain: str) -> None:
                     f"reason={row.reason or ''}",
                     f"blocked_tool_name={row.blocked_tool_name or ''}",
                     f"blocked_tool_version={row.blocked_tool_version or ''}",
-                    f"since={row.updated_at.isoformat()}",
+                    f"since={row.condition_changed_at.isoformat()}",
                 ]
             )
         )
@@ -168,7 +168,7 @@ def _record_fix(session: Session, component: str, *, note: str, limit: int) -> i
                 ReconciliationCondition.condition == CONDITION_BLOCKED,
                 ConditionComponent.component == component,
             )
-            .order_by(ReconciliationCondition.updated_at, ReconciliationCondition.id)
+            .order_by(ReconciliationCondition.condition_changed_at, ReconciliationCondition.id)
             .limit(limit)
         )
     )

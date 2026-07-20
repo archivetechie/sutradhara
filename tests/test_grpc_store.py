@@ -9,6 +9,7 @@ from collections.abc import Iterator
 import pytest
 from sqlalchemy import Engine, inspect, select
 
+from sutradhara.catalog.models import ArtifactClass
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.grpc import store
 
@@ -17,6 +18,8 @@ from sutradhara.grpc import store
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add(ArtifactClass(name="video-master"))
     yield eng
     eng.dispose()
 

@@ -35,6 +35,10 @@ def record_attempt(
     attempt = JobAttempt(
         job_id=job.id,
         job_kind=job.kind,
+        subject_job_id=job.id,
+        subject_domain=job.recon_domain,
+        subject_key=job.recon_target_key,
+        params_snapshot=dict(job.params or {}),
         attempt_number=job.attempts,
         outcome=job.status,
         error=job.last_error,

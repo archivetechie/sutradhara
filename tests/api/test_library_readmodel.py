@@ -490,7 +490,7 @@ def _add_backend_pool(
         backend_id=backend.id,
         representation="RAO_PLAIN",
         location="test",
-        tier="archive",
+        storage_class="archive",
     )
     session.add(pool)
     session.flush([pool])

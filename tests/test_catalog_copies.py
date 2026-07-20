@@ -11,13 +11,14 @@ import pytest
 from sqlalchemy import Engine, select
 
 from sutradhara.catalog.copies import (
+    CopyIdentityConflict,
     UnknownBundle,
     UnknownLogicalAsset,
     add_bundle_copy,
     add_copy,
     lookup_by_hash,
 )
-from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset, Pool
+from sutradhara.catalog.models import ArtifactClass, Backend, Bundle, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
 
@@ -152,8 +153,8 @@ def test_add_copy_is_idempotent_and_does_not_mutate_existing(engine: Engine) -> 
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
             native_locator=locator,
-            integrity_hash=_hash("ignored"),
-            source=CopySource.SCRUB,
+            integrity_hash=original_integrity,
+            source=CopySource.INGEST,
             health=CopyHealth.SUSPECT,
         )
         assert first_created is True
@@ -170,15 +171,44 @@ def test_add_copy_is_idempotent_and_does_not_mutate_existing(engine: Engine) -> 
         assert copies[0].integrity_hash == original_integrity
 
 
+def test_add_copy_rejects_locator_replay_with_different_identity_claims(
+    engine: Engine,
+) -> None:
+    backend_id = _add_backend(engine)
+    asset_hash = _add_asset(engine, b"conflicting replay")
+    locator = _locator(asset_hash)
+
+    with session_scope(engine) as s:
+        add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=locator,
+            integrity_hash=asset_hash,
+            source=CopySource.INGEST,
+        )
+        with pytest.raises(CopyIdentityConflict, match="integrity_hash, source"):
+            add_copy(
+                s,
+                logical_asset_hash=asset_hash,
+                backend_id=backend_id,
+                native_locator=locator,
+                integrity_hash=_hash("different claim"),
+                source=CopySource.SCRUB,
+            )
+
+
 def test_add_bundle_copy_records_bundle_without_logical_asset(engine: Engine) -> None:
     backend_id = _add_backend(engine)
     locator = {
         "pool_id": "archive-pool",
         "object_id": "bundle-001",
+        "tape_uuid": "bundle-001",
         "content_sha256": _hash("bundle").hex(),
     }
 
     with session_scope(engine) as s:
+        s.add(ArtifactClass(name="o-archive"))
         s.add(Bundle(id="bundle-001", artifactclass="o-archive"))
         s.add(
             Pool(
@@ -204,9 +234,9 @@ def test_add_bundle_copy_records_bundle_without_logical_asset(engine: Engine) ->
             backend_id=backend_id,
             pool_id="archive-pool",
             native_locator=locator,
-            integrity_hash=_hash("ignored"),
-            source=CopySource.SCRUB,
-            storage_metadata={"representation": "ignored"},
+            integrity_hash=_hash("bundle"),
+            source=CopySource.INGEST,
+            storage_metadata={"representation": "rao-plain-v1"},
         )
         assert created is True
         assert second_created is False
