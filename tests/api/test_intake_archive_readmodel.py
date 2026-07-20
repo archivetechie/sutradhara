@@ -41,7 +41,7 @@ from sutradhara.catalog.types import (
     RetentionState,
     SubmissionStatus,
 )
-from tests.api.conftest import auth_headers, make_api_app
+from tests.api.conftest import administer_artifactclass, auth_headers, make_api_app
 
 INTAKE_KEYS = {
     "intake_id",
@@ -127,6 +127,7 @@ def test_intake_contract_detail_uses_virtual_paths_and_cross_intake_derivations(
     base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
     source_hash = _digest("source")
     derived_hash = _digest("derived")
+    administer_artifactclass(api_engine, "s-proxy")
     with session_scope(api_engine) as session:
         _add_asset(session, source_hash, size=10)
         _add_asset(session, derived_hash, size=20)
@@ -159,7 +160,7 @@ def test_intake_contract_detail_uses_virtual_paths_and_cross_intake_derivations(
             AssetDerivation(
                 source_item_id=source_item.id,
                 derived_item_id=derived_item.id,
-                kind="transcode",
+                kind="preview",
                 created_at=base + dt.timedelta(minutes=2),
             )
         )
@@ -204,7 +205,7 @@ def test_intake_contract_detail_uses_virtual_paths_and_cross_intake_derivations(
     assert set(body["items"][0]) == INGEST_ITEM_KEYS
     assert body["derivations"] == [
         {
-            "kind": "transcode",
+            "kind": "preview",
             "source_sha256": source_hash.hex(),
             "derived_sha256": derived_hash.hex(),
         }
@@ -600,7 +601,11 @@ def test_archive_bundle_and_submission_contracts_and_status_vocabularies(
             bundle,
             backend,
             pool,
-            locator={"media_id": "VOL001", "object_id": "bundle-1"},
+            locator={
+                "media_id": "VOL001",
+                "tape_uuid": "00000000000000000000000000000001",
+                "object_id": "bundle-1",
+            },
         )
         _add_submission_fixture(
             session,
@@ -657,6 +662,7 @@ def test_archive_asset_uses_asset_locator_origin_rule_and_locator_shaping(
 ) -> None:
     base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
     digest = _digest("locator-only-asset")
+    administer_artifactclass(api_engine, "s-proxy")
     with session_scope(api_engine) as session:
         _add_asset(session, digest, size=456)
         _add_intake(session, "origin-old", artifactclass="s-masters", created_at=base)
@@ -700,7 +706,11 @@ def test_archive_asset_uses_asset_locator_origin_rule_and_locator_shaping(
             bundle,
             backend,
             pool,
-            locator={"media_id": "VOL001", "object_path": "/var/lib/replica/private/bundle.rao"},
+            locator={
+                "media_id": "VOL001",
+                "tape_uuid": "00000000000000000000000000000001",
+                "object_path": "/var/lib/replica/private/bundle.rao",
+            },
             health=CopyHealth.SUSPECT,
             last_checked_at=base + dt.timedelta(hours=2),
         )
@@ -761,6 +771,7 @@ def test_archive_asset_uses_asset_locator_origin_rule_and_locator_shaping(
 def test_catalog_assets_are_asset_class_pairs_with_offset_paging(api_engine: Engine) -> None:
     base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
     digest = _digest("multi-class-asset")
+    administer_artifactclass(api_engine, "s-proxy")
     with session_scope(api_engine) as session:
         _add_asset(session, digest, size=99, media_kind=MediaKind.VIDEO)
         _add_intake(session, "catalog-intake", artifactclass="s-masters", created_at=base)
@@ -932,7 +943,11 @@ def _add_intake(
         artifactclass=artifactclass,
         label=f"Label {intake_id}",
         status=status,
-        retention_state=RetentionState.HELD,
+        retention_state=(
+            RetentionState.HELD
+            if status == IntakeStatus.REGISTERED
+            else RetentionState.NOT_APPLICABLE
+        ),
         created_at=created_at,
         updated_at=created_at,
         registered_at=created_at if status == IntakeStatus.REGISTERED else None,
