@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from sutradhara.backend.port import VerifyResult
 from sutradhara.catalog.models import Copy, VerifyReceipt
-from sutradhara.catalog.types import CopyHealth, is_content_hash
+from sutradhara.catalog.types import CopyHealth, IntegrityHashProvenance, is_content_hash
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job
 
@@ -61,6 +61,13 @@ def record_measured(
     elif not result.ok:
         copy.health = CopyHealth.SUSPECT
         failure_kind = "backend-failure"
+    elif (
+        copy.logical_asset_hash is not None
+        and copy.integrity_hash != copy.logical_asset_hash
+        and copy.integrity_hash_provenance != IntegrityHashProvenance.LOCALLY_COMPUTED
+    ):
+        copy.health = CopyHealth.SUSPECT
+        failure_kind = "identity-unproven"
     else:
         copy.health = CopyHealth.OK
         failure_kind = None

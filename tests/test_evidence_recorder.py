@@ -20,7 +20,14 @@ from sutradhara.catalog.session import (
     make_session_factory,
     session_scope,
 )
-from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
+from sutradhara.catalog.types import (
+    BackendKind,
+    BackendTier,
+    CopyHealth,
+    CopySource,
+    IntegrityHashProvenance,
+    content_hash,
+)
 from sutradhara.evidence_recorder import record_measured
 
 
@@ -137,6 +144,46 @@ def test_record_measured_retry_deduplicates_without_rewriting_projection(
         assert copy.last_measured_digest == copy.integrity_hash
         assert copy.last_measured_at == good_at
         assert session.scalar(select(func.count()).select_from(VerifyReceipt)) == 1
+
+
+def test_backend_discovered_identity_conflict_cannot_reach_ok_via_readback(
+    engine: Engine,
+) -> None:
+    asset_digest = content_hash(hashlib.sha256(b"asset identity").digest())
+    discovered_digest = content_hash(hashlib.sha256(b"backend claim").digest())
+    with session_scope(engine) as session:
+        backend = Backend(
+            name="discovered-memory",
+            kind=BackendKind.MEMORY,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        session.add_all([backend, LogicalAsset(content_sha256=asset_digest, size_bytes=14)])
+        session.flush()
+        locator = {"object": "discovered-conflict"}
+        copy = Copy(
+            logical_asset_hash=asset_digest,
+            backend_id=backend.id,
+            native_locator=locator,
+            native_locator_key=locator_key(locator),
+            integrity_hash=discovered_digest,
+            integrity_hash_provenance=IntegrityHashProvenance.BACKEND_DISCOVERED,
+            source=CopySource.SCRUB,
+            health=CopyHealth.SUSPECT,
+        )
+        session.add(copy)
+        session.flush()
+
+        receipt = record_measured(
+            session,
+            copy,
+            VerifyResult(ok=True, measured=True, actual_hash=discovered_digest),
+            source="verify-job",
+            execution_id="verify-discovered-conflict",
+        )
+
+        assert copy.last_measured_digest == discovered_digest
+        assert copy.health == CopyHealth.SUSPECT
+        assert receipt.failure_kind == "identity-unproven"
 
 
 def _seed_copy(engine: Engine) -> int:

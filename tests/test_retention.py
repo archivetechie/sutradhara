@@ -51,13 +51,16 @@ from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_SATISFIED,
     OBSERVED_MISSING,
     OBSERVED_PRESENT,
+    reopen_condition,
 )
 from sutradhara.jobs.reconcilers.derivation import DOMAIN as DERIVATION_DOMAIN
 from sutradhara.jobs.reconcilers.derivation import make_target_key
 from sutradhara.replication import select_restore_source
 from sutradhara.retention import (
+    abandon_retention,
     confirm_offsite,
     releasable,
+    retention_status,
     run_retention,
     sweep_staging,
 )
@@ -378,10 +381,76 @@ def test_landing_holds_arrangement_and_prepared_profile_fail_closed(
                 ReconciliationCondition.target_key == transcode_key
             )
         ).one().condition = CONDITION_SATISFIED
-        session.scalars(
+        blocked = session.scalars(
             select(ReconciliationCondition).where(ReconciliationCondition.target_key == pfr_key)
-        ).one().condition = CONDITION_BLOCKED
+        ).one()
+        blocked.condition = CONDITION_BLOCKED
+        status = retention_status(session, "intake-c")
+        assert not status.releasable
+        assert f"derivation:{pfr_key}:blocked" in status.holds
+        held = run_retention(session, "intake-c", actor="ops")
+        assert not held.released
+        assert held.reason == f"derivation:{pfr_key}:blocked"
+
+        reopen_condition(session, blocked, actor="ops", note="tool fixed")
+        assert not releasable(session, "intake-c")
+        blocked.condition = CONDITION_SATISFIED
         assert releasable(session, "intake-c")
+
+
+def test_abandon_terminates_blocked_retention_without_releasing_or_purging(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    with session_scope(engine) as session:
+        pool = _add_pool(session, artifactclass="s-masters", pool_id="abandon-pool")
+        item = _add_intake_with_item(
+            session,
+            tmp_path,
+            "intake-abandon",
+            artifactclass="s-masters",
+        )
+        _add_asset_copy(
+            session,
+            item,
+            backend_id=pool.backend_id,
+            pool_id=pool.id,
+            verified=True,
+        )
+        intake = session.get(Intake, "intake-abandon")
+        assert intake is not None
+        intake.requested_profile = "hd-review"
+        target_key = make_target_key(item.id, "transcode")
+        _add_condition(session, target_key, CONDITION_BLOCKED)
+        _add_condition(session, make_target_key(item.id, "pfr-index"), CONDITION_SATISFIED)
+        assert intake.manifest_path is not None
+        staging_root = Path(intake.manifest_path).parent
+
+        held = run_retention(session, intake, actor="ops")
+        assert not held.released
+        assert held.reason == f"derivation:{target_key}:blocked"
+        assert abandon_retention(session, intake, actor="ops", reason="permanent tool block")
+        assert intake.retention_state == RetentionState.ABANDONED
+
+        release_after_abandon = run_retention(session, intake, actor="ops")
+        purge_after_abandon = sweep_staging(session, intake, actor="ops")
+        assert not release_after_abandon.released
+        assert release_after_abandon.reason == "state=abandoned"
+        assert not purge_after_abandon.purged
+        assert purge_after_abandon.reason == "abandoned"
+        assert intake.released_at is None
+        assert intake.staging_deleted_at is None
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(RetentionEvent)
+                .where(RetentionEvent.action == "released")
+            )
+            == 0
+        )
+        assert staging_root.exists()
+        assert item.item_metadata["source_path"]
+        assert Path(item.item_metadata["source_path"]).exists()
 
 
 def test_per_pool_existential_and_tombstone_are_global(

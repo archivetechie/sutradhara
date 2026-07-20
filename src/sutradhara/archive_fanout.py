@@ -1279,34 +1279,69 @@ def _members_from_manifest(
     manifest: dict[str, Any],
     inputs: Sequence[MemberInput],
 ) -> Sequence[BuiltMember]:
+    """Join manifest locators to source-owned member identity facts."""
+
     by_path = {member.member_path: member for member in inputs}
+    if len(by_path) != len(inputs):
+        raise ArchiveFanoutError("archive inputs contain duplicate member paths")
     raw_members = manifest.get("members", [])
-    if not raw_members:
+    if not isinstance(raw_members, list) or not raw_members:
         raise ArchiveFanoutError("rem manifest did not include member locators")
     built: list[BuiltMember] = []
+    seen: set[str] = set()
     for item in raw_members:
         if not isinstance(item, dict):
-            continue
-        path = str(item.get("path") or item.get("member_path"))
+            raise ArchiveFanoutError("rem manifest member must be an object")
+        raw_path = item.get("path") or item.get("member_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ArchiveFanoutError("rem manifest member is missing its path")
+        path = raw_path
         if path not in by_path:
             raise ArchiveFanoutError(f"rem manifest returned unknown member path {path!r}")
+        if path in seen:
+            raise ArchiveFanoutError(f"rem manifest duplicated member path {path!r}")
+        seen.add(path)
         source = by_path[path]
+        reported_size = item.get("size_bytes")
+        if reported_size != source.size_bytes:
+            raise ArchiveFanoutError(
+                f"rem manifest resized member {path!r}: "
+                f"{reported_size!r} != {source.size_bytes}"
+            )
+        reported_sha256 = item.get("sha256")
+        try:
+            reported_digest = bytes.fromhex(reported_sha256)
+        except (TypeError, ValueError):
+            raise ArchiveFanoutError(
+                f"rem manifest returned invalid file_sha256 for member {path!r}"
+            ) from None
+        if reported_digest != source.file_sha256:
+            raise ArchiveFanoutError(f"rem manifest rehashed member {path!r}")
+        try:
+            first_chunk_lba = int(item.get("first_chunk_lba", 0))
+        except (TypeError, ValueError):
+            raise ArchiveFanoutError(
+                f"rem manifest returned invalid first_chunk_lba for member {path!r}"
+            ) from None
         built.append(
             BuiltMember(
                 logical_asset_hash=source.logical_asset_hash,
-                member_path=path,
-                size_bytes=int(item.get("size_bytes", source.size_bytes)),
-                file_sha256=bytes.fromhex(str(item.get("sha256", source.file_sha256.hex()))),
+                member_path=source.member_path,
+                size_bytes=source.size_bytes,
+                file_sha256=source.file_sha256,
                 native_locator={
-                    "member_path": path,
-                    "first_chunk_lba": int(item.get("first_chunk_lba", 0)),
-                    "size_bytes": int(item.get("size_bytes", source.size_bytes)),
+                    "member_path": source.member_path,
+                    "first_chunk_lba": first_chunk_lba,
+                    "size_bytes": source.size_bytes,
                 },
                 ingest_item_id=(
                     None if item.get("ingest_item_id") is None else str(item.get("ingest_item_id"))
                 ),
             )
         )
+    omitted = sorted(by_path.keys() - seen)
+    if omitted:
+        raise ArchiveFanoutError(f"rem manifest omitted member paths: {omitted!r}")
     return built
 
 
