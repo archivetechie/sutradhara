@@ -28,6 +28,7 @@ from sutradhara.archive_fanout import (
     LocalArchiveBuilder,
     ManifestSigningError,
     MemberInput,
+    _members_from_manifest,
     build_bundle_copy_for_pool,
     flush_bundle,
 )
@@ -839,6 +840,63 @@ def test_member_locator_verification_runs_before_bundle_seals(
         assert bundle is not None
         assert bundle.status == "open"
         assert list(s.scalars(select(Copy))) == []
+
+
+def _manifest_inputs(tmp_path: Path) -> tuple[tuple[MemberInput, ...], dict[str, Any]]:
+    inputs = tuple(
+        MemberInput(
+            logical_asset_hash=_digest(payload),
+            member_path=path,
+            source_path=tmp_path / path,
+            size_bytes=len(payload),
+            file_sha256=_digest(payload),
+        )
+        for path, payload in (("one.bin", b"one"), ("two.bin", b"two"))
+    )
+    manifest = {
+        "members": [
+            {
+                "path": member.member_path,
+                "size_bytes": member.size_bytes,
+                "sha256": member.file_sha256.hex(),
+                "first_chunk_lba": index,
+            }
+            for index, member in enumerate(inputs, start=1)
+        ]
+    }
+    return inputs, manifest
+
+
+def test_rem_manifest_cannot_omit_an_input(tmp_path: Path) -> None:
+    inputs, manifest = _manifest_inputs(tmp_path)
+    manifest["members"].pop()
+
+    with pytest.raises(ArchiveFanoutError, match="omitted member paths"):
+        _members_from_manifest(manifest, inputs)
+
+
+def test_rem_manifest_cannot_duplicate_an_input(tmp_path: Path) -> None:
+    inputs, manifest = _manifest_inputs(tmp_path)
+    manifest["members"].append(dict(manifest["members"][0]))
+
+    with pytest.raises(ArchiveFanoutError, match="duplicated member path"):
+        _members_from_manifest(manifest, inputs)
+
+
+def test_rem_manifest_cannot_resize_an_input(tmp_path: Path) -> None:
+    inputs, manifest = _manifest_inputs(tmp_path)
+    manifest["members"][0]["size_bytes"] += 1
+
+    with pytest.raises(ArchiveFanoutError, match="resized member"):
+        _members_from_manifest(manifest, inputs)
+
+
+def test_rem_manifest_cannot_rehash_an_input(tmp_path: Path) -> None:
+    inputs, manifest = _manifest_inputs(tmp_path)
+    manifest["members"][0]["sha256"] = hashlib.sha256(b"different").hexdigest()
+
+    with pytest.raises(ArchiveFanoutError, match="rehashed member"):
+        _members_from_manifest(manifest, inputs)
 
 
 def test_restore_uses_policy_preference_and_falls_back_to_d2(

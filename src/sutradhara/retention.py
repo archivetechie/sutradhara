@@ -51,7 +51,7 @@ from sutradhara.catalog.types import (
 from sutradhara.durability import AssetTarget, durable_placements
 from sutradhara.intake import media_kind_for_path
 from sutradhara.jobs.models import ReconciliationCondition
-from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED, CONDITION_SATISFIED
+from sutradhara.jobs.reconcilers.conditions import CONDITION_SATISFIED
 from sutradhara.jobs.reconcilers.derivation import DOMAIN as DERIVATION_DOMAIN
 from sutradhara.jobs.reconcilers.derivation import make_target_key
 from sutradhara.jobs.reconcilers.profiles import entries_for
@@ -71,7 +71,7 @@ WITNESS_MAX_AGE = dt.timedelta(seconds=5)
 CLOUD_BLOB_PREFIX = "cloud-blob:"
 POLICY_FINGERPRINT_VERSION = "v1"
 TOMBSTONE_BASENAME_VERSION = "v1"
-TERMINAL_DERIVATION_CONDITIONS = {CONDITION_SATISFIED, CONDITION_BLOCKED}
+TERMINAL_DERIVATION_CONDITIONS = {CONDITION_SATISFIED}
 
 _EVENT_DETAIL_KEYS: dict[str, frozenset[str]] = {
     "released": frozenset({"copy_ids"}),
