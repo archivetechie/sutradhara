@@ -22,6 +22,7 @@ from sutradhara.backend.port import (
 )
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import (
+    ArtifactClass,
     ArtifactClassPool,
     Backend,
     Copy,
@@ -271,6 +272,7 @@ def test_scrub_discovery_is_satisfied_pending_until_verify_runs(
                 representation=Representation.RAW_BYTES.value,
             )
         )
+        session.add(ArtifactClass(name="masters"))
         session.add(ArtifactClassPool(artifactclass="masters", pool_id=pool_id))
         session.add(LogicalAsset(content_sha256=data_hash, size_bytes=len(payload)))
         session.add(
@@ -414,7 +416,11 @@ def test_scrub_existing_rao_copy_does_not_create_stored_digest_asset(
 ) -> None:
     asset_hash = _hash(b"plaintext asset")
     stored_digest = _hash(b"stored rao bytes")
-    locator = {"pool_id": "o-copy-1-pool", "object_id": "stored-rao"}
+    locator = {
+        "pool_id": "o-copy-1-pool",
+        "object_id": "stored-rao",
+        "tape_uuid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }
     now = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
 
     class _ExistingRaoBackend:

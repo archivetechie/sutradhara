@@ -1328,6 +1328,19 @@ def _seed_item(
         session.add(
             Pool(id=pool_id, backend_id=backend_row.id, representation=representation.value)
         )
+        apply_artifactclass_policy(
+            session,
+            artifactclass,
+            ArtifactClassPolicy(
+                ruleset=f"rm12a.{suffix}",
+                placements=(PlacementPolicy(pool_id),),
+                bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
+                restore_preference=(pool_id,),
+                expect="messy",
+                hdcache=HdcachePolicy(enabled=True, privacy_level=privacy_level),
+                durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
+            ),
+        )
         session.add(LogicalAsset(content_sha256=digest, size_bytes=len(payload)))
         session.add(
             Bundle(
@@ -1348,19 +1361,6 @@ def _seed_item(
                 file_sha256=digest,
             )
         )
-        apply_artifactclass_policy(
-            session,
-            artifactclass,
-            ArtifactClassPolicy(
-                ruleset=f"rm12a.{suffix}",
-                placements=(PlacementPolicy(pool_id),),
-                bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
-                restore_preference=(pool_id,),
-                expect="messy",
-                hdcache=HdcachePolicy(enabled=True, privacy_level=privacy_level),
-                durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
-            ),
-        )
         copy = Copy(
             bundle_id=bundle_id,
             backend_id=backend_row.id,
@@ -1378,10 +1378,7 @@ def _seed_item(
         )
         session.add(copy)
         session.flush()
-        locator_native: dict[str, object] = {
-            "member_path": member_path,
-            "size_bytes": len(payload),
-        }
+        locator_native: dict[str, object] = {"size_bytes": len(payload)}
         if block_range is not None:
             locator_native["block_range"] = block_range
         if representation is Representation.RAO_AEAD_V1:
@@ -1588,7 +1585,6 @@ def _add_archive_candidate(rig: _Rig, item_id: int, payload: bytes, *, suffix: s
                 bundle_id=primary.bundle_id,
                 member_path="payload.bin",
                 native_locator={
-                    "member_path": "payload.bin",
                     "size_bytes": len(payload),
                     "block_range": [len(prefix), len(prefix) + len(payload)],
                 },

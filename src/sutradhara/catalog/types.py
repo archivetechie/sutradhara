@@ -138,7 +138,6 @@ class IntakeSourceKind(StrEnum):
 class IntakeStatus(StrEnum):
     """Registration state for a landing intake."""
 
-    RECEIVING = "receiving"
     VERIFYING = "verifying"
     QUARANTINED = "quarantined"
     REGISTERED = "registered"
@@ -158,8 +157,6 @@ class ArrangementStatus(StrEnum):
     """Lifecycle for a mutable pre-archive arrangement workspace."""
 
     DRAFT = "draft"
-    PENDING_DERIVATIVES = "pending_derivatives"
-    READY = "ready"
     SUBMITTED = "submitted"
     ABANDONED = "abandoned"
 
@@ -174,6 +171,7 @@ class SubmissionStatus(StrEnum):
 class RetentionState(StrEnum):
     """Per-intake lifecycle for temporary-byte retention."""
 
+    NOT_APPLICABLE = "not_applicable"
     HELD = "held"
     RELEASED = "released"
     TOMBSTONED = "tombstoned"

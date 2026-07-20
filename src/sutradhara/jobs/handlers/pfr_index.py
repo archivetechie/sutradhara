@@ -279,7 +279,7 @@ def _assert_reason_matrix_closed() -> None:
 
 
 def _source_path(item: IngestItem) -> Path:
-    raw = (item.item_metadata or {}).get("source_path")
+    raw = item.source_path
     if not isinstance(raw, str) or not raw:
-        raise ValueError(f"ingest_item id={item.id} has no metadata.source_path")
+        raise ValueError(f"ingest_item id={item.id} has no source_path")
     return Path(raw)

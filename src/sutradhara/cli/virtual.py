@@ -274,13 +274,20 @@ def reject_cmd(asset_hash_hex: str, reason: str | None, actor: str | None) -> No
 
 @click.command("unreject")
 @click.argument("asset_hash_hex")
-def unreject_cmd(asset_hash_hex: str) -> None:
+@click.option("--reason", default=None, help="Reason recorded with the decision.")
+@click.option("--actor", default=None, help="Operator recorded with the decision.")
+def unreject_cmd(asset_hash_hex: str, reason: str | None, actor: str | None) -> None:
     """Clear the reject marker for one logical asset."""
 
     engine = make_engine()
     try:
         with session_scope(engine) as session:
-            asset = unreject_asset(session, _asset_hash(asset_hash_hex))
+            asset = unreject_asset(
+                session,
+                _asset_hash(asset_hash_hex),
+                actor=actor or _operator(),
+                reason=reason,
+            )
     except (ValueError, VirtualArrangementError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"unrejected {asset.content_sha256.hex()}")

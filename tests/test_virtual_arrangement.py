@@ -293,7 +293,7 @@ def test_reject_gates_restore_globally_and_preservation_is_ungated(
             force_rejected=True,
         )
         assert both.output_path.read_bytes() == b"reject me"
-        unreject_asset(session, asset_hash)
+        unreject_asset(session, asset_hash, actor="operator", reason="reconsidered")
         assert len(list_view(session, view)) == 1
 
 

@@ -443,7 +443,10 @@ def test_offsite_confirmation_receipt_is_atomic_and_revocation_supersedes(
     engine: Engine,
 ) -> None:
     copy_id = _seed_copy(engine)
-    media_id = f"memory:exempt:{copy_id}"
+    with session_scope(engine) as lookup:
+        copy = lookup.get(Copy, copy_id)
+        assert copy is not None
+        media_id = copy.media_id
     factory = make_session_factory(engine)
     session = factory()
     try:
@@ -587,7 +590,7 @@ def _append_retention_event(engine: Engine, *, ordinal: int, at: dt.datetime) ->
                 action="batch_invoked",
                 operation_id=f"batch-{ordinal}",
                 actor="ops",
-                at=at,
+                occurred_at=at,
                 detail={
                     "action": "release",
                     "limit": 25,

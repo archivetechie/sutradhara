@@ -37,7 +37,6 @@ from sutradhara.backend.port import (
     VerifyResult,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
-from sutradhara.jobs.runtime_observations import report_tape_locator
 from sutradhara.sealing.port import Representation
 
 _DEFAULT_DEVICE_ENV = Path("/var/lib/replica/d2tape/device.env")
@@ -121,7 +120,6 @@ class D2TapeBackend:
                 yield _record_from_sidecar_artifact(artifact)
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
-        report_tape_locator(locator)
         device = self._device_config()
         artifact_name = _required_str(locator, "artifact_name")
         start_block = _required_int(locator, "start_block")
@@ -177,7 +175,6 @@ class D2TapeBackend:
 
         if chunk_bytes <= 0:
             raise ValueError("chunk_bytes must be greater than zero")
-        report_tape_locator(locator)
         with tempfile.TemporaryDirectory(prefix="sutradhara-d2tape-restore-") as raw:
             restored = self._restore_payload(locator, Path(raw))
             size = restored.stat().st_size
@@ -193,7 +190,6 @@ class D2TapeBackend:
                 )
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
-        report_tape_locator(locator)
         device = self._device_config()
         artifact = self._artifact_for_locator(locator)
         expected = content_hash(bytes.fromhex(_required_str(artifact, "integrity_hash")))
@@ -227,9 +223,7 @@ class D2TapeBackend:
                     ok=False,
                     measured=True,
                     actual_hash=actual,
-                    detail=(
-                        f"expected {expected.hex()[:12]}..., got {actual.hex()[:12]}..."
-                    ),
+                    detail=(f"expected {expected.hex()[:12]}..., got {actual.hex()[:12]}..."),
                 )
         return VerifyResult(
             ok=False,
@@ -254,7 +248,6 @@ class D2TapeBackend:
         artifact_name = f"n-{digest.hex()[:16]}"
         relpath = f"{artifact_name}/{_PAYLOAD_NAME}"
         volume_uuid = self._volume_uuid_for(device)
-        report_tape_locator({"barcode": device.barcode, "volume_uuid": volume_uuid})
         state_path = self._state_path(device.barcode)
         state = self._load_state(device, volume_uuid)
         prev_end_block = state.get("last_end_block")

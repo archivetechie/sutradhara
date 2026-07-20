@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, selectinload
 from sutradhara.arrangement import canonical_member_path
 from sutradhara.catalog.models import (
     AssetLocator,
+    AssetReviewEvent,
     AssetTag,
     Bundle,
     Copy,
@@ -229,20 +230,46 @@ def reject_asset(
     if not actor:
         raise VirtualArrangementError("actor must be non-empty")
     asset = _get_asset(session, asset_hash)
-    asset.rejected_at = _utcnow()
+    decided_at = _utcnow()
+    asset.rejected_at = decided_at
     asset.rejected_by = actor
     asset.rejection_reason = reason
+    session.add(
+        AssetReviewEvent(
+            logical_asset_hash=asset_hash,
+            action="reject",
+            actor=actor,
+            reason=reason,
+            decided_at=decided_at,
+        )
+    )
     session.flush()
     return asset
 
 
-def unreject_asset(session: Session, asset_hash: bytes) -> LogicalAsset:
-    """Clear the reject marker for one logical asset."""
+def unreject_asset(
+    session: Session,
+    asset_hash: bytes,
+    *,
+    actor: str,
+    reason: str | None = None,
+) -> LogicalAsset:
+    """Clear the reject marker and append an attributed decision event."""
 
+    if not actor:
+        raise VirtualArrangementError("actor must be non-empty")
     asset = _get_asset(session, asset_hash)
     asset.rejected_at = None
     asset.rejected_by = None
     asset.rejection_reason = None
+    session.add(
+        AssetReviewEvent(
+            logical_asset_hash=asset_hash,
+            action="unreject",
+            actor=actor,
+            reason=reason,
+        )
+    )
     session.flush()
     return asset
 

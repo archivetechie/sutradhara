@@ -59,7 +59,6 @@ from sutradhara.replication import (
     PoolTarget,
     ReplicationError,
     ReplicationPolicyMissing,
-    _copy_media_id,
     target_pools,
 )
 from sutradhara.restore import _fsync_directory
@@ -1130,7 +1129,7 @@ def _pool_gate_status(
         elif witness.eligible and (witness.result is None or not witness.result.confirmed):
             saw_witness_hold = True
             continue
-        media_id = _copy_media_id(copy)
+        media_id = copy.media_id
         if target.offsite_gate:
             if not media_id:
                 saw_missing_media = True
@@ -1156,7 +1155,7 @@ def _pool_gate_status(
         target.offsite_gate,
         False,
         candidates[0].id,
-        _copy_media_id(candidates[0]),
+        candidates[0].media_id,
         reason,
     )
 
@@ -1566,9 +1565,9 @@ def _staging_root_for_intake(intake: Intake) -> Path | None:
     if intake.manifest_path:
         return Path(intake.manifest_path).absolute().parent
     source_paths = [
-        Path(value).absolute()
+        Path(item.source_path).absolute()
         for item in intake.items
-        if isinstance((value := item.item_metadata.get("source_path")), str) and value
+        if item.source_path
     ]
     if not source_paths:
         return None
@@ -1626,7 +1625,7 @@ def _confirmed_media_ids(session: Session) -> set[str]:
 
 def _known_media_id(session: Session, media_id: str) -> bool:
     return any(
-        _copy_media_id(copy) == media_id
+        copy.media_id == media_id
         for copy in session.scalars(select(Copy).where(Copy.deleted_at.is_(None)))
     )
 
@@ -1831,7 +1830,7 @@ def _add_event(
         action=action,
         operation_id=operation_id,
         actor=actor,
-        at=at or _utcnow(),
+        occurred_at=at or _utcnow(),
         detail=detail,
         supersedes_source=supersedes_source,
         supersedes_event_id=supersedes_event_id,

@@ -255,7 +255,7 @@ def _reindex_items(
         return [
             item
             for item in items
-            if isinstance((item.item_metadata or {}).get("pfr_sidecar_path"), str)
+            if isinstance(item.pfr_sidecar_path, str)
         ]
     selected: list[IngestItem] = []
     for item in items:

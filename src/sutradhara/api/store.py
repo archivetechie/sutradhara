@@ -31,6 +31,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from sutradhara.catalog.models import Base
 from sutradhara.catalog.session import make_session_factory
+from sutradhara.schema_conventions import vocabulary_check_sql
 
 DEFAULT_TTL = dt.timedelta(minutes=30)
 DEFAULT_HEARTBEAT_INTERVAL = dt.timedelta(seconds=5)
@@ -68,8 +69,7 @@ class IdempotencyRecord(Base):
             name="uq_idempotency_scope",
         ),
         CheckConstraint(
-            "status IN ('in_progress', 'completed', 'warned', 'authorized', 'started', "
-            "'committed', 'aborted', 'quarantined', 'failed')",
+            vocabulary_check_sql("status", "idempotency_status"),
             name="ck_idempotency_record_status",
         ),
         Index("ix_idempotency_record_last_heartbeat", "last_heartbeat"),
@@ -107,7 +107,8 @@ class IdempotencyRecord(Base):
         DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
+        DateTime(timezone=True), nullable=False, default=lambda: _utcnow(),
+        onupdate=lambda: _utcnow()
     )
     last_heartbeat: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
@@ -128,7 +129,8 @@ class SourceClaim(Base):
         DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
     )
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: _utcnow()
+        DateTime(timezone=True), nullable=False, default=lambda: _utcnow(),
+        onupdate=lambda: _utcnow()
     )
     last_heartbeat: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: _utcnow()

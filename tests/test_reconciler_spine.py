@@ -127,16 +127,10 @@ def test_due_backoff_observation_preserves_attempt_count(engine: Engine) -> None
 def test_condition_default_backoff_has_jitter_and_clamp_bounds() -> None:
     now = dt.datetime.now(dt.UTC)
     base = 120
-    samples = [
-        (_default_backoff_due(now, 2) - now).total_seconds()
-        for _index in range(50)
-    ]
+    samples = [(_default_backoff_due(now, 2) - now).total_seconds() for _index in range(50)]
 
     assert all(base * 0.8 <= sample <= base * 1.2 for sample in samples)
-    clamped = [
-        (_default_backoff_due(now, 7) - now).total_seconds()
-        for _index in range(50)
-    ]
+    clamped = [(_default_backoff_due(now, 7) - now).total_seconds() for _index in range(50)]
     assert all(sample <= 3600 for sample in clamped)
 
 
@@ -215,9 +209,9 @@ def test_reconcile_cli_lists_and_reopens_blocked_conditions(
         with session_scope(engine) as session:
             rows = {
                 row.target_key: row
-                for row in session.scalars(select(ReconciliationCondition).order_by(
-                    ReconciliationCondition.target_key
-                ))
+                for row in session.scalars(
+                    select(ReconciliationCondition).order_by(ReconciliationCondition.target_key)
+                )
             }
             reopened_row = rows["asset:" + "1" * 64 + ":pool-a"]
             held_row = rows["asset:" + "2" * 64 + ":pool-a"]
@@ -227,7 +221,9 @@ def test_reconcile_cli_lists_and_reopens_blocked_conditions(
             assert reopened_row.blocked_tool_version is None
             assert reopened_row.attempt_count == 0
             assert reopened_row.next_eligible_at is not None
-            assert "reopened by" in (reopened_row.message or "")
+            assert reopened_row.reopened_by
+            assert reopened_row.reopened_at is not None
+            assert reopened_row.message == "operator reopen"
             assert held_row.condition == CONDITION_BLOCKED
             assert held_row.reason == "drive-error"
     finally:
@@ -307,8 +303,9 @@ def test_record_fix_reopens_only_exact_component_snapshot(
             }
             assert rows["match-a"].condition == CONDITION_OPEN
             assert rows["match-a"].last_attempt_id is None
-            assert "reopened by operator-a" in (rows["match-a"].message or "")
-            assert "tape replaced" in (rows["match-a"].message or "")
+            assert rows["match-a"].reopened_by == "operator-a"
+            assert rows["match-a"].reopened_at is not None
+            assert rows["match-a"].message == "tape replaced"
             assert rows["match-a"].attempt_count == 0
             assert rows["other"].condition == CONDITION_BLOCKED
     finally:
@@ -348,10 +345,7 @@ def test_version_bump_reopens_only_changed_known_tool_versions(engine: Engine) -
 
             assert reopen_version_bumped(session, "copy") == 1
 
-            rows = {
-                row.target_key: row
-                for row in session.scalars(select(ReconciliationCondition))
-            }
+            rows = {row.target_key: row for row in session.scalars(select(ReconciliationCondition))}
             assert rows["diff"].condition == CONDITION_OPEN
             assert rows["diff"].reason is None
             assert rows["diff"].blocked_tool_name is None

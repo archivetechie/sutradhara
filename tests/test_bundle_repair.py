@@ -14,7 +14,6 @@ from sqlalchemy import Engine, select
 from sutradhara.archive_bundle import add_bundle_member
 from sutradhara.archive_fanout import (
     BuildArtifact,
-    BuiltBlobRoot,
     BuiltExclusion,
     LocalArchiveBuilder,
     flush_bundle,
@@ -39,7 +38,6 @@ from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     AssetLocator,
     Backend,
-    BlobRoot,
     Bundle,
     Copy,
     ExclusionRecord,
@@ -144,12 +142,6 @@ class _OutputsBuilder(LocalArchiveBuilder):
         artifact = super().build(**kwargs)
         return replace(
             artifact,
-            blob_roots=(
-                BuiltBlobRoot(
-                    root_path="root",
-                    native_locator={"member_path": "root", "offset": 0},
-                ),
-            ),
             exclusions=(BuiltExclusion(path="skip.tmp", reason="test-exclusion"),),
         )
 
@@ -186,14 +178,13 @@ def test_bundle_repair_rebuilds_missing_pool_after_staging_purge(
         ).one()
         locators = list(s.scalars(select(AssetLocator).where(AssetLocator.copy_id == repaired.id)))
         assert len(locators) == len(assets)
-        assert len(list(s.scalars(select(BlobRoot).where(BlobRoot.copy_id == repaired.id)))) == 1
         assert len(list(s.scalars(select(ExclusionRecord)))) == old_exclusion_count
         for locator in locators:
             assert read_member_bytes(backend, repaired, locator, work_dir=tmp_path) == assets[
                 locator.logical_asset_hash
             ]
         attempt = s.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
-        assert "tape:D2BAR000003" in attempt.detail["components"]
+        assert "tape:d2tape:D2BAR000003" in attempt.detail["components"]
 
 
 def test_bundle_repair_marks_corrupt_source_suspect_and_falls_back(

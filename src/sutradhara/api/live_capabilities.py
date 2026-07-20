@@ -26,6 +26,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 from sutradhara.api.identity import GROUP_CAPABILITIES
 from sutradhara.catalog.models import Base
 from sutradhara.catalog.session import make_session_factory
+from sutradhara.schema_conventions import vocabulary_check_sql
 
 LOG = logging.getLogger(__name__)
 KNOWN_CAPABILITIES = frozenset(cap for grants in GROUP_CAPABILITIES.values() for cap in grants)
@@ -48,8 +49,7 @@ class OperatorLiveCapability(Base):
     __tablename__ = "operator_live_capability"
     __table_args__ = (
         CheckConstraint(
-            "capability IN ('can_view', 'can_receive', 'can_restore', 'can_logs', "
-            "'can_admin', 'can_restore_p2', 'can_restore_p3')",
+            vocabulary_check_sql("capability", "operator_capability"),
             name="ck_operator_live_capability_value",
         ),
         UniqueConstraint("operator", "capability", name="uq_operator_live_capability"),

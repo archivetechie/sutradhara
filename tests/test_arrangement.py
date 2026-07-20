@@ -27,6 +27,7 @@ from sutradhara.arrangement import (
 )
 from sutradhara.catalog.models import (
     Arrangement,
+    ArtifactClass,
     AssetDerivation,
     IngestItem,
     Intake,
@@ -48,6 +49,8 @@ from sutradhara.cli.arrangement import _arrangement_payload
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add(ArtifactClass(name="s-masters"))
     try:
         yield eng
     finally:
@@ -84,6 +87,7 @@ def test_create_from_intake_selects_masters_only(engine: Engine, tmp_path: Path)
         intake.status = IntakeStatus.VERIFYING
         with pytest.raises(ArrangementError, match="requires registered"):
             create_from_intake(session, "intake-a", label="bad")
+        intake.status = IntakeStatus.REGISTERED
 
 
 def test_create_all_arrangement_lineage_column_exists(engine: Engine) -> None:
@@ -178,7 +182,7 @@ def test_arrangement_lineage_exposed_in_summary_and_cli_payload(
 def test_move_touches_only_arrangement(engine: Engine, tmp_path: Path) -> None:
     with session_scope(engine) as session:
         item = _registered_intake(session, tmp_path, "intake-b", ["DCIM/A.mov"])[0]
-        original = (item.as_received_path, item.virtual_path, item.item_metadata["source_path"])
+        original = (item.as_received_path, item.virtual_path, item.source_path)
         arrangement = create_from_intake(session, "intake-b", label="moves")
 
         move_member(session, arrangement.id, "DCIM/A.mov", "satsang/day-1/A.mov")
@@ -186,9 +190,9 @@ def test_move_touches_only_arrangement(engine: Engine, tmp_path: Path) -> None:
         assert (
             item.as_received_path,
             item.virtual_path,
-            item.item_metadata["source_path"],
+            item.source_path,
         ) == original
-        assert Path(str(item.item_metadata["source_path"])).exists()
+        assert Path(str(item.source_path)).exists()
         assert arrangement.members[0].member_path == "satsang/day-1/A.mov"
 
 
@@ -291,8 +295,8 @@ def test_submit_emits_source_map_manifest_and_queryable_rows(
             items[0].logical_asset_hash,
         ]
         assert [row.source_path for row in mirror] == [
-            items[1].item_metadata["source_path"],
-            items[0].item_metadata["source_path"],
+            items[1].source_path,
+            items[0].source_path,
         ]
 
 
@@ -368,7 +372,7 @@ def test_submit_rejects_changed_source_bytes_without_db_row(
         item = _registered_intake(session, tmp_path, "intake-f", ["clip.mov"])[0]
         arrangement = create_from_intake(session, "intake-f", label="changed")
         arrangement_id = arrangement.id
-        Path(str(item.item_metadata["source_path"])).write_bytes(b"changed")
+        Path(str(item.source_path)).write_bytes(b"changed")
 
     with pytest.raises(ArrangementError, match="hashes to"):
         _submit_changed_source(engine, arrangement_id, submission_root)
@@ -387,7 +391,7 @@ def test_submit_rejects_missing_source_without_db_row(
         item = _registered_intake(session, tmp_path, "intake-missing", ["clip.mov"])[0]
         arrangement = create_from_intake(session, "intake-missing", label="missing")
         arrangement_id = arrangement.id
-        Path(str(item.item_metadata["source_path"])).unlink()
+        Path(str(item.source_path)).unlink()
 
     submit_missing = "missing-submit"
     with pytest.raises(ArrangementError, match="missing or not a file"):
@@ -504,6 +508,7 @@ def test_interleaved_concurrent_submit_hits_status_guard_before_insert(
     submission_root = tmp_path / "submissions"
     try:
         with session_scope(engine) as session:
+            session.add(ArtifactClass(name="s-masters"))
             _registered_intake(session, tmp_path, "intake-race", ["clip.mov"])
             arrangement = create_from_intake(session, "intake-race", label="race")
             arrangement_id = arrangement.id
@@ -624,7 +629,8 @@ def _add_item(
         st_ino=source.stat().st_ino,
         size_bytes=len(data),
         artifactclass="s-masters",
-        item_metadata={"source_path": str(source)},
+        source_path=str(source),
+        item_metadata={},
     )
     session.add(item)
     session.flush()

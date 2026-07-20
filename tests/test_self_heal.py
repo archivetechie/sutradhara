@@ -30,6 +30,7 @@ from sutradhara.backend.port import (
 )
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import (
+    ArtifactClass,
     ArtifactClassPool,
     Backend,
     Copy,
@@ -220,6 +221,7 @@ def _add_asset(engine: Engine, data: bytes) -> ContentHash:
 
 def _add_o_archive_pools(engine: Engine, backend_id: int) -> None:
     with session_scope(engine) as s:
+        s.add(ArtifactClass(name="o-archive"))
         s.add(
             Pool(
                 id="o-copy-1-pool",
@@ -344,7 +346,10 @@ def test_wrapper_reuses_repair_identity_for_retry_but_not_later_execution(
             session,
             logical_asset_hash=asset_hash,
             backend_id=backend_id,
-            native_locator={"object_id": "execution-source"},
+            native_locator={
+                "object_id": "execution-source",
+                "tape_uuid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
             health=CopyHealth.OK,

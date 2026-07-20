@@ -49,8 +49,6 @@ MANIFEST_NAME = "manifest-sha256.txt"
 SOURCE_MAP_COLUMNS = ("archive_path", "source_path", "sha256", "size", "ingest_item_id")
 MUTABLE_ARRANGEMENT_STATUSES = {
     ArrangementStatus.DRAFT,
-    ArrangementStatus.PENDING_DERIVATIVES,
-    ArrangementStatus.READY,
 }
 
 
@@ -227,6 +225,28 @@ def include_member(session: Session, arrangement_id: int, member_path: str) -> A
     except IntegrityError as exc:
         raise ArrangementError(f"duplicate active archive path {archive_path!r}") from exc
     return member
+
+
+def abandon_arrangement(
+    session: Session,
+    arrangement_id: int,
+    *,
+    actor: str,
+    reason: str | None = None,
+) -> Arrangement:
+    """Abandon one draft arrangement through the sole lifecycle verb."""
+
+    if not actor:
+        raise ArrangementError("actor must be non-empty")
+    arrangement = _get_mutable_arrangement(session, arrangement_id)
+    now = _utcnow()
+    arrangement.status = ArrangementStatus.ABANDONED
+    arrangement.abandoned_at = now
+    arrangement.abandoned_by = actor
+    arrangement.abandonment_reason = reason
+    arrangement.updated_at = now
+    session.flush([arrangement])
+    return arrangement
 
 
 def list_arrangements(session: Session) -> list[ArrangementSummary]:
@@ -601,9 +621,9 @@ def _validate_live_master(session: Session, item: IngestItem) -> None:
 
 
 def _source_path_for_item(item: IngestItem) -> str:
-    value = item.item_metadata.get("source_path") if item.item_metadata else None
+    value = item.source_path
     if not isinstance(value, str) or not value:
-        raise ArrangementError(f"item {item.id} has no item_metadata['source_path']")
+        raise ArrangementError(f"item {item.id} has no source_path")
     return value
 
 

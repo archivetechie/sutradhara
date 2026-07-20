@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 import sutradhara.jobs.handlers  # noqa: F401 -- register built-in handlers
 from sutradhara.catalog.facts import record_derivation
 from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
     ArtifactClassPool,
     AssetDerivation,
     Backend,
@@ -50,9 +51,22 @@ from sutradhara.sealing.port import Representation
 
 
 @pytest.fixture
-def engine() -> Iterator[Engine]:
+def engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Engine]:
+    monkeypatch.setenv("SUTRADHARA_CACHE_ROOT", str(tmp_path / "cache"))
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        for artifactclass in ("s-masters", "s-proxy"):
+            session.add(
+                ArtifactClassPolicyRecord(
+                    artifactclass=artifactclass,
+                    ruleset=f"test.{artifactclass}.v1",
+                    expect="compliant",
+                    target_bytes=0,
+                    max_age_seconds=0,
+                    restore_preference=[],
+                )
+            )
     yield eng
     eng.dispose()
 
@@ -215,7 +229,9 @@ def test_pfr_sidecar_observation_has_no_derived_item_or_copy(
 
         item = session.get(IngestItem, item_id)
         assert item is not None
-        assert Path(item.item_metadata["pfr_sidecar_path"]).exists()
+        assert item.pfr_sidecar_path is not None
+        assert Path(item.pfr_sidecar_path).exists()
+        assert "pfr_sidecar_path" not in item.item_metadata
         target_key = derivation_reconciler.make_target_key(item_id, "pfr-index")
         assert _condition(session, target_key).condition == CONDITION_SATISFIED
         assert session.scalar(select(func.count()).select_from(AssetDerivation)) == 0

@@ -16,7 +16,6 @@ from sqlalchemy.orm import Session
 from sutradhara.catalog.models import Copy, Intake
 from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.catalog.types import RetentionState
-from sutradhara.replication import _copy_media_id
 from sutradhara.retention import (
     DEFAULT_STAGING_GRACE_DAYS,
     RetentionBatchResult,
@@ -488,7 +487,7 @@ def _resolve_media_id(
     assert tape is not None
     matches: set[str] = set()
     for copy in session.scalars(select(Copy).where(Copy.deleted_at.is_(None))):
-        canonical = _copy_media_id(copy)
+        canonical = copy.media_id
         if canonical is None:
             continue
         locator_labels = {

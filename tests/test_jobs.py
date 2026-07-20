@@ -21,7 +21,7 @@ from sutradhara.api.identity import parse_identity
 from sutradhara.backend import factory as backend_factory
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.backend.port import StorageBackend
-from sutradhara.catalog.models import Backend, Copy, LogicalAsset, VerifyReceipt
+from sutradhara.catalog.models import ArtifactClass, Backend, Copy, LogicalAsset, VerifyReceipt
 from sutradhara.catalog.session import (
     create_all,
     locator_key,
@@ -73,6 +73,8 @@ from sutradhara.structured_logs import configure_structured_stdout_logging
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")
     create_all(eng)
+    with session_scope(eng) as session:
+        session.add(ArtifactClass(name="s-masters"))
     yield eng
     eng.dispose()
 
@@ -898,6 +900,9 @@ def _seed_memory_backend(
     engine: Engine,
     content: bytes,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    kind: BackendKind = BackendKind.MEMORY,
+    locator_extra: dict[str, object] | None = None,
 ) -> tuple[int, MemoryBackend]:
     """Insert a backend row + an asset/copy row pointing into a MemoryBackend.
 
@@ -910,11 +915,11 @@ def _seed_memory_backend(
     backend_impl = MemoryBackend("test-mem")
     h = backend_impl.add(content)
 
-    locator = {"hash_hex": h.hex()}
+    locator = {"hash_hex": h.hex(), **(locator_extra or {})}
     with session_scope(engine) as s:
         backend_row = Backend(
             name="test-mem",
-            kind=BackendKind.MEMORY,
+            kind=kind,
             tier=BackendTier.SELF_DESCRIBING,
         )
         s.add(backend_row)
@@ -968,20 +973,23 @@ def test_verify_handler_attempt_records_d2_tape_component(
     engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    copy_id, _ = _seed_memory_backend(engine, b"d2 verify bytes", monkeypatch)
     barcode = "D2VERIFY01"
+    copy_id, _ = _seed_memory_backend(
+        engine,
+        b"d2 verify bytes",
+        monkeypatch,
+        kind=BackendKind.D2_TAPE,
+        locator_extra={"barcode": barcode},
+    )
 
     with session_scope(engine) as session:
         copy = session.get(Copy, copy_id)
         assert copy is not None
-        copy.backend.kind = BackendKind.D2_TAPE
-        copy.native_locator = {**copy.native_locator, "barcode": barcode}
-        copy.native_locator_key = locator_key(copy.native_locator)
         job = submit(session, "verify", {"copy_id": copy_id})
         assert run_one(session, job.id).ok
 
         attempt = session.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
-        assert f"tape:{barcode}" in attempt.detail["components"]
+        assert f"tape:d2tape:{barcode}" in attempt.detail["components"]
 
 
 def test_verify_detects_corruption_marks_corrupt_and_succeeds(
@@ -1718,4 +1726,4 @@ def test_restore_handler_runs_gated_request_item(
         assert job.step_state["restore"]["restore_request_item_id"] == item_id
         assert job.step_state["restore"]["source"] == "tape"
         attempt = s.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
-        assert f"tape:{barcode}" in attempt.detail["components"]
+        assert f"tape:d2tape:{barcode}" in attempt.detail["components"]

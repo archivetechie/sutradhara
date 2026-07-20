@@ -75,14 +75,15 @@ class JobContext:
     ) -> None:
         """Record fields returned by an opened Remanence tape session."""
 
-        self.observe(
-            {
-                "session_id": _identity_text(session_id),
-                "drive_element_address": drive_element_address,
-            }
-        )
+        observation: dict[str, Any] = {
+            "session_id": _identity_text(session_id),
+            "drive_element_address": drive_element_address,
+        }
         if tape_uuid is not None:
-            self.touch(f"tape:{_identity_text(tape_uuid)}")
+            observation["tape_uuid"] = _identity_text(tape_uuid)
+        if library is not None:
+            observation["library"] = _identity_text(library)
+        self.observe(observation)
         drive = f"drive:{drive_element_address}"
         if library is None:
             self.touch(drive)

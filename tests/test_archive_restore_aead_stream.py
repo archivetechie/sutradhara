@@ -82,7 +82,7 @@ class _StreamingObjectBackend:
 
     def add(self, object_id: str, data: bytes) -> BackendLocator:
         self.objects[object_id] = data
-        return {"object_id": object_id}
+        return {"object_id": object_id, "tape_uuid": object_id}
 
     def enumerate(self) -> Iterator[CopyRecord]:
         return iter(())
@@ -370,6 +370,18 @@ def _install_candidates(
             )
             for pool_id in pool_ids
         )
+        apply_artifactclass_policy(
+            session,
+            "aead-test",
+            ArtifactClassPolicy(
+                ruleset="rao.aead.stream.test",
+                placements=tuple(PlacementPolicy(pool_id) for pool_id in pool_ids),
+                bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
+                restore_preference=tuple(pool_ids),
+                expect="messy",
+                durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
+            ),
+        )
         session.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(logical)))
         session.add(
             Bundle(
@@ -389,18 +401,6 @@ def _install_candidates(
                 size_bytes=len(logical),
                 file_sha256=asset_hash,
             )
-        )
-        apply_artifactclass_policy(
-            session,
-            "aead-test",
-            ArtifactClassPolicy(
-                ruleset="rao.aead.stream.test",
-                placements=tuple(PlacementPolicy(pool_id) for pool_id in pool_ids),
-                bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
-                restore_preference=tuple(pool_ids),
-                expect="messy",
-                durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
-            ),
         )
         copy_ids: list[int] = []
         for index, (pool_id, stored) in enumerate(zip(pool_ids, stored_candidates, strict=True)):
@@ -432,7 +432,6 @@ def _install_candidates(
                     bundle_id="aead-test-bundle",
                     member_path="asset.bin",
                     native_locator={
-                        "member_path": "asset.bin",
                         # RAO reserves chunk 0 for the pax/rao header; the member payload
                         # begins at chunk 1 (member_byte_base = 1 * RAO_CHUNK_SIZE), matching
                         # the real sealed object's data_offset. (Was 0 — which sliced the

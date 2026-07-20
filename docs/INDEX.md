@@ -11,6 +11,8 @@
 - [Database schema reference](reference-database-schema.md) — authoritative tables,
   constraints, evidence projections, retention receipts, and compatibility
   downgrade export policy.
+- [Schema conventions](reference-schema-conventions.md) — executable P1
+  vocabulary/FK/clock manifest and P5 persistent-field writer/reader ownership.
 - [Retention evidence journal](reference-retention-journal.md) — locked chained
   export, append-only DR shipping, checking, corrections, and ops alarms.
 - [Glossary](reference-glossary.md) — project terminology.

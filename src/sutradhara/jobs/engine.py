@@ -11,7 +11,6 @@ import datetime as dt
 import socket
 import traceback
 from collections.abc import Sequence
-from functools import partial
 from typing import Any, cast
 
 from sqlalchemy import select, update
@@ -20,7 +19,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sutradhara.jobs.attempts import record_attempt
-from sutradhara.jobs.components import touch_tape_locator
 from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.leases import LeaseManager, normalize_required_resources
 from sutradhara.jobs.models import (
@@ -45,7 +43,6 @@ from sutradhara.jobs.registry import (
 )
 from sutradhara.jobs.runtime_observations import (
     bind_session_open_observer,
-    bind_tape_locator_observer,
 )
 
 
@@ -165,10 +162,7 @@ def run_one(
         return JobResult(ok=False, detail=str(e))
 
     try:
-        with (
-            bind_session_open_observer(ctx.observe_session_open),
-            bind_tape_locator_observer(partial(touch_tape_locator, ctx)),
-        ):
+        with bind_session_open_observer(ctx.observe_session_open):
             result = _invoke_handler_in_savepoint(session, ctx, handler)
     except NotImplementedError as e:
         job.status = JobStatus.FAILED
@@ -450,10 +444,6 @@ def _touch_param_components(ctx: JobContext, params: dict[str, Any]) -> None:
         if value is not None:
             suffix = value if value.startswith("sha256:") else f"sha256:{value}"
             ctx.touch(f"asset:{suffix}")
-    for key in ("tape", "tape_id", "tape_uuid", "media_id"):
-        value = _component_value(params.get(key))
-        if value is not None:
-            ctx.touch(f"tape:{value}")
     for key in ("drive", "drive_id", "drive_element_address"):
         value = _component_value(params.get(key))
         if value is not None:

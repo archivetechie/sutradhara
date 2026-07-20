@@ -12,18 +12,21 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 from sqlalchemy import Engine, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import sutradhara.cli.retention as retention_cli
 import sutradhara.retention as retention_module
-from sutradhara.arrangement import ArrangementError, create_from_intake
+from sutradhara.arrangement import ArrangementError, abandon_arrangement, create_from_intake
 from sutradhara.backend.port import ByteRange, VerifyResult, WitnessResult
 from sutradhara.catalog.models import (
     Arrangement,
+    ArtifactClass,
     ArtifactClassPool,
     AssetLocator,
     Backend,
     Bundle,
+    BundleMember,
     Copy,
     IngestItem,
     Intake,
@@ -235,6 +238,15 @@ def test_bundle_asset_locator_copy_counts_for_durability(
         bundle = Bundle(id="submission-sub-a", artifactclass="s-masters", status="sealed")
         session.add(bundle)
         session.flush()
+        session.add(
+            BundleMember(
+                bundle_id=bundle.id,
+                logical_asset_hash=item.logical_asset_hash,
+                member_path=item.as_received_path,
+                size_bytes=item.size_bytes,
+                file_sha256=item.logical_asset_hash,
+            )
+        )
         locator = {"tape_uuid": "tape-b", "object_id": "bundle-copy"}
         copy = Copy(
             bundle_id=bundle.id,
@@ -268,9 +280,11 @@ def test_bundle_asset_locator_copy_counts_for_durability(
         assert releasable(session, "intake-b")
 
 
-def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
+@pytest.mark.parametrize("mismatch", ["copy-pool", "bundle-member"])
+def test_bundle_locator_identity_chain_mismatch_is_rejected(
     engine: Engine,
     tmp_path: Path,
+    mismatch: str,
 ) -> None:
     with session_scope(engine) as session:
         offsite = _add_pool(
@@ -292,6 +306,15 @@ def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
         bundle = Bundle(id="submission-mismatch", artifactclass="s-masters", status="sealed")
         session.add(bundle)
         session.flush()
+        session.add(
+            BundleMember(
+                bundle_id=bundle.id,
+                logical_asset_hash=item.logical_asset_hash,
+                member_path=item.as_received_path,
+                size_bytes=item.size_bytes,
+                file_sha256=item.logical_asset_hash,
+            )
+        )
         locator = {"tape_uuid": "tape-mismatch", "object_id": "bundle-copy"}
         copy = Copy(
             bundle_id=bundle.id,
@@ -312,25 +335,19 @@ def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
         session.add(
             AssetLocator(
                 logical_asset_hash=item.logical_asset_hash,
-                pool_id=wrong_pool.id,
+                pool_id=wrong_pool.id if mismatch == "copy-pool" else offsite.id,
                 copy_id=copy.id,
                 bundle_id=bundle.id,
                 native_locator={"first_chunk_lba": 1, "size_bytes": item.size_bytes},
-                member_path=item.as_received_path,
+                member_path=(
+                    "missing/member.mov" if mismatch == "bundle-member" else item.as_received_path
+                ),
                 representation=Representation.RAO_PLAIN_V1.value,
             )
         )
-        confirm_offsite(session, media_id="tape:tape-mismatch", confirmed_by="ops")
-
-        status = retention_module.retention_status(session, "intake-mismatch")
-
-    assert not status.releasable
-    [asset] = status.assets
-    [pool_status] = asset.pools
-    assert pool_status.pool_id == "offsite-pool"
-    assert pool_status.satisfied is False
-    assert pool_status.copy_id is None
-    assert pool_status.reason == "no-verified-copy"
+        with pytest.raises(IntegrityError, match="FOREIGN KEY"):
+            session.flush()
+        session.rollback()
 
 
 def test_landing_holds_arrangement_and_prepared_profile_fail_closed(
@@ -364,7 +381,9 @@ def test_landing_holds_arrangement_and_prepared_profile_fail_closed(
         arrangement.submission_id = None
         assert not releasable(session, "intake-c")
 
-        arrangement.status = ArrangementStatus.ABANDONED
+        arrangement.status = ArrangementStatus.DRAFT
+        session.flush([arrangement])
+        abandon_arrangement(session, arrangement.id, actor="ops", reason="not needed")
         intake = session.get(Intake, "intake-c")
         assert intake is not None
         intake.requested_profile = "hd-review"
@@ -449,8 +468,8 @@ def test_abandon_terminates_blocked_retention_without_releasing_or_purging(
             == 0
         )
         assert staging_root.exists()
-        assert item.item_metadata["source_path"]
-        assert Path(item.item_metadata["source_path"]).exists()
+        assert item.source_path
+        assert Path(item.source_path).exists()
 
 
 def test_per_pool_existential_and_tombstone_are_global(
@@ -1230,6 +1249,8 @@ def _add_pool(
     offsite_gate: bool = False,
     kind: BackendKind = BackendKind.MEMORY,
 ) -> Pool:
+    if session.get(ArtifactClass, artifactclass) is None:
+        session.add(ArtifactClass(name=artifactclass))
     backend = Backend(
         name=f"backend-{pool_id}",
         kind=kind,
@@ -1293,7 +1314,8 @@ def _add_intake_with_item(
         virtual_path=relpath,
         size_bytes=len(data),
         artifactclass=artifactclass,
-        item_metadata={"source_path": str(source)},
+        source_path=str(source),
+        item_metadata={},
     )
     session.add(item)
     session.flush()
@@ -1308,6 +1330,8 @@ def _add_empty_intake(
     status: IntakeStatus,
     artifactclass: str = "s-masters",
 ) -> Intake:
+    if session.get(ArtifactClass, artifactclass) is None:
+        session.add(ArtifactClass(name=artifactclass))
     intake_root = tmp_path / intake_id
     intake_root.mkdir(parents=True, exist_ok=True)
     manifest = intake_root / "manifest-sha256.txt"
@@ -1328,7 +1352,11 @@ def _add_empty_intake(
         status=status,
         registered_at=_now() if status == IntakeStatus.REGISTERED else None,
         quarantined_at=_now() if status == IntakeStatus.QUARANTINED else None,
-        retention_state=RetentionState.HELD,
+        retention_state=(
+            RetentionState.HELD
+            if status == IntakeStatus.REGISTERED
+            else RetentionState.NOT_APPLICABLE
+        ),
     )
     session.add(intake)
     session.flush()
@@ -1368,6 +1396,8 @@ def _add_asset_copy(
 
 
 def _add_cloud_copy(session: Session, intake_id: str, locator: dict[str, str]) -> Copy:
+    if session.get(ArtifactClass, "cloud-temp") is None:
+        session.add(ArtifactClass(name="cloud-temp"))
     backend = Backend(
         name="cloud-temp",
         kind=BackendKind.MEMORY,

@@ -15,7 +15,13 @@ from sutradhara.artifactclass_policy import (
     get_artifactclass_policy,
     parse_artifactclass_policy,
 )
-from sutradhara.catalog.models import ArtifactClassPolicyRecord, ArtifactClassPool, Backend, Pool
+from sutradhara.catalog.models import (
+    ArtifactClass,
+    ArtifactClassPolicyRecord,
+    ArtifactClassPool,
+    Backend,
+    Pool,
+)
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier
 from sutradhara.sealing.port import Representation
@@ -233,6 +239,7 @@ def test_apply_artifactclass_policy_upserts_memberships(engine: Engine) -> None:
         s.flush()
         s.add_all(
             [
+                ArtifactClass(name="o-archive"),
                 Pool(
                     id="o-copy-1-pool",
                     backend_id=backend.id,

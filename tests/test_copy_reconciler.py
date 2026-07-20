@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
     ArtifactClassPool,
     Backend,
     IngestItem,
@@ -269,6 +270,7 @@ def _add_registered_asset_with_pool(
 def _add_registered_asset(engine: Engine, data: bytes, artifactclass: str) -> bytes:
     asset_hash = hashlib.sha256(data).digest()
     with session_scope(engine) as session:
+        _ensure_artifactclass_policy(session, artifactclass)
         session.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(data)))
         _add_membership_rows(
             session,
@@ -287,7 +289,22 @@ def _add_membership(
     intake_id: str,
 ) -> None:
     with session_scope(engine) as session:
+        _ensure_artifactclass_policy(session, artifactclass)
         _add_membership_rows(session, asset_hash, artifactclass, intake_id=intake_id)
+
+
+def _ensure_artifactclass_policy(session: Session, artifactclass: str) -> None:
+    if session.get(ArtifactClassPolicyRecord, artifactclass) is None:
+        session.add(
+            ArtifactClassPolicyRecord(
+                artifactclass=artifactclass,
+                ruleset=f"test.{artifactclass}.v1",
+                expect="compliant",
+                target_bytes=0,
+                max_age_seconds=0,
+                restore_preference=[],
+            )
+        )
 
 
 def _add_membership_rows(
@@ -366,7 +383,11 @@ def _record_healthy_copy(ctx: JobContext) -> JobResult:
         logical_asset_hash=asset_hash,
         backend_id=backend.id,
         pool_id=params["pool_id"],
-        native_locator={"pool_id": params["pool_id"], "asset": params["asset_hash"]},
+        native_locator={
+            "pool_id": params["pool_id"],
+            "asset": params["asset_hash"],
+            "tape_uuid": params["pool_id"],
+        },
         integrity_hash=asset_hash,
         source=CopySource.INGEST,
         health=CopyHealth.OK,

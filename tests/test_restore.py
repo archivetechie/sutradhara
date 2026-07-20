@@ -19,7 +19,14 @@ from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from sutradhara.backend.memory import MemoryBackend
-from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset, VerifyReceipt
+from sutradhara.catalog.models import (
+    ArtifactClass,
+    Backend,
+    Bundle,
+    Copy,
+    LogicalAsset,
+    VerifyReceipt,
+)
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
 from sutradhara.restore import (
@@ -356,6 +363,7 @@ def test_restore_rejects_missing_bundle_and_bad_representation(
     bundle_hash = backend.add(bundle_bytes)
     with session_scope(engine) as s:
         backend_row = _add_backend_row(s)
+        s.add(ArtifactClass(name="o-archive"))
         bundle = Bundle(id="bundle-1", artifactclass="o-archive")
         s.add(bundle)
         s.flush()

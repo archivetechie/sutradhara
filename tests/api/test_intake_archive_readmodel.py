@@ -959,7 +959,8 @@ def _add_item(
         virtual_path=virtual_path,
         size_bytes=session.get(LogicalAsset, digest).size_bytes,
         artifactclass=artifactclass,
-        item_metadata={"source_path": as_received_path},
+        source_path=as_received_path,
+        item_metadata={},
         created_at=created_at,
     )
     session.add(item)
@@ -985,7 +986,7 @@ def _add_backend_pool(
         backend_id=backend.id,
         representation="RAO_PLAIN",
         location="test",
-        tier="archive",
+        storage_class="archive",
     )
     session.add(pool)
     session.flush([pool])
@@ -1106,7 +1107,7 @@ def _add_archived_submission_member(
             submission_id=submission_id,
             ingest_item_id=item.id,
             archive_path=item.virtual_path,
-            source_path=str(item.item_metadata["source_path"]),
+            source_path=str(item.source_path),
             sha256=item.logical_asset_hash,
             size_bytes=item.size_bytes,
             ord=0,

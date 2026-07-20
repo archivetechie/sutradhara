@@ -37,11 +37,16 @@ def _hash(s: str) -> bytes:
     return hashlib.sha256(s.encode()).digest()
 
 
-def _add_backend(engine: Engine, name: str = "primary-tape") -> int:
+def _add_backend(
+    engine: Engine,
+    name: str = "primary-tape",
+    *,
+    kind: BackendKind = BackendKind.REM_TAPE,
+) -> int:
     with session_scope(engine) as s:
         b = Backend(
             name=name,
-            kind=BackendKind.REM_TAPE,
+            kind=kind,
             tier=BackendTier.SELF_DESCRIBING,
             config={"library_uuid": "L91234L9"},
         )
@@ -149,7 +154,7 @@ def test_same_asset_can_have_copies_on_two_backends(engine: Engine) -> None:
     """Multi-copy across backends: one asset, two backends, two copy rows."""
     h = _hash("multi-copy")
     primary = _add_backend(engine, name="primary-tape")
-    secondary = _add_backend(engine, name="cloud-mirror")
+    secondary = _add_backend(engine, name="cloud-mirror", kind=BackendKind.S3)
     loc1 = {"tape_uuid": "tape-1", "tape_file_number": 3}
     loc2 = {"bucket": "archive-primary", "key": "assets/ab/cd/abcd/object.bin"}
 
@@ -193,10 +198,10 @@ def test_locator_key_is_deterministic_regardless_of_dict_order() -> None:
     assert locator_key(a) == locator_key(b)
 
 
-def test_cascade_delete_removes_copies(engine: Engine) -> None:
-    h = _hash("cascade")
+def test_logical_asset_delete_is_restricted_while_copy_exists(engine: Engine) -> None:
+    h = _hash("restrict")
     backend_id = _add_backend(engine)
-    locator = {"path": "/tmp/cascade"}
+    locator = {"tape_uuid": "restrict-tape", "tape_file_number": 1}
 
     with session_scope(engine) as s:
         s.add(LogicalAsset(content_sha256=h, size_bytes=1))
@@ -215,7 +220,9 @@ def test_cascade_delete_removes_copies(engine: Engine) -> None:
         asset = s.get(LogicalAsset, h)
         assert asset is not None
         s.delete(asset)
+        with pytest.raises(IntegrityError):
+            s.flush()
+        s.rollback()
 
     with session_scope(engine) as s:
-        remaining = s.scalars(select(Copy).where(Copy.logical_asset_hash == h)).all()
-        assert remaining == []
+        assert s.scalar(select(Copy).where(Copy.logical_asset_hash == h)) is not None

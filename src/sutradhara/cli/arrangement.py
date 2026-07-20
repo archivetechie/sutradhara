@@ -12,6 +12,7 @@ import click
 
 from sutradhara.arrangement import (
     ArrangementError,
+    abandon_arrangement,
     create_from_arrangement,
     create_from_intake,
     exclude_member,
@@ -92,6 +93,26 @@ def exclude_cmd(arrangement_id: int, member_path: str) -> None:
         with session_scope(engine) as session:
             member = exclude_member(session, arrangement_id, member_path)
             message = f"excluded arrangement {arrangement_id}: {member.member_path!r}"
+    except ArrangementError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(message)
+
+
+@arrangement_group.command("abandon")
+@click.argument("arrangement_id", type=int)
+@click.option("--actor", default=None, help="Operator recorded on the abandonment.")
+@click.option("--reason", default=None, help="Reason recorded on the abandonment.")
+def abandon_cmd(arrangement_id: int, actor: str | None, reason: str | None) -> None:
+    """Abandon a draft arrangement."""
+
+    operator = actor or os.environ.get("USER") or "unknown"
+    engine = make_engine()
+    try:
+        with session_scope(engine) as session:
+            arrangement = abandon_arrangement(
+                session, arrangement_id, actor=operator, reason=reason
+            )
+            message = f"abandoned arrangement {arrangement.id}"
     except ArrangementError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(message)

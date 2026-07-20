@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +19,6 @@ import pytest
 from sutradhara.backend.d2tape import D2TapeBackend
 from sutradhara.backend.port import ByteRange, StorageBackend
 from sutradhara.catalog.types import content_hash
-from sutradhara.jobs.runtime_observations import bind_tape_locator_observer
 
 
 def test_d2tape_backend_satisfies_storagebackend_protocol(
@@ -43,19 +41,8 @@ def test_write_read_verify_round_trip_and_sidecar_progression(
     second.write_bytes(b"second payload")
     first_hash = content_hash(hashlib.sha256(first.read_bytes()).digest())
     second_hash = content_hash(hashlib.sha256(second.read_bytes()).digest())
-    touched_locators: list[dict[str, Any]] = []
-
-    def observe_locator(
-        locator: Mapping[str, Any],
-        *,
-        library: bytes | str | None = None,
-    ) -> None:
-        del library
-        touched_locators.append(dict(locator))
-
-    with bind_tape_locator_observer(observe_locator):
-        first_record = backend.write_object_to_pool(first, "n-copy-3")
-        second_record = backend.write_object_to_pool(second, "n-copy-3")
+    first_record = backend.write_object_to_pool(first, "n-copy-3")
+    second_record = backend.write_object_to_pool(second, "n-copy-3")
 
     assert first_record.logical_id == first_hash
     assert first_record.integrity_hash == first_hash
@@ -72,23 +59,19 @@ def test_write_read_verify_round_trip_and_sidecar_progression(
     assert second_record.native_locator["start_block"] == 9
     assert second_record.native_locator["end_block"] == 12
 
-    with bind_tape_locator_observer(observe_locator):
-        assert backend.read_range(first_record.native_locator, ByteRange(0, 0)) == b"first payload"
-        assert backend.read_range(first_record.native_locator, ByteRange(6, 13)) == b"payload"
-        with backend.open_materialized_range_chunks(
-            first_record.native_locator,
-            ByteRange(2, 11),
-            chunk_bytes=3,
-        ) as chunks:
-            assert list(chunks) == [b"rst", b" pa", b"ylo"]
-        verify = backend.verify(first_record.native_locator)
+    assert backend.read_range(first_record.native_locator, ByteRange(0, 0)) == b"first payload"
+    assert backend.read_range(first_record.native_locator, ByteRange(6, 13)) == b"payload"
+    with backend.open_materialized_range_chunks(
+        first_record.native_locator,
+        ByteRange(2, 11),
+        chunk_bytes=3,
+    ) as chunks:
+        assert list(chunks) == [b"rst", b" pa", b"ylo"]
+    verify = backend.verify(first_record.native_locator)
     assert verify.ok
     assert verify.measured is True
     assert verify.actual_hash == first_hash
     assert any(call["verb"] == "restore" for call in _calls(log_path))
-    assert len(touched_locators) == 6
-    assert all(locator["barcode"] == "D2T002L7" for locator in touched_locators)
-
     state = json.loads((tmp_path / "state" / "D2T002L7.json").read_text())
     assert state["last_end_block"] == 12
     assert [artifact["start_block"] for artifact in state["artifacts"]] == [2, 9]

@@ -17,7 +17,6 @@ from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     ArtifactClassPool,
     AssetLocator,
-    BlobRoot,
     Copy,
     Pool,
 )
@@ -125,7 +124,7 @@ def set_pool_retired(session: Session, pool_id: str, *, retired: bool) -> Pool:
         return pool
     if retired and _pool_has_live_locators(session, pool_id):
         raise PoolRetirementHasLiveLocators(
-            f"pool {pool_id!r} still has live AssetLocator/BlobRoot rows"
+            f"pool {pool_id!r} still has live AssetLocator rows"
         )
     pool.retired = retired
     session.flush([pool])
@@ -175,12 +174,7 @@ def _pool_has_live_locators(session: Session, pool_id: str) -> bool:
     asset_locator_id = session.scalars(
         select(AssetLocator.id).where(AssetLocator.pool_id == pool_id).limit(1)
     ).first()
-    if asset_locator_id is not None:
-        return True
-    blob_root_id = session.scalars(
-        select(BlobRoot.id).where(BlobRoot.pool_id == pool_id).limit(1)
-    ).first()
-    return blob_root_id is not None
+    return asset_locator_id is not None
 
 
 def _record_forced_write_fence_alarm(

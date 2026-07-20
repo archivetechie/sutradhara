@@ -8,12 +8,14 @@ from collections.abc import Iterator
 import pytest
 from sqlalchemy import Engine, select
 
-from sutradhara.catalog.copies import add_copy
+from sutradhara.catalog.copies import add_bundle_copy, add_copy
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     ArtifactClassPool,
     AssetLocator,
     Backend,
+    Bundle,
+    BundleMember,
     LogicalAsset,
     Pool,
 )
@@ -94,7 +96,11 @@ def test_pool_representation_is_immutable_after_first_copy(engine: Engine) -> No
             logical_asset_hash=asset_hash,
             backend_id=backend.id,
             pool_id="archive-pool",
-            native_locator={"pool_id": "archive-pool", "object_id": "one"},
+            native_locator={
+                "pool_id": "archive-pool",
+                "object_id": "one",
+                "tape_uuid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
             storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
@@ -175,12 +181,53 @@ def test_set_pool_retired_refuses_live_locator(engine: Engine) -> None:
                 representation=Representation.RAO_PLAIN_V1.value,
             )
         )
-        s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=5))
+        s.add_all(
+            [
+                ArtifactClassPolicyRecord(
+                    artifactclass="masters",
+                    ruleset="rules",
+                    expect="messy",
+                    target_bytes=1,
+                    max_age_seconds=60,
+                    restore_preference=["archive-pool"],
+                    min_copies=1,
+                    min_impl_families=1,
+                    staging_config={},
+                    hdcache_config={},
+                ),
+                LogicalAsset(content_sha256=asset_hash, size_bytes=5),
+            ]
+        )
         s.flush()
+        bundle = Bundle(id="bundle-one", artifactclass="masters", status="sealed")
+        s.add(bundle)
+        s.flush()
+        member = BundleMember(
+            bundle_id=bundle.id,
+            logical_asset_hash=asset_hash,
+            member_path="asset.bin",
+            size_bytes=5,
+            file_sha256=asset_hash,
+        )
+        s.add(member)
+        copy, _ = add_bundle_copy(
+            s,
+            bundle_id=bundle.id,
+            backend_id=backend.id,
+            pool_id="archive-pool",
+            native_locator={
+                "object": "one",
+                "tape_uuid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            },
+            integrity_hash=asset_hash,
+            source=CopySource.INGEST,
+        )
         s.add(
             AssetLocator(
                 logical_asset_hash=asset_hash,
                 pool_id="archive-pool",
+                copy_id=copy.id,
+                bundle_id=bundle.id,
                 native_locator={"object": "one"},
                 member_path="asset.bin",
                 representation=Representation.RAO_PLAIN_V1.value,
