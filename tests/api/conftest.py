@@ -10,15 +10,27 @@ import pytest
 from sqlalchemy import Engine
 
 from sutradhara.api.app import create_app
-from sutradhara.catalog.models import ArtifactClassPolicyRecord
+from sutradhara.artifactclass_policy import (
+    ArtifactClassPolicy,
+    BundlingPolicy,
+    DurabilityPolicy,
+    PlacementPolicy,
+    apply_artifactclass_policy,
+)
+from sutradhara.catalog.models import Backend, Pool
 from sutradhara.catalog.session import create_all, make_engine, session_scope
+from sutradhara.catalog.types import BackendKind, BackendTier
+from sutradhara.sealing.port import Representation
+
+_POLICY_BACKEND_NAME = "api-fixture-policy-backend"
+_POLICY_POOL_ID = "api-fixture-policy-pool"
 
 
 @pytest.fixture
 def api_engine(tmp_path: Path) -> Iterator[Engine]:
     engine = make_engine(f"sqlite:///{tmp_path / 'api.db'}")
     create_all(engine)
-    seed_artifactclass(engine, "s-masters")
+    administer_artifactclass(engine, "s-masters")
     yield engine
     engine.dispose()
 
@@ -35,18 +47,39 @@ def make_api_app(engine: Engine):
     return app
 
 
-def seed_artifactclass(engine: Engine, artifactclass: str) -> None:
+def administer_artifactclass(engine: Engine, artifactclass: str) -> None:
+    """Administer an API-test artifactclass through the production policy path."""
+
     with session_scope(engine) as session:
-        session.merge(
-            ArtifactClassPolicyRecord(
-                artifactclass=artifactclass,
-                ruleset="test.rules.v1",
-                expect="messy",
-                target_bytes=1024,
-                max_age_seconds=3600,
-                restore_preference=[],
-                staging_config={},
+        pool = session.get(Pool, _POLICY_POOL_ID)
+        if pool is None:
+            backend = Backend(
+                name=_POLICY_BACKEND_NAME,
+                kind=BackendKind.MEMORY,
+                tier=BackendTier.SELF_DESCRIBING,
             )
+            session.add(backend)
+            session.flush([backend])
+            pool = Pool(
+                id=_POLICY_POOL_ID,
+                backend_id=backend.id,
+                representation=Representation.RAW_BYTES.value,
+                location="test",
+                storage_class="archive",
+            )
+            session.add(pool)
+            session.flush([pool])
+        apply_artifactclass_policy(
+            session,
+            artifactclass,
+            ArtifactClassPolicy(
+                ruleset="test.rules.v1",
+                placements=(PlacementPolicy(_POLICY_POOL_ID, role="test"),),
+                bundling=BundlingPolicy(target_gb=1 / 1024**2, max_age_seconds=3600),
+                restore_preference=(_POLICY_POOL_ID,),
+                expect="messy",
+                durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
+            ),
         )
 
 
