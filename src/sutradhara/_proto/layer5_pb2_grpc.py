@@ -392,6 +392,11 @@ class LibraryServiceStub:
                 request_serializer=layer5__pb2.CleanDriveRequest.SerializeToString,
                 response_deserializer=layer5__pb2.OperationRef.FromString,
                 _registered_method=True)
+        self.ResumeMediaReadiness = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/ResumeMediaReadiness',
+                request_serializer=layer5__pb2.ResumeMediaReadinessRequest.SerializeToString,
+                response_deserializer=layer5__pb2.OperationRef.FromString,
+                _registered_method=True)
         self.ListAlarms = channel.unary_unary(
                 '/remanence.api.v1.LibraryService/ListAlarms',
                 request_serializer=layer5__pb2.ListAlarmsRequest.SerializeToString,
@@ -506,6 +511,14 @@ class LibraryServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ResumeMediaReadiness(self, request, context):
+        """Resume an existing durable media-readiness fence in place. Progress is
+        observed through Daemon.WatchOperation using the returned operation id.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListAlarms(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -615,6 +628,11 @@ def add_LibraryServiceServicer_to_server(servicer, server):
             'CleanDrive': grpc.unary_unary_rpc_method_handler(
                     servicer.CleanDrive,
                     request_deserializer=layer5__pb2.CleanDriveRequest.FromString,
+                    response_serializer=layer5__pb2.OperationRef.SerializeToString,
+            ),
+            'ResumeMediaReadiness': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResumeMediaReadiness,
+                    request_deserializer=layer5__pb2.ResumeMediaReadinessRequest.FromString,
                     response_serializer=layer5__pb2.OperationRef.SerializeToString,
             ),
             'ListAlarms': grpc.unary_unary_rpc_method_handler(
@@ -936,6 +954,33 @@ class LibraryService:
             target,
             '/remanence.api.v1.LibraryService/CleanDrive',
             layer5__pb2.CleanDriveRequest.SerializeToString,
+            layer5__pb2.OperationRef.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ResumeMediaReadiness(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/ResumeMediaReadiness',
+            layer5__pb2.ResumeMediaReadinessRequest.SerializeToString,
             layer5__pb2.OperationRef.FromString,
             options,
             channel_credentials,
@@ -1893,7 +1938,7 @@ class WriteSessionServiceStub:
         self.CheckpointSession = channel.unary_unary(
                 '/remanence.api.v1.WriteSessionService/CheckpointSession',
                 request_serializer=layer5__pb2.CheckpointSessionRequest.SerializeToString,
-                response_deserializer=layer5__pb2.WriteSession.FromString,
+                response_deserializer=layer5__pb2.CheckpointSessionResponse.FromString,
                 _registered_method=True)
         self.CloseWriteSession = channel.unary_unary(
                 '/remanence.api.v1.WriteSessionService/CloseWriteSession',
@@ -1934,8 +1979,10 @@ class WriteSessionServiceServicer:
     def AppendObject(self, request_iterator, context):
         """Stream one object into the session. The first message in each call must
         be an AppendObjectStart; subsequent messages are AppendObjectChunk; the
-        last is AppendObjectFinish. Returns one ObjectRecord describing the
-        committed object.
+        last is AppendObjectFinish. In per-object mode the returned ObjectRecord
+        is CHECKPOINTED. In batched mode it may be a locator-free WRITTEN advisory
+        acknowledgement; callers must retain and re-send it after any session or
+        stream failure unless CheckpointSession reports its committed copy.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -1981,7 +2028,7 @@ def add_WriteSessionServiceServicer_to_server(servicer, server):
             'CheckpointSession': grpc.unary_unary_rpc_method_handler(
                     servicer.CheckpointSession,
                     request_deserializer=layer5__pb2.CheckpointSessionRequest.FromString,
-                    response_serializer=layer5__pb2.WriteSession.SerializeToString,
+                    response_serializer=layer5__pb2.CheckpointSessionResponse.SerializeToString,
             ),
             'CloseWriteSession': grpc.unary_unary_rpc_method_handler(
                     servicer.CloseWriteSession,
@@ -2089,7 +2136,7 @@ class WriteSessionService:
             target,
             '/remanence.api.v1.WriteSessionService/CheckpointSession',
             layer5__pb2.CheckpointSessionRequest.SerializeToString,
-            layer5__pb2.WriteSession.FromString,
+            layer5__pb2.CheckpointSessionResponse.FromString,
             options,
             channel_credentials,
             insecure,
