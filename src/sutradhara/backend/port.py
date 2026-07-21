@@ -110,12 +110,18 @@ class StorageBackend(Protocol):
         ...
 
     def enumerate(self) -> Iterator[CopyRecord]:
-        """Yield every copy this backend holds.
+        """Yield every durable copy this backend holds.
 
         Each `CopyRecord` carries `logical_id` (the content hash) so the
         catalog can be rebuilt from the union of every backend's
         enumeration. This is the load-bearing operation that makes the
         rebuildable-index discipline real (spec-v0.1.md §2 principle 1).
+
+        Implementations MUST NOT yield a copy whose backend durability state
+        is short of CHECKPOINTED. In particular, a Remanence WRITTEN append is
+        provisional: it has no catalog, scrub, verification, retention, or
+        durability-accounting visibility. This rule is enforced here because
+        scrub synthesizes catalog ``Copy`` rows from enumeration results.
         """
         ...
 
