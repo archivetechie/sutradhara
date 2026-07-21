@@ -786,21 +786,24 @@ def build_bundle_copy_for_pool(
     if artifact_validator is not None:
         artifact_validator(target, artifact)
     try:
-        record = backend.write_object_to_pool(artifact.artifact_path, target.pool_id)
+        committed_record = backend.write_object_to_pool(
+            artifact.artifact_path,
+            target.pool_id,
+        )
     except (BackendError, OSError) as exc:
         raise TransientPoolFanoutError(target.pool_id, target.backend_name, exc) from exc
-    report_tape_locator(record.native_locator)
+    report_tape_locator(committed_record.native_locator)
     storage_metadata = _copy_storage_metadata(
         target.representation,
         recipient_epochs=artifact.recipient_epochs,
-        stored_size_bytes=record.size_bytes,
+        stored_size_bytes=committed_record.size_bytes,
     )
     copy, _ = add_bundle_copy(
         session,
         bundle_id=bundle.id,
         backend_id=target.backend_id,
         pool_id=target.pool_id,
-        native_locator=record.native_locator,
+        native_locator=committed_record.native_locator,
         integrity_hash=artifact.stored_digest,
         source=CopySource.INGEST,
         health=CopyHealth.OK,

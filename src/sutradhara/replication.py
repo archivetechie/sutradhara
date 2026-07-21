@@ -59,7 +59,11 @@ class WritableStorageBackend(StorageBackend, Protocol):
     """Storage backend surface needed by the fan-out writer."""
 
     def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
-        """Write `source` to this backend's pool id and return a copy record."""
+        """Return only after `source` is durable and copy-accountable.
+
+        Checkpoint-capable implementations must return the copy selected from
+        the checkpoint/close committed-copy set, never from a WRITTEN append.
+        """
         ...
 
 
@@ -195,14 +199,17 @@ def replicate_asset(
             representation,
             key_epoch=seal_epoch,
         ) as sealed:
-            record = backend.write_object_to_pool(sealed.sealed_path, target.pool_id)
-            _assert_copy_integrity(asset_hash, record, sealed, target)
+            committed_record = backend.write_object_to_pool(
+                sealed.sealed_path,
+                target.pool_id,
+            )
+            _assert_copy_integrity(asset_hash, committed_record, sealed, target)
         copy, created = add_copy(
             session,
             logical_asset_hash=asset_hash,
             backend_id=target.backend_id,
             pool_id=target.pool_id,
-            native_locator=record.native_locator,
+            native_locator=committed_record.native_locator,
             integrity_hash=sealed.stored_digest,
             source=CopySource.INGEST,
             health=CopyHealth.OK,
@@ -254,14 +261,17 @@ def repair(
             representation,
             key_epoch=seal_epoch,
         ) as sealed:
-            record = backend.write_object_to_pool(sealed.sealed_path, target.pool_id)
-            _assert_copy_integrity(asset_hash, record, sealed, target)
+            committed_record = backend.write_object_to_pool(
+                sealed.sealed_path,
+                target.pool_id,
+            )
+            _assert_copy_integrity(asset_hash, committed_record, sealed, target)
         copy, created = add_copy(
             session,
             logical_asset_hash=asset_hash,
             backend_id=target.backend_id,
             pool_id=target.pool_id,
-            native_locator=record.native_locator,
+            native_locator=committed_record.native_locator,
             integrity_hash=sealed.stored_digest,
             source=CopySource.INGEST,
             health=CopyHealth.OK,
