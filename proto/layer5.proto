@@ -55,15 +55,26 @@ message OperationRef {
   bytes operation_id = 1; // 16-byte UUID assigned by daemon.
 }
 
+// A digest claim whose algorithm remains explicit and independently evolvable.
+// Writers currently emit only algorithm="sha256".
+message Digest {
+  string algorithm = 1;
+  bytes value       = 2;
+}
+
 // State of a long-running operation.
 enum OperationState {
+  reserved 6;
+  reserved "OPERATION_STATE_UNKNOWN";
   OPERATION_STATE_UNSPECIFIED = 0;
   OPERATION_STATE_QUEUED      = 1;
   OPERATION_STATE_RUNNING     = 2;
   OPERATION_STATE_SUCCEEDED   = 3;
   OPERATION_STATE_FAILED      = 4;
   OPERATION_STATE_CANCELLED   = 5;
-  OPERATION_STATE_UNKNOWN     = 6; // CompletionUnknown per audit semantics
+  // A completed attempt whose durable outcome cannot be established. This is
+  // distinct from UNSPECIFIED, which means no state was supplied.
+  OPERATION_STATE_COMPLETION_UNKNOWN = 7;
 }
 
 message OperationStatus {
@@ -113,8 +124,25 @@ message HealthResponse {
   }
   Status status            = 1;
   // Per-component summary (e.g., "library:7CBAD9CF74" → "healthy").
+  // Deprecated compatibility view; use component_health.
   map<string, string> components = 2;
   string detail            = 3;
+  repeated ComponentHealth component_health = 4;
+}
+
+message ComponentHealth {
+  string component = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_HEALTHY = 1;
+    STATUS_READ_ONLY = 2;
+    STATUS_DEGRADED = 3;
+    STATUS_FAILED = 4;
+    // `other_status` carries the unrecognized implementation-specific value.
+    STATUS_OTHER = 5;
+  }
+  Status status = 2;
+  string other_status = 3;
 }
 
 message VersionResponse {
@@ -166,6 +194,9 @@ service LibraryService {
   rpc RetireDrive       (RetireDriveRequest)          returns (RetireDriveResponse);
   rpc PollDrive         (PollDriveRequest)            returns (DriveHealthSnapshot);
   rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
+  // Resume an existing durable media-readiness fence in place. Progress is
+  // observed through Daemon.WatchOperation using the returned operation id.
+  rpc ResumeMediaReadiness (ResumeMediaReadinessRequest) returns (OperationRef);
   rpc ListAlarms        (ListAlarmsRequest)           returns (ListAlarmsResponse);
   rpc AckAlarm          (AckAlarmRequest)             returns (Alarm);
   rpc GetLiveStatus     (GetLiveStatusRequest)        returns (GetLiveStatusResponse);
@@ -239,7 +270,14 @@ message Drive {
   uint64 tape_io_ioctl_p95_us = 23;
   uint64 tape_io_ioctl_max_us = 24;
   uint64 tape_io_cadence_us = 25;
+  // Cumulative average over the current/most recently published transfer.
   uint64 tape_io_effective_feed_bytes_per_second = 26;
+  // Changer-reported seated cartridge barcode; empty when no cartridge is loaded.
+  string loaded_tape_barcode = 27;
+  // Seconds since this daemon first observed the current barcode seated in this bay.
+  uint64 mount_age_seconds = 28;
+  // Combined read/write byte rate over the daemon's rolling ~5 second window.
+  uint64 tape_io_window_feed_bytes_per_second = 29;
 }
 
 message DriveCatalogEntry {
@@ -298,6 +336,7 @@ message DriveHealthSnapshot {
   bytes drive_uuid = 2;
   google.protobuf.Timestamp at_utc = 3;
   string trigger = 4;
+  // Deprecated canonical UUID text retained for compatibility.
   string session_id = 5;
   string tape_alert_flags = 6;
   uint64 write_errors_corrected = 7;
@@ -305,6 +344,9 @@ message DriveHealthSnapshot {
   uint64 read_errors_corrected = 9;
   uint64 read_errors_uncorrected = 10;
   string raw_pages = 11;
+  // Canonical 16-byte UUID form shared with Drive.session_id and
+  // DriveAssignment.current_session_id.
+  bytes session_uuid = 12;
 }
 
 message Alarm {
@@ -477,6 +519,16 @@ message LoadDriveRequest {
   uint32 slot_element_address     = 2;
   uint32 drive_element_address    = 3;
   IdempotencyKey idempotency_key  = 4;
+  // Skip the post-load TEST UNIT READY wait and preserve legacy behavior.
+  bool no_wait                    = 5;
+}
+
+message ResumeMediaReadinessRequest {
+  // Durable media-readiness operation UUID returned in a readiness fence.
+  bytes operation_id            = 1;
+  // Bounded wait parameters. Both must be non-zero.
+  uint32 timeout_seconds        = 2;
+  uint32 poll_interval_seconds  = 3;
 }
 
 message UnloadDriveRequest {
@@ -615,6 +667,7 @@ message TapeFile {
   uint64 block_count           = 4;
   // Set for kind="object".
   bytes object_id              = 5;
+  Digest canonical_metadata_digest = 6;
 }
 
 enum AppendMode {
@@ -625,17 +678,30 @@ enum AppendMode {
   APPEND_MODE_SEAL           = 4;
 }
 
+// Object-grain durability. WRITTEN is advisory and must be re-sent after any
+// session/stream failure unless a later response reports CHECKPOINTED.
+enum AppendDurability {
+  APPEND_DURABILITY_UNSPECIFIED  = 0;
+  APPEND_DURABILITY_WRITTEN      = 1;
+  APPEND_DURABILITY_CHECKPOINTED = 2;
+}
+
 message AppendCommitInfo {
   AppendMode append_mode              = 1;
   bytes tape_uuid                     = 2;
   optional string voltag              = 3;
-  uint64 tape_file_number             = 4;
+  optional uint64 tape_file_number    = 4;
   uint64 first_body_lba               = 5;
   optional uint64 position_before_lba = 6;
   optional uint64 position_after_lba  = 7;
   optional uint64 journal_record_ordinal = 8;
   optional uint64 estimated_remaining_bytes = 9;
   optional bool sealed_after_write    = 10;
+  AppendDurability durability         = 11;
+  // Present only for a WRITTEN acknowledgement.
+  bytes batch_id                      = 12;
+  // Session-local provisional ordinal; never a tape-file locator.
+  optional uint64 provisional_ordinal = 13;
 }
 
 // One object's catalog-level record. Body-format-agnostic.
@@ -652,6 +718,11 @@ message ObjectRecord {
   google.protobuf.Timestamp created_at = 7;
   repeated ObjectCopy copies   = 8;
   AppendCommitInfo append_commit_info = 9;
+  // Algorithm-aware mirror of content_sha256. During the compatibility
+  // window servers populate both fields with the same SHA-256 value.
+  Digest content_digest        = 10;
+  // Canonical body-format metadata digest when the catalog has one.
+  Digest metadata_digest       = 11;
 }
 
 message ObjectCopy {
@@ -672,6 +743,8 @@ message ObjectCopy {
   Health health                = 5;
   // Pool of the tape when this copy was committed. Empty means unassigned.
   string pool_id               = 6;
+  Digest plaintext_digest      = 7;
+  Digest stored_digest         = 8;
 }
 
 // A single payload file inside an object (rem-tar-v1: one pax entry).
@@ -686,6 +759,9 @@ message FileRecord {
   // chunk-aligned start).
   uint64 first_chunk_body_lba  = 6;
   uint32 chunk_count           = 7;
+  // Algorithm-aware mirror of file_sha256. During the compatibility window
+  // servers populate both fields with the same SHA-256 value.
+  Digest file_digest           = 8;
 }
 
 message ListTapesRequest {
@@ -733,9 +809,15 @@ message EnumerateObjectsRequest {
 
 message GetObjectRequest {
   oneof key {
-    bytes  object_id        = 1; // Remanence UUID
-    bytes  content_sha256   = 2; // by content hash
+    bytes  object_id        = 1; // Remanence daemon-local primary-key UUID
+    // Canonical logical-asset identity lookup, not proof that a particular
+    // physical copy was measured. The server requires exactly one matching
+    // logical object; zero is NOT_FOUND and multiple matches are
+    // FAILED_PRECONDITION. Never use this tautological index lookup as
+    // deletion evidence; re-derive measured copy evidence at action time.
+    bytes  content_sha256   = 2;
     string caller_object_id = 3; // by orchestrator-supplied id
+    Digest content_digest   = 4; // algorithm-aware logical-asset identity
   }
 }
 
@@ -744,6 +826,7 @@ message FindObjectCopiesRequest {
     bytes  object_id        = 1;
     bytes  content_sha256   = 2;
     string caller_object_id = 3;
+    Digest content_digest   = 4;
   }
 }
 message FindObjectCopiesResponse {
@@ -868,12 +951,16 @@ enum CatalogEntryKind {
 }
 
 enum CatalogEntryState {
+  reserved 5;
+  reserved "CATALOG_ENTRY_STATE_UNKNOWN";
   CATALOG_ENTRY_STATE_UNSPECIFIED = 0;
   CATALOG_ENTRY_STATE_COMPLETE = 1;
   CATALOG_ENTRY_STATE_PARTIAL = 2;
   CATALOG_ENTRY_STATE_DAMAGED = 3;
   CATALOG_ENTRY_STATE_UNSUPPORTED = 4;
-  CATALOG_ENTRY_STATE_UNKNOWN = 5;
+  // A scan ran but could not classify the entry state. This is distinct from
+  // UNSPECIFIED, which means no state was supplied.
+  CATALOG_ENTRY_STATE_UNCLASSIFIED = 6;
 }
 
 enum IntegrityBasis {
@@ -930,11 +1017,13 @@ service WriteSessionService {
 
   // Stream one object into the session. The first message in each call must
   // be an AppendObjectStart; subsequent messages are AppendObjectChunk; the
-  // last is AppendObjectFinish. Returns one ObjectRecord describing the
-  // committed object.
+  // last is AppendObjectFinish. In per-object mode the returned ObjectRecord
+  // is CHECKPOINTED. In batched mode it may be a locator-free WRITTEN advisory
+  // acknowledgement; callers must retain and re-send it after any session or
+  // stream failure unless CheckpointSession reports its committed copy.
   rpc AppendObject       (stream AppendObjectMessage) returns (ObjectRecord);
 
-  rpc CheckpointSession  (CheckpointSessionRequest)  returns (WriteSession);
+  rpc CheckpointSession  (CheckpointSessionRequest)  returns (CheckpointSessionResponse);
   rpc CloseWriteSession  (CloseWriteSessionRequest)  returns (WriteSession);
   rpc AbortWriteSession  (AbortWriteSessionRequest)  returns (WriteSession);
   rpc GetWriteSession    (GetWriteSessionRequest)    returns (WriteSession);
@@ -967,6 +1056,14 @@ message WriteSession {
   TargetKind target_kind      = 10;
   repeated bytes tape_sequence = 11;
   uint32 current_tape_index   = 12;
+  uint64 pending_checkpoint_objects = 13;
+  uint64 pending_checkpoint_bytes = 14;
+  uint64 oldest_pending_age_seconds = 15;
+  google.protobuf.Timestamp checkpoint_deadline = 16;
+  // Durable receipts not previously returned by CheckpointSession. A close
+  // response carries these so close-triggered barriers do not lose locators.
+  repeated ObjectRecord checkpointed_objects = 17;
+  repeated ObjectCopy committed_copies = 18;
 }
 
 message OpenWriteSessionRequest {
@@ -1012,6 +1109,11 @@ message AppendObjectMessage {
   }
 }
 
+enum SourceReplayCapability {
+  SOURCE_REPLAY_CAPABILITY_UNSPECIFIED       = 0;
+  SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START = 1;
+}
+
 message AppendObjectStart {
   bytes session_id                    = 1;
   string caller_object_id             = 2; // §4.2 orchestrator opaque id
@@ -1024,6 +1126,14 @@ message AppendObjectStart {
   // accordingly. The exact shape is body-format-specific; this draft leaves
   // it as a serialized blob owned by the format adapter.
   bytes body_format_manifest          = 5;
+  // Binding payload digest used for overlap admission. New clients mirror
+  // this value in AppendObjectFinish during the compatibility window.
+  bytes expected_content_sha256       = 6;
+  // Whether the caller retains immutable source bytes and can replay them
+  // from byte zero after an interrupted overlap append.
+  SourceReplayCapability source_replay_capability = 7;
+  // Algorithm-aware mirror of expected_content_sha256.
+  Digest expected_content_digest = 8;
 }
 
 message AppendObjectChunk {
@@ -1036,11 +1146,23 @@ message AppendObjectFinish {
   // If client pre-computed the object's content_sha256, daemon validates
   // before committing.
   bytes expected_content_sha256 = 2;
+  // Algorithm-aware mirror of expected_content_sha256.
+  Digest expected_content_digest = 3;
 }
 
 message CheckpointSessionRequest {
   bytes session_id               = 1;
   IdempotencyKey idempotency_key = 2;
+}
+
+message CheckpointSessionResponse {
+  WriteSession session = 1;
+  // Durable objects not previously returned by CheckpointSession, retained
+  // across automatic threshold/timer barriers for caller correlation.
+  repeated ObjectRecord committed_objects = 2;
+  // The corresponding committed-copy set. Callers register copies, enqueue
+  // verification, and release retained source bytes only from this field.
+  repeated ObjectCopy committed_copies = 3;
 }
 
 message CloseWriteSessionRequest {
@@ -1093,6 +1215,11 @@ message ReadSession {
   }
   State state                = 4;
   google.protobuf.Timestamp opened_at = 5;
+  // Present after a cold resume open. Encoded identically to the write-side
+  // AppendCommitInfo.position_after_lba field.
+  DevicePositionProof position_proof = 6;
+  // Epoch of the daemon that minted this fresh read session.
+  uint64 daemon_epoch = 7;
 }
 
 message OpenReadSessionRequest {
@@ -1101,6 +1228,27 @@ message OpenReadSessionRequest {
     TapeTarget  tape_target  = 2;
   }
   IdempotencyKey idempotency_key = 3;
+  // Durable coordinates for a cold resume. This deliberately contains no
+  // session_id: every resume open creates a fresh read session.
+  ReadResumeTarget resume_target = 4;
+}
+
+message ReadResumeTarget {
+  bytes tape_uuid                    = 1;
+  bytes object_id                    = 2;
+  bytes file_id                      = 3;
+  // Object-local byte offset of the file's first body chunk. The server
+  // rejects offsets that do not equal the catalogued file boundary.
+  uint64 file_boundary_byte_offset   = 4;
+  optional uint64 expected_position_lba = 5;
+  optional uint64 daemon_epoch       = 6;
+}
+
+// Caller-visible proof produced by READ POSITION after resume positioning.
+message DevicePositionProof {
+  // Uses the established AppendCommitInfo.position_after_lba uint64 LBA wire
+  // representation; it is not a byte offset.
+  uint64 position_after_lba = 1;
 }
 
 message CloseReadSessionRequest {
@@ -1167,4 +1315,7 @@ message AuditEntry {
   // Free-form structured detail; CBOR-encoded in the on-disk log, JSON-ified
   // here for client convenience.
   string detail_json           = 8;
+  // Producing crate version plus build-time git description. Absent only for
+  // audit records written before this field was introduced.
+  optional string software_build = 9;
 }

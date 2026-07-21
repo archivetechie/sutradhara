@@ -19,7 +19,7 @@ class OperationState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     OPERATION_STATE_SUCCEEDED: _ClassVar[OperationState]
     OPERATION_STATE_FAILED: _ClassVar[OperationState]
     OPERATION_STATE_CANCELLED: _ClassVar[OperationState]
-    OPERATION_STATE_UNKNOWN: _ClassVar[OperationState]
+    OPERATION_STATE_COMPLETION_UNKNOWN: _ClassVar[OperationState]
 
 class AppendMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -28,6 +28,12 @@ class AppendMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     APPEND_MODE_APPEND: _ClassVar[AppendMode]
     APPEND_MODE_RESUME_CONTROL: _ClassVar[AppendMode]
     APPEND_MODE_SEAL: _ClassVar[AppendMode]
+
+class AppendDurability(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    APPEND_DURABILITY_UNSPECIFIED: _ClassVar[AppendDurability]
+    APPEND_DURABILITY_WRITTEN: _ClassVar[AppendDurability]
+    APPEND_DURABILITY_CHECKPOINTED: _ClassVar[AppendDurability]
 
 class CatalogUnitOriginKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -64,7 +70,7 @@ class CatalogEntryState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CATALOG_ENTRY_STATE_PARTIAL: _ClassVar[CatalogEntryState]
     CATALOG_ENTRY_STATE_DAMAGED: _ClassVar[CatalogEntryState]
     CATALOG_ENTRY_STATE_UNSUPPORTED: _ClassVar[CatalogEntryState]
-    CATALOG_ENTRY_STATE_UNKNOWN: _ClassVar[CatalogEntryState]
+    CATALOG_ENTRY_STATE_UNCLASSIFIED: _ClassVar[CatalogEntryState]
 
 class IntegrityBasis(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -82,18 +88,26 @@ class ArchiveGapCause(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     ARCHIVE_GAP_CAUSE_MISSING: _ClassVar[ArchiveGapCause]
     ARCHIVE_GAP_CAUSE_RESYNC: _ClassVar[ArchiveGapCause]
     ARCHIVE_GAP_CAUSE_UNSUPPORTED: _ClassVar[ArchiveGapCause]
+
+class SourceReplayCapability(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SOURCE_REPLAY_CAPABILITY_UNSPECIFIED: _ClassVar[SourceReplayCapability]
+    SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START: _ClassVar[SourceReplayCapability]
 OPERATION_STATE_UNSPECIFIED: OperationState
 OPERATION_STATE_QUEUED: OperationState
 OPERATION_STATE_RUNNING: OperationState
 OPERATION_STATE_SUCCEEDED: OperationState
 OPERATION_STATE_FAILED: OperationState
 OPERATION_STATE_CANCELLED: OperationState
-OPERATION_STATE_UNKNOWN: OperationState
+OPERATION_STATE_COMPLETION_UNKNOWN: OperationState
 APPEND_MODE_UNSPECIFIED: AppendMode
 APPEND_MODE_FRESH: AppendMode
 APPEND_MODE_APPEND: AppendMode
 APPEND_MODE_RESUME_CONTROL: AppendMode
 APPEND_MODE_SEAL: AppendMode
+APPEND_DURABILITY_UNSPECIFIED: AppendDurability
+APPEND_DURABILITY_WRITTEN: AppendDurability
+APPEND_DURABILITY_CHECKPOINTED: AppendDurability
 CATALOG_UNIT_ORIGIN_KIND_UNSPECIFIED: CatalogUnitOriginKind
 CATALOG_UNIT_ORIGIN_KIND_NATIVE_OBJECT: CatalogUnitOriginKind
 CATALOG_UNIT_ORIGIN_KIND_FOREIGN_ARCHIVE: CatalogUnitOriginKind
@@ -115,7 +129,7 @@ CATALOG_ENTRY_STATE_COMPLETE: CatalogEntryState
 CATALOG_ENTRY_STATE_PARTIAL: CatalogEntryState
 CATALOG_ENTRY_STATE_DAMAGED: CatalogEntryState
 CATALOG_ENTRY_STATE_UNSUPPORTED: CatalogEntryState
-CATALOG_ENTRY_STATE_UNKNOWN: CatalogEntryState
+CATALOG_ENTRY_STATE_UNCLASSIFIED: CatalogEntryState
 INTEGRITY_BASIS_UNSPECIFIED: IntegrityBasis
 INTEGRITY_BASIS_UNKNOWN: IntegrityBasis
 INTEGRITY_BASIS_CONTENT_HASH: IntegrityBasis
@@ -127,6 +141,8 @@ ARCHIVE_GAP_CAUSE_READ_ERROR: ArchiveGapCause
 ARCHIVE_GAP_CAUSE_MISSING: ArchiveGapCause
 ARCHIVE_GAP_CAUSE_RESYNC: ArchiveGapCause
 ARCHIVE_GAP_CAUSE_UNSUPPORTED: ArchiveGapCause
+SOURCE_REPLAY_CAPABILITY_UNSPECIFIED: SourceReplayCapability
+SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START: SourceReplayCapability
 
 class IdempotencyKey(_message.Message):
     __slots__ = ("value",)
@@ -139,6 +155,14 @@ class OperationRef(_message.Message):
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     operation_id: bytes
     def __init__(self, operation_id: _Optional[bytes] = ...) -> None: ...
+
+class Digest(_message.Message):
+    __slots__ = ("algorithm", "value")
+    ALGORITHM_FIELD_NUMBER: _ClassVar[int]
+    VALUE_FIELD_NUMBER: _ClassVar[int]
+    algorithm: str
+    value: bytes
+    def __init__(self, algorithm: _Optional[str] = ..., value: _Optional[bytes] = ...) -> None: ...
 
 class OperationStatus(_message.Message):
     __slots__ = ("operation_id", "operation_kind", "state", "created_at", "updated_at", "progress", "error_summary")
@@ -172,7 +196,7 @@ class PageToken(_message.Message):
     def __init__(self, value: _Optional[bytes] = ...) -> None: ...
 
 class HealthResponse(_message.Message):
-    __slots__ = ("status", "components", "detail")
+    __slots__ = ("status", "components", "detail", "component_health")
     class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         STATUS_UNSPECIFIED: _ClassVar[HealthResponse.Status]
@@ -195,10 +219,36 @@ class HealthResponse(_message.Message):
     STATUS_FIELD_NUMBER: _ClassVar[int]
     COMPONENTS_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
+    COMPONENT_HEALTH_FIELD_NUMBER: _ClassVar[int]
     status: HealthResponse.Status
     components: _containers.ScalarMap[str, str]
     detail: str
-    def __init__(self, status: _Optional[_Union[HealthResponse.Status, str]] = ..., components: _Optional[_Mapping[str, str]] = ..., detail: _Optional[str] = ...) -> None: ...
+    component_health: _containers.RepeatedCompositeFieldContainer[ComponentHealth]
+    def __init__(self, status: _Optional[_Union[HealthResponse.Status, str]] = ..., components: _Optional[_Mapping[str, str]] = ..., detail: _Optional[str] = ..., component_health: _Optional[_Iterable[_Union[ComponentHealth, _Mapping]]] = ...) -> None: ...
+
+class ComponentHealth(_message.Message):
+    __slots__ = ("component", "status", "other_status")
+    class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        STATUS_UNSPECIFIED: _ClassVar[ComponentHealth.Status]
+        STATUS_HEALTHY: _ClassVar[ComponentHealth.Status]
+        STATUS_READ_ONLY: _ClassVar[ComponentHealth.Status]
+        STATUS_DEGRADED: _ClassVar[ComponentHealth.Status]
+        STATUS_FAILED: _ClassVar[ComponentHealth.Status]
+        STATUS_OTHER: _ClassVar[ComponentHealth.Status]
+    STATUS_UNSPECIFIED: ComponentHealth.Status
+    STATUS_HEALTHY: ComponentHealth.Status
+    STATUS_READ_ONLY: ComponentHealth.Status
+    STATUS_DEGRADED: ComponentHealth.Status
+    STATUS_FAILED: ComponentHealth.Status
+    STATUS_OTHER: ComponentHealth.Status
+    COMPONENT_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    OTHER_STATUS_FIELD_NUMBER: _ClassVar[int]
+    component: str
+    status: ComponentHealth.Status
+    other_status: str
+    def __init__(self, component: _Optional[str] = ..., status: _Optional[_Union[ComponentHealth.Status, str]] = ..., other_status: _Optional[str] = ...) -> None: ...
 
 class VersionResponse(_message.Message):
     __slots__ = ("daemon_version", "api_version", "rust_target")
@@ -290,7 +340,7 @@ class LibraryState(_message.Message):
     def __init__(self, library: _Optional[_Union[Library, _Mapping]] = ..., drives: _Optional[_Iterable[_Union[Drive, _Mapping]]] = ..., slots: _Optional[_Iterable[_Union[Slot, _Mapping]]] = ..., import_export_ports: _Optional[_Iterable[_Union[PortalSlot, _Mapping]]] = ..., last_inventory_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., managed: _Optional[str] = ...) -> None: ...
 
 class Drive(_message.Message):
-    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status", "drive_uuid", "cleaning_due", "fenced", "lifetime_read_bytes", "lifetime_write_bytes", "counter_epoch", "session_id", "active_alert_names", "tape_io_staging_ring_buffers", "tape_io_effective_batch_blocks", "tape_io_gap_p50_us", "tape_io_gap_p95_us", "tape_io_gap_max_us", "tape_io_ioctl_p50_us", "tape_io_ioctl_p95_us", "tape_io_ioctl_max_us", "tape_io_cadence_us", "tape_io_effective_feed_bytes_per_second")
+    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status", "drive_uuid", "cleaning_due", "fenced", "lifetime_read_bytes", "lifetime_write_bytes", "counter_epoch", "session_id", "active_alert_names", "tape_io_staging_ring_buffers", "tape_io_effective_batch_blocks", "tape_io_gap_p50_us", "tape_io_gap_p95_us", "tape_io_gap_max_us", "tape_io_ioctl_p50_us", "tape_io_ioctl_p95_us", "tape_io_ioctl_max_us", "tape_io_cadence_us", "tape_io_effective_feed_bytes_per_second", "loaded_tape_barcode", "mount_age_seconds", "tape_io_window_feed_bytes_per_second")
     class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         DRIVE_STATUS_UNSPECIFIED: _ClassVar[Drive.Status]
@@ -332,6 +382,9 @@ class Drive(_message.Message):
     TAPE_IO_IOCTL_MAX_US_FIELD_NUMBER: _ClassVar[int]
     TAPE_IO_CADENCE_US_FIELD_NUMBER: _ClassVar[int]
     TAPE_IO_EFFECTIVE_FEED_BYTES_PER_SECOND_FIELD_NUMBER: _ClassVar[int]
+    LOADED_TAPE_BARCODE_FIELD_NUMBER: _ClassVar[int]
+    MOUNT_AGE_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    TAPE_IO_WINDOW_FEED_BYTES_PER_SECOND_FIELD_NUMBER: _ClassVar[int]
     element_address: int
     drive_serial: str
     host_device_path: str
@@ -357,7 +410,10 @@ class Drive(_message.Message):
     tape_io_ioctl_max_us: int
     tape_io_cadence_us: int
     tape_io_effective_feed_bytes_per_second: int
-    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ..., drive_uuid: _Optional[bytes] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., lifetime_read_bytes: _Optional[int] = ..., lifetime_write_bytes: _Optional[int] = ..., counter_epoch: _Optional[int] = ..., session_id: _Optional[bytes] = ..., active_alert_names: _Optional[_Iterable[str]] = ..., tape_io_staging_ring_buffers: _Optional[int] = ..., tape_io_effective_batch_blocks: _Optional[int] = ..., tape_io_gap_p50_us: _Optional[int] = ..., tape_io_gap_p95_us: _Optional[int] = ..., tape_io_gap_max_us: _Optional[int] = ..., tape_io_ioctl_p50_us: _Optional[int] = ..., tape_io_ioctl_p95_us: _Optional[int] = ..., tape_io_ioctl_max_us: _Optional[int] = ..., tape_io_cadence_us: _Optional[int] = ..., tape_io_effective_feed_bytes_per_second: _Optional[int] = ...) -> None: ...
+    loaded_tape_barcode: str
+    mount_age_seconds: int
+    tape_io_window_feed_bytes_per_second: int
+    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ..., drive_uuid: _Optional[bytes] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., lifetime_read_bytes: _Optional[int] = ..., lifetime_write_bytes: _Optional[int] = ..., counter_epoch: _Optional[int] = ..., session_id: _Optional[bytes] = ..., active_alert_names: _Optional[_Iterable[str]] = ..., tape_io_staging_ring_buffers: _Optional[int] = ..., tape_io_effective_batch_blocks: _Optional[int] = ..., tape_io_gap_p50_us: _Optional[int] = ..., tape_io_gap_p95_us: _Optional[int] = ..., tape_io_gap_max_us: _Optional[int] = ..., tape_io_ioctl_p50_us: _Optional[int] = ..., tape_io_ioctl_p95_us: _Optional[int] = ..., tape_io_ioctl_max_us: _Optional[int] = ..., tape_io_cadence_us: _Optional[int] = ..., tape_io_effective_feed_bytes_per_second: _Optional[int] = ..., loaded_tape_barcode: _Optional[str] = ..., mount_age_seconds: _Optional[int] = ..., tape_io_window_feed_bytes_per_second: _Optional[int] = ...) -> None: ...
 
 class DriveCatalogEntry(_message.Message):
     __slots__ = ("drive_uuid", "serial", "identity_source", "actionable", "vendor", "product", "firmware_rev", "managed", "state", "cleaning_due", "fenced", "first_seen_utc", "last_seen_utc", "last_library_serial", "last_element_address", "purchase_date", "warranty_until", "cost", "notes", "retired_at_utc", "retire_reason", "correlation_rollups")
@@ -456,7 +512,7 @@ class DriveHistoryEvent(_message.Message):
     def __init__(self, event_id: _Optional[int] = ..., drive_uuid: _Optional[bytes] = ..., event_kind: _Optional[str] = ..., at_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., library_serial: _Optional[str] = ..., element_address: _Optional[int] = ..., tape_uuid: _Optional[bytes] = ..., detail: _Optional[str] = ...) -> None: ...
 
 class DriveHealthSnapshot(_message.Message):
-    __slots__ = ("snapshot_id", "drive_uuid", "at_utc", "trigger", "session_id", "tape_alert_flags", "write_errors_corrected", "write_errors_uncorrected", "read_errors_corrected", "read_errors_uncorrected", "raw_pages")
+    __slots__ = ("snapshot_id", "drive_uuid", "at_utc", "trigger", "session_id", "tape_alert_flags", "write_errors_corrected", "write_errors_uncorrected", "read_errors_corrected", "read_errors_uncorrected", "raw_pages", "session_uuid")
     SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
     DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
     AT_UTC_FIELD_NUMBER: _ClassVar[int]
@@ -468,6 +524,7 @@ class DriveHealthSnapshot(_message.Message):
     READ_ERRORS_CORRECTED_FIELD_NUMBER: _ClassVar[int]
     READ_ERRORS_UNCORRECTED_FIELD_NUMBER: _ClassVar[int]
     RAW_PAGES_FIELD_NUMBER: _ClassVar[int]
+    SESSION_UUID_FIELD_NUMBER: _ClassVar[int]
     snapshot_id: int
     drive_uuid: bytes
     at_utc: _timestamp_pb2.Timestamp
@@ -479,7 +536,8 @@ class DriveHealthSnapshot(_message.Message):
     read_errors_corrected: int
     read_errors_uncorrected: int
     raw_pages: str
-    def __init__(self, snapshot_id: _Optional[int] = ..., drive_uuid: _Optional[bytes] = ..., at_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., trigger: _Optional[str] = ..., session_id: _Optional[str] = ..., tape_alert_flags: _Optional[str] = ..., write_errors_corrected: _Optional[int] = ..., write_errors_uncorrected: _Optional[int] = ..., read_errors_corrected: _Optional[int] = ..., read_errors_uncorrected: _Optional[int] = ..., raw_pages: _Optional[str] = ...) -> None: ...
+    session_uuid: bytes
+    def __init__(self, snapshot_id: _Optional[int] = ..., drive_uuid: _Optional[bytes] = ..., at_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., trigger: _Optional[str] = ..., session_id: _Optional[str] = ..., tape_alert_flags: _Optional[str] = ..., write_errors_corrected: _Optional[int] = ..., write_errors_uncorrected: _Optional[int] = ..., read_errors_corrected: _Optional[int] = ..., read_errors_uncorrected: _Optional[int] = ..., raw_pages: _Optional[str] = ..., session_uuid: _Optional[bytes] = ...) -> None: ...
 
 class Alarm(_message.Message):
     __slots__ = ("alarm_id", "condition_key", "kind", "severity", "state", "first_seen_utc", "last_seen_utc", "acked_by", "acked_at_utc", "detail")
@@ -746,16 +804,28 @@ class MoveMediumRequest(_message.Message):
     def __init__(self, library_uuid: _Optional[bytes] = ..., source_element_address: _Optional[int] = ..., destination_element_address: _Optional[int] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ...) -> None: ...
 
 class LoadDriveRequest(_message.Message):
-    __slots__ = ("library_uuid", "slot_element_address", "drive_element_address", "idempotency_key")
+    __slots__ = ("library_uuid", "slot_element_address", "drive_element_address", "idempotency_key", "no_wait")
     LIBRARY_UUID_FIELD_NUMBER: _ClassVar[int]
     SLOT_ELEMENT_ADDRESS_FIELD_NUMBER: _ClassVar[int]
     DRIVE_ELEMENT_ADDRESS_FIELD_NUMBER: _ClassVar[int]
     IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    NO_WAIT_FIELD_NUMBER: _ClassVar[int]
     library_uuid: bytes
     slot_element_address: int
     drive_element_address: int
     idempotency_key: IdempotencyKey
-    def __init__(self, library_uuid: _Optional[bytes] = ..., slot_element_address: _Optional[int] = ..., drive_element_address: _Optional[int] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ...) -> None: ...
+    no_wait: bool
+    def __init__(self, library_uuid: _Optional[bytes] = ..., slot_element_address: _Optional[int] = ..., drive_element_address: _Optional[int] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ..., no_wait: _Optional[bool] = ...) -> None: ...
+
+class ResumeMediaReadinessRequest(_message.Message):
+    __slots__ = ("operation_id", "timeout_seconds", "poll_interval_seconds")
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    TIMEOUT_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    POLL_INTERVAL_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    operation_id: bytes
+    timeout_seconds: int
+    poll_interval_seconds: int
+    def __init__(self, operation_id: _Optional[bytes] = ..., timeout_seconds: _Optional[int] = ..., poll_interval_seconds: _Optional[int] = ...) -> None: ...
 
 class UnloadDriveRequest(_message.Message):
     __slots__ = ("library_uuid", "drive_element_address", "destination_slot_address", "idempotency_key")
@@ -887,21 +957,23 @@ class TapePool(_message.Message):
     def __init__(self, pool_id: _Optional[str] = ..., display_name: _Optional[str] = ..., copy_class: _Optional[str] = ..., content_class: _Optional[str] = ...) -> None: ...
 
 class TapeFile(_message.Message):
-    __slots__ = ("tape_uuid", "tape_file_number", "kind", "block_count", "object_id")
+    __slots__ = ("tape_uuid", "tape_file_number", "kind", "block_count", "object_id", "canonical_metadata_digest")
     TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
     TAPE_FILE_NUMBER_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     BLOCK_COUNT_FIELD_NUMBER: _ClassVar[int]
     OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    CANONICAL_METADATA_DIGEST_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     tape_file_number: int
     kind: str
     block_count: int
     object_id: bytes
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., tape_file_number: _Optional[int] = ..., kind: _Optional[str] = ..., block_count: _Optional[int] = ..., object_id: _Optional[bytes] = ...) -> None: ...
+    canonical_metadata_digest: Digest
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., tape_file_number: _Optional[int] = ..., kind: _Optional[str] = ..., block_count: _Optional[int] = ..., object_id: _Optional[bytes] = ..., canonical_metadata_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class AppendCommitInfo(_message.Message):
-    __slots__ = ("append_mode", "tape_uuid", "voltag", "tape_file_number", "first_body_lba", "position_before_lba", "position_after_lba", "journal_record_ordinal", "estimated_remaining_bytes", "sealed_after_write")
+    __slots__ = ("append_mode", "tape_uuid", "voltag", "tape_file_number", "first_body_lba", "position_before_lba", "position_after_lba", "journal_record_ordinal", "estimated_remaining_bytes", "sealed_after_write", "durability", "batch_id", "provisional_ordinal")
     APPEND_MODE_FIELD_NUMBER: _ClassVar[int]
     TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
     VOLTAG_FIELD_NUMBER: _ClassVar[int]
@@ -912,6 +984,9 @@ class AppendCommitInfo(_message.Message):
     JOURNAL_RECORD_ORDINAL_FIELD_NUMBER: _ClassVar[int]
     ESTIMATED_REMAINING_BYTES_FIELD_NUMBER: _ClassVar[int]
     SEALED_AFTER_WRITE_FIELD_NUMBER: _ClassVar[int]
+    DURABILITY_FIELD_NUMBER: _ClassVar[int]
+    BATCH_ID_FIELD_NUMBER: _ClassVar[int]
+    PROVISIONAL_ORDINAL_FIELD_NUMBER: _ClassVar[int]
     append_mode: AppendMode
     tape_uuid: bytes
     voltag: str
@@ -922,10 +997,13 @@ class AppendCommitInfo(_message.Message):
     journal_record_ordinal: int
     estimated_remaining_bytes: int
     sealed_after_write: bool
-    def __init__(self, append_mode: _Optional[_Union[AppendMode, str]] = ..., tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., tape_file_number: _Optional[int] = ..., first_body_lba: _Optional[int] = ..., position_before_lba: _Optional[int] = ..., position_after_lba: _Optional[int] = ..., journal_record_ordinal: _Optional[int] = ..., estimated_remaining_bytes: _Optional[int] = ..., sealed_after_write: _Optional[bool] = ...) -> None: ...
+    durability: AppendDurability
+    batch_id: bytes
+    provisional_ordinal: int
+    def __init__(self, append_mode: _Optional[_Union[AppendMode, str]] = ..., tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., tape_file_number: _Optional[int] = ..., first_body_lba: _Optional[int] = ..., position_before_lba: _Optional[int] = ..., position_after_lba: _Optional[int] = ..., journal_record_ordinal: _Optional[int] = ..., estimated_remaining_bytes: _Optional[int] = ..., sealed_after_write: _Optional[bool] = ..., durability: _Optional[_Union[AppendDurability, str]] = ..., batch_id: _Optional[bytes] = ..., provisional_ordinal: _Optional[int] = ...) -> None: ...
 
 class ObjectRecord(_message.Message):
-    __slots__ = ("object_id", "caller_object_id", "content_sha256", "logical_size_bytes", "body_format", "caller_metadata", "created_at", "copies", "append_commit_info")
+    __slots__ = ("object_id", "caller_object_id", "content_sha256", "logical_size_bytes", "body_format", "caller_metadata", "created_at", "copies", "append_commit_info", "content_digest", "metadata_digest")
     class CallerMetadataEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -942,6 +1020,8 @@ class ObjectRecord(_message.Message):
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
     COPIES_FIELD_NUMBER: _ClassVar[int]
     APPEND_COMMIT_INFO_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    METADATA_DIGEST_FIELD_NUMBER: _ClassVar[int]
     object_id: bytes
     caller_object_id: str
     content_sha256: bytes
@@ -951,10 +1031,12 @@ class ObjectRecord(_message.Message):
     created_at: _timestamp_pb2.Timestamp
     copies: _containers.RepeatedCompositeFieldContainer[ObjectCopy]
     append_commit_info: AppendCommitInfo
-    def __init__(self, object_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., content_sha256: _Optional[bytes] = ..., logical_size_bytes: _Optional[int] = ..., body_format: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., copies: _Optional[_Iterable[_Union[ObjectCopy, _Mapping]]] = ..., append_commit_info: _Optional[_Union[AppendCommitInfo, _Mapping]] = ...) -> None: ...
+    content_digest: Digest
+    metadata_digest: Digest
+    def __init__(self, object_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., content_sha256: _Optional[bytes] = ..., logical_size_bytes: _Optional[int] = ..., body_format: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., copies: _Optional[_Iterable[_Union[ObjectCopy, _Mapping]]] = ..., append_commit_info: _Optional[_Union[AppendCommitInfo, _Mapping]] = ..., content_digest: _Optional[_Union[Digest, _Mapping]] = ..., metadata_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class ObjectCopy(_message.Message):
-    __slots__ = ("tape_uuid", "tape_file_number", "first_body_lba", "last_verified_at", "health", "pool_id")
+    __slots__ = ("tape_uuid", "tape_file_number", "first_body_lba", "last_verified_at", "health", "pool_id", "plaintext_digest", "stored_digest")
     class Health(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         OBJECT_COPY_HEALTH_UNSPECIFIED: _ClassVar[ObjectCopy.Health]
@@ -973,16 +1055,20 @@ class ObjectCopy(_message.Message):
     LAST_VERIFIED_AT_FIELD_NUMBER: _ClassVar[int]
     HEALTH_FIELD_NUMBER: _ClassVar[int]
     POOL_ID_FIELD_NUMBER: _ClassVar[int]
+    PLAINTEXT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    STORED_DIGEST_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     tape_file_number: int
     first_body_lba: int
     last_verified_at: _timestamp_pb2.Timestamp
     health: ObjectCopy.Health
     pool_id: str
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., tape_file_number: _Optional[int] = ..., first_body_lba: _Optional[int] = ..., last_verified_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., health: _Optional[_Union[ObjectCopy.Health, str]] = ..., pool_id: _Optional[str] = ...) -> None: ...
+    plaintext_digest: Digest
+    stored_digest: Digest
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., tape_file_number: _Optional[int] = ..., first_body_lba: _Optional[int] = ..., last_verified_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., health: _Optional[_Union[ObjectCopy.Health, str]] = ..., pool_id: _Optional[str] = ..., plaintext_digest: _Optional[_Union[Digest, _Mapping]] = ..., stored_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class FileRecord(_message.Message):
-    __slots__ = ("object_id", "file_id", "path", "size_bytes", "file_sha256", "first_chunk_body_lba", "chunk_count")
+    __slots__ = ("object_id", "file_id", "path", "size_bytes", "file_sha256", "first_chunk_body_lba", "chunk_count", "file_digest")
     OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
     FILE_ID_FIELD_NUMBER: _ClassVar[int]
     PATH_FIELD_NUMBER: _ClassVar[int]
@@ -990,6 +1076,7 @@ class FileRecord(_message.Message):
     FILE_SHA256_FIELD_NUMBER: _ClassVar[int]
     FIRST_CHUNK_BODY_LBA_FIELD_NUMBER: _ClassVar[int]
     CHUNK_COUNT_FIELD_NUMBER: _ClassVar[int]
+    FILE_DIGEST_FIELD_NUMBER: _ClassVar[int]
     object_id: bytes
     file_id: bytes
     path: str
@@ -997,7 +1084,8 @@ class FileRecord(_message.Message):
     file_sha256: bytes
     first_chunk_body_lba: int
     chunk_count: int
-    def __init__(self, object_id: _Optional[bytes] = ..., file_id: _Optional[bytes] = ..., path: _Optional[str] = ..., size_bytes: _Optional[int] = ..., file_sha256: _Optional[bytes] = ..., first_chunk_body_lba: _Optional[int] = ..., chunk_count: _Optional[int] = ...) -> None: ...
+    file_digest: Digest
+    def __init__(self, object_id: _Optional[bytes] = ..., file_id: _Optional[bytes] = ..., path: _Optional[str] = ..., size_bytes: _Optional[int] = ..., file_sha256: _Optional[bytes] = ..., first_chunk_body_lba: _Optional[int] = ..., chunk_count: _Optional[int] = ..., file_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class ListTapesRequest(_message.Message):
     __slots__ = ("library_uuid", "page_token", "page_size", "pool_id", "kind")
@@ -1080,24 +1168,28 @@ class EnumerateObjectsRequest(_message.Message):
     def __init__(self, tape_uuid: _Optional[bytes] = ..., library_uuid: _Optional[bytes] = ..., all: _Optional[_Union[_empty_pb2.Empty, _Mapping]] = ..., reconcile_from_tape: _Optional[bool] = ...) -> None: ...
 
 class GetObjectRequest(_message.Message):
-    __slots__ = ("object_id", "content_sha256", "caller_object_id")
+    __slots__ = ("object_id", "content_sha256", "caller_object_id", "content_digest")
     OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
     CONTENT_SHA256_FIELD_NUMBER: _ClassVar[int]
     CALLER_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     object_id: bytes
     content_sha256: bytes
     caller_object_id: str
-    def __init__(self, object_id: _Optional[bytes] = ..., content_sha256: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ...) -> None: ...
+    content_digest: Digest
+    def __init__(self, object_id: _Optional[bytes] = ..., content_sha256: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., content_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class FindObjectCopiesRequest(_message.Message):
-    __slots__ = ("object_id", "content_sha256", "caller_object_id")
+    __slots__ = ("object_id", "content_sha256", "caller_object_id", "content_digest")
     OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
     CONTENT_SHA256_FIELD_NUMBER: _ClassVar[int]
     CALLER_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     object_id: bytes
     content_sha256: bytes
     caller_object_id: str
-    def __init__(self, object_id: _Optional[bytes] = ..., content_sha256: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ...) -> None: ...
+    content_digest: Digest
+    def __init__(self, object_id: _Optional[bytes] = ..., content_sha256: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., content_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class FindObjectCopiesResponse(_message.Message):
     __slots__ = ("object", "copies")
@@ -1260,7 +1352,7 @@ class ArchiveGap(_message.Message):
     def __init__(self, unit_id: _Optional[bytes] = ..., source_start: _Optional[int] = ..., source_end: _Optional[int] = ..., cause: _Optional[_Union[ArchiveGapCause, str]] = ...) -> None: ...
 
 class WriteSession(_message.Message):
-    __slots__ = ("session_id", "tape_uuid", "drive_element_address", "body_format", "state", "objects_committed", "bytes_committed", "opened_at", "last_checkpoint_at", "target_kind", "tape_sequence", "current_tape_index")
+    __slots__ = ("session_id", "tape_uuid", "drive_element_address", "body_format", "state", "objects_committed", "bytes_committed", "opened_at", "last_checkpoint_at", "target_kind", "tape_sequence", "current_tape_index", "pending_checkpoint_objects", "pending_checkpoint_bytes", "oldest_pending_age_seconds", "checkpoint_deadline", "checkpointed_objects", "committed_copies")
     class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         WRITE_SESSION_STATE_UNSPECIFIED: _ClassVar[WriteSession.State]
@@ -1297,6 +1389,12 @@ class WriteSession(_message.Message):
     TARGET_KIND_FIELD_NUMBER: _ClassVar[int]
     TAPE_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     CURRENT_TAPE_INDEX_FIELD_NUMBER: _ClassVar[int]
+    PENDING_CHECKPOINT_OBJECTS_FIELD_NUMBER: _ClassVar[int]
+    PENDING_CHECKPOINT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    OLDEST_PENDING_AGE_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINT_DEADLINE_FIELD_NUMBER: _ClassVar[int]
+    CHECKPOINTED_OBJECTS_FIELD_NUMBER: _ClassVar[int]
+    COMMITTED_COPIES_FIELD_NUMBER: _ClassVar[int]
     session_id: bytes
     tape_uuid: bytes
     drive_element_address: int
@@ -1309,7 +1407,13 @@ class WriteSession(_message.Message):
     target_kind: WriteSession.TargetKind
     tape_sequence: _containers.RepeatedScalarFieldContainer[bytes]
     current_tape_index: int
-    def __init__(self, session_id: _Optional[bytes] = ..., tape_uuid: _Optional[bytes] = ..., drive_element_address: _Optional[int] = ..., body_format: _Optional[str] = ..., state: _Optional[_Union[WriteSession.State, str]] = ..., objects_committed: _Optional[int] = ..., bytes_committed: _Optional[int] = ..., opened_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., last_checkpoint_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., target_kind: _Optional[_Union[WriteSession.TargetKind, str]] = ..., tape_sequence: _Optional[_Iterable[bytes]] = ..., current_tape_index: _Optional[int] = ...) -> None: ...
+    pending_checkpoint_objects: int
+    pending_checkpoint_bytes: int
+    oldest_pending_age_seconds: int
+    checkpoint_deadline: _timestamp_pb2.Timestamp
+    checkpointed_objects: _containers.RepeatedCompositeFieldContainer[ObjectRecord]
+    committed_copies: _containers.RepeatedCompositeFieldContainer[ObjectCopy]
+    def __init__(self, session_id: _Optional[bytes] = ..., tape_uuid: _Optional[bytes] = ..., drive_element_address: _Optional[int] = ..., body_format: _Optional[str] = ..., state: _Optional[_Union[WriteSession.State, str]] = ..., objects_committed: _Optional[int] = ..., bytes_committed: _Optional[int] = ..., opened_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., last_checkpoint_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., target_kind: _Optional[_Union[WriteSession.TargetKind, str]] = ..., tape_sequence: _Optional[_Iterable[bytes]] = ..., current_tape_index: _Optional[int] = ..., pending_checkpoint_objects: _Optional[int] = ..., pending_checkpoint_bytes: _Optional[int] = ..., oldest_pending_age_seconds: _Optional[int] = ..., checkpoint_deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., checkpointed_objects: _Optional[_Iterable[_Union[ObjectRecord, _Mapping]]] = ..., committed_copies: _Optional[_Iterable[_Union[ObjectCopy, _Mapping]]] = ...) -> None: ...
 
 class OpenWriteSessionRequest(_message.Message):
     __slots__ = ("drive_target", "tape_target", "pool_target", "body_format", "idempotency_key", "recover_session_id")
@@ -1368,7 +1472,7 @@ class AppendObjectMessage(_message.Message):
     def __init__(self, start: _Optional[_Union[AppendObjectStart, _Mapping]] = ..., chunk: _Optional[_Union[AppendObjectChunk, _Mapping]] = ..., finish: _Optional[_Union[AppendObjectFinish, _Mapping]] = ...) -> None: ...
 
 class AppendObjectStart(_message.Message):
-    __slots__ = ("session_id", "caller_object_id", "caller_metadata", "declared_size_bytes", "body_format_manifest")
+    __slots__ = ("session_id", "caller_object_id", "caller_metadata", "declared_size_bytes", "body_format_manifest", "expected_content_sha256", "source_replay_capability", "expected_content_digest")
     class CallerMetadataEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -1381,12 +1485,18 @@ class AppendObjectStart(_message.Message):
     CALLER_METADATA_FIELD_NUMBER: _ClassVar[int]
     DECLARED_SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
     BODY_FORMAT_MANIFEST_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_CONTENT_SHA256_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_REPLAY_CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_CONTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     session_id: bytes
     caller_object_id: str
     caller_metadata: _containers.ScalarMap[str, str]
     declared_size_bytes: int
     body_format_manifest: bytes
-    def __init__(self, session_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., declared_size_bytes: _Optional[int] = ..., body_format_manifest: _Optional[bytes] = ...) -> None: ...
+    expected_content_sha256: bytes
+    source_replay_capability: SourceReplayCapability
+    expected_content_digest: Digest
+    def __init__(self, session_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., declared_size_bytes: _Optional[int] = ..., body_format_manifest: _Optional[bytes] = ..., expected_content_sha256: _Optional[bytes] = ..., source_replay_capability: _Optional[_Union[SourceReplayCapability, str]] = ..., expected_content_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class AppendObjectChunk(_message.Message):
     __slots__ = ("session_id", "data")
@@ -1397,12 +1507,14 @@ class AppendObjectChunk(_message.Message):
     def __init__(self, session_id: _Optional[bytes] = ..., data: _Optional[bytes] = ...) -> None: ...
 
 class AppendObjectFinish(_message.Message):
-    __slots__ = ("session_id", "expected_content_sha256")
+    __slots__ = ("session_id", "expected_content_sha256", "expected_content_digest")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     EXPECTED_CONTENT_SHA256_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_CONTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     session_id: bytes
     expected_content_sha256: bytes
-    def __init__(self, session_id: _Optional[bytes] = ..., expected_content_sha256: _Optional[bytes] = ...) -> None: ...
+    expected_content_digest: Digest
+    def __init__(self, session_id: _Optional[bytes] = ..., expected_content_sha256: _Optional[bytes] = ..., expected_content_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class CheckpointSessionRequest(_message.Message):
     __slots__ = ("session_id", "idempotency_key")
@@ -1411,6 +1523,16 @@ class CheckpointSessionRequest(_message.Message):
     session_id: bytes
     idempotency_key: IdempotencyKey
     def __init__(self, session_id: _Optional[bytes] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ...) -> None: ...
+
+class CheckpointSessionResponse(_message.Message):
+    __slots__ = ("session", "committed_objects", "committed_copies")
+    SESSION_FIELD_NUMBER: _ClassVar[int]
+    COMMITTED_OBJECTS_FIELD_NUMBER: _ClassVar[int]
+    COMMITTED_COPIES_FIELD_NUMBER: _ClassVar[int]
+    session: WriteSession
+    committed_objects: _containers.RepeatedCompositeFieldContainer[ObjectRecord]
+    committed_copies: _containers.RepeatedCompositeFieldContainer[ObjectCopy]
+    def __init__(self, session: _Optional[_Union[WriteSession, _Mapping]] = ..., committed_objects: _Optional[_Iterable[_Union[ObjectRecord, _Mapping]]] = ..., committed_copies: _Optional[_Iterable[_Union[ObjectCopy, _Mapping]]] = ...) -> None: ...
 
 class CloseWriteSessionRequest(_message.Message):
     __slots__ = ("session_id", "idempotency_key")
@@ -1437,7 +1559,7 @@ class GetWriteSessionRequest(_message.Message):
     def __init__(self, session_id: _Optional[bytes] = ...) -> None: ...
 
 class ReadSession(_message.Message):
-    __slots__ = ("session_id", "tape_uuid", "drive_element_address", "state", "opened_at")
+    __slots__ = ("session_id", "tape_uuid", "drive_element_address", "state", "opened_at", "position_proof", "daemon_epoch")
     class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         READ_SESSION_STATE_UNSPECIFIED: _ClassVar[ReadSession.State]
@@ -1453,22 +1575,50 @@ class ReadSession(_message.Message):
     DRIVE_ELEMENT_ADDRESS_FIELD_NUMBER: _ClassVar[int]
     STATE_FIELD_NUMBER: _ClassVar[int]
     OPENED_AT_FIELD_NUMBER: _ClassVar[int]
+    POSITION_PROOF_FIELD_NUMBER: _ClassVar[int]
+    DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
     session_id: bytes
     tape_uuid: bytes
     drive_element_address: int
     state: ReadSession.State
     opened_at: _timestamp_pb2.Timestamp
-    def __init__(self, session_id: _Optional[bytes] = ..., tape_uuid: _Optional[bytes] = ..., drive_element_address: _Optional[int] = ..., state: _Optional[_Union[ReadSession.State, str]] = ..., opened_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    position_proof: DevicePositionProof
+    daemon_epoch: int
+    def __init__(self, session_id: _Optional[bytes] = ..., tape_uuid: _Optional[bytes] = ..., drive_element_address: _Optional[int] = ..., state: _Optional[_Union[ReadSession.State, str]] = ..., opened_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., position_proof: _Optional[_Union[DevicePositionProof, _Mapping]] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
 
 class OpenReadSessionRequest(_message.Message):
-    __slots__ = ("drive_target", "tape_target", "idempotency_key")
+    __slots__ = ("drive_target", "tape_target", "idempotency_key", "resume_target")
     DRIVE_TARGET_FIELD_NUMBER: _ClassVar[int]
     TAPE_TARGET_FIELD_NUMBER: _ClassVar[int]
     IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    RESUME_TARGET_FIELD_NUMBER: _ClassVar[int]
     drive_target: DriveTarget
     tape_target: TapeTarget
     idempotency_key: IdempotencyKey
-    def __init__(self, drive_target: _Optional[_Union[DriveTarget, _Mapping]] = ..., tape_target: _Optional[_Union[TapeTarget, _Mapping]] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ...) -> None: ...
+    resume_target: ReadResumeTarget
+    def __init__(self, drive_target: _Optional[_Union[DriveTarget, _Mapping]] = ..., tape_target: _Optional[_Union[TapeTarget, _Mapping]] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ..., resume_target: _Optional[_Union[ReadResumeTarget, _Mapping]] = ...) -> None: ...
+
+class ReadResumeTarget(_message.Message):
+    __slots__ = ("tape_uuid", "object_id", "file_id", "file_boundary_byte_offset", "expected_position_lba", "daemon_epoch")
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    FILE_ID_FIELD_NUMBER: _ClassVar[int]
+    FILE_BOUNDARY_BYTE_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_POSITION_LBA_FIELD_NUMBER: _ClassVar[int]
+    DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    object_id: bytes
+    file_id: bytes
+    file_boundary_byte_offset: int
+    expected_position_lba: int
+    daemon_epoch: int
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., object_id: _Optional[bytes] = ..., file_id: _Optional[bytes] = ..., file_boundary_byte_offset: _Optional[int] = ..., expected_position_lba: _Optional[int] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
+
+class DevicePositionProof(_message.Message):
+    __slots__ = ("position_after_lba",)
+    POSITION_AFTER_LBA_FIELD_NUMBER: _ClassVar[int]
+    position_after_lba: int
+    def __init__(self, position_after_lba: _Optional[int] = ...) -> None: ...
 
 class CloseReadSessionRequest(_message.Message):
     __slots__ = ("session_id", "idempotency_key")
@@ -1538,7 +1688,7 @@ class QueryAuditRequest(_message.Message):
     def __init__(self, since: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., until: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., filter: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class AuditEntry(_message.Message):
-    __slots__ = ("sequence", "timestamp", "actor", "source_layer", "operation_id", "session_id", "event_kind", "detail_json")
+    __slots__ = ("sequence", "timestamp", "actor", "source_layer", "operation_id", "session_id", "event_kind", "detail_json", "software_build")
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
     ACTOR_FIELD_NUMBER: _ClassVar[int]
@@ -1547,6 +1697,7 @@ class AuditEntry(_message.Message):
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     EVENT_KIND_FIELD_NUMBER: _ClassVar[int]
     DETAIL_JSON_FIELD_NUMBER: _ClassVar[int]
+    SOFTWARE_BUILD_FIELD_NUMBER: _ClassVar[int]
     sequence: int
     timestamp: _timestamp_pb2.Timestamp
     actor: str
@@ -1555,4 +1706,5 @@ class AuditEntry(_message.Message):
     session_id: bytes
     event_kind: str
     detail_json: str
-    def __init__(self, sequence: _Optional[int] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., actor: _Optional[str] = ..., source_layer: _Optional[str] = ..., operation_id: _Optional[bytes] = ..., session_id: _Optional[bytes] = ..., event_kind: _Optional[str] = ..., detail_json: _Optional[str] = ...) -> None: ...
+    software_build: str
+    def __init__(self, sequence: _Optional[int] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., actor: _Optional[str] = ..., source_layer: _Optional[str] = ..., operation_id: _Optional[bytes] = ..., session_id: _Optional[bytes] = ..., event_kind: _Optional[str] = ..., detail_json: _Optional[str] = ..., software_build: _Optional[str] = ...) -> None: ...

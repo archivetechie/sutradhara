@@ -47,8 +47,11 @@ class RestoreServiceStub:
 
     OpenRestore rejects a live open-session generation and supersedes only an
     expired generation. WatchAssignments polls admitted queued/sent agent items
-    and emits each observed item once per watch. It is scoped to the authenticated
-    mTLS peer: device_id MUST equal that peer's device id.
+    and emits each observed item once per watch. It deliberately exposes only
+    device-scoped metadata (item id/path/size/artifactclass/destination) and does
+    not apply the live operator-capability gate; OpenRestore fully gates object
+    bytes. It is scoped to the authenticated mTLS peer: device_id MUST equal that
+    peer's device id.
     """
 
     def __init__(self, channel):
@@ -96,8 +99,11 @@ class RestoreServiceServicer:
 
     OpenRestore rejects a live open-session generation and supersedes only an
     expired generation. WatchAssignments polls admitted queued/sent agent items
-    and emits each observed item once per watch. It is scoped to the authenticated
-    mTLS peer: device_id MUST equal that peer's device id.
+    and emits each observed item once per watch. It deliberately exposes only
+    device-scoped metadata (item id/path/size/artifactclass/destination) and does
+    not apply the live operator-capability gate; OpenRestore fully gates object
+    bytes. It is scoped to the authenticated mTLS peer: device_id MUST equal that
+    peer's device id.
     """
 
     def OpenRestore(self, request, context):
@@ -166,8 +172,11 @@ class RestoreService:
 
     OpenRestore rejects a live open-session generation and supersedes only an
     expired generation. WatchAssignments polls admitted queued/sent agent items
-    and emits each observed item once per watch. It is scoped to the authenticated
-    mTLS peer: device_id MUST equal that peer's device id.
+    and emits each observed item once per watch. It deliberately exposes only
+    device-scoped metadata (item id/path/size/artifactclass/destination) and does
+    not apply the live operator-capability gate; OpenRestore fully gates object
+    bytes. It is scoped to the authenticated mTLS peer: device_id MUST equal that
+    peer's device id.
     """
 
     @staticmethod
