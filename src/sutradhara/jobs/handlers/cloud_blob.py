@@ -30,6 +30,8 @@ from sutradhara.sealing.port import Representation
 
 
 class KeyedObjectWriter(Protocol):
+    """Object-store writer that returns only after its durable write completes."""
+
     def write_object(
         self, source: Path | str, *, key: str, pool: str | None = None
     ) -> CopyRecord: ...
@@ -120,15 +122,20 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
     backend = factory.backend_from_row(backend_row)
     key = f"intakes/{intake.intake_id}.rao"
     if hasattr(backend, "write_object"):
-        record = cast(KeyedObjectWriter, backend).write_object(blob_path, key=key, pool=pool_id)
+        committed_record = cast(KeyedObjectWriter, backend).write_object(
+            blob_path,
+            key=key,
+            pool=pool_id,
+        )
     elif hasattr(backend, "write_object_to_pool"):
-        record = backend.write_object_to_pool(blob_path, pool_id)
+        # Remanence's compatibility method is a checkpointed batch of one.
+        committed_record = backend.write_object_to_pool(blob_path, pool_id)
     else:
         raise ValueError(f"backend {backend_name!r} does not support object writes")
     library = (backend_row.config or {}).get("library_uuid")
     touch_tape_locator(
         ctx,
-        record.native_locator,
+        committed_record.native_locator,
         library=library if isinstance(library, (bytes, str)) else None,
     )
 
@@ -137,12 +144,12 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
         bundle_id=bundle.id,
         backend_id=backend_row.id,
         pool_id=pool_id,
-        native_locator=record.native_locator,
-        integrity_hash=record.integrity_hash,
+        native_locator=committed_record.native_locator,
+        integrity_hash=committed_record.integrity_hash,
         source=CopySource.INGEST,
         health=CopyHealth.OK,
         storage_metadata={
-            **record.metadata,
+            **committed_record.metadata,
             "representation": representation.value,
             "recipient_epochs": list(recipient_epochs),
             "payload_root": str(payload_root),
