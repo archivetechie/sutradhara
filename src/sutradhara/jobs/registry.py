@@ -22,6 +22,8 @@ from sqlalchemy.orm import Session
 
 from sutradhara.jobs.models import Job
 
+CHECKPOINT_BATCH_STATE_KEY = "checkpoint_batches"
+
 
 @dataclass
 class JobContext:
@@ -88,6 +90,76 @@ class JobContext:
             self.touch(drive)
         else:
             self.touch(drive, parent=f"library:{_identity_text(library)}")
+
+    def record_batch_written(
+        self,
+        *,
+        batch_id: str,
+        provisional_ordinal: int,
+        caller_object_id: str,
+        source: str,
+    ) -> None:
+        """Persist one WRITTEN object as a byte-zero requeue obligation."""
+
+        prior = dict(self.job.step_state or {})
+        batches = {
+            str(key): dict(value)
+            for key, value in dict(prior.get(CHECKPOINT_BATCH_STATE_KEY) or {}).items()
+        }
+        batch = dict(batches.get(batch_id) or {})
+        objects = [
+            dict(item)
+            for item in list(batch.get("objects") or [])
+            if item.get("caller_object_id") != caller_object_id
+        ]
+        objects.append(
+            {
+                "caller_object_id": caller_object_id,
+                "provisional_ordinal": provisional_ordinal,
+                "source": source,
+                "restart_offset": 0,
+            }
+        )
+        objects.sort(key=lambda item: (int(item["provisional_ordinal"]), item["caller_object_id"]))
+        batches[batch_id] = {"objects": objects}
+        self.job.step_state = {**prior, CHECKPOINT_BATCH_STATE_KEY: batches}
+        self.session.info["checkpoint_batch_state_touched"] = True
+        self.session.flush([self.job])
+
+    def record_batch_checkpointed(
+        self,
+        *,
+        batch_id: str,
+        caller_object_ids: tuple[str, ...],
+    ) -> None:
+        """Clear only the objects named by the committed-copy set."""
+
+        prior = dict(self.job.step_state or {})
+        batches = {
+            str(key): dict(value)
+            for key, value in dict(prior.get(CHECKPOINT_BATCH_STATE_KEY) or {}).items()
+        }
+        batch = batches.get(batch_id)
+        if batch is None:
+            return
+        committed = set(caller_object_ids)
+        objects = [
+            dict(item)
+            for item in list(batch.get("objects") or [])
+            if item.get("caller_object_id") not in committed
+        ]
+        if objects:
+            batches[batch_id] = {**batch, "objects": objects}
+        else:
+            batches.pop(batch_id, None)
+        next_state = dict(prior)
+        if batches:
+            next_state[CHECKPOINT_BATCH_STATE_KEY] = batches
+        else:
+            next_state.pop(CHECKPOINT_BATCH_STATE_KEY, None)
+        self.job.step_state = next_state
+        self.session.info["checkpoint_batch_state_touched"] = True
+        self.session.flush([self.job])
 
 
 @dataclass(frozen=True)
