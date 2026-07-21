@@ -494,6 +494,81 @@ def test_scrub_tolerates_duplicate_locator_in_one_enumerate(engine: Engine) -> N
         assert len(list(s.scalars(select(Copy)))) == 1
 
 
+def test_scrub_during_open_batch_neither_marks_missing_nor_synthesizes(
+    engine: Engine,
+) -> None:
+    """The backend port hides WRITTEN objects on both scrub reconciliation legs."""
+
+    committed_hash = _hash(b"already checkpointed")
+    written_hash = _hash(b"written only")
+    committed_locator = {"object_id": "committed"}
+
+    class _CheckpointVisibilityBackend:
+        def __init__(self) -> None:
+            self.checkpointed = [
+                CopyRecord(
+                    logical_id=committed_hash,
+                    native_locator=committed_locator,
+                    integrity_hash=committed_hash,
+                    size_bytes=20,
+                )
+            ]
+            self.written: list[CopyRecord] = []
+
+        @property
+        def name(self) -> str:
+            return "checkpoint-visibility"
+
+        def append_open_batch(self) -> None:
+            self.written.append(
+                CopyRecord(
+                    logical_id=written_hash,
+                    native_locator={"object_id": "provisional"},
+                    integrity_hash=written_hash,
+                    size_bytes=12,
+                )
+            )
+
+        def enumerate(self) -> Iterator[CopyRecord]:
+            # The contract deliberately excludes self.written.
+            return iter(self.checkpointed)
+
+        def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+            raise AssertionError("read_range is not used by scrub")
+
+        def verify(self, locator: BackendLocator) -> VerifyResult:
+            raise AssertionError("verify is not used by scrub")
+
+    backend = _CheckpointVisibilityBackend()
+    with session_scope(engine) as session:
+        row = Backend(
+            name=backend.name,
+            kind=BackendKind.MEMORY,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        session.add(row)
+        session.add(LogicalAsset(content_sha256=committed_hash, size_bytes=20))
+        session.flush()
+        existing, _ = add_copy(
+            session,
+            logical_asset_hash=committed_hash,
+            backend_id=row.id,
+            native_locator=committed_locator,
+            integrity_hash=committed_hash,
+            source=CopySource.INGEST,
+            health=CopyHealth.OK,
+        )
+        backend.append_open_batch()
+
+        report = scrub_backend(session, row, backend)
+
+        assert report.copies_marked_missing == 0
+        assert report.copies_added == 0
+        assert existing.health == CopyHealth.OK
+        assert list(session.scalars(select(Copy))) == [existing]
+        assert session.get(LogicalAsset, written_hash) is None
+
+
 def test_scrub_against_live_backend_surfaces_unavailable(engine: Engine) -> None:
     from sutradhara.backend.port import BackendUnavailableError
     from sutradhara.backend.remanence import RemanenceBackend

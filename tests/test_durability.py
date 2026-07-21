@@ -45,6 +45,8 @@ from sutradhara.durability import (
     durable_placements,
     placement_status,
 )
+from sutradhara.jobs.models import Job, JobStatus
+from sutradhara.jobs.registry import CHECKPOINT_BATCH_STATE_KEY
 from sutradhara.replication import replication_status
 from sutradhara.sealing.port import Representation
 
@@ -213,6 +215,50 @@ def test_placement_status_flags_duplicate_pool_without_raw_counting(engine: Engi
     assert missing.pool_id == "pool-b"
     assert missing.have is False
     assert missing.duplicate_count == 0
+
+
+def test_open_batch_tracking_does_not_contribute_to_durability_floor(
+    engine: Engine,
+) -> None:
+    asset_hash = _digest(b"written but not checkpointed")
+    with session_scope(engine) as session:
+        pool = _add_pool(session, "pool-a", artifactclass="masters")
+        session.add(LogicalAsset(content_sha256=asset_hash, size_bytes=26))
+        session.add(
+            Job(
+                kind="copy",
+                params={"asset_hash": asset_hash.hex()},
+                status=JobStatus.RUNNING,
+                step_state={
+                    CHECKPOINT_BATCH_STATE_KEY: {
+                        "batch-a": {
+                            "objects": [
+                                {
+                                    "caller_object_id": asset_hash.hex(),
+                                    "provisional_ordinal": 1,
+                                    "source": "/staging/object.rao",
+                                    "restart_offset": 0,
+                                }
+                            ]
+                        }
+                    }
+                },
+            )
+        )
+        session.flush()
+
+        accounting = durable_placements(
+            session,
+            AssetTarget(asset_hash, "masters"),
+            require_verified=False,
+            artifactclass="masters",
+        )
+        status = placement_status(session, AssetTarget(asset_hash, "masters"))
+
+    assert accounting == []
+    assert status["complete"] is False
+    assert status["have"] == set()
+    assert {target.pool_id for target in status["missing"]} == {pool.id}
 
 
 def test_bundle_replication_status_reports_complete_and_missing(engine: Engine) -> None:

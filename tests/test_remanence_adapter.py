@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from concurrent import futures
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import grpc
 import pytest
@@ -27,9 +28,11 @@ from sutradhara.backend.port import (
     StorageBackend,
 )
 from sutradhara.backend.remanence import (
+    CommittedCopy,
     RemanenceBackend,
     RemanenceWriteResult,
     RemanenceWriteSessionError,
+    WrittenReceipt,
 )
 from sutradhara.catalog.session import locator_key
 from sutradhara.catalog.types import content_hash
@@ -804,6 +807,7 @@ class _WriteSession(layer5_pb2_grpc.WriteSessionServiceServicer):
         self.open_request: layer5_pb2.OpenWriteSessionRequest | None = None
         self.appended: list[layer5_pb2.AppendObjectMessage] = []
         self.opened = False
+        self.checkpointed = False
         self.closed = False
         self.aborted = False
         self.abort_reason: str | None = None
@@ -828,6 +832,14 @@ class _WriteSession(layer5_pb2_grpc.WriteSessionServiceServicer):
             context.abort(self.append_error, "append failed")
             raise AssertionError("unreachable after context.abort")
         return self.obj
+
+    def CheckpointSession(
+        self,
+        request: layer5_pb2.CheckpointSessionRequest,
+        context: grpc.ServicerContext,
+    ) -> layer5_pb2.WriteSession:
+        self.checkpointed = True
+        return layer5_pb2.WriteSession(session_id=self.session_id, tape_uuid=self.tape_uuid)
 
     def CloseWriteSession(
         self,
@@ -882,6 +894,11 @@ class _DirectWriteClient:
             raise _DirectWriteError()
         return self.obj
 
+    def CheckpointSession(
+        self, request: layer5_pb2.CheckpointSessionRequest
+    ) -> layer5_pb2.WriteSession:
+        return layer5_pb2.WriteSession(session_id=request.session_id)
+
     def CloseWriteSession(
         self, request: layer5_pb2.CloseWriteSessionRequest
     ) -> layer5_pb2.WriteSession:
@@ -907,6 +924,84 @@ class _MalformedCommittedWriteClient(_DirectWriteClient):
             logical_size_bytes=4,
             body_format="raw-bytes",
         )
+
+
+class _CheckpointBatchClient:
+    """Handwritten mirror of the checkpoint proto while generated stubs lag."""
+
+    def __init__(self, *, fail_checkpoint: bool = False) -> None:
+        self.session_id = b"checkpoint-session"
+        self.tape_uuid = bytes.fromhex("a1" * 16)
+        self.fail_checkpoint = fail_checkpoint
+        self.pending: list[layer5_pb2.ObjectRecord] = []
+        self.aborted = False
+
+    def OpenWriteSession(
+        self, request: layer5_pb2.OpenWriteSessionRequest
+    ) -> layer5_pb2.WriteSession:
+        return layer5_pb2.WriteSession(
+            session_id=self.session_id,
+            tape_uuid=self.tape_uuid,
+            drive_element_address=0x202,
+        )
+
+    def AppendObject(self, messages: Iterator[layer5_pb2.AppendObjectMessage]) -> object:
+        caller_object_id = ""
+        data = bytearray()
+        for message in messages:
+            if message.HasField("start"):
+                caller_object_id = message.start.caller_object_id
+            elif message.HasField("chunk"):
+                data.extend(message.chunk.data)
+        ordinal = len(self.pending) + 1
+        digest = hashlib.sha256(data).digest()
+        self.pending.append(
+            layer5_pb2.ObjectRecord(
+                object_id=ordinal.to_bytes(16),
+                caller_object_id=caller_object_id,
+                content_sha256=digest,
+                logical_size_bytes=len(data),
+                body_format="raw-bytes",
+                copies=[
+                    layer5_pb2.ObjectCopy(
+                        tape_uuid=self.tape_uuid,
+                        tape_file_number=ordinal,
+                        first_body_lba=1,
+                        health=layer5_pb2.ObjectCopy.OBJECT_COPY_HEALTH_OK,
+                        pool_id="checkpoint-pool",
+                    )
+                ],
+            )
+        )
+        return SimpleNamespace(
+            object_id=ordinal.to_bytes(16),
+            caller_object_id=caller_object_id,
+            copies=[],
+            append_commit_info=SimpleNamespace(
+                durability="WRITTEN",
+                batch_id=b"batch-1",
+                provisional_ordinal=ordinal,
+                tape_file_number=None,
+            ),
+        )
+
+    def CheckpointSession(self, request: layer5_pb2.CheckpointSessionRequest) -> object:
+        if self.fail_checkpoint:
+            raise _DirectWriteError()
+        committed = list(self.pending)
+        self.pending.clear()
+        return SimpleNamespace(committed_copies=committed)
+
+    def CloseWriteSession(self, request: layer5_pb2.CloseWriteSessionRequest) -> object:
+        committed = list(self.pending)
+        self.pending.clear()
+        return SimpleNamespace(committed_copies=committed)
+
+    def AbortWriteSession(
+        self, request: layer5_pb2.AbortWriteSessionRequest
+    ) -> layer5_pb2.WriteSession:
+        self.aborted = True
+        return layer5_pb2.WriteSession(session_id=request.session_id)
 
 
 @contextmanager
@@ -990,6 +1085,79 @@ def test_malformed_committed_write_response_keeps_opened_session_identity(
     assert client.aborted
 
 
+def test_batch_append_is_advisory_until_checkpoint(tmp_path: Path) -> None:
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    client = _CheckpointBatchClient()
+    backend = RemanenceBackend(
+        "direct-rem",
+        endpoint="direct",
+        write_session=client,
+    )
+
+    batch = backend.open_batch("checkpoint-pool")
+    first_receipt = batch.append(first, "object-1")
+    second_receipt = batch.append(second, "object-2")
+
+    assert first_receipt == WrittenReceipt(batch_id="62617463682d31", provisional_ordinal=1)
+    assert second_receipt == WrittenReceipt(batch_id="62617463682d31", provisional_ordinal=2)
+    committed = batch.checkpoint()
+    assert all(isinstance(item, CommittedCopy) for item in committed)
+    assert [item.caller_object_id for item in committed] == ["object-1", "object-2"]
+    assert [item.native_locator["tape_file_number"] for item in committed] == [1, 2]
+    assert batch.close() == []
+
+
+def test_batch_failure_requeues_every_outstanding_object_from_byte_zero(
+    tmp_path: Path,
+) -> None:
+    sources = [tmp_path / "one.bin", tmp_path / "two.bin"]
+    for index, source in enumerate(sources):
+        source.write_bytes(bytes([index]))
+    client = _CheckpointBatchClient(fail_checkpoint=True)
+    backend = RemanenceBackend(
+        "direct-rem",
+        endpoint="direct",
+        write_session=client,
+    )
+    batch = backend.open_batch("checkpoint-pool")
+    batch.append(sources[0], "object-1")
+    batch.append(sources[1], "object-2")
+
+    with pytest.raises(RemanenceWriteSessionError) as raised:
+        batch.checkpoint()
+
+    assert client.aborted
+    assert [item.caller_object_id for item in raised.value.requeue_objects] == [
+        "object-1",
+        "object-2",
+    ]
+    assert [item.source for item in raised.value.requeue_objects] == sources
+    assert [item.provisional_ordinal for item in raised.value.requeue_objects] == [1, 2]
+
+
+def test_batch_of_one_preserves_existing_write_result_contract(tmp_path: Path) -> None:
+    source = tmp_path / "one.bin"
+    source.write_bytes(b"one object")
+    client = _CheckpointBatchClient()
+    backend = RemanenceBackend(
+        "direct-rem",
+        endpoint="direct",
+        write_session=client,
+    )
+
+    result = backend.write_object_to_pool(source, "checkpoint-pool")
+
+    assert isinstance(result, RemanenceWriteResult)
+    assert result.session_id == client.session_id
+    assert result.drive_element_address == 0x202
+    assert result.logical_id == hashlib.sha256(b"one object").digest()
+    assert result.native_locator["tape_file_number"] == 1
+    assert client.pending == []
+
+
 def test_write_object_to_pool_success(
     write_server: tuple[str, _WriteSession],
     tmp_path: Path,
@@ -1008,6 +1176,7 @@ def test_write_object_to_pool_success(
     assert record.metadata["append_commit_info"]["append_mode"] == "fresh"
     assert record.metadata["append_commit_info"]["tape_file_number"] == 1
     assert servicer.opened
+    assert servicer.checkpointed
     assert servicer.closed
     assert not servicer.aborted
     assert servicer.open_request is not None
@@ -1132,6 +1301,16 @@ class _RTWrite(layer5_pb2_grpc.WriteSessionServiceServicer):
     def CloseWriteSession(
         self,
         request: layer5_pb2.CloseWriteSessionRequest,
+        context: grpc.ServicerContext,
+    ) -> layer5_pb2.WriteSession:
+        return layer5_pb2.WriteSession(
+            session_id=self.session_id,
+            tape_uuid=self.store.tape_uuid,
+        )
+
+    def CheckpointSession(
+        self,
+        request: layer5_pb2.CheckpointSessionRequest,
         context: grpc.ServicerContext,
     ) -> layer5_pb2.WriteSession:
         return layer5_pb2.WriteSession(

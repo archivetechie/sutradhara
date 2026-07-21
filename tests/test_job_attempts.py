@@ -29,7 +29,12 @@ from sutradhara.jobs.reconcilers.conditions import (
     OBSERVED_MISSING,
     record_observation,
 )
-from sutradhara.jobs.registry import JobContext, JobResult, register_handler
+from sutradhara.jobs.registry import (
+    CHECKPOINT_BATCH_STATE_KEY,
+    JobContext,
+    JobResult,
+    register_handler,
+)
 from sutradhara.jobs.runtime_observations import report_session_open
 
 
@@ -113,6 +118,41 @@ def test_multiple_attempts_keep_retry_history(engine: Engine) -> None:
             assert row.last_error is None
     finally:
         _unregister("_attempt_retry")
+
+
+def test_outstanding_checkpoint_batch_tracking_survives_failed_run_restart(
+    engine: Engine,
+) -> None:
+    @register_handler("_checkpoint_batch_failure")
+    def _checkpoint_batch_failure(ctx: JobContext) -> JobResult:
+        for ordinal in (1, 2):
+            ctx.record_batch_written(
+                batch_id="batch-a",
+                provisional_ordinal=ordinal,
+                caller_object_id=f"object-{ordinal}",
+                source=f"/staging/object-{ordinal}.rao",
+            )
+        raise RuntimeError("checkpoint stream disconnected")
+
+    try:
+        with session_scope(engine) as session:
+            job = submit(session, "_checkpoint_batch_failure", {})
+            result = run_one(session, job.id)
+            assert not result.ok
+            job_id = job.id
+
+        # A new ORM session models the Sutradhara worker restart boundary.
+        with session_scope(engine) as session:
+            restarted = session.get(Job, job_id)
+            assert restarted is not None
+            objects = restarted.step_state[CHECKPOINT_BATCH_STATE_KEY]["batch-a"]["objects"]
+            assert [item["caller_object_id"] for item in objects] == [
+                "object-1",
+                "object-2",
+            ]
+            assert [item["restart_offset"] for item in objects] == [0, 0]
+    finally:
+        _unregister("_checkpoint_batch_failure")
 
 
 def test_attempts_survive_terminal_job_prune(engine: Engine) -> None:
@@ -302,6 +342,11 @@ class _AttemptWriteClient:
 
     def CloseWriteSession(
         self, request: layer5_pb2.CloseWriteSessionRequest
+    ) -> layer5_pb2.WriteSession:
+        return layer5_pb2.WriteSession(session_id=request.session_id)
+
+    def CheckpointSession(
+        self, request: layer5_pb2.CheckpointSessionRequest
     ) -> layer5_pb2.WriteSession:
         return layer5_pb2.WriteSession(session_id=request.session_id)
 
