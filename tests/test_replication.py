@@ -83,7 +83,7 @@ class _PoolWriteBackend:
     def name(self) -> str:
         return self._name
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
         self.writes.append(pool)
@@ -123,7 +123,7 @@ class _PoolWriteBackend:
 
 
 class _WrongHashBackend(_PoolWriteBackend):
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         record = super().write_object_to_pool(source, pool)
         wrong = content_hash(hashlib.sha256(b"different").digest())
         return CopyRecord(
@@ -135,7 +135,7 @@ class _WrongHashBackend(_PoolWriteBackend):
 
 
 class _D2TapeFakeBackend(_PoolWriteBackend):
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
         self.writes.append(pool)
