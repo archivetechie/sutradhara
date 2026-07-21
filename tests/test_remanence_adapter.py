@@ -12,7 +12,6 @@ from collections.abc import Iterator
 from concurrent import futures
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
 
 import grpc
 import pytest
@@ -38,6 +37,70 @@ from sutradhara.catalog.session import locator_key
 from sutradhara.catalog.types import content_hash
 
 FIXTURE = Path(__file__).parent / "fixtures" / "remanence_objects.json"
+
+
+def _committed_object(
+    template: layer5_pb2.ObjectRecord,
+    caller_object_id: str,
+) -> layer5_pb2.ObjectRecord:
+    """Clone a catalog record as one generated CHECKPOINTED write result."""
+
+    result = layer5_pb2.ObjectRecord()
+    result.CopyFrom(template)
+    result.caller_object_id = caller_object_id
+    result.append_commit_info.durability = layer5_pb2.APPEND_DURABILITY_CHECKPOINTED
+    return result
+
+
+def _written_ack(
+    caller_object_id: str,
+    *,
+    object_id: bytes,
+    ordinal: int = 1,
+    batch_id: bytes = b"batch-1",
+) -> layer5_pb2.ObjectRecord:
+    """Build the real locator-free ObjectRecord shape for a WRITTEN append ack."""
+
+    return layer5_pb2.ObjectRecord(
+        object_id=object_id,
+        caller_object_id=caller_object_id,
+        append_commit_info=layer5_pb2.AppendCommitInfo(
+            durability=layer5_pb2.APPEND_DURABILITY_WRITTEN,
+            batch_id=batch_id,
+            provisional_ordinal=ordinal,
+        ),
+    )
+
+
+def _checkpoint_response(
+    session_id: bytes,
+    tape_uuid: bytes,
+    committed: list[layer5_pb2.ObjectRecord],
+) -> layer5_pb2.CheckpointSessionResponse:
+    """Build a generated checkpoint response with parallel committed sets."""
+
+    copies = [next(cp for cp in obj.copies if cp.tape_uuid == tape_uuid) for obj in committed]
+    return layer5_pb2.CheckpointSessionResponse(
+        session=layer5_pb2.WriteSession(session_id=session_id, tape_uuid=tape_uuid),
+        committed_objects=committed,
+        committed_copies=copies,
+    )
+
+
+def _write_session_response(
+    session_id: bytes,
+    tape_uuid: bytes,
+    committed: list[layer5_pb2.ObjectRecord],
+) -> layer5_pb2.WriteSession:
+    """Build the generated close response carrying any checkpointed objects."""
+
+    copies = [next(cp for cp in obj.copies if cp.tape_uuid == tape_uuid) for obj in committed]
+    return layer5_pb2.WriteSession(
+        session_id=session_id,
+        tape_uuid=tape_uuid,
+        checkpointed_objects=committed,
+        committed_copies=copies,
+    )
 
 
 @pytest.fixture
@@ -266,6 +329,7 @@ def proto_object() -> layer5_pb2.ObjectRecord:
             tape_file_number=1,
             first_body_lba=1,
             position_after_lba=42,
+            durability=layer5_pb2.APPEND_DURABILITY_CHECKPOINTED,
         ),
     )
 
@@ -811,6 +875,7 @@ class _WriteSession(layer5_pb2_grpc.WriteSessionServiceServicer):
         self.closed = False
         self.aborted = False
         self.abort_reason: str | None = None
+        self.pending: list[layer5_pb2.ObjectRecord] = []
 
     def OpenWriteSession(
         self,
@@ -826,20 +891,26 @@ class _WriteSession(layer5_pb2_grpc.WriteSessionServiceServicer):
         request_iterator: Iterator[layer5_pb2.AppendObjectMessage],
         context: grpc.ServicerContext,
     ) -> layer5_pb2.ObjectRecord:
+        caller_object_id = ""
         for msg in request_iterator:
             self.appended.append(msg)
+            if msg.HasField("start"):
+                caller_object_id = msg.start.caller_object_id
         if self.append_error is not None:
             context.abort(self.append_error, "append failed")
             raise AssertionError("unreachable after context.abort")
-        return self.obj
+        self.pending.append(_committed_object(self.obj, caller_object_id))
+        return _written_ack(caller_object_id, object_id=self.obj.object_id)
 
     def CheckpointSession(
         self,
         request: layer5_pb2.CheckpointSessionRequest,
         context: grpc.ServicerContext,
-    ) -> layer5_pb2.WriteSession:
+    ) -> layer5_pb2.CheckpointSessionResponse:
         self.checkpointed = True
-        return layer5_pb2.WriteSession(session_id=self.session_id, tape_uuid=self.tape_uuid)
+        committed = list(self.pending)
+        self.pending.clear()
+        return _checkpoint_response(self.session_id, self.tape_uuid, committed)
 
     def CloseWriteSession(
         self,
@@ -847,7 +918,9 @@ class _WriteSession(layer5_pb2_grpc.WriteSessionServiceServicer):
         context: grpc.ServicerContext,
     ) -> layer5_pb2.WriteSession:
         self.closed = True
-        return layer5_pb2.WriteSession(session_id=self.session_id, tape_uuid=self.tape_uuid)
+        committed = list(self.pending)
+        self.pending.clear()
+        return _write_session_response(self.session_id, self.tape_uuid, committed)
 
     def AbortWriteSession(
         self,
@@ -876,6 +949,7 @@ class _DirectWriteClient:
         self.session_id = b"direct-write-session"
         self.drive_element_address = 0x102
         self.aborted = False
+        self.pending: list[layer5_pb2.ObjectRecord] = []
 
     def OpenWriteSession(
         self, request: layer5_pb2.OpenWriteSessionRequest
@@ -889,20 +963,30 @@ class _DirectWriteClient:
     def AppendObject(
         self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
     ) -> layer5_pb2.ObjectRecord:
-        list(request_iterator)
+        messages = list(request_iterator)
         if self.raise_on_append:
             raise _DirectWriteError()
-        return self.obj
+        caller_object_id = messages[0].start.caller_object_id
+        self.pending.append(_committed_object(self.obj, caller_object_id))
+        return _written_ack(caller_object_id, object_id=self.obj.object_id)
 
     def CheckpointSession(
         self, request: layer5_pb2.CheckpointSessionRequest
-    ) -> layer5_pb2.WriteSession:
-        return layer5_pb2.WriteSession(session_id=request.session_id)
+    ) -> layer5_pb2.CheckpointSessionResponse | layer5_pb2.WriteSession:
+        committed = list(self.pending)
+        self.pending.clear()
+        return _checkpoint_response(self.session_id, self.obj.copies[0].tape_uuid, committed)
 
     def CloseWriteSession(
         self, request: layer5_pb2.CloseWriteSessionRequest
     ) -> layer5_pb2.WriteSession:
-        return layer5_pb2.WriteSession(session_id=request.session_id)
+        committed = list(self.pending)
+        self.pending.clear()
+        return _write_session_response(
+            self.session_id,
+            self.obj.copies[0].tape_uuid,
+            committed,
+        )
 
     def AbortWriteSession(
         self, request: layer5_pb2.AbortWriteSessionRequest
@@ -914,20 +998,57 @@ class _DirectWriteClient:
 class _MalformedCommittedWriteClient(_DirectWriteClient):
     """Return a committed response whose written copy cannot be selected."""
 
-    def AppendObject(
-        self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
-    ) -> layer5_pb2.ObjectRecord:
-        list(request_iterator)
-        return layer5_pb2.ObjectRecord(
+    def CheckpointSession(
+        self, request: layer5_pb2.CheckpointSessionRequest
+    ) -> layer5_pb2.CheckpointSessionResponse:
+        malformed = layer5_pb2.ObjectRecord(
             object_id=bytes.fromhex("20" * 16),
+            caller_object_id=self.pending[0].caller_object_id,
             content_sha256=bytes.fromhex("30" * 32),
             logical_size_bytes=4,
             body_format="raw-bytes",
         )
+        self.pending.clear()
+        return layer5_pb2.CheckpointSessionResponse(
+            session=layer5_pb2.WriteSession(session_id=request.session_id),
+            committed_objects=[malformed],
+            committed_copies=[],
+        )
+
+
+class _LegacyWriteSessionClient(_DirectWriteClient):
+    """Model the documented pre-checkpoint WriteSession response compatibility seam."""
+
+    def __init__(
+        self,
+        obj: layer5_pb2.ObjectRecord,
+        *,
+        modern_checkpoint_response: bool = False,
+    ) -> None:
+        super().__init__(obj)
+        self.modern_checkpoint_response = modern_checkpoint_response
+
+    def AppendObject(
+        self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+    ) -> layer5_pb2.ObjectRecord:
+        list(request_iterator)
+        legacy = layer5_pb2.ObjectRecord()
+        legacy.CopyFrom(self.obj)
+        legacy.ClearField("append_commit_info")
+        return legacy
+
+    def CheckpointSession(
+        self, request: layer5_pb2.CheckpointSessionRequest
+    ) -> layer5_pb2.CheckpointSessionResponse | layer5_pb2.WriteSession:
+        if self.modern_checkpoint_response:
+            return layer5_pb2.CheckpointSessionResponse(
+                session=layer5_pb2.WriteSession(session_id=request.session_id)
+            )
+        return layer5_pb2.WriteSession(session_id=request.session_id)
 
 
 class _CheckpointBatchClient:
-    """Handwritten mirror of the checkpoint proto while generated stubs lag."""
+    """Direct generated-type client for checkpoint batch behavior."""
 
     def __init__(self, *, fail_checkpoint: bool = False) -> None:
         self.session_id = b"checkpoint-session"
@@ -945,7 +1066,9 @@ class _CheckpointBatchClient:
             drive_element_address=0x202,
         )
 
-    def AppendObject(self, messages: Iterator[layer5_pb2.AppendObjectMessage]) -> object:
+    def AppendObject(
+        self, messages: Iterator[layer5_pb2.AppendObjectMessage]
+    ) -> layer5_pb2.ObjectRecord:
         caller_object_id = ""
         data = bytearray()
         for message in messages:
@@ -971,31 +1094,36 @@ class _CheckpointBatchClient:
                         pool_id="checkpoint-pool",
                     )
                 ],
+                append_commit_info=layer5_pb2.AppendCommitInfo(
+                    append_mode=layer5_pb2.APPEND_MODE_FRESH,
+                    tape_uuid=self.tape_uuid,
+                    tape_file_number=ordinal,
+                    first_body_lba=1,
+                    durability=layer5_pb2.APPEND_DURABILITY_CHECKPOINTED,
+                ),
             )
         )
-        return SimpleNamespace(
+        return _written_ack(
+            caller_object_id,
             object_id=ordinal.to_bytes(16),
-            caller_object_id=caller_object_id,
-            copies=[],
-            append_commit_info=SimpleNamespace(
-                durability="WRITTEN",
-                batch_id=b"batch-1",
-                provisional_ordinal=ordinal,
-                tape_file_number=None,
-            ),
+            ordinal=ordinal,
         )
 
-    def CheckpointSession(self, request: layer5_pb2.CheckpointSessionRequest) -> object:
+    def CheckpointSession(
+        self, request: layer5_pb2.CheckpointSessionRequest
+    ) -> layer5_pb2.CheckpointSessionResponse:
         if self.fail_checkpoint:
             raise _DirectWriteError()
         committed = list(self.pending)
         self.pending.clear()
-        return SimpleNamespace(committed_copies=committed)
+        return _checkpoint_response(self.session_id, self.tape_uuid, committed)
 
-    def CloseWriteSession(self, request: layer5_pb2.CloseWriteSessionRequest) -> object:
+    def CloseWriteSession(
+        self, request: layer5_pb2.CloseWriteSessionRequest
+    ) -> layer5_pb2.WriteSession:
         committed = list(self.pending)
         self.pending.clear()
-        return SimpleNamespace(committed_copies=committed)
+        return _write_session_response(self.session_id, self.tape_uuid, committed)
 
     def AbortWriteSession(
         self, request: layer5_pb2.AbortWriteSessionRequest
@@ -1062,6 +1190,42 @@ def test_write_result_and_error_surface_opened_session_without_grpc_server(
     assert raised.value.session_id == error_client.session_id
     assert raised.value.drive_element_address == error_client.drive_element_address
     assert error_client.aborted
+
+
+def test_pre_checkpoint_write_session_response_uses_legacy_append_record(
+    proto_object: layer5_pb2.ObjectRecord,
+    tmp_path: Path,
+) -> None:
+    """The documented legacy WriteSession fallback remains isolated and covered."""
+
+    src = tmp_path / "legacy.bin"
+    src.write_bytes(b"legacy checkpoint response")
+    client = _LegacyWriteSessionClient(proto_object)
+    backend = RemanenceBackend(
+        "direct-rem",
+        endpoint="direct",
+        write_session=client,
+    )
+
+    result = backend.write_object_to_pool(src, "scenario-a")
+
+    assert result.session_id == client.session_id
+    assert result.native_locator["object_id"] == proto_object.object_id.hex()
+
+    modern_client = _LegacyWriteSessionClient(
+        proto_object,
+        modern_checkpoint_response=True,
+    )
+    modern_backend = RemanenceBackend(
+        "direct-rem",
+        endpoint="direct",
+        write_session=modern_client,
+    )
+    with pytest.raises(
+        RemanenceWriteSessionError,
+        match="did not commit every pending caller object",
+    ):
+        modern_backend.write_object_to_pool(src, "scenario-a")
 
 
 def test_malformed_committed_write_response_keeps_opened_session_identity(
@@ -1228,11 +1392,12 @@ def test_write_aborts_on_stream_error(
 def test_write_object_locator_parity_with_enumerate(
     write_server: tuple[str, _WriteSession],
     catalog_server: tuple[str, _Catalog],
+    proto_object: layer5_pb2.ObjectRecord,
     tmp_path: Path,
 ) -> None:
     write_endpoint, _ = write_server
     catalog_endpoint, _ = catalog_server
-    src = tmp_path / "obj.bin"
+    src = tmp_path / proto_object.caller_object_id
     src.write_bytes(b"x" * 10)
 
     written = RemanenceBackend.from_grpc("primary-tape", write_endpoint).write_object_to_pool(
@@ -1256,6 +1421,7 @@ class _RTWrite(layer5_pb2_grpc.WriteSessionServiceServicer):
     def __init__(self, store: _RoundTripStore) -> None:
         self.store = store
         self.session_id = b"rt-write-1"
+        self.pending: layer5_pb2.ObjectRecord | None = None
 
     def OpenWriteSession(
         self,
@@ -1281,7 +1447,7 @@ class _RTWrite(layer5_pb2_grpc.WriteSessionServiceServicer):
                 buf.extend(msg.chunk.data)
         data = bytes(buf)
         self.store.objects[self.store.object_id] = data
-        return layer5_pb2.ObjectRecord(
+        self.pending = layer5_pb2.ObjectRecord(
             object_id=self.store.object_id,
             caller_object_id=caller_object_id,
             content_sha256=hashlib.sha256(data).digest(),
@@ -1296,6 +1462,17 @@ class _RTWrite(layer5_pb2_grpc.WriteSessionServiceServicer):
                     pool_id="scenario-a",
                 )
             ],
+            append_commit_info=layer5_pb2.AppendCommitInfo(
+                append_mode=layer5_pb2.APPEND_MODE_FRESH,
+                tape_uuid=self.store.tape_uuid,
+                tape_file_number=1,
+                first_body_lba=1,
+                durability=layer5_pb2.APPEND_DURABILITY_CHECKPOINTED,
+            ),
+        )
+        return _written_ack(
+            caller_object_id,
+            object_id=self.store.object_id,
         )
 
     def CloseWriteSession(
@@ -1303,19 +1480,25 @@ class _RTWrite(layer5_pb2_grpc.WriteSessionServiceServicer):
         request: layer5_pb2.CloseWriteSessionRequest,
         context: grpc.ServicerContext,
     ) -> layer5_pb2.WriteSession:
-        return layer5_pb2.WriteSession(
-            session_id=self.session_id,
-            tape_uuid=self.store.tape_uuid,
+        committed = [] if self.pending is None else [self.pending]
+        self.pending = None
+        return _write_session_response(
+            self.session_id,
+            self.store.tape_uuid,
+            committed,
         )
 
     def CheckpointSession(
         self,
         request: layer5_pb2.CheckpointSessionRequest,
         context: grpc.ServicerContext,
-    ) -> layer5_pb2.WriteSession:
-        return layer5_pb2.WriteSession(
-            session_id=self.session_id,
-            tape_uuid=self.store.tape_uuid,
+    ) -> layer5_pb2.CheckpointSessionResponse:
+        committed = [] if self.pending is None else [self.pending]
+        self.pending = None
+        return _checkpoint_response(
+            self.session_id,
+            self.store.tape_uuid,
+            committed,
         )
 
     def AbortWriteSession(

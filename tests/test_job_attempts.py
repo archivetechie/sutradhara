@@ -307,6 +307,7 @@ class _AttemptWriteClient:
         self.session_id = f"adapter-session-{suffix}".encode()
         self.tape_uuid = bytes([suffix]) * 16
         self.drive_element_address = 0x100 + suffix
+        self.pending: layer5_pb2.ObjectRecord | None = None
 
     def OpenWriteSession(
         self, request: layer5_pb2.OpenWriteSessionRequest
@@ -320,13 +321,14 @@ class _AttemptWriteClient:
     def AppendObject(
         self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
     ) -> layer5_pb2.ObjectRecord:
-        list(request_iterator)
+        messages = list(request_iterator)
         if self.fail_after_open:
             raise RuntimeError("append stopped after open")
         digest = hashlib.sha256(self.data).digest()
-        return layer5_pb2.ObjectRecord(
+        caller_object_id = messages[0].start.caller_object_id
+        self.pending = layer5_pb2.ObjectRecord(
             object_id=bytes.fromhex("10" * 16),
-            caller_object_id="attempt-adapter",
+            caller_object_id=caller_object_id,
             content_sha256=digest,
             logical_size_bytes=len(self.data),
             body_format="raw-bytes",
@@ -338,17 +340,47 @@ class _AttemptWriteClient:
                     pool_id="attempt-pool",
                 )
             ],
+            append_commit_info=layer5_pb2.AppendCommitInfo(
+                append_mode=layer5_pb2.APPEND_MODE_FRESH,
+                tape_uuid=self.tape_uuid,
+                tape_file_number=1,
+                first_body_lba=1,
+                durability=layer5_pb2.APPEND_DURABILITY_CHECKPOINTED,
+            ),
+        )
+        return layer5_pb2.ObjectRecord(
+            object_id=bytes.fromhex("10" * 16),
+            caller_object_id=caller_object_id,
+            append_commit_info=layer5_pb2.AppendCommitInfo(
+                durability=layer5_pb2.APPEND_DURABILITY_WRITTEN,
+                batch_id=b"attempt-batch",
+                provisional_ordinal=1,
+            ),
         )
 
     def CloseWriteSession(
         self, request: layer5_pb2.CloseWriteSessionRequest
     ) -> layer5_pb2.WriteSession:
-        return layer5_pb2.WriteSession(session_id=request.session_id)
+        committed = [] if self.pending is None else [self.pending]
+        copies = [] if self.pending is None else [self.pending.copies[0]]
+        self.pending = None
+        return layer5_pb2.WriteSession(
+            session_id=request.session_id,
+            checkpointed_objects=committed,
+            committed_copies=copies,
+        )
 
     def CheckpointSession(
         self, request: layer5_pb2.CheckpointSessionRequest
-    ) -> layer5_pb2.WriteSession:
-        return layer5_pb2.WriteSession(session_id=request.session_id)
+    ) -> layer5_pb2.CheckpointSessionResponse:
+        committed = [] if self.pending is None else [self.pending]
+        copies = [] if self.pending is None else [self.pending.copies[0]]
+        self.pending = None
+        return layer5_pb2.CheckpointSessionResponse(
+            session=layer5_pb2.WriteSession(session_id=request.session_id),
+            committed_objects=committed,
+            committed_copies=copies,
+        )
 
     def AbortWriteSession(
         self, request: layer5_pb2.AbortWriteSessionRequest

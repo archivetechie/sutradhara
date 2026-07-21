@@ -23,7 +23,7 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -217,37 +217,19 @@ class _WriteSessionClient(Protocol):
 
     def AppendObject(
         self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
-    ) -> object: ...
+    ) -> layer5_pb2.ObjectRecord: ...
 
-    # REGENERATION NOTE: the checked-in stubs still type this as WriteSession.
-    # The coordinated Remanence checkpoint proto returns a response containing
-    # the committed-copy set; keep this structural until those stubs land.
-    def CheckpointSession(self, request: layer5_pb2.CheckpointSessionRequest) -> object: ...
+    def CheckpointSession(
+        self, request: layer5_pb2.CheckpointSessionRequest
+    ) -> layer5_pb2.CheckpointSessionResponse | layer5_pb2.WriteSession: ...
 
-    def CloseWriteSession(self, request: layer5_pb2.CloseWriteSessionRequest) -> object: ...
+    def CloseWriteSession(
+        self, request: layer5_pb2.CloseWriteSessionRequest
+    ) -> layer5_pb2.WriteSession: ...
 
     def AbortWriteSession(
         self, request: layer5_pb2.AbortWriteSessionRequest
     ) -> layer5_pb2.WriteSession: ...
-
-
-# REGENERATION NOTE: replace these structural v0.4 mirrors with generated
-# layer5 types when the coordinated Remanence proto/stubs land in this repo.
-class _AppendCommitInfoV04(Protocol):
-    durability: int | str
-    batch_id: bytes | str
-    provisional_ordinal: int
-    tape_file_number: int | None
-
-
-class _AppendAckV04(Protocol):
-    caller_object_id: str
-    append_commit_info: _AppendCommitInfoV04
-    copies: Iterable[object]
-
-
-class _CheckpointResponseV04(Protocol):
-    committed_copies: Iterable[object]
 
 
 class _ReadRangeCall(Protocol):
@@ -919,7 +901,7 @@ class _PendingAppend:
     source: Path
     caller_object_id: str
     receipt: WrittenReceipt
-    legacy_record: object | None
+    legacy_record: layer5_pb2.ObjectRecord | None
 
 
 class BatchWriter:
@@ -976,9 +958,8 @@ class BatchWriter:
             response = self._client.AppendObject(
                 self._backend._append_messages(self.session_id, source, caller_object_id)
             )
-            obj = _unwrap_append_object(response)
             receipt, durability = _written_receipt_from_response(
-                obj,
+                response,
                 fallback_batch_id=self._batch_id or self.session_id.hex(),
                 fallback_ordinal=self._next_ordinal,
             )
@@ -993,7 +974,7 @@ class BatchWriter:
                     source=source,
                     caller_object_id=caller_object_id,
                     receipt=receipt,
-                    legacy_record=obj if durability is None else None,
+                    legacy_record=response if durability is None else None,
                 )
             )
             report_batch_written(
@@ -1055,54 +1036,49 @@ class BatchWriter:
         self._backend._safe_abort(self._client, self.session_id, reason)
         self._closed = True
 
-    def _accept_committed(self, response: object, *, operation: str) -> list[CommittedCopy]:
-        response_objects = _committed_objects_from_response(response)
-        legacy_fallback = response_objects is None
-        if response_objects is None:
-            # Compatibility for the checked-in pre-checkpoint stubs: retain the
-            # legacy AppendObject records privately, but expose them only after
-            # a successful barrier/close response. Remove when proto regenerates.
+    def _accept_committed(
+        self,
+        response: layer5_pb2.CheckpointSessionResponse | layer5_pb2.WriteSession,
+        *,
+        operation: str,
+    ) -> list[CommittedCopy]:
+        response_commits = _committed_proto_pairs_from_response(response, operation=operation)
+        legacy_fallback = response_commits is None
+        if response_commits is None:
+            # PRE-CHECKPOINT COMPATIBILITY NOTE: a legacy daemon/client pair returned
+            # WriteSession without a committed set after AppendObject had already
+            # returned the durable ObjectRecord. Keep that fallback only for an
+            # actual WriteSession response; modern CheckpointSessionResponse values
+            # must carry the generated committed-object/copy set.
             if any(item.legacy_record is None for item in self._pending):
                 raise BackendError(f"Remanence {operation} response omitted the committed-copy set")
-            response_objects = [item.legacy_record for item in self._pending]
+            response_commits = [
+                (record, _select_written_copy(record, self.tape_uuid))
+                for pending_item in self._pending
+                if (record := pending_item.legacy_record) is not None
+            ]
 
         by_caller = {item.caller_object_id: item for item in self._pending}
         committed: list[CommittedCopy] = []
         seen: set[str] = set()
-        for index, raw in enumerate(response_objects):
-            if raw is None:
-                continue
-            if isinstance(raw, CommittedCopy):
-                item = by_caller.get(raw.caller_object_id)
-                if item is None:
-                    raise BackendError(
-                        f"Remanence {operation} returned unknown caller_object_id "
-                        f"{raw.caller_object_id!r}"
-                    )
-                value = raw
+        item: _PendingAppend | None
+        for index, (obj, cp) in enumerate(response_commits):
+            if legacy_fallback and index < len(self._pending):
+                item = self._pending[index]
+                caller_object_id = item.caller_object_id
             else:
-                obj = _unwrap_append_object(raw)
-                if legacy_fallback and index < len(self._pending):
-                    item = self._pending[index]
-                    caller_object_id = item.caller_object_id
-                else:
-                    caller_object_id = str(getattr(obj, "caller_object_id", ""))
-                    item = by_caller.get(caller_object_id)
-                if item is None:
-                    raise BackendError(
-                        f"Remanence {operation} returned unknown caller_object_id "
-                        f"{caller_object_id!r}"
-                    )
-                copy_record = _copy_record_from_proto(
-                    obj,
-                    _select_written_copy(obj, self.tape_uuid),
+                caller_object_id = obj.caller_object_id
+                item = by_caller.get(caller_object_id)
+            if item is None:
+                raise BackendError(
+                    f"Remanence {operation} returned unknown caller_object_id {caller_object_id!r}"
                 )
-                value = CommittedCopy(
-                    caller_object_id=caller_object_id,
-                    copy_record=copy_record,
-                    batch_id=item.receipt.batch_id,
-                    provisional_ordinal=item.receipt.provisional_ordinal,
-                )
+            value = CommittedCopy(
+                caller_object_id=caller_object_id,
+                copy_record=_copy_record_from_proto(obj, cp),
+                batch_id=item.receipt.batch_id,
+                provisional_ordinal=item.receipt.provisional_ordinal,
+            )
             if value.caller_object_id in seen:
                 raise BackendError(
                     f"Remanence {operation} returned duplicate committed copy for "
@@ -1472,101 +1448,73 @@ def _select_written_copy(
     )
 
 
-def _unwrap_append_object(response: object) -> Any:
-    """Return the ObjectRecord carried by old or checkpoint-era responses."""
-
-    if hasattr(response, "object_id") and hasattr(response, "copies"):
-        return response
-    for field in ("object_record", "object", "record"):
-        value = getattr(response, field, None)
-        if value is not None and hasattr(value, "object_id") and hasattr(value, "copies"):
-            return value
-    raise BackendError(
-        f"Remanence append/commit response has no ObjectRecord: {type(response).__name__}"
-    )
-
-
 def _written_receipt_from_response(
-    obj: Any,
+    obj: layer5_pb2.ObjectRecord,
     *,
     fallback_batch_id: str,
     fallback_ordinal: int,
 ) -> tuple[WrittenReceipt, AppendDurability | None]:
-    """Map AppendCommitInfo while tolerating only the checked-in legacy shape."""
+    """Map generated AppendCommitInfo while tolerating a legacy absent field."""
 
-    ack = cast(_AppendAckV04, obj)
-    info = getattr(ack, "append_commit_info", None)
+    info = obj.append_commit_info if obj.HasField("append_commit_info") else None
     durability = _append_durability(info)
     if durability is AppendDurability.WRITTEN:
-        if list(ack.copies):
+        if obj.copies:
             raise BackendError("Remanence WRITTEN ack exposed a committed ObjectCopy")
-        if _field_is_present(info, "tape_file_number"):
+        if info is not None and info.HasField("tape_file_number"):
             raise BackendError("Remanence WRITTEN ack exposed provisional tape_file_number")
 
-    raw_batch_id = getattr(info, "batch_id", None)
-    batch_id = _identity_text(raw_batch_id) if raw_batch_id else fallback_batch_id
-    raw_ordinal = getattr(info, "provisional_ordinal", None)
-    provisional_ordinal = int(raw_ordinal) if raw_ordinal is not None else fallback_ordinal
+    batch_id = info.batch_id.hex() if info is not None and info.batch_id else fallback_batch_id
+    provisional_ordinal = (
+        int(info.provisional_ordinal)
+        if info is not None and info.HasField("provisional_ordinal")
+        else fallback_ordinal
+    )
     if provisional_ordinal < 0:
         raise BackendError("Remanence provisional ordinal must be non-negative")
     return WrittenReceipt(batch_id, provisional_ordinal), durability
 
 
-def _append_durability(info: object | None) -> AppendDurability | None:
-    """Read the new enum structurally; absent means the generated legacy proto."""
+def _append_durability(
+    info: layer5_pb2.AppendCommitInfo | None,
+) -> AppendDurability | None:
+    """Map the generated durability enum; absent marks a legacy append response."""
 
-    if info is None or not hasattr(info, "durability"):
+    if info is None:
         return None
-    value = cast(Any, info).durability
-    if isinstance(value, str):
-        label = value.upper()
-    else:
-        label = ""
-        descriptor = getattr(info, "DESCRIPTOR", None)
-        field = None if descriptor is None else descriptor.fields_by_name.get("durability")
-        enum_value = None if field is None else field.enum_type.values_by_number.get(int(value))
-        if enum_value is not None:
-            label = enum_value.name.upper()
-        elif int(value) == 1:
-            label = AppendDurability.WRITTEN.value
-        elif int(value) == 2:
-            label = AppendDurability.CHECKPOINTED.value
-    if label.endswith("_WRITTEN") or label == AppendDurability.WRITTEN.value:
+    value = info.durability
+    if value == layer5_pb2.APPEND_DURABILITY_WRITTEN:
         return AppendDurability.WRITTEN
-    if label.endswith("_CHECKPOINTED") or label == AppendDurability.CHECKPOINTED.value:
+    if value == layer5_pb2.APPEND_DURABILITY_CHECKPOINTED:
         return AppendDurability.CHECKPOINTED
     raise BackendError(f"Remanence AppendCommitInfo has unknown durability {value!r}")
 
 
-def _field_is_present(message: object, field: str) -> bool:
-    """Check optional proto presence without treating a legacy scalar zero as set."""
+def _committed_proto_pairs_from_response(
+    response: layer5_pb2.CheckpointSessionResponse | layer5_pb2.WriteSession,
+    *,
+    operation: str,
+) -> list[tuple[layer5_pb2.ObjectRecord, layer5_pb2.ObjectCopy]] | None:
+    """Pair the generated committed object/copy sets, or identify legacy WriteSession."""
 
-    has_field = getattr(message, "HasField", None)
-    if callable(has_field):
-        try:
-            return bool(has_field(field))
-        except (ValueError, TypeError):
-            return False
-    return getattr(message, field, None) is not None
-
-
-def _identity_text(value: object) -> str:
-    if isinstance(value, bytes):
-        return value.hex()
-    return str(value)
-
-
-def _committed_objects_from_response(response: object) -> list[object] | None:
-    """Read the checkpoint committed-copy set through the temporary protocol seam."""
-
-    if isinstance(response, (list, tuple)):
-        return list(response)
-    if hasattr(response, "committed_copies"):
-        return list(cast(_CheckpointResponseV04, response).committed_copies)
-    for field in ("committed_objects", "objects"):
-        if hasattr(response, field):
-            return list(getattr(response, field))
-    return None
+    if isinstance(response, layer5_pb2.CheckpointSessionResponse):
+        objects = list(response.committed_objects)
+        copies = list(response.committed_copies)
+    elif isinstance(response, layer5_pb2.WriteSession):
+        objects = list(response.checkpointed_objects)
+        copies = list(response.committed_copies)
+        if not objects and not copies:
+            return None
+    else:
+        raise BackendError(
+            f"Remanence {operation} returned unexpected response type {type(response).__name__}"
+        )
+    if len(objects) != len(copies):
+        raise BackendError(
+            f"Remanence {operation} returned {len(copies)} copies for "
+            f"{len(objects)} committed objects"
+        )
+    return list(zip(objects, copies, strict=True))
 
 
 def _native_locator_from_proto(
