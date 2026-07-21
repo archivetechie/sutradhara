@@ -11,6 +11,7 @@ import datetime as dt
 import socket
 import traceback
 from collections.abc import Sequence
+from copy import deepcopy
 from functools import partial
 from typing import Any, cast
 
@@ -36,6 +37,7 @@ from sutradhara.jobs.reconcilers.conditions import (
     record_condition,
 )
 from sutradhara.jobs.registry import (
+    CHECKPOINT_BATCH_STATE_KEY,
     ConditionProjection,
     HandlerNotRegistered,
     JobContext,
@@ -44,6 +46,7 @@ from sutradhara.jobs.registry import (
     get_handler,
 )
 from sutradhara.jobs.runtime_observations import (
+    bind_batch_observers,
     bind_session_open_observer,
     bind_tape_locator_observer,
 )
@@ -168,6 +171,10 @@ def run_one(
         with (
             bind_session_open_observer(ctx.observe_session_open),
             bind_tape_locator_observer(partial(touch_tape_locator, ctx)),
+            bind_batch_observers(
+                ctx.record_batch_written,
+                ctx.record_batch_checkpointed,
+            ),
         ):
             result = _invoke_handler_in_savepoint(session, ctx, handler)
     except NotImplementedError as e:
@@ -272,9 +279,22 @@ def _invoke_handler_in_savepoint(
         handled_objects = list(handler_session.info.get("handler_flushed_objects", ()))
         connection_savepoint.commit()
     except BaseException:
+        batch_state_touched = bool(handler_session.info.get("checkpoint_batch_state_touched"))
+        failed_batch_state = deepcopy(
+            dict(handler_job.step_state or {}).get(CHECKPOINT_BATCH_STATE_KEY)
+        )
         handler_session.rollback()
         if connection_savepoint.is_active:
             connection_savepoint.rollback()
+        if batch_state_touched:
+            session.expire(engine_job)
+            prior = dict(engine_job.step_state or {})
+            if failed_batch_state:
+                prior[CHECKPOINT_BATCH_STATE_KEY] = failed_batch_state
+            else:
+                prior.pop(CHECKPOINT_BATCH_STATE_KEY, None)
+            engine_job.step_state = prior
+            session.flush([engine_job])
         raise
     else:
         session.expire_all()
