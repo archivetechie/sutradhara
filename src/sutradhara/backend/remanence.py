@@ -763,7 +763,7 @@ class RemanenceBackend:
             drive_element_address=int(session.drive_element_address),
         )
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> RemanenceWriteResult:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> RemanenceWriteResult:
         """Write one local file through the checkpoint batch funnel.
 
         Existing callers retain the synchronous batch-of-one contract: this
@@ -772,18 +772,19 @@ class RemanenceBackend:
         """
 
         source = Path(source)
+        caller_id = caller_object_id or source.name
         batch = self.open_batch(pool)
         try:
-            batch.append(source, source.name)
+            batch.append(source, caller_id)
             committed = [*batch.checkpoint(), *batch.close()]
         except Exception:
             batch.abort("batch-of-one write failed")
             raise
-        matches = [copy for copy in committed if copy.caller_object_id == source.name]
+        matches = [copy for copy in committed if copy.caller_object_id == caller_id]
         if len(matches) != 1:
             raise RemanenceWriteSessionError(
                 f"Remanence checkpoint returned {len(matches)} committed copies for "
-                f"caller_object_id={source.name!r}",
+                f"caller_object_id={caller_id!r}",
                 session_id=batch.session_id,
                 drive_element_address=batch.drive_element_address,
             )

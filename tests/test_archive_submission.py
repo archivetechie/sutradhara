@@ -86,7 +86,7 @@ class _WriteBackend:
     def name(self) -> str:
         return self._name
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         self._counter += 1
         if self.fail_on_write == self._counter:
             raise RuntimeError(f"configured write failure for {pool}")

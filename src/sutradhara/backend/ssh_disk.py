@@ -342,7 +342,7 @@ class SshDiskBackend:
                 size_bytes=size,
             )
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         source_path = Path(source)
         clean_pool = pool.strip("/")
         key = f"{clean_pool}/{source_path.name}" if clean_pool else source_path.name

@@ -238,7 +238,7 @@ class D2TapeBackend:
             detail=f"d2tape verify reported failure for {_required_str(locator, 'artifact_name')}",
         )
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         """Write one plaintext file as one d2 tar artifact and verify it.
 
         d2tape finalization is intentionally not performed here: finalizing

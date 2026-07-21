@@ -85,7 +85,7 @@ class _Backend:
     def name(self) -> str:
         return "rem"
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         self._counter += 1
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())

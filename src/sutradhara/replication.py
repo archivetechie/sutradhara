@@ -20,6 +20,8 @@ from typing import Any, Literal, Protocol, TypedDict, TypeVar
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
+from uuid import uuid4
+
 from sutradhara.backend.port import BackendError, CopyRecord, StorageBackend
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import ArtifactClassPool, Bundle, Copy, Pool
@@ -58,7 +60,7 @@ class SelfHealUnavailable(ReplicationError):
 class WritableStorageBackend(StorageBackend, Protocol):
     """Storage backend surface needed by the fan-out writer."""
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         """Return only after `source` is durable and copy-accountable.
 
         Checkpoint-capable implementations must return the copy selected from
@@ -178,8 +180,10 @@ def replicate_asset(
     backends: WritableBackendMap,
     sealer: Sealer | None = None,
     key_epoch: str | None = None,
+    execution_id: str | None = None,
 ) -> list[Copy]:
     """Replicate one asset to every active write-eligible pool for an artifactclass."""
+    execution_id = execution_id or f"exec-{uuid4().hex[:12]}"
     targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
     existing = _healthy_copies_by_pool(session, asset_hash, targets)
     sealer = sealer or RaoCliSealer(KeyRegistry())
@@ -202,6 +206,7 @@ def replicate_asset(
             committed_record = backend.write_object_to_pool(
                 sealed.sealed_path,
                 target.pool_id,
+                caller_object_id=f"{asset_hash.hex()[:32]}-{execution_id}",
             )
             _assert_copy_integrity(asset_hash, committed_record, sealed, target)
         copy, created = add_copy(
@@ -234,8 +239,10 @@ def repair(
     backends: WritableBackendMap,
     sealer: Sealer | None = None,
     key_epoch: str | None = None,
+    execution_id: str | None = None,
 ) -> list[Copy]:
     """Write copies for write-eligible pools currently missing from replication status."""
+    execution_id = execution_id or f"repair-{uuid4().hex[:12]}"
     status = replication_status(
         session,
         asset_hash,
@@ -264,6 +271,7 @@ def repair(
             committed_record = backend.write_object_to_pool(
                 sealed.sealed_path,
                 target.pool_id,
+                caller_object_id=f"{asset_hash.hex()[:32]}-{execution_id}",
             )
             _assert_copy_integrity(asset_hash, committed_record, sealed, target)
         copy, created = add_copy(
@@ -376,6 +384,7 @@ def self_heal(
                     backends=backends,
                     sealer=sealer,
                     key_epoch=key_epoch,
+                    execution_id=execution_id,
                 )
         except RestoreIntegrityError as exc:
             if _is_content_digest_mismatch(exc):

@@ -133,7 +133,7 @@ class _ArchiveWriteBackend:
     def stream_kind(self) -> StreamKind:
         return StreamKind.native_stream
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
         self._counter += 1
@@ -197,7 +197,7 @@ class _TransientWriteBackend(_ArchiveWriteBackend):
         super().__init__(name)
         self.failing_pools = failing_pools
 
-    def write_object_to_pool(self, source: Path | str, pool: str) -> CopyRecord:
+    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
         if pool in self.failing_pools:
             raise BackendError(f"transport unavailable for pool {pool}")
         return super().write_object_to_pool(source, pool)
