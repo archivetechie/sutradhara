@@ -4,7 +4,7 @@ The internal vocabulary of Sutradhara, as the code actually uses it. Each
 entry names the defining module so you can check the source. Terms that
 appear in older design docs but not in the code are flagged as such.
 
-<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ df8165b -->
+<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ 5688438 -->
 ## Receive and intake
 
 **bag / BagIt** — the on-disk form of a received intake: a BagIt 1.0 bag
@@ -65,7 +65,7 @@ check — see "duplicate warning" under
 [Relay and enrollment](#relay-and-enrollment) for the live, pre-registration
 half computed by `receive_novelty.py`.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py @ 5688438 -->
 ## Catalog identities
 
 **logical asset** — content identity. One row per distinct SHA-256; the
@@ -81,8 +81,11 @@ two ingest items. These are "the two identities" the design docs mention.
 
 **copy** — one stored realization of a logical asset or a bundle on one
 backend (`Copy`). Exactly one of `logical_asset_hash` / `bundle_id` is
-set. Health is `ok`, `suspect`, `corrupt`, or `missing`; retention
-tombstones copies via `deleted_at` instead of deleting rows.
+set. Health is `ok`, `suspect`, `corrupt`, or `missing` — a
+backend-reported digest that disagrees with the asset hash
+(`integrity_hash_provenance = backend_discovered`) can never promote
+health to `ok`; retention tombstones copies via `deleted_at` instead of
+deleting rows.
 
 **bundle / bundle member** — a synthetic archive object packing one or
 more assets for tape efficiency (`Bundle`, `BundleMember`). Bundles are
@@ -117,7 +120,7 @@ to override), never deletion or preservation. `sutra unreject` clears it.
 **tag** — a soft-deleted governance label on an asset (`AssetTag`);
 removal tombstones the row for audit.
 
-<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ 5688438 -->
 ## Policy and placement
 
 **artifactclass** — the policy class of a piece of content (e.g. masters
@@ -157,7 +160,7 @@ uploaded at registration to the `cloud-temp` backend/pool (an encrypted
 RAO of the whole intake). Temporary by design: the retention gate deletes
 it once durable copies are proven.
 
-<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys/registry.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys/registry.py @ 5688438 -->
 ## Sealing
 
 **representation** — the stored form of a copy: `raw-bytes`,
@@ -181,7 +184,7 @@ private material opens through a short-lived `0600` RAOP file that is
 best-effort zeroized before removal. Recovery private material stays offline.
 Retiring an epoch stops new seals but preserves its retained material.
 
-<!-- code-anchor: src/sutradhara/arrangement.py src/sutradhara/virtual_arrangement.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/arrangement.py src/sutradhara/virtual_arrangement.py @ 5688438 -->
 ## Arrangement
 
 **arrangement** — the mutable pre-archive workspace: registered masters
@@ -204,7 +207,7 @@ organizational view (`VirtualArrangement`). Members key on
 catalog-only. Older docs call this "virtual segregation" or "VS" — same
 thing, renamed 2026-06-27.
 
-<!-- code-anchor: src/sutradhara/jobs @ df8165b -->
+<!-- code-anchor: src/sutradhara/jobs @ 5688438 -->
 ## Jobs and reconciliation
 
 **job / job attempt** — a `Job` row is one unit of work dispatched by
@@ -246,7 +249,7 @@ substitute it (e.g. "the `rem.tape.write_object` seam", "the hdcache read
 seam" around `resolve_read_source`). An architecture term, not a data
 model term.
 
-<!-- code-anchor: src/sutradhara/scrub.py src/sutradhara/replication.py src/sutradhara/retention.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/scrub.py src/sutradhara/replication.py src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py @ 5688438 -->
 ## Verification and lifecycle
 
 **scrub** — re-enumerating a backend and reconciling it against the
@@ -258,19 +261,55 @@ the index is rebuildable.
 healthy copy and re-sealing it to the gap (`replication.self_heal`,
 driven by the copy and bundle-copy reconcilers).
 
-**retention states** — `held` → `released` → `purged` on the intake. The
-gate (`sutra retention run`) releases only when every recipe copy is
-verified and offsite-confirmed where required and nothing still depends
-on the landing bytes; `sweep-staging` deletes landing bytes after the
-grace period (default 30 days). Retention is the only code that deletes
-bytes.
+**retention states** — `held` → `released` → `tombstoned` → `purged` on
+the intake, with a terminal `abandoned` branch reachable from `held` or
+`released` (`retention.abandon_retention`, a bytes-preserving operator
+opt-out). The gate (`sutra retention run`) releases only when every
+recipe copy is verified, offsite-confirmed where required, independently
+witnessed against the backend's own catalog, and nothing still depends on
+the landing bytes (a `blocked` derivation holds release — it is never
+treated as done); `sweep-staging` re-gates, atomically tombstones the
+landing tree, then deletes it after the grace period (default 30 days).
+Retention is the only code that deletes bytes. See "Deletion evidence and
+the retention witness gate" in `architecture-overview.md`.
+
+**deletion evidence** — the durable read-back record behind "verified":
+`evidence_recorder.py::record_measured` is the sole writer of
+`Copy.last_measured_digest`/`_at` and the append-only `VerifyReceipt` row,
+called from fan-out, `verify` jobs, restores, and scrub. Distinct from the
+retention witness below, which is a live cross-check, not a stored
+receipt.
+
+**witness (retention)** — a live, point-in-time call to a storage
+backend's own catalog (`RetentionWitnessBackend.witness_copy`) made
+immediately before releasing or purging an intake, to confirm the backend
+independently agrees a copy exists. Answers are trusted for only 5 seconds
+(`WITNESS_MAX_AGE`); any failure or disagreement holds the gate rather
+than erroring or overriding a hold.
+
+**checkpoint** — three unrelated things share this name; check context.
+(1) A Remanence Layer 5 write acknowledgement: `CHECKPOINTED` is the
+durable ack level, stronger than the provisional `WRITTEN` append receipt
+(`backend/remanence.py`'s `BatchWriter`). (2) `restore_item_checkpoint`,
+the durable per-item delivery-progress row for agent-delivered restore
+(`committed_index`, `revealed` — see "The restore path" in
+`architecture-overview.md`). (3)
+`RetentionJournalCheckpoint`, the singleton row tracking the evidence
+journal's own export/DR-shipping progress (`retention_journal.py`).
+
+**caller_object_id** — the opaque per-invocation write identity Remanence
+uses to detect duplicate or conflicting writes across retries.
+`replication.py` mints one per execution
+(`<asset-hash-prefix>-<execution_id>`) rather than reusing a fixed name,
+so a legitimate re-write (e.g. self-heal re-encrypting to a new key
+epoch) never collides with an earlier write of the same copy.
 
 **PFR (partial file restore)** — restoring a clip or byte range without
 reading the whole stored object: a `pfr-index-v1` container-index sidecar
 plus Remanence byte-range reads, with a fallback ladder to whole-member
 restore (`pfr.py`, `sutra pfr`).
 
-<!-- code-anchor: src/sutradhara/hdcache @ df8165b -->
+<!-- code-anchor: src/sutradhara/hdcache @ 5688438 -->
 ## HD cache
 
 **hdcache** — the expendable disk cache tier: independent JBOD disks in
@@ -306,7 +345,7 @@ the restore-serving path: after enough cache-read failures within a
 window, the disk is treated as down (skip straight to fallback) until a
 recovery probe succeeds, so a wedged disk isn't retried into the ground.
 
-<!-- code-anchor: src/sutradhara/grpc src/sutradhara/api/routes_devices.py @ 3d8310c -->
+<!-- code-anchor: src/sutradhara/grpc src/sutradhara/api/routes_devices.py @ 5688438 -->
 ## Relay and enrollment
 
 **agent / helper** — the Rust `sutra-agent` workstation program (separate

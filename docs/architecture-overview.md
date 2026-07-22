@@ -26,7 +26,7 @@ not a data-loss event.
 
 *Fig. 1 — What talks to what: three entry surfaces over one catalog database, the reconciler enqueuing what the job engine runs, and storage below. The tape-side path is where durable copies are written.*
 
-<!-- code-anchor: src/sutradhara pyproject.toml @ df8165b -->
+<!-- code-anchor: src/sutradhara pyproject.toml @ 5688438 -->
 ## The shape of the code
 
 One Python package, `src/sutradhara/`, plus one workspace package. The
@@ -58,9 +58,13 @@ duplicate check), `arrangement.py` and `virtual_arrangement.py`,
 restore, and the phase-1c ALL-semantics archived predicate), `staging.py`
 (pre-fanout transforms), `replication.py` (copy policy and self-heal),
 `restore.py` (the verified whole-copy read primitive), `retention.py`
-(the only code that deletes bytes), `scrub.py`, `durability.py`,
-`pools.py`, `artifactclass_policy.py`, `resource_control.py`, `pfr.py`,
-and `logs_store.py`.
+(the only code that deletes bytes, gated on independent backend witnesses
+— see "Deletion evidence and the retention witness gate" below),
+`retention_journal.py` (the append-only evidence journal),
+`evidence_recorder.py` (the sole writer of a copy's read-back evidence
+projection), `scrub.py`, `durability.py`, `pools.py`,
+`artifactclass_policy.py`, `resource_control.py`, `pfr.py`, and
+`logs_store.py`.
 
 `packages/sutradhara-receive` is a separate, dependency-light package
 that owns the first-contact receive contract (BagIt bag writing,
@@ -71,7 +75,7 @@ canonical implementation is Python (`core.py`), with a Rust crate under
 (a separate repository) links the same crate. The server imports the
 package as `sutradhara_receive` via the uv workspace.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/catalog/types.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/catalog/types.py @ 5688438 -->
 ## Data model
 
 Two identities anchor everything:
@@ -89,9 +93,13 @@ Around those, the catalog groups into five clusters:
 
 **Intake**: `Intake` (a landing batch; status `receiving` → `verifying` →
 `registered`, or `quarantined`; retention state `held` → `released` →
-`purged`; carries an indexed `card_id`/`device_id` pair copied from the
-gRPC intake row at registration, used to match a card against its own
-receive history) and `AssetDerivation` (provenance edges between items,
+`tombstoned` → `purged`, with a terminal `abandoned` escape hatch from
+`held` or `released` that permanently excludes an intake from deletion
+without touching its bytes (`retention.abandon_retention`) — see
+"Deletion evidence and the retention witness gate" below for what
+`tombstoned` is for; carries an indexed `card_id`/`device_id` pair copied
+from the gRPC intake row at registration, used to match a card against its
+own receive history) and `AssetDerivation` (provenance edges between items,
 e.g. transcodes). Each `IngestItem` also carries a content-novelty
 verdict — `disposition` (`new`, `known_durable`, `known_under_durable`,
 `reverified`, or the reserved-but-currently-unproduced `legacy_unknown`),
@@ -122,9 +130,11 @@ objects and per-member transforms), and the two grains of stored truth:
 - **`Copy`** — one realization of a logical asset *or* a bundle on one
   backend (a check constraint enforces the XOR). Unique on
   `(backend_id, native_locator_key)`; carries `health`
-  (`ok`/`suspect`/`corrupt`/`missing`), `integrity_hash`,
-  `storage_metadata` (representation, key epoch), `last_checked_at`, and
-  the retention tombstone `deleted_at`.
+  (`ok`/`suspect`/`corrupt`/`missing`), `integrity_hash` with its
+  `integrity_hash_provenance` (`locally_computed` vs `backend_discovered` —
+  a backend-reported digest that disagrees with the asset hash can never
+  promote health to `ok`), `storage_metadata` (representation, key epoch),
+  `last_checked_at`, and the retention tombstone `deleted_at`.
 - **`AssetLocator`** — the per-asset pointer that lets a bundle-scoped
   `Copy` count as durable coverage for one asset, with the member path
   and representation.
@@ -144,8 +154,12 @@ fences change.
 `last_measured_at` is the current read-back evidence projection;
 `VerifyReceipt` records each measurement or invalidation.
 `OffsiteConfirmation` keeps attributed confirmation/revocation state, and
-`RetentionEvent` records release, purge, tripwire, and correction decisions.
-`ExclusionRecord` and `ReviewDecision` cover held-bundle review.
+`RetentionEvent` records release, purge, tripwire, and correction
+decisions, including append-only `supersedes_event_id` corrections.
+`RetentionJournalCheckpoint` (a singleton) tracks the emit-only evidence
+journal's export/DR-shipping progress — see "Deletion evidence and the
+retention witness gate" below. `ExclusionRecord` and `ReviewDecision`
+cover held-bundle review.
 
 The job tables (`job`, `job_attempt`, `reconciliation_condition`) live in
 `jobs/models.py`. The hdcache tables — `cache_disk`, `cache_entry`, and
@@ -226,20 +240,31 @@ The intended flow, each step naming the code that implements it:
    restore gates.
 7. **Release and reclaim** (`retention.py`). The retention gate releases
    an intake only when every recipe copy is verified and every
-   offsite-gated placement's tape has an `OffsiteConfirmation`, and no
-   arrangement or pending derivation still depends on the landing bytes
-   (fail-closed). After release, `sweep-staging` deletes the landing
-   bytes once the grace period (default 30 days) passes, and the
-   cloud-temp blob is deleted immediately. Deletions run
-   external-delete-before-DB and tombstone the `Copy` row rather than
-   dropping it. Nothing else in the system deletes bytes.
+   offsite-gated placement's tape has an `OffsiteConfirmation`, no
+   `blocked` derivation reconciliation condition still depends on the
+   landing bytes — `blocked` is deliberately never treated as terminal
+   here, so a permanently stuck derivative holds release rather than being
+   silently ignored — and, for backends that support it, an independent
+   witness call confirms the backend's own catalog agrees a copy exists
+   (fail-closed: a witness failure holds release, it can never turn a hold
+   into a release). See "Deletion evidence and the retention witness gate"
+   below for the full mechanism. After release, `sweep-staging` re-runs
+   the same gate, then atomically tombstones the landing tree (a
+   resumable, crash-safe rename) before actually deleting it once the
+   grace period (default 30 days) passes; the cloud-temp blob is deleted
+   immediately. Deletions run external-delete-before-DB and tombstone the
+   `Copy` row rather than dropping it. An operator can also `retention
+   abandon` a held or released intake — a terminal, bytes-preserving
+   opt-out for content that should never be swept. Nothing else in the
+   system deletes bytes.
 
    The separate emit-only journal (`retention_journal.py`) exports verification
    and decision receipts after commit. Its locked, source-ranked JSONL chain is
    resumed from published footers, checkpointed only as an optimization, and
    shipped with head anchors to dated append-only `ssh_disk` destinations.
    Export, shipping, staleness, or check failures are operator alarms and are
-   intentionally absent from every retention-gate input.
+   intentionally absent from every retention-gate input — the journal records
+   what the gate decided, it is never itself a gate input.
 
 Continuously, in the background: **scrub** (`scrub.py`) re-enumerates a
 backend and reconciles it against the catalog (bump `last_checked_at`,
@@ -247,7 +272,7 @@ insert unknown objects, mark absentees `missing`, flag hash conflicts
 `suspect` — never delete), and **self-heal** (`replication.py`) re-seals
 missing placements from a healthy copy.
 
-<!-- code-anchor: src/sutradhara/jobs @ df8165b -->
+<!-- code-anchor: src/sutradhara/jobs @ 5688438 -->
 ## Job engine and reconciler spine
 
 Intent lives in the catalog; jobs are ephemeral attempts. That is the
@@ -309,7 +334,12 @@ state machine:
   `backoff` with exponential due times, escalating to `blocked` after 3
   attempts. Blocked rows wait for an operator (`sutra reconcile DOMAIN
   --reopen-blocked`) or a recorded tool-version bump, which reopens them
-  automatically.
+  automatically. `blocked` is deliberately never treated as "done enough"
+  by anything downstream: in particular, `retention.py`'s release gate no
+  longer counts a blocked derivation as satisfied (a correctness fix — see
+  "Release and reclaim" above), so a permanently stuck derivative holds
+  its source intake's landing bytes rather than letting them be released
+  out from under it.
 
 ![Two-axis condition state machine: observation moves rows between satisfied and open; failed attempts move them through backoff to blocked, reopened by an operator or a tool-version bump](assets/reconciler-two-axis.svg)
 
@@ -320,7 +350,7 @@ a batch of targets, process due conditions, and enqueue at most one live
 job per target. Level-triggered and idempotent: running it twice is safe,
 and crashed state converges on the next cycle.
 
-<!-- code-anchor: src/sutradhara/backend @ df8165b -->
+<!-- code-anchor: src/sutradhara/backend src/sutradhara/replication.py src/sutradhara/jobs/registry.py @ 5688438 -->
 ## Storage backends
 
 The port (`backend/port.py`) is deliberately small: `enumerate()` yields
@@ -369,7 +399,38 @@ every turn still calls `OpenReadSession`, and a lost reservation race is
 simply requeued for another turn — and it degrades to no ordering at all
 if the daemon doesn't support the live-status RPC.
 
-<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ df8165b -->
+**Checkpoint vs. WRITTEN: what counts as a durable copy.** Remanence's
+write protocol distinguishes a fast, provisional per-object `WRITTEN`
+append receipt from a `CHECKPOINTED` one, returned only once a batch is
+checkpointed or the write session closes — only the latter is
+backend-durable and copy-accountable. `backend/port.py`'s
+`StorageBackend.enumerate()` contract is explicit about this: an
+implementation must never yield a copy whose durability is short of
+`CHECKPOINTED`, because scrub synthesizes `Copy` rows straight from
+`enumerate()`. `RemanenceBackend.open_batch` returns a `BatchWriter`
+(`append` / `checkpoint` / `close` / `abort`) that callers — archive
+fan-out, the `cloud-blob` job, `replication.py`'s self-heal — use to
+register a `Copy` only from the checkpoint-confirmed set, never from a
+provisional `WRITTEN` append; in-flight `WRITTEN` objects are persisted on
+the job row (`Job.step_state`) so a crash between "written" and
+"checkpointed" is recovered and requeued on the next attempt rather than
+silently lost or silently counted as durable. This closed a real
+production incident: the vendored `layer5.proto` stubs predated
+Remanence's `CheckpointSessionResponse` message, so the adapter's older
+structural-fallback parsing discarded the real committed-copy set — an
+archive write could report zero durable copies while tape held the data
+fine.
+
+Every write also carries a `caller_object_id`, an opaque per-invocation
+identity Remanence uses to detect duplicate or conflicting writes across
+retries. `replication.py` mints it as `<asset-hash-prefix>-<execution_id>`
+rather than reusing a fixed name — earlier code shared one
+`caller_object_id` (the sealed temp filename, always `sealed.rao`) across
+every write of a given copy, so a legitimate re-write (self-heal
+re-encrypting a placement to a new key epoch, for instance) collided with
+Remanence's own conflict check and was wrongly refused.
+
+<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 5688438 -->
 ## Sealing and keys
 
 A copy's on-backend form is its **representation**: `raw-bytes`
@@ -394,7 +455,7 @@ zeroize and unlink it. Recovery private keys are minted offline and never
 stored beneath the serving-host registry. Epoch IDs are explicitly
 domain-tagged and all seal/open sites assert their domain.
 
-<!-- code-anchor: src/sutradhara/hdcache @ df8165b -->
+<!-- code-anchor: src/sutradhara/hdcache @ 5688438 -->
 ## The HD cache tier
 
 `hdcache/` is a speed layer of independent JBOD disks in front of tape.
@@ -437,7 +498,7 @@ today — a cache miss there defers to disk-only archive candidates and
 explicitly refuses tape (see below). One producer, two callers, so a cache
 read is never less verified for one delivery mode than the other.
 
-<!-- code-anchor: src/sutradhara/restore.py src/sutradhara/archive_restore.py src/sutradhara/hdcache/manager.py src/sutradhara/grpc/restore_service.py proto/restore.proto @ df8165b -->
+<!-- code-anchor: src/sutradhara/restore.py src/sutradhara/archive_restore.py src/sutradhara/hdcache/manager.py src/sutradhara/grpc/restore_service.py proto/restore.proto @ 5688438 -->
 ## The restore path
 
 Bytes reach a requester in one of two ways, sharing the same gates,
@@ -532,7 +593,7 @@ ranges let ffmpeg cut a clip without reading the whole object, through a
 bounded local blob cache, with a fallback ladder down to whole-member
 restore.
 
-<!-- code-anchor: src/sutradhara/api src/sutradhara/grpc proto @ df8165b -->
+<!-- code-anchor: src/sutradhara/api src/sutradhara/grpc proto @ 5688438 -->
 ## Operator surface
 
 The HTTP API (`api/app.py`, FastAPI) binds to a Unix socket behind a
@@ -621,16 +682,77 @@ stage filters with `SUTRADHARA_ARCHIVED_ALL_SEMANTICS` — the default
 remains ANY-semantics until the read-only `sutra archive predicate-audit`
 is clean, after which it derives from `archive_state == complete`.
 
-<!-- code-anchor: alembic @ df8165b -->
+<!-- code-anchor: src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 5688438 -->
+## Deletion evidence and the retention witness gate
+
+Retention already refused to delete anything until every recipe copy was
+verified and offsite-confirmed (see "Release and reclaim" above). A
+second, independent layer sits on top of that gate rather than replacing
+it: before either irreversible step — releasing an intake, or actually
+purging its tombstoned landing bytes — Sutradhara asks the storage
+backend itself whether it agrees a copy exists, instead of trusting only
+what Sutradhara's own catalog already believes.
+
+Backends that can answer this implement
+`RetentionWitnessBackend.witness_copy` (`backend/port.py`);
+`RemanenceBackend.witness_copy` (`backend/remanence.py`) calls the
+Remanence Layer 5 `Catalog.GetObject` RPC by object id and checks that the
+returned digest and tape match what Sutradhara has on file. A witness
+answer is only trusted for `WITNESS_MAX_AGE` (5 seconds) before it must be
+re-collected — the gate re-witnesses right before the point of no return
+rather than trusting a stale answer from earlier in the request. If a
+backend doesn't implement the protocol, the call fails, or the two
+catalogs disagree, the gate *holds*: `retention_status`'s own docstring is
+explicit that "witness failures become hold reasons, never errors."
+Nothing about this can accidentally let a release proceed that would
+otherwise have held.
+
+**The purge path gained a middle state.** `Intake.retention_state` is now
+`held` → `released` → `tombstoned` → `purged`, with a terminal `abandoned`
+branch reachable from `held` or `released` (`retention.abandon_retention`
+— an operator opt-out that keeps the bytes and the intake row,
+permanently, without ever running the delete path). `tombstoned` exists
+because deleting a landing tree isn't atomic: `sweep_staging` first
+renames the tree to a recovery marker (`_atomic_tombstone`) — a single
+filesystem operation — and only garbage-collects it after that succeeds.
+If the process crashes between the rename and the GC, `_resume_tombstone_gc`
+picks the tombstone back up on the next sweep instead of leaving an
+intake stuck half-deleted, or worse, double-deleted.
+
+**This is layered on top of the audit trail, not a replacement for it.**
+`evidence_recorder.py` is the sole writer of a copy's read-back evidence:
+every measurement (from a fan-out, a `verify` job, a restore, or scrub)
+calls `record_measured`, which updates `Copy.last_measured_digest`/`_at`
+and appends an audit-only `VerifyReceipt` row in the same transaction —
+this is what "verified" means everywhere else in this document. The
+witness gate is a live, point-in-time cross-check made at release/purge
+time; `VerifyReceipt` is the durable history of past measurements. Full
+table and column detail lives in
+[`reference-database-schema.md`](reference-database-schema.md); the
+separate export/DR-shipping/check/correct mechanics for turning that
+history into a tamper-evident evidence journal are in
+[`reference-retention-journal.md`](reference-retention-journal.md) and
+`sutra retention journal export|check|correct` /
+`sutra retention sitrep` in [`reference-cli.md`](reference-cli.md).
+
+<!-- code-anchor: alembic @ 5688438 -->
 ## Migrations
 
-Schema history is alembic, in `alembic/`: 32 migrations in a single
-linear chain from `ea7254a77d7a` (the initial
-logical-asset/backend/copy tables) to head `b7c1d9e3f5a2` (restore-agent
-protocol foundations: device/scope/grant tables, per-item delivery
-checkpoints, and the exclusive open-restore lease). The two revisions
-immediately before head are `f6a7b8c9d0e1` (receive-dedup phase 2: the
-per-`IngestItem` content-novelty disposition columns) and
+Schema history is alembic, in `alembic/`: 35 migrations in a single
+linear chain from `ea7254a77d7a` (the initial logical-asset/backend/copy
+tables) to head `f2a3b4c5d6e7` (retention-journal checkpoint and
+supersession targets). The three revisions immediately before head layer
+in the deletion-evidence work: `c8d2e4f6a1b3` (indexed component
+snapshots for parked reconciliation conditions — the state `sutra
+reconcile record-fix` matches against), `e1f2a3b4c5d6` (deletion
+evidence: the `verify_receipt` table, `integrity_hash_provenance` and
+related `copy` columns, the `tombstoned`/`abandoned` retention states,
+and expanded `retention_event` vocabulary), and `f2a3b4c5d6e7` itself
+(`retention_journal_checkpoint` and append-only `retention_event`
+correction targets). Before that: `b7c1d9e3f5a2` (restore-agent protocol
+foundations: device/scope/grant tables, per-item delivery checkpoints,
+and the exclusive open-restore lease), `f6a7b8c9d0e1` (receive-dedup
+phase 2: the per-`IngestItem` content-novelty disposition columns), and
 `e5f6a7b8c9d0` (receive-dedup phase 1c: the composite intake/hash
 anti-join index); phase 1a's preceding `d4e5f6a7b8c9` revision adds
 durable receive-intent columns on the idempotency table plus
@@ -638,8 +760,9 @@ durable receive-intent columns on the idempotency table plus
 job table, pools, staging transforms, leases, the reconciler spine,
 arrangements and submissions, virtual arrangements, retention, gRPC
 intake and relay state, the hdcache tier, restore admission and
-progress, copy-grain durability, and now the agent-delivery restore
-protocol. `alembic/env.py` resolves the database from `SUTRADHARA_DB_URL`
+progress, copy-grain durability, the agent-delivery restore protocol,
+and now the deletion-evidence witness gate and retention evidence
+journal. `alembic/env.py` resolves the database from `SUTRADHARA_DB_URL`
 exactly like the runtime. `sutra db init` (create-all) exists for
 development; production schema changes go through `alembic upgrade
 head`.

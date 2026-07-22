@@ -31,7 +31,7 @@ data-loss event.
 - Not a vendor product like Miria — it is first-party software designed to
   outlive its dependencies.
 
-<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ df8165b -->
+<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 5688438 -->
 ## Status
 
 Beyond the v0.1 anchor spec (see [`docs/spec-v0.1.md`](docs/spec-v0.1.md) for
@@ -49,7 +49,11 @@ restore lifecycle is implemented end to end, including:
   fills, bundle self-heal, and expired restore-lease reopening
   (`sutra reconcile`).
 - Retention / deletion gating that only reclaims landing data once durable
-  copies are verified and offsite-confirmed (`sutra retention`, `sutra offsite`).
+  copies are verified, offsite-confirmed, and independently witnessed
+  against the backend's own catalog — every release and purge decision is
+  exported to a tamper-evident, chained evidence journal (`sutra retention`,
+  `sutra offsite`, `sutra retention journal export|check|correct`,
+  `sutra retention sitrep`).
 - Scrub and self-heal against live backend state (`sutra scrub`).
 - An expendable HD-cache disk tier in front of tape, including a
   cache-first, bounded, digest-verified byte producer shared by both
@@ -82,7 +86,7 @@ superseded / historical) and is the authoritative map of what's built versus
 still proposed. `docs/roadmap.md` and
 `docs/implementation-plan-ingest-v2.md` track what's next.
 
-<!-- code-anchor: pyproject.toml packages @ df8165b -->
+<!-- code-anchor: pyproject.toml packages @ 5688438 -->
 ## Layout
 
 ```
@@ -105,7 +109,7 @@ The Rust workstation helper (`sutra-agent`, tray + headless binaries) lives
 in its own repository and links `packages/sutradhara-receive` as a crate;
 an earlier in-tree `packages/sutra-agent` was removed when it moved.
 
-<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ df8165b -->
+<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ 5688438 -->
 ## Install & verify
 
 Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/).
@@ -132,7 +136,7 @@ init`. [`docs/guide-quickstart.md`](docs/guide-quickstart.md) walks a full
 local tour, including a catalog rebuild from a fixture backend and one
 receive → register pass, plus troubleshooting.
 
-<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 5688438 -->
 ## CLI overview
 
 `sutra --help` lists every command group; each group has its own `--help`,
@@ -156,7 +160,7 @@ order:
 | `sutra backends` | Register and inspect storage backends and their pools. |
 | `sutra scrub` | Re-enumerate a backend and reconcile it against the catalog. |
 | `sutra hdcache` | Manage the HD-cache disk tier (enrollment, fills, walker, repopulation). |
-| `sutra retention` / `offsite` | Retention release gate, offsite confirmation, staging sweep. |
+| `sutra retention` / `offsite` | Retention release gate (verified + offsite-confirmed + backend-witnessed), staging sweep, offsite confirmation, and the append-only deletion-evidence journal (`journal export/check/correct`, `sitrep`). |
 | `sutra pfr` | Partial file restore: clip cuts, sidecar status, forced reindex. |
 | `sutra serve` / `serve-api` / `serve-grpc` | Operator HTTP API and mTLS gRPC relay (device intake, browser console). |
 | `sutra db` / `sutra admin` | Schema init (dev), doctor, and dangerous catalog maintenance. |
@@ -167,7 +171,7 @@ CLI adapter for the legacy d2 tape library), `s3` (cloud), `ssh_disk`
 accepted by `backends add` (`rem_disk`, `plain_disk`, `gcs`, `azure_blob`)
 are reserved names without adapters yet.
 
-<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 5688438 -->
 ## Configuration
 
 Beyond `SUTRADHARA_DB_URL`, the environment variables most operators need:
@@ -188,7 +192,7 @@ Every other knob — hdcache tuning, resource control, PFR, the d2tape
 backend, test fakes — is documented with exact defaults in
 [`docs/reference-config.md`](docs/reference-config.md).
 
-<!-- code-anchor: src/sutradhara/sealing @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/sealing @ 5688438 -->
 ## Scenario O — sealed RAO copies
 
 Scenario O seals per-copy representations before storage instead of storing

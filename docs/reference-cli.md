@@ -11,7 +11,7 @@ the rest) see [`reference-config.md`](reference-config.md). For what the
 pieces mean, see [`reference-glossary.md`](reference-glossary.md) and
 [`architecture-overview.md`](architecture-overview.md).
 
-<!-- code-anchor: src/sutradhara/cli/main.py src/sutradhara/catalog/session.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/cli/main.py src/sutradhara/catalog/session.py @ 5688438 -->
 ## Conventions
 
 - The CLI lives in the project virtualenv: `.venv/bin/sutra`, or
@@ -29,7 +29,7 @@ pieces mean, see [`reference-glossary.md`](reference-glossary.md) and
 
 ## Command map
 
-`sutra --help` lists 24 top-level entries. In lifecycle order:
+`sutra --help` lists 25 top-level entries. In lifecycle order:
 
 | Command | Purpose |
 |---|---|
@@ -58,7 +58,7 @@ pieces mean, see [`reference-glossary.md`](reference-glossary.md) and
 | `sutra db` | Schema management (dev convenience; production uses alembic). |
 | `sutra admin` | Dangerous local catalog maintenance. |
 
-<!-- code-anchor: src/sutradhara/cli/receive.py packages/sutradhara-receive/src/sutradhara_receive @ 3d8310c -->
+<!-- code-anchor: src/sutradhara/cli/receive.py packages/sutradhara-receive/src/sutradhara_receive @ 5688438 -->
 ## sutra receive
 
 Receive source trees (cards, drives, folders) into landing intakes as BagIt
@@ -104,7 +104,7 @@ Verify completed bags whose destination-verification sidecar is absent,
 mid-transfer, or failed. Flags: `--landing DIRECTORY` (required,
 repeatable), `--json`. Exits 4 when any bag fails.
 
-<!-- code-anchor: src/sutradhara/cli/intake.py src/sutradhara/intake.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/cli/intake.py src/sutradhara/intake.py @ 5688438 -->
 ## sutra intake and sutra prepare
 
 Landing intakes cross the acceptance boundary here: `inspect` validates
@@ -163,7 +163,7 @@ Record a prepare profile for the derivation reconciler. Flags:
 code registry in `src/sutradhara/jobs/reconcilers/profiles.py`; the
 derivation reconciler picks the desired state up on its next cycle.
 
-<!-- code-anchor: src/sutradhara/cli/arrangement.py src/sutradhara/arrangement.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/cli/arrangement.py src/sutradhara/arrangement.py @ 5688438 -->
 ## sutra arrangement
 
 Arrange registered masters into an archive namespace, then freeze the
@@ -181,7 +181,7 @@ workspaces; submissions are terminal (revise by cloning, not resubmitting).
 
 `create`, `list`, `show`, and `submit` accept `--json`.
 
-<!-- code-anchor: src/sutradhara/cli/archive.py src/sutradhara/archive_restore.py src/sutradhara/artifactclass_policy.py @ df8165b -->
+<!-- code-anchor: src/sutradhara/cli/archive.py src/sutradhara/archive_restore.py src/sutradhara/artifactclass_policy.py @ 5688438 -->
 ## sutra archive
 
 Artifactclass policy, durable bundles, held-bundle review, archiving frozen
@@ -254,7 +254,7 @@ the held summary.
 | `--why TEXT` | | Reason for the review decision. |
 | `--who TEXT` | | Reviewer/operator name. |
 
-<!-- code-anchor: src/sutradhara/cli/virtual.py src/sutradhara/virtual_arrangement.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/virtual.py src/sutradhara/virtual_arrangement.py @ 5688438 -->
 ## sutra virtual, tag, reject, unreject
 
 Post-archive organization and governance. Virtual arrangements are named,
@@ -284,7 +284,7 @@ they gate restore, never preservation, and nothing here deletes anything.
 | `reject` | `ASSET_HASH_HEX` | Reject one logical asset without deleting it. `--reason TEXT`, `--actor TEXT`. |
 | `unreject` | `ASSET_HASH_HEX` | Clear the reject marker. |
 
-<!-- code-anchor: src/sutradhara/cli/assets.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/assets.py @ 5688438 -->
 ## sutra list
 
 Catalog queries. Currently one subcommand:
@@ -292,7 +292,7 @@ Catalog queries. Currently one subcommand:
 - `sutra list assets` — list logical assets. `--limit INTEGER` (default
   `50`, `0` = unlimited), `--json`.
 
-<!-- code-anchor: src/sutradhara/cli/reconcile.py src/sutradhara/jobs/reconcilers @ df8165b -->
+<!-- code-anchor: src/sutradhara/cli/reconcile.py src/sutradhara/jobs/reconcilers @ 5688438 -->
 ## sutra reconcile DOMAIN / record-fix
 
 Run one bounded reconcile cycle for DOMAIN: observe desired state, discover
@@ -319,7 +319,7 @@ The reopen audit message records the local actor and supplied note.
 | `--reason TEXT` | | Filter `--reopen-blocked` by reason. |
 | `--note TEXT` | | Required with `record-fix`; audited operator note. |
 
-<!-- code-anchor: src/sutradhara/cli/jobs.py src/sutradhara/cli/worker.py src/sutradhara/jobs @ df8165b -->
+<!-- code-anchor: src/sutradhara/cli/jobs.py src/sutradhara/cli/worker.py src/sutradhara/jobs @ 5688438 -->
 ## sutra jobs and sutra worker
 
 Direct job control and the worker loop. Most jobs are created by
@@ -344,7 +344,7 @@ counted resource pools.
 | `--once` | off | Drain currently eligible jobs and exit. |
 | `--pools TEXT` | | Override counted pool capacity, e.g. `--pools cpu=8 --pools io=2`. Repeatable. |
 
-<!-- code-anchor: src/sutradhara/cli/backends.py src/sutradhara/backend/factory.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/backends.py src/sutradhara/backend/factory.py @ 5688438 -->
 ## sutra backends
 
 Register and inspect storage backends and manage pool write fences.
@@ -367,7 +367,7 @@ Register and inspect storage backends and manage pool write fences.
 | `set-pool-retired` | `POOL_ID` | Set a pool's descriptive retired flag. `--retired/--active` (required). |
 | `set-pool-writes` | `POOL_ID` | Set a pool's write fence with durability-floor validation. `--accepts-writes/--no-accepts-writes` (required), `--force` overrides a durability-floor drain refusal and records an alarm. |
 
-<!-- code-anchor: src/sutradhara/cli/scrub.py src/sutradhara/scrub.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/scrub.py src/sutradhara/scrub.py @ 5688438 -->
 ## sutra scrub
 
 Re-enumerate a backend and reconcile it against the catalog: matching
@@ -377,7 +377,7 @@ are marked `MISSING`. Scrub never deletes. This is the working proof of the
 rebuildable-index principle. Flags: `--backend TEXT` (required, a
 registered backend name).
 
-<!-- code-anchor: src/sutradhara/cli/hdcache.py src/sutradhara/hdcache @ df8165b -->
+<!-- code-anchor: src/sutradhara/cli/hdcache.py src/sutradhara/hdcache @ 5688438 -->
 ## sutra hdcache
 
 Manage the expendable HD cache disk tier: enrollment and lifecycle of
@@ -406,7 +406,7 @@ operation is reversible from the archive.
 | `rebuild` | | Rebuild untrusted cache rows from self-describing disk filenames (rows stay untrusted until cross-checked against the catalog). `--json`. |
 | `drill status` | `[DISK_ID]` | Show remaining/refilled counts and ETA for dead-disk repopulation drills. `--json`. |
 
-<!-- code-anchor: src/sutradhara/cli/retention.py src/sutradhara/retention.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/retention.py src/sutradhara/retention.py @ 5688438 -->
 ## sutra retention and sutra offsite
 
 The only place in the system that deletes bytes. Both stages require current
@@ -430,7 +430,7 @@ limit.
 | `offsite confirm` | | Confirm one known media id as offsite. `--tape TEXT` or `--media-id TEXT`, `--shipment TEXT`, `--actor TEXT`, `--json`. |
 | `offsite revoke` | | Revoke an offsite confirmation without deleting its history. `--tape TEXT` or `--media-id TEXT`, `--reason TEXT`, `--actor TEXT`, `--json`. |
 
-<!-- code-anchor: src/sutradhara/cli/pfr.py src/sutradhara/pfr.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/pfr.py src/sutradhara/pfr.py @ 5688438 -->
 ## sutra pfr
 
 Partial file restore: container-index sidecars and byte-range clip cuts.
@@ -443,7 +443,7 @@ available.
 | `status` | `[ASSET_HASH_HEX]` | Show PFR readiness for one asset or member selector. `--artifactclass TEXT` (required), `--member-name TEXT`, `--json`. |
 | `reindex` | `[ASSET_HASH_HEX]` | Enqueue forced pfr-index jobs, bypassing the presence-gated reconciler. `--artifactclass TEXT`, `--member-name TEXT`, `--grammar [fallback]`, `--all` reindexes every current PFR sidecar, `--json`. |
 
-<!-- code-anchor: src/sutradhara/cli/serve.py src/sutradhara/cli/api.py src/sutradhara/cli/grpc.py @ 3d8310c -->
+<!-- code-anchor: src/sutradhara/cli/serve.py src/sutradhara/cli/api.py src/sutradhara/cli/grpc.py @ 5688438 -->
 ## sutra serve, serve-api, serve-grpc
 
 The operator-facing servers. `sutra serve` runs both halves in one process;
@@ -490,7 +490,7 @@ without starting the server.
 | `--sign-csr FILE` | | Sign a device CSR (with `--token`, `--cert-out FILE`). |
 | `--skip-artifactclass-validation` | off | Development/testing only: allow unknown artifactclasses. |
 
-<!-- code-anchor: src/sutradhara/cli/db.py src/sutradhara/cli/admin.py @ 5c44b85 -->
+<!-- code-anchor: src/sutradhara/cli/db.py src/sutradhara/cli/admin.py @ 5688438 -->
 ## sutra db and sutra admin
 
 Schema and local maintenance.
