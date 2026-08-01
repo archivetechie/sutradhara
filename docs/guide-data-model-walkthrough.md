@@ -1,5 +1,27 @@
 # The life of a shot — a guided tour of the Sutradhara data model
 
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
+> **Scope note.** Most of this walkthrough describes tables that exist in this
+> repository today — verify any specific field against
+> [`reference-database-schema.md`](reference-database-schema.md), the
+> field-exact reference. The **Artifact layer** is the one deliberate
+> exception: `artifact`, `artifact_member`, `artifact_relation`,
+> `artifact_event`, `artifact_external_identifier`,
+> `artifactclass_policy_version`, and `artifact_bundle_part` (most of
+> Chapters 3 and 4, and threaded through 5, 7, 8, 10, and 11) are a **frozen
+> design, not yet implemented in this codebase** — none of those tables exist
+> in `catalog/models.py` as of the commit above. The design was finalized in
+> the companion `~/system` repository's data-model recommendation
+> (2026-07-14) and its implementation ("schema-hardening W1") is in progress
+> on an unmerged branch. Until it lands, policy and class authority still
+> live on `intake` / `ingest_item` / `submission` / `bundle` exactly as
+> `reference-database-schema.md` describes, not on a separate `artifact` row.
+> This note was added deliberately rather than rewriting the walkthrough,
+> because the Artifact narrative is intentional forward-looking design
+> writing (see commit `84914c1`), not accidental drift — but a newcomer
+> reading only this page, with no other context, should not come away
+> believing the Artifact tables exist yet.
+
 *A companion to the field-level references ([`reference-database-schema.md`](reference-database-schema.md)
 for the byte/occurrence/storage/view layers, and the data-model & Artifact
 architecture write-up in `~/system/docs/` for the Artifact, membership,

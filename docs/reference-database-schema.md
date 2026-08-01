@@ -8,13 +8,14 @@ rebuilt by enumerating the backend.
 
 The live source of truth is the SQLAlchemy model set in
 `src/sutradhara/catalog/models.py`, `jobs/models.py`, `api/store.py`,
-`grpc/store.py`, and `hdcache/models.py`, applied in order by `alembic/`.
-This page was checked against the full model set loaded by
-`catalog.session.create_all` and the Alembic head. Do not hand-edit a
+`api/live_capabilities.py`, `grpc/store.py`, and `hdcache/models.py`, applied
+in order by `alembic/`. This page was checked against the full model set
+loaded by `catalog.session.create_all` and the Alembic head. Do not hand-edit a
 production database: use the CLI/API and Alembic migrations. When this
 reference and the models disagree, the models and migrations win; please fix
 this page.
 
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
 ## Reading this reference
 
 - `PK` means primary key. `FK -> table.column` means a foreign key. Fields not
@@ -27,6 +28,7 @@ this page.
   a bundle copy, never both. `asset_locator` is the bridge that lets a member
   of a stored bundle count as coverage for one logical asset.
 
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
 ## Why these boundaries exist
 
 The most important modelling choice is to keep *content identity* separate
@@ -45,6 +47,7 @@ catalog-authoritative ones are explicitly marked so their database backup
 requirements are visible. That trade-off is described in more depth in
 [`architecture-overview.md`](architecture-overview.md).
 
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
 ## Relationship map
 
 `logical_asset` is the content identity. `ingest_item` records each appearance
@@ -57,6 +60,7 @@ Backends contain policy-facing `pool` rows; `copy` records what was written and
 The job, reconciliation, cache, and restore tables share the same database so
 operators can explain a decision without joining separate operational stores.
 
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
 ## Content and intake
 
 ### `logical_asset`
@@ -114,8 +118,8 @@ can preserve their own provenance even when their bytes deduplicate.
 | Field | Type / key | Meaning |
 |---|---|---|
 | `id` | integer, PK | Occurrence identifier. |
-| `intake_id` | text, FK -> `intake.intake_id` | Intake that supplied the occurrence. |
-| `logical_asset_hash` | hash, FK -> `logical_asset.content_sha256` | Content represented by this occurrence. |
+| `intake_id` | text, FK -> `intake.intake_id`, indexed | Intake that supplied the occurrence. |
+| `logical_asset_hash` | hash, FK -> `logical_asset.content_sha256`, indexed | Content represented by this occurrence. |
 | `as_received_path` | text | Path exactly as received; unique within an intake. |
 | `virtual_path` | text | Normalized working path used before archive arrangement. |
 | `st_dev`, `st_ino` | bigint, optional | Source filesystem device/inode evidence when available. |
@@ -142,6 +146,7 @@ the same kind of edge being recorded twice for one source/derived pair.
 | `kind` | text | Derivation kind, such as a transcode profile. |
 | `created_at` | time | When the provenance edge was recorded. |
 
+<!-- code-anchor: src/sutradhara/api/store.py src/sutradhara/grpc/store.py @ 5688438 -->
 ## Receive API and device relay
 
 These tables make duplicate-receive decisions, live source ownership, and
@@ -202,6 +207,19 @@ marker is only a watcher/sweep hint; this row is the authority through commit.
 | `landing_root` | text | Server-configured landing destination. |
 | `created_at`, `updated_at` | time | Lifecycle timestamps. |
 
+### `grpc_logical_device`
+
+The stable device identity that survives a certificate rotation. Enrollment
+rows, enrollment tokens, and restore-destination grants all reference this
+identity rather than a fingerprint, so a device keeps its authorized scopes
+across a re-issued certificate.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `device_id` | text, PK | Logical device identity. |
+| `scopes` | json | Authorized capability set: `["ingest"]`, `["restore"]`, or `["ingest", "restore"]`; defaults to `["ingest"]`. |
+| `created_at`, `updated_at` | time | Creation and last scope-update time. |
+
 ### `grpc_device_enrollment`
 
 Maps an mTLS client-certificate fingerprint to its authorized device and
@@ -211,7 +229,8 @@ device merely by supplying its identifier.
 | Field | Type / key | Meaning |
 |---|---|---|
 | `id` | integer, PK | Enrollment-row identifier. |
-| `device_id`, `cert_fingerprint` | text, unique pair | Enrolled helper and certificate fingerprint. |
+| `device_id` | text, FK -> `grpc_logical_device.device_id`, unique with `cert_fingerprint` | Enrolled logical device. |
+| `cert_fingerprint` | text | Certificate fingerprint, unique with `device_id`. |
 | `operator` | text | Owning operator. |
 | `revoked` | boolean | Whether the certificate may still authenticate; defaults to false. |
 | `created_at`, `revoked_at` | time | Enrollment and optional revocation time. |
@@ -226,9 +245,24 @@ primary key because it is the secret bearer value and may only be consumed once.
 | `token` | text, PK | Enrollment bearer token. |
 | `created_at`, `expires_at`, `used_at` | time | Creation, expiry, and optional consumption time. |
 | `operator`, `device_id` | text | Intended owner and device binding. |
+| `scopes` | json | Capability set granted on consumption; same closed vocabulary as `grpc_logical_device.scopes`, defaults to `["ingest"]`. |
 | `rotation_authority` | text, optional | `self` or `admin` authority for a re-enrollment. |
 | `rotation_fingerprint` | text, optional | Existing certificate fingerprint required for a self-rotation. |
 
+### `grpc_device_destination_grant`
+
+One opaque restore-destination binding authorized for a logical device, used
+by the agent restore-delivery path.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Grant identifier. |
+| `device_id` | text, FK -> `grpc_logical_device.device_id`, unique with `destination_id` | Authorized device. |
+| `destination_id` | text, indexed | Opaque destination identity, unique with `device_id`. |
+| `dest_root` | text | Destination root path for delivered restores. |
+| `created_at` | time | Grant time. |
+
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
 ## Arrangement and submission
 
 ### `arrangement`
@@ -250,7 +284,10 @@ only after the arrangement is frozen.
 ### `arrangement_member`
 
 One editable path in an arrangement. Its lifecycle is controlled by its parent
-arrangement rather than a separate state field.
+arrangement rather than a separate state field. A partial unique index on
+`(arrangement_id, member_path)` where `excluded` is false stops two active
+members from claiming the same path; an excluded member does not block reuse
+of its old path.
 
 | Field | Type / key | Meaning |
 |---|---|---|
@@ -294,6 +331,7 @@ The immutable member rows represented by a submission's source map.
 | `size_bytes` | bigint | Member byte length. |
 | `ord` | integer | Stable source-map order. |
 
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
 ## Storage policy and archive objects
 
 ### `backend`
@@ -350,13 +388,15 @@ defines routing; this table keeps the validated values the runtime uses.
 
 ### `artifactclass_pool`
 
-Joins an artifactclass to a pool, with the policy ordering and role.
+Joins an artifactclass to a pool, with the policy ordering and role. The
+`(artifactclass, pool_id)` pair is unique, so a class cannot list the same
+pool twice.
 
 | Field | Type / key | Meaning |
 |---|---|---|
 | `id` | integer, PK | Placement-row identifier. |
-| `artifactclass` | text, indexed | Referenced policy class. |
-| `pool_id` | text, FK -> `pool.id` | Eligible pool. |
+| `artifactclass` | text, indexed, unique with `pool_id` | Referenced policy class. |
+| `pool_id` | text, FK -> `pool.id`, unique with `artifactclass` | Eligible pool. |
 | `active` | boolean | Whether normal routing selects it. |
 | `sort_order` | integer | Deterministic routing order. |
 | `role` | text, optional | Policy-defined placement role. |
@@ -443,7 +483,9 @@ an individual-file copy.
 ### `asset_locator`
 
 The per-asset pointer into a bundle copy. This is the important distinction
-between an object on storage and the file a restore operator asked for.
+between an object on storage and the file a restore operator asked for. The
+triple `(copy_id, logical_asset_hash, member_path)` is unique, so the same
+asset cannot be pointed at the same member path in the same copy twice.
 
 | Field | Type / key | Meaning |
 |---|---|---|
@@ -471,6 +513,7 @@ Root-level metadata for blob-style bundle storage, separate from member-level
 | `archive_id` | text, optional | Backend archive identifier. |
 | `created_at` | time | Creation time. |
 
+<!-- code-anchor: src/sutradhara/catalog/models.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 5688438 -->
 ## Organization, retention, and review
 
 ### `virtual_arrangement`
@@ -490,7 +533,10 @@ without risking a new tape write.
 ### `virtual_arrangement_member`
 
 One asset path in a virtual arrangement. Asset and artifactclass together are
-the durable member identity; `path` is allowed to change and is audited.
+the durable member identity; `path` is allowed to change and is audited. A
+partial unique index on `(va_id, path)` where `excluded` is false stops two
+active members from sharing a path within the same view, the same pattern
+used for `arrangement_member`.
 
 | Field | Type / key | Meaning |
 |---|---|---|
@@ -541,7 +587,12 @@ this before it releases landing bytes.
 
 ### `retention_event`
 
-Append-only record of an intake, media, or batch retention decision.
+Append-only record of an intake, media, or batch retention decision. A
+partial unique index on `(action, operation_id)` covers the six idempotency-
+sensitive actions (`release_attempted`, `cloud_blob_deleted`, `released`,
+`purge_attempted`, `staging_tombstoned`, `staging_deleted`) so an operation
+retry cannot double-record the same outcome; other actions, including
+`correction_recorded`, are unconstrained by this index.
 
 | Field | Type / key | Meaning |
 |---|---|---|
@@ -560,7 +611,9 @@ before appending an event.
 ### `verify_receipt`
 
 Append-only audit receipt written in the same transaction as a copy's current
-measurement projection or measurement invalidation.
+measurement projection or measurement invalidation. The triple `(source,
+execution_id, copy_id)` is unique, so retrying a fan-out, verify-job, restore,
+or scrub execution cannot record the same copy's outcome twice.
 
 | Field | Type / key | Meaning |
 |---|---|---|
@@ -581,7 +634,7 @@ crash without causing duplicate or omitted receipts.
 |---|---|---|
 | `id` | integer, PK constrained to `1` | Singleton identity. |
 | `envelope_id`, `hash_algorithm_id` | text | Versioned encoding and hash identifiers. |
-| `global_sequence`, `head_hash` | integer / hash | Latest published sequence and chain head. |
+| `global_sequence`, `head_hash` | non-negative integer / hash | Latest published sequence and chain head. |
 | `verify_receipt_cursor`, `retention_event_cursor` | non-negative integers | Inclusive source-table cursors. |
 | `published_filename`, `published_at` | text / time | Authoritative segment/footer mirrored by this checkpoint. |
 
@@ -625,6 +678,7 @@ applies only to this ingest or becomes a persisted rule.
 | `persisted_rule` | json, optional | Rule created for future matching input. |
 | `decided_at` | time | Decision time. |
 
+<!-- code-anchor: src/sutradhara/jobs/models.py @ 5688438 -->
 ## Jobs and reconciliation
 
 ### `job`
@@ -676,10 +730,12 @@ reality and the latest attempt so reconcilers do not scan the full job history.
 | `domain`, `target_key` | text, unique pair | Reconciler namespace and target identity. |
 | `observed_state`, `condition` | text | What exists and current disposition. |
 | `reason`, `message` | text, optional | Machine-readable reason and human detail. |
-| `attempt_count`, `next_eligible_at` | integer / time | Retry count and next allowable attempt. |
+| `attempt_count` | integer | Retry count. |
+| `next_eligible_at` | time, optional | Next allowable attempt. |
 | `blocked_tool_name`, `blocked_tool_version` | text, optional | Tool evidence that can reopen a blocked condition after change. |
 | `last_attempt_id` | integer, optional FK -> `job_attempt.id` | Latest supporting attempt. |
-| `last_attempt_at`, `last_success_at`, `updated_at` | time | Attempt, success, and row-update times. |
+| `last_attempt_at`, `last_success_at` | time, optional | Latest attempt and success times. |
+| `updated_at` | time | Row-update time. |
 
 ### `condition_component`
 
@@ -693,6 +749,7 @@ null `reconciliation_condition.last_attempt_id` without removing this lookup.
 | `condition_id` | integer, FK -> `reconciliation_condition.id` | Parked condition; cascades on condition deletion. |
 | `component` | text, indexed | Exact component string used by `record-fix`; unique per condition. |
 
+<!-- code-anchor: src/sutradhara/hdcache/models.py @ 5688438 -->
 ## HD cache and restore
 
 The HD cache is expendable operational state. These tables intentionally do
@@ -710,7 +767,8 @@ not make a cache disk a durable backend or pool.
 | `capacity_bytes`, `filled_bytes` | bigint | Usable capacity and tracked cache occupancy. |
 | `capacity_state` | enum | `ok` or `over_reserve`. |
 | `smart_status` | text, optional | Latest SMART summary. |
-| `enrolled_at`, `last_walk_at` | time | Enrollment and most recent inventory-walk times. |
+| `enrolled_at` | time | Enrollment time. |
+| `last_walk_at` | time, optional | Most recent inventory-walk time. |
 
 ### `cache_entry`
 
@@ -730,14 +788,17 @@ logical asset across the current cache inventory.
 | `key_epoch` | text, optional | Encryption-key epoch for encrypted cache content. |
 | `stored_digest` | hash, optional | Digest of stored representation. |
 | `trusted` | boolean | Whether the cache result is trusted for use. |
-| `placed_at`, `last_read_at` | time | Placement and last-read times. |
+| `placed_at` | time | Placement time. |
+| `last_read_at` | time, optional | Last-read time. |
 | `lost_origin_disk_id`, `lost_drill_id`, `lost_at`, `refilled_at` | text / time, optional | Loss-drill provenance and refill audit. |
 
 ### `restore_request`
 
 One persisted operator request, independently tracking the cache and tape
 branches. The idempotency fields prevent an HTTP retry from creating a second
-request with different content.
+request with different content. `delivery_mode` and `receiver_device_id` are
+paired by a check constraint: a `server_local` request must leave
+`receiver_device_id` null, and an `agent` request must set it.
 
 | Field | Type / key | Meaning |
 |---|---|---|
@@ -745,10 +806,13 @@ request with different content.
 | `identity` | text | Requesting operator/identity. |
 | `created_at` | time | Request time. |
 | `destination_id` | text | Configured destination identity. |
+| `delivery_mode` | enum | `server_local` or `agent`; defaults to `server_local`. |
+| `receiver_device_id` | text, optional FK -> `grpc_logical_device.device_id` | Delivery-agent device; required when `delivery_mode` is `agent`, forbidden otherwise. |
 | `state` | enum | `pending`, `active`, `completed`, or `completed_with_errors`. |
 | `admitted_by`, `admitted_at` | text / time, optional | Authorization-admission audit. |
 | `admitted_capabilities` | json, optional | Capabilities accepted at admission. |
-| `idempotency_key`, `idempotency_body_hash` | text, optional | Request replay key and body digest. |
+| `idempotency_key` | text, optional, unique | Request replay key. |
+| `idempotency_body_hash` | text, optional | Body digest paired with the replay key. |
 
 ### `restore_request_item`
 
@@ -760,14 +824,75 @@ One requested asset within a restore request.
 | `request_id` | text, FK -> `restore_request.id` | Parent request. |
 | `content_sha256` | hash, FK -> `logical_asset.content_sha256` | Asset to restore. |
 | `artifactclass` | text | Restore-policy class. |
-| `state` | enum | `queued`, `waking_disk`, `streaming`, `done`, `fell_back_to_tape`, `denied`, or `failed`. |
+| `final_rel_path` | text, optional | Destination-relative path once delivery completes. |
+| `state` | enum | `queued`, `waking_disk`, `streaming`, `sent`, `done`, `fell_back_to_tape`, `denied`, or `failed`. |
 | `detail` | text, optional | Operator-visible outcome detail. |
 | `denial_kind` | enum, optional | `capability`, `privacy_unmapped`, `suspect`, or `rejected`. |
-| `size_bytes`, `bytes_restored` | bigint | Expected and completed byte counts. |
+| `size_bytes` | bigint, optional | Expected byte count. |
+| `bytes_restored` | bigint | Completed byte count. |
 | `source` | enum, optional | `cache` or `tape` source actually used. |
 | `admitted_force_suspect`, `admitted_force_rejected` | boolean, optional | Recorded admission overrides. |
 | `updated_at` | time | Last progress update. |
 
+### `restore_item_checkpoint`
+
+Durable per-item staged/revealed progress for agent restore delivery, keyed
+1:1 by `restore_request_item`. `revealed` can only be true once at least one
+chunk has been committed.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `restore_request_item_id` | integer, PK, FK -> `restore_request_item.id` | Parent restore item. |
+| `manifest_sha256` | hash | Digest of the delivery manifest this checkpoint tracks. |
+| `committed_index` | integer | Last committed chunk index; defaults to 0. |
+| `revealed` | boolean | Whether the destination path has been exposed to the receiver; defaults to false. |
+| `updated_at` | time | Last checkpoint update. |
+
+### `restore_open_session`
+
+An exclusive, expiring generation lease for opening one agent restore item, so
+a stale or duplicate agent session cannot race a live one.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `restore_request_item_id` | integer, PK, FK -> `restore_request_item.id` | Restore item the session opens. |
+| `receiver_device_id` | text, FK -> `grpc_logical_device.device_id` | Device holding the lease. |
+| `manifest_sha256` | hash | Digest of the delivery manifest for this open. |
+| `generation` | integer | Monotonically increasing lease generation, starting at 1. |
+| `expires_at` | time | Lease expiry. |
+| `created_at`, `updated_at` | time | Lease creation and last renewal time. |
+
+<!-- code-anchor: src/sutradhara/api/live_capabilities.py @ 5688438 -->
+## Operator capability cache
+
+Restore admission trusts an HTTP session's capability headers as a snapshot,
+but an agent restore open can happen well after admission. These two tables
+give the agent-open path a separately revocable, authoritative source, so a
+capability revoked after admission cannot still be exercised through an open
+agent session.
+
+### `operator_capability_sync`
+
+The freshness boundary for one operator's synchronized capability snapshot.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `operator` | text, PK | Synchronized operator. |
+| `synchronized_at` | time | When this snapshot was last refreshed. |
+| `valid_until` | time | When this snapshot must be refreshed again to stay authoritative. |
+
+### `operator_live_capability`
+
+One synchronized, currently effective capability grant. `(operator,
+capability)` is unique.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Grant identifier. |
+| `operator` | text, FK -> `operator_capability_sync.operator`, unique with `capability` | Granted operator. |
+| `capability` | enum, unique with `operator` | One of `can_view`, `can_receive`, `can_restore`, `can_logs`, `can_admin`, `can_restore_p2`, `can_restore_p3`. |
+
+<!-- code-anchor: src/sutradhara/catalog/models.py alembic @ 5688438 -->
 ## Integrity constraints and migration practice
 
 Besides the primary and foreign keys shown above, the implementation enforces
