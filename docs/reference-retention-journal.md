@@ -4,6 +4,7 @@ The retention journal is an emit-only flight recorder. Retention release and
 staging purge never read it, so an exporter or DR outage raises an alarm without
 changing a deletion-gate decision.
 
+<!-- code-anchor: src/sutradhara/retention_journal.py @ 5688438 -->
 ## Export and publication
 
 `sutra retention journal export` takes the same non-blocking process-level
@@ -24,6 +25,7 @@ rename but before checkpoint therefore resumes without omissions or duplicates.
 The checkpoint is a singleton optimization row. It is not evidence and is not a
 gate input.
 
+<!-- code-anchor: src/sutradhara/retention_journal.py src/sutradhara/backend/ssh_disk.py @ 5688438 -->
 ## Append-only DR shipping
 
 Production shipping requires
@@ -40,6 +42,7 @@ Local append-only destinations are available through the library API for
 hermetic tests and DR drills. They use the same names and collision rules as the
 SSH destination; they are not a second exporter.
 
+<!-- code-anchor: src/sutradhara/retention_journal.py src/sutradhara/cli/retention.py src/sutradhara/catalog/models.py @ 5688438 -->
 ## Checking and corrections
 
 `sutra retention journal check` walks every entry and footer, verifies sequence
@@ -55,6 +58,7 @@ to append an attributed `correction_recorded` event. Its
 Offsite revocation uses the same rule and targets the confirmation event it
 supersedes.
 
+<!-- code-anchor: src/sutradhara/cli/retention.py src/sutradhara/retention_journal.py systemd/sutradhara-retention-journal-export.service systemd/sutradhara-retention-journal-export.timer @ 5688438 -->
 ## Operations
 
 Every mutating retention/offsite CLI invocation attempts export after its
