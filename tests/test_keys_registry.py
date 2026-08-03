@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,10 @@ from sutradhara.keys import (
     key_domain,
     mint_recovery_keypair,
 )
-from sutradhara.keys.remanence import RecipientPublicIdentity
+from sutradhara.keys.remanence import (
+    RecipientPublicIdentity,
+    RemRecipientKeyCodec,
+)
 from tests.key_helpers import (
     TEST_RECIPIENT_CODEC,
     DeterministicRecipientKeyCodec,
@@ -289,14 +293,82 @@ def test_deterministic_mode_has_path_and_state_interlocks(tmp_path: Path) -> Non
         KeyRegistry("/var/lib/test-sutradhara-keys", deterministic_test=True)
     with pytest.raises(ValueError, match="outside /var/lib"):
         KeyRegistry(deterministic_test=True)
-    with pytest.raises(ValueError, match="custom recipient codec"):
+    with pytest.raises(ValueError, match="allow_test_codec mode"):
         KeyRegistry("/var/lib/test-sutradhara-keys", recipient_codec=TEST_RECIPIENT_CODEC)
+    with pytest.raises(ValueError, match="allow_test_codec mode"):
+        KeyRegistry(tmp_path / "custom-codec", recipient_codec=TEST_RECIPIENT_CODEC)
+    with pytest.raises(ValueError, match="outside /var/lib"):
+        mint_recovery_keypair(
+            public_key_path="/var/lib/test-recovery.remr",
+            private_key_path="/var/lib/test-recovery.remp",
+            recipient_codec=TEST_RECIPIENT_CODEC,
+            allow_test_codec=True,
+        )
 
     path = tmp_path / "keys"
     test_registry = KeyRegistry(path, deterministic_test=True)
     epoch = test_registry.create_epoch()
     with pytest.raises(RuntimeError, match="deterministic test epoch"):
         KeyRegistry(path).get_epoch(epoch.key_id)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        '{"slot_index": 0}\n{"slot_index": 1}\n',
+        'notice\n{"slot_index": 0}\n',
+        '{"slot_index": 0}\n\n',
+        ' {"slot_index": 0}\n',
+        '{"slot_index": 0} trailing\n',
+        '{"slot_index": 0}',
+    ],
+)
+def test_rem_recipient_codec_rejects_non_exact_json_stdout(
+    stdout: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sutradhara.rem_archive_cli.resolve_rem_bin",
+        lambda _configured: "/test/rem",
+    )
+    monkeypatch.setattr(
+        "sutradhara.keys.remanence.run_managed",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=["/test/rem"],
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=r"exactly one JSON object|invalid JSON"):
+        RemRecipientKeyCodec("/test/rem")._run(
+            ["archive", "recipient", "inspect"],
+            failure_label="recipient inspect",
+        )
+
+
+def test_rem_recipient_codec_accepts_one_json_object_and_newline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sutradhara.rem_archive_cli.resolve_rem_bin",
+        lambda _configured: "/test/rem",
+    )
+    monkeypatch.setattr(
+        "sutradhara.keys.remanence.run_managed",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=["/test/rem"],
+            returncode=0,
+            stdout='{"slot_index": 0}\n',
+            stderr="",
+        ),
+    )
+
+    assert RemRecipientKeyCodec("/test/rem")._run(
+        ["archive", "recipient", "inspect"],
+        failure_label="recipient inspect",
+    ) == {"slot_index": 0}
 
 
 def test_private_epoch_selection_fails_closed_on_corrupt_matching_state(tmp_path: Path) -> None:

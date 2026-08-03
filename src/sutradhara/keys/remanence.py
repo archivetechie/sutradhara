@@ -131,21 +131,19 @@ class RemRecipientKeyCodec:
                 f"stdout={completed.stdout.strip()[:500]!r} "
                 f"stderr={completed.stderr.strip()[:500]!r}"
             )
-        for line in completed.stdout.splitlines():
-            line = line.strip()
-            if not (line.startswith("{") and line.endswith("}")):
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"{failure_label} emitted invalid JSON") from exc
-            if isinstance(value, dict):
-                return value
-        raise RuntimeError(
-            f"{failure_label} emitted no JSON object: "
-            f"stdout={completed.stdout.strip()[:500]!r} "
-            f"stderr={completed.stderr.strip()[:500]!r}"
-        )
+        stdout = completed.stdout
+        if not stdout.endswith("\n") or stdout.count("\n") != 1:
+            raise RuntimeError(f"{failure_label} must emit exactly one JSON object")
+        payload = stdout[:-1]
+        if not payload or payload != payload.strip():
+            raise RuntimeError(f"{failure_label} must emit exactly one JSON object")
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{failure_label} emitted invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError(f"{failure_label} did not emit a JSON object")
+        return value
 
 
 def parse_public_structure(payload: bytes) -> RecipientPublicIdentity:
