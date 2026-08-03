@@ -66,6 +66,7 @@ class KeyRegistry:
         *,
         deterministic_test: bool = False,
         recipient_codec: RecipientKeyCodec | None = None,
+        allow_test_codec: bool = False,
     ) -> None:
         selected_dir = (
             registry_dir
@@ -78,8 +79,10 @@ class KeyRegistry:
                 "deterministic_test key registry must resolve outside /var/lib and must not "
                 f"use {_DEFAULT_REGISTRY_DIR}"
             )
-        if recipient_codec is not None and _is_production_registry_path(resolved):
-            raise ValueError("custom recipient codec must resolve outside /var/lib")
+        if allow_test_codec and _is_production_registry_path(resolved):
+            raise ValueError("allow_test_codec registry must resolve outside /var/lib")
+        if recipient_codec is not None and not (deterministic_test or allow_test_codec):
+            raise ValueError("custom recipient codec requires allow_test_codec mode")
         self._registry_dir = resolved
         self._deterministic_test = deterministic_test
         self._recipient_codec = recipient_codec or RemRecipientKeyCodec()
@@ -499,11 +502,18 @@ def mint_recovery_keypair(
     public_key_path: Path | str,
     private_key_path: Path | str,
     recipient_codec: RecipientKeyCodec | None = None,
+    allow_test_codec: bool = False,
 ) -> KeyEpoch:
     """Mint an offline recovery keypair to operator-selected REMR/REMP paths."""
 
     public_path = Path(public_key_path).expanduser().resolve(strict=False)
     private_path = Path(private_key_path).expanduser().resolve(strict=False)
+    if recipient_codec is not None and not allow_test_codec:
+        raise ValueError("custom recipient codec requires allow_test_codec mode")
+    if allow_test_codec and any(
+        _is_production_registry_path(path) for path in (public_path, private_path)
+    ):
+        raise ValueError("allow_test_codec recovery key paths must resolve outside /var/lib")
     if public_path == private_path:
         raise ValueError("recovery public and private key paths must differ")
     configured_registry = (

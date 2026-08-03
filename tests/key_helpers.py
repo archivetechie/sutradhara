@@ -57,6 +57,7 @@ def make_test_key_registry(path: Path, *, deterministic_test: bool = True) -> Ke
         path,
         deterministic_test=deterministic_test,
         recipient_codec=TEST_RECIPIENT_CODEC,
+        allow_test_codec=True,
     )
 
 
@@ -78,6 +79,7 @@ def registry_with_recovery(
         public_key_path=public_path,
         private_key_path=private_path,
         recipient_codec=recipient_codec,
+        allow_test_codec=True,
     )
     recovery = registry.import_public_epoch(public_path)
     return registry, recovery
