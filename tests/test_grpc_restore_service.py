@@ -75,6 +75,7 @@ from sutradhara.jobs.models import Job
 from sutradhara.jobs.reconcilers import restore_open as restore_open_reconciler
 from sutradhara.jobs.reconcilers.spine import reconcile
 from sutradhara.keys import KEY_DOMAIN_HDCACHE
+from sutradhara.keys.remanence import RemRecipientKeyCodec
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
@@ -300,7 +301,10 @@ def rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Rig]:
             )
 
     rem_bin = resolve_rem_bin()
-    keys, _recovery = registry_with_recovery(root / "keys")
+    keys, _recovery = registry_with_recovery(
+        root / "keys",
+        recipient_codec=RemRecipientKeyCodec(rem_bin),
+    )
     cache_config = RestoreConfig(
         scratch_root=root / "cache-scratch",
         key_registry=keys,

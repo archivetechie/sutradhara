@@ -1639,8 +1639,8 @@ else:
     object_path = tmp_path / "encrypted.rao"
     stored = bytearray(b"x" * 4096)
     header = bytearray(128)
-    header[:4] = b"RAO1"
-    header[6] = 1
+    header[:4] = b"REMO"
+    header[6] = 2
     header[0x30:0x38] = (17).to_bytes(8, "big")
     stored[:128] = header
     stored[128:145] = b"m" * 17

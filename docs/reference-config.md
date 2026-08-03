@@ -22,8 +22,8 @@ in the hdcache/placement helpers.
 |---|---|---|
 | `SUTRADHARA_DB_URL` | `sqlite:///./sutradhara.db` | SQLAlchemy URL of the catalog database. The default is a SQLite file in the current working directory, so long-lived deployments should always set this. Alembic resolves the same variable (`alembic/env.py`). SQLite engines get WAL mode and foreign-key enforcement turned on. (`catalog/session.py`) |
 | `SUTRADHARA_ARCHIVED_ALL_SEMANTICS` | `false` | Phase-1c rollout gate for the legacy intake `archived` boolean and stage filters. Off keeps ANY-semantics; true derives compatibility values from `archive_state == complete`. Enable only after `sutra archive predicate-audit` reports `gate_safe: true`. (`archive_predicate.py`) |
-| `REM_BIN` | see below | Path to the Remanence `rem` CLI used for RAO sealing, opening, and archive builds. Resolution order: an explicit `--rem-bin` flag, then `REM_BIN`, then `rem` on `PATH`, then `~/remanence/target/release/rem`. A missing binary raises `FileNotFoundError` with that list. (`rem_archive_cli.py:resolve_rem_bin`) |
-| `SUTRADHARA_KEY_REGISTRY_DIR` | `/var/lib/replica/sutradhara-key-registry` | Root of the local RAO-v2 X25519 epoch registry. Create it with service-user ownership and mode `0700`; hot-domain raw private files and JSON state are `0600`, while non-secret RAOR public files are `0644`. Recovery epochs are public-only imports: their private half must never be placed here. Retiring an epoch never deletes retained key material. (`keys/registry.py`) |
+| `REM_BIN` | see below | Path to the Remanence `rem` CLI used for REM-OBJECT sealing, opening, and archive builds. Resolution order: an explicit `--rem-bin` flag, then `REM_BIN`, then `rem` on `PATH`, then `~/remanence/target/release/rem`. A missing binary raises `FileNotFoundError` with that list. (`rem_archive_cli.py:resolve_rem_bin`) |
+| `SUTRADHARA_KEY_REGISTRY_DIR` | `/var/lib/replica/sutradhara-key-registry` | Root of the local REM-ENCRYPT X-Wing epoch registry. Create it with service-user ownership and mode `0700`; hot-domain raw 32-byte seed files and JSON state are `0600`, while non-secret REMR public files are `0644`. Recovery epochs are public-only imports: their private half must never be placed here. Retiring an epoch never deletes retained key material. (`keys/registry.py`) |
 | `SUTRADHARA_CACHE_ROOT` | `/var/lib/replica/cache` | Derivation cache root where transcode/index outputs are written before archiving. `sutra reconcile --cache-root` overrides it for one run. (`jobs/config.py:derivation_cache_root`) |
 | `SUTRADHARA_STATE_DIR` | unset | Where the worker's single-instance lock file goes for non-file database URLs: `$SUTRADHARA_STATE_DIR/worker-locks`, else `$XDG_STATE_HOME/sutradhara/worker-locks`, else `~/.local/state/sutradhara/worker-locks`. SQLite file URLs ignore this and lock next to the database file (`<database>.worker.lock`). (`jobs/worker_lock.py`) |
 | `SUTRADHARA_RETENTION_JOURNAL_DIR` | beside a file-backed SQLite catalog; otherwise under the state directory | Root for authoritative UTC-dated retention-journal JSONL segments. |
@@ -37,6 +37,11 @@ in the hdcache/placement helpers.
 | `SUTRADHARA_MIGRATION_PRIORITY` | `100` | Job priority for migration work. Must stay above the hdcache fill priority. (`hdcache/fill.py`) |
 | `SUTRADHARA_RETENTION_LANDING_ROOTS` | unset (falls back to `SUTRA_RECEIVE_LANDING_ROOT`, or `/replica/landing`) | `os.pathsep`-delimited list of additional absolute landing roots the staging-sweep purge path treats as valid, symlink-checked intake locations. (`retention.py`) |
 | `SUTRADHARA_RETENTION_TOMBSTONE_ROOT` | unset (`<first landing root>/.retention-tombstones`) | Overrides where retention tombstone marker files are written and validated during a staging-sweep purge — see "Deletion evidence and the retention witness gate" in `architecture-overview.md`. (`retention.py`) |
+
+The current registry accepts only REM-ENCRYPT X-Wing REMR/REMP material. An
+older RAOR/RAOP registry cannot be relabelled: move it intact to a protected
+backup and initialize new epochs, or perform a separately designed migration
+when old encrypted objects must remain readable.
 
 <!-- code-anchor: src/sutradhara/cli/api.py src/sutradhara/api/app.py src/sutradhara/api/sources.py @ 5688438 -->
 ## Operator API and servers
@@ -180,6 +185,6 @@ the path is configurable via the backend row's `device_env_path`).
 | Variable | Used for |
 |---|---|
 | `XDG_STATE_HOME` | Worker lock directory when `SUTRADHARA_STATE_DIR` is unset. |
-| `XDG_RUNTIME_DIR` | First candidate for the private `0700` temp directory where short-lived `0600` RAOP private-key files are materialized (then `/run/user/<uid>`, `/dev/shm`, and the platform temp directory). |
+| `XDG_RUNTIME_DIR` | First candidate for the private `0700` temp directory where short-lived `0600` REMP private-key files are materialized (then `/run/user/<uid>`, `/dev/shm`, and the platform temp directory). |
 | `USER` | Default operator attribution on receives, submissions, retention actions, tags, and virtual-arrangement edits. |
 | `JAVA_HOME` | Passed through to the d2tape CLI subprocess when the backend row configures `java_home`. |

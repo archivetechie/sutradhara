@@ -167,20 +167,19 @@ it once durable copies are proven.
 `rao-plain-v1`, `rao-aead-v1`, or `d2tar-raw` (`Representation` in
 `sealing/port.py`).
 
-**RAO** — Remanence Archive Object, the container format the `rem` CLI
-builds. In this repo "the RAO codec" means `RaoCliSealer`/`RaoCliOpener`:
-a stateless local wrapper around `rem archive build/extract`, never a
-daemon.
+**RAO** — Sutradhara's retained internal name for a stored REM-OBJECT
+representation. "The RAO codec" means `RaoCliSealer`/`RaoCliOpener`: a
+stateless local wrapper around `rem archive build/extract`, never a daemon.
 
 **sealer / opener** — the ports that convert plaintext to stored form and
 back (`sealing/port.py`). Every restore and self-heal goes through an
 opener, so no path can skip verification.
 
-**key epoch / recipient epoch** — one domain-tagged X25519 recipient identity
+**key epoch / recipient epoch** — one domain-tagged X-Wing recipient identity
 in the local `KeyRegistry`, encoded as `<domain>-<32hex>`. Encrypted copies
 record a list: the copy-domain hot epoch (`archive`, `hdcache`, or `backup`)
-and a public-only `recovery` epoch. Public RAOR files seal; locally held
-private material opens through a short-lived `0600` RAOP file that is
+and a public-only `recovery` epoch. Public REMR files seal; locally held
+private material opens through a short-lived `0600` REMP file that is
 best-effort zeroized before removal. Recovery private material stays offline.
 Retiring an epoch stops new seals but preserves its retained material.
 

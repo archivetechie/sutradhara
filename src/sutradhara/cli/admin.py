@@ -37,14 +37,14 @@ def admin_keys() -> None:
     "public_key_path",
     type=click.Path(path_type=Path, dir_okay=False),
     required=True,
-    help="Operator-selected output path for the non-secret RAOR public key.",
+    help="Operator-selected output path for the non-secret REMR public key.",
 )
 @click.option(
     "--private-key",
     "private_key_path",
     type=click.Path(path_type=Path, dir_okay=False),
     required=True,
-    help="Operator-selected escrow output path for the secret RAOP private key.",
+    help="Operator-selected escrow output path for the secret REMP private key.",
 )
 def admin_keys_mint_recovery(public_key_path: Path, private_key_path: Path) -> None:
     """Mint a recovery keypair offline; never place its private half in the registry."""
@@ -80,7 +80,7 @@ def admin_keys_mint_recovery(public_key_path: Path, private_key_path: Path) -> N
     "public_key_path",
     type=click.Path(path_type=Path, exists=True, dir_okay=False, readable=True),
     required=True,
-    help="Canonical recovery RAOR public-key file to import.",
+    help="Canonical recovery REMR public-key file to import.",
 )
 def admin_keys_import_public(public_key_path: Path) -> None:
     """Import a recovery public epoch into the serving-host registry."""

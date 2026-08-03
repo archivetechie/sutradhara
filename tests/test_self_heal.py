@@ -48,6 +48,7 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.evidence_recorder import record_measured
 from sutradhara.keys import KeyEpoch
+from sutradhara.keys.remanence import RemRecipientKeyCodec
 from sutradhara.replication import (
     SelfHealUnavailable,
     replicate_asset,
@@ -810,7 +811,7 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
     tmp_path: Path,
 ) -> None:
     try:
-        resolve_rem_bin()
+        rem_bin = resolve_rem_bin()
     except FileNotFoundError as exc:
         pytest.skip(str(exc))
 
@@ -821,7 +822,10 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
     backend = _backend()
     source = tmp_path / "asset.bin"
     source.write_bytes(data)
-    registry, _recovery = registry_with_recovery(tmp_path / "keys")
+    registry, _recovery = registry_with_recovery(
+        tmp_path / "keys",
+        recipient_codec=RemRecipientKeyCodec(rem_bin),
+    )
     epoch = registry.create_epoch()
 
     with session_scope(engine) as s:

@@ -434,25 +434,28 @@ Remanence's own conflict check and was wrongly refused.
 ## Sealing and keys
 
 A copy's on-backend form is its **representation**: `raw-bytes`
-(passthrough), `rao-plain-v1` (unencrypted RAO container), `rao-aead-v1`
-(AEAD-encrypted RAO), or `d2tar-raw` (legacy d2 tar, passthrough at
+(passthrough), `rao-plain-v1` (unencrypted REM-OBJECT), `rao-aead-v1`
+(encrypted REM-OBJECT), or `d2tar-raw` (legacy d2 tar, passthrough at
 seal). The `Sealer`/`Opener` ports in `sealing/port.py` convert between
 plaintext and stored form; `RaoCliSealer`/`RaoCliOpener` implement them by
 shelling out to the Remanence `rem` CLI (`rem archive build/extract`) as
 a stateless local codec — by explicit decision there is no sealing daemon
-or service. RAO builds are deterministic: fixed chunk size (262144),
+or service. Plaintext REM-OBJECT builds are deterministic: fixed chunk size (262144),
 fixed timestamp and UUIDs derived from the plaintext digest for plaintext
-RAO. Encrypted RAO v2 uses fresh envelope randomness. `inspect_rao` is
+objects. Encrypted REM-OBJECT v2 uses fresh envelope randomness. `inspect_rao` is
 keyless and reports format version plus every `{epoch_id, label}` recipient.
 
 Encrypted copies record a **recipient epoch list** from the `KeyRegistry`
 (`keys/registry.py`). Each hot domain (`archive`, `hdcache`, or `backup`)
-has an OS-random X25519 keypair; every seal uses that domain's public epoch
-plus the active public-only `recovery` epoch. Public RAOR files persist for
+has an OS-random X-Wing seed and derived public key; every seal uses that
+domain's public epoch plus the active public-only `recovery` epoch. Public REMR files persist for
 sealing. Opens select a matching locally held private epoch and materialize
-a canonical RAOP file as `0600` only for one `rem` call, then best-effort
+a canonical REMP file as `0600` only for one `rem` call, then best-effort
 zeroize and unlink it. Recovery private keys are minted offline and never
-stored beneath the serving-host registry. Epoch IDs are explicitly
+stored beneath the serving-host registry. X-Wing public derivation and
+canonical key-file validation run through Remanence's hardware-free `archive
+recipient` commands, so Sutradhara does not carry a second cryptographic
+implementation. Epoch IDs are explicitly
 domain-tagged and all seal/open sites assert their domain.
 
 <!-- code-anchor: src/sutradhara/hdcache @ 5688438 -->
