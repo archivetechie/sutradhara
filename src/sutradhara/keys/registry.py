@@ -225,6 +225,12 @@ class KeyRegistry:
     def get_epoch(self, key_id: str) -> KeyEpoch:
         """Return validated persisted state for an existing epoch."""
 
+        epoch, _private_seed = self._validated_epoch(key_id)
+        return epoch
+
+    def _validated_epoch(self, key_id: str) -> tuple[KeyEpoch, bytes | None]:
+        """Return validated state and the exact hot-seed snapshot it validated."""
+
         key_id = _validate_key_id(key_id)
         self._ensure_registry_dir()
         state = self._read_state(key_id)
@@ -258,6 +264,7 @@ class KeyRegistry:
 
         kind = state.get("key_kind")
         private_path = self._private_key_path(key_id)
+        private_seed: bytes | None = None
         if domain == KEY_DOMAIN_RECOVERY:
             if kind != "public-only":
                 raise RuntimeError(f"recovery epoch {key_id} is not public-only")
@@ -270,18 +277,21 @@ class KeyRegistry:
         else:
             if kind != "keypair":
                 raise RuntimeError(f"hot epoch {key_id} is not a keypair")
-            private = self._read_private_key(key_id)
+            private_seed = self._read_private_key(key_id)
             derived = self._derive_public_payload(
                 key_id,
-                private,
+                private_seed,
                 slot_index=_slot_index_for_domain(domain),
             )
             if derived != public_payload:
                 raise RuntimeError(f"registry keypair material mismatch for {key_id}")
-        return KeyEpoch(
-            key_id=key_id,
-            created_at=created_at,
-            active=active,
+        return (
+            KeyEpoch(
+                key_id=key_id,
+                created_at=created_at,
+                active=active,
+            ),
+            private_seed,
         )
 
     def active_epoch(self, domain: str) -> KeyEpoch:
@@ -415,12 +425,13 @@ class KeyRegistry:
                 path.unlink()
 
     def _write_temp_private_key(self, key_id: str) -> Path:
-        key_id = self.get_epoch(key_id).key_id
-        private_key = self._read_private_key(key_id)
-        payload = _serialize_private_key(key_id, private_key)
+        epoch, private_seed = self._validated_epoch(key_id)
+        if private_seed is None:
+            raise KeyError(f"private key unavailable for epoch: {epoch.key_id}")
+        payload = _serialize_private_key(epoch.key_id, private_seed)
         return _write_secure_temp_payload(
             payload,
-            prefix=f"rem-private-{key_domain(key_id)}-",
+            prefix=f"rem-private-{key_domain(epoch.key_id)}-",
             suffix=".remp",
         )
 

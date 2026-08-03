@@ -128,6 +128,31 @@ def test_materialized_private_key_is_zeroized_before_unlink(
     assert len(erased[-1]) == materialized_size
 
 
+def test_materialized_private_key_uses_the_validated_seed_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = KeyRegistry(tmp_path / "keys", deterministic_test=True)
+    epoch = registry.create_epoch()
+    private_path = registry.registry_dir / f"{epoch.key_id}.private"
+    expected_seed = private_path.read_bytes()
+    original_read = registry._read_private_key
+    reads = 0
+
+    def read_then_swap(key_id: str) -> bytes:
+        nonlocal reads
+        seed = original_read(key_id)
+        reads += 1
+        private_path.write_bytes(b"x" * 32)
+        return seed
+
+    monkeypatch.setattr(registry, "_read_private_key", read_then_swap)
+    with registry.materialized_private_key(epoch.key_id) as materialized:
+        assert materialized.read_bytes().endswith(expected_seed)
+
+    assert reads == 1
+
+
 def test_key_registry_domains_are_explicit_namespaces(tmp_path: Path) -> None:
     registry = KeyRegistry(tmp_path / "keys", deterministic_test=True)
 
