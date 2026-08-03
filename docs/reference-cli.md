@@ -490,7 +490,7 @@ without starting the server.
 | `--sign-csr FILE` | | Sign a device CSR (with `--token`, `--cert-out FILE`). |
 | `--skip-artifactclass-validation` | off | Development/testing only: allow unknown artifactclasses. |
 
-<!-- code-anchor: src/sutradhara/cli/db.py src/sutradhara/cli/admin.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/db.py src/sutradhara/cli/admin.py @ 46bb240 -->
 ## sutra db and sutra admin
 
 Schema and local maintenance.
