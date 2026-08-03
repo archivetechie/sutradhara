@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from sutradhara.keys import KeyRegistry
+from sutradhara.keys.remanence import RemRecipientKeyCodec
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import (
     RAO_CHUNK_SIZE,
@@ -86,14 +87,14 @@ def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 }
                 payload = json.dumps(body, sort_keys=True).encode()
                 if encrypt:
-                    payload = b"RAO1" + payload
+                    payload = b"REMO" + payload
                 out.write_bytes(payload)
                 stored_digest = hashlib.sha256(payload).hexdigest()
                 file_digest = hashlib.sha256(data).hexdigest()
                 emit({
-                    "body_format": "rao-v1",
+                    "body_format": "rem-object-v1",
                     "chunk_size": int(opt("--chunk-size")),
-                    "encryption": "RAO1" if encrypt else "none",
+                    "encryption": "REMO" if encrypt else "none",
                     "files": [{
                         "entry_type": "regular",
                         "file_sha256": file_digest,
@@ -108,12 +109,12 @@ def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 })
             elif command == ["archive", "inspect"]:
                 obj = Path(opt("--object")).read_bytes()
-                encrypted = obj.startswith(b"RAO1")
+                encrypted = obj.startswith(b"REMO")
                 body = json.loads((obj[4:] if encrypted else obj).decode())
                 emit({
-                    "body_format": "rao-v1",
+                    "body_format": "rem-object-v1",
                     "chunk_size": int(opt("--chunk-size") or 262144),
-                    "encryption": "RAO1" if encrypted else "none",
+                    "encryption": "REMO" if encrypted else "none",
                     "format_version": 2 if encrypted else None,
                     "recipient_epochs": body["recipient_epochs"] if encrypted else None,
                     "keyed": False if encrypted else None,
@@ -122,7 +123,7 @@ def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 })
             elif command == ["archive", "extract"]:
                 obj = Path(opt("--object")).read_bytes()
-                encrypted = obj.startswith(b"RAO1")
+                encrypted = obj.startswith(b"REMO")
                 if encrypted and opt("--private-key") is None:
                     print("error: encrypted RAO extract requires --private-key", file=sys.stderr)
                     sys.exit(1)
@@ -272,7 +273,10 @@ def test_rao_real_binary_round_trips_and_v2_recipients(tmp_path: Path) -> None:
     rem_bin = _rem_bin_or_skip()
     source = tmp_path / "asset.bin"
     source.write_bytes(b"real remanence rao integration")
-    registry, recovery = registry_with_recovery(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(
+        tmp_path / "keys",
+        recipient_codec=RemRecipientKeyCodec(rem_bin),
+    )
     epoch = registry.create_epoch()
     sealer = RaoCliSealer(registry)
     opener = RaoCliOpener(registry)

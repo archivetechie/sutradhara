@@ -40,6 +40,7 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
+from sutradhara.keys.remanence import RemRecipientKeyCodec
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
@@ -216,8 +217,8 @@ def _synthetic_rao_prefix() -> bytes:
     """Return framing sufficient for Python to bound input to the Rust query."""
 
     header = bytearray(128)
-    header[:4] = b"RAO1"
-    header[6] = 1
+    header[:4] = b"REMO"
+    header[6] = 2
     header[0x30:0x38] = (17).to_bytes(8, "big")
     return bytes(header) + b"m" * 17
 
@@ -454,7 +455,10 @@ def test_real_encrypted_copy_round_trips_through_unbuffered_plan(
     source = tmp_path / "source.bin"
     logical = b"real encrypted streaming restore" * 4096
     source.write_bytes(logical)
-    registry, recovery = registry_with_recovery(tmp_path / "keys")
+    registry, recovery = registry_with_recovery(
+        tmp_path / "keys",
+        recipient_codec=RemRecipientKeyCodec(rem_bin),
+    )
     epoch = registry.create_epoch()
     backend = _StreamingObjectBackend()
     with RaoCliSealer(registry).seal(

@@ -1,4 +1,4 @@
-"""Tests for Sutradhara's X25519 recipient-key epoch registry."""
+"""Tests for Sutradhara's X-Wing recipient-key epoch registry."""
 
 from __future__ import annotations
 
@@ -22,12 +22,27 @@ from sutradhara.keys import (
     key_domain,
     mint_recovery_keypair,
 )
-from tests.key_helpers import registry_with_recovery
+from sutradhara.keys.remanence import RecipientPublicIdentity
+from tests.key_helpers import (
+    TEST_RECIPIENT_CODEC,
+    DeterministicRecipientKeyCodec,
+    registry_with_recovery,
+)
 
 _TEST_SEED = bytes.fromhex(
     "73797374656d2d6861726e6573733a737574726164686172612d6b65792d7365"
     "616d3a616d6265722d616561642d6465763a7631"
 )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_recipient_codec(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep registry unit tests independent of an installed Remanence binary."""
+
+    monkeypatch.setattr(
+        "sutradhara.keys.registry.RemRecipientKeyCodec",
+        lambda: TEST_RECIPIENT_CODEC,
+    )
 
 
 def _mode(path: Path) -> int:
@@ -50,7 +65,7 @@ def test_key_registry_create_materialize_and_retire_preserves_keypair(tmp_path: 
     public_path = registry.registry_dir / f"{epoch.key_id}.public"
     state_path = registry.registry_dir / f"{epoch.key_id}.json"
     assert len(private_path.read_bytes()) == 32
-    assert public_path.read_bytes().startswith(b"RAOR\0")
+    assert public_path.read_bytes().startswith(b"REMR\0")
     assert _mode(private_path) == 0o600
     assert _mode(public_path) == 0o644
     assert _mode(state_path) == 0o600
@@ -59,7 +74,7 @@ def test_key_registry_create_materialize_and_retire_preserves_keypair(tmp_path: 
     with registry.materialized_private_key(epoch.key_id) as key_path:
         materialized = key_path
         payload = materialized.read_bytes()
-        assert payload.startswith(b"RAOP" + bytes.fromhex(epoch.key_id.rsplit("-", 1)[1]))
+        assert payload.startswith(b"REMP" + bytes.fromhex(epoch.key_id.rsplit("-", 1)[1]))
         assert b"archive" in payload
         assert _mode(materialized) == 0o600
     assert not materialized.exists()
@@ -71,7 +86,7 @@ def test_key_registry_create_materialize_and_retire_preserves_keypair(tmp_path: 
     assert public_path.is_file()
     assert registry.get_epoch(epoch.key_id).active is False
     with registry.materialized_private_key(epoch.key_id) as retired_key:
-        assert retired_key.read_bytes().startswith(b"RAOP")
+        assert retired_key.read_bytes().startswith(b"REMP")
 
 
 def test_key_registry_create_epoch_is_idempotent_and_random_by_default(tmp_path: Path) -> None:
@@ -95,7 +110,7 @@ def test_materialized_private_key_is_zeroized_before_unlink(
     erased: list[bytes] = []
 
     def recording_unlink(path: Path, missing_ok: bool = False) -> None:
-        if path.name.startswith("rao-private-") and path.exists():
+        if path.name.startswith("rem-private-") and path.exists():
             erased.append(path.read_bytes())
         original_unlink(path, missing_ok=missing_ok)
 
@@ -104,7 +119,9 @@ def test_materialized_private_key_is_zeroized_before_unlink(
         materialized_size = key_path.stat().st_size
         assert key_path.read_bytes() != b"\0" * materialized_size
 
-    assert erased == [b"\0" * materialized_size]
+    assert len(erased) == 2  # integrity derivation temp + yielded private temp
+    assert all(payload == b"\0" * len(payload) for payload in erased)
+    assert len(erased[-1]) == materialized_size
 
 
 def test_key_registry_domains_are_explicit_namespaces(tmp_path: Path) -> None:
@@ -124,8 +141,8 @@ def test_key_registry_domains_are_explicit_namespaces(tmp_path: Path) -> None:
 
 def test_recovery_is_offline_minted_and_imported_public_only(tmp_path: Path) -> None:
     registry = KeyRegistry(tmp_path / "keys", deterministic_test=True)
-    public_path = tmp_path / "escrow" / "recovery.raor"
-    private_path = tmp_path / "escrow" / "recovery.raop"
+    public_path = tmp_path / "escrow" / "recovery.remr"
+    private_path = tmp_path / "escrow" / "recovery.remp"
     public_path.parent.mkdir()
 
     minted = mint_recovery_keypair(
@@ -149,6 +166,51 @@ def test_recovery_is_offline_minted_and_imported_public_only(tmp_path: Path) -> 
         registry.create_epoch(KEY_DOMAIN_RECOVERY)
 
 
+def test_recovery_import_validates_and_stores_one_public_snapshot(tmp_path: Path) -> None:
+    escrow = tmp_path / "escrow"
+    escrow.mkdir()
+    public_path = escrow / "recovery.remr"
+    private_path = escrow / "recovery.remp"
+    mint_recovery_keypair(
+        public_key_path=public_path,
+        private_key_path=private_path,
+    )
+    original = public_path.read_bytes()
+    inspected_payloads: list[bytes] = []
+
+    class SourceSwappingCodec(DeterministicRecipientKeyCodec):
+        def inspect_public(self, snapshot_path: Path) -> RecipientPublicIdentity:
+            assert snapshot_path != public_path
+            public_path.write_bytes(b"RAOR legacy replacement")
+            inspected_payloads.append(snapshot_path.read_bytes())
+            return super().inspect_public(snapshot_path)
+
+    registry = KeyRegistry(
+        tmp_path / "keys",
+        deterministic_test=True,
+        recipient_codec=SourceSwappingCodec(),
+    )
+    imported = registry.import_public_epoch(public_path)
+
+    assert inspected_payloads
+    assert set(inspected_payloads) == {original}
+    assert registry.public_key_path(imported.key_id).read_bytes() == original
+    assert public_path.read_bytes() == b"RAOR legacy replacement"
+
+
+def test_recovery_import_rejects_legacy_public_key_without_codec_call(tmp_path: Path) -> None:
+    public_path = tmp_path / "legacy.raor"
+    public_path.write_bytes(b"RAOR" + b"\0" * 58)
+    registry = KeyRegistry(
+        tmp_path / "keys",
+        deterministic_test=True,
+        recipient_codec=TEST_RECIPIENT_CODEC,
+    )
+
+    with pytest.raises(ValueError, match="recipient public-key file"):
+        registry.import_public_epoch(public_path)
+
+
 def test_recovery_reimport_refuses_corrupt_existing_state(tmp_path: Path) -> None:
     registry, recovery = registry_with_recovery(tmp_path / "keys")
     public_path = registry.public_key_path(recovery.key_id)
@@ -169,8 +231,8 @@ def test_recovery_import_rotates_active_public_epoch_without_private_material(
     escrow.mkdir()
     imported = []
     for index in (1, 2):
-        public_path = escrow / f"recovery-{index}.raor"
-        private_path = escrow / f"recovery-{index}.raop"
+        public_path = escrow / f"recovery-{index}.remr"
+        private_path = escrow / f"recovery-{index}.remp"
         mint_recovery_keypair(
             public_key_path=public_path,
             private_key_path=private_path,
@@ -227,6 +289,8 @@ def test_deterministic_mode_has_path_and_state_interlocks(tmp_path: Path) -> Non
         KeyRegistry("/var/lib/test-sutradhara-keys", deterministic_test=True)
     with pytest.raises(ValueError, match="outside /var/lib"):
         KeyRegistry(deterministic_test=True)
+    with pytest.raises(ValueError, match="custom recipient codec"):
+        KeyRegistry("/var/lib/test-sutradhara-keys", recipient_codec=TEST_RECIPIENT_CODEC)
 
     path = tmp_path / "keys"
     test_registry = KeyRegistry(path, deterministic_test=True)
@@ -273,8 +337,8 @@ def test_admin_recovery_mint_and_public_import_cli(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry_dir = tmp_path / "registry"
-    public_path = tmp_path / "escrow" / "recovery public.raor"
-    private_path = tmp_path / "escrow" / "recovery private.raop"
+    public_path = tmp_path / "escrow" / "recovery public.remr"
+    private_path = tmp_path / "escrow" / "recovery private.remp"
     public_path.parent.mkdir()
     monkeypatch.setenv("SUTRADHARA_KEY_REGISTRY_DIR", str(registry_dir))
     runner = CliRunner()
@@ -312,8 +376,8 @@ def test_recovery_mint_removes_partial_private_output_on_write_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    public_path = tmp_path / "recovery.raor"
-    private_path = tmp_path / "recovery.raop"
+    public_path = tmp_path / "recovery.remr"
+    private_path = tmp_path / "recovery.remp"
 
     def fail_fdopen(fd: int, mode: str) -> object:
         del mode
@@ -341,8 +405,8 @@ def test_recovery_mint_refuses_private_output_under_registry_dir(
 
     with pytest.raises(ValueError, match="outside registry_dir"):
         mint_recovery_keypair(
-            public_key_path=tmp_path / "recovery.raor",
-            private_key_path=registry_dir / "escrow.raop",
+            public_key_path=tmp_path / "recovery.remr",
+            private_key_path=registry_dir / "escrow.remp",
         )
 
 

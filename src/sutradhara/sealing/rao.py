@@ -1,8 +1,8 @@
-"""Remanence RAO CLI implementation of the Sutradhara sealing port.
+"""Remanence REM-OBJECT CLI implementation of the Sutradhara sealing port.
 
 This module wraps `rem archive build/inspect/extract` as Sutradhara's
-stateless file codec. It seals one local plaintext file into RAO objects for
-backend storage, opens stored RAO objects back to plaintext for
+stateless file codec. It seals one local plaintext file into REM-OBJECT files
+for backend storage, opens stored objects back to plaintext for
 self-heal, and maps Remanence's JSON reports into the catalog representation
 strings used by the replication policy.
 """
@@ -425,7 +425,7 @@ def _single_restored_member(dest: Path) -> Path:
 
 def _looks_encrypted(path: Path) -> bool:
     with path.open("rb") as handle:
-        return handle.read(4) == b"RAO1"
+        return handle.read(4) == b"REMO"
 
 
 def _run_rem(

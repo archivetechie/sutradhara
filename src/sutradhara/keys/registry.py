@@ -1,9 +1,9 @@
-"""Local X25519 recipient-key registry for encrypted RAO epochs.
+"""Local X-Wing recipient-key registry for encrypted REM-OBJECT epochs.
 
 Serving hosts mint OS-random keypairs for hot archive, hdcache, and backup
 domains.  Recovery epochs are minted offline and imported public-only.  The
-registry exposes persistent non-secret RAOR public files for sealing and
-materializes canonical RAOP private files only for the lifetime of an open.
+registry exposes persistent non-secret REMR public files for sealing and
+materializes canonical REMP private files only for the lifetime of an open.
 """
 
 from __future__ import annotations
@@ -19,10 +19,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey,
-    X25519PublicKey,
+from sutradhara.keys.remanence import (
+    RecipientKeyCodec,
+    RecipientPublicIdentity,
+    RecipientPublicMaterial,
+    RemRecipientKeyCodec,
+    parse_public_structure,
 )
 
 _DEFAULT_REGISTRY_DIR = Path("/var/lib/replica/sutradhara-key-registry")
@@ -43,8 +45,7 @@ _TEST_SEED = bytes.fromhex(
     "73797374656d2d6861726e6573733a737574726164686172612d6b65792d7365"
     "616d3a616d6265722d616561642d6465763a7631"
 )
-_PUBLIC_MAGIC = b"RAOR"
-_PRIVATE_MAGIC = b"RAOP"
+_PRIVATE_MAGIC = b"REMP"
 
 
 @dataclass(frozen=True)
@@ -57,13 +58,14 @@ class KeyEpoch:
 
 
 class KeyRegistry:
-    """Persistent local registry for RAO X25519 recipient epochs."""
+    """Persistent local registry for REM-ENCRYPT X-Wing recipient epochs."""
 
     def __init__(
         self,
         registry_dir: Path | str | None = None,
         *,
         deterministic_test: bool = False,
+        recipient_codec: RecipientKeyCodec | None = None,
     ) -> None:
         selected_dir = (
             registry_dir
@@ -76,8 +78,11 @@ class KeyRegistry:
                 "deterministic_test key registry must resolve outside /var/lib and must not "
                 f"use {_DEFAULT_REGISTRY_DIR}"
             )
+        if recipient_codec is not None and _is_production_registry_path(resolved):
+            raise ValueError("custom recipient codec must resolve outside /var/lib")
         self._registry_dir = resolved
         self._deterministic_test = deterministic_test
+        self._recipient_codec = recipient_codec or RemRecipientKeyCodec()
 
     @property
     def registry_dir(self) -> Path:
@@ -108,14 +113,14 @@ class KeyRegistry:
             return existing
 
         generation = self._next_generation(domain)
-        key_id, private_key, public_key = self._new_keypair(domain, generation=generation)
+        key_id, private_key = self._new_seed(domain, generation=generation)
         private_path = self._private_key_path(key_id)
         public_path = self._public_key_path(key_id)
         state_path = self._state_path(key_id)
         created_at = datetime.now(UTC).isoformat()
-        public_payload = _serialize_public_key(
+        public_payload = self._derive_public_payload(
             key_id,
-            public_key,
+            private_key,
             slot_index=_slot_index_for_domain(domain),
         )
         created_paths: list[Path] = []
@@ -147,7 +152,7 @@ class KeyRegistry:
         return KeyEpoch(key_id=key_id, created_at=created_at, active=True)
 
     def import_public_epoch(self, public_key_file: Path | str) -> KeyEpoch:
-        """Import one canonical recovery RAOR file without private material."""
+        """Import one canonical recovery REMR file without private material."""
 
         source = Path(public_key_file)
         try:
@@ -155,6 +160,8 @@ class KeyRegistry:
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"recovery public-key file does not exist: {source}") from exc
         parsed = _parse_public_key(payload)
+        inspected = self._inspect_public_payload(payload)
+        _assert_codec_identity(parsed, inspected, context="recovery public-key import")
         key_id = parsed.key_id
         if key_domain(key_id) != KEY_DOMAIN_RECOVERY:
             raise ValueError("only recovery-domain public epochs may be imported")
@@ -239,9 +246,10 @@ class KeyRegistry:
             )
         public_path = self._public_key_path(key_id)
         try:
-            public = _parse_public_key(public_path.read_bytes())
+            public_payload = public_path.read_bytes()
         except FileNotFoundError as exc:
             raise KeyError(f"unknown key epoch: {key_id}") from exc
+        public = _parse_public_key(public_payload)
         if public.key_id != key_id or public.slot_index != _slot_index_for_domain(domain):
             raise RuntimeError(f"registry public-key identity mismatch for {key_id}")
 
@@ -254,11 +262,18 @@ class KeyRegistry:
                 raise RuntimeError(
                     f"recovery epoch {key_id} has forbidden private material under registry_dir"
                 )
+            inspected = self._inspect_public_payload(public_payload)
+            _assert_codec_identity(public, inspected, context="registry public-key validation")
         else:
             if kind != "keypair":
                 raise RuntimeError(f"hot epoch {key_id} is not a keypair")
-            private = X25519PrivateKey.from_private_bytes(self._read_private_key(key_id))
-            if _public_bytes(private.public_key()) != public.public_key:
+            private = self._read_private_key(key_id)
+            derived = self._derive_public_payload(
+                key_id,
+                private,
+                slot_index=_slot_index_for_domain(domain),
+            )
+            if derived != public_payload:
                 raise RuntimeError(f"registry keypair material mismatch for {key_id}")
         return KeyEpoch(
             key_id=key_id,
@@ -314,14 +329,14 @@ class KeyRegistry:
         raise KeyError(f"no {domain} recipient epoch has resolvable private material on this host")
 
     def public_key_path(self, key_id: str) -> Path:
-        """Return the persistent non-secret canonical RAOR file for an epoch."""
+        """Return the persistent non-secret canonical REMR file for an epoch."""
 
         epoch = self.get_epoch(key_id)
         return self._public_key_path(epoch.key_id)
 
     @contextlib.contextmanager
     def materialized_private_key(self, key_id: str) -> Iterator[Path]:
-        """Yield a short-lived 0600 RAOP file, then zeroize and remove it."""
+        """Yield a short-lived 0600 REMP file, then zeroize and remove it."""
 
         path = self._write_temp_private_key(key_id)
         try:
@@ -353,37 +368,58 @@ class KeyRegistry:
             "public_key_preserved": True,
         }
 
-    def _new_keypair(self, domain: str, *, generation: int) -> tuple[str, bytes, bytes]:
+    def _new_seed(self, domain: str, *, generation: int) -> tuple[str, bytes]:
         if self._deterministic_test:
-            return _derive_test_keypair(domain, generation=generation)
+            return _derive_test_seed(domain, generation=generation)
         while True:
             key_id = f"{domain}-{os.urandom(16).hex()}"
             if not self._state_path(key_id).exists():
                 break
-        private = X25519PrivateKey.generate()
-        return key_id, _private_bytes(private), _public_bytes(private.public_key())
+        return key_id, os.urandom(32)
+
+    def _derive_public_payload(
+        self,
+        key_id: str,
+        private_key: bytes,
+        *,
+        slot_index: int,
+    ) -> bytes:
+        private_payload = _serialize_private_key(key_id, private_key)
+        path = _write_secure_temp_payload(
+            private_payload,
+            prefix=f"rem-private-{key_domain(key_id)}-",
+            suffix=".remp",
+        )
+        try:
+            material = self._recipient_codec.derive_public(path, slot_index=slot_index)
+        finally:
+            _best_effort_zeroize(path)
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        _assert_derived_identity(key_id, material, slot_index=slot_index)
+        return material.canonical_bytes
+
+    def _inspect_public_payload(self, payload: bytes) -> RecipientPublicIdentity:
+        path = _write_secure_temp_payload(
+            payload,
+            prefix="rem-public-",
+            suffix=".remr",
+        )
+        try:
+            return self._recipient_codec.inspect_public(path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
 
     def _write_temp_private_key(self, key_id: str) -> Path:
         key_id = self.get_epoch(key_id).key_id
         private_key = self._read_private_key(key_id)
         payload = _serialize_private_key(key_id, private_key)
-        fd, raw_path = tempfile.mkstemp(
-            prefix=f"rao-private-{key_domain(key_id)}-",
-            suffix=".raop",
-            dir=_secure_temp_dir(),
+        return _write_secure_temp_payload(
+            payload,
+            prefix=f"rem-private-{key_domain(key_id)}-",
+            suffix=".remp",
         )
-        path = Path(raw_path)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
-            raise
-        return path
 
     def _read_private_key(self, key_id: str) -> bytes:
         self._ensure_registry_dir()
@@ -394,10 +430,6 @@ class KeyRegistry:
             raise KeyError(f"private key unavailable for epoch: {key_id}") from exc
         if len(data) != 32:
             raise RuntimeError(f"registry private key for {key_id} is {len(data)} bytes")
-        try:
-            X25519PrivateKey.from_private_bytes(data)
-        except ValueError as exc:
-            raise RuntimeError(f"registry private key for {key_id} is invalid") from exc
         return data
 
     def _read_state(self, key_id: str) -> dict[str, Any]:
@@ -460,15 +492,15 @@ class KeyRegistry:
 class _ParsedPublicKey:
     key_id: str
     slot_index: int
-    public_key: bytes
 
 
 def mint_recovery_keypair(
     *,
     public_key_path: Path | str,
     private_key_path: Path | str,
+    recipient_codec: RecipientKeyCodec | None = None,
 ) -> KeyEpoch:
-    """Mint an offline recovery keypair to operator-selected RAOR/RAOP paths."""
+    """Mint an offline recovery keypair to operator-selected REMR/REMP paths."""
 
     public_path = Path(public_key_path).expanduser().resolve(strict=False)
     private_path = Path(private_key_path).expanduser().resolve(strict=False)
@@ -487,18 +519,22 @@ def mint_recovery_keypair(
                 f"recovery key destination parent does not exist: {path.parent}"
             )
     key_id = f"{KEY_DOMAIN_RECOVERY}-{os.urandom(16).hex()}"
-    private = X25519PrivateKey.generate()
-    private_raw = _private_bytes(private)
-    public_raw = _public_bytes(private.public_key())
+    private_raw = os.urandom(32)
     created_at = datetime.now(UTC).isoformat()
     private_payload = _serialize_private_key(key_id, private_raw)
-    public_payload = _serialize_public_key(
-        key_id,
-        public_raw,
-        slot_index=_slot_index_for_domain(KEY_DOMAIN_RECOVERY),
-    )
     _write_new_bytes(private_path, private_payload, mode=0o600)
     try:
+        codec = recipient_codec or RemRecipientKeyCodec()
+        material = codec.derive_public(
+            private_path,
+            slot_index=_slot_index_for_domain(KEY_DOMAIN_RECOVERY),
+        )
+        _assert_derived_identity(
+            key_id,
+            material,
+            slot_index=_slot_index_for_domain(KEY_DOMAIN_RECOVERY),
+        )
+        public_payload = material.canonical_bytes
         _write_new_bytes(public_path, public_payload, mode=0o644)
     except Exception:
         _best_effort_zeroize(private_path)
@@ -535,7 +571,7 @@ def assert_key_epoch_domain(
         )
 
 
-def _derive_test_keypair(domain: str, *, generation: int = 0) -> tuple[str, bytes, bytes]:
+def _derive_test_seed(domain: str, *, generation: int = 0) -> tuple[str, bytes]:
     if generation < 0:
         raise ValueError("generation must be non-negative")
     domain = _validate_domain(domain)
@@ -544,56 +580,26 @@ def _derive_test_keypair(domain: str, *, generation: int = 0) -> tuple[str, byte
     epoch_hex = hashlib.sha256(prefix + b":epoch-id").digest()[:16].hex()
     if epoch_hex == "0" * 32:
         raise RuntimeError("deterministic test epoch id must not be all zero")
-    private_raw = hashlib.sha256(prefix + b":x25519-private").digest()
-    private = X25519PrivateKey.from_private_bytes(private_raw)
-    return f"{domain}-{epoch_hex}", private_raw, _public_bytes(private.public_key())
-
-
-def _serialize_public_key(key_id: str, public_key: bytes, *, slot_index: int) -> bytes:
-    key_id = _validate_key_id(key_id)
-    X25519PublicKey.from_public_bytes(public_key)
-    # The installed Remanence P1 parser caps RAOR labels at 32 bytes, while a
-    # registry id is 39-41 bytes. Keep the domain in the wire label and the
-    # exact 16-byte epoch payload on wire; report parsing reconstructs the
-    # canonical ``<domain>-<32hex>`` registry id.
-    label = key_domain(key_id).encode("ascii")
-    return (
-        _PUBLIC_MAGIC
-        + bytes([slot_index])
-        + _wire_epoch_id(key_id)
-        + bytes([len(label)])
-        + label
-        + public_key
-    )
+    private_raw = hashlib.sha256(prefix + b":xwing-seed").digest()
+    return f"{domain}-{epoch_hex}", private_raw
 
 
 def _parse_public_key(payload: bytes) -> _ParsedPublicKey:
-    if payload[:4] != _PUBLIC_MAGIC or len(payload) < 54:
-        raise ValueError("invalid RAO recipient public-key file")
-    slot_index = payload[4]
-    wire_id = payload[5:21]
-    label_len = payload[21]
-    if len(payload) != 54 + label_len:
-        raise ValueError("invalid RAO recipient public-key file length")
-    try:
-        domain = payload[22 : 22 + label_len].decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ValueError("invalid RAO recipient public-key label") from exc
+    structure = parse_public_structure(payload)
+    slot_index = structure.slot_index
+    wire_id = structure.recipient_epoch_id
+    domain = structure.epoch_label
     domain = _validate_domain(domain)
     key_id = _validate_key_id(f"{domain}-{wire_id.hex()}")
     if wire_id != _wire_epoch_id(key_id):
-        raise ValueError("RAO recipient public-key epoch id does not match its label")
-    public_key = payload[22 + label_len :]
-    try:
-        X25519PublicKey.from_public_bytes(public_key)
-    except ValueError as exc:
-        raise ValueError("invalid X25519 recipient public key") from exc
-    return _ParsedPublicKey(key_id=key_id, slot_index=slot_index, public_key=public_key)
+        raise ValueError("REM-OBJECT recipient public-key epoch id does not match its label")
+    return _ParsedPublicKey(key_id=key_id, slot_index=slot_index)
 
 
 def _serialize_private_key(key_id: str, private_key: bytes) -> bytes:
     key_id = _validate_key_id(key_id)
-    X25519PrivateKey.from_private_bytes(private_key)
+    if len(private_key) != 32:
+        raise ValueError("X-Wing recipient seed must be exactly 32 bytes")
     label = key_domain(key_id).encode("ascii")
     return _PRIVATE_MAGIC + _wire_epoch_id(key_id) + bytes([len(label)]) + label + private_key
 
@@ -606,19 +612,36 @@ def _slot_index_for_domain(domain: str) -> int:
     return 1 if domain == KEY_DOMAIN_RECOVERY else 0
 
 
-def _private_bytes(private: X25519PrivateKey) -> bytes:
-    return private.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
+def _assert_derived_identity(
+    key_id: str,
+    material: RecipientPublicMaterial,
+    *,
+    slot_index: int,
+) -> None:
+    parsed = _parse_public_key(material.canonical_bytes)
+    if (
+        parsed.key_id != key_id
+        or parsed.slot_index != slot_index
+        or material.recipient_epoch_id != _wire_epoch_id(key_id)
+        or material.epoch_label != key_domain(key_id)
+        or material.slot_index != slot_index
+    ):
+        raise RuntimeError(f"Remanence derived recipient identity mismatch for {key_id}")
 
 
-def _public_bytes(public: X25519PublicKey) -> bytes:
-    return public.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
+def _assert_codec_identity(
+    parsed: _ParsedPublicKey,
+    inspected: RecipientPublicIdentity,
+    *,
+    context: str,
+) -> None:
+    if (
+        inspected.recipient_epoch_id != _wire_epoch_id(parsed.key_id)
+        or inspected.epoch_label != key_domain(parsed.key_id)
+        or inspected.slot_index != parsed.slot_index
+        or inspected.public_key_bytes != 1216
+    ):
+        raise RuntimeError(f"Remanence {context} identity differs from the REMR file")
 
 
 def _state_generation(state: dict[str, Any]) -> int:
@@ -679,15 +702,32 @@ def _secure_temp_dir() -> Path:
             continue
         base = Path(candidate)
         if base.is_dir() and os.access(base, os.W_OK):
-            path = base / f"sutradhara-rao-keys-{os.getuid()}"
+            path = base / f"sutradhara-rem-keys-{os.getuid()}"
             path.mkdir(mode=0o700, exist_ok=True)
             os.chmod(path, 0o700)
             return path
 
-    fallback = Path(tempfile.gettempdir()) / f"sutradhara-rao-keys-{os.getuid()}"
+    fallback = Path(tempfile.gettempdir()) / f"sutradhara-rem-keys-{os.getuid()}"
     fallback.mkdir(mode=0o700, exist_ok=True)
     os.chmod(fallback, 0o700)
     return fallback
+
+
+def _write_secure_temp_payload(data: bytes, *, prefix: str, suffix: str) -> Path:
+    fd, raw_path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=_secure_temp_dir())
+    path = Path(raw_path)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        _best_effort_zeroize(path)
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        raise
+    return path
 
 
 def _best_effort_zeroize(path: Path) -> None:

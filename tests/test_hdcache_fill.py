@@ -68,8 +68,9 @@ from sutradhara.jobs.reconcilers.conditions import (
 from sutradhara.jobs.reconcilers.spine import reconcile
 from sutradhara.jobs.registry import JobContext, JobResult
 from sutradhara.jobs.worker import JobWorker
-from sutradhara.keys import KeyEpoch, KeyRegistry
+from sutradhara.keys import KeyEpoch
 from sutradhara.sealing.port import Representation, SealResult
+from tests.key_helpers import TEST_RECIPIENT_CODEC, make_test_key_registry
 
 TEST_HDCACHE_HMAC_SECRET = b"hdcache-fill-test-secret"
 
@@ -175,7 +176,7 @@ def test_hdcache_aead_fill_records_hdcache_epoch_and_stored_digest(
 ) -> None:
     source = tmp_path / "private.mov"
     source.write_bytes(b"private bytes")
-    registry = KeyRegistry(tmp_path / "keys")
+    registry = make_test_key_registry(tmp_path / "keys", deterministic_test=False)
 
     with session_scope(engine) as session:
         _add_disk(session, "d001", tmp_path / "d001")
@@ -214,7 +215,7 @@ def test_policy_sha_change_between_reservation_and_finalize_refills_under_new_po
 ) -> None:
     source = tmp_path / "clip.mov"
     source.write_bytes(b"privacy race")
-    registry = KeyRegistry(tmp_path / "keys")
+    registry = make_test_key_registry(tmp_path / "keys", deterministic_test=False)
     original_write = fill_module._write_source_to_disk
     raised = False
 
@@ -449,7 +450,11 @@ def test_hdcache_convergence_marks_privacy_raise_and_retired_epoch_lost(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registry = KeyRegistry(tmp_path / "keys")
+    monkeypatch.setattr(
+        "sutradhara.keys.registry.RemRecipientKeyCodec",
+        lambda: TEST_RECIPIENT_CODEC,
+    )
+    registry = make_test_key_registry(tmp_path / "keys", deterministic_test=False)
     monkeypatch.setenv("SUTRADHARA_KEY_REGISTRY_DIR", str(registry.registry_dir))
     monkeypatch.setenv("SUTRADHARA_HDCACHE_SCRATCH_ROOT", str(tmp_path / "scratch"))
     monkeypatch.setenv("SUTRADHARA_HDCACHE_HMAC_SECRET_HEX", TEST_HDCACHE_HMAC_SECRET.hex())
