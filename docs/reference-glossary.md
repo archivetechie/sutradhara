@@ -160,7 +160,7 @@ uploaded at registration to the `cloud-temp` backend/pool (an encrypted
 RAO of the whole intake). Temporary by design: the retention gate deletes
 it once durable copies are proven.
 
-<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys/registry.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys/registry.py @ 46bb240 -->
 ## Sealing
 
 **representation** — the stored form of a copy: `raw-bytes`,

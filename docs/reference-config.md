@@ -15,7 +15,7 @@ Types: "bool" variables accept `1`, `true`, `yes`, `on` and `0`, `false`,
 raise on non-numeric values. An empty string is treated the same as unset
 in the hdcache/placement helpers.
 
-<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/jobs/config.py src/sutradhara/jobs/worker_lock.py src/sutradhara/logs_store.py src/sutradhara/retention.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/jobs/config.py src/sutradhara/jobs/worker_lock.py src/sutradhara/logs_store.py src/sutradhara/retention.py @ 46bb240 -->
 ## Core
 
 | Variable | Default | Purpose |
@@ -179,7 +179,7 @@ the path is configurable via the backend row's `device_env_path`).
 | `D2TAPE_STINIT_SCRIPT` | unset | Optional stinit script passed to the CLI. |
 | `D2TAPE_JAR` | newest `~/d2tape/d2tape-cli/target/d2tape-cli-*-jar-with-dependencies.jar` | Path to the d2tape CLI fat jar. Env-only (not read from `device.env`). |
 
-<!-- code-anchor: src/sutradhara/jobs/worker_lock.py src/sutradhara/keys/registry.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/jobs/worker_lock.py src/sutradhara/keys/registry.py @ 46bb240 -->
 ## Standard variables Sutradhara also honors
 
 | Variable | Used for |

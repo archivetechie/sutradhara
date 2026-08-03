@@ -430,7 +430,7 @@ every write of a given copy, so a legitimate re-write (self-heal
 re-encrypting a placement to a new key epoch, for instance) collided with
 Remanence's own conflict check and was wrongly refused.
 
-<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 5688438 -->
+<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 46bb240 -->
 ## Sealing and keys
 
 A copy's on-backend form is its **representation**: `raw-bytes`
