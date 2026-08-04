@@ -258,7 +258,10 @@ def _predict_tape_items(
             planner = planner_factory() if callable(planner_factory) else None
             if planner is None:
                 continue  # backend has no live plan surface
-            locator = dict(member.locator.native_locator)
+            # The copy's locator carries the tape identity (tape_uuid,
+            # tape_file_number, object_id); the asset locator is member-
+            # scoped and may not.
+            locator = dict(member.copy.native_locator)
             tape_uuid_hex = locator.get("tape_uuid")
             if not isinstance(tape_uuid_hex, str):
                 continue
@@ -440,8 +443,9 @@ def _plan_volume(
             calibration_generation=calibration_generation,
         )
         return
-    if status_name in _ORDERED_OUTCOMES and int(response.cost_model_basis) not in (
-        _KNOWN_COST_MODEL_BASES
+    if (
+        status_name in _ORDERED_OUTCOMES
+        and int(response.cost_model_basis) not in _KNOWN_COST_MODEL_BASES
     ):
         # cost_model_basis is read (estimates stay unused for scheduling);
         # an unrecognised value downgrades rather than passing as success.
