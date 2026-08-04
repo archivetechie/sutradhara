@@ -821,7 +821,7 @@ class RemanenceBackend:
         for attempt in range(2):
             try:
                 try:
-                    obj = self._catalog.GetObject(request, timeout=1.0)  # type: ignore[call-arg]
+                    obj = self._catalog.GetObject(request, timeout=1.0)
                 except TypeError:
                     # Lightweight test stubs may not model gRPC call options.
                     obj = self._catalog.GetObject(request)
