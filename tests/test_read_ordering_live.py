@@ -69,9 +69,10 @@ FIXTURE_DESCRIPTORS = [
 
 
 def _daemon_binary() -> Path:
-    return Path(
-        os.environ.get("REM_DAEMON_BIN", "/home/swami/remanence/target/release/rem-daemon")
-    )
+    override = os.environ.get("REM_DAEMON_BIN")
+    if override:
+        return Path(override)
+    return Path.home() / "remanence" / "target" / "release" / "rem-daemon"
 
 
 class FixtureDaemon:
