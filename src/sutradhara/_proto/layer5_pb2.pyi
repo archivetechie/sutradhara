@@ -93,6 +93,38 @@ class SourceReplayCapability(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     SOURCE_REPLAY_CAPABILITY_UNSPECIFIED: _ClassVar[SourceReplayCapability]
     SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START: _ClassVar[SourceReplayCapability]
+
+class PlanObjective(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    OBJECTIVE_UNSPECIFIED: _ClassVar[PlanObjective]
+    MIN_TOTAL_TIME: _ClassVar[PlanObjective]
+    MIN_TIME_TO_FIRST: _ClassVar[PlanObjective]
+
+class CompressionState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    COMPRESSION_UNSPECIFIED: _ClassVar[CompressionState]
+    COMPRESSION_DISABLED: _ClassVar[CompressionState]
+    COMPRESSION_ENABLED: _ClassVar[CompressionState]
+
+class PlanStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    PLAN_STATUS_UNSPECIFIED: _ClassVar[PlanStatus]
+    OK: _ClassVar[PlanStatus]
+    DEGRADED_ASCENDING_FALLBACK: _ClassVar[PlanStatus]
+    UNAVAILABLE_UNKNOWN_BLOCK_SIZE: _ClassVar[PlanStatus]
+    UNAVAILABLE_COMPRESSION_ENABLED: _ClassVar[PlanStatus]
+    UNAVAILABLE_UNKNOWN_COMPRESSION: _ClassVar[PlanStatus]
+    UNAVAILABLE_UNSUPPORTED_FORMAT: _ClassVar[PlanStatus]
+    UNAVAILABLE_UNKNOWN_FORMAT: _ClassVar[PlanStatus]
+    UNAVAILABLE_UNKNOWN_EXTENT: _ClassVar[PlanStatus]
+    UNAVAILABLE_UNCALIBRATED: _ClassVar[PlanStatus]
+    UNAVAILABLE_MAP_STALE: _ClassVar[PlanStatus]
+
+class CostModelBasis(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    COST_MODEL_BASIS_UNSPECIFIED: _ClassVar[CostModelBasis]
+    PRIORS: _ClassVar[CostModelBasis]
+    FITTED: _ClassVar[CostModelBasis]
 OPERATION_STATE_UNSPECIFIED: OperationState
 OPERATION_STATE_QUEUED: OperationState
 OPERATION_STATE_RUNNING: OperationState
@@ -143,6 +175,26 @@ ARCHIVE_GAP_CAUSE_RESYNC: ArchiveGapCause
 ARCHIVE_GAP_CAUSE_UNSUPPORTED: ArchiveGapCause
 SOURCE_REPLAY_CAPABILITY_UNSPECIFIED: SourceReplayCapability
 SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START: SourceReplayCapability
+OBJECTIVE_UNSPECIFIED: PlanObjective
+MIN_TOTAL_TIME: PlanObjective
+MIN_TIME_TO_FIRST: PlanObjective
+COMPRESSION_UNSPECIFIED: CompressionState
+COMPRESSION_DISABLED: CompressionState
+COMPRESSION_ENABLED: CompressionState
+PLAN_STATUS_UNSPECIFIED: PlanStatus
+OK: PlanStatus
+DEGRADED_ASCENDING_FALLBACK: PlanStatus
+UNAVAILABLE_UNKNOWN_BLOCK_SIZE: PlanStatus
+UNAVAILABLE_COMPRESSION_ENABLED: PlanStatus
+UNAVAILABLE_UNKNOWN_COMPRESSION: PlanStatus
+UNAVAILABLE_UNSUPPORTED_FORMAT: PlanStatus
+UNAVAILABLE_UNKNOWN_FORMAT: PlanStatus
+UNAVAILABLE_UNKNOWN_EXTENT: PlanStatus
+UNAVAILABLE_UNCALIBRATED: PlanStatus
+UNAVAILABLE_MAP_STALE: PlanStatus
+COST_MODEL_BASIS_UNSPECIFIED: CostModelBasis
+PRIORS: CostModelBasis
+FITTED: CostModelBasis
 
 class IdempotencyKey(_message.Message):
     __slots__ = ("value",)
@@ -903,7 +955,7 @@ class LibraryEvent(_message.Message):
     def __init__(self, at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., kind: _Optional[_Union[LibraryEvent.Kind, str]] = ..., detail: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class Tape(_message.Message):
-    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id", "correlation_rollups")
+    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id", "correlation_rollups", "written_extent_lba")
     class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         TAPE_STATE_UNSPECIFIED: _ClassVar[Tape.State]
@@ -930,6 +982,7 @@ class Tape(_message.Message):
     UPDATED_AT_FIELD_NUMBER: _ClassVar[int]
     POOL_ID_FIELD_NUMBER: _ClassVar[int]
     CORRELATION_ROLLUPS_FIELD_NUMBER: _ClassVar[int]
+    WRITTEN_EXTENT_LBA_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     voltag: str
     body_format: str
@@ -942,7 +995,8 @@ class Tape(_message.Message):
     updated_at: _timestamp_pb2.Timestamp
     pool_id: str
     correlation_rollups: _containers.RepeatedCompositeFieldContainer[DriveCorrelationRollup]
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ...) -> None: ...
+    written_extent_lba: int
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ..., written_extent_lba: _Optional[int] = ...) -> None: ...
 
 class TapePool(_message.Message):
     __slots__ = ("pool_id", "display_name", "copy_class", "content_class")
@@ -1036,7 +1090,7 @@ class ObjectRecord(_message.Message):
     def __init__(self, object_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., content_sha256: _Optional[bytes] = ..., logical_size_bytes: _Optional[int] = ..., body_format: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., copies: _Optional[_Iterable[_Union[ObjectCopy, _Mapping]]] = ..., append_commit_info: _Optional[_Union[AppendCommitInfo, _Mapping]] = ..., content_digest: _Optional[_Union[Digest, _Mapping]] = ..., metadata_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
 
 class ObjectCopy(_message.Message):
-    __slots__ = ("tape_uuid", "tape_file_number", "first_body_lba", "last_verified_at", "health", "pool_id", "plaintext_digest", "stored_digest")
+    __slots__ = ("tape_uuid", "tape_file_number", "first_body_lba", "last_verified_at", "health", "pool_id", "plaintext_digest", "stored_digest", "global_start_block", "global_end_block")
     class Health(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         OBJECT_COPY_HEALTH_UNSPECIFIED: _ClassVar[ObjectCopy.Health]
@@ -1057,6 +1111,8 @@ class ObjectCopy(_message.Message):
     POOL_ID_FIELD_NUMBER: _ClassVar[int]
     PLAINTEXT_DIGEST_FIELD_NUMBER: _ClassVar[int]
     STORED_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    GLOBAL_START_BLOCK_FIELD_NUMBER: _ClassVar[int]
+    GLOBAL_END_BLOCK_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     tape_file_number: int
     first_body_lba: int
@@ -1065,7 +1121,9 @@ class ObjectCopy(_message.Message):
     pool_id: str
     plaintext_digest: Digest
     stored_digest: Digest
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., tape_file_number: _Optional[int] = ..., first_body_lba: _Optional[int] = ..., last_verified_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., health: _Optional[_Union[ObjectCopy.Health, str]] = ..., pool_id: _Optional[str] = ..., plaintext_digest: _Optional[_Union[Digest, _Mapping]] = ..., stored_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
+    global_start_block: int
+    global_end_block: int
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., tape_file_number: _Optional[int] = ..., first_body_lba: _Optional[int] = ..., last_verified_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., health: _Optional[_Union[ObjectCopy.Health, str]] = ..., pool_id: _Optional[str] = ..., plaintext_digest: _Optional[_Union[Digest, _Mapping]] = ..., stored_digest: _Optional[_Union[Digest, _Mapping]] = ..., global_start_block: _Optional[int] = ..., global_end_block: _Optional[int] = ...) -> None: ...
 
 class FileRecord(_message.Message):
     __slots__ = ("object_id", "file_id", "path", "size_bytes", "file_sha256", "first_chunk_body_lba", "chunk_count", "file_digest")
@@ -1442,14 +1500,16 @@ class DriveTarget(_message.Message):
     def __init__(self, library_uuid: _Optional[bytes] = ..., drive_element_address: _Optional[int] = ..., required_pool_id: _Optional[str] = ...) -> None: ...
 
 class TapeTarget(_message.Message):
-    __slots__ = ("tape_uuid", "mount_if_needed", "required_pool_id")
+    __slots__ = ("tape_uuid", "mount_if_needed", "required_pool_id", "allow_unpooled")
     TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
     MOUNT_IF_NEEDED_FIELD_NUMBER: _ClassVar[int]
     REQUIRED_POOL_ID_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_UNPOOLED_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     mount_if_needed: bool
     required_pool_id: str
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., mount_if_needed: _Optional[bool] = ..., required_pool_id: _Optional[str] = ...) -> None: ...
+    allow_unpooled: bool
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., mount_if_needed: _Optional[bool] = ..., required_pool_id: _Optional[str] = ..., allow_unpooled: _Optional[bool] = ...) -> None: ...
 
 class TapePoolTarget(_message.Message):
     __slots__ = ("pool_id", "library_uuid", "mount_if_needed")
@@ -1669,6 +1729,98 @@ class BytesChunk(_message.Message):
     data: bytes
     is_last: bool
     def __init__(self, data: _Optional[bytes] = ..., is_last: _Optional[bool] = ...) -> None: ...
+
+class ReadTarget(_message.Message):
+    __slots__ = ("partition", "start_block", "end_block", "tag")
+    PARTITION_FIELD_NUMBER: _ClassVar[int]
+    START_BLOCK_FIELD_NUMBER: _ClassVar[int]
+    END_BLOCK_FIELD_NUMBER: _ClassVar[int]
+    TAG_FIELD_NUMBER: _ClassVar[int]
+    partition: int
+    start_block: int
+    end_block: int
+    tag: bytes
+    def __init__(self, partition: _Optional[int] = ..., start_block: _Optional[int] = ..., end_block: _Optional[int] = ..., tag: _Optional[bytes] = ...) -> None: ...
+
+class CartridgeFacts(_message.Message):
+    __slots__ = ("cartridge_generation", "recording_format", "voltag", "block_size_bytes", "compression", "written_extent_lba")
+    CARTRIDGE_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    RECORDING_FORMAT_FIELD_NUMBER: _ClassVar[int]
+    VOLTAG_FIELD_NUMBER: _ClassVar[int]
+    BLOCK_SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    COMPRESSION_FIELD_NUMBER: _ClassVar[int]
+    WRITTEN_EXTENT_LBA_FIELD_NUMBER: _ClassVar[int]
+    cartridge_generation: str
+    recording_format: str
+    voltag: str
+    block_size_bytes: int
+    compression: CompressionState
+    written_extent_lba: int
+    def __init__(self, cartridge_generation: _Optional[str] = ..., recording_format: _Optional[str] = ..., voltag: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., compression: _Optional[_Union[CompressionState, str]] = ..., written_extent_lba: _Optional[int] = ...) -> None: ...
+
+class StartPosition(_message.Message):
+    __slots__ = ("partition", "block")
+    PARTITION_FIELD_NUMBER: _ClassVar[int]
+    BLOCK_FIELD_NUMBER: _ClassVar[int]
+    partition: int
+    block: int
+    def __init__(self, partition: _Optional[int] = ..., block: _Optional[int] = ...) -> None: ...
+
+class PlanBatchReadRequest(_message.Message):
+    __slots__ = ("cartridge", "targets", "objective", "start_position", "end_position", "tape_uuid")
+    CARTRIDGE_FIELD_NUMBER: _ClassVar[int]
+    TARGETS_FIELD_NUMBER: _ClassVar[int]
+    OBJECTIVE_FIELD_NUMBER: _ClassVar[int]
+    START_POSITION_FIELD_NUMBER: _ClassVar[int]
+    END_POSITION_FIELD_NUMBER: _ClassVar[int]
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    cartridge: CartridgeFacts
+    targets: _containers.RepeatedCompositeFieldContainer[ReadTarget]
+    objective: PlanObjective
+    start_position: StartPosition
+    end_position: StartPosition
+    tape_uuid: bytes
+    def __init__(self, cartridge: _Optional[_Union[CartridgeFacts, _Mapping]] = ..., targets: _Optional[_Iterable[_Union[ReadTarget, _Mapping]]] = ..., objective: _Optional[_Union[PlanObjective, str]] = ..., start_position: _Optional[_Union[StartPosition, _Mapping]] = ..., end_position: _Optional[_Union[StartPosition, _Mapping]] = ..., tape_uuid: _Optional[bytes] = ...) -> None: ...
+
+class PlannedHop(_message.Message):
+    __slots__ = ("target", "estimated_locate_ns")
+    TARGET_FIELD_NUMBER: _ClassVar[int]
+    ESTIMATED_LOCATE_NS_FIELD_NUMBER: _ClassVar[int]
+    target: ReadTarget
+    estimated_locate_ns: int
+    def __init__(self, target: _Optional[_Union[ReadTarget, _Mapping]] = ..., estimated_locate_ns: _Optional[int] = ...) -> None: ...
+
+class ResolvedGeometryKey(_message.Message):
+    __slots__ = ("cartridge_generation", "recording_format")
+    CARTRIDGE_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    RECORDING_FORMAT_FIELD_NUMBER: _ClassVar[int]
+    cartridge_generation: str
+    recording_format: str
+    def __init__(self, cartridge_generation: _Optional[str] = ..., recording_format: _Optional[str] = ...) -> None: ...
+
+class PlanBatchReadResponse(_message.Message):
+    __slots__ = ("status", "detail", "hops", "estimated_total_ns", "cost_model_basis", "resolved_key", "format_disagreement", "max_targets", "calibration_generation", "uses_estimated_eod_geometry")
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    HOPS_FIELD_NUMBER: _ClassVar[int]
+    ESTIMATED_TOTAL_NS_FIELD_NUMBER: _ClassVar[int]
+    COST_MODEL_BASIS_FIELD_NUMBER: _ClassVar[int]
+    RESOLVED_KEY_FIELD_NUMBER: _ClassVar[int]
+    FORMAT_DISAGREEMENT_FIELD_NUMBER: _ClassVar[int]
+    MAX_TARGETS_FIELD_NUMBER: _ClassVar[int]
+    CALIBRATION_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    USES_ESTIMATED_EOD_GEOMETRY_FIELD_NUMBER: _ClassVar[int]
+    status: PlanStatus
+    detail: str
+    hops: _containers.RepeatedCompositeFieldContainer[PlannedHop]
+    estimated_total_ns: int
+    cost_model_basis: CostModelBasis
+    resolved_key: ResolvedGeometryKey
+    format_disagreement: bool
+    max_targets: int
+    calibration_generation: int
+    uses_estimated_eod_geometry: bool
+    def __init__(self, status: _Optional[_Union[PlanStatus, str]] = ..., detail: _Optional[str] = ..., hops: _Optional[_Iterable[_Union[PlannedHop, _Mapping]]] = ..., estimated_total_ns: _Optional[int] = ..., cost_model_basis: _Optional[_Union[CostModelBasis, str]] = ..., resolved_key: _Optional[_Union[ResolvedGeometryKey, _Mapping]] = ..., format_disagreement: _Optional[bool] = ..., max_targets: _Optional[int] = ..., calibration_generation: _Optional[int] = ..., uses_estimated_eod_geometry: _Optional[bool] = ...) -> None: ...
 
 class QueryAuditRequest(_message.Message):
     __slots__ = ("since", "until", "filter")

@@ -241,6 +241,152 @@ class RestoreRequestItem(Base):
     )
 
 
+class RestoreReadPlanSlot(Base):
+    """One release slot: item X is the Nth tape read released for volume V
+    under restore request R's **current** plan.
+
+    Workflow state on the workflow's rows (whiteboard erasure class): the
+    dispatcher's release queue, rewritten per volume by each re-plan. The
+    history of ordering decisions is NOT here — that is the
+    `restore_ordering_outcome` ledger. Completion state is never mirrored
+    here either; the release gate joins to `restore_request_item.state`.
+
+    `planned=True` rows come from the plan's hop order and carry the
+    `ReadTarget` actually sent (tag + inclusive block span) — stored because
+    a read-failure re-plan must originate from the *target we actually
+    read*, not from a re-fetch of spans that may have changed since.
+    `planned=False` rows are the volume's unspanned tail, appended after
+    the ordered ones in today's order; they never went on the wire, so they
+    carry no tag and no span.
+    """
+
+    __tablename__ = "restore_read_plan_slot"
+    __table_args__ = (
+        CheckConstraint(
+            "(planned AND tag IS NOT NULL AND start_block IS NOT NULL "
+            "AND end_block IS NOT NULL) OR "
+            "(NOT planned AND tag IS NULL AND start_block IS NULL "
+            "AND end_block IS NULL)",
+            name="ck_restore_read_plan_slot_planned_shape",
+        ),
+        UniqueConstraint(
+            "request_id",
+            "tape_uuid",
+            "position",
+            name="uq_restore_read_plan_slot_position",
+        ),
+        # An item occupies at most one slot (item ids are globally unique).
+        UniqueConstraint("item_id", name="uq_restore_read_plan_slot_item"),
+        # Declared backstop of the tag rule (unique per item within the
+        # request). The planning pass detects collisions first and falls
+        # back to unordered loudly; this constraint documents the invariant.
+        UniqueConstraint("request_id", "tag", name="uq_restore_read_plan_slot_tag"),
+        Index("ix_restore_read_plan_slot_request_volume", "request_id", "tape_uuid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("restore_request.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tape_uuid: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("restore_request_item.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    planned: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    tag: Mapped[bytes | None] = mapped_column(LargeBinary(64), nullable=True)
+    start_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    end_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    item: Mapped[RestoreRequestItem] = relationship()
+
+
+#: Every status value the ordering ledger can carry has exactly one writer
+#: in hdcache/read_ordering.py; the vocabulary is closed on purpose.
+ORDERING_OUTCOME_STATUSES = (
+    # Plan adopted — reads released in the returned order.
+    "ok",
+    "degraded_ascending_fallback",
+    # Rem answered: ordering unavailable (a normal, recorded result).
+    "unavailable_unknown_block_size",
+    "unavailable_compression_enabled",
+    "unavailable_unknown_compression",
+    "unavailable_unsupported_format",
+    "unavailable_unknown_format",
+    "unavailable_unknown_extent",
+    "unavailable_uncalibrated",
+    "unavailable_map_stale",
+    # Downgrades — unknown values are never treated as success.
+    "unknown_plan_status",
+    "unknown_cost_model_basis",
+    # The plan call machinery failed (§5 transport rows).
+    "rpc_unimplemented",
+    "rpc_invalid_argument",
+    "rpc_transport_error",
+    # Sutradhara-side decisions.
+    "tag_collision",
+    "no_spanned_targets",
+    "read_failure_unordered",
+    "planning_error",
+)
+
+
+class RestoreOrderingOutcome(Base):
+    """One read-ordering decision for one volume of one restore request.
+
+    Ledger erasure class: append-only, never updated — each planning phase
+    (initial pass, the single post-mount re-plan, a read-failure re-plan)
+    appends the decision it reached, so an operator can see from the record
+    that a restore ran unordered, and why. "Did the post-mount re-plan run
+    exactly once?" is a count over this ledger, not a stored flag; whether
+    a volume is currently ordered is derived (slots exist), not stored.
+
+    `status` deliberately folds rem's plan verdicts and sutradhara's
+    machinery outcomes into one closed vocabulary because the design's §5
+    degradation table is itself that fold: the operator's one question is
+    "why did this volume run unordered", and every answer is one value.
+    `calibration_generation` is provenance for calibration-derived rows —
+    absent when the decision never got a plan response.
+    """
+
+    __tablename__ = "restore_ordering_outcome"
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('initial', 'post_mount', 'read_failure')",
+            name="ck_restore_ordering_outcome_phase",
+        ),
+        CheckConstraint(
+            "status IN ("
+            + ", ".join(f"'{status}'" for status in ORDERING_OUTCOME_STATUSES)
+            + ")",
+            name="ck_restore_ordering_outcome_status",
+        ),
+        Index("ix_restore_ordering_outcome_request_volume", "request_id", "tape_uuid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("restore_request.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tape_uuid: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
+    phase: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    calibration_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
 class RestoreItemCheckpoint(Base):
     """Durable per-item staged/revealed progress for agent delivery."""
 

@@ -43,6 +43,7 @@ from sutradhara.jobs.registry import (
     JobContext,
     JobHandler,
     JobResult,
+    get_dispatch_gate,
     get_handler,
 )
 from sutradhara.jobs.runtime_observations import (
@@ -537,7 +538,11 @@ def _pending_candidates(session: Session, *, now: dt.datetime) -> list[Job]:
             .order_by(Job.priority, Job.created_at, Job.id)
         )
     )
-    return [job for job in rows if _prerequisites_succeeded(session, job)]
+    return [
+        job
+        for job in rows
+        if _prerequisites_succeeded(session, job) and _dispatch_gate_allows(session, job)
+    ]
 
 
 def _live_job_for_dedupe(session: Session, dedupe_key: str) -> Job | None:
@@ -550,6 +555,19 @@ def _live_job_for_dedupe(session: Session, dedupe_key: str) -> Job | None:
         .order_by(Job.id)
         .limit(1)
     ).one_or_none()
+
+
+def _dispatch_gate_allows(session: Session, job: Job) -> bool:
+    """Consult the kind's registered release gate; a raising gate releases."""
+
+    gate = get_dispatch_gate(job.kind)
+    if gate is None:
+        return True
+    try:
+        return gate(session, job)
+    except Exception:
+        traceback.print_exc()
+        return True
 
 
 def _prerequisites_succeeded(session: Session, job: Job) -> bool:
