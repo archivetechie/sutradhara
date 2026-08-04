@@ -50,6 +50,18 @@ fi
     "${PROTO_SRC}/device.proto" \
     "${PROTO_SRC}/restore.proto"
 
+# The vendored google/rpc detail types (Status + BadRequest) are messages
+# only — no services — so they get --python_out without --grpc_python_out.
+# They decode the `grpc-status-details-bin` trailer Remanence attaches to
+# INVALID_ARGUMENT responses (PlanBatchRead names offending targets by
+# index through google.rpc.BadRequest).
+"${PYTHON}" -m grpc_tools.protoc \
+    --proto_path="${PROTO_SRC}" \
+    --python_out="${SERVER_PROTO_OUT}" \
+    --pyi_out="${SERVER_PROTO_OUT}" \
+    "${PROTO_SRC}/google/rpc/status.proto" \
+    "${PROTO_SRC}/google/rpc/error_details.proto"
+
 # protoc emits imports like `import layer5_pb2`, which only works if
 # ${PROTO_OUT} is on sys.path. We're a package, so rewrite to a relative
 # import. (Standard workaround; see grpc/grpc#9575.)
@@ -70,6 +82,8 @@ for grpc_file in out.glob("*_pb2_grpc.py"):
 PY
 
 touch "${SERVER_PROTO_OUT}/__init__.py"
+touch "${SERVER_PROTO_OUT}/google/__init__.py"
+touch "${SERVER_PROTO_OUT}/google/rpc/__init__.py"
 
 echo "generated: ${SERVER_PROTO_OUT}/*_pb2.py"
 echo "generated: ${SERVER_PROTO_OUT}/*_pb2.pyi"

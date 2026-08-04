@@ -57,6 +57,10 @@ from sutradhara.jobs.runtime_observations import (
 
 _WRITE_CHUNK_BYTES = 1024 * 1024
 _DRIVE_ASSIGNMENT_POLL_SECONDS = 0.1
+# Read-ordering plan calls are metadata-only and bounded so a dead daemon
+# can never hang restore admission; a timeout degrades to unordered.
+_PLAN_METADATA_TIMEOUT_SECONDS = 15.0
+_PLAN_RPC_TIMEOUT_SECONDS = 30.0
 _DRIVE_ASSIGNMENT_ACTIVE = layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_ACTIVE")
 _DRIVE_ASSIGNMENT_IDLE = layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_IDLE")
 
@@ -201,7 +205,17 @@ class _CatalogClient(Protocol):
         self, request: layer5_pb2.EnumerateObjectsRequest
     ) -> Iterator[layer5_pb2.ObjectRecord]: ...
 
-    def GetObject(self, request: layer5_pb2.GetObjectRequest) -> layer5_pb2.ObjectRecord: ...
+    def GetObject(
+        self,
+        request: layer5_pb2.GetObjectRequest,
+        timeout: float | None = None,
+    ) -> layer5_pb2.ObjectRecord: ...
+
+    def GetTape(
+        self,
+        request: layer5_pb2.GetTapeRequest,
+        timeout: float | None = None,
+    ) -> layer5_pb2.Tape: ...
 
     def ListTapePools(
         self, request: layer5_pb2.ListTapePoolsRequest
@@ -256,6 +270,28 @@ class _LibraryClient(Protocol):
     def GetLiveStatus(
         self, request: layer5_pb2.GetLiveStatusRequest
     ) -> layer5_pb2.GetLiveStatusResponse: ...
+
+
+class _ReadPlanClient(Protocol):
+    def PlanBatchRead(
+        self,
+        request: layer5_pb2.PlanBatchReadRequest,
+        timeout: float | None = None,
+    ) -> layer5_pb2.PlanBatchReadResponse: ...
+
+
+@dataclass(frozen=True)
+class TapeReadFacts:
+    """The `GetTape` facts the read-ordering planning pass consumes.
+
+    `written_extent_lba` is `None` when the R1 optional field is absent —
+    absent means unknown and is never defaulted to 0 here; the 0-as-unknown
+    conflation is `block_size_bytes`' precedent and stops with it.
+    """
+
+    voltag: str
+    block_size_bytes: int
+    written_extent_lba: int | None
 
 
 class _DriveQueueLease:
@@ -397,6 +433,7 @@ class RemanenceBackend:
         library: _LibraryClient | None = None,
         library_identity: bytes | str | None = None,
         channel: grpc.Channel | None = None,
+        read_plan: _ReadPlanClient | None = None,
     ) -> None:
         self._name = name
         self._endpoint = endpoint
@@ -404,6 +441,7 @@ class RemanenceBackend:
         self._write_session = write_session
         self._read_session = read_session
         self._library = library
+        self._read_plan = read_plan
         self._library_identity = library_identity
         self._channel = channel
         self._drive_queue = (
@@ -495,6 +533,10 @@ class RemanenceBackend:
             _LibraryClient,
             layer5_pb2_grpc.LibraryServiceStub(channel),  # type: ignore[no-untyped-call]
         )
+        read_plan = cast(
+            _ReadPlanClient,
+            layer5_pb2_grpc.ReadPlanServiceStub(channel),  # type: ignore[no-untyped-call]
+        )
         return cls(
             name,
             endpoint=endpoint,
@@ -504,6 +546,7 @@ class RemanenceBackend:
             library=library,
             library_identity=library_identity,
             channel=channel,
+            read_plan=read_plan,
         )
 
     # --- StorageBackend protocol -----------------------------------------
@@ -663,6 +706,72 @@ class RemanenceBackend:
             chunk_count=0,
         )
 
+    # --- read-ordering planner (design-restore-read-ordering §4) ----------
+    #
+    # These three calls are the whole surface the restore planning pass
+    # consumes (hdcache/read_ordering.py). They are metadata-only: no read
+    # session, no mount, no tape motion. gRPC errors propagate — the
+    # ordering module owns the §5 degradation mapping, and a restore must
+    # never fail because ordering could not be computed.
+
+    def read_ordering_planner(self) -> RemanenceBackend | None:
+        """Return self when the live plan surface is available, else None."""
+
+        if self._catalog is not None and self._read_plan is not None:
+            return self
+        return None
+
+    def get_tape_facts(self, tape_uuid: bytes) -> TapeReadFacts:
+        """Fetch the `GetTape` facts feeding `CartridgeFacts`."""
+
+        catalog = self._require_catalog()
+        tape = catalog.GetTape(
+            layer5_pb2.GetTapeRequest(tape_uuid=tape_uuid),
+            timeout=_PLAN_METADATA_TIMEOUT_SECONDS,
+        )
+        return TapeReadFacts(
+            voltag=tape.voltag,
+            block_size_bytes=int(tape.block_size_bytes),
+            written_extent_lba=_optional_u64(tape, "written_extent_lba"),
+        )
+
+    def get_copy_read_span(self, locator: BackendLocator) -> tuple[int, int] | None:
+        """Return this copy's volume-global `[start, end)` span, or None.
+
+        None means the tape file predates span capture (the R1 optional
+        fields are absent) or the copy is unknown to the daemon — the item
+        joins the unordered tail; absence is never guessed and never 0.
+        """
+
+        object_id = _uuid_bytes_from_locator(locator, "object_id")
+        tape_uuid = _uuid_bytes_from_locator(locator, "tape_uuid")
+        tape_file_number = int(locator["tape_file_number"])
+        catalog = self._require_catalog()
+        record = catalog.GetObject(
+            layer5_pb2.GetObjectRequest(object_id=object_id),
+            timeout=_PLAN_METADATA_TIMEOUT_SECONDS,
+        )
+        for cp in record.copies:
+            if bytes(cp.tape_uuid) != tape_uuid:
+                continue
+            if int(cp.tape_file_number) != tape_file_number:
+                continue
+            if cp.HasField("global_start_block") and cp.HasField("global_end_block"):
+                return (int(cp.global_start_block), int(cp.global_end_block))
+            return None
+        return None
+
+    def plan_batch_read(
+        self, request: layer5_pb2.PlanBatchReadRequest
+    ) -> layer5_pb2.PlanBatchReadResponse:
+        """One `ReadPlanService.PlanBatchRead` call; RpcError propagates."""
+
+        if self._read_plan is None:
+            raise BackendUnavailableError(
+                "RemanenceBackend has no ReadPlanService client (fixture mode)"
+            )
+        return self._read_plan.PlanBatchRead(request, timeout=_PLAN_RPC_TIMEOUT_SECONDS)
+
     def verify(self, locator: BackendLocator) -> VerifyResult:
         if self._read_session is not None:
             data = self.read_range(locator, ByteRange(0, 0))
@@ -712,7 +821,7 @@ class RemanenceBackend:
         for attempt in range(2):
             try:
                 try:
-                    obj = self._catalog.GetObject(request, timeout=1.0)  # type: ignore[call-arg]
+                    obj = self._catalog.GetObject(request, timeout=1.0)
                 except TypeError:
                     # Lightweight test stubs may not model gRPC call options.
                     obj = self._catalog.GetObject(request)

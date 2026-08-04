@@ -59,6 +59,7 @@ from sutradhara.hdcache.fill import (
     mark_entry_lost_and_delete,
 )
 from sutradhara.hdcache.models import CacheDisk, CacheEntry, RestoreRequest, RestoreRequestItem
+from sutradhara.hdcache.read_ordering import plan_restore_request_read_order
 from sutradhara.hdcache.store import (
     AEAD_REPRESENTATION,
     BUFFER_SIZE,
@@ -599,6 +600,10 @@ def admit_restore_request(
         session.add(item)
     session.flush()
     _update_request_state(request)
+    # Read-ordering planning pass: after the request's items are accepted,
+    # before item dispatch (design-restore-read-ordering §4.1). Always on;
+    # never raises — planning failure degrades to unordered dispatch.
+    plan_restore_request_read_order(session, request, config=final_config)
     return request
 
 

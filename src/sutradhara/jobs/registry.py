@@ -230,6 +230,30 @@ def registered_kinds() -> Mapping[str, JobHandler]:
     return dict(_HANDLERS)
 
 
+DispatchGate = Callable[[Session, Job], bool]
+"""A per-kind release gate the engine consults before claiming a PENDING job.
+
+Returning False leaves the job pending this scan (it stays eligible and is
+re-examined on every subsequent scan); True releases it. Gates must be
+read-only and must fail open — the engine treats a raising gate as True.
+"""
+
+_DISPATCH_GATES: dict[str, DispatchGate] = {}
+
+
+def register_dispatch_gate(kind: str, gate: DispatchGate) -> None:
+    """Register the claim-time release gate for a job `kind`."""
+
+    existing = _DISPATCH_GATES.get(kind)
+    if existing is not None and existing is not gate:
+        raise ValueError(f"dispatch gate already registered for kind {kind!r}")
+    _DISPATCH_GATES[kind] = gate
+
+
+def get_dispatch_gate(kind: str) -> DispatchGate | None:
+    return _DISPATCH_GATES.get(kind)
+
+
 def _identity_text(value: bytes | str) -> str:
     """Return a stable JSON/component spelling for an opaque identity."""
 
