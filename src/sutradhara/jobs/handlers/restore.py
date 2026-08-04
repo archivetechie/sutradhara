@@ -19,8 +19,22 @@ from sutradhara.hdcache.manager import (
     serve_restore_item,
 )
 from sutradhara.hdcache.models import RestoreRequestItem
+from sutradhara.hdcache.read_ordering import (
+    note_restore_item_outcome,
+    restore_release_allowed,
+)
 from sutradhara.jobs.components import touch_asset, touch_copy_tape, touch_destination
-from sutradhara.jobs.registry import JobContext, JobResult, register_handler
+from sutradhara.jobs.registry import (
+    JobContext,
+    JobResult,
+    register_dispatch_gate,
+    register_handler,
+)
+
+# The dispatcher enforces read ordering at claim time: a volume's restore
+# jobs are released per the persisted per-volume list; items in no list
+# dispatch exactly as today (design-restore-read-ordering §4).
+register_dispatch_gate("restore", restore_release_allowed)
 
 
 @register_handler("restore")
@@ -64,6 +78,15 @@ def handle_restore(ctx: JobContext) -> JobResult:
         return _failure("not-admitted", str(exc))
     except Exception as exc:
         return _failure("restore-failed", f"{type(exc).__name__}: {exc}")
+
+    # Read-ordering runtime hooks: the single post-mount re-plan and the
+    # read-failure re-plan observe every served item here. Never raises.
+    note_restore_item_outcome(
+        ctx.session,
+        item,
+        served_copy_id=result.copy_id,
+        config=config,
+    )
 
     if item.state != ITEM_DONE:
         return _failure("restore-failed", item.detail or f"item ended in state={item.state!r}")
