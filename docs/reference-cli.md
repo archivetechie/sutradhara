@@ -189,11 +189,12 @@ submissions, and asset restore.
 
 ### sutra archive predicate-audit
 
-Write the read-only receive-dedup phase-1c preservation audit as a
-schema-versioned JSON artifact. `--output FILE` is required; an existing file
-is refused unless `--force` is supplied. Run it against the deployment catalog
-before enabling `SUTRADHARA_ARCHIVED_ALL_SEMANTICS`; only a report with
-`summary.gate_safe: true` clears the rollout gate.
+Write the read-only preservation-gap audit as a schema-versioned JSON
+artifact. `--output FILE` is required; an existing file is refused unless
+`--force` is supplied. It reports every retention-passed intake whose archive
+state is only *partial* — some of its material is on sealed, sufficiently
+replicated media and some is not — which is the shape a preservation gap
+takes. `summary.clean: true` means no such intake exists.
 
 ### sutra archive artifactclass apply ARTIFACTCLASS POLICY_PATH
 
@@ -233,7 +234,15 @@ Enqueue a registered intake's items as batches, one ruleset scan per
 
 ### sutra archive bundle flush BUNDLE_ID
 
-Flush one open bundle to all active artifactclass pools.
+Force-flush one open bundle to its bundle group's basis pools.
+
+Force-flush is **group grain**, not class grain. The bundle is the accumulator
+for every artifactclass whose storage placement matches, so sealing it here
+seals other classes' material too — at whatever fill it has reached. Before
+sealing, the command prints the accumulator's current fill (bytes against the
+group's effective target) and the member classes the flush will seal, because
+an operator sealing a 12%-full accumulator to get one class's material onto
+tape is spending the whole group's tape efficiency to do it.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -242,12 +251,33 @@ Flush one open bundle to all active artifactclass pools.
 | `--key-epoch TEXT` | | Key epoch for rao-aead-v1 pools. |
 | `--manifest-signing-key-file FILE` | | Raw HMAC key file for customer manifest receipts. |
 
-### sutra archive submission flush SUBMISSION_ID
+### sutra archive bundle sweep
 
-Flush one pending arrangement submission to its artifactclass pools: build
-the arranged archive object straight from the originals named in the frozen
-source-map, fan out to every active pool, and flip the submission to
-`archived`. Flags: `--rem-bin TEXT` (default `rem`), `--key-epoch TEXT`.
+Run one sweeper pass. In order: reap `flushing` bundles whose claimer is gone,
+void-seal empty orphan accumulators whose bundle group no live policy derives
+any more, drain the non-empty ones, then flush every open bundle `bundle_due`
+says is due — open funnel bundles (include-alone, cloud-blob) included, since
+they have no flusher of their own.
+
+This is the only caller of the age arm: a quiet class's accumulator seals here
+or not at all. The same pass runs as the `bundle-sweep` job. A flush failure is
+reported per bundle and exits non-zero without stopping the rest of the pass.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--rem-bin TEXT` | `rem` | rem CLI binary. |
+| `--key-epoch TEXT` | | Key epoch for rao-aead-v1 pools. |
+| `--no-reap` | off | Skip the stuck-claim reaper (diagnosis only). |
+
+### sutra archive submission accumulate SUBMISSION_ID
+
+Append one arrangement submission's members to its bundle group's open
+accumulator. The submission no longer builds an object of its own: this
+command writes catalog rows and touches no backend, and the sweeper seals the
+accumulator when it is full or overdue. It reports the bundles the submission's
+members currently sit in, their statuses, and whether the submission is
+`archived` — which is derived, and true only once every member sits in a sealed
+bundle with enough verified copies.
 
 ### sutra archive restore [ASSET_HASH_HEX]
 

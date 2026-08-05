@@ -99,8 +99,9 @@ The test suite runs it with `SUTRADHARA_FAKE_CLOUD_BLOB=1`.
 
 ## Where the full loop needs real infrastructure
 
-The remaining lifecycle — `sutra arrangement` and `sutra archive
-submission flush`, restore, retention — is wired end to end but needs the
+The remaining lifecycle — `sutra arrangement`, `sutra archive submission
+accumulate` and `sutra archive bundle sweep`, restore, retention — is
+wired end to end but needs the
 Remanence `rem` CLI (set `REM_BIN`), registered pools with an applied
 artifactclass policy, and for encrypted placements a key registry
 directory. See [`reference-config.md`](reference-config.md) for those
