@@ -178,9 +178,27 @@ def stage_and_enqueue_artifact(
     if member.member_path != staged.stored_member_path:
         # The naming ladder disambiguated this member. Staged files keep their
         # on-disk names; the transform chain and the source_metadata copy are
-        # re-keyed onto the enqueue-returned name before recording, so the
-        # final-step equality and the (bundle_id, stored_member_path,
-        # step_order) uniqueness both hold under tagging.
+        # re-keyed onto the enqueue-returned name before recording.
+        #
+        # The tag is a *catalog-name* artifact, so it goes on every catalog
+        # name in the chain and on nothing else:
+        #
+        # * every step's ``stored_member_path`` is tagged — not just the final
+        #   one. The final step needs it for the member equality
+        #   `record_staging_transform` asserts, and every step needs it for the
+        #   (bundle_id, stored_member_path, step_order) unique surface: two
+        #   co-resident classes staging the same logical path through the same
+        #   two-step chain (AppleDouble merge then zstd) collide at
+        #   ``step_order = 0`` unless the intermediate name is tagged too.
+        # * ``original_member_path`` is tagged for steps after the first, so
+        #   step N still links to step N-1's stored name.
+        # * **step 0's ``original_member_path`` is left untagged.** It is the
+        #   one name in the chain that is not a catalog name: it is the
+        #   source's own logical name, the same string
+        #   ``source_metadata["logical_path"]`` holds and the customer manifest
+        #   prints as ``member_name`` (design §5). Tagging it recorded a
+        #   filename no file ever carried, and made the chain contradict the
+        #   receipt about the member's logical name.
         tag = extract_member_tag(staged.stored_member_path, member.member_path)
         if tag is None:
             raise StagingError(
@@ -193,10 +211,14 @@ def stage_and_enqueue_artifact(
             transforms=tuple(
                 dataclasses.replace(
                     transform,
-                    original_member_path=tag_member_path(transform.original_member_path, tag),
+                    original_member_path=(
+                        transform.original_member_path
+                        if index == 0
+                        else tag_member_path(transform.original_member_path, tag)
+                    ),
                     stored_member_path=tag_member_path(transform.stored_member_path, tag),
                 )
-                for transform in staged.transforms
+                for index, transform in enumerate(staged.transforms)
             ),
         )
         if created:

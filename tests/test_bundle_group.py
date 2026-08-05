@@ -1189,6 +1189,197 @@ def test_staging_rekey_crash_retry_is_idempotent(
         assert len(transforms) == 2  # one zstd step per member, no duplicates
 
 
+# --- restore by the name the receipt prints ---------------------------------
+
+
+def _staging_class(
+    s,
+    artifactclass: str,
+    pool_ids: list[str],
+    *,
+    appledouble: str = "off",
+    compression: bool = True,
+) -> ArtifactClassPolicyRecord:
+    """A class in the shared group, with a chosen staging chain length."""
+    policy = _add_class(s, artifactclass, pool_ids, target_bytes=1 << 30)
+    policy.staging_config = {
+        "appledouble": {
+            "action": appledouble,
+            "tool": "sutradhara-parser",
+            "on_error": "hold",
+            "record": True,
+        },
+        "compression": (
+            {"codec": "zstd", "level": 3, "globs": []} if compression else {"codec": "off"}
+        ),
+    }
+    s.flush()
+    return policy
+
+
+def _receipt_member_name(member: BundleMember) -> str:
+    """The `member_name` the customer manifest prints for this member.
+
+    Mirrors ``archive_fanout._customer_manifest_members`` — the receipt reads
+    the logical name and falls back to the stored name when staging recorded
+    none.
+    """
+    logical = (member.source_metadata or {}).get("logical_path")
+    return logical if isinstance(logical, str) and logical else member.member_path
+
+
+def test_tagged_transformed_member_restores_by_its_receipt_name(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """A tagged member's receipt name resolves, and the chain stops lying.
+
+    Guards the iron finding: two classes in one group both zstd-staging
+    ``images/disk.img``. The second is recorded as
+    ``images/disk.<tag>.img.zst``, and the re-key used to rewrite the chain's
+    ``original_member_path`` onto the tagged name too — so
+    ``resolve_member_asset_hash`` raised ``RestoreNameError`` for the very
+    name the second member's own customer manifest prints, while the
+    co-resident first member resolved fine. Two receipts, one ``member_name``,
+    only one of them restorable.
+    """
+    from sutradhara.archive_restore import resolve_member_asset_hash
+    from sutradhara.catalog.models import StagingTransform
+    from sutradhara.staging import stage_and_enqueue_artifact
+
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        first_policy = _staging_class(s, "disk.one", ["pool-a"])
+        second_policy = _staging_class(s, "disk.two", ["pool-a"])
+
+        first = _source(tmp_path / "one" / "images", "disk.img", b"one-bytes" * 20)
+        second = _source(tmp_path / "two" / "images", "disk.img", b"two-bytes" * 20)
+        staged_first = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.one",
+            policy=first_policy,
+            source_path=first,
+            staging_root=tmp_path / "stage-one",
+            member_path="images/disk.img",
+        )
+        staged_second = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.two",
+            policy=second_policy,
+            source_path=second,
+            staging_root=tmp_path / "stage-two",
+            member_path="images/disk.img",
+        )
+        # Both landed in the one group accumulator, and the ladder tagged the
+        # second — the collision this whole case needs.
+        assert staged_first.bundle_id == staged_second.bundle_id
+        assert staged_first.stored_member_path == "images/disk.img.zst"
+        assert staged_second.stored_member_path != "images/disk.img.zst"
+
+        members = {
+            member.artifactclass: member
+            for member in s.scalars(select(BundleMember))
+        }
+        # Both receipts print the same logical name (design §5), so both must
+        # restore by it.
+        assert _receipt_member_name(members["disk.one"]) == "images/disk.img"
+        assert _receipt_member_name(members["disk.two"]) == "images/disk.img"
+        for artifactclass, staged in (
+            ("disk.one", staged_first),
+            ("disk.two", staged_second),
+        ):
+            assert (
+                resolve_member_asset_hash(
+                    s,
+                    artifactclass=artifactclass,
+                    member_name=_receipt_member_name(members[artifactclass]),
+                )
+                == staged.logical_sha256
+            )
+
+        # The chain no longer records a pre-transform name no file ever had:
+        # step 0's original is the source's own logical name, while every
+        # stored name carries the tag.
+        tagged = s.scalars(
+            select(StagingTransform).where(StagingTransform.artifactclass == "disk.two")
+        ).one()
+        assert tagged.step_order == 0
+        assert tagged.original_member_path == "images/disk.img"
+        assert tagged.stored_member_path == members["disk.two"].member_path
+
+
+def test_rekey_tags_every_intermediate_stored_path(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Tagging only the *final* stored name breaks a two-step chain.
+
+    Guards the alternative fix for the finding above. Two classes staging the
+    same logical path through AppleDouble-merge **then** zstd each record two
+    transform rows; their ``step_order = 0`` rows both store the untagged
+    intermediate name, which collides on
+    ``uq_staging_transform_bundle_stored_step`` and lets a raw
+    ``IntegrityError`` escape ``record_staging_transform`` — the one thing §3
+    says never happens. Every stored name carries the tag; only step 0's
+    ``original_member_path``, which is the source's own logical name, does not.
+    """
+    from sutradhara.catalog.models import StagingTransform
+    from sutradhara.staging import stage_and_enqueue_artifact
+
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        first_policy = _staging_class(
+            s, "disk.one", ["pool-a"], appledouble="merge-to-xattrs"
+        )
+        second_policy = _staging_class(
+            s, "disk.two", ["pool-a"], appledouble="merge-to-xattrs"
+        )
+        first = _source(tmp_path / "one" / "images", "disk.img", b"one-bytes" * 20)
+        second = _source(tmp_path / "two" / "images", "disk.img", b"two-bytes" * 20)
+        stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.one",
+            policy=first_policy,
+            source_path=first,
+            staging_root=tmp_path / "stage-one",
+            member_path="images/disk.img",
+        )
+        stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.two",
+            policy=second_policy,
+            source_path=second,
+            staging_root=tmp_path / "stage-two",
+            member_path="images/disk.img",
+        )
+
+        rows = list(
+            s.scalars(
+                select(StagingTransform).order_by(
+                    StagingTransform.artifactclass, StagingTransform.step_order
+                )
+            )
+        )
+        assert [(row.artifactclass, row.step_order) for row in rows] == [
+            ("disk.one", 0),
+            ("disk.one", 1),
+            ("disk.two", 0),
+            ("disk.two", 1),
+        ]
+        keys = {(row.bundle_id, row.stored_member_path, row.step_order) for row in rows}
+        assert len(keys) == len(rows)
+
+        by_class: dict[str, list[StagingTransform]] = {}
+        for row in rows:
+            by_class.setdefault(row.artifactclass, []).append(row)
+        tagged_steps = by_class["disk.two"]
+        # The intermediate stored name is tagged (this is what the unique
+        # surface needs), and the chain still links step 1 to step 0.
+        assert tagged_steps[0].stored_member_path != "images/disk.img"
+        assert tagged_steps[1].original_member_path == tagged_steps[0].stored_member_path
+        # Step 0's original is untagged in both chains: it is the logical name.
+        assert by_class["disk.one"][0].original_member_path == "images/disk.img"
+        assert tagged_steps[0].original_member_path == "images/disk.img"
+
+
 # --- migration (§7 order) ---------------------------------------------------
 
 
