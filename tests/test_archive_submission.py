@@ -13,7 +13,14 @@ import pytest
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_fanout import BuildArtifact, BuiltMember, MemberInput
+from sutradhara.archive_bundle import enqueue_artifact
+from sutradhara.archive_fanout import (
+    ArchiveFanoutError,
+    BuildArtifact,
+    BuiltMember,
+    MemberInput,
+    flush_bundle,
+)
 from sutradhara.archive_restore import (
     RestoreNameError,
     resolve_member_asset_hash,
@@ -27,12 +34,14 @@ from sutradhara.artifactclass_policy import (
     DurabilityPolicy,
     PlacementPolicy,
     apply_artifactclass_policy,
+    get_artifactclass_policy,
 )
 from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, VerifyResult
 from sutradhara.catalog.models import (
     AssetLocator,
     Backend,
     Bundle,
+    BundleMember,
     Copy,
     IngestItem,
     Intake,
@@ -206,63 +215,343 @@ class _MapArchiveBuilder:
         return backend.read_range(copy_locator, ByteRange(start, start + member.size_bytes))
 
 
-def test_archive_submission_fans_out_and_restores_arranged_member(
+def _flush_all(
+    engine: Engine,
+    setup: _Setup,
+    *,
+    builder: Any = None,
+) -> tuple[_WriteBackend, _WriteBackend]:
+    """Seal every open bundle, the way the sweeper does. Returns the backends."""
+    rem_backend = _WriteBackend("rem")
+    d2_backend = _WriteBackend("d2")
+    with session_scope(engine) as session:
+        for bundle in session.scalars(select(Bundle).where(Bundle.status == "open")):
+            flush_bundle(
+                session,
+                bundle_id=bundle.id,
+                backends={
+                    setup.rem_backend_id: rem_backend,
+                    setup.d2_backend_id: d2_backend,
+                },
+                builder=builder or _MapArchiveBuilder(),
+                key_epoch=ARCHIVE_EPOCH,
+            )
+    return rem_backend, d2_backend
+
+
+def test_two_submissions_and_intake_members_converge_into_one_object(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
-    setup = _create_submission(
+    """The point of the arc, at the submission seam.
+
+    Guards: the retired ``bundle-{submission-id}`` contract coming back. Each
+    submission used to mint and immediately flush its own object, so three
+    small deliveries with identical storage placement became three small
+    objects — three bootstrap rows, three short seals. They now share one
+    accumulator and seal as one.
+    """
+    first = _create_submission(engine, tmp_path, intake_id="intake-a", submission_id="submit-a")
+    second = _create_submission(
         engine,
         tmp_path,
-        moves={"clip-a.mov": "arranged/day-1/clip-a.mov"},
+        intake_id="intake-b",
+        submission_id="submit-b",
+        files={"clip-c.mov": b"gamma-body", "clip-d.mov": b"delta-body"},
     )
-    rem_backend = _WriteBackend("rem")
-    d2_backend = _WriteBackend("d2")
-    builder = _MapArchiveBuilder()
 
     with session_scope(engine) as session:
-        result = archive_submission(
+        first_result = archive_submission(session, first.submission_id)
+        second_result = archive_submission(session, second.submission_id)
+        # An intake enqueue for the same class lands in the same accumulator.
+        extra = tmp_path / "intake-extra.tif"
+        extra.write_bytes(b"extra-body")
+        extra_hash = hashlib.sha256(b"extra-body").digest()
+        session.add(LogicalAsset(content_sha256=extra_hash, size_bytes=len(b"extra-body")))
+        session.flush()
+        accumulator, _, _ = enqueue_artifact(
             session,
-            setup.submission_id,
+            artifactclass="s-masters",
+            policy=get_artifactclass_policy(session, "s-masters"),
+            logical_asset_hash=extra_hash,
+            source_path=extra,
+            member_path="intake-extra.tif",
+        )
+
+        assert first_result.bundle_ids == second_result.bundle_ids == (accumulator.id,)
+        assert accumulator.status == "open"
+        assert accumulator.member_count == 5
+        # Nothing is on media yet, so neither submission is archived.
+        assert first_result.archived is False
+        assert second_result.archived is False
+        assert session.get(Submission, first.submission_id).status == (
+            SubmissionStatus.ACCUMULATED
+        )
+
+    rem_backend, d2_backend = _flush_all(engine, first)
+    with session_scope(engine) as session:
+        bundles = list(session.scalars(select(Bundle)))
+        assert len(bundles) == 1
+        assert bundles[0].status == "sealed"
+        assert bundles[0].member_count == 5
+    # One object per pool, not one per submission.
+    assert rem_backend.writes == ["offsite-pool", "working-pool"]
+    assert d2_backend.writes == ["d2-shelf-pool"]
+
+
+def test_result_shape_carries_bundle_ids_by_opened_at_and_copies_per_bundle(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """A submission split across a seal boundary.
+
+    Guards: the flat ``bundle_id``/``copy_ids`` pair, which cannot express a
+    split submission — it would name one of the two bundles and silently drop
+    the other's copies from the caller's view. The result is
+    ``bundle_ids`` ordered by ``opened_at`` plus a per-bundle copy mapping,
+    identical on a re-entrant call.
+    """
+    setup = _create_submission(engine, tmp_path)
+    with session_scope(engine) as session:
+        members = list(
+            session.scalars(
+                select(SubmissionMember)
+                .where(SubmissionMember.submission_id == setup.submission_id)
+                .order_by(SubmissionMember.ord)
+            )
+        )
+        # Append the first member, then seal the accumulator under it, so the
+        # second member has to open a new one.
+        first_only = members[0]
+        remaining = members[1:]
+        for member in remaining:
+            session.delete(member)
+        session.flush()
+        archive_submission(session, setup.submission_id)
+        first_bundle_id = session.scalars(
+            select(Bundle.id).where(Bundle.status == "open")
+        ).one()
+
+    _flush_all(engine, setup)
+
+    with session_scope(engine) as session:
+        submission = session.get(Submission, setup.submission_id)
+        for ordinal, member in enumerate(remaining, start=1):
+            session.add(
+                SubmissionMember(
+                    submission_id=submission.id,
+                    ingest_item_id=member.ingest_item_id,
+                    archive_path=member.archive_path,
+                    source_path=member.source_path,
+                    sha256=member.sha256,
+                    size_bytes=member.size_bytes,
+                    ord=ordinal,
+                )
+            )
+        session.flush()
+        result = archive_submission(session, submission.id)
+        second_bundle_id = next(
+            bundle_id for bundle_id in result.bundle_ids if bundle_id != first_bundle_id
+        )
+        assert result.bundle_ids == (first_bundle_id, second_bundle_id)
+        # Ordered by opened_at: the sealed bundle first.
+        assert list(result.copies_by_bundle[first_bundle_id]) != []
+        assert result.copies_by_bundle[second_bundle_id] == ()
+        assert result.archived is False
+
+        # Re-entrant call: same shape, no second append, no duplicate members.
+        replay = archive_submission(session, submission.id)
+        assert replay.noop is True
+        assert replay.bundle_ids == result.bundle_ids
+        assert replay.copies_by_bundle == result.copies_by_bundle
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(BundleMember)
+                .where(BundleMember.bundle_id == second_bundle_id)
+            )
+            == 1
+        )
+    assert first_only is members[0]
+
+
+def test_crash_retry_after_a_partial_append_is_a_no_op_for_landed_members(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """Guards: a retry duplicating the members that already landed.
+
+    Re-entrancy is a member-presence check over ``SubmissionMember``, not a
+    bundle-id probe — the per-submission bundle id no longer exists, so a
+    crash-retry has nothing to look up and must reason from the members
+    themselves.
+    """
+    setup = _create_submission(engine, tmp_path)
+    with session_scope(engine) as session:
+        members = list(
+            session.scalars(
+                select(SubmissionMember)
+                .where(SubmissionMember.submission_id == setup.submission_id)
+                .order_by(SubmissionMember.ord)
+            )
+        )
+        # Simulate a crash after the first member appended: append it by hand
+        # through the same funnel, with the same recorded linkage.
+        enqueue_artifact(
+            session,
+            artifactclass="s-masters",
+            policy=get_artifactclass_policy(session, "s-masters"),
+            logical_asset_hash=members[0].sha256,
+            source_path=Path(members[0].source_path),
+            member_path=members[0].archive_path,
+            member_path_is_escaped=True,
+            size_bytes=members[0].size_bytes,
+            file_sha256=members[0].sha256,
+            source_metadata={
+                "submission_id": setup.submission_id,
+                "submission_member_id": members[0].id,
+            },
+        )
+        member_count_before = session.scalar(select(func.count()).select_from(BundleMember))
+        assert member_count_before == 1
+
+        result = archive_submission(session, setup.submission_id)
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == len(members)
+        assert len(result.bundle_ids) == 1
+
+        # A second retry adds nothing at all.
+        again = archive_submission(session, setup.submission_id)
+        assert again.noop is True
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == len(members)
+
+
+def test_identity_mismatch_is_caught_before_any_physical_write(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """P4 gate condition C3, closed.
+
+    The old per-submission validator early-returned for representations
+    outside the RAO family, and basis-ordered fan-out sorts the D2 shelf pool
+    first — so an identity mismatch was caught only *after* the shelf write and
+    left a media-only orphan. The identity gate is now catalog-grain and runs
+    once, before any build and before any physical write, for every
+    representation. Both backends must be untouched.
+    """
+    setup = _create_submission(engine, tmp_path)
+    with session_scope(engine) as session:
+        archive_submission(session, setup.submission_id)
+        # The submission row and the catalog member now disagree: exactly the
+        # class of defect the pre-write gate exists to catch.
+        member = session.scalars(
+            select(SubmissionMember)
+            .where(SubmissionMember.submission_id == setup.submission_id)
+            .order_by(SubmissionMember.ord)
+        ).first()
+        member.size_bytes = member.size_bytes + 1
+        session.flush()
+        bundle_id = session.scalars(select(Bundle.id).where(Bundle.status == "open")).one()
+
+    builder = _MapArchiveBuilder()
+    rem_backend = _WriteBackend("rem")
+    d2_backend = _WriteBackend("d2")
+    with (
+        pytest.raises(ArchiveFanoutError, match="submission member"),
+        session_scope(engine) as session,
+    ):
+        flush_bundle(
+            session,
+            bundle_id=bundle_id,
             backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
             builder=builder,
             key_epoch=ARCHIVE_EPOCH,
         )
 
-        assert result.archived is True
-        assert result.noop is False
-        assert result.bundle_id == f"submission-{setup.submission_id}"
-        submission = session.get(Submission, setup.submission_id)
-        assert submission is not None
-        assert submission.status == SubmissionStatus.ARCHIVED
-        bundle = session.get(Bundle, result.bundle_id)
-        assert bundle is not None
-        assert bundle.status == "sealed"
-        copies = list(session.scalars(select(Copy).where(Copy.bundle_id == result.bundle_id)))
-        assert copies
-        assert all(copy.last_checked_at is not None for copy in copies)
-        # The flush renders its own catalog map now; the frozen submit-time
-        # map stays the integrity artifact but is no longer the build input.
-        assert bundle.scan_summary is not None
-        assert bundle.scan_summary["mode"] == "map"
-        assert bundle.scan_summary["member_count"] == 2
-        rendered_digest = bundle.scan_summary["map_sha256"]
-        assert isinstance(rendered_digest, str)
-        assert len(rendered_digest) == 64
-        # The builder received exactly that rendered map (digest handoff).
-        assert {call[3] for call in builder.calls} == {rendered_digest}
+    # Nothing was built and nothing reached ANY backend — no media-only orphan.
+    assert builder.calls == []
+    assert rem_backend.writes == []
+    assert d2_backend.writes == []
+    with session_scope(engine) as session:
+        assert list(session.scalars(select(Copy))) == []
+        assert list(session.scalars(select(AssetLocator))) == []
+        # And the un-claim: the bundle is open and flushable again once fixed.
+        assert session.get(Bundle, bundle_id).status == "open"
+        assert session.get(Bundle, bundle_id).claimed_by is None
 
-        locators = list(
-            session.scalars(select(AssetLocator).where(AssetLocator.bundle_id == result.bundle_id))
+
+def test_builder_that_echoes_a_wrong_ingest_item_id_is_caught_before_its_write(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """Guards: a builder mis-associating a member with someone else's lineage.
+
+    Every target is built and validated before the first
+    ``write_object_to_pool``, so a defect the builder introduces on the second
+    representation still costs no media.
+    """
+    setup = _create_submission(
+        engine,
+        tmp_path,
+        moves={"clip-a.mov": "arranged/day-1/clip-a.mov"},
+    )
+    with session_scope(engine) as session:
+        archive_submission(session, setup.submission_id)
+        bundle_id = session.scalars(select(Bundle.id).where(Bundle.status == "open")).one()
+
+    builder = _MapArchiveBuilder(bad_ingest_path="arranged/day-1/clip-a.mov")
+    rem_backend = _WriteBackend("rem")
+    d2_backend = _WriteBackend("d2")
+    with (
+        pytest.raises(ArchiveFanoutError, match="echoed ingest_item_id"),
+        session_scope(engine) as session,
+    ):
+        flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
+            builder=builder,
+            key_epoch=ARCHIVE_EPOCH,
         )
-        assert len(locators) == 6
-        by_pool = {
-            locator.pool_id: locator
-            for locator in locators
-            if locator.member_path.endswith("clip-a.mov")
-        }
-        assert by_pool["working-pool"].native_locator["first_chunk_lba"] == 1
-        assert "first_chunk_lba" in by_pool["offsite-pool"].native_locator
-        assert "block_range" in by_pool["d2-shelf-pool"].native_locator
+
+    assert builder.calls
+    assert rem_backend.writes == []
+    # The D2 shelf pool sorts first in basis order and used to be written
+    # before the RAO-family mismatch surfaced. It is not written now.
+    assert d2_backend.writes == []
+    with session_scope(engine) as session:
+        assert list(session.scalars(select(Copy))) == []
+        assert list(session.scalars(select(AssetLocator))) == []
+
+
+def test_accumulated_material_restores_and_reports_archived_once_verified(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """The whole path: append, seal, restore an arranged member by name, and
+    only then report the submission archived.
+
+    Guards: reporting archived at append (material in an open bundle is not
+    archive evidence) and losing member-name resolution across the retired
+    per-submission bundle.
+    """
+    setup = _create_submission(
+        engine,
+        tmp_path,
+        moves={"clip-a.mov": "arranged/day-1/clip-a.mov"},
+    )
+    with session_scope(engine) as session:
+        result = archive_submission(session, setup.submission_id)
+        assert result.archived is False
+        assert result.copy_ids == ()
+
+    rem_backend, d2_backend = _flush_all(engine, setup)
+
+    with session_scope(engine) as session:
+        result = archive_submission(session, setup.submission_id)
+        assert result.noop is True
+        assert result.archived is True
+        assert session.get(Submission, setup.submission_id).status == SubmissionStatus.ARCHIVED
+        assert len(result.copy_ids) == 3
 
         resolved = resolve_member_asset_hash(
             session,
@@ -280,115 +569,36 @@ def test_archive_submission_fans_out_and_restores_arranged_member(
         )
         assert restored.read_bytes() == b"alpha-body"
 
-    # Fan-out order is group_basis order — pool id, canonically sorted (§2/§5)
-    # — not the class's placement sort_order: d2-shelf-pool, offsite-pool,
-    # working-pool. Placement order is operational state and never re-orders
-    # or re-partitions a group.
-    assert [call[0] for call in builder.calls] == [
-        Representation.RAO_AEAD_V1,
-        Representation.RAO_PLAIN_V1,
-    ]
-    assert rem_backend.writes == ["offsite-pool", "working-pool"]
-    assert d2_backend.writes == ["d2-shelf-pool"]
+    # A real member name that was never arranged still misses cleanly.
+    with session_scope(engine) as session, pytest.raises(RestoreNameError, match="no catalog"):
+        resolve_member_asset_hash(
+            session,
+            artifactclass="s-masters",
+            member_name="arranged/day-1/does-not-exist.mov",
+        )
 
 
-def test_archive_submission_noop_replay_writes_nothing(
+def test_source_drift_fails_before_any_append(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
+    """Guards: appending a member whose bytes no longer match the frozen
+    manifest. The digest check runs at append, which is now the only place
+    the submission touches the source at all."""
     setup = _create_submission(engine, tmp_path)
-    rem_backend = _WriteBackend("rem")
-    d2_backend = _WriteBackend("d2")
-    with session_scope(engine) as session:
-        archive_submission(
-            session,
-            setup.submission_id,
-            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
-            builder=_MapArchiveBuilder(),
-            key_epoch=ARCHIVE_EPOCH,
-        )
-
-    with session_scope(engine) as session:
-        copy_count = session.scalar(select(func.count()).select_from(Copy))
-        locator_count = session.scalar(select(func.count()).select_from(AssetLocator))
-        result = archive_submission(
-            session,
-            setup.submission_id,
-            backends={},
-            builder=_MapArchiveBuilder(),
-            key_epoch=ARCHIVE_EPOCH,
-        )
-        assert result.noop is True
-        assert session.scalar(select(func.count()).select_from(Copy)) == copy_count
-        assert session.scalar(select(func.count()).select_from(AssetLocator)) == locator_count
-
-
-def test_partial_failure_rolls_back_catalog_and_retry_rearchives(
-    engine: Engine,
-    tmp_path: Path,
-) -> None:
-    setup = _create_submission(engine, tmp_path)
-    rem_backend = _WriteBackend("rem", fail_on_write=2)
-    d2_backend = _WriteBackend("d2")
-
-    with (
-        pytest.raises(RuntimeError, match="configured write failure"),
-        session_scope(engine) as session,
-    ):
-        archive_submission(
-            session,
-            setup.submission_id,
-            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
-            builder=_MapArchiveBuilder(),
-            key_epoch=ARCHIVE_EPOCH,
-        )
-
-    assert len(rem_backend.objects) == 1
-    with session_scope(engine) as session:
-        assert session.scalar(select(func.count()).select_from(Bundle)) == 0
-        assert session.scalar(select(func.count()).select_from(Copy)) == 0
-        assert session.scalar(select(func.count()).select_from(AssetLocator)) == 0
-        submission = session.get(Submission, setup.submission_id)
-        assert submission is not None
-        assert submission.status == SubmissionStatus.PENDING_ARCHIVE
-
-    rem_backend.fail_on_write = None
-    with session_scope(engine) as session:
-        result = archive_submission(
-            session,
-            setup.submission_id,
-            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
-            builder=_MapArchiveBuilder(),
-            key_epoch=ARCHIVE_EPOCH,
-        )
-        assert result.archived is True
-        assert session.scalar(select(func.count()).select_from(Bundle)) == 1
-
-
-def test_source_drift_fails_before_build_or_write(
-    engine: Engine,
-    tmp_path: Path,
-) -> None:
-    setup = _create_submission(engine, tmp_path)
-    source = setup.source_paths["clip-a.mov"]
-    source.write_bytes(b"ALPHA-body")
-    builder = _MapArchiveBuilder()
-    rem_backend = _WriteBackend("rem")
+    setup.source_paths["clip-a.mov"].write_bytes(b"ALPHA-body")
 
     with pytest.raises(ArchiveSubmissionError, match="hashes to"), session_scope(engine) as session:
-        archive_submission(
-            session,
-            setup.submission_id,
-            backends={setup.rem_backend_id: rem_backend},
-            builder=builder,
-            key_epoch=ARCHIVE_EPOCH,
+        archive_submission(session, setup.submission_id)
+
+    with session_scope(engine) as session:
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == 0
+        assert session.get(Submission, setup.submission_id).status == (
+            SubmissionStatus.PENDING_ARCHIVE
         )
 
-    assert builder.calls == []
-    assert rem_backend.writes == []
 
-
-def test_source_root_escape_fails_before_build_or_write(
+def test_source_root_escape_fails_before_any_append(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -399,69 +609,45 @@ def test_source_root_escape_fails_before_build_or_write(
         member = session.scalar(
             select(SubmissionMember).where(SubmissionMember.submission_id == setup.submission_id)
         )
-        assert member is not None
         member.source_path = str(outside)
 
-    builder = _MapArchiveBuilder()
-    rem_backend = _WriteBackend("rem")
     with (
         pytest.raises(ArchiveSubmissionError, match="escapes source root"),
         session_scope(engine) as session,
     ):
-        archive_submission(
-            session,
-            setup.submission_id,
-            backends={setup.rem_backend_id: rem_backend},
-            builder=builder,
-            key_epoch=ARCHIVE_EPOCH,
-        )
+        archive_submission(session, setup.submission_id)
 
-    assert builder.calls == []
-    assert rem_backend.writes == []
+    with session_scope(engine) as session:
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == 0
 
 
 def test_archive_refuses_tampered_source_map(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
-    # Per-member source drift is covered elsewhere; this guards the frozen
-    # source-map *receipt* itself (archive_submission._verified_source_map_path).
+    """The frozen submit-time map is no longer the build instruction, but it is
+    still the arrangement's integrity artifact and its digest still gates the
+    append (``_verified_source_map_path``)."""
     setup = _create_submission(
         engine,
         tmp_path,
         moves={"clip-a.mov": "arranged/day-1/clip-a.mov"},
     )
     with session_scope(engine) as session:
-        submission = session.get(Submission, setup.submission_id)
-        assert submission is not None
-        source_map = Path(submission.source_map_path)
-    # Tamper the frozen receipt after submit, before archive.
+        source_map = Path(session.get(Submission, setup.submission_id).source_map_path)
     source_map.write_bytes(source_map.read_bytes() + b"# tampered\n")
 
-    builder = _MapArchiveBuilder()
-    rem_backend = _WriteBackend("rem")
-    d2_backend = _WriteBackend("d2")
     with (
         pytest.raises(ArchiveSubmissionError, match="digest drifted"),
         session_scope(engine) as session,
     ):
-        archive_submission(
-            session,
-            setup.submission_id,
-            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
-            builder=builder,
-            key_epoch=ARCHIVE_EPOCH,
-        )
+        archive_submission(session, setup.submission_id)
 
-    assert builder.calls == []
-    assert rem_backend.writes == []
     with session_scope(engine) as session:
-        assert session.scalar(select(func.count()).select_from(Bundle)) == 0
-        assert session.scalar(select(func.count()).select_from(Copy)) == 0
-        assert session.scalar(select(func.count()).select_from(AssetLocator)) == 0
-        submission = session.get(Submission, setup.submission_id)
-        assert submission is not None
-        assert submission.status == SubmissionStatus.PENDING_ARCHIVE
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == 0
+        assert session.get(Submission, setup.submission_id).status == (
+            SubmissionStatus.PENDING_ARCHIVE
+        )
 
 
 def test_archive_refuses_missing_source_map(
@@ -470,136 +656,19 @@ def test_archive_refuses_missing_source_map(
 ) -> None:
     setup = _create_submission(engine, tmp_path)
     with session_scope(engine) as session:
-        submission = session.get(Submission, setup.submission_id)
-        assert submission is not None
-        source_map = Path(submission.source_map_path)
-    source_map.unlink()
+        Path(session.get(Submission, setup.submission_id).source_map_path).unlink()
 
-    builder = _MapArchiveBuilder()
-    rem_backend = _WriteBackend("rem")
     with (
         pytest.raises(ArchiveSubmissionError, match="source-map is missing"),
         session_scope(engine) as session,
     ):
-        archive_submission(
-            session,
-            setup.submission_id,
-            backends={setup.rem_backend_id: rem_backend},
-            builder=builder,
-            key_epoch=ARCHIVE_EPOCH,
-        )
+        archive_submission(session, setup.submission_id)
 
-    assert builder.calls == []
-    assert rem_backend.writes == []
     with session_scope(engine) as session:
-        assert session.scalar(select(func.count()).select_from(Bundle)) == 0
-        submission = session.get(Submission, setup.submission_id)
-        assert submission is not None
-        assert submission.status == SubmissionStatus.PENDING_ARCHIVE
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == 0
 
 
-def test_resolve_member_rejects_valid_but_absent_name(
-    engine: Engine,
-    tmp_path: Path,
-) -> None:
-    setup = _create_submission(
-        engine,
-        tmp_path,
-        moves={"clip-a.mov": "arranged/day-1/clip-a.mov"},
-    )
-    with session_scope(engine) as session:
-        archive_submission(
-            session,
-            setup.submission_id,
-            backends={
-                setup.rem_backend_id: _WriteBackend("rem"),
-                setup.d2_backend_id: _WriteBackend("d2"),
-            },
-            builder=_MapArchiveBuilder(),
-            key_epoch=ARCHIVE_EPOCH,
-        )
-        # The arranged member resolves to its asset hash...
-        assert (
-            resolve_member_asset_hash(
-                session,
-                artifactclass="s-masters",
-                member_name="arranged/day-1/clip-a.mov",
-            )
-            == setup.asset_hashes["arranged/day-1/clip-a.mov"]
-        )
-        # ...but a well-formed name that was never arranged misses cleanly (not a crash).
-        with pytest.raises(RestoreNameError, match="no catalog member"):
-            resolve_member_asset_hash(
-                session,
-                artifactclass="s-masters",
-                member_name="arranged/day-1/does-not-exist.mov",
-            )
-        # A real member name under the wrong artifactclass also misses (no cross-class leak).
-        with pytest.raises(RestoreNameError, match="no catalog member"):
-            resolve_member_asset_hash(
-                session,
-                artifactclass="s-proxy",
-                member_name="arranged/day-1/clip-a.mov",
-            )
-
-
-def test_identity_mismatch_rolls_back_catalog_but_leaves_a_media_only_orphan(
-    engine: Engine,
-    tmp_path: Path,
-) -> None:
-    """What the identity cross-check does, and what it no longer prevents.
-
-    The check runs per target, inside that target's savepoint, before that
-    target's pool write — so a mismatch aborts the whole fan-out and the
-    catalog is left exactly as it was: no ``Copy``, no ``AssetLocator``, no
-    submission row moved.
-
-    It is no longer true that *no* backend write happens first. The mechanism:
-    ``_validate_artifact_members`` early-returns for representations outside
-    the RAO family, and basis-order fan-out (§2/§5) now sorts the D2 shelf pool
-    first — so the unchecked D2 write lands before the mismatch is caught on
-    the next target. The residue is media with no catalog row pointing at it: a
-    media-only orphan, not an inconsistent catalog. Flagged for the
-    submission-build rework, which retires this per-submission build entirely;
-    this test pins the behaviour as it stands, including that residue.
-
-    The fix — pre-write identity validation for every representation, not just
-    the RAO family — is scoped into
-    ``journal/sutradhara/prompt-bg-p3-sweeper-convergence.md`` scope item 3.
-    """
-    setup = _create_submission(
-        engine,
-        tmp_path,
-        moves={"clip-a.mov": "arranged/day-1/clip-a.mov"},
-    )
-    builder = _MapArchiveBuilder(bad_ingest_path="arranged/day-1/clip-a.mov")
-    rem_backend = _WriteBackend("rem")
-    d2_backend = _WriteBackend("d2")
-
-    with (
-        pytest.raises(ArchiveSubmissionError, match="ingest_item_id"),
-        session_scope(engine) as session,
-    ):
-        archive_submission(
-            session,
-            setup.submission_id,
-            backends={setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend},
-            builder=builder,
-            key_epoch=ARCHIVE_EPOCH,
-        )
-
-    assert builder.calls
-    # No checked (RAO-family) representation is ever written.
-    assert rem_backend.writes == []
-    # The unchecked D2 shelf write lands first and is the media-only orphan.
-    assert d2_backend.writes == ["d2-shelf-pool"]
-    # The catalog is consistent: nothing points at that orphan.
-    with session_scope(engine) as session:
-        assert list(session.scalars(select(Copy))) == []
-        assert list(session.scalars(select(AssetLocator))) == []
-
-
-def test_long_paths_archive_through_widened_member_path_and_source_metadata(
+def test_long_paths_accumulate_and_archive_through_the_group_bundle(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -614,19 +683,12 @@ def test_long_paths_archive_through_widened_member_path_and_source_metadata(
     assert len(str(setup.source_paths["clip-a.mov"])) > 2048
 
     with session_scope(engine) as session:
-        result = archive_submission(
-            session,
-            setup.submission_id,
-            backends={
-                setup.rem_backend_id: _WriteBackend("rem"),
-                setup.d2_backend_id: _WriteBackend("d2"),
-            },
-            builder=_MapArchiveBuilder(),
-            key_epoch=ARCHIVE_EPOCH,
-        )
+        archive_submission(session, setup.submission_id)
+    _flush_all(engine, setup)
+
+    with session_scope(engine) as session:
+        result = archive_submission(session, setup.submission_id)
         assert result.archived is True
-        bundle_member = session.scalar(select(Bundle).where(Bundle.id == result.bundle_id))
-        assert bundle_member is not None
         assert (
             session.scalar(
                 select(func.count())
@@ -638,6 +700,10 @@ def test_long_paths_archive_through_widened_member_path_and_source_metadata(
 
 
 def _install_policy(session: Session) -> tuple[int, int]:
+    existing_rem = session.scalars(select(Backend).where(Backend.name == "rem")).first()
+    if existing_rem is not None:
+        d2 = session.scalars(select(Backend).where(Backend.name == "d2")).one()
+        return existing_rem.id, d2.id
     rem = Backend(name="rem", kind=BackendKind.REM_TAPE, tier=BackendTier.SELF_DESCRIBING)
     d2 = Backend(name="d2", kind=BackendKind.D2_TAPE, tier=BackendTier.SELF_DESCRIBING)
     session.add_all([rem, d2])
@@ -687,20 +753,24 @@ def _create_submission(
     *,
     moves: dict[str, str] | None = None,
     long_source_for: str | None = None,
+    intake_id: str = "intake-a",
+    submission_id: str = "submit-a",
+    files: dict[str, bytes] | None = None,
 ) -> _Setup:
     with session_scope(engine) as session:
         rem_id, d2_id = _install_policy(session)
         items = _registered_intake(
             session,
             tmp_path,
-            "intake-a",
-            {
+            intake_id,
+            files
+            or {
                 "clip-a.mov": b"alpha-body",
                 "clip-b.mov": b"beta-body",
             },
             long_source_for=long_source_for,
         )
-        arrangement = create_from_intake(session, "intake-a", label="archive")
+        arrangement = create_from_intake(session, intake_id, label="archive")
         for from_path, to_path in (moves or {}).items():
             move_member(session, arrangement.id, from_path, to_path)
         result = submit_arrangement(
@@ -708,7 +778,7 @@ def _create_submission(
             arrangement.id,
             submitted_by="tester",
             submission_root=tmp_path / "submissions",
-            submission_id="submit-a",
+            submission_id=submission_id,
         )
         source_paths = {
             relpath: Path(str(item.item_metadata["source_path"])) for relpath, item in items.items()

@@ -1,94 +1,107 @@
-"""Archive frozen arrangement submissions through the bundle fan-out path.
+"""Converge frozen arrangement submissions onto the group accumulator.
 
-P2.5 turns a P2.3a submission source-map into a deterministic open Bundle, then
-reuses ``flush_bundle`` for policy fan-out. The function owns source-root
-proofs, pre-write source re-verification, and rem map-report identity checks;
-the caller owns the SQL transaction and commit.
+The per-submission bundle is retired (design-bundle-groups §4). A submission no
+longer mints ``bundle-{submission-id}`` and no longer drives its own build:
+it appends its members to the open accumulator for its class's bundle group,
+exactly as an intake enqueue does, and the sweeper flushes that accumulator
+when ``bundle_due`` says so. Two submissions and an intake batch that share a
+storage placement therefore converge into one object.
+
+What that changes, stated:
+
+- **The submit-time map stops being the build instruction.** It stays what it
+  truly is — the arrangement's frozen integrity artifact — and its digest is
+  still verified here. The build instruction is the flush-time catalog map
+  ``flush_bundle`` renders from the bundle's own member rows.
+- **Member integrity is verified at append**, against the submission manifest,
+  as ``_verify_sources`` already did. The widened append-to-flush window is
+  guarded on the far side by ``validate_submission_member_identity`` (pre-write,
+  every representation) and by rem's writer hashing the streamed payload
+  against the map's digest column.
+- **Submission status is derived.** ``accumulated`` is written at append.
+  ``archived`` is true only when every member sits in a sealed bundle whose
+  copies satisfy the member's class ``min_copies`` in verified state —
+  ``sutradhara.archive_predicate``. Material in an open bundle is not archive
+  evidence and releases no source hold.
+- **The result shape is a mapping, not a pair.** A seal boundary may split a
+  submission across bundles, which the flat ``bundle_id``/``copy_ids`` pair
+  cannot express: ``bundle_ids`` is ordered by the bundles' ``opened_at`` and
+  ``copies_by_bundle`` maps each to its copy ids. Re-entrant calls return the
+  same shape.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import hashlib
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_bundle import add_bundle_member
-from sutradhara.archive_fanout import ArchiveBuilder, BuildArtifact, RemArchiveBuilder, flush_bundle
+from sutradhara.archive_bundle import enqueue_artifact
+from sutradhara.archive_predicate import submission_is_archived
 from sutradhara.artifactclass_policy import get_artifactclass_policy
-from sutradhara.bundle_group import (
-    BASIS_SOURCE_DERIVED,
-    compute_bundle_group,
-    group_basis_document,
-)
-from sutradhara.catalog.models import Bundle, Copy, Submission, SubmissionMember
+from sutradhara.catalog.models import Bundle, BundleMember, Copy, Submission, SubmissionMember
 from sutradhara.catalog.types import SubmissionStatus
 from sutradhara.rem_archive_cli import sha256_file
-from sutradhara.replication import PoolTarget, WritableStorageBackend
-from sutradhara.sealing.port import Representation
 
 
 class ArchiveSubmissionError(ValueError):
-    """The submitted source-map cannot be archived safely."""
+    """The submitted source-map cannot be accumulated safely."""
 
 
 @dataclass(frozen=True)
 class ArchiveSubmissionResult:
-    """Summary of a submission archive attempt."""
+    """Where one submission's members currently live.
+
+    ``bundle_ids`` is ordered by the bundles' ``opened_at`` (ties broken by id),
+    and ``copies_by_bundle`` carries each bundle's recorded copy ids — empty
+    for a bundle that is still open. ``archived`` is the derived predicate, not
+    a stored flag.
+    """
 
     submission_id: str
-    bundle_id: str
-    copy_ids: tuple[int, ...]
+    bundle_ids: tuple[str, ...]
+    copies_by_bundle: dict[str, tuple[int, ...]]
     archived: bool
     noop: bool = False
 
+    @property
+    def copy_ids(self) -> tuple[int, ...]:
+        """Every copy id across the submission's bundles, in bundle order."""
+        return tuple(
+            copy_id
+            for bundle_id in self.bundle_ids
+            for copy_id in self.copies_by_bundle.get(bundle_id, ())
+        )
 
-def archive_submission(
-    session: Session,
-    submission_id: str,
-    *,
-    backends: dict[int, WritableStorageBackend],
-    builder: ArchiveBuilder | None = None,
-    key_epoch: str | None = None,
-    tape_capacity_bytes: int | None = None,
-) -> ArchiveSubmissionResult:
-    """Archive one pending submission without committing the caller's session."""
+
+def archive_submission(session: Session, submission_id: str) -> ArchiveSubmissionResult:
+    """Append one pending submission to its group accumulator.
+
+    Re-entrancy is a **member-presence check**, not a bundle-id probe: the
+    per-submission bundle id no longer exists, and a crash-retry after a
+    partial append must land the remaining members without duplicating the
+    ones already recorded. Every member already present is skipped by the
+    naming ladder's idempotency rung; the result shape is identical on every
+    re-entrant call.
+    """
 
     submission = session.get(Submission, submission_id)
     if submission is None:
         raise ArchiveSubmissionError(f"no submission {submission_id!r}")
-    bundle_id = _bundle_id(submission.id)
-    if submission.status == SubmissionStatus.ARCHIVED:
-        copy_ids = tuple(
-            session.scalars(select(Copy.id).where(Copy.bundle_id == bundle_id).order_by(Copy.id))
-        )
-        return ArchiveSubmissionResult(
-            submission_id=submission.id,
-            bundle_id=bundle_id,
-            copy_ids=copy_ids,
-            archived=True,
-            noop=True,
-        )
-    if submission.status != SubmissionStatus.PENDING_ARCHIVE:
+    if submission.status not in {
+        SubmissionStatus.PENDING_ARCHIVE,
+        SubmissionStatus.ACCUMULATED,
+        SubmissionStatus.ARCHIVED,
+    }:
         raise ArchiveSubmissionError(
-            f"submission {submission.id!r} is {submission.status!r}; expected pending_archive"
-        )
-    if session.get(Bundle, bundle_id) is not None:
-        raise ArchiveSubmissionError(
-            f"pending submission {submission.id!r} already has bundle {bundle_id!r}"
+            f"submission {submission.id!r} is {submission.status!r}; "
+            "expected pending_archive, accumulated, or archived"
         )
 
-    # The frozen submit-time map is the arrangement's integrity artifact:
-    # its digest check still gates the flush, but the build instruction is
-    # the flush-time catalog map that flush_bundle renders from the bundle's
-    # own member rows (design-bundle-groups §4). For a single-submission
-    # bundle the rendered map equals today's semantics.
-    _verified_source_map_path(submission)
-    source_root = _source_root(submission)
     members = list(
         session.scalars(
             select(SubmissionMember)
@@ -98,36 +111,145 @@ def archive_submission(
     )
     if not members:
         raise ArchiveSubmissionError(f"submission {submission.id!r} has no members")
-    _verify_sources(source_root, members)
-    bundle = _project_bundle(session, submission, members, bundle_id=bundle_id)
-    expected = {member.archive_path: member for member in members}
 
-    result = flush_bundle(
-        session,
-        bundle_id=bundle.id,
-        backends=backends,
-        builder=builder or RemArchiveBuilder(),
-        key_epoch=key_epoch,
-        tape_capacity_bytes=tape_capacity_bytes,
-        artifact_validator=lambda target, artifact: _validate_artifact_members(
-            target,
-            artifact,
-            expected,
-        ),
+    already = submission_bundle_members(session, submission)
+    if len(already) == len(members):
+        # Every member is already accumulated: a pure re-entry. Nothing is
+        # appended and nothing is re-hashed.
+        _refresh_submission_status(session, submission)
+        return _result(session, submission, noop=True)
+
+    _verified_source_map_path(submission)
+    source_root = _source_root(submission)
+    _verify_sources(source_root, members)
+    policy = get_artifactclass_policy(session, submission.artifactclass)
+    for member in members:
+        if member.id in already:
+            continue
+        # One funnel: the same enqueue helper the intake path uses, so
+        # include-alone routing, the one-open-accumulator index, and the
+        # canonical naming ladder all behave identically for both producers.
+        # The digest and size are handed in because _verify_sources just
+        # computed them — re-hashing every byte a second time at append is
+        # the whole submission's bytes for nothing.
+        enqueue_artifact(
+            session,
+            artifactclass=submission.artifactclass,
+            policy=policy,
+            logical_asset_hash=member.sha256,
+            source_path=Path(member.source_path),
+            member_path=member.archive_path,
+            # Submission names are validated upstream by the arrangement's
+            # canonical_member_path, which rejects what the escaper would
+            # emit, so the naming helper leaves them as validated (§5).
+            member_path_is_escaped=True,
+            size_bytes=member.size_bytes,
+            file_sha256=member.sha256,
+            source_metadata={
+                # The recorded linkage design §4 names: SubmissionMember ->
+                # bundle_member -> bundle. It survives the naming ladder,
+                # which an archive_path join does not.
+                "submission_id": submission.id,
+                "submission_member_id": member.id,
+            },
+        )
+    _refresh_submission_status(session, submission)
+    return _result(session, submission)
+
+
+def submission_bundle_members(
+    session: Session,
+    submission: Submission,
+) -> dict[int, BundleMember]:
+    """Map ``SubmissionMember.id`` to the bundle member row that carries it.
+
+    Indexed on ``bundle_member.logical_asset_hash`` (the submission's own
+    digests bound the scan), then filtered on the recorded linkage. Reading the
+    linkage rather than re-deriving a name is the §3 rule: catalog names are
+    authoritative, and a disambiguated member's recorded name is not
+    reproducible from the input set alone.
+
+    The digest set comes from a query, not from ``submission.members``: that
+    collection is loaded once per instance, so a caller that added members in
+    the same session would silently narrow the scan to the members it happened
+    to have loaded first.
+    """
+    digests = set(
+        session.scalars(
+            select(SubmissionMember.sha256).where(
+                SubmissionMember.submission_id == submission.id
+            )
+        )
     )
-    submission.status = SubmissionStatus.ARCHIVED
-    submission.archived_at = dt.datetime.now(dt.UTC)
+    if not digests:
+        return {}
+    found: dict[int, BundleMember] = {}
+    for row in session.scalars(
+        select(BundleMember).where(BundleMember.logical_asset_hash.in_(digests))
+    ):
+        metadata = row.source_metadata or {}
+        if metadata.get("submission_id") != submission.id:
+            continue
+        member_id = metadata.get("submission_member_id")
+        if isinstance(member_id, int):
+            found[member_id] = row
+    return found
+
+
+def submission_bundles(session: Session, submission: Submission) -> list[Bundle]:
+    """Return the submission's bundles ordered by ``opened_at``, then id."""
+    bundle_ids = {
+        row.bundle_id for row in submission_bundle_members(session, submission).values()
+    }
+    if not bundle_ids:
+        return []
+    return list(
+        session.scalars(
+            select(Bundle).where(Bundle.id.in_(bundle_ids)).order_by(Bundle.opened_at, Bundle.id)
+        )
+    )
+
+
+def _refresh_submission_status(session: Session, submission: Submission) -> None:
+    """Move the submission to its derived status.
+
+    ``accumulated`` at append; ``archived`` only when the derived predicate
+    says every member is on sealed, sufficiently-replicated media. The status
+    is a projection of that predicate and never an independent claim — the
+    erasure path reads the predicate itself.
+    """
+    if submission_is_archived(session, submission.id):
+        if submission.status != SubmissionStatus.ARCHIVED:
+            submission.status = SubmissionStatus.ARCHIVED
+            submission.archived_at = dt.datetime.now(dt.UTC)
+    elif submission.status != SubmissionStatus.ACCUMULATED:
+        submission.status = SubmissionStatus.ACCUMULATED
+        submission.archived_at = None
     session.flush()
+
+
+def _result(
+    session: Session,
+    submission: Submission,
+    *,
+    noop: bool = False,
+) -> ArchiveSubmissionResult:
+    bundles = submission_bundles(session, submission)
+    bundle_ids = tuple(bundle.id for bundle in bundles)
+    copies: dict[str, tuple[int, ...]] = {}
+    for bundle in bundles:
+        copies[bundle.id] = tuple(
+            session.scalars(
+                select(Copy.id).where(Copy.bundle_id == bundle.id).order_by(Copy.id)
+            )
+        )
     return ArchiveSubmissionResult(
         submission_id=submission.id,
-        bundle_id=result.bundle_id,
-        copy_ids=result.copy_ids,
-        archived=True,
+        bundle_ids=bundle_ids,
+        copies_by_bundle=copies,
+        archived=submission.status == SubmissionStatus.ARCHIVED,
+        noop=noop,
     )
-
-
-def _bundle_id(submission_id: str) -> str:
-    return f"submission-{submission_id}"
 
 
 def _verified_source_map_path(submission: Submission) -> Path:
@@ -185,98 +307,6 @@ def _verify_sources(source_root: Path, members: list[SubmissionMember]) -> None:
                 f"source_path for submission member {member.id} has size {size}, "
                 f"expected {member.size_bytes}"
             )
-
-
-def _project_bundle(
-    session: Session,
-    submission: Submission,
-    members: list[SubmissionMember],
-    *,
-    bundle_id: str,
-) -> Bundle:
-    policy = get_artifactclass_policy(session, submission.artifactclass)
-    fingerprint, basis = compute_bundle_group(session, submission.artifactclass)
-    bundle = Bundle(
-        id=bundle_id,
-        bundle_group=fingerprint,
-        group_basis=group_basis_document(
-            basis,
-            basis_source=BASIS_SOURCE_DERIVED,
-            target_bytes=policy.target_bytes,
-            max_age_seconds=policy.max_age_seconds,
-        ),
-        status="open",
-        target_bytes=policy.target_bytes,
-        max_age_seconds=policy.max_age_seconds,
-        # Funnel-style mint: the per-submission bundle is non-accumulating and
-        # never adoptable, and must not collide with the group accumulator on
-        # the one-open-accumulator partial index. flush_bundle keeps a
-        # pre-assigned archive_id as-is. (The per-submission build itself is
-        # retired by the P3 submission-convergence rework.)
-        archive_id=f"archive-{bundle_id}",
-        opened_at=dt.datetime.now(dt.UTC),
-    )
-    session.add(bundle)
-    session.flush()
-    for member in members:
-        add_bundle_member(
-            session,
-            bundle=bundle,
-            artifactclass=submission.artifactclass,
-            logical_asset_hash=member.sha256,
-            member_path=member.archive_path,
-            source_path=None,
-            size_bytes=member.size_bytes,
-            file_sha256=member.sha256,
-            source_metadata={
-                "source_path_bytes_hex": os.fsencode(Path(member.source_path)).hex(),
-            },
-        )
-    return bundle
-
-
-def _validate_artifact_members(
-    target: PoolTarget,
-    artifact: BuildArtifact,
-    expected: dict[str, SubmissionMember],
-) -> None:
-    representation = Representation(target.representation)
-    if representation not in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
-        return
-    seen: set[str] = set()
-    for built in artifact.members:
-        member = expected.get(built.member_path)
-        if member is None:
-            raise ArchiveSubmissionError(
-                f"archive build returned unexpected member {built.member_path!r}"
-            )
-        seen.add(built.member_path)
-        if built.logical_asset_hash != member.sha256:
-            raise ArchiveSubmissionError(
-                f"archive build member {built.member_path!r} has wrong logical hash"
-            )
-        if built.file_sha256 != member.sha256:
-            raise ArchiveSubmissionError(
-                f"archive build member {built.member_path!r} has sha256 "
-                f"{built.file_sha256.hex()}, expected {member.sha256.hex()}"
-            )
-        if built.size_bytes != member.size_bytes:
-            raise ArchiveSubmissionError(
-                f"archive build member {built.member_path!r} has size "
-                f"{built.size_bytes}, expected {member.size_bytes}"
-            )
-        if member.ingest_item_id is None:
-            raise ArchiveSubmissionError(
-                f"submission member {member.id} has no ingest_item_id to cross-check"
-            )
-        if built.ingest_item_id != str(member.ingest_item_id):
-            raise ArchiveSubmissionError(
-                f"archive build member {built.member_path!r} echoed ingest_item_id "
-                f"{built.ingest_item_id!r}, expected {member.ingest_item_id}"
-            )
-    missing = sorted(set(expected) - seen)
-    if missing:
-        raise ArchiveSubmissionError(f"archive build omitted members: {missing!r}")
 
 
 def _is_under(path: Path, root: Path) -> bool:
