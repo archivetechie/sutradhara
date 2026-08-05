@@ -17,10 +17,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_fanout import _customer_manifest_members
+from sutradhara.archive_fanout import (
+    BuildArtifact,
+    BuiltExclusion,
+    _customer_manifest_members,
+    _record_build_exclusions,
+)
 from sutradhara.archive_restore import (
     RestoreNameError,
     _choose_bundle_restore_group,
@@ -50,6 +55,7 @@ from sutradhara.catalog.models import (
     Backend,
     Bundle,
     BundleMember,
+    ExclusionRecord,
     LogicalAsset,
     Pool,
 )
@@ -802,6 +808,83 @@ def test_policy_apply_report_names_open_bundles_predating_a_membership_change(
         assert group.open_bundles_predating_change == ("open-accumulator",)
         assert WARNING_MEMBERSHIP_CHANGED in group.warning_kinds()
         assert bundle.max_age_seconds == 3600, "an open bundle's thresholds never change"
+
+
+# --------------------------------------------------------------------------
+# Build exclusions: class, ruleset and hash all come from the member (§5)
+# --------------------------------------------------------------------------
+
+
+def test_build_exclusions_source_class_and_ruleset_from_the_member(
+    engine: Engine,
+) -> None:
+    """Guards: an exclusion filed under a co-resident class's ruleset.
+
+    An exclusion whose path matches a member row exactly is a per-asset
+    exclusion: it must record that member's class, that class's ruleset, and
+    that member's logical hash — so the record joins back through members by
+    hash. A cluster exclusion with no matching member has no recoverable
+    producing class in a multi-class bundle and is recorded classless rather
+    than guessed onto whichever class sorted first.
+    """
+    one_hash = _digest(b"member of class one")
+    two_hash = _digest(b"member of class two")
+
+    with session_scope(engine) as session:
+        backend = _add_backend(session, "mem")
+        _add_pool(session, "pool-1", backend)
+        _apply(session, "cls-one", pools=("pool-1",))
+        _apply(session, "cls-two", pools=("pool-1",))
+        bundle = Bundle(
+            id="excluding",
+            **bundle_kwargs_for_class(session, "cls-one"),
+            status="open",
+        )
+        session.add(bundle)
+        session.flush()
+        _add_member(
+            session,
+            bundle_id="excluding",
+            artifactclass="cls-one",
+            asset_hash=one_hash,
+            member_path="one/kept.mov",
+        )
+        _add_member(
+            session,
+            bundle_id="excluding",
+            artifactclass="cls-two",
+            asset_hash=two_hash,
+            member_path="two/kept.mov",
+        )
+        session.refresh(bundle)
+
+        _record_build_exclusions(
+            session,
+            bundle=bundle,
+            artifact=BuildArtifact(
+                artifact_path=Path("/dev/null"),
+                stored_digest=_digest(b"artifact"),
+                members=(),
+                exclusions=(
+                    BuiltExclusion(path="two/kept.mov", reason="deviation"),
+                    BuiltExclusion(path="tmp/", reason="unsupported-entry", count=4),
+                ),
+            ),
+        )
+        records = {
+            record.path: record
+            for record in session.scalars(select(ExclusionRecord))
+        }
+
+        member_sourced = records["two/kept.mov"]
+        assert member_sourced.artifactclass == "cls-two"
+        assert member_sourced.ruleset_name == "cls-two.rules"
+        assert member_sourced.logical_asset_hash == two_hash
+
+        cluster = records["tmp/"]
+        assert cluster.artifactclass == ""
+        assert cluster.ruleset_name is None
+        assert cluster.logical_asset_hash is None
 
 
 # --------------------------------------------------------------------------
