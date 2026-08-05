@@ -62,7 +62,7 @@ from sutradhara.jobs.reconcilers.conditions import (
     OBSERVED_PRESENT,
 )
 from sutradhara.sealing.port import Representation
-from tests.bundle_group_helpers import bundle_kwargs
+from tests.bundle_group_helpers import bundle_kwargs_for_class
 
 
 @pytest.fixture
@@ -513,7 +513,13 @@ def _flushed_bundle(
                 ),
             ),
         )
-        bundle = Bundle(id="bundle-a", **bundle_kwargs(seed="class-a"), status="open")
+        # The basis must name the real pools: fan-out and repair both read
+        # their target list from group_basis, in basis order (§2/§5).
+        bundle = Bundle(
+            id="bundle-a",
+            **bundle_kwargs_for_class(s, "class-a"),
+            status="open",
+        )
         s.add(bundle)
         assets: dict[bytes, bytes] = {}
         for member_path, data in paths.items():

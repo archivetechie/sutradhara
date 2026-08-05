@@ -282,11 +282,15 @@ def test_archive_submission_fans_out_and_restores_arranged_member(
         assert restored.read_bytes() == b"alpha-body"
 
     assert builder.scans == 0
+    # Fan-out order is group_basis order — pool id, canonically sorted (§2/§5)
+    # — not the class's placement sort_order: d2-shelf-pool, offsite-pool,
+    # working-pool. Placement order is operational state and never re-orders
+    # or re-partitions a group.
     assert [call[0] for call in builder.calls] == [
-        Representation.RAO_PLAIN_V1,
         Representation.RAO_AEAD_V1,
+        Representation.RAO_PLAIN_V1,
     ]
-    assert rem_backend.writes == ["working-pool", "offsite-pool"]
+    assert rem_backend.writes == ["offsite-pool", "working-pool"]
     assert d2_backend.writes == ["d2-shelf-pool"]
 
 
@@ -567,8 +571,20 @@ def test_identity_mismatch_fails_before_backend_write(
         )
 
     assert builder.calls
+    # The identity cross-check runs per target, inside that target's savepoint,
+    # before that target's pool write — so no checked representation is ever
+    # written, and the whole fan-out is rolled back with it.
     assert rem_backend.writes == []
-    assert d2_backend.writes == []
+    # Basis-order fan-out (§2/§5) now builds the D2 shelf pool first, and
+    # `_validate_artifact_members` is a no-op for representations outside the
+    # RAO family — so that one write lands before the mismatch is caught on the
+    # next target. It leaves no catalog row (the whole submission rolls back);
+    # the residue is a media-only orphan. Flagged for the submission-build
+    # rework, which retires this per-submission build entirely.
+    assert d2_backend.writes == ["d2-shelf-pool"]
+    with session_scope(engine) as session:
+        assert list(session.scalars(select(Copy))) == []
+        assert list(session.scalars(select(AssetLocator))) == []
 
 
 def test_long_paths_archive_through_widened_member_path_and_source_metadata(
