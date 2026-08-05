@@ -8,6 +8,7 @@ from __future__ import annotations
 
 # Side-effect imports: each module's @register_handler decorator runs.
 from sutradhara.jobs.handlers import bundle_repair as _bundle_repair  # noqa: F401
+from sutradhara.jobs.handlers import bundle_sweep as _bundle_sweep  # noqa: F401
 from sutradhara.jobs.handlers import cloud_blob as _cloud_blob  # noqa: F401
 from sutradhara.jobs.handlers import copy as _copy  # noqa: F401
 from sutradhara.jobs.handlers import hdcache_fill as _hdcache_fill  # noqa: F401
