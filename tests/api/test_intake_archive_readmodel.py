@@ -76,6 +76,9 @@ INGEST_ITEM_KEYS = {
 DERIVATION_KEYS = {"kind", "source_sha256", "derived_sha256"}
 BUNDLE_KEYS = {
     "id",
+    "artifactclasses",
+    # Kept alongside the list for the console, which reads the singular key as
+    # non-optional; see test_bundle_payload_keeps_the_singular_artifactclass_key.
     "artifactclass",
     "status",
     "member_count",
@@ -651,6 +654,72 @@ def test_archive_bundle_and_submission_contracts_and_status_vocabularies(
     assert bad_bundle_status.json()["detail"]["error"] == "bad_request"
     assert bad_submission_status.status_code == 400
     assert bad_submission_status.json()["detail"]["error"] == "bad_request"
+
+
+def test_bundle_payload_keeps_the_singular_artifactclass_key(
+    api_engine: Engine,
+) -> None:
+    """Guards: the console's Class field silently going blank.
+
+    The member-grain rewrite added ``artifactclasses`` (a list). The console
+    still reads the singular ``artifactclass`` as a non-optional string — the
+    Class detail metric, and the bundle-sourced entries of the class filter
+    list, which are collected through ``.filter(Boolean)`` and would therefore
+    swallow an ``undefined`` and drop those classes with no error anywhere. So
+    the singular key stays alongside the list until the console reads the list.
+
+    For a group bundle holding several classes the singular key carries the
+    **first of the sorted classes** — a deterministic choice pinned here, not a
+    claim that the bundle has one class. A bundle with no members and no
+    deriving policy has an empty list and a ``None`` singular.
+    """
+    base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
+    masters_digest = _digest("group-member-masters")
+    proxy_digest = _digest("group-member-proxy")
+    with session_scope(api_engine) as session:
+        _add_asset(session, masters_digest, size=64)
+        _add_asset(session, proxy_digest, size=32)
+        group_bundle = _add_bundle(
+            session,
+            "bundle-group",
+            artifactclass="z-proxy",
+            status="sealed",
+            total_bytes=96,
+            member_count=2,
+            opened_at=base + dt.timedelta(minutes=1),
+            sealed_at=base + dt.timedelta(minutes=5),
+        )
+        # Added proxy-first so "first of the sorted classes" cannot be mistaken
+        # for "the class of the first member added".
+        _add_bundle_member(session, group_bundle, proxy_digest, size=32, member_path="p.mp4")
+        group_bundle._test_artifactclass = "a-masters"
+        _add_bundle_member(session, group_bundle, masters_digest, size=64, member_path="m.mov")
+        _add_bundle(
+            session,
+            "bundle-memberless",
+            artifactclass="s-masters",
+            status="open",
+            total_bytes=0,
+            member_count=0,
+            opened_at=base,
+        )
+    client = TestClient(make_api_app(api_engine))
+
+    response = client.get("/api/ui/archive/bundles?limit=10", headers=auth_headers("viewer"))
+
+    assert response.status_code == 200
+    payload = {row["id"]: row for row in response.json()["bundles"]}
+    assert set(payload) == {"bundle-group", "bundle-memberless"}
+    for row in payload.values():
+        assert set(row) == BUNDLE_KEYS
+
+    group = payload["bundle-group"]
+    assert group["artifactclasses"] == ["a-masters", "z-proxy"]
+    assert group["artifactclass"] == "a-masters"
+
+    memberless = payload["bundle-memberless"]
+    assert memberless["artifactclasses"] == []
+    assert memberless["artifactclass"] is None
 
 
 def test_archive_asset_uses_asset_locator_origin_rule_and_locator_shaping(

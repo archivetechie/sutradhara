@@ -14,9 +14,9 @@ from pathlib import Path, PurePosixPath
 from typing import cast
 
 from sqlalchemy import select
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import Session, joinedload
 
-from sutradhara.archive_bundle import bundle_primary_artifactclass
+from sutradhara.archive_bundle import bundle_artifactclasses
 from sutradhara.archive_fanout import (
     ArchiveBuilder,
     ArchiveFanoutError,
@@ -65,13 +65,15 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
     bundle = _load_sealed_bundle(ctx, bundle_id)
     for member in bundle.members:
         touch_asset(ctx, member.logical_asset_hash)
-    # BG-P4: representative member class (identical pool set across member
-    # classes by fingerprint construction); P4 reads group_basis pool order.
-    hop_class = bundle_primary_artifactclass(ctx.session, bundle)
-    if hop_class is None:
+    # Member grain (§5): repair converges toward the same want-set the
+    # bundle_copy reconciler demands — the union over the bundle's member
+    # classes' live write-eligible pool sets, so a policy edit propagates to
+    # sealed bundles and reconcile/repair can never disagree about "missing".
+    classes = bundle_artifactclasses(ctx.session, bundle)
+    if not classes:
         raise ValueError(f"bundle {bundle_id!r} has no member artifactclass for repair")
-    backends = _target_backends(ctx, hop_class)
-    targets = target_pools(ctx.session, hop_class, backends, key_epoch=key_epoch)
+    backends = _classes_target_backends(ctx, classes)
+    targets = _classes_target_pools(ctx.session, classes, backends, key_epoch=key_epoch)
     missing = _missing_pool_ids(ctx, bundle.id)
     blocked_projection = bundle_copy.blocked_projection_for_bundle(ctx.session, bundle.id)
     if blocked_projection is not None:
@@ -201,14 +203,16 @@ def _load_sealed_bundle(ctx: JobContext, bundle_id: str) -> Bundle:
     return bundle
 
 
-def _target_backends(ctx: JobContext, artifactclass: str) -> dict[int, WritableStorageBackend]:
+def _classes_target_backends(
+    ctx: JobContext, classes: list[str]
+) -> dict[int, WritableStorageBackend]:
     rows = list(
         ctx.session.scalars(
             select(Backend)
             .join(Pool, Pool.backend_id == Backend.id)
             .join(ArtifactClassPool, ArtifactClassPool.pool_id == Pool.id)
             .where(
-                ArtifactClassPool.artifactclass == artifactclass,
+                ArtifactClassPool.artifactclass.in_(classes),
                 ArtifactClassPool.active.is_(True),
                 Pool.accepts_writes.is_(True),
             )
@@ -225,6 +229,27 @@ def _target_backends(ctx: JobContext, artifactclass: str) -> dict[int, WritableS
             )
         result[row.id] = cast(WritableStorageBackend, backend)
     return result
+
+
+def _classes_target_pools(
+    session: Session,
+    classes: list[str],
+    backends: dict[int, WritableStorageBackend],
+    *,
+    key_epoch: str | None,
+) -> list[PoolTargetEntry[WritableStorageBackend]]:
+    """Union of per-class target pools, deduped by (backend, pool) — the same
+    want-set the reconciler's member-grain observation demands."""
+    targets: list[PoolTargetEntry[WritableStorageBackend]] = []
+    seen: set[tuple[int, str]] = set()
+    for artifactclass in classes:
+        for backend, target in target_pools(session, artifactclass, backends, key_epoch=key_epoch):
+            key = (target.backend_id, target.pool_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append((backend, target))
+    return targets
 
 
 def _missing_pool_ids(ctx: JobContext, bundle_id: str) -> set[str]:

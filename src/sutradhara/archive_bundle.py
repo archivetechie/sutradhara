@@ -78,13 +78,18 @@ class StagingTransformError(ArchiveBundleError):
 class MemberNamingError(ArchiveBundleError):
     """The canonical member-naming ladder could not produce a name.
 
-    Unreachable by construction: the terminal rung (full content hash plus
-    class slug) collides only if two different contents share a SHA-256.
+    The terminal rung carries the member's full content hash plus the class
+    slug seeded with a hash of the raw class name — the slug alone is not
+    injective (``photo.raw`` and ``photo-raw`` share a slug; the seed is
+    injective up to a SHA-256 collision on class names). Exhaustion therefore
+    requires a SHA-256 collision, or a co-resident member whose literal
+    recorded name equals this member's terminal-rung name — not merely two
+    classes with lookalike names.
     """
 
 
 # Progressive hash-prefix rungs for the collision ladder; the terminal rung is
-# the full hash plus the class slug (appended by _name_ladder itself).
+# the full hash plus the seeded class slug (appended by _name_ladder itself).
 _NAME_LADDER_PREFIXES = (10, 20, 32, 48, 64)
 
 
@@ -160,7 +165,6 @@ def _new_bundle(
     max_age_seconds: int,
     bundle_id: str | None,
     now: dt.datetime | None,
-    archive_id: str | None = None,
 ) -> Bundle:
     resolved_id = bundle_id or f"bundle-{uuid.uuid4().hex}"
     document = group_basis_document(
@@ -176,7 +180,6 @@ def _new_bundle(
         status="open",
         target_bytes=target_bytes,
         max_age_seconds=max_age_seconds,
-        archive_id=archive_id,
         opened_at=now or dt.datetime.now(dt.UTC),
     )
     _assert_open_witness(bundle)
@@ -278,8 +281,30 @@ def enqueue_artifact(
             now=now,
         )
         bundle.archive_id = f"archive-{bundle.id}"
-        session.add(bundle)
-        session.flush()
+        minted_id = bundle.id
+        try:
+            with session.begin_nested():
+                session.add(bundle)
+                session.flush()
+        except IntegrityError as exc:
+            # F8: the funnel mint gets the same savepoint guard as the other
+            # two surfaces — §3's "raw IntegrityError never escapes" holds
+            # unqualified. The only unique surface here is the bundle id
+            # (explicit bundle_id on a crash-retry); adopt the existing open
+            # funnel, bounded to one re-read.
+            _discard_pending(session, bundle)
+            winner = session.get(Bundle, minted_id)
+            if (
+                winner is None
+                or winner.status != "open"
+                or winner.bundle_group != fingerprint
+                or winner.archive_id is None
+            ):
+                raise BundleStateError(
+                    f"could not mint include-alone funnel {minted_id!r} for bundle "
+                    f"group {fingerprint!r}: {exc.orig}"
+                ) from exc
+            bundle = winner
     else:
         bundle, _ = get_or_create_open_bundle(
             session,
@@ -388,20 +413,36 @@ def _class_slug(artifactclass: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "-", artifactclass) or "class"
 
 
+def _class_seed(artifactclass: str) -> str:
+    """A short hash of the raw class name; injective where the slug is not.
+
+    ``_class_slug`` collapses distinct class names (``photo.raw`` and
+    ``photo-raw`` share a slug), so the terminal rung seeds it with the hash
+    of the raw name (F5) — two distinct classes can never share a terminal
+    rung short of a SHA-256 collision.
+    """
+    return hashlib.sha256(artifactclass.encode("utf-8")).hexdigest()[:12]
+
+
 def _name_ladder(requested: str, file_sha256: bytes, artifactclass: str) -> list[str]:
     """The complete deterministic collision ladder for one requested name.
 
     Rung 0 is the requested name; the following rungs insert progressively
     longer prefixes of the member's own content hash (never arrival order);
-    the terminal rung is the full hash plus the class slug, so the ladder
-    always ends and every rung is arrival-order-independent.
+    the terminal rung is the full hash plus the seeded class slug, so the
+    ladder always ends and every rung is arrival-order-independent.
     """
     digest = file_sha256.hex()
     candidates = [requested]
     candidates.extend(
         tag_member_path(requested, digest[:length]) for length in _NAME_LADDER_PREFIXES
     )
-    candidates.append(tag_member_path(requested, f"{digest}.{_class_slug(artifactclass)}"))
+    candidates.append(
+        tag_member_path(
+            requested,
+            f"{digest}.{_class_slug(artifactclass)}-{_class_seed(artifactclass)}",
+        )
+    )
     return candidates
 
 
@@ -439,9 +480,9 @@ def _resolve_member_name(
             return candidate, row, first_occupant
         if first_occupant is None:
             first_occupant = row
-    # Same-key different-hash within a class is impossible by construction
-    # after the ladder (the terminal rung carries the full content hash and
-    # the class slug); reaching this line means a SHA-256 collision.
+    # The terminal rung carries the full content hash and the seeded class
+    # slug; reaching this line means a SHA-256 collision or a co-resident
+    # literal name equal to the terminal rung (see MemberNamingError).
     raise MemberNamingError(
         f"member naming ladder exhausted for {requested!r} in bundle "
         f"{bundle_id!r} (class {artifactclass!r})"
@@ -727,34 +768,35 @@ def record_review_decision(
     return decision
 
 
-# BG-P4: mechanical hop for consumers of the dropped bundle.artifactclass.
-# P4 rewrites each §5 consumer to member grain / group_basis; until then this
-# returns a deterministic representative class: the first member's class, or
-# (for memberless funnel bundles, e.g. cloud-blob) any class whose projection
-# derives this bundle's group.
-def bundle_primary_artifactclass(session: Session, bundle: Bundle) -> str | None:
-    member_class = session.scalars(
-        select(BundleMember.artifactclass)
-        .where(BundleMember.bundle_id == bundle.id)
-        .order_by(BundleMember.id)
-        .limit(1)
-    ).first()
-    if member_class is not None:
-        return member_class
-    return session.scalars(
-        select(ArtifactClassPolicyRecord.artifactclass)
-        .where(ArtifactClassPolicyRecord.bundle_group == bundle.bundle_group)
-        .order_by(ArtifactClassPolicyRecord.artifactclass)
-        .limit(1)
-    ).first()
+def bundle_artifactclasses(session: Session, bundle: Bundle) -> list[str]:
+    """Return the sorted distinct member classes of a bundle (member grain, §5).
 
-
-# BG-P4: mechanical hop for query filters that matched Bundle.artifactclass;
-# P4 replaces call sites with real member-grain rewrites.
-def bundle_ids_for_artifactclass(artifactclass: str) -> Any:
-    return select(BundleMember.bundle_id).where(
-        BundleMember.artifactclass == artifactclass
-    ).scalar_subquery()
+    A bundle may hold several classes; every §5 consumer that used to read the
+    dropped ``bundle.artifactclass`` column reads the member rows instead. A
+    memberless funnel bundle (e.g. cloud-blob before its wrap lands) falls
+    back to the classes whose policy projection derives this bundle's group —
+    identical pool sets by fingerprint construction.
+    """
+    classes = sorted(
+        set(
+            session.scalars(
+                select(BundleMember.artifactclass).where(
+                    BundleMember.bundle_id == bundle.id
+                )
+            )
+        )
+    )
+    if classes:
+        return classes
+    return sorted(
+        set(
+            session.scalars(
+                select(ArtifactClassPolicyRecord.artifactclass).where(
+                    ArtifactClassPolicyRecord.bundle_group == bundle.bundle_group
+                )
+            )
+        )
+    )
 
 
 def _require_asset(session: Session, logical_asset_hash: bytes) -> LogicalAsset:

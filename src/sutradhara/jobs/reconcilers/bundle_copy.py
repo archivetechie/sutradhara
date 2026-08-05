@@ -11,11 +11,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import func as sa_func
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from sutradhara.archive_bundle import bundle_primary_artifactclass
+from sutradhara.archive_bundle import bundle_artifactclasses
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     ArtifactClassPool,
@@ -67,15 +66,15 @@ def enumerate_targets(
     rows = _sealed_bundle_rows(session, cursor=cursor, batch=batch)
     if not rows:
         return []
-    bundle_ids = [bundle_id for bundle_id, _artifactclass in rows]
-    classes = {artifactclass for _bundle_id, artifactclass in rows}
+    bundle_ids = [bundle_id for bundle_id, _classes in rows]
+    classes = {artifactclass for _bundle_id, bundle_classes in rows for artifactclass in bundle_classes}
     desired_by_class = _desired_targets_by_class(session, classes)
     floors_by_class = _floors_for_classes(session, classes)
     placement_aggregates = _reconciler_aggregates(session, bundle_ids)
 
     observations: list[TargetObservation] = []
-    for bundle_id, artifactclass in rows:
-        desired_targets = desired_by_class.get(artifactclass, {})
+    for bundle_id, bundle_classes in rows:
+        desired_targets = _merge_desired_targets(desired_by_class, bundle_classes)
         if not desired_targets:
             continue
         observations.append(
@@ -83,7 +82,9 @@ def enumerate_targets(
                 bundle_id=bundle_id,
                 desired_targets=desired_targets,
                 aggregate=placement_aggregates[bundle_id],
-                floor=floors_by_class[artifactclass],
+                floor=_strictest_floor(
+                    [floors_by_class[artifactclass] for artifactclass in bundle_classes]
+                ),
             )
         )
     return observations
@@ -99,14 +100,8 @@ def observe(session: Session, target_key: str) -> TargetObservation:
             desired=False,
             observed_state=OBSERVED_MISSING,
         )
-    # BG-P4: representative member class stands in for the dropped column.
-    artifactclass = bundle_primary_artifactclass(session, bundle)
-    desired_targets = (
-        {}
-        if artifactclass is None
-        else _desired_targets_by_class(session, {artifactclass}).get(artifactclass, {})
-    )
-    if not desired_targets or artifactclass is None:
+    desired_targets, floor = _bundle_desired_and_floor(session, bundle)
+    if not desired_targets:
         return TargetObservation(
             target_key=target_key,
             desired=False,
@@ -117,7 +112,7 @@ def observe(session: Session, target_key: str) -> TargetObservation:
         bundle_id=bundle.id,
         desired_targets=desired_targets,
         aggregate=aggregate,
-        floor=_floor_for_class(session, artifactclass),
+        floor=floor,
     )
 
 
@@ -149,17 +144,11 @@ def blocked_projection_for_bundle(session: Session, bundle_id: str) -> tuple[str
     duplicate_message = _duplicate_message(bundle.id, aggregate)
     if duplicate_message is not None:
         return "duplicate-copy", duplicate_message
-    # BG-P4: representative member class stands in for the dropped column.
-    artifactclass = bundle_primary_artifactclass(session, bundle)
-    desired_targets = (
-        {}
-        if artifactclass is None
-        else _desired_targets_by_class(session, {artifactclass}).get(artifactclass, {})
-    )
+    desired_targets, floor = _bundle_desired_and_floor(session, bundle)
     structural_message = _structural_floor_message(
         session,
         desired_targets=desired_targets,
-        floor=_floor_for_class(session, artifactclass) if artifactclass else DurabilityFloor(),
+        floor=floor,
         aggregate=aggregate,
     )
     if structural_message is None:
@@ -185,28 +174,15 @@ def _sealed_bundle_rows(
     *,
     cursor: int | None,
     batch: int,
-) -> list[tuple[str, str]]:
-    # BG-P4: representative member class per bundle (deterministic first
-    # member); memberless funnel bundles fall back to any class whose
-    # projection derives their group.
-    representative_class = (
-        select(BundleMember.artifactclass)
-        .where(BundleMember.bundle_id == Bundle.id)
-        .order_by(BundleMember.id)
-        .limit(1)
-        .correlate(Bundle)
-        .scalar_subquery()
-    )
-    projection_class = (
-        select(ArtifactClassPolicyRecord.artifactclass)
-        .where(ArtifactClassPolicyRecord.bundle_group == Bundle.bundle_group)
-        .order_by(ArtifactClassPolicyRecord.artifactclass)
-        .limit(1)
-        .correlate(Bundle)
-        .scalar_subquery()
-    )
+) -> list[tuple[str, tuple[str, ...]]]:
+    """One bounded batch of sealed bundles with their member classes (§5).
+
+    Every member class speaks for its members; memberless funnel bundles fall
+    back to the classes whose policy projection derives their group —
+    identical pool sets by fingerprint construction.
+    """
     query = (
-        select(Bundle.id, sa_func.coalesce(representative_class, projection_class))
+        select(Bundle.id, Bundle.bundle_group)
         .where(Bundle.status == "sealed")
         .order_by(Bundle.id)
         .limit(batch)
@@ -215,11 +191,77 @@ def _sealed_bundle_rows(
         # Bundle ids are strings in the current schema; use cursor as a stable
         # batch offset until M3 introduces a better typed cursor for this domain.
         query = query.offset(cursor)
-    return [
-        (str(bundle_id), str(artifactclass))
-        for bundle_id, artifactclass in session.execute(query)
-        if artifactclass is not None
-    ]
+    bundles = [(str(bundle_id), str(group)) for bundle_id, group in session.execute(query)]
+    if not bundles:
+        return []
+
+    classes_by_bundle: dict[str, set[str]] = {bundle_id: set() for bundle_id, _ in bundles}
+    for bundle_id, artifactclass in session.execute(
+        select(BundleMember.bundle_id, BundleMember.artifactclass)
+        .where(BundleMember.bundle_id.in_(list(classes_by_bundle)))
+        .distinct()
+    ):
+        classes_by_bundle[str(bundle_id)].add(str(artifactclass))
+
+    memberless_groups = {
+        group for bundle_id, group in bundles if not classes_by_bundle[bundle_id]
+    }
+    projection_classes: dict[str, set[str]] = {group: set() for group in memberless_groups}
+    if memberless_groups:
+        for group, artifactclass in session.execute(
+            select(
+                ArtifactClassPolicyRecord.bundle_group,
+                ArtifactClassPolicyRecord.artifactclass,
+            ).where(ArtifactClassPolicyRecord.bundle_group.in_(list(memberless_groups)))
+        ):
+            projection_classes[str(group)].add(str(artifactclass))
+
+    rows: list[tuple[str, tuple[str, ...]]] = []
+    for bundle_id, group in bundles:
+        classes = classes_by_bundle[bundle_id] or projection_classes.get(group, set())
+        if classes:
+            rows.append((bundle_id, tuple(sorted(classes))))
+    return rows
+
+
+def _merge_desired_targets(
+    desired_by_class: dict[str, dict[tuple[int, str], PoolTarget]],
+    bundle_classes: tuple[str, ...] | list[str],
+) -> dict[tuple[int, str], PoolTarget]:
+    """Union of the member classes' desired target maps; first class wins on
+    shared pools (deterministic — classes arrive sorted)."""
+    merged: dict[tuple[int, str], PoolTarget] = {}
+    for artifactclass in bundle_classes:
+        for key, target in desired_by_class.get(artifactclass, {}).items():
+            merged.setdefault(key, target)
+    return merged
+
+
+def _strictest_floor(floors: list[DurabilityFloor]) -> DurabilityFloor:
+    """The strictest declared floor across a bundle's member classes."""
+    if not floors:
+        return DurabilityFloor()
+    return DurabilityFloor(
+        min_copies=max(floor.min_copies for floor in floors),
+        min_impl_families=max(floor.min_impl_families for floor in floors),
+    )
+
+
+def _bundle_desired_and_floor(
+    session: Session,
+    bundle: Bundle,
+) -> tuple[dict[tuple[int, str], PoolTarget], DurabilityFloor]:
+    """Member-grain desired targets and floor for one bundle (§5): the union
+    over member classes' live write-eligible pool sets, under the strictest
+    member class's declared durability floor."""
+    classes = bundle_artifactclasses(session, bundle)
+    if not classes:
+        return {}, DurabilityFloor()
+    desired_by_class = _desired_targets_by_class(session, set(classes))
+    return (
+        _merge_desired_targets(desired_by_class, classes),
+        _strictest_floor([_floor_for_class(session, artifactclass) for artifactclass in classes]),
+    )
 
 
 def _desired_targets_by_class(
@@ -329,14 +371,7 @@ def classify_condition(
     bundle = session.get(Bundle, target_key)
     if bundle is None or bundle.status != "sealed":
         return
-    # BG-P4: representative member class stands in for the dropped column.
-    artifactclass = bundle_primary_artifactclass(session, bundle)
-    desired_targets = (
-        {}
-        if artifactclass is None
-        else _desired_targets_by_class(session, {artifactclass}).get(artifactclass, {})
-    )
-    floor = _floor_for_class(session, artifactclass) if artifactclass else DurabilityFloor()
+    desired_targets, floor = _bundle_desired_and_floor(session, bundle)
     aggregate = _reconciler_aggregates(session, [bundle.id])[bundle.id]
     duplicate_message = _duplicate_message(bundle.id, aggregate)
     if duplicate_message is not None:

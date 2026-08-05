@@ -399,7 +399,8 @@ def _resolve_archived_artifactclass(
 
 
 def _healthy_archived_artifactclasses(session: Session, asset_hash: bytes) -> list[str]:
-    # BG-P4: class read through the member join (the member's own class row).
+    # Member grain (§5): the class comes from the asset's own member row in
+    # the locator's bundle (hash + class) — co-resident classes never leak in.
     rows = session.scalars(
         select(distinct(BundleMember.artifactclass))
         .join(AssetLocator, AssetLocator.bundle_id == BundleMember.bundle_id)

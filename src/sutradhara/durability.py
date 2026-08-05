@@ -203,15 +203,19 @@ def placement_status(
     ``is_duplicate`` while keeping the original PoolTarget attributes available
     for harness seams that getattr-map pool/backend/representation fields.
     """
-    artifactclass = _artifactclass_for_target(session, target)
-    targets = [target for _, target in _policy_targets(session, artifactclass)]
     if isinstance(target, BundleTarget):
+        bundle = session.get(Bundle, target.bundle_id)
+        if bundle is None:
+            raise ValueError(f"bundle {target.bundle_id!r} does not exist")
+        targets = _bundle_policy_targets(session, bundle)
         counts_by_key = bundle_copy_counts_by_pool(
             session,
             [target.bundle_id],
             require_verified=require_verified,
         )[target.bundle_id]
     else:
+        artifactclass = target.artifactclass
+        targets = [pool_target for _, pool_target in _policy_targets(session, artifactclass)]
         counts_by_key: dict[tuple[int, str], int] = {}
         for copy in durable_placements(
             session,
@@ -477,33 +481,46 @@ def _locator_artifactclass_filter(
 ) -> Any:
     legacy_ok = asset_has_artifactclass_membership(session, asset_hash, artifactclass)
     legacy_clause = AssetLocator.bundle_id.is_(None) if legacy_ok else false()
-    # BG-P4: mechanical hop — bundle-class filter via the member class column.
+    # Member grain (§5): the locator's asset must itself sit in the locator's
+    # bundle under this class — hash + class, never the bundle's co-residents.
+    # A bundle may hold several classes, and duplicate-content members (the
+    # Sony split) resolve through their own class membership alone.
+    member_clause = (
+        select(BundleMember.id)
+        .where(
+            BundleMember.bundle_id == AssetLocator.bundle_id,
+            BundleMember.logical_asset_hash == asset_hash,
+            BundleMember.artifactclass == artifactclass,
+        )
+        .exists()
+    )
     return or_(
-        and_(
-            AssetLocator.bundle_id.is_not(None),
-            Bundle.id.in_(
-                select(BundleMember.bundle_id).where(
-                    BundleMember.artifactclass == artifactclass
-                )
-            ),
-        ),
+        and_(AssetLocator.bundle_id.is_not(None), member_clause),
         legacy_clause,
     )
 
 
-def _artifactclass_for_target(session: Session, target: Target) -> str:
-    if isinstance(target, AssetTarget):
-        return target.artifactclass
-    bundle = session.get(Bundle, target.bundle_id)
-    if bundle is None:
-        raise ValueError(f"bundle {target.bundle_id!r} does not exist")
-    # BG-P4: representative member class stands in for the dropped column.
-    from sutradhara.archive_bundle import bundle_primary_artifactclass
+def _bundle_policy_targets(session: Session, bundle: Bundle) -> list[PoolTarget]:
+    """Member-grain want-set for a bundle: the union over its member classes'
+    live active pool sets (§5). Each member's class policy speaks for that
+    member, so the union satisfies them all; classes that coalesced shared a
+    pool set at open, and post-seal policy drift widens (never silently
+    narrows) what the reconcile/repair machinery demands. Deterministic order:
+    sorted class, then class membership order; first occurrence wins on
+    shared pools.
+    """
+    from sutradhara.archive_bundle import bundle_artifactclasses
 
-    artifactclass = bundle_primary_artifactclass(session, bundle)
-    if artifactclass is None:
-        raise ValueError(f"bundle {target.bundle_id!r} has no member artifactclass")
-    return artifactclass
+    targets: list[PoolTarget] = []
+    seen: set[tuple[int, str]] = set()
+    for artifactclass in bundle_artifactclasses(session, bundle):
+        for _, pool_target in _policy_targets(session, artifactclass):
+            key = (pool_target.backend_id, pool_target.pool_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(pool_target)
+    return targets
 
 
 def _policy_targets(session: Session, artifactclass: str) -> list[tuple[StorageBackend, PoolTarget]]:

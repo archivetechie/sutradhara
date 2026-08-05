@@ -11,7 +11,7 @@ import click
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_bundle import bundle_primary_artifactclass, record_review_decision
+from sutradhara.archive_bundle import record_review_decision
 from sutradhara.archive_enqueue import (
     ArchiveEnqueueError,
     BatchScanHeld,
@@ -40,6 +40,8 @@ from sutradhara.artifactclass_policy import (
 )
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
+from sutradhara.bundle_group import basis_pool_ids
+from sutradhara.bundle_group_report import render_policy_apply_report
 from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool, Submission
 from sutradhara.catalog.session import make_engine, make_read_only_engine, session_scope
 from sutradhara.hdcache.manager import (
@@ -69,10 +71,16 @@ def artifactclass_apply(artifactclass: str, policy_path: str) -> None:
     """Strict-validate and apply an artifactclass TOML policy."""
     engine = make_engine()
     with session_scope(engine) as session:
-        policy = apply_artifactclass_policy_file(session, artifactclass, policy_path)
+        policy, report = apply_artifactclass_policy_file(session, artifactclass, policy_path)
+        # Rendered inside the session: the report is a value built from catalog
+        # rows, but it is only meaningful next to the apply that produced it.
+        rendered = render_policy_apply_report(report)
     click.echo(
         f"Applied {artifactclass!r}: ruleset={policy.ruleset!r}, pools={len(policy.placements)}"
     )
+    # Bundle groups are derived, never declared — this is the operator's only
+    # read-back of which classes now share a crate (§2).
+    click.echo(rendered)
 
 
 @archive_group.group("bundle")
@@ -238,6 +246,11 @@ def bundle_enqueue(
             raise click.ClickException(_enqueue_error_text(exc)) from exc
         if result is not None:
             if result.enqueued:
+                # Member grain (§5, P1 residue F6): report the bundle this
+                # member actually landed in — `EnqueuedMember.bundle_id` is
+                # copied straight off the member's own catalog row, never a
+                # group-wide accumulator lookup, which would misreport an
+                # include-alone funnel routing.
                 member = result.enqueued[0]
                 message = f"enqueued {member.member_path!r} in bundle {member.bundle_id}"
             else:
@@ -330,11 +343,9 @@ def bundle_flush(
         bundle = session.get(Bundle, bundle_id)
         if bundle is None:
             raise click.ClickException(f"no bundle {bundle_id!r}")
-        # BG-P4: representative member class; P4 reads group_basis pool order.
-        hop_class = bundle_primary_artifactclass(session, bundle)
-        if hop_class is None:
-            raise click.ClickException(f"bundle {bundle_id!r} has no member artifactclass")
-        backends = _target_backends(session, hop_class)
+        # Group grain (§5): the flush's backends come from the bundle's frozen
+        # group_basis pool set, not from any member class's live policy.
+        backends = _bundle_basis_backends(session, bundle)
         try:
             result = flush_bundle(
                 session,
@@ -482,6 +493,21 @@ def restore_cmd(
         except (ArchiveRestoreError, RestoreManagerError) as exc:
             raise click.ClickException(str(exc)) from exc
     click.echo(f"restored {asset_hash.hex()} from {result.source} to {result.output_path}")
+
+
+def _bundle_basis_backends(
+    session: Session, bundle: Bundle
+) -> dict[int, WritableStorageBackend]:
+    """Backends for the pools in a bundle's frozen group_basis (§5)."""
+    pool_ids = basis_pool_ids(bundle.group_basis)
+    if not pool_ids:
+        raise click.ClickException(f"bundle {bundle.id!r} has an empty group_basis")
+    rows = list(
+        session.scalars(
+            select(Backend).join(Backend.pools).where(Pool.id.in_(pool_ids)).distinct()
+        )
+    )
+    return {row.id: cast(WritableStorageBackend, backend_from_row(row)) for row in rows}
 
 
 def _target_backends(session: Session, artifactclass: str) -> dict[int, WritableStorageBackend]:

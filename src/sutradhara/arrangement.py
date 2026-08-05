@@ -70,9 +70,13 @@ class ArrangementSubmitRace(ArrangementError):
 class SourceMapEntry:
     """One frozen source-map row ready for TSV export and DB mirroring.
 
-    ``ingest_item_id`` is ``None`` for members with no submission lineage
-    (intake-accumulator members in a flush-time map); the renderer emits the
-    empty string for those — rem accepts an empty ingest_item_id column.
+    ``ingest_item_id`` is ``None`` for members with no submission lineage.
+    Member grain (§5) makes that routine: a bundle group mixes
+    arrangement-origin members, which always carry an ingest item, with
+    intake-accumulator members in a flush-time map, which do not. The
+    renderer emits the empty string for those — rem accepts an empty
+    ingest_item_id column — never the literal string "None", which a bare
+    ``str()`` would have written into a signed, hashed source map.
     """
 
     archive_path: str

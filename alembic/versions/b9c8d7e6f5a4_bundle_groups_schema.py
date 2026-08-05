@@ -55,7 +55,7 @@ def _class_bases(bind: sa.Connection) -> dict[str, list[dict[str, str]]]:
         sa.text(
             "SELECT acp.artifactclass, acp.pool_id, p.representation "
             "FROM artifactclass_pool acp JOIN pool p ON p.id = acp.pool_id "
-            "WHERE acp.active ORDER BY acp.artifactclass, acp.pool_id"
+            "WHERE acp.active"
         )
     )
     for artifactclass, pool_id, representation in rows:
@@ -63,6 +63,10 @@ def _class_bases(bind: sa.Connection) -> dict[str, list[dict[str, str]]]:
         if representation is not None:  # NULLs canonicalise as absent keys
             entry["representation"] = representation
         bases.setdefault(artifactclass, []).append(entry)
+    # Canonical order is Python codepoint sort, never a SQL ORDER BY —
+    # collation-independent (F9), fingerprint-identical for ASCII pool ids.
+    for basis in bases.values():
+        basis.sort(key=lambda entry: entry["pool"])
     # A class with no active memberships hashes the empty basis (callers use
     # bases.get(artifactclass, [])).
     return bases
