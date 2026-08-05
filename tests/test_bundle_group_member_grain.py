@@ -46,12 +46,14 @@ from sutradhara.bundle_group import (
     group_basis_document,
 )
 from sutradhara.bundle_group_report import (
+    DEGENERATE_TARGET_FLOOR_BYTES,
     WARNING_CLAMP_ACTIVE,
     WARNING_MEMBERSHIP_CHANGED,
     WARNING_NEAR_MISS,
     WARNING_NO_FLOOR_DECLARED,
     WARNING_ORPHAN_GROUP,
     WARNING_STALE_PROJECTION,
+    WARNING_TARGET_BELOW_FLOOR,
     build_policy_apply_report,
     render_policy_apply_report,
 )
@@ -773,6 +775,168 @@ def test_policy_apply_report_golden(engine: Engine) -> None:
         f"[{WARNING_NEAR_MISS}]",
     ):
         assert needle in rendered, needle
+
+
+def test_report_warns_when_the_effective_target_makes_include_alone_the_rule(
+    engine: Engine,
+) -> None:
+    """The silent degeneration the iron run found, now said out loud.
+
+    ``enqueue_artifact`` routes any member at or above the group's effective
+    ``target_bytes`` into a non-adoptable funnel bundle of its own. A group
+    whose effective target sits at or below ordinary member sizes therefore
+    seals one object per member — the tape-row waste bundling exists to
+    prevent — and the report used to say nothing at all: the clamp is inactive
+    (no pool declares a floor) and ``no-floor-declared`` only reports that the
+    guard is *off*, never that it being off has already produced a harmful
+    number. The observed shape: a ``target_gb=0.000000001`` policy computes
+    ``target_bytes = 1``, and three 1.5 KB members became three sealed objects.
+    """
+    with session_scope(engine) as session:
+        backend = _add_backend(session, "mem")
+        _add_pool(session, "pool-open", backend)
+        report = _apply(
+            session,
+            "degenerate",
+            pools=("pool-open",),
+            target_gb=0.000000001,
+            max_age_seconds=3600,
+        )
+        group = report.group_of("degenerate")
+        assert group is not None
+        assert group.effective_target_bytes == 1
+        assert WARNING_TARGET_BELOW_FLOOR in group.warning_kinds()
+        message = next(
+            warning.message
+            for warning in group.warnings
+            if warning.kind == WARNING_TARGET_BELOW_FLOOR
+        )
+        assert str(DEGENERATE_TARGET_FLOOR_BYTES) in message
+        assert "no member pool declares a min_object_bytes" in message
+        assert "include-alone" in message
+        # It reaches the operator's actual surface, not just the JSON.
+        assert f"[{WARNING_TARGET_BELOW_FLOOR}]" in render_policy_apply_report(report)
+
+
+def test_report_warns_when_the_declared_pool_floor_is_itself_degenerate(
+    engine: Engine,
+) -> None:
+    """A floor comparison against the pool's own declaration cannot fire.
+
+    Guards two wrong shapes at once. Keying the warning on the *declared*
+    ``min_object_bytes`` is vacuous — the clamp lifts the effective target to
+    at least the strictest declared floor, so ``effective < declared`` is
+    unreachable. Gating it on "no floor declared" is worse: it stays silent
+    exactly when an operator declared a floor so low it degenerates anyway.
+    Here ``pool-tiny`` declares 4 KiB, the clamp fires, and the group still
+    seals one object per member.
+    """
+    with session_scope(engine) as session:
+        backend = _add_backend(session, "mem")
+        _add_pool(session, "pool-tiny", backend, min_object_bytes=4096)
+        report = _apply(
+            session,
+            "tiny-floor",
+            pools=("pool-tiny",),
+            target_gb=0.000000001,
+            max_age_seconds=3600,
+        )
+        group = report.group_of("tiny-floor")
+        assert group is not None
+        assert group.effective_target_bytes == 4096
+        kinds = group.warning_kinds()
+        assert WARNING_TARGET_BELOW_FLOOR in kinds
+        # The pool declares a floor, so the floorless warning must not fire —
+        # the degenerate-target warning is the only one that can catch this.
+        assert WARNING_NO_FLOOR_DECLARED not in kinds
+        message = next(
+            warning.message
+            for warning in group.warnings
+            if warning.kind == WARNING_TARGET_BELOW_FLOOR
+        )
+        assert "pool-tiny = 4096" in message
+
+
+def test_degenerate_target_warning_is_a_warning_and_not_a_gate(
+    engine: Engine,
+) -> None:
+    """Refusing the policy would break legitimate small-object pools.
+
+    The apply must succeed, the group must open on the thresholds it declared,
+    and a small member must still route include-alone exactly as before. The
+    report is a value the operator reads; nothing on the write path consults
+    the floor — the constant does not even live in ``bundle_group``.
+    """
+    from sutradhara.archive_bundle import enqueue_artifact
+    from sutradhara.bundle_group import effective_group_thresholds
+
+    with session_scope(engine) as session:
+        backend = _add_backend(session, "mem")
+        _add_pool(session, "pool-open", backend)
+        report = _apply(
+            session,
+            "small-objects",
+            pools=("pool-open",),
+            target_gb=0.000000001,
+            max_age_seconds=3600,
+        )
+        assert WARNING_TARGET_BELOW_FLOOR in report.group_of("small-objects").warning_kinds()
+
+        record = session.scalars(
+            select(ArtifactClassPolicyRecord).where(
+                ArtifactClassPolicyRecord.artifactclass == "small-objects"
+            )
+        ).one()
+        fingerprint, basis = compute_bundle_group(session, "small-objects")
+        assert effective_group_thresholds(
+            session,
+            artifactclass="small-objects",
+            policy=record,
+            fingerprint=fingerprint,
+            basis=basis,
+        ) == (1, 3600)
+
+        source = Path(REPO_ROOT / "pyproject.toml")
+        payload = source.read_bytes()
+        asset_hash = hashlib.sha256(payload).digest()
+        session.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(payload)))
+        session.flush()
+        bundle, member, created = enqueue_artifact(
+            session,
+            artifactclass="small-objects",
+            policy=record,
+            logical_asset_hash=asset_hash,
+            source_path=source,
+        )
+        assert created
+        # Include-alone: its own non-adoptable funnel, untouched by the warning.
+        assert bundle.archive_id is not None
+        assert bundle.member_count == 1
+        assert member.bundle_id == bundle.id
+
+
+def test_report_is_silent_when_the_effective_target_clears_the_object_floor(
+    engine: Engine,
+) -> None:
+    """A tuned estate must not be nagged.
+
+    The golden estate's 64 GiB clamped target and this 2 GiB unclamped one are
+    both healthy; a warning that fired here would be noise on every apply and
+    would train operators to ignore the one that matters.
+    """
+    with session_scope(engine) as session:
+        backend = _add_backend(session, "mem")
+        _add_pool(session, "pool-open", backend)
+        report = _apply(
+            session, "healthy", pools=("pool-open",), target_gb=2.0, max_age_seconds=3600
+        )
+        group = report.group_of("healthy")
+        assert group is not None
+        assert group.effective_target_bytes == 2 * 1024**3
+        assert WARNING_TARGET_BELOW_FLOOR not in group.warning_kinds()
+        # The floorless pool is still reported — the two warnings are distinct
+        # claims: "the guard is off" versus "it being off already hurt".
+        assert WARNING_NO_FLOOR_DECLARED in group.warning_kinds()
 
 
 def test_policy_apply_report_names_open_bundles_predating_a_membership_change(

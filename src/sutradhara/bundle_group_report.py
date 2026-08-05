@@ -16,8 +16,9 @@ projections, and it shows per group:
 * the **differing excluded fields** (``restore_preference``, staging and
   hdcache config) — so an operator sees what coalescing does *not* imply,
 * the count of bundles carrying ``backfilled`` vs ``derived`` basis,
-* the clamp-activation warning, the no-floor-declared warning per pool, and
-  the open accumulators that predate the group's current membership,
+* the clamp-activation warning, the no-floor-declared warning per pool, the
+  degenerate-target warning (below), and the open accumulators that predate
+  the group's current membership,
 * **orphan groups** — fingerprints that still hold bundles but that no live
   class derives any more. Total membership loss is the strictest form of "the
   membership changed since the last apply", so it is the one the report must
@@ -60,7 +61,40 @@ from sutradhara.catalog.models import (
 # so — coalescing placement does not coalesce read-side or staging behaviour.
 EXCLUDED_FIELDS = ("restore_preference", "staging_config", "hdcache_config")
 
+# The object-size floor of last resort, used only to *warn* — never to gate.
+#
+# `enqueue_artifact` routes any member whose size meets or exceeds the group's
+# effective `target_bytes` include-alone, into a non-adoptable funnel bundle of
+# its own. Design §4 chose max-of-targets partly to keep that exception rare,
+# but shipped no guard: with a low enough effective target, include-alone
+# becomes the *rule* and the group degenerates into one sealed object per
+# member — precisely the tape-row waste bundle groups exist to prevent, arrived
+# at silently. (Observed on iron: a "force size-due" fixture declaring
+# `target_gb=0.000000001` computes `target_bytes = 1`, and three 1.5 KB members
+# became three separate sealed objects.)
+#
+# The reference is a **fixed constant, not the pool's declared
+# `min_object_bytes`**: the clamp already lifts the effective target to at
+# least the strictest declared floor, so `effective target < declared floor` is
+# unreachable and a warning keyed on it could never fire. Comparing against a
+# constant instead also catches the case a declared-floor comparison would
+# miss — a floor that is itself degenerately low.
+#
+# 1 GiB is deliberately an order of magnitude *below* any realistic declared
+# floor (§2 recommends 1.5x the sizing guide's figure for the pool's media,
+# which on an LTO pool is tens of GiB), so the warning cannot second-guess a
+# tuned estate; it only fires on targets low enough to make include-alone
+# ordinary. It measures the *object*, not the member: an include-alone member
+# that is itself larger than the floor seals a large object and is not the
+# waste this warns about.
+#
+# It lives in the report module, not in `bundle_group`, so that the write path
+# structurally cannot consult it. Refusing such a policy would break legitimate
+# small-object pools; this is an operator-visible warning and nothing more.
+DEGENERATE_TARGET_FLOOR_BYTES = 1024**3
+
 WARNING_CLAMP_ACTIVE = "generation-floor-clamp"
+WARNING_TARGET_BELOW_FLOOR = "target-below-object-floor"
 WARNING_NO_FLOOR_DECLARED = "no-floor-declared"
 WARNING_NEAR_MISS = "near-miss-thresholds"
 WARNING_MEMBERSHIP_CHANGED = "membership-changed"
@@ -497,6 +531,32 @@ def _warnings(
                 WARNING_CLAMP_ACTIVE,
                 f"declared target {thresholds.declared_target_bytes} sits below a member "
                 f"pool floor; clamped up to {thresholds.target_bytes} by {pools}",
+            )
+        )
+    if thresholds.target_bytes < DEGENERATE_TARGET_FLOOR_BYTES:
+        declared_floors = sorted(
+            (floor, pool_id)
+            for pool_id, floor in thresholds.pool_floors.items()
+            if floor is not None
+        )
+        if declared_floors:
+            floor, pool_id = declared_floors[-1]
+            floor_note = (
+                f"the strictest declared pool floor ({pool_id} = {floor}) is itself "
+                f"below {DEGENERATE_TARGET_FLOOR_BYTES}"
+            )
+        else:
+            floor_note = "no member pool declares a min_object_bytes to clamp it up"
+        warnings.append(
+            GroupWarning(
+                WARNING_TARGET_BELOW_FLOOR,
+                f"effective target {thresholds.target_bytes} is below the "
+                f"{DEGENERATE_TARGET_FLOOR_BYTES}-byte object floor, and {floor_note}. "
+                "Every member at or above the target is routed include-alone into a "
+                "sealed object of its own, so this group degenerates into one object "
+                "per member — the tape-row waste bundling exists to prevent. Raise the "
+                "member classes' target_bytes, or declare min_object_bytes on the "
+                "pools (1.5x the sizing guide's figure for the media)",
             )
         )
     for pool_id in thresholds.floorless_pools:
