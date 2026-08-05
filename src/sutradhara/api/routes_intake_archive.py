@@ -464,12 +464,20 @@ def _derivation_payloads(session: Any, intake_id: str) -> list[dict[str, object]
 def _bundle_payload(session: Any, bundle: Bundle, *, copy_count: int) -> dict[str, object]:
     # Member grain (§5): the operator surface names every member class a
     # group bundle holds — a single class field cannot describe a group.
+    artifactclasses = [
+        _text(artifactclass) for artifactclass in bundle_artifactclasses(session, bundle)
+    ]
     return {
         "id": _text(bundle.id),
-        "artifactclasses": [
-            _text(artifactclass)
-            for artifactclass in bundle_artifactclasses(session, bundle)
-        ],
+        "artifactclasses": artifactclasses,
+        # Compatibility: the console reads a non-optional singular `artifactclass`
+        # (Class detail metric, bundle-sourced filter list). Dropping it would
+        # blank that field and silently vanish bundle-sourced classes from the
+        # filter, so the singular key stays until the console reads the list.
+        # `bundle_artifactclasses` returns its classes sorted, so the first
+        # element is the deterministic choice for a multi-class group bundle —
+        # lexicographically first, never "the bundle's class".
+        "artifactclass": artifactclasses[0] if artifactclasses else None,
         "status": _text(bundle.status),
         "member_count": bundle.member_count,
         "total_bytes": bundle.total_bytes,
