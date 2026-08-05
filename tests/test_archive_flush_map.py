@@ -893,6 +893,101 @@ def test_writer_digest_failure_quarantines_by_archive_path(
     assert _map_archive_paths(builder.maps[1]) == ["nested/b.bin"]
 
 
+# The two rem-shaped stderr lines, in rem's own wire format: `rem` writes
+# `error: {message}` (remanence-cli run_with_mode), the map-line form comes
+# from archive_map.rs::parse_source_map_row and the archive-path form from
+# remanence-format writer.rs via FormatError::InvalidInput's Display.
+_REM_SHAPED_STDERR = {
+    "map-line": (
+        "error: source map line 3 size mismatch for /srv/stage/b.bin: "
+        "map says 9, filesystem says 12",
+        "nested/b.bin",
+    ),
+    "archive-path": (
+        "error: invalid REM-OBJECT input: streamed data hash for a.bin "
+        "does not match spec",
+        "a.bin",
+    ),
+}
+
+
+@pytest.mark.parametrize("form", sorted(_REM_SHAPED_STDERR))
+def test_rem_shaped_stderr_through_the_cli_wrapper_quarantines_the_named_member(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    form: str,
+) -> None:
+    """The failure loop parses ``str(exc)``, but in production that string is
+    not rem's stderr — it is assembled by ``run_rem_archive_build``, which
+    truncates stdout and stderr to 500 characters each and wraps them in
+    ``repr()``. Every other failure test raises a hand-written RuntimeError and
+    therefore never crosses that wrapper: the regexes could stop matching the
+    real shape and the suite would stay green, which is the exact way this arc
+    has shipped broken twice.
+
+    This test lets a real non-zero ``rem`` process produce each of the two real
+    stderr forms, so the string ``_identify_member_failure`` sees is the one
+    production builds. It guards the quoting/truncation of the wrapper drifting
+    away from ``_MAP_LINE_FAILURE``/``_WRITER_DIGEST_FAILURE`` — after which
+    every member failure becomes an unidentified one and poisons the bundle."""
+    stderr_text, expected_quarantined = _REM_SHAPED_STDERR[form]
+    rem_bin = tmp_path / "rem-stub"
+    rem_bin.write_text(f"#!/bin/sh\nprintf '%s\\n' '{stderr_text}' >&2\nexit 1\n")
+    rem_bin.chmod(rem_bin.stat().st_mode | stat.S_IXUSR)
+
+    calls: list[list[str]] = []
+
+    def dispatch(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if len(calls) == 1:
+            # Really execute the fake rem: real exit code, real stderr bytes.
+            return subprocess.run(cmd, capture_output=True, text=True, check=False)
+        # The retry succeeds so the flush can finish and be asserted on.
+        result = _fake_rao_build(
+            {
+                "map_path": Path(cmd[cmd.index("--map") + 1]),
+                "output_path": Path(cmd[cmd.index("--out") + 1]),
+                "manifest_path": Path(cmd[cmd.index("--manifest-out") + 1]),
+            }
+        )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(result.stdout_report) + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("sutradhara.rem_archive_cli.run_managed", dispatch)
+
+    bundle_id, backend = _two_member_bundle(engine, tmp_path)
+    with session_scope(engine) as s:
+        result = flush_bundle(
+            s,
+            bundle_id=bundle_id,
+            backends=_backends_for(s, backend),
+            builder=RemArchiveBuilder(rem_bin=rem_bin),
+        )
+        assert len(result.copy_ids) == 1
+
+    assert len(calls) == 2
+    with session_scope(engine) as s:
+        sealed = s.get(Bundle, bundle_id)
+        assert sealed is not None
+        assert sealed.status == "sealed"
+        [quarantine] = list(s.scalars(select(Bundle).where(Bundle.status == "held")))
+        assert [row.member_path for row in _member_rows_for_flush(s, quarantine)] == [
+            expected_quarantined
+        ]
+        assert [row.member_path for row in _member_rows_for_flush(s, sealed)] == [
+            path for path in ("a.bin", "nested/b.bin") if path != expected_quarantined
+        ]
+        # The recorded reason is the wrapper's string, not rem's raw stderr:
+        # proof the regex matched what production actually produces.
+        reason = quarantine.review_summary["quarantined_members"][0]["reason"]
+        assert reason.startswith("rem archive build failed (exit 1): command=")
+
+
 def test_quarantine_moves_staging_transform_rows_with_the_member(
     engine: Engine,
     tmp_path: Path,
