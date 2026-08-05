@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -124,15 +125,62 @@ def group_basis_document(
     }
 
 
-def effective_group_thresholds(
+@dataclass(frozen=True)
+class GroupThresholds:
+    """The threshold arithmetic for one bundle group, with its inputs shown.
+
+    The open path wants only the two effective numbers; the policy-apply
+    report wants the arithmetic that produced them — which classes declared
+    what, which pools declared a floor, and whether the floor clamp fired. Both
+    read this one computation, so the report can never drift from what the
+    accumulator actually freezes.
+    """
+
+    declared: dict[str, tuple[int, int]]
+    """Class -> (declared target_bytes, declared max_age_seconds)."""
+    declared_target_bytes: int
+    """Max-over-classes target, *before* the generation-floor clamp."""
+    max_age_seconds: int
+    """Min-over-classes latency ceiling."""
+    pool_floors: dict[str, int | None]
+    """Basis pool -> declared ``min_object_bytes``; ``None`` = no floor declared."""
+    target_bytes: int
+    """Effective target after clamping up to the strictest declared floor."""
+
+    @property
+    def clamp_active(self) -> bool:
+        """True when a pool floor lifted the declared max-over-classes target."""
+        return self.target_bytes > self.declared_target_bytes
+
+    @property
+    def clamping_pools(self) -> list[str]:
+        """Basis pools whose declared floor sits above the declared target.
+
+        §2 warns **when the clamp activates**, on the declared value: after
+        clamping the effective target can never undershoot, so a warning keyed
+        on the effective value would be unreachable.
+        """
+        return sorted(
+            pool_id
+            for pool_id, floor in self.pool_floors.items()
+            if floor is not None and floor > self.declared_target_bytes
+        )
+
+    @property
+    def floorless_pools(self) -> list[str]:
+        """Basis pools with no declared floor — never an implicit zero (§3)."""
+        return sorted(pool_id for pool_id, floor in self.pool_floors.items() if floor is None)
+
+
+def group_thresholds(
     session: Session,
     *,
     artifactclass: str,
     policy: ArtifactClassPolicyRecord,
     fingerprint: str,
     basis: list[dict[str, Any]],
-) -> tuple[int, int]:
-    """Compute the effective ``(target_bytes, max_age_seconds)`` for a group open.
+) -> GroupThresholds:
+    """Compute one group's threshold arithmetic from catalog rows.
 
     The declared class set is every ``artifactclass_policy`` row whose
     ``bundle_group`` projection equals this fingerprint, **unioned with the
@@ -141,13 +189,7 @@ def effective_group_thresholds(
     ``max_age_seconds`` is a latency ceiling — the group takes the minimum;
     ``target_bytes`` is an accumulation goal — the group takes the maximum,
     clamped up by the strictest member pool's declared ``min_object_bytes``.
-    An empty declared set is an error; zero thresholds are never written.
     """
-    if not basis:
-        raise EmptyBundleGroupError(
-            f"artifactclass {artifactclass!r} has no active pool placements; "
-            "an accumulator cannot open for an empty bundle group"
-        )
     declared: dict[str, tuple[int, int]] = {}
     for row in session.scalars(
         select(ArtifactClassPolicyRecord).where(
@@ -159,27 +201,61 @@ def effective_group_thresholds(
     # live-derived fingerprint, even when its stored projection is stale — so
     # the declared set is never empty here (F7 removed the dead empty check).
     declared[artifactclass] = (policy.target_bytes, policy.max_age_seconds)
-    target_bytes = max(target for target, _ in declared.values())
+    declared_target_bytes = max(target for target, _ in declared.values())
     max_age_seconds = min(age for _, age in declared.values())
 
-    pool_ids = [entry["pool"] for entry in basis]
-    floors = [
-        floor
-        for floor in session.scalars(
-            select(Pool.min_object_bytes).where(Pool.id.in_(pool_ids))
-        )
-        if floor is not None
-    ]
-    if floors:
-        target_bytes = max(target_bytes, max(floors))
+    pool_ids = [str(entry["pool"]) for entry in basis]
+    pool_floors: dict[str, int | None] = {pool_id: None for pool_id in pool_ids}
+    if pool_ids:
+        for pool_id, floor in session.execute(
+            select(Pool.id, Pool.min_object_bytes).where(Pool.id.in_(pool_ids))
+        ).all():
+            pool_floors[str(pool_id)] = floor
+    floors = [floor for floor in pool_floors.values() if floor is not None]
+    target_bytes = max(declared_target_bytes, max(floors)) if floors else declared_target_bytes
 
-    if target_bytes <= 0 or max_age_seconds <= 0:
+    return GroupThresholds(
+        declared=declared,
+        declared_target_bytes=declared_target_bytes,
+        max_age_seconds=max_age_seconds,
+        pool_floors=pool_floors,
+        target_bytes=target_bytes,
+    )
+
+
+def effective_group_thresholds(
+    session: Session,
+    *,
+    artifactclass: str,
+    policy: ArtifactClassPolicyRecord,
+    fingerprint: str,
+    basis: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Return the effective ``(target_bytes, max_age_seconds)`` for a group open.
+
+    The open path's view of :func:`group_thresholds`. An empty basis is an
+    error; zero thresholds are never written.
+    """
+    if not basis:
+        raise EmptyBundleGroupError(
+            f"artifactclass {artifactclass!r} has no active pool placements; "
+            "an accumulator cannot open for an empty bundle group"
+        )
+    thresholds = group_thresholds(
+        session,
+        artifactclass=artifactclass,
+        policy=policy,
+        fingerprint=fingerprint,
+        basis=basis,
+    )
+    if thresholds.target_bytes <= 0 or thresholds.max_age_seconds <= 0:
         raise BundleGroupError(
             f"bundle group {fingerprint!r} derived zero thresholds "
-            f"(target_bytes={target_bytes}, max_age_seconds={max_age_seconds}); "
+            f"(target_bytes={thresholds.target_bytes}, "
+            f"max_age_seconds={thresholds.max_age_seconds}); "
             "zero thresholds are never written"
         )
-    return target_bytes, max_age_seconds
+    return thresholds.target_bytes, thresholds.max_age_seconds
 
 
 def basis_entries(group_basis: dict[str, Any] | None) -> list[dict[str, Any]]:

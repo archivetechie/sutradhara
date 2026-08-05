@@ -34,6 +34,7 @@ from sutradhara.artifactclass_policy import (
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
 from sutradhara.bundle_group import basis_pool_ids
+from sutradhara.bundle_group_report import render_policy_apply_report
 from sutradhara.catalog.models import (
     ArtifactClassPool,
     Backend,
@@ -70,10 +71,16 @@ def artifactclass_apply(artifactclass: str, policy_path: str) -> None:
     """Strict-validate and apply an artifactclass TOML policy."""
     engine = make_engine()
     with session_scope(engine) as session:
-        policy = apply_artifactclass_policy_file(session, artifactclass, policy_path)
+        policy, report = apply_artifactclass_policy_file(session, artifactclass, policy_path)
+        # Rendered inside the session: the report is a value built from catalog
+        # rows, but it is only meaningful next to the apply that produced it.
+        rendered = render_policy_apply_report(report)
     click.echo(
         f"Applied {artifactclass!r}: ruleset={policy.ruleset!r}, pools={len(policy.placements)}"
     )
+    # Bundle groups are derived, never declared — this is the operator's only
+    # read-back of which classes now share a crate (§2).
+    click.echo(rendered)
 
 
 @archive_group.group("bundle")
