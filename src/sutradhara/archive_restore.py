@@ -923,8 +923,20 @@ def resolve_member_asset_hash(
     receipts print ``IMG_0001.JPG`` as ``member_name``. Flattening the tiers
     would make that string resolve to nothing, taking the *untagged* member's
     own stored name down with it. Stored-name precedence keeps every stored
-    name resolving exactly as it did, so adding the logical tier can only turn
+    name resolving exactly as it did, so *the tier addition* can only turn
     failures into successes.
+
+    That is a claim about the tier addition alone, not about the whole change,
+    and one request that used to resolve *uniquely* now raises ``ambiguous``.
+    ``original_member_path`` was previously read in the same breath as the
+    stored names while the re-key tagged it, so where a compressed class
+    staged ``images/disk.img`` into two bundles — tagged in the second by a
+    co-resident from another class — only the untagged chain still carried the
+    logical name, the match looked unique, and the first member's bytes came
+    back without a word. Both members' receipts print ``images/disk.img`` as
+    ``member_name``: the name named two assets all along, and surfacing that
+    is the honest answer
+    (``test_compressed_logical_name_main_resolved_uniquely_now_raises``).
 
     Names are **read, never re-derived** (design §3): resolution is equality
     against recorded strings. A tagged name is never reconstructed from the
