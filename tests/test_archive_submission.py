@@ -13,7 +13,11 @@ import pytest
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_bundle import enqueue_artifact
+from sutradhara.archive_bundle import (
+    enqueue_artifact,
+    submission_link_metadata,
+    submission_links,
+)
 from sutradhara.archive_fanout import (
     ArchiveFanoutError,
     BuildArtifact,
@@ -299,6 +303,107 @@ def test_two_submissions_and_intake_members_converge_into_one_object(
     assert d2_backend.writes == ["d2-shelf-pool"]
 
 
+def test_a_co_resident_enqueue_does_not_swallow_the_submission_linkage(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """Guards: the linkage dropped on an idempotent member hit.
+
+    The intake path enqueues one of the submission's files first — same class,
+    same archive path, same content hash. The submission's append then lands on
+    that existing row, and ``add_bundle_member`` used to return it untouched,
+    silently discarding ``submission_links``. The member was then invisible to
+    ``submission_bundle_members``: ``archive_submission`` could never reach its
+    noop branch, so it re-hashed every byte of the submission on every call,
+    the member's bundle was missing from the reported result, and the pre-write
+    identity gate skipped that member as a co-resident.
+
+    The second call must therefore noop **without touching the sources at
+    all**, which is what deleting them before it proves.
+    """
+    setup = _create_submission(engine, tmp_path)
+    with session_scope(engine) as session:
+        members = list(
+            session.scalars(
+                select(SubmissionMember)
+                .where(SubmissionMember.submission_id == setup.submission_id)
+                .order_by(SubmissionMember.ord)
+            )
+        )
+        co_resident = members[0]
+        enqueue_artifact(
+            session,
+            artifactclass="s-masters",
+            policy=get_artifactclass_policy(session, "s-masters"),
+            logical_asset_hash=co_resident.sha256,
+            source_path=Path(co_resident.source_path),
+            member_path=co_resident.archive_path,
+            member_path_is_escaped=True,
+            size_bytes=co_resident.size_bytes,
+            file_sha256=co_resident.sha256,
+        )
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == 1
+
+        result = archive_submission(session, setup.submission_id)
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == len(members)
+        assert len(result.bundle_ids) == 1
+
+        # The co-resident row carries the linkage, merged rather than replaced.
+        row = session.scalars(
+            select(BundleMember).where(
+                BundleMember.logical_asset_hash == co_resident.sha256
+            )
+        ).one()
+        assert submission_links(row.source_metadata) == [
+            (setup.submission_id, co_resident.id)
+        ]
+
+        for member in members:
+            Path(member.source_path).unlink()
+        again = archive_submission(session, setup.submission_id)
+        assert again.noop is True
+        assert again.bundle_ids == result.bundle_ids
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == len(members)
+
+
+def test_two_submissions_of_identical_content_both_keep_their_linkage(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """Guards: last-writer-wins on a single-valued linkage.
+
+    Duplicate content across two deliveries is a legitimate workflow, and both
+    submissions' members converge on the same bundle member row. A scalar
+    ``submission_id`` would let the second append steal the first's linkage —
+    and then each call would take it back from the other, so neither submission
+    ever reaches noop and each re-hashes its whole delivery every time.
+    """
+    same = {"clip-a.mov": b"alpha-body", "clip-b.mov": b"beta-body"}
+    first = _create_submission(
+        engine, tmp_path / "one", intake_id="intake-a", submission_id="submit-a", files=same
+    )
+    second = _create_submission(
+        engine, tmp_path / "two", intake_id="intake-b", submission_id="submit-b", files=same
+    )
+
+    with session_scope(engine) as session:
+        first_result = archive_submission(session, first.submission_id)
+        second_result = archive_submission(session, second.submission_id)
+        # One row per (class, path, content), shared by both submissions.
+        assert session.scalar(select(func.count()).select_from(BundleMember)) == 2
+        assert first_result.bundle_ids == second_result.bundle_ids
+        assert len(first_result.bundle_ids) == 1
+
+        for row in session.scalars(select(BundleMember)):
+            assert {link[0] for link in submission_links(row.source_metadata)} == {
+                first.submission_id,
+                second.submission_id,
+            }
+        # Neither submission has to re-derive anything on a second call.
+        assert archive_submission(session, first.submission_id).noop is True
+        assert archive_submission(session, second.submission_id).noop is True
+
+
 def test_result_shape_carries_bundle_ids_by_opened_at_and_copies_per_bundle(
     engine: Engine,
     tmp_path: Path,
@@ -407,10 +512,7 @@ def test_crash_retry_after_a_partial_append_is_a_no_op_for_landed_members(
             member_path_is_escaped=True,
             size_bytes=members[0].size_bytes,
             file_sha256=members[0].sha256,
-            source_metadata={
-                "submission_id": setup.submission_id,
-                "submission_member_id": members[0].id,
-            },
+            source_metadata=submission_link_metadata(setup.submission_id, members[0].id),
         )
         member_count_before = session.scalar(select(func.count()).select_from(BundleMember))
         assert member_count_before == 1
@@ -851,8 +953,11 @@ def _add_item(
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(data)
     digest = hashlib.sha256(data).digest()
-    session.add(LogicalAsset(content_sha256=digest, size_bytes=len(data)))
-    session.flush()
+    # Idempotent: two intakes may legitimately deliver the same bytes, which is
+    # exactly the duplicate-content case one test below exercises.
+    if session.get(LogicalAsset, digest) is None:
+        session.add(LogicalAsset(content_sha256=digest, size_bytes=len(data)))
+        session.flush()
     item = IngestItem(
         intake_id=intake_root.name,
         logical_asset_hash=digest,

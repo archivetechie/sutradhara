@@ -40,7 +40,11 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_bundle import enqueue_artifact
+from sutradhara.archive_bundle import (
+    enqueue_artifact,
+    submission_link_metadata,
+    submission_links,
+)
 from sutradhara.archive_predicate import submission_is_archived
 from sutradhara.artifactclass_policy import get_artifactclass_policy
 from sutradhara.catalog.models import Bundle, BundleMember, Copy, Submission, SubmissionMember
@@ -145,13 +149,13 @@ def archive_submission(session: Session, submission_id: str) -> ArchiveSubmissio
             member_path_is_escaped=True,
             size_bytes=member.size_bytes,
             file_sha256=member.sha256,
-            source_metadata={
-                # The recorded linkage design §4 names: SubmissionMember ->
-                # bundle_member -> bundle. It survives the naming ladder,
-                # which an archive_path join does not.
-                "submission_id": submission.id,
-                "submission_member_id": member.id,
-            },
+            # The recorded linkage design §4 names: SubmissionMember ->
+            # bundle_member -> bundle. It survives the naming ladder, which an
+            # archive_path join does not, and it MERGES on an idempotent hit —
+            # a member whose content a co-resident already enqueued lands on
+            # the existing row, and the linkage has to reach that row or this
+            # submission can never recognise its own members again.
+            source_metadata=submission_link_metadata(submission.id, member.id),
         )
     _refresh_submission_status(session, submission)
     return _result(session, submission)
@@ -187,12 +191,9 @@ def submission_bundle_members(
     for row in session.scalars(
         select(BundleMember).where(BundleMember.logical_asset_hash.in_(digests))
     ):
-        metadata = row.source_metadata or {}
-        if metadata.get("submission_id") != submission.id:
-            continue
-        member_id = metadata.get("submission_member_id")
-        if isinstance(member_id, int):
-            found[member_id] = row
+        for submission_id, member_id in submission_links(row.source_metadata):
+            if submission_id == submission.id:
+                found[member_id] = row
     return found
 
 
