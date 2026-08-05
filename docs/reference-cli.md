@@ -259,9 +259,19 @@ any more, drain the non-empty ones, then flush every open bundle `bundle_due`
 says is due — open funnel bundles (include-alone, cloud-blob) included, since
 they have no flusher of their own.
 
+A bundle the reaper returned to `open` is flushed on the same pass without
+re-asking whether it is due: it was already judged flush-worthy when it was
+claimed, and it can no longer take members.
+
 This is the only caller of the age arm: a quiet class's accumulator seals here
 or not at all. The same pass runs as the `bundle-sweep` job. A flush failure is
-reported per bundle and exits non-zero without stopping the rest of the pass.
+reported per bundle and exits non-zero without stopping the rest of the pass;
+each bundle's flush is transactionally its own, so a failed one leaves nothing
+behind — it is back to `open` and un-claimed, and the next pass retries it. A
+failure *after* bytes reach a pool is different: that pool's copy is recorded
+`suspect`, the bundle still seals with the copies that succeeded, and the
+bundle-copy condition goes to `blocked` for a human, because retrying a tape
+write appends a second object rather than replacing the first.
 
 | Flag | Default | Meaning |
 |---|---|---|

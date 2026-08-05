@@ -304,7 +304,9 @@ engine moves jobs between `pending`, `running`, `succeeded`, and
 hyphen/underscore for historical reasons.) `bundle-sweep` is the periodic
 accumulator pass: it reaps stuck flush claims, void-seals empty orphan
 accumulators, and flushes every bundle that is due — the only caller of
-the accumulator age arm.
+the accumulator age arm. Each bundle's flush is its own transaction, so
+one that fails rolls back to `open` and un-claimed rather than leaving a
+half-claimed bundle behind for the next pass to skip.
 
 **Worker** (`jobs/worker.py`, `sutra worker`). Single-node,
 lease-aware. A `LeaseManager` keeps in-memory counted pools; the defaults
