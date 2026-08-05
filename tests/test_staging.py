@@ -22,8 +22,8 @@ from sutradhara.catalog.models import (
     Pool,
     StagingTransform,
 )
-from sutradhara.catalog.types import BackendKind, BackendTier
 from sutradhara.catalog.session import create_all, make_engine, session_scope
+from sutradhara.catalog.types import BackendKind, BackendTier
 from sutradhara.staging import StagingHeld, stage_and_enqueue_artifact
 
 

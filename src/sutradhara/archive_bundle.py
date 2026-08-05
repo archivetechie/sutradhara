@@ -116,6 +116,7 @@ def get_or_create_open_bundle(
     fingerprint, basis = compute_bundle_group(session, artifactclass)
     existing = _find_open_accumulator(session, fingerprint)
     if existing is not None:
+        _assert_open_witness(existing)
         return existing, False
 
     target_bytes, max_age_seconds = effective_group_thresholds(
