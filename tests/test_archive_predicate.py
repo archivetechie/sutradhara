@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import datetime as dt
 import hashlib
 
@@ -32,6 +34,7 @@ from sutradhara.catalog.types import (
     RetentionState,
     SubmissionStatus,
 )
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 def test_rollout_gate_defaults_off_and_rejects_ambiguous_values() -> None:
@@ -80,7 +83,7 @@ def test_audit_reports_partial_retention_passed_intakes_without_mutating(tmp_pat
             )
         bundle = Bundle(
             id="sealed",
-            artifactclass="s-masters",
+            **bundle_kwargs(seed="s-masters"),
             status="sealed",
             total_bytes=10,
             member_count=1,
@@ -95,6 +98,7 @@ def test_audit_reports_partial_retention_passed_intakes_without_mutating(tmp_pat
             BundleMember(
                 bundle_id=bundle.id,
                 logical_asset_hash=archived_hash,
+                artifactclass="s-masters",
                 member_path="archived.mov",
                 size_bytes=10,
                 file_sha256=archived_hash,
@@ -309,17 +313,20 @@ def test_all_predicate_uses_indexes_in_one_query_at_pilot_scale(tmp_path) -> Non
             "CURRENT_TIMESTAMP FROM seq",
             (archived_hash, missing_hash),
         )
+        pilot_fields = bundle_kwargs(seed="s-masters")
         connection.exec_driver_sql(
             "INSERT INTO bundle "
-            "(id, artifactclass, status, total_bytes, member_count, target_bytes, "
-            "max_age_seconds, opened_at, sealed_at) VALUES "
-            "('pilot-sealed', 's-masters', 'sealed', 1, 1, 1, 60, CURRENT_TIMESTAMP, "
-            "CURRENT_TIMESTAMP)"
+            "(id, bundle_group, group_basis, status, total_bytes, member_count, "
+            "target_bytes, max_age_seconds, opened_at, sealed_at) VALUES "
+            "('pilot-sealed', ?, ?, 'sealed', 1, 1, 1, 60, CURRENT_TIMESTAMP, "
+            "CURRENT_TIMESTAMP)",
+            (pilot_fields["bundle_group"], json.dumps(pilot_fields["group_basis"])),
         )
         connection.exec_driver_sql(
             "INSERT INTO bundle_member "
-            "(bundle_id, logical_asset_hash, member_path, size_bytes, file_sha256, added_at) "
-            "VALUES ('pilot-sealed', ?, 'archived', 1, ?, CURRENT_TIMESTAMP)",
+            "(bundle_id, logical_asset_hash, artifactclass, member_path, size_bytes, "
+            "file_sha256, added_at) "
+            "VALUES ('pilot-sealed', ?, 's-masters', 'archived', 1, ?, CURRENT_TIMESTAMP)",
             (archived_hash, archived_hash),
         )
 

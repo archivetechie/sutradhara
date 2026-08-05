@@ -264,19 +264,25 @@ def _recreate_referenced_table(table: sa.Table) -> None:
 
     Mirrors the copygrain-M3 pattern: on SQLite the rebuild runs with foreign
     keys off (referencing tables keep their rows) and re-checks them after.
+    The pragma is restored to its prior value — leaving it ON would make a
+    later migration's table rebuild in the same invocation cascade-delete
+    referencing rows when it drops the old table.
     """
     name = table.name
     context = op.get_context()
-    if op.get_bind().dialect.name != "sqlite":
+    bind = op.get_bind()
+    if bind.dialect.name != "sqlite":
         with op.batch_alter_table(name, recreate="always", copy_from=table):
             pass
         return
     with context.autocommit_block():
+        was_on = bool(bind.exec_driver_sql("PRAGMA foreign_keys").scalar())
         op.execute("PRAGMA foreign_keys=OFF")
         with op.batch_alter_table(name, recreate="always", copy_from=table):
             pass
-        op.execute("PRAGMA foreign_keys=ON")
         op.execute("PRAGMA foreign_key_check")
+        if was_on:
+            op.execute("PRAGMA foreign_keys=ON")
 
 
 def _submission_table(*, legacy_check: bool = False) -> sa.Table:
@@ -311,5 +317,6 @@ def _submission_table(*, legacy_check: bool = False) -> sa.Table:
         ),
         sa.UniqueConstraint("arrangement_id", name="uq_submission_arrangement_id"),
         sa.Index("ix_submission_arrangement_id", "arrangement_id"),
+        sa.Index("ix_submission_artifactclass", "artifactclass"),
         sa.Index("ix_submission_status", "status"),
     )

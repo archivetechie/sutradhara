@@ -31,6 +31,7 @@ from sutradhara.hdcache.walker import HdcacheWalkerEvent
 from sutradhara.jobs.models import Job, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED, CONDITION_OPEN
 from tests.api.conftest import auth_headers, make_api_app, post_headers
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 def test_restore_destinations_contract_shape(api_engine: Engine, tmp_path: Path) -> None:
@@ -638,7 +639,7 @@ def _seed_asset(engine: Engine, digest: bytes, *, privacy: str) -> None:
             session.add(
                 Bundle(
                     id=bundle_id,
-                    artifactclass=artifactclass,
+                    **bundle_kwargs(seed=artifactclass),
                     status="sealed",
                     target_bytes=1024,
                     max_age_seconds=3600,
@@ -648,6 +649,7 @@ def _seed_asset(engine: Engine, digest: bytes, *, privacy: str) -> None:
                 BundleMember(
                     bundle_id=bundle_id,
                     logical_asset_hash=digest,
+                    artifactclass=artifactclass,
                     member_path=f"{digest.hex()}.mov",
                     size_bytes=1,
                     file_sha256=digest,

@@ -65,6 +65,7 @@ from sutradhara.retention import (
     sweep_staging,
 )
 from sutradhara.sealing.port import Representation
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 @pytest.fixture
@@ -232,7 +233,7 @@ def test_bundle_asset_locator_copy_counts_for_durability(
             kind=BackendKind.REM_TAPE,
         )
         item = _add_intake_with_item(session, tmp_path, "intake-b", artifactclass="s-masters")
-        bundle = Bundle(id="submission-sub-a", artifactclass="s-masters", status="sealed")
+        bundle = Bundle(id="submission-sub-a", **bundle_kwargs(seed="s-masters"), status="sealed")
         session.add(bundle)
         session.flush()
         locator = {"tape_uuid": "tape-b", "object_id": "bundle-copy"}
@@ -289,7 +290,7 @@ def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
         item = _add_intake_with_item(
             session, tmp_path, "intake-mismatch", artifactclass="s-masters"
         )
-        bundle = Bundle(id="submission-mismatch", artifactclass="s-masters", status="sealed")
+        bundle = Bundle(id="submission-mismatch", **bundle_kwargs(seed="s-masters"), status="sealed")
         session.add(bundle)
         session.flush()
         locator = {"tape_uuid": "tape-mismatch", "object_id": "bundle-copy"}
@@ -1384,7 +1385,7 @@ def _add_cloud_copy(session: Session, intake_id: str, locator: dict[str, str]) -
     )
     bundle = Bundle(
         id=f"cloud-blob:{intake_id}",
-        artifactclass="cloud-temp",
+        **bundle_kwargs(seed="cloud-temp"),
         status="sealed",
     )
     session.add_all([pool, bundle])

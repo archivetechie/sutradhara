@@ -63,6 +63,7 @@ from sutradhara.sealing.port import Representation
 
 # Ensure the restore handler (and its dispatch gate) is registered.
 import sutradhara.jobs.handlers  # noqa: F401  isort: skip
+from tests.bundle_group_helpers import bundle_kwargs
 
 TAPE_A = bytes.fromhex("aa" * 16)
 TAPE_B = bytes.fromhex("bb" * 16)
@@ -298,7 +299,7 @@ def _seed_tape_asset(
         session.add(
             Bundle(
                 id=bundle_id,
-                artifactclass=artifactclass,
+                **bundle_kwargs(seed=artifactclass),
                 status="sealed",
                 target_bytes=1024,
                 max_age_seconds=3600,
@@ -308,6 +309,7 @@ def _seed_tape_asset(
             BundleMember(
                 bundle_id=bundle_id,
                 logical_asset_hash=digest,
+                artifactclass=artifactclass,
                 member_path=f"{digest.hex()}.mov",
                 size_bytes=len(data),
                 file_sha256=digest,

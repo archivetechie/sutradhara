@@ -80,6 +80,7 @@ from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
 from tests.key_helpers import registry_with_recovery
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 class _DiskArchiveBackend:
@@ -1336,7 +1337,7 @@ def _seed_item(
         session.add(
             Bundle(
                 id=bundle_id,
-                artifactclass=artifactclass,
+                **bundle_kwargs(seed=artifactclass),
                 status="sealed",
                 total_bytes=len(payload),
                 member_count=1,
@@ -1347,6 +1348,7 @@ def _seed_item(
             BundleMember(
                 bundle_id=bundle_id,
                 logical_asset_hash=digest,
+                artifactclass=artifactclass,
                 member_path=member_path,
                 size_bytes=len(payload),
                 file_sha256=digest,

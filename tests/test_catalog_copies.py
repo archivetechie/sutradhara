@@ -20,6 +20,7 @@ from sutradhara.catalog.copies import (
 from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 @pytest.fixture
@@ -179,7 +180,7 @@ def test_add_bundle_copy_records_bundle_without_logical_asset(engine: Engine) ->
     }
 
     with session_scope(engine) as s:
-        s.add(Bundle(id="bundle-001", artifactclass="o-archive"))
+        s.add(Bundle(id="bundle-001", **bundle_kwargs(seed="o-archive"),))
         s.add(
             Pool(
                 id="archive-pool",

@@ -42,6 +42,7 @@ from sutradhara.cli.main import cli
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job, JobStatus
 from sutradhara_receive import receive_source
+from tests.bundle_group_helpers import bundle_kwargs
 
 FIXTURE = Path(__file__).parent / "fixtures" / "remanence_objects.json"
 
@@ -513,7 +514,7 @@ def test_top_level_review_shows_and_records_held_bundle(
         session.add(
             Bundle(
                 id="bundle-held",
-                artifactclass="o-archive",
+                **bundle_kwargs(seed="o-archive"),
                 status="held",
                 review_summary={"clusters": [{"prefix": "tmp/", "count": 2}]},
             )
@@ -521,7 +522,7 @@ def test_top_level_review_shows_and_records_held_bundle(
         session.add(
             Bundle(
                 id="bundle-open",
-                artifactclass="o-archive",
+                **bundle_kwargs(seed="o-archive"),
                 status="open",
             )
         )

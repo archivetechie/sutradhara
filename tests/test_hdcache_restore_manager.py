@@ -89,6 +89,7 @@ from sutradhara.hdcache.store import (
     write_entry,
 )
 from sutradhara.sealing.port import Representation
+from tests.bundle_group_helpers import bundle_kwargs
 
 TEST_HDCACHE_HMAC_SECRET = b"restore-manager-test-secret"
 
@@ -2021,7 +2022,7 @@ def _seed_archived_asset(
         session.add(
             Bundle(
                 id=bundle_id,
-                artifactclass=artifactclass,
+                **bundle_kwargs(seed=artifactclass),
                 status="sealed",
                 target_bytes=1024,
                 max_age_seconds=3600,
@@ -2031,6 +2032,7 @@ def _seed_archived_asset(
             BundleMember(
                 bundle_id=bundle_id,
                 logical_asset_hash=digest,
+                artifactclass=artifactclass,
                 member_path=f"{digest.hex()}.mov",
                 size_bytes=len(data),
                 file_sha256=digest,
@@ -2114,7 +2116,7 @@ def _add_class_membership(
     session.add(
         Bundle(
             id=bundle_id,
-            artifactclass=artifactclass,
+            **bundle_kwargs(seed=artifactclass),
             status="sealed",
             target_bytes=1024,
             max_age_seconds=3600,
@@ -2124,6 +2126,7 @@ def _add_class_membership(
         BundleMember(
             bundle_id=bundle_id,
             logical_asset_hash=digest,
+            artifactclass=artifactclass,
             member_path=f"{digest.hex()}.mov",
             size_bytes=0,
             file_sha256=digest,

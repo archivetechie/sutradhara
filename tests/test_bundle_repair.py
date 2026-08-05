@@ -62,6 +62,7 @@ from sutradhara.jobs.reconcilers.conditions import (
     OBSERVED_PRESENT,
 )
 from sutradhara.sealing.port import Representation
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 @pytest.fixture
@@ -512,7 +513,7 @@ def _flushed_bundle(
                 ),
             ),
         )
-        bundle = Bundle(id="bundle-a", artifactclass="class-a", status="open")
+        bundle = Bundle(id="bundle-a", **bundle_kwargs(seed="class-a"), status="open")
         s.add(bundle)
         assets: dict[bytes, bytes] = {}
         for member_path, data in paths.items():
@@ -524,6 +525,7 @@ def _flushed_bundle(
             add_bundle_member(
                 s,
                 bundle=bundle,
+                artifactclass="class-a",
                 logical_asset_hash=asset_hash,
                 member_path=member_path,
                 size_bytes=len(data),

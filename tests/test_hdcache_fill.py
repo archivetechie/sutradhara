@@ -71,6 +71,7 @@ from sutradhara.jobs.worker import JobWorker
 from sutradhara.keys import KeyEpoch
 from sutradhara.sealing.port import Representation, SealResult
 from tests.key_helpers import TEST_RECIPIENT_CODEC, make_test_key_registry
+from tests.bundle_group_helpers import bundle_kwargs
 
 TEST_HDCACHE_HMAC_SECRET = b"hdcache-fill-test-secret"
 
@@ -913,7 +914,7 @@ def _seed_archived_backlog(
         session.add(
             Bundle(
                 id=bundle_id,
-                artifactclass=artifactclass,
+                **bundle_kwargs(seed=artifactclass),
                 status="sealed",
                 target_bytes=1024,
                 max_age_seconds=3600,
@@ -923,6 +924,7 @@ def _seed_archived_backlog(
             BundleMember(
                 bundle_id=bundle_id,
                 logical_asset_hash=digest,
+                artifactclass=artifactclass,
                 member_path=f"{digest.hex()}.mov",
                 source_path=str(source_path),
                 size_bytes=len(data),
@@ -1039,7 +1041,7 @@ def _seed_archived_asset(
     bundle_id = f"bundle-{artifactclass}-{digest.hex()[:12]}"
     bundle = Bundle(
         id=bundle_id,
-        artifactclass=artifactclass,
+        **bundle_kwargs(seed=artifactclass),
         status="sealed",
         target_bytes=1024,
         max_age_seconds=3600,
@@ -1049,6 +1051,7 @@ def _seed_archived_asset(
         BundleMember(
             bundle_id=bundle_id,
             logical_asset_hash=digest,
+            artifactclass=artifactclass,
             member_path=f"{digest.hex()}.mov",
             source_path=source_text,
             size_bytes=len(data),
