@@ -11,7 +11,7 @@ import click
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_bundle import bundle_primary_artifactclass, record_review_decision
+from sutradhara.archive_bundle import record_review_decision
 from sutradhara.archive_fanout import (
     BundleHeld,
     HmacManifestSigner,
@@ -33,8 +33,15 @@ from sutradhara.artifactclass_policy import (
 )
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
-from sutradhara.bundle_group import compute_bundle_group
-from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool, Submission
+from sutradhara.bundle_group import basis_pool_ids
+from sutradhara.catalog.models import (
+    ArtifactClassPool,
+    Backend,
+    Bundle,
+    BundleMember,
+    Pool,
+    Submission,
+)
 from sutradhara.catalog.session import make_engine, make_read_only_engine, session_scope
 from sutradhara.hdcache.manager import (
     PrivacyOverride,
@@ -186,20 +193,23 @@ def bundle_enqueue(
                 raise click.ClickException(
                     f"source hash {staged.logical_sha256.hex()} does not match {asset_hash_hex}"
                 )
-            # BG-P4: find-open-bundle becomes find-by-group — the accumulator
-            # keys on the class's derived bundle-group fingerprint now.
-            fingerprint, _ = compute_bundle_group(session, artifactclass)
-            bundle = session.scalars(
-                select(Bundle)
+            # Member grain (§5): report the bundle this member actually landed
+            # in, read from its own catalog row (hash + class + recorded name
+            # — never a group-wide guess, which would misreport include-alone
+            # funnel routings).
+            member = session.scalars(
+                select(BundleMember)
                 .where(
-                    Bundle.bundle_group == fingerprint,
-                    Bundle.status == "open",
+                    BundleMember.artifactclass == artifactclass,
+                    BundleMember.logical_asset_hash == staged.logical_sha256,
+                    BundleMember.member_path == staged.stored_member_path,
                 )
-                .order_by(Bundle.opened_at, Bundle.id)
+                .order_by(BundleMember.id.desc())
+                .limit(1)
             ).first()
-            if bundle is None:
-                raise click.ClickException("staging did not create an open bundle")
-            message = f"enqueued {staged.stored_member_path!r} in bundle {bundle.id}"
+            if member is None:
+                raise click.ClickException("staging did not enqueue a bundle member")
+            message = f"enqueued {staged.stored_member_path!r} in bundle {member.bundle_id}"
     if held_summary is not None:
         raise click.ClickException(json.dumps(held_summary, indent=2, sort_keys=True))
     if message is not None:
@@ -235,11 +245,9 @@ def bundle_flush(
         bundle = session.get(Bundle, bundle_id)
         if bundle is None:
             raise click.ClickException(f"no bundle {bundle_id!r}")
-        # BG-P4: representative member class; P4 reads group_basis pool order.
-        hop_class = bundle_primary_artifactclass(session, bundle)
-        if hop_class is None:
-            raise click.ClickException(f"bundle {bundle_id!r} has no member artifactclass")
-        backends = _target_backends(session, hop_class)
+        # Group grain (§5): the flush's backends come from the bundle's frozen
+        # group_basis pool set, not from any member class's live policy.
+        backends = _bundle_basis_backends(session, bundle)
         try:
             result = flush_bundle(
                 session,
@@ -384,6 +392,21 @@ def restore_cmd(
         except (ArchiveRestoreError, RestoreManagerError) as exc:
             raise click.ClickException(str(exc)) from exc
     click.echo(f"restored {asset_hash.hex()} from {result.source} to {result.output_path}")
+
+
+def _bundle_basis_backends(
+    session: Session, bundle: Bundle
+) -> dict[int, WritableStorageBackend]:
+    """Backends for the pools in a bundle's frozen group_basis (§5)."""
+    pool_ids = basis_pool_ids(bundle.group_basis)
+    if not pool_ids:
+        raise click.ClickException(f"bundle {bundle.id!r} has an empty group_basis")
+    rows = list(
+        session.scalars(
+            select(Backend).join(Backend.pools).where(Pool.id.in_(pool_ids)).distinct()
+        )
+    )
+    return {row.id: cast(WritableStorageBackend, backend_from_row(row)) for row in rows}
 
 
 def _target_backends(session: Session, artifactclass: str) -> dict[int, WritableStorageBackend]:

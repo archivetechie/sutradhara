@@ -76,7 +76,7 @@ INGEST_ITEM_KEYS = {
 DERIVATION_KEYS = {"kind", "source_sha256", "derived_sha256"}
 BUNDLE_KEYS = {
     "id",
-    "artifactclass",
+    "artifactclasses",
     "status",
     "member_count",
     "total_bytes",

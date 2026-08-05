@@ -25,7 +25,7 @@ from sutradhara.api.console import (
     sanitize_text,
 )
 from sutradhara.api.identity import parse_identity
-from sutradhara.archive_bundle import bundle_primary_artifactclass
+from sutradhara.archive_bundle import bundle_artifactclasses
 from sutradhara.archive_predicate import intake_archive_state_expr, legacy_archived_expr
 from sutradhara.catalog.models import (
     AssetDerivation,
@@ -211,7 +211,9 @@ def get_archive_bundles(
             .limit(page_limit)
         )
         if artifactclass_filter is not None:
-            # BG-P4: class filter through the member class column.
+            # Member grain (§5): a bundle matches the class filter when it
+            # holds at least one member of that class — a group bundle may
+            # hold several classes and list under each of them.
             query = query.where(
                 Bundle.id.in_(
                     select(BundleMember.bundle_id).where(
@@ -460,12 +462,14 @@ def _derivation_payloads(session: Any, intake_id: str) -> list[dict[str, object]
 
 
 def _bundle_payload(session: Any, bundle: Bundle, *, copy_count: int) -> dict[str, object]:
-    # BG-P4: representative member class keeps the payload shape until P4's
-    # member-grain rewrite of the operator surfaces.
-    artifactclass = bundle_primary_artifactclass(session, bundle)
+    # Member grain (§5): the operator surface names every member class a
+    # group bundle holds — a single class field cannot describe a group.
     return {
         "id": _text(bundle.id),
-        "artifactclass": None if artifactclass is None else _text(artifactclass),
+        "artifactclasses": [
+            _text(artifactclass)
+            for artifactclass in bundle_artifactclasses(session, bundle)
+        ],
         "status": _text(bundle.status),
         "member_count": bundle.member_count,
         "total_bytes": bundle.total_bytes,

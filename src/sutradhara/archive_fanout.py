@@ -26,7 +26,6 @@ from sqlalchemy import event, select
 from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.archive_bundle import (
-    bundle_primary_artifactclass,
     close_bundle,
     hold_bundle,
     record_asset_locator,
@@ -57,7 +56,7 @@ from sutradhara.rem_archive_cli import (
 from sutradhara.replication import (
     PoolTarget,
     WritableStorageBackend,
-    target_pools,
+    bundle_group_targets,
 )
 from sutradhara.resource_control import run_managed
 from sutradhara.sealing.port import Representation
@@ -584,22 +583,25 @@ def flush_bundle(
                 )
 
     members = [_member_input(member) for member in bundle.members]
-    # BG-P4: mechanical hop — bundle.artifactclass/ruleset/expect were dropped.
-    # A representative member class (identical pool set across member classes
-    # by fingerprint construction) stands in until P2 moves scanning to member
-    # grain at enqueue and P4 reads the pool list from group_basis.
-    hop_class = bundle_primary_artifactclass(session, bundle)
-    hop_policy = (
-        None if hop_class is None else session.get(ArtifactClassPolicyRecord, hop_class)
-    )
-    ruleset = "" if hop_policy is None else hop_policy.ruleset
-    expect = None if hop_policy is None else hop_policy.expect
     if resolved_map_path is None:
-        scan = builder.scan(bundle=bundle, members=members, ruleset=ruleset)
-        bundle.scan_summary = scan.to_summary()
-        if expect == "compliant" and scan.has_deviations:
-            hold_bundle(session, bundle, summary=scan.to_summary())
-            raise BundleHeld(f"bundle {bundle.id!r} held for conformance review")
+        # Member-grain conformance scan (§2/§5): each member is scanned under
+        # its own class's ruleset and the bundle's scan_summary aggregates the
+        # per-class verdicts. (P2 relocates the scan seam to enqueue-batch
+        # time; this flush-time form applies the same member-grain contract
+        # without assuming P2 has landed.)
+        scans_by_class = _scan_members_by_class(session, bundle, builder)
+        bundle.scan_summary = _aggregate_scan_summary(scans_by_class)
+        held_classes = sorted(
+            artifactclass
+            for artifactclass, (expect, scan) in scans_by_class.items()
+            if expect == "compliant" and scan.has_deviations
+        )
+        if held_classes:
+            hold_bundle(session, bundle, summary=bundle.scan_summary)
+            raise BundleHeld(
+                f"bundle {bundle.id!r} held for conformance review "
+                f"(classes: {', '.join(held_classes)})"
+            )
     else:
         bundle.scan_summary = {
             "mode": "map",
@@ -608,12 +610,9 @@ def flush_bundle(
 
     if bundle.archive_id is None:
         bundle.archive_id = f"archive-{bundle.id}"
-    if hop_class is None:
-        raise ArchiveFanoutError(
-            f"bundle {bundle.id!r} has no member class to resolve fan-out targets"
-        )
-    # BG-P4: target_pools by representative class; P4 reads group_basis order.
-    targets = target_pools(session, hop_class, backends, key_epoch=key_epoch)
+    # Fan-out targets come from the bundle's frozen group_basis, in basis
+    # order (§2/§5) — never from a member class's live policy.
+    targets = bundle_group_targets(session, bundle, backends, key_epoch=key_epoch)
     _require_key_epoch(targets)
     copy_ids: list[int] = []
     transient_failures: list[TransientPoolFanoutError] = []
@@ -649,8 +648,6 @@ def flush_bundle(
                         session,
                         bundle=bundle,
                         artifact=artifact,
-                        artifactclass=hop_class,
-                        ruleset_name=ruleset or None,
                     )
             except TransientPoolFanoutError as exc:
                 transient_failures.append(exc)
@@ -669,8 +666,6 @@ def flush_bundle(
                         manifest_path=artifact.manifest_path,
                         destination_dir=Path(deliverables_dir),
                         signer=manifest_signer,
-                        artifactclass=hop_class,
-                        ruleset=ruleset or None,
                     )
                 )
                 bundle.customer_manifest_path = manifest_receipt
@@ -698,6 +693,72 @@ def flush_bundle(
         condition_reason=condition_reason,
         condition_message=condition_message,
     )
+
+
+def _members_by_class(bundle: Bundle) -> dict[str, list[BundleMember]]:
+    """Group a bundle's members by artifactclass, classes in sorted order."""
+    grouped: dict[str, list[BundleMember]] = {}
+    for member in bundle.members:
+        grouped.setdefault(member.artifactclass, []).append(member)
+    return {artifactclass: grouped[artifactclass] for artifactclass in sorted(grouped)}
+
+
+def _scan_members_by_class(
+    session: Session,
+    bundle: Bundle,
+    builder: ArchiveBuilder,
+) -> dict[str, tuple[str | None, ConformanceScan]]:
+    """Scan each class's members under that class's own ruleset (§2/§5)."""
+    results: dict[str, tuple[str | None, ConformanceScan]] = {}
+    for artifactclass, class_members in _members_by_class(bundle).items():
+        policy = session.get(ArtifactClassPolicyRecord, artifactclass)
+        ruleset = "" if policy is None else policy.ruleset
+        expect = None if policy is None else policy.expect
+        scan = builder.scan(
+            bundle=bundle,
+            members=[_member_input(member) for member in class_members],
+            ruleset=ruleset,
+        )
+        results[artifactclass] = (expect, scan)
+    return results
+
+
+def _aggregate_scan_summary(
+    scans_by_class: dict[str, tuple[str | None, ConformanceScan]],
+) -> dict[str, Any]:
+    """Aggregate per-class scan verdicts into the bundle's scan_summary.
+
+    The top-level ``clusters``/``exclusions`` keys keep their pre-group shape
+    (concatenated across classes) for existing consumers; ``by_class`` carries
+    the member-grain breakdown.
+    """
+    clusters: list[dict[str, Any]] = []
+    exclusions: list[dict[str, Any]] = []
+    by_class: dict[str, dict[str, Any]] = {}
+    for artifactclass, (_expect, scan) in scans_by_class.items():
+        summary = scan.to_summary()
+        by_class[artifactclass] = summary
+        clusters.extend(summary["clusters"])
+        exclusions.extend(summary["exclusions"])
+    return {"clusters": clusters, "exclusions": exclusions, "by_class": by_class}
+
+
+def _bundle_build_ruleset(session: Session, bundle: Bundle) -> str:
+    """Build-time ruleset for the inputs route, member-grain honest (§5).
+
+    A single ``--rules`` flag cannot express two classes' rulesets, and
+    applying one class's exclusion rules to another class's members could
+    silently drop catalog members from the object — a preservation inversion.
+    A single-class bundle keeps its class's ruleset (today's behavior
+    exactly); a multi-class bundle builds rule-less — conformance is already
+    gated per class at scan time, and over-inclusion is the safe direction.
+    (P2's map route retires build-time rules entirely.)
+    """
+    classes = sorted({member.artifactclass for member in bundle.members})
+    if len(classes) != 1:
+        return ""
+    policy = session.get(ArtifactClassPolicyRecord, classes[0])
+    return "" if policy is None else policy.ruleset
 
 
 def _record_bundle_copy_outbox(session: Session, bundle_id: str) -> None:
@@ -791,13 +852,6 @@ def build_bundle_copy_for_pool(
     the same write path without changing its current behavior.
     """
 
-    # BG-P4: mechanical hop — the frozen bundle.ruleset column was dropped;
-    # the representative member class's applied policy ruleset stands in
-    # until P2 relocates scanning to enqueue.
-    hop_class = bundle_primary_artifactclass(session, bundle)
-    hop_policy = (
-        None if hop_class is None else session.get(ArtifactClassPolicyRecord, hop_class)
-    )
     artifact = _build_for_target(
         bundle=bundle,
         members=member_sources,
@@ -805,7 +859,7 @@ def build_bundle_copy_for_pool(
         builder=builder,
         key_epoch=key_epoch,
         work_dir=work_dir,
-        ruleset="" if hop_policy is None else hop_policy.ruleset,
+        ruleset=_bundle_build_ruleset(session, bundle),
         map_path=map_path,
         source_root=source_root,
         map_sha256=map_sha256,
@@ -891,10 +945,15 @@ def emit_customer_manifest(
     manifest_path: Path,
     destination_dir: Path,
     signer: ManifestSigner | None,
-    artifactclass: str | None = None,
-    ruleset: str | None = None,
 ) -> Path:
-    """Wrap rem's manifest with an archive id, timestamp, and keyed signature."""
+    """Wrap rem's manifest with an archive id, timestamp, and keyed signature.
+
+    The receipt is member-grain (§5): each member entry carries its own
+    ``artifactclass``, ``stored_member_name`` carries any disambiguation tag,
+    and ``member_name`` is the logical name — two co-resident same-named
+    members share a ``member_name`` and are distinguished by
+    ``stored_member_name``, so the receipt is not misread as a duplicate.
+    """
     if signer is None:
         raise ManifestSigningError("customer manifest requires a keyed signer")
     destination_dir.mkdir(parents=True, exist_ok=True)
@@ -903,10 +962,7 @@ def emit_customer_manifest(
     payload = {
         "archive_id": archive_id,
         "bundle_id": bundle.id,
-        # BG-P4: representative class/ruleset; P4 makes the receipt carry
-        # per-member class instead of a bundle-level one.
-        "artifactclass": artifactclass,
-        "ruleset": ruleset,
+        "member_classes": sorted({member.artifactclass for member in bundle.members}),
         "issued_at": dt.datetime.now(dt.UTC).isoformat(),
         "manifest": source,
         "members": _customer_manifest_members(bundle),
@@ -933,6 +989,7 @@ def _customer_manifest_members(bundle: Bundle) -> list[dict[str, Any]]:
             {
                 "member_name": logical_name,
                 "stored_member_name": member.member_path,
+                "artifactclass": member.artifactclass,
                 "logical_sha256": member.logical_asset_hash.hex(),
                 "stored_sha256": member.file_sha256.hex(),
                 "transforms": [transform.kind for transform in transforms],
@@ -1093,21 +1150,46 @@ def _record_build_exclusions(
     *,
     bundle: Bundle,
     artifact: BuildArtifact,
-    artifactclass: str | None,
-    ruleset_name: str | None,
 ) -> None:
-    # BG-P4: class and ruleset arrive from the flush's representative-class
-    # hop; under member-grain scanning (P2/P4) both come from the member.
+    """Record build exclusions with member-sourced class and ruleset (§5).
+
+    An exclusion whose path matches a member row exactly is a per-asset
+    exclusion: it records the member's class, that class's ruleset, and the
+    member's logical hash (joined through members by hash — the Sony-split
+    duplicate resolves to its own class's row). A cluster exclusion with no
+    matching member keys to the bundle's sole member class where one exists;
+    a multi-class bundle records it classless — the producing class is not
+    recoverable from the build artifact, and P2's enqueue-time scan keys
+    these by (class, root) scan identity instead.
+    """
+    members_by_path = {member.member_path: member for member in bundle.members}
+    classes = sorted({member.artifactclass for member in bundle.members})
+    sole_class = classes[0] if len(classes) == 1 else None
+    rulesets: dict[str, str | None] = {}
+
+    def _ruleset_for(artifactclass: str | None) -> str | None:
+        if not artifactclass:
+            return None
+        if artifactclass not in rulesets:
+            policy = session.get(ArtifactClassPolicyRecord, artifactclass)
+            rulesets[artifactclass] = None if policy is None else (policy.ruleset or None)
+        return rulesets[artifactclass]
+
     for exclusion in artifact.exclusions:
+        member = (
+            members_by_path.get(exclusion.path) if exclusion.count <= 1 else None
+        )
+        artifactclass = member.artifactclass if member is not None else sole_class
         record_exclusion(
             session,
             bundle_id=bundle.id,
             artifactclass=artifactclass or "",
+            logical_asset_hash=None if member is None else member.logical_asset_hash,
             path=exclusion.path,
             reason=exclusion.reason,
             count=exclusion.count,
             bytes_total=exclusion.bytes_total,
-            ruleset_name=ruleset_name,
+            ruleset_name=_ruleset_for(artifactclass),
             detail=exclusion.detail,
         )
 

@@ -768,26 +768,35 @@ def record_review_decision(
     return decision
 
 
-# BG-P4: mechanical hop for consumers of the dropped bundle.artifactclass.
-# P4 rewrites each §5 consumer to member grain / group_basis; until then this
-# returns a deterministic representative class: the first member's class, or
-# (for memberless funnel bundles, e.g. cloud-blob) any class whose projection
-# derives this bundle's group.
-def bundle_primary_artifactclass(session: Session, bundle: Bundle) -> str | None:
-    member_class = session.scalars(
-        select(BundleMember.artifactclass)
-        .where(BundleMember.bundle_id == bundle.id)
-        .order_by(BundleMember.id)
-        .limit(1)
-    ).first()
-    if member_class is not None:
-        return member_class
-    return session.scalars(
-        select(ArtifactClassPolicyRecord.artifactclass)
-        .where(ArtifactClassPolicyRecord.bundle_group == bundle.bundle_group)
-        .order_by(ArtifactClassPolicyRecord.artifactclass)
-        .limit(1)
-    ).first()
+def bundle_artifactclasses(session: Session, bundle: Bundle) -> list[str]:
+    """Return the sorted distinct member classes of a bundle (member grain, §5).
+
+    A bundle may hold several classes; every §5 consumer that used to read the
+    dropped ``bundle.artifactclass`` column reads the member rows instead. A
+    memberless funnel bundle (e.g. cloud-blob before its wrap lands) falls
+    back to the classes whose policy projection derives this bundle's group —
+    identical pool sets by fingerprint construction.
+    """
+    classes = sorted(
+        set(
+            session.scalars(
+                select(BundleMember.artifactclass).where(
+                    BundleMember.bundle_id == bundle.id
+                )
+            )
+        )
+    )
+    if classes:
+        return classes
+    return sorted(
+        set(
+            session.scalars(
+                select(ArtifactClassPolicyRecord.artifactclass).where(
+                    ArtifactClassPolicyRecord.bundle_group == bundle.bundle_group
+                )
+            )
+        )
+    )
 
 
 def _require_asset(session: Session, logical_asset_hash: bytes) -> LogicalAsset:
