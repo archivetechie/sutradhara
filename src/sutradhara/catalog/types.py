@@ -168,6 +168,10 @@ class SubmissionStatus(StrEnum):
     """Archive lifecycle for an immutable submitted source-map payload."""
 
     PENDING_ARCHIVE = "pending_archive"
+    # Material appended to an open group accumulator; not yet archive evidence.
+    # Admitted by ck_submission_status now; written by the P3 submission
+    # convergence rework (derived-status arc).
+    ACCUMULATED = "accumulated"
     ARCHIVED = "archived"
 
 

@@ -442,8 +442,7 @@ def desired_targets_for_class(session: Session, artifactclass: str) -> list[Hdca
     rows = list(
         session.scalars(
             select(BundleMember)
-            .join(Bundle, Bundle.id == BundleMember.bundle_id)
-            .where(Bundle.artifactclass == artifactclass)
+            .where(BundleMember.artifactclass == artifactclass)
             .order_by(BundleMember.id)
         )
     )
@@ -485,12 +484,14 @@ def desired_target_for_asset(
     if asset is None:
         return None
     candidates: list[tuple[int, str, int, HdcacheFillTarget]] = []
+    # hdcache privacy is per-member: the class joins through the member row,
+    # unaffected by co-residence in a multi-class bundle.
     for member, bundle, policy in session.execute(
         select(BundleMember, Bundle, ArtifactClassPolicyRecord)
         .join(Bundle, Bundle.id == BundleMember.bundle_id)
         .join(
             ArtifactClassPolicyRecord,
-            ArtifactClassPolicyRecord.artifactclass == Bundle.artifactclass,
+            ArtifactClassPolicyRecord.artifactclass == BundleMember.artifactclass,
         )
         .where(BundleMember.logical_asset_hash == content_sha256)
         .order_by(BundleMember.id)
@@ -503,14 +504,14 @@ def desired_target_for_asset(
             continue
         target = HdcacheFillTarget(
             content_sha256=content_sha256,
-            artifactclass=bundle.artifactclass,
+            artifactclass=member.artifactclass,
             size_bytes=asset.size_bytes,
             bundle_key=bundle.id,
-            group_key=_fallback_group_key(bundle),
+            group_key=_fallback_group_key(bundle, member.artifactclass),
             source_path=member.source_path,
         )
         privacy = hdcache_policy_from_json(policy.hdcache_config).privacy_level
-        candidates.append((_privacy_rank(privacy), bundle.artifactclass, member.id, target))
+        candidates.append((_privacy_rank(privacy), member.artifactclass, member.id, target))
     if not candidates:
         return None
     return max(candidates, key=lambda item: (item[0], item[1], -item[2]))[3]
@@ -1112,9 +1113,9 @@ def effective_privacy_level(session: Session, content_sha256: bytes) -> str:
 
     classes = set(
         session.scalars(
-            select(Bundle.artifactclass)
-            .join(BundleMember, BundleMember.bundle_id == Bundle.id)
-            .where(BundleMember.logical_asset_hash == content_sha256)
+            select(BundleMember.artifactclass).where(
+                BundleMember.logical_asset_hash == content_sha256
+            )
         )
     )
     classes.update(
@@ -1462,9 +1463,9 @@ def _unique_targets(targets: Iterator[HdcacheFillTarget]) -> list[HdcacheFillTar
     return list(result.values())
 
 
-def _fallback_group_key(bundle: Bundle) -> str:
+def _fallback_group_key(bundle: Bundle, artifactclass: str) -> str:
     stamp = bundle.sealed_at or bundle.flushed_at or bundle.opened_at
-    return f"{bundle.artifactclass}:{stamp.date().isoformat()}"
+    return f"{artifactclass}:{stamp.date().isoformat()}"
 
 
 def _entry_relpath(content_sha256: bytes, representation: str, key_epoch: str | None) -> str:

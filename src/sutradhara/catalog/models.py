@@ -456,7 +456,7 @@ class Submission(Base):
     __tablename__ = "submission"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending_archive', 'archived')",
+            "status IN ('pending_archive', 'accumulated', 'archived')",
             name="ck_submission_status",
         ),
         UniqueConstraint("arrangement_id", name="uq_submission_arrangement_id"),
@@ -900,6 +900,10 @@ class Pool(Base):
             "id",
             name="uq_pool_backend_id",
         ),
+        CheckConstraint(
+            "min_object_bytes IS NULL OR min_object_bytes >= 0",
+            name="ck_pool_min_object_bytes_non_negative",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -916,6 +920,9 @@ class Pool(Base):
     accepts_writes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     retired: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     media_generation: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Operator-declared efficiency floor (bytes) for objects sealed to this
+    # pool; NULL = no floor declared (clamp inactive), never an implicit zero.
+    min_object_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -982,6 +989,10 @@ class ArtifactClassPolicyRecord(Base):
     artifactclass: Mapped[str] = mapped_column(String(128), primary_key=True)
     ruleset: Mapped[str] = mapped_column(String(256), nullable=False)
     expect: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Bundle-group fingerprint projection, written at policy apply and by
+    # every path that can change a fingerprint input; recomputable from
+    # artifactclass_pool + pool (see sutradhara.bundle_group).
+    bundle_group: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     target_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     max_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     restore_preference: Mapped[list[str]] = mapped_column(JSON, nullable=False)
@@ -1003,19 +1014,27 @@ class ArtifactClassPolicyRecord(Base):
 
 
 class Bundle(Base):
-    """A synthetic archive object containing one or more logical assets."""
+    """A synthetic archive object containing one or more logical assets.
+
+    One row = one synthetic archive object accumulating (or sealed) for one
+    bundle group. Status vocabulary: ``open`` | ``flushing`` | ``held`` |
+    ``sealed`` | ``void`` (terminal seal for empty orphan accumulators whose
+    fingerprint no longer derives from any live policy). ``bundle_group`` and
+    ``group_basis`` are immutable at open; the typed threshold columns remain
+    authoritative for ``bundle_due`` and must equal the ``group_basis``
+    witness (asserted at open).
+    """
 
     __tablename__ = "bundle"
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    bundle_group: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    group_basis: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     member_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     target_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     max_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    ruleset: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    expect: Mapped[str | None] = mapped_column(String(32), nullable=True)
     archive_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     scan_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     review_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -1048,12 +1067,12 @@ class Bundle(Base):
 
     def __repr__(self) -> str:
         return (
-            f"<Bundle id={self.id!r} artifactclass={self.artifactclass!r} status={self.status!r}>"
+            f"<Bundle id={self.id!r} group={self.bundle_group[:12]}… status={self.status!r}>"
         )
 
 
 class BundleMember(Base):
-    """Membership of one logical asset inside a synthetic archive bundle."""
+    """Membership of one logical asset inside one bundle under one artifactclass."""
 
     __tablename__ = "bundle_member"
     __table_args__ = (
@@ -1077,6 +1096,7 @@ class BundleMember(Base):
         nullable=False,
         index=True,
     )
+    artifactclass: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     member_path: Mapped[str] = mapped_column(String(2048), nullable=False)
     source_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -1094,6 +1114,18 @@ class BundleMember(Base):
         lazy="selectin",
         order_by="StagingTransform.step_order",
     )
+
+
+# One open accumulator per bundle group. Funnel-style bundles (cloud-blob,
+# quarantine, include-alone, per-submission) carry archive_id from creation
+# and stay outside this surface by construction.
+Index(
+    "uq_bundle_open_accumulator_per_group",
+    Bundle.bundle_group,
+    unique=True,
+    sqlite_where=(Bundle.status == "open") & Bundle.archive_id.is_(None),
+    postgresql_where=(Bundle.status == "open") & Bundle.archive_id.is_(None),
+)
 
 
 class StagingTransform(Base):

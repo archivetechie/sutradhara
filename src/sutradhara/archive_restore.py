@@ -913,10 +913,8 @@ def resolve_member_asset_hash(
     )
     hashes.update(
         session.scalars(
-            select(BundleMember.logical_asset_hash)
-            .join(Bundle, Bundle.id == BundleMember.bundle_id)
-            .where(
-                Bundle.artifactclass == artifactclass,
+            select(BundleMember.logical_asset_hash).where(
+                BundleMember.artifactclass == artifactclass,
                 BundleMember.member_path == canonical,
             )
         )
@@ -973,14 +971,19 @@ def _choose_bundle_restore_group(
     pool_rank = {pool_id: index for index, pool_id in enumerate(pool_order)}
     if not pool_rank:
         return None
+    # BG-P4: class filter through the member rows (a bundle may hold several
+    # classes; only locators whose bundle carries members of this class count).
     locators = list(
         session.scalars(
             select(AssetLocator)
             .options(joinedload(AssetLocator.copy).joinedload(Copy.backend))
-            .outerjoin(Bundle, AssetLocator.bundle_id == Bundle.id)
             .where(
                 AssetLocator.logical_asset_hash.in_(asset_hashes),
-                Bundle.artifactclass == artifactclass,
+                AssetLocator.bundle_id.in_(
+                    select(BundleMember.bundle_id).where(
+                        BundleMember.artifactclass == artifactclass
+                    )
+                ),
             )
         )
     )

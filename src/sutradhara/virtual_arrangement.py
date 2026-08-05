@@ -19,7 +19,7 @@ from sutradhara.arrangement import canonical_member_path
 from sutradhara.catalog.models import (
     AssetLocator,
     AssetTag,
-    Bundle,
+    BundleMember,
     Copy,
     LogicalAsset,
     VirtualArrangement,
@@ -399,16 +399,18 @@ def _resolve_archived_artifactclass(
 
 
 def _healthy_archived_artifactclasses(session: Session, asset_hash: bytes) -> list[str]:
+    # BG-P4: class read through the member join (the member's own class row).
     rows = session.scalars(
-        select(distinct(Bundle.artifactclass))
-        .join(AssetLocator, AssetLocator.bundle_id == Bundle.id)
+        select(distinct(BundleMember.artifactclass))
+        .join(AssetLocator, AssetLocator.bundle_id == BundleMember.bundle_id)
         .join(Copy, Copy.id == AssetLocator.copy_id)
         .where(
             AssetLocator.logical_asset_hash == asset_hash,
+            BundleMember.logical_asset_hash == asset_hash,
             Copy.health == CopyHealth.OK,
             Copy.deleted_at.is_(None),
         )
-        .order_by(Bundle.artifactclass)
+        .order_by(BundleMember.artifactclass)
     )
     return list(rows)
 

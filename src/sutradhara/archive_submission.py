@@ -20,6 +20,11 @@ from sqlalchemy.orm import Session
 from sutradhara.archive_bundle import add_bundle_member
 from sutradhara.archive_fanout import ArchiveBuilder, BuildArtifact, RemArchiveBuilder, flush_bundle
 from sutradhara.artifactclass_policy import get_artifactclass_policy
+from sutradhara.bundle_group import (
+    BASIS_SOURCE_DERIVED,
+    compute_bundle_group,
+    group_basis_document,
+)
 from sutradhara.catalog.models import Bundle, Copy, Submission, SubmissionMember
 from sutradhara.catalog.types import SubmissionStatus
 from sutradhara.rem_archive_cli import sha256_file
@@ -188,14 +193,25 @@ def _project_bundle(
     bundle_id: str,
 ) -> Bundle:
     policy = get_artifactclass_policy(session, submission.artifactclass)
+    fingerprint, basis = compute_bundle_group(session, submission.artifactclass)
     bundle = Bundle(
         id=bundle_id,
-        artifactclass=submission.artifactclass,
+        bundle_group=fingerprint,
+        group_basis=group_basis_document(
+            basis,
+            basis_source=BASIS_SOURCE_DERIVED,
+            target_bytes=policy.target_bytes,
+            max_age_seconds=policy.max_age_seconds,
+        ),
         status="open",
         target_bytes=policy.target_bytes,
         max_age_seconds=policy.max_age_seconds,
-        ruleset=policy.ruleset,
-        expect=policy.expect,
+        # Funnel-style mint: the per-submission bundle is non-accumulating and
+        # never adoptable, and must not collide with the group accumulator on
+        # the one-open-accumulator partial index. flush_bundle keeps a
+        # pre-assigned archive_id as-is. (The per-submission build itself is
+        # retired by the P3 submission-convergence rework.)
+        archive_id=f"archive-{bundle_id}",
         opened_at=dt.datetime.now(dt.UTC),
     )
     session.add(bundle)
@@ -204,6 +220,7 @@ def _project_bundle(
         add_bundle_member(
             session,
             bundle=bundle,
+            artifactclass=submission.artifactclass,
             logical_asset_hash=member.sha256,
             member_path=member.archive_path,
             source_path=None,

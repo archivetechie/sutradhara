@@ -13,6 +13,11 @@ from sqlalchemy import select
 
 from sutradhara.archive_fanout import MemberInput
 from sutradhara.backend import factory
+from sutradhara.bundle_group import (
+    BASIS_SOURCE_DERIVED,
+    compute_bundle_group,
+    group_basis_document,
+)
 from sutradhara.backend.port import CopyRecord
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Backend, Bundle, Copy, IngestItem, Intake, Pool
@@ -321,26 +326,33 @@ def _upsert_cloud_bundle(
 ) -> Bundle:
     bundle = ctx.session.get(Bundle, bundle_id)
     if bundle is None:
+        # Non-accumulating funnel bundle: group fields computed at create and
+        # immutable on upsert; archive_id from creation keeps it outside the
+        # one-open-accumulator index and the adoption guard.
+        fingerprint, basis = compute_bundle_group(ctx.session, intake.artifactclass)
         bundle = Bundle(
             id=bundle_id,
-            artifactclass=intake.artifactclass,
+            bundle_group=fingerprint,
+            group_basis=group_basis_document(
+                basis,
+                basis_source=BASIS_SOURCE_DERIVED,
+                target_bytes=total_bytes,
+                max_age_seconds=0,
+            ),
             status="open",
             total_bytes=total_bytes,
             member_count=member_count,
             target_bytes=total_bytes,
             max_age_seconds=0,
-            ruleset="blob **/",
-            expect="compliant",
             archive_id=bundle_id,
         )
         ctx.session.add(bundle)
     else:
-        bundle.artifactclass = intake.artifactclass
+        # Group identity is immutable on upsert (the historical artifactclass
+        # reassignment is removed with the column).
         bundle.total_bytes = total_bytes
         bundle.member_count = member_count
         bundle.target_bytes = total_bytes
-        bundle.ruleset = "blob **/"
-        bundle.expect = "compliant"
     ctx.session.flush()
     return bundle
 

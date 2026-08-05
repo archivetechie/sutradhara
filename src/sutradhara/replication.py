@@ -554,7 +554,14 @@ def _user_restore_candidates(session: Session, target: Any) -> list[Copy]:
         bundle = session.get(Bundle, target.bundle_id)
         if bundle is None:
             return []
-        artifactclass = bundle.artifactclass
+        # BG-P4: representative member class; the real rewrite gives
+        # member-initiated restores the member's class restore_preference and
+        # whole-bundle operator restores the group_basis pool order.
+        from sutradhara.archive_bundle import bundle_primary_artifactclass
+
+        artifactclass = bundle_primary_artifactclass(session, bundle)
+        if artifactclass is None:
+            return []
         copies = durable_placements(
             session,
             target,
