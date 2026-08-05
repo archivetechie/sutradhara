@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import json
-
 import datetime as dt
 import hashlib
+import json
 
 import pytest
 from sqlalchemy import event, select, text

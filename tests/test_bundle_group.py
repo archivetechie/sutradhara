@@ -7,6 +7,7 @@ guards against (design-bundle-groups v0.8, prompt bg-p1).
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -396,7 +397,7 @@ def test_accumulator_race_translates_foreign_integrity_error(
     with session_scope(engine) as s:
         _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
-        winner, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
+        _winner, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         s.flush()
         monkeypatch.setattr(
             archive_bundle_module, "_find_open_accumulator", lambda *a, **k: None
@@ -565,7 +566,8 @@ def test_idempotent_noop_same_class_same_hash(engine: Engine) -> None:
             size_bytes=4,
             file_sha256=digest,
         )
-        assert created_first and not created_second
+        assert created_first
+        assert not created_second
         assert first.id == second.id
         assert bundle.member_count == 1
 
@@ -763,7 +765,7 @@ def test_include_alone_routes_oversized_member_to_funnel(
             logical_asset_hash=small_hash,
             source_path=small,
         )
-        funnel, member, created = enqueue_artifact(
+        funnel, _member, created = enqueue_artifact(
             s,
             artifactclass="photo",
             policy=policy,
@@ -812,7 +814,7 @@ def test_include_alone_retry_lands_on_open_funnel(
             source_path=big,
         )
         assert created
-        again, member, created_again = enqueue_artifact(
+        again, _member, created_again = enqueue_artifact(
             s,
             artifactclass="photo",
             policy=policy,
@@ -998,9 +1000,8 @@ def test_staging_rekey_crash_retry_is_idempotent(
 # --- migration (§7 order) ---------------------------------------------------
 
 
-def _alembic(db_path: Path, revision: str) -> "subprocess.CompletedProcess[bytes]":
+def _alembic(db_path: Path, revision: str) -> subprocess.CompletedProcess[bytes]:
     import os
-    import subprocess
     import sys
 
     repo_root = Path(__file__).resolve().parents[1]

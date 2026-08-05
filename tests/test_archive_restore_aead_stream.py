@@ -44,8 +44,8 @@ from sutradhara.keys.remanence import RemRecipientKeyCodec
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
-from tests.key_helpers import registry_with_recovery
 from tests.bundle_group_helpers import bundle_kwargs
+from tests.key_helpers import registry_with_recovery
 
 
 @pytest.fixture

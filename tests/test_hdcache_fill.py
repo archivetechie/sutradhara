@@ -70,8 +70,8 @@ from sutradhara.jobs.registry import JobContext, JobResult
 from sutradhara.jobs.worker import JobWorker
 from sutradhara.keys import KeyEpoch
 from sutradhara.sealing.port import Representation, SealResult
-from tests.key_helpers import TEST_RECIPIENT_CODEC, make_test_key_registry
 from tests.bundle_group_helpers import bundle_kwargs
+from tests.key_helpers import TEST_RECIPIENT_CODEC, make_test_key_registry
 
 TEST_HDCACHE_HMAC_SECRET = b"hdcache-fill-test-secret"
 
