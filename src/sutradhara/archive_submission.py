@@ -82,7 +82,12 @@ def archive_submission(
             f"pending submission {submission.id!r} already has bundle {bundle_id!r}"
         )
 
-    source_map_path = _verified_source_map_path(submission)
+    # The frozen submit-time map is the arrangement's integrity artifact:
+    # its digest check still gates the flush, but the build instruction is
+    # the flush-time catalog map that flush_bundle renders from the bundle's
+    # own member rows (design-bundle-groups §4). For a single-submission
+    # bundle the rendered map equals today's semantics.
+    _verified_source_map_path(submission)
     source_root = _source_root(submission)
     members = list(
         session.scalars(
@@ -104,9 +109,6 @@ def archive_submission(
         builder=builder or RemArchiveBuilder(),
         key_epoch=key_epoch,
         tape_capacity_bytes=tape_capacity_bytes,
-        map_path=source_map_path,
-        source_root=source_root,
-        map_sha256=submission.manifest_digest,
         artifact_validator=lambda target, artifact: _validate_artifact_members(
             target,
             artifact,

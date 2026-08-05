@@ -68,13 +68,18 @@ class ArrangementSubmitRace(ArrangementError):
 
 @dataclass(frozen=True)
 class SourceMapEntry:
-    """One frozen source-map row ready for TSV export and DB mirroring."""
+    """One frozen source-map row ready for TSV export and DB mirroring.
+
+    ``ingest_item_id`` is ``None`` for members with no submission lineage
+    (intake-accumulator members in a flush-time map); the renderer emits the
+    empty string for those — rem accepts an empty ingest_item_id column.
+    """
 
     archive_path: str
     source_path: str
     sha256: bytes
     size_bytes: int
-    ingest_item_id: int
+    ingest_item_id: int | None
 
 
 @dataclass(frozen=True)
@@ -384,7 +389,8 @@ def render_source_map(entries: list[SourceMapEntry]) -> str:
                     entry.source_path,
                     entry.sha256.hex(),
                     str(entry.size_bytes),
-                    str(entry.ingest_item_id),
+                    # Absent lineage renders as the empty string, never "None".
+                    "" if entry.ingest_item_id is None else str(entry.ingest_item_id),
                 )
             )
         )

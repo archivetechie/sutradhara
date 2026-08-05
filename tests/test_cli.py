@@ -584,7 +584,14 @@ def test_top_level_review_shows_and_records_held_bundle(
 def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
     cli_env: dict[str, str],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The enqueue wrapper scans its (class, tree root) batch first; mock the
+    # rem process boundary so the staging-hold path under test is reached.
+    monkeypatch.setattr(
+        "sutradhara.archive_enqueue.run_rem_archive_scan",
+        lambda **kwargs: {"clusters": [], "exclusions": []},
+    )
     _run(["db", "init"])
     source = tmp_path / "photo.tif"
     source.write_bytes(b"image-data")
@@ -640,6 +647,90 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
         assert bundle.status == "held"
         assert bundle.review_summary is not None
         assert bundle.review_summary["clusters"][0]["reason"] == "appledouble-merge-failed"
+
+
+def test_archive_bundle_enqueue_reports_the_include_alone_bundle_not_the_accumulator(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 gate residue F6: the CLI used to re-derive the group accumulator and
+    print its id. A member at or over the group target routes include-alone to
+    its own non-adoptable bundle, so the printed id named a bundle the member
+    is not in — an operator following it reviews the wrong member set. The CLI
+    must report the bundle the member actually landed in."""
+    monkeypatch.setattr(
+        "sutradhara.archive_enqueue.run_rem_archive_scan",
+        lambda **kwargs: {"clusters": [], "exclusions": []},
+    )
+    _run(["db", "init"])
+    engine = make_engine()
+    with session_scope(engine) as session:
+        backend = Backend(
+            name="rem-photo",
+            kind=BackendKind.REM_TAPE,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        session.add(backend)
+        session.flush()
+        session.add(
+            Pool(id="pool-photo", backend_id=backend.id, representation="rao-plain-v1")
+        )
+        session.add(
+            ArtifactClassPool(artifactclass="photo", pool_id="pool-photo", active=True)
+        )
+        session.add(
+            ArtifactClassPolicyRecord(
+                artifactclass="photo",
+                ruleset="rao.photo.v1",
+                expect="messy",
+                target_bytes=64,
+                max_age_seconds=60,
+                restore_preference=[],
+            )
+        )
+
+    small = tmp_path / "small" / "small.tif"
+    small.parent.mkdir()
+    small.write_bytes(b"s" * 8)
+    big = tmp_path / "big" / "big.tif"
+    big.parent.mkdir()
+    big.write_bytes(b"b" * 128)
+
+    accumulated = _run(
+        [
+            "archive",
+            "bundle",
+            "enqueue",
+            "photo",
+            hashlib.sha256(b"s" * 8).hexdigest(),
+            str(small),
+        ]
+    )
+    include_alone = _run(
+        [
+            "archive",
+            "bundle",
+            "enqueue",
+            "photo",
+            hashlib.sha256(b"b" * 128).hexdigest(),
+            str(big),
+        ]
+    )
+
+    accumulator_id = accumulated.output.rsplit("bundle ", 1)[1].strip()
+    funnel_id = include_alone.output.rsplit("bundle ", 1)[1].strip()
+    assert funnel_id != accumulator_id
+    with session_scope(engine) as session:
+        funnel = session.get(Bundle, funnel_id)
+        assert funnel is not None
+        # Non-adoptable by construction, and it really holds the big member.
+        assert funnel.archive_id is not None
+        assert [member.member_path for member in funnel.members] == ["big.tif"]
+        accumulator = session.get(Bundle, accumulator_id)
+        assert accumulator is not None
+        assert accumulator.status == "open"
+        assert [member.member_path for member in accumulator.members] == ["small.tif"]
 
 
 def test_admin_doctor_reports_rem_and_key_registry(

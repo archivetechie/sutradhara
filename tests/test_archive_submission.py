@@ -247,10 +247,16 @@ def test_archive_submission_fans_out_and_restores_arranged_member(
         copies = list(session.scalars(select(Copy).where(Copy.bundle_id == result.bundle_id)))
         assert copies
         assert all(copy.last_checked_at is not None for copy in copies)
-        assert bundle.scan_summary == {
-            "mode": "map",
-            "source_map_path": str(Path(submission.source_map_path)),
-        }
+        # The flush renders its own catalog map now; the frozen submit-time
+        # map stays the integrity artifact but is no longer the build input.
+        assert bundle.scan_summary is not None
+        assert bundle.scan_summary["mode"] == "map"
+        assert bundle.scan_summary["member_count"] == 2
+        rendered_digest = bundle.scan_summary["map_sha256"]
+        assert isinstance(rendered_digest, str)
+        assert len(rendered_digest) == 64
+        # The builder received exactly that rendered map (digest handoff).
+        assert {call[3] for call in builder.calls} == {rendered_digest}
 
         locators = list(
             session.scalars(select(AssetLocator).where(AssetLocator.bundle_id == result.bundle_id))
