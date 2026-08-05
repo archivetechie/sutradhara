@@ -89,14 +89,30 @@ def held_process_lock_identity(lockfile: Path) -> str | None:
     ``jobs/attempts.py::default_worker_id`` produces, so a bundle's
     ``claimed_by`` can be compared to it directly.
 
-    flock() locks belong to the open file *description*, not the process, so a
-    second ``open()`` from the worker's own process still reports the lock as
-    held — the sweeper running inside the worker correctly sees its own claim
-    as live.
+    **The probe never takes the lock.** Asking "is it held?" by trying to hold
+    it makes the reader a writer: while the answer is being computed the lock
+    is unavailable, and a worker starting inside that window is told another
+    worker is already running and exits. ``LOCK_SH`` does not fix that — a
+    shared lock still refuses the worker's ``LOCK_EX`` — so the holder is read
+    out of ``/proc/locks``, which is a pure read. flock entries there carry the
+    inode the lock is held on, and an entry means *some* open file description
+    holds it, including one belonging to this process: the sweeper running
+    inside the worker correctly sees its own claim as live.
+
+    Where ``/proc/locks`` is unavailable the old acquire-probe stands in, with
+    its window: an unsure answer must not read as "unheld", because for the
+    reaper "unheld" means "reap", and reaping a live flush is the worst
+    outcome available.
     """
 
     if not lockfile.exists():
         return None
+    holders = _flock_holder_pids(lockfile)
+    if holders is not None:
+        if not holders:
+            return None
+        with lockfile.open("r", encoding="utf-8") as fh:
+            return _holder_identity(fh.read())
     with lockfile.open("a+", encoding="utf-8") as fh:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -107,6 +123,37 @@ def held_process_lock_identity(lockfile: Path) -> str | None:
             return _holder_identity(fh.read())
         fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         return None
+
+
+_PROC_LOCKS = Path("/proc/locks")
+
+
+def _flock_holder_pids(lockfile: Path) -> list[int] | None:
+    """Return the pids holding an flock on ``lockfile``, or None if unknowable.
+
+    ``/proc/locks`` prints one line per lock as
+    ``<n>: FLOCK ADVISORY WRITE <pid> <major:minor:inode> 0 EOF``, with the
+    device in hex and the inode in decimal — matched against the file's own
+    ``st_dev``/``st_ino``. An empty list means nobody holds it; ``None`` means
+    the file could not be read at all, and the caller falls back rather than
+    guessing "unheld".
+    """
+    try:
+        stat = lockfile.stat()
+        content = _PROC_LOCKS.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    wanted = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
+    pids: list[int] = []
+    for line in content.splitlines():
+        fields = line.split()
+        # id:, type, ADVISORY/MANDATORY, mode, pid, dev:inode, start, end
+        if len(fields) < 6 or fields[1] != "FLOCK" or fields[5] != wanted:
+            continue
+        pid = _parse_pid(fields[4])
+        if pid is not None:
+            pids.append(pid)
+    return pids
 
 
 def _holder_identity(content: str) -> str | None:

@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import socket
 import subprocess
 from pathlib import Path
 
+import pytest
 from sqlalchemy import Engine
 
+import sutradhara.jobs.worker_lock as worker_lock_module
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import Job, JobStatus
-from sutradhara.jobs.worker_lock import worker_lock
+from sutradhara.jobs.worker_lock import (
+    exclusive_process_lock,
+    held_process_lock_identity,
+    worker_lock,
+)
 
 
 def test_worker_lock_denies_second_once_and_loop_process(tmp_path: Path) -> None:
@@ -81,6 +88,57 @@ def test_worker_start_cannot_reset_orphans_without_lock(tmp_path: Path) -> None:
             assert row.started_at is None
     finally:
         engine.dispose()
+
+
+def test_the_holder_probe_never_takes_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guards: a reader that answers "is it held?" by holding it.
+
+    ``held_process_lock_identity`` used to take ``LOCK_EX`` when the lock was
+    free, so a worker starting inside that window got ``WorkerAlreadyRunning``
+    and exited — a spurious singleton conflict caused by the reaper merely
+    looking. ``LOCK_SH`` would not have fixed it either: a shared lock still
+    refuses the worker's exclusive one.
+    """
+    lockfile = tmp_path / "probe.worker.lock"
+
+    def _no_flock(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the holder probe must not touch flock()")
+
+    # Free: the answer is "nobody", derived without acquiring anything.
+    lockfile.write_text("stale-host:999999\npid=999999\npurpose=worker\n", encoding="utf-8")
+    monkeypatch.setattr(worker_lock_module.fcntl, "flock", _no_flock)
+    assert held_process_lock_identity(lockfile) is None
+    monkeypatch.undo()
+
+    # Held: the identity comes back, still without acquiring anything.
+    with exclusive_process_lock(lockfile, purpose="worker"):
+        monkeypatch.setattr(worker_lock_module.fcntl, "flock", _no_flock)
+        assert held_process_lock_identity(lockfile) == f"{socket.gethostname()}:{os.getpid()}"
+        monkeypatch.undo()
+
+    # And a starting worker is not blocked by a concurrent probe: the probe
+    # holds nothing, so the exclusive acquisition that follows it succeeds.
+    assert held_process_lock_identity(lockfile) is None
+    with exclusive_process_lock(lockfile, purpose="worker"):
+        pass
+
+
+def test_the_holder_probe_falls_back_when_proc_locks_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guards: reading "cannot tell" as "unheld" off a platform without /proc.
+
+    For the reaper "unheld" means "reap", and reaping a live flush is the worst
+    outcome available — so an unreadable ``/proc/locks`` falls back to the
+    acquire-probe rather than answering None.
+    """
+    lockfile = tmp_path / "fallback.worker.lock"
+    monkeypatch.setattr(worker_lock_module, "_PROC_LOCKS", tmp_path / "no-such-proc-locks")
+    with exclusive_process_lock(lockfile, purpose="worker"):
+        assert held_process_lock_identity(lockfile) == f"{socket.gethostname()}:{os.getpid()}"
+    assert held_process_lock_identity(lockfile) is None
 
 
 def _sqlite_db(tmp_path: Path) -> tuple[str, Engine]:
