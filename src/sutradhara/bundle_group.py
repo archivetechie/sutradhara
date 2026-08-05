@@ -58,10 +58,13 @@ def compute_group_basis(session: Session, artifactclass: str) -> list[dict[str, 
             ArtifactClassPool.artifactclass == artifactclass,
             ArtifactClassPool.active.is_(True),
         )
-        .order_by(ArtifactClassPool.pool_id)
     ).all()
     basis: list[dict[str, Any]] = []
-    for pool_id, representation in rows:
+    # The canonical order is Python codepoint sort, never a SQL ORDER BY —
+    # collation-independent by construction (F9); for ASCII pool ids it equals
+    # the previous BINARY-collation order, so no fingerprint changes (parity
+    # test pins the golden value across both code paths).
+    for pool_id, representation in sorted(rows, key=lambda row: row[0]):
         entry: dict[str, Any] = {"pool": pool_id}
         # NULLs canonicalise as absent keys (design §7.7).
         if representation is not None:
