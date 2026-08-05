@@ -33,6 +33,7 @@ from sutradhara.archive_bundle import (
     record_asset_locator,
     record_blob_root,
     record_exclusion,
+    submission_links,
 )
 from sutradhara.archive_restore import ArchiveRestoreError, member_byte_base, read_member_bytes
 from sutradhara.arrangement import SourceMapEntry, render_source_map
@@ -925,8 +926,7 @@ def validate_submission_member_identity(
     """
     linked: dict[int, BundleMember] = {}
     for row in member_rows:
-        member_id = (row.source_metadata or {}).get("submission_member_id")
-        if isinstance(member_id, int):
+        for _submission_id, member_id in submission_links(row.source_metadata):
             linked[member_id] = row
     if not linked:
         return
@@ -1984,9 +1984,7 @@ def _member_inputs_for_flush(
     linked = {
         member_id: row
         for row in member_rows
-        if isinstance(
-            member_id := (row.source_metadata or {}).get("submission_member_id"), int
-        )
+        for _submission_id, member_id in submission_links(row.source_metadata)
     }
     lineage: dict[int, int] = {}
     if linked:

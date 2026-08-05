@@ -104,6 +104,84 @@ class MemberNamingError(ArchiveBundleError):
 # the full hash plus the seeded class slug (appended by _name_ladder itself).
 _NAME_LADDER_PREFIXES = (10, 20, 32, 48, 64)
 
+# The submission linkage design §4 names: SubmissionMember -> bundle_member ->
+# bundle. It is a LIST because one member row can legitimately serve several
+# submissions: the group accumulator converges producers, so a submission whose
+# (class, member_path, content hash) is already present — a co-resident intake
+# enqueue, or a second submission of identical content under the duplicate-
+# content workflow — lands on the existing row rather than a new one. A single
+# submission_id field made that last-writer-wins, and the loser then never
+# found its own members again: no noop branch, the whole submission re-hashed
+# on every call, and its bundle missing from the reported result.
+SUBMISSION_LINKS_KEY = "submission_links"
+
+
+def submission_links(metadata: dict[str, Any] | None) -> list[tuple[str, int]]:
+    """Return the ``(submission_id, submission_member_id)`` pairs a member carries."""
+    raw = (metadata or {}).get(SUBMISSION_LINKS_KEY)
+    if not isinstance(raw, list):
+        return []
+    links: list[tuple[str, int]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        submission_id = entry.get("submission_id")
+        member_id = entry.get("submission_member_id")
+        if isinstance(submission_id, str) and isinstance(member_id, int):
+            links.append((submission_id, member_id))
+    return links
+
+
+def submission_link_metadata(submission_id: str, submission_member_id: int) -> dict[str, Any]:
+    """Render one submission linkage as ``source_metadata`` for an append."""
+    return {
+        SUBMISSION_LINKS_KEY: [
+            {"submission_id": submission_id, "submission_member_id": submission_member_id}
+        ]
+    }
+
+
+def merge_member_source_metadata(
+    session: Session,
+    member: BundleMember,
+    incoming: dict[str, Any] | None,
+) -> bool:
+    """Fold an idempotent append's metadata into the member row it landed on.
+
+    Submission links accumulate; every other key is first-writer-wins, because
+    the row's other metadata (``source_path_bytes_hex``) describes the source
+    the row was created from and a later producer's view of it is not better
+    information. Returns whether anything changed.
+    """
+    if not incoming:
+        return False
+    merged = dict(member.source_metadata or {})
+    changed = False
+    for key, value in incoming.items():
+        if key == SUBMISSION_LINKS_KEY:
+            existing = submission_links(merged)
+            added = [
+                entry
+                for entry in submission_links({SUBMISSION_LINKS_KEY: value})
+                if entry not in existing
+            ]
+            if not added:
+                continue
+            merged[key] = [
+                {"submission_id": submission_id, "submission_member_id": member_id}
+                for submission_id, member_id in [*existing, *added]
+            ]
+            changed = True
+        elif key not in merged:
+            merged[key] = value
+            changed = True
+    if changed:
+        # Reassigned, not mutated in place: the JSON column is not a
+        # MutableDict, so an in-place edit would never reach the database.
+        member.source_metadata = merged
+        session.flush()
+    return changed
+
 
 def _find_open_accumulator(session: Session, fingerprint: str) -> Bundle | None:
     return session.scalars(
@@ -293,7 +371,23 @@ def enqueue_artifact(
             .order_by(Bundle.opened_at, Bundle.id)
         ).first()
         if existing is not None:
-            return existing[0], existing[1], False
+            # Fall through to `add_bundle_member` rather than returning here:
+            # its idempotency rung lands on this same row and it is the one
+            # place that folds the incoming metadata in, so the funnel probe
+            # and the accumulator path cannot drift apart on the linkage.
+            bundle = existing[0]
+            return _append(
+                session,
+                bundle=bundle,
+                artifactclass=artifactclass,
+                logical_asset_hash=logical_asset_hash,
+                member_path=path_in_bundle,
+                source_path=stored_source_path,
+                size_bytes=size_bytes,
+                file_sha256=file_sha256,
+                source=source,
+                metadata=metadata,
+            )
         bundle = _new_bundle(
             fingerprint=fingerprint,
             basis=basis,
@@ -335,13 +429,41 @@ def enqueue_artifact(
             bundle_id=bundle_id,
             now=now,
         )
-    member, created = add_bundle_member(
+    return _append(
         session,
         bundle=bundle,
         artifactclass=artifactclass,
         logical_asset_hash=logical_asset_hash,
         member_path=path_in_bundle,
         source_path=stored_source_path,
+        size_bytes=size_bytes,
+        file_sha256=file_sha256,
+        source=source,
+        metadata=metadata,
+    )
+
+
+def _append(
+    session: Session,
+    *,
+    bundle: Bundle,
+    artifactclass: str,
+    logical_asset_hash: bytes,
+    member_path: str,
+    source_path: str | None,
+    size_bytes: int,
+    file_sha256: bytes | None,
+    source: Path,
+    metadata: dict[str, Any],
+) -> tuple[Bundle, BundleMember, bool]:
+    """The single append funnel both enqueue routings end in."""
+    member, created = add_bundle_member(
+        session,
+        bundle=bundle,
+        artifactclass=artifactclass,
+        logical_asset_hash=logical_asset_hash,
+        member_path=member_path,
+        source_path=source_path,
         size_bytes=size_bytes,
         file_sha256=_sha256_file(source) if file_sha256 is None else file_sha256,
         source_metadata=metadata or None,
@@ -611,11 +733,15 @@ def add_bundle_member(
     """Add a logical asset to a bundle through the canonical naming ladder.
 
     A requested ``(bundle, member_path)`` already present with the same class
-    and same logical hash is the idempotent no-op. Any other hit gets a
-    deterministic disambiguated name from the collision ladder, recorded as
-    an event. Counter bumps are atomic SQL updates; a check-then-insert race
-    on the ``(bundle_id, member_path)`` unique surface recovers by re-running
-    the ladder against the now-visible winner (bounded, one retry) — a raw
+    and same logical hash is the idempotent no-op — **except for
+    ``source_metadata``, which is folded into the existing row**. The linkage a
+    submission append carries is the whole reason the append happened; dropping
+    it on the idempotent path silently unlinked every submission whose content
+    a co-resident had already enqueued. Any other hit gets a deterministic
+    disambiguated name from the collision ladder, recorded as an event. Counter
+    bumps are atomic SQL updates; a check-then-insert race on the
+    ``(bundle_id, member_path)`` unique surface recovers by re-running the
+    ladder against the now-visible winner (bounded, one retry) — a raw
     ``IntegrityError`` never escapes.
     """
     if bundle.status != "open":
@@ -635,6 +761,7 @@ def add_bundle_member(
             logical_asset_hash=logical_asset_hash,
         )
         if existing is not None:
+            merge_member_source_metadata(session, existing, source_metadata)
             return existing, False
         candidate = BundleMember(
             bundle_id=bundle.id,
