@@ -156,12 +156,9 @@ def effective_group_thresholds(
     ):
         declared[row.artifactclass] = (row.target_bytes, row.max_age_seconds)
     # Opener-union: the opening class is in the set by construction, from its
-    # live-derived fingerprint, even when its stored projection is stale.
+    # live-derived fingerprint, even when its stored projection is stale — so
+    # the declared set is never empty here (F7 removed the dead empty check).
     declared[artifactclass] = (policy.target_bytes, policy.max_age_seconds)
-    if not declared:
-        raise EmptyBundleGroupError(
-            f"bundle group {fingerprint!r} has no declared classes at open"
-        )
     target_bytes = max(target for target, _ in declared.values())
     max_age_seconds = min(age for _, age in declared.values())
 
