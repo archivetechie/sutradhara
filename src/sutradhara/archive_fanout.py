@@ -15,27 +15,36 @@ import hmac
 import json
 import logging
 import os
+import re
 import tarfile
 import tempfile
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Protocol
 
-from sqlalchemy import event, select
+from sqlalchemy import event, select, update
 from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.archive_bundle import (
     close_bundle,
-    hold_bundle,
     record_asset_locator,
     record_blob_root,
     record_exclusion,
 )
 from sutradhara.archive_restore import ArchiveRestoreError, member_byte_base, read_member_bytes
+from sutradhara.arrangement import SourceMapEntry, render_source_map
 from sutradhara.backend.port import BackendError, ByteRange, VerifyResult
 from sutradhara.catalog.copies import add_bundle_copy
-from sutradhara.catalog.models import ArtifactClassPolicyRecord, Bundle, BundleMember, Copy
+from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
+    Bundle,
+    BundleMember,
+    Copy,
+    StagingTransform,
+    SubmissionMember,
+)
 from sutradhara.catalog.types import CopyHealth, CopySource
 from sutradhara.evidence_recorder import record_measured, record_unmeasured_promotion
 from sutradhara.hdcache.fill import enqueue_post_flush_hdcache_fills
@@ -51,7 +60,6 @@ from sutradhara.rem_archive_cli import (
     recipient_registry_ids,
     resolve_rem_bin,
     run_rem_archive_build,
-    run_rem_archive_scan,
 )
 from sutradhara.replication import (
     PoolTarget,
@@ -61,6 +69,7 @@ from sutradhara.replication import (
 from sutradhara.resource_control import run_managed
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.structured_logs import emit_structured_event
 
 LOGGER = logging.getLogger(__name__)
 _BUNDLE_COPY_FAST_PATH_KEY = "sutradhara_bundle_copy_fast_path"
@@ -70,8 +79,8 @@ class ArchiveFanoutError(Exception):
     """Base class for archive fan-out errors."""
 
 
-class BundleHeld(ArchiveFanoutError):
-    """The conformance gate held a bundle for review."""
+class FlushPreflightShort(ArchiveFanoutError):
+    """The flush work directory lacks space for bundle x target materialisation."""
 
 
 class BundleOversize(ArchiveFanoutError):
@@ -205,17 +214,12 @@ class BuildArtifact:
 
 
 class ArchiveBuilder(Protocol):
-    """Archive builder boundary owned by remanence in production."""
+    """Archive builder boundary owned by remanence in production.
 
-    def scan(
-        self,
-        *,
-        bundle: Bundle,
-        members: Sequence[MemberInput],
-        ruleset: str,
-    ) -> ConformanceScan:
-        """Run the ruleset scan-only pass and return clustered deviations."""
-        ...
+    Conformance scanning is not part of this boundary: scanning happens at
+    enqueue-batch time, per (artifactclass, source tree root) — see
+    ``sutradhara.archive_enqueue``. The build consumes a flush-rendered map.
+    """
 
     def build(
         self,
@@ -286,20 +290,17 @@ class LocalArchiveBuilder:
     The object format is intentionally simple and self-describing:
     ``8-byte header length`` + JSON header + concatenated member bytes. It is
     not RAO; production callers should use ``RemArchiveBuilder``.
+
+    WARNING: this builder reads member bytes from ``members`` directly and
+    IGNORES ``map_path``/``source_root``/``map_sha256`` — a map defect cannot
+    fail a LocalArchiveBuilder test. Map-route coverage must execute through
+    ``RemArchiveBuilder`` with the process boundary mocked (the twice-flagged
+    ships-green hazard).
     """
 
     _TEST_RECOVERY_EPOCH = (
         "recovery-" + hashlib.sha256(b"sutradhara-local-archive-builder-recovery").hexdigest()[:32]
     )
-
-    def scan(
-        self,
-        *,
-        bundle: Bundle,
-        members: Sequence[MemberInput],
-        ruleset: str,
-    ) -> ConformanceScan:
-        return ConformanceScan()
 
     def build(
         self,
@@ -367,10 +368,16 @@ class LocalArchiveBuilder:
 class RemArchiveBuilder:
     """Subprocess adapter for ``rem archive build``.
 
-    The command is deliberately thin: sutradhara passes the ruleset name/path and
-    member paths, then consumes the manifest emitted by rem. The exact rem
+    The command is deliberately thin: sutradhara passes a flush-rendered
+    catalog map, then consumes the manifest emitted by rem. The exact rem
     manifest shape is normalized permissively so tests can cover the sutradhara
     side without depending on rem internals.
+
+    Builds go by ``--map`` only (design-bundle-groups §4): on the ``--inputs``
+    route rem derives member names from the filesystem itself and hard-errors
+    on duplicate basenames — sutradhara owns member names only on the map
+    route, and the retired segment-counting root derivation
+    (``_rem_input_paths``) must not come back.
     """
 
     def __init__(
@@ -381,21 +388,6 @@ class RemArchiveBuilder:
     ) -> None:
         self._rem_bin = None if rem_bin is None else str(rem_bin)
         self._keys = keys or KeyRegistry()
-
-    def scan(
-        self,
-        *,
-        bundle: Bundle,
-        members: Sequence[MemberInput],
-        ruleset: str,
-    ) -> ConformanceScan:
-        report = run_rem_archive_scan(
-            inputs=_rem_input_paths(members),
-            ruleset=ruleset or None,
-            rem_bin=self._rem_bin,
-            failure_label="rem archive scan",
-        )
-        return _scan_from_json(_normalized_rem_scan_report(report))
 
     def build(
         self,
@@ -412,10 +404,12 @@ class RemArchiveBuilder:
     ) -> BuildArtifact:
         output_path = work_dir / f"{bundle.id}-{representation.value}.rao"
         manifest_path = work_dir / f"{bundle.id}-{representation.value}.manifest.json"
-        rem_ruleset: str | None = ruleset or None
-        rem_inputs = _rem_input_paths(members) if map_path is None else None
         expected_recipient_epochs: tuple[str, ...] = ()
-        if map_path is not None and source_root is None:
+        if map_path is None:
+            raise ArchiveFanoutError(
+                "RemArchiveBuilder builds by map only; the --inputs route is retired"
+            )
+        if source_root is None:
             raise ArchiveFanoutError("map archive build requires source_root")
         if representation is Representation.RAO_AEAD_V1:
             if key_epoch is None:
@@ -434,8 +428,8 @@ class RemArchiveBuilder:
             )
             expected_recipient_epochs = tuple(epoch.key_id for epoch in recipients)
             result = run_rem_archive_build(
-                inputs=rem_inputs,
-                ruleset=None if map_path is not None else rem_ruleset,
+                inputs=None,
+                ruleset=None,
                 map_path=map_path,
                 source_root=source_root,
                 map_sha256=map_sha256,
@@ -447,8 +441,8 @@ class RemArchiveBuilder:
             )
         else:
             result = run_rem_archive_build(
-                inputs=rem_inputs,
-                ruleset=None if map_path is not None else rem_ruleset,
+                inputs=None,
+                ruleset=None,
                 map_path=map_path,
                 source_root=source_root,
                 map_sha256=map_sha256,
@@ -548,22 +542,26 @@ def flush_bundle(
     deliverables_dir: Path | str | None = None,
     manifest_signer: ManifestSigner | None = None,
     tape_capacity_bytes: int | None = None,
-    map_path: Path | str | None = None,
-    source_root: Path | str | None = None,
-    map_sha256: str | None = None,
     artifact_validator: Callable[[PoolTarget, BuildArtifact], None] | None = None,
 ) -> FanoutResult:
-    """Flush one open bundle, build each pool copy, and record catalog state."""
+    """Flush one open bundle, build each pool copy, and record catalog state.
+
+    Every flush renders its build map from the bundle's own member rows (the
+    flush-time catalog map of design-bundle-groups §4) and builds by map with
+    ``--source-root /``. The map's digest column carries the catalog
+    ``file_sha256`` of the staged bytes; rem's writer verifies the streamed
+    payload against it, which IS the pre-write content check — no separate
+    re-hash pass exists here by design.
+
+    A rem failure that names a member (the map line for missing-source and
+    size-drift, the archive path for the writer digest refusal) is caught
+    inside this claim: the member is quarantined into a held funnel bundle,
+    the map is re-rendered without it, and the build retries — an internal
+    loop, never a re-entry into ``flush_bundle``. Non-member failures
+    propagate as before.
+    """
     if deliverables_dir is not None and manifest_signer is None:
         raise ManifestSigningError("deliverables_dir requires a manifest_signer")
-    resolved_map_path = None if map_path is None else Path(map_path)
-    resolved_source_root = None if source_root is None else Path(source_root)
-    if resolved_map_path is not None and resolved_source_root is None:
-        raise ArchiveFanoutError("map flush requires source_root")
-    if resolved_map_path is None and resolved_source_root is not None:
-        raise ArchiveFanoutError("source_root is only valid for map flush")
-    if resolved_map_path is None and map_sha256 is not None:
-        raise ArchiveFanoutError("map_sha256 is only valid for map flush")
     bundle = (
         session.scalars(
             select(Bundle).options(joinedload(Bundle.members)).where(Bundle.id == bundle_id)
@@ -582,93 +580,102 @@ def flush_bundle(
                     f"member {member.member_path!r} exceeds tape capacity; # TODO: oversize split"
                 )
 
-    members = [_member_input(member) for member in bundle.members]
-    if resolved_map_path is None:
-        # Member-grain conformance scan (§2/§5): each member is scanned under
-        # its own class's ruleset and the bundle's scan_summary aggregates the
-        # per-class verdicts. (P2 relocates the scan seam to enqueue-batch
-        # time; this flush-time form applies the same member-grain contract
-        # without assuming P2 has landed.)
-        scans_by_class = _scan_members_by_class(session, bundle, builder)
-        bundle.scan_summary = _aggregate_scan_summary(scans_by_class)
-        held_classes = sorted(
-            artifactclass
-            for artifactclass, (expect, scan) in scans_by_class.items()
-            if expect == "compliant" and scan.has_deviations
-        )
-        if held_classes:
-            hold_bundle(session, bundle, summary=bundle.scan_summary)
-            raise BundleHeld(
-                f"bundle {bundle.id!r} held for conformance review "
-                f"(classes: {', '.join(held_classes)})"
-            )
-    else:
-        bundle.scan_summary = {
-            "mode": "map",
-            "source_map_path": str(resolved_map_path),
-        }
-
-    if bundle.archive_id is None:
-        bundle.archive_id = f"archive-{bundle.id}"
+    # Scanning does not happen here at all: the member-grain scan contract
+    # lives at enqueue-batch time (``sutradhara.archive_enqueue``), per
+    # (class, source tree root) — ``--map`` conflicts with ``--rules``, and a
+    # single-file scan would match rules against the bare basename.
+    #
     # Fan-out targets come from the bundle's frozen group_basis, in basis
-    # order (§2/§5) — never from a member class's live policy.
+    # order (§2/§5) — never from a member class's live policy and never from a
+    # representative-class hop.
     targets = bundle_group_targets(session, bundle, backends, key_epoch=key_epoch)
     _require_key_epoch(targets)
-    copy_ids: list[int] = []
-    transient_failures: list[TransientPoolFanoutError] = []
-    manifest_receipt: str | None = None
-    bundle.status = "flushing"
-    bundle.flushed_at = dt.datetime.now(dt.UTC)
 
     with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-{bundle.id}-") as raw:
         work_dir = Path(raw)
-        for backend, target in targets:
-            # Each target owns a savepoint so retryable backend failures do not
-            # erase catalog rows for earlier successful placements.
-            built: list[BuildArtifact] = []
-            try:
-                with session.begin_nested():
-                    copy = build_bundle_copy_for_pool(
-                        session,
-                        bundle=bundle,
-                        target=target,
-                        member_sources=members,
-                        builder=builder,
-                        backend=backend,
-                        key_epoch=key_epoch,
-                        work_dir=work_dir,
-                        map_path=resolved_map_path,
-                        source_root=resolved_source_root,
-                        map_sha256=map_sha256,
-                        artifact_validator=artifact_validator,
-                        artifact_observer=built.append,
-                    )
-                    [artifact] = built
-                    _record_build_exclusions(
-                        session,
-                        bundle=bundle,
-                        artifact=artifact,
-                    )
-            except TransientPoolFanoutError as exc:
-                transient_failures.append(exc)
-                continue
-            copy_ids.append(copy.id)
-            if (
-                deliverables_dir is not None
-                and artifact.manifest_path is not None
-                and manifest_receipt is None
-                and Representation(target.representation)
-                in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}
-            ):
-                manifest_receipt = str(
-                    emit_customer_manifest(
-                        bundle=bundle,
-                        manifest_path=artifact.manifest_path,
-                        destination_dir=Path(deliverables_dir),
-                        signer=manifest_signer,
-                    )
+        # §8 preflight: the flush materialises the bundle once per pool target.
+        # Skip-and-alarm BEFORE anything is mutated — the archive_id mint and
+        # the status transition both sit after it, so a short work dir leaves
+        # the bundle exactly as it found it.
+        _preflight_flush_work_dir(
+            work_dir,
+            bundle_id=bundle.id,
+            required_bytes=bundle.total_bytes * max(len(targets), 1),
+            target_count=len(targets),
+        )
+        if bundle.archive_id is None:
+            bundle.archive_id = f"archive-{bundle.id}"
+        bundle.status = "flushing"
+        bundle.flushed_at = dt.datetime.now(dt.UTC)
+
+        quarantine: Bundle | None = None
+        attempt = 0
+        # Each retry quarantines exactly one member, so the loop is bounded by
+        # the member count; an empty remainder fails the flush loudly below.
+        max_attempts = len(bundle.members)
+        while True:
+            member_rows = _member_rows_for_flush(session, bundle)
+            if not member_rows:
+                raise ArchiveFanoutError(
+                    f"bundle {bundle.id!r} has no members left to flush; "
+                    f"all were quarantined"
                 )
-                bundle.customer_manifest_path = manifest_receipt
+            members = [_member_input(row) for row in member_rows]
+            # §8 work-dir hygiene: each quarantine retry gets its own
+            # subdirectory. Reusing per-target dirs across attempts leaves an
+            # earlier attempt's artifact in place, and a target that built then
+            # failed transiently on the backend write would meet its own stale
+            # `--out already exists` on the retry.
+            attempt_dir = work_dir / f"attempt-{attempt}"
+            attempt_dir.mkdir()
+            try:
+                # Rendering is inside the try because a member whose source
+                # path is not UTF-8 encodable is a member verdict, and the
+                # quarantine loop below is what moves it out of the way.
+                map_text = _render_flush_map(session, members, member_rows=member_rows)
+                # Strict: the renderer has already rejected every member the
+                # map could not carry, so a surviving surrogate is a hole in
+                # that check and must fail loudly rather than reach rem, whose
+                # --map loader is strict UTF-8 over the whole file.
+                map_bytes = map_text.encode("utf-8")
+                map_path = attempt_dir / f"{bundle.id}.map.tsv"
+                map_path.write_bytes(map_bytes)
+                map_digest = hashlib.sha256(map_bytes).hexdigest()
+                bundle.scan_summary = {
+                    "mode": "map",
+                    "map_sha256": map_digest,
+                    "member_count": len(member_rows),
+                }
+                copy_ids, transient_failures, manifest_receipt = _fan_out_targets(
+                    session,
+                    bundle=bundle,
+                    targets=targets,
+                    members=members,
+                    member_rows=member_rows,
+                    builder=builder,
+                    key_epoch=key_epoch,
+                    work_dir=attempt_dir,
+                    map_path=map_path,
+                    map_sha256=map_digest,
+                    deliverables_dir=deliverables_dir,
+                    manifest_signer=manifest_signer,
+                    artifact_validator=artifact_validator,
+                )
+            except _MemberBuildFailure as failure:
+                attempt += 1
+                if attempt > max_attempts:  # pragma: no cover - structural bound
+                    raise ArchiveFanoutError(
+                        f"bundle {bundle.id!r} flush exceeded its quarantine bound"
+                    ) from failure
+                quarantine = _quarantine_member(
+                    session,
+                    bundle=bundle,
+                    member_row=failure.member_row,
+                    quarantine=quarantine,
+                    message=failure.message,
+                )
+                continue
+            break
 
     close_bundle(session, bundle)
     if transient_failures:
@@ -695,70 +702,382 @@ def flush_bundle(
     )
 
 
-def _members_by_class(bundle: Bundle) -> dict[str, list[BundleMember]]:
-    """Group a bundle's members by artifactclass, classes in sorted order."""
-    grouped: dict[str, list[BundleMember]] = {}
-    for member in bundle.members:
-        grouped.setdefault(member.artifactclass, []).append(member)
-    return {artifactclass: grouped[artifactclass] for artifactclass in sorted(grouped)}
+# The map route requires one containing root and a group bundle's sources are
+# scattered by construction (submission data dirs, per-source staging dirs).
+# The anchoring contract exists to bound hand-authored maps; a catalog-rendered
+# map is not that case — the compensating control is rem's writer verifying
+# every streamed payload against the map's digest column. (Design §4.)
+_MAP_SOURCE_ROOT = Path("/")
+
+# rem names the map *line* for missing-source and size-drift refusals
+# (line 1 is the header, data rows start at line 2)...
+_MAP_LINE_FAILURE = re.compile(r"source map line (\d+)")
+# ...and the archive path for the writer's streamed-digest refusal
+# (remanence-format/src/writer.rs).
+_WRITER_DIGEST_FAILURE = re.compile(r"streamed data hash for (.+?) does not match spec")
 
 
-def _scan_members_by_class(
+class _MemberBuildFailure(Exception):
+    """Internal: a rem build failure identified one member row as the cause."""
+
+    def __init__(self, member_row: BundleMember, message: str) -> None:
+        super().__init__(message)
+        self.member_row = member_row
+        self.message = message
+
+
+def _member_rows_for_flush(session: Session, bundle: Bundle) -> list[BundleMember]:
+    """Return the bundle's member rows in map order (sorted by archive path).
+
+    The sort is Python's, not SQL's, on purpose: design §4 gives sutradhara
+    ownership of on-media member order, and a SQL ``ORDER BY`` would hand that
+    order to whatever collation the database happens to be configured with —
+    the same catalog could then lay members down in one order on SQLite and
+    another on Postgres. Python compares by codepoint, everywhere.
+    """
+    rows = list(
+        session.scalars(select(BundleMember).where(BundleMember.bundle_id == bundle.id))
+    )
+    return sorted(rows, key=lambda row: row.member_path)
+
+
+def _render_flush_map(
     session: Session,
-    bundle: Bundle,
-    builder: ArchiveBuilder,
-) -> dict[str, tuple[str | None, ConformanceScan]]:
-    """Scan each class's members under that class's own ruleset (§2/§5)."""
-    results: dict[str, tuple[str | None, ConformanceScan]] = {}
-    for artifactclass, class_members in _members_by_class(bundle).items():
-        policy = session.get(ArtifactClassPolicyRecord, artifactclass)
-        ruleset = "" if policy is None else policy.ruleset
-        expect = None if policy is None else policy.expect
-        scan = builder.scan(
-            bundle=bundle,
-            members=[_member_input(member) for member in class_members],
-            ruleset=ruleset,
+    members: Sequence[MemberInput],
+    *,
+    member_rows: Sequence[BundleMember] | None = None,
+) -> str:
+    """Render the flush-time catalog map for one build attempt.
+
+    Rows arrive sorted by archive path (rem's own ``--inputs`` convention —
+    sutradhara owns on-media member order now, so it is declared, not
+    incidental). ``sha256`` is the catalog ``file_sha256`` — the digest of the
+    staged bytes, which rem's writer verifies against the streamed payload.
+    ``ingest_item_id`` fills from the ``SubmissionMember`` join where the
+    member has one, else the empty string.
+
+    ``member_rows`` is the flush's row snapshot, index-aligned with
+    ``members``. When it is supplied a member the map cannot carry is reported
+    as a ``_MemberBuildFailure`` against its row, so the flush's quarantine
+    loop moves that one member aside and the rest of the bundle still builds.
+    Without it (the bundle-repair rebuild path, which has no quarantine loop)
+    the same condition raises a plain, named ``ArchiveFanoutError``.
+    """
+    for index, member in enumerate(members):
+        _reject_unmappable_member(
+            member,
+            None if member_rows is None else member_rows[index],
         )
-        results[artifactclass] = (expect, scan)
-    return results
+    ingest_ids = _submission_ingest_item_ids(session, members)
+    entries = [
+        SourceMapEntry(
+            archive_path=member.member_path,
+            source_path=str(member.source_path),
+            sha256=member.file_sha256,
+            size_bytes=member.size_bytes,
+            ingest_item_id=ingest_ids.get((member.member_path, member.file_sha256)),
+        )
+        for member in members
+    ]
+    return render_source_map(entries)
 
 
-def _aggregate_scan_summary(
-    scans_by_class: dict[str, tuple[str | None, ConformanceScan]],
-) -> dict[str, Any]:
-    """Aggregate per-class scan verdicts into the bundle's scan_summary.
+def _reject_unmappable_member(
+    member: MemberInput,
+    member_row: BundleMember | None,
+) -> None:
+    """Refuse one member whose paths cannot survive the map's UTF-8 contract.
 
-    The top-level ``clusters``/``exclusions`` keys keep their pre-group shape
-    (concatenated across classes) for existing consumers; ``by_class`` carries
-    the member-grain breakdown.
+    rem parses the map with ``std::str::from_utf8`` over the WHOLE file
+    (``remanence-cli/src/archive_map.rs``), so a single non-UTF-8-encodable
+    byte rejects every row: the error names no map line and no archive path,
+    ``_identify_member_failure`` cannot attribute it, and one odd filename
+    kills a whole multi-class bundle — precisely what the quarantine loop
+    exists to prevent. This is a live case, not a hypothetical: members whose
+    source path is not UTF-8 encodable carry it as
+    ``source_metadata['source_path_bytes_hex']`` (``archive_bundle.py``,
+    ``archive_submission.py``) and ``_member_source_path`` surrogate-decodes
+    it back.
+
+    The member is quarantined rather than rescued. Rescuing it would mean
+    republishing the bytes under a UTF-8-safe name in the flush work dir, and
+    a hardlink only works within one filesystem — across the staging/work-dir
+    boundary that degrades to a full copy of a possibly very large member, at
+    flush time, to paper over a filename the operator should see. A
+    non-UTF-8 filename is a data-hygiene fact worth surfacing; the split hold
+    surfaces it while the rest of the bundle reaches media.
     """
-    clusters: list[dict[str, Any]] = []
-    exclusions: list[dict[str, Any]] = []
-    by_class: dict[str, dict[str, Any]] = {}
-    for artifactclass, (_expect, scan) in scans_by_class.items():
-        summary = scan.to_summary()
-        by_class[artifactclass] = summary
-        clusters.extend(summary["clusters"])
-        exclusions.extend(summary["exclusions"])
-    return {"clusters": clusters, "exclusions": exclusions, "by_class": by_class}
+    for label, value in (
+        ("source_path", str(member.source_path)),
+        ("member_path", member.member_path),
+    ):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            message = (
+                f"member {member.member_path!r} has a {label} that is not UTF-8 "
+                f"encodable ({os.fsencode(value)!r}); rem's --map loader is "
+                f"strict UTF-8 over the whole file, so this row would reject "
+                f"the entire map"
+            )
+            if member_row is None:
+                raise ArchiveFanoutError(message) from None
+            raise _MemberBuildFailure(member_row, message) from None
 
 
-def _bundle_build_ruleset(session: Session, bundle: Bundle) -> str:
-    """Build-time ruleset for the inputs route, member-grain honest (§5).
+def _submission_ingest_item_ids(
+    session: Session,
+    members: Sequence[MemberInput],
+) -> dict[tuple[str, bytes], int]:
+    """Map (archive path, staged digest) to ingest_item_id via SubmissionMember."""
+    digests = {member.file_sha256 for member in members}
+    if not digests:
+        return {}
+    wanted = {(member.member_path, member.file_sha256) for member in members}
+    resolved: dict[tuple[str, bytes], int] = {}
+    rows = session.execute(
+        select(
+            SubmissionMember.archive_path,
+            SubmissionMember.sha256,
+            SubmissionMember.ingest_item_id,
+        )
+        .where(SubmissionMember.sha256.in_(digests))
+        .order_by(SubmissionMember.id)
+    )
+    for archive_path, sha256, ingest_item_id in rows:
+        key = (archive_path, sha256)
+        if key in wanted and ingest_item_id is not None:
+            # Later submissions win deterministically (rows ordered by id).
+            resolved[key] = ingest_item_id
+    return resolved
 
-    A single ``--rules`` flag cannot express two classes' rulesets, and
-    applying one class's exclusion rules to another class's members could
-    silently drop catalog members from the object — a preservation inversion.
-    A single-class bundle keeps its class's ruleset (today's behavior
-    exactly); a multi-class bundle builds rule-less — conformance is already
-    gated per class at scan time, and over-inclusion is the safe direction.
-    (P2's map route retires build-time rules entirely.)
+
+def _preflight_flush_work_dir(
+    work_dir: Path,
+    *,
+    bundle_id: str,
+    required_bytes: int,
+    target_count: int,
+) -> None:
+    """§8 statvfs preflight sized to the bundle x target count; skip-and-alarm."""
+    stats = os.statvfs(work_dir)
+    available = stats.f_bavail * stats.f_frsize
+    if available < required_bytes:
+        emit_structured_event(
+            "bundle_flush_preflight_short",
+            bundle_id=bundle_id,
+            required_bytes=required_bytes,
+            available_bytes=available,
+            target_count=target_count,
+            work_dir=str(work_dir),
+        )
+        raise FlushPreflightShort(
+            f"bundle {bundle_id!r} flush skipped: work dir has {available} bytes free, "
+            f"needs {required_bytes} ({target_count} targets)"
+        )
+
+
+def _fan_out_targets(
+    session: Session,
+    *,
+    bundle: Bundle,
+    targets: Sequence[tuple[WritableStorageBackend, PoolTarget]],
+    members: Sequence[MemberInput],
+    member_rows: Sequence[BundleMember],
+    builder: ArchiveBuilder,
+    key_epoch: str | None,
+    work_dir: Path,
+    map_path: Path,
+    map_sha256: str,
+    deliverables_dir: Path | str | None,
+    manifest_signer: ManifestSigner | None,
+    artifact_validator: Callable[[PoolTarget, BuildArtifact], None] | None,
+) -> tuple[list[int], list[TransientPoolFanoutError], str | None]:
+    """Run one full per-target build/write/verify pass for the current map."""
+    copy_ids: list[int] = []
+    transient_failures: list[TransientPoolFanoutError] = []
+    manifest_receipt: str | None = None
+    for index, (backend, target) in enumerate(targets):
+        # §8 work-dir hygiene: two same-representation pool targets used to
+        # collide on the work-dir artifact filename; every target now owns a
+        # subdirectory, so artifact filenames are per-target.
+        target_dir = work_dir / f"target-{index:02d}-{_pool_slug(target.pool_id)}"
+        target_dir.mkdir(exist_ok=True)
+        # Each target owns a savepoint so retryable backend failures do not
+        # erase catalog rows for earlier successful placements.
+        built: list[BuildArtifact] = []
+        try:
+            with session.begin_nested():
+                copy = build_bundle_copy_for_pool(
+                    session,
+                    bundle=bundle,
+                    target=target,
+                    member_sources=members,
+                    builder=builder,
+                    backend=backend,
+                    key_epoch=key_epoch,
+                    work_dir=target_dir,
+                    map_path=map_path,
+                    source_root=_MAP_SOURCE_ROOT,
+                    map_sha256=map_sha256,
+                    artifact_validator=artifact_validator,
+                    artifact_observer=built.append,
+                )
+                [artifact] = built
+                # Member grain (§5): class and ruleset come from the matching
+                # member row, not from a representative-class hop.
+                _record_build_exclusions(
+                    session,
+                    bundle=bundle,
+                    artifact=artifact,
+                )
+        except TransientPoolFanoutError as exc:
+            transient_failures.append(exc)
+            continue
+        except RuntimeError as exc:
+            member_row = _identify_member_failure(str(exc), member_rows)
+            if member_row is not None and not copy_ids:
+                # The quarantine-re-render-retry loop in flush_bundle handles
+                # this. With copies already written for earlier targets a
+                # retry would rebuild them (duplicate physical writes), so a
+                # late member failure propagates instead — stated limitation.
+                raise _MemberBuildFailure(member_row, str(exc)) from exc
+            raise
+        copy_ids.append(copy.id)
+        if (
+            deliverables_dir is not None
+            and artifact.manifest_path is not None
+            and manifest_receipt is None
+            and Representation(target.representation)
+            in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}
+        ):
+            manifest_receipt = str(
+                # Member grain (§5): the receipt carries per-member classes as
+                # a `member_classes` roll-up, not one bundle-level class.
+                emit_customer_manifest(
+                    bundle=bundle,
+                    manifest_path=artifact.manifest_path,
+                    destination_dir=Path(deliverables_dir),
+                    signer=manifest_signer,
+                )
+            )
+            bundle.customer_manifest_path = manifest_receipt
+    return copy_ids, transient_failures, manifest_receipt
+
+
+def _pool_slug(pool_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", pool_id) or "pool"
+
+
+def _identify_member_failure(
+    message: str,
+    member_rows: Sequence[BundleMember],
+) -> BundleMember | None:
+    """Map a rem build failure back to the member row it names, if any."""
+    match = _MAP_LINE_FAILURE.search(message)
+    if match:
+        # Header is line 1; the renderer preserves row order, so data line N
+        # is sorted row index N - 2.
+        index = int(match.group(1)) - 2
+        if 0 <= index < len(member_rows):
+            return member_rows[index]
+        return None
+    match = _WRITER_DIGEST_FAILURE.search(message)
+    if match:
+        wanted = match.group(1)
+        for row in member_rows:
+            if row.member_path == wanted:
+                return row
+        return None
+    return None
+
+
+def _quarantine_member(
+    session: Session,
+    *,
+    bundle: Bundle,
+    member_row: BundleMember,
+    quarantine: Bundle | None,
+    message: str,
+) -> Bundle:
+    """Move one failed member into the flush's held quarantine bundle.
+
+    The quarantine bundle is minted funnel-style — ``archive_id`` set at
+    creation — so it never sits ``open`` under the group fingerprint and
+    cannot collide with the one-open-accumulator partial index or be adopted.
+    The member row and its staging-transform rows move by direct UPDATE, and
+    both bundles' counters move atomically (design §4, hold-split mechanics).
     """
-    classes = sorted({member.artifactclass for member in bundle.members})
-    if len(classes) != 1:
-        return ""
-    policy = session.get(ArtifactClassPolicyRecord, classes[0])
-    return "" if policy is None else policy.ruleset
+    if quarantine is None:
+        stamp = dt.datetime.now(dt.UTC)
+        quarantine_id = f"bundle-{uuid.uuid4().hex}"
+        quarantine = Bundle(
+            id=quarantine_id,
+            bundle_group=bundle.bundle_group,
+            group_basis=bundle.group_basis,
+            status="held",
+            target_bytes=bundle.target_bytes,
+            max_age_seconds=bundle.max_age_seconds,
+            archive_id=f"archive-{quarantine_id}",
+            opened_at=stamp,
+            held_at=stamp,
+            review_summary={"quarantined_members": []},
+        )
+        session.add(quarantine)
+        session.flush()
+    session.execute(
+        update(BundleMember)
+        .where(BundleMember.id == member_row.id)
+        .values(bundle_id=quarantine.id)
+    )
+    session.execute(
+        update(StagingTransform)
+        .where(StagingTransform.bundle_member_id == member_row.id)
+        .values(bundle_id=quarantine.id)
+    )
+    session.execute(
+        update(Bundle)
+        .where(Bundle.id == bundle.id)
+        .values(
+            total_bytes=Bundle.total_bytes - member_row.size_bytes,
+            member_count=Bundle.member_count - 1,
+        )
+    )
+    session.execute(
+        update(Bundle)
+        .where(Bundle.id == quarantine.id)
+        .values(
+            total_bytes=Bundle.total_bytes + member_row.size_bytes,
+            member_count=Bundle.member_count + 1,
+        )
+    )
+    summary = dict(quarantine.review_summary or {})
+    quarantined = list(summary.get("quarantined_members", []))
+    quarantined.append(
+        {
+            "member_path": member_row.member_path,
+            "artifactclass": member_row.artifactclass,
+            "reason": message[:500],
+        }
+    )
+    summary["quarantined_members"] = quarantined
+    quarantine.review_summary = summary
+    emit_structured_event(
+        "bundle_member_quarantined",
+        bundle_id=bundle.id,
+        quarantine_bundle_id=quarantine.id,
+        member_path=member_row.member_path,
+        artifactclass=member_row.artifactclass,
+        reason=message[:500],
+    )
+    # Flush pending ORM state BEFORE expiring: expire() discards unflushed
+    # changes on the instance, and the flush's own status/claim writes must
+    # not be lost to the counter refresh.
+    session.flush()
+    session.expire(member_row)
+    session.expire(bundle)
+    session.expire(quarantine, ["total_bytes", "member_count"])
+    return quarantine
 
 
 def _record_bundle_copy_outbox(session: Session, bundle_id: str) -> None:
@@ -846,12 +1165,21 @@ def build_bundle_copy_for_pool(
     """Build, write, verify, and record one pool's bundle copy.
 
     This primitive records the bundle ``Copy`` plus its ``AssetLocator`` and
-    ``BlobRoot`` rows only. Bundle lifecycle, conformance gates, customer
-    manifests, and ``ExclusionRecord`` rows stay with ``flush_bundle``.
-    Optional map/validator/observer arguments exist so ``flush_bundle`` can use
-    the same write path without changing its current behavior.
+    ``BlobRoot`` rows only. Bundle lifecycle, customer manifests, and
+    ``ExclusionRecord`` rows stay with ``flush_bundle``. When the caller does
+    not hand in a map (the bundle-repair rebuild path), one is rendered here
+    from ``member_sources`` — every RAO build goes through the map route.
     """
 
+    if map_path is None:
+        ordered = sorted(member_sources, key=lambda member: member.member_path)
+        map_text = _render_flush_map(session, ordered)
+        map_bytes = map_text.encode("utf-8")
+        map_path = work_dir / f"{bundle.id}.map.tsv"
+        map_path.write_bytes(map_bytes)
+        map_sha256 = hashlib.sha256(map_bytes).hexdigest()
+        source_root = _MAP_SOURCE_ROOT
+        member_sources = ordered
     artifact = _build_for_target(
         bundle=bundle,
         members=member_sources,
@@ -859,7 +1187,11 @@ def build_bundle_copy_for_pool(
         builder=builder,
         key_epoch=key_epoch,
         work_dir=work_dir,
-        ruleset=_bundle_build_ruleset(session, bundle),
+        # The map route retires build-time rules entirely: `--map` conflicts
+        # with `--rules`, and the member-grain scan already ran at enqueue
+        # under each class's own ruleset. No bundle-level ruleset is derived
+        # here — there is no honest one for a multi-class group bundle.
+        ruleset="",
         map_path=map_path,
         source_root=source_root,
         map_sha256=map_sha256,
@@ -1016,6 +1348,11 @@ def _build_for_target(
 ) -> BuildArtifact:
     representation = Representation(target.representation)
     if representation is Representation.D2TAR_RAW:
+        # D2TAR_RAW stays map-blind by design (§4): _build_d2_tar tars the
+        # staged sources directly and carries only the post-write readback
+        # check, so a legacy-pool leg pays one wasted write on a bad source,
+        # never silent corruption. The map's pre-write digest check is the
+        # RAO writer's.
         return _build_d2_tar(bundle, members, work_dir)
     return builder.build(
         bundle=bundle,
@@ -1305,23 +1642,6 @@ def _member_source_path(member: BundleMember) -> Path | None:
                 f"bundle member {member.id} has invalid source_path_bytes_hex"
             ) from exc
     return None
-
-
-def _rem_input_paths(members: Sequence[MemberInput]) -> list[Path]:
-    """Return build roots that make rem member paths match the catalog paths."""
-
-    roots: list[Path] = []
-    seen: set[Path] = set()
-    for member in members:
-        source = Path(member.source_path)
-        parts = PurePosixPath(member.member_path).parts
-        root = source
-        if parts and len(source.parents) >= len(parts):
-            root = source.parents[len(parts) - 1]
-        if root not in seen:
-            roots.append(root)
-            seen.add(root)
-    return roots
 
 
 def _scan_from_json(raw: dict[str, Any]) -> ConformanceScan:

@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_fanout import BuildArtifact, BuiltMember, ConformanceScan, MemberInput
+from sutradhara.archive_fanout import BuildArtifact, BuiltMember, MemberInput
 from sutradhara.archive_restore import (
     RestoreNameError,
     resolve_member_asset_hash,
@@ -125,17 +125,10 @@ class _MapArchiveBuilder:
     def __init__(self, *, bad_ingest_path: str | None = None) -> None:
         self.bad_ingest_path = bad_ingest_path
         self.calls: list[tuple[Representation, Path | None, Path | None, str | None]] = []
-        self.scans = 0
 
-    def scan(
-        self,
-        *,
-        bundle: Bundle,
-        members: Sequence[MemberInput],
-        ruleset: str,
-    ) -> ConformanceScan:
-        self.scans += 1
-        raise AssertionError("map-mode submission archive must not call scan")
+    # No `scan` method by design: scanning left the ArchiveBuilder boundary
+    # entirely (design §4 — it lives at enqueue-batch grain now), so a stub
+    # that raises on a call nothing can make guards nothing.
 
     def build(
         self,
@@ -247,10 +240,16 @@ def test_archive_submission_fans_out_and_restores_arranged_member(
         copies = list(session.scalars(select(Copy).where(Copy.bundle_id == result.bundle_id)))
         assert copies
         assert all(copy.last_checked_at is not None for copy in copies)
-        assert bundle.scan_summary == {
-            "mode": "map",
-            "source_map_path": str(Path(submission.source_map_path)),
-        }
+        # The flush renders its own catalog map now; the frozen submit-time
+        # map stays the integrity artifact but is no longer the build input.
+        assert bundle.scan_summary is not None
+        assert bundle.scan_summary["mode"] == "map"
+        assert bundle.scan_summary["member_count"] == 2
+        rendered_digest = bundle.scan_summary["map_sha256"]
+        assert isinstance(rendered_digest, str)
+        assert len(rendered_digest) == 64
+        # The builder received exactly that rendered map (digest handoff).
+        assert {call[3] for call in builder.calls} == {rendered_digest}
 
         locators = list(
             session.scalars(select(AssetLocator).where(AssetLocator.bundle_id == result.bundle_id))
@@ -281,7 +280,6 @@ def test_archive_submission_fans_out_and_restores_arranged_member(
         )
         assert restored.read_bytes() == b"alpha-body"
 
-    assert builder.scans == 0
     # Fan-out order is group_basis order — pool id, canonically sorted (§2/§5)
     # — not the class's placement sort_order: d2-shelf-pool, offsite-pool,
     # working-pool. Placement order is operational state and never re-orders
@@ -564,6 +562,10 @@ def test_identity_mismatch_rolls_back_catalog_but_leaves_a_media_only_orphan(
     media-only orphan, not an inconsistent catalog. Flagged for the
     submission-build rework, which retires this per-submission build entirely;
     this test pins the behaviour as it stands, including that residue.
+
+    The fix — pre-write identity validation for every representation, not just
+    the RAO family — is scoped into
+    ``journal/sutradhara/prompt-bg-p3-sweeper-convergence.md`` scope item 3.
     """
     setup = _create_submission(
         engine,
