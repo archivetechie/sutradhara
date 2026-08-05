@@ -180,7 +180,8 @@ def _migration_module():
         / "b9c8d7e6f5a4_bundle_groups_schema.py"
     )
     spec = importlib.util.spec_from_file_location("bundle_groups_schema_migration", path)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -786,6 +787,69 @@ def test_ladder_exhaustion_is_a_hash_collision_assert(engine: Engine) -> None:
             )
 
 
+def test_f5_slug_collision_classes_get_distinct_terminal_rungs(engine: Engine) -> None:
+    """F5: ``photo.raw`` and ``photo-raw`` share a slug; the terminal rung is
+    seeded with a hash of the raw class name, so the same content under the
+    same requested name in both classes lands on two distinct rows instead of
+    exhausting the ladder."""
+    assert archive_bundle_module._class_slug("photo.raw") == archive_bundle_module._class_slug(
+        "photo-raw"
+    )
+    content = b"same bytes in both classes"
+    digest = _hash(content)
+    ladder_a = archive_bundle_module._name_ladder("IMG_0001.JPG", digest, "photo.raw")
+    ladder_b = archive_bundle_module._name_ladder("IMG_0001.JPG", digest, "photo-raw")
+    # Same content, same name: every hash-prefix rung collides across the two
+    # classes — only the seeded terminal rung separates them.
+    assert ladder_a[:-1] == ladder_b[:-1]
+    assert ladder_a[-1] != ladder_b[-1]
+
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        policy_a = _add_class(s, "photo.raw", ["pool-a"])
+        _add_class(s, "photo-raw", ["pool-a"])
+        asset = _add_asset(s, content)
+        bundle, _ = get_or_create_open_bundle(s, artifactclass="photo.raw", policy=policy_a)
+        member_a, created_a = add_bundle_member(
+            s,
+            bundle=bundle,
+            artifactclass="photo.raw",
+            logical_asset_hash=asset,
+            member_path="IMG_0001.JPG",
+            size_bytes=len(content),
+            file_sha256=asset,
+        )
+        # Occupy every shared rung so the second class is forced to the
+        # terminal rung — the pre-F5 defect point.
+        for index, candidate in enumerate(ladder_a[1:-1]):
+            squatter = _add_asset(s, f"f5-squatter-{index}".encode())
+            s.add(
+                BundleMember(
+                    bundle_id=bundle.id,
+                    logical_asset_hash=squatter,
+                    artifactclass="photo.raw",
+                    member_path=candidate,
+                    size_bytes=1,
+                    file_sha256=squatter,
+                )
+            )
+        s.flush()
+        member_b, created_b = add_bundle_member(
+            s,
+            bundle=bundle,
+            artifactclass="photo-raw",
+            logical_asset_hash=asset,
+            member_path="IMG_0001.JPG",
+            size_bytes=len(content),
+            file_sha256=asset,
+        )
+        assert created_a
+        assert created_b
+        assert member_a.id != member_b.id
+        assert member_b.member_path == ladder_b[-1]
+        assert member_a.member_path != member_b.member_path
+
+
 def test_tag_helpers_roundtrip() -> None:
     tagged = tag_member_path("dir/name.ext.zst", "abc123")
     assert tagged == "dir/name.abc123.ext.zst"
@@ -880,6 +944,77 @@ def test_include_alone_retry_lands_on_open_funnel(
         )
         assert not created_again
         assert again.id == funnel.id
+
+
+def test_f8_include_alone_mint_savepoint_guard(engine: Engine, tmp_path: Path) -> None:
+    """F8: an IntegrityError on the funnel mint (explicit bundle id colliding
+    with a crash-orphaned funnel that has no member row yet) must resolve
+    through the savepoint guard — adopt the open funnel, add the member, and
+    never let a raw IntegrityError escape."""
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        policy = _add_class(s, "photo", ["pool-a"], target_bytes=100)
+        big = _source(tmp_path, "big.bin", b"y" * 200)
+        big_hash = _add_asset(s, b"y" * 200)
+        # A crash between funnel insert and member insert: the funnel row
+        # exists, the member row does not — so the pre-mint idempotency
+        # select misses and the mint collides on the bundle id.
+        _fingerprint, basis = compute_bundle_group(s, "photo")
+        from tests.bundle_group_helpers import bundle_kwargs
+
+        s.add(
+            Bundle(
+                id="funnel-fixed",
+                status="open",
+                archive_id="archive-funnel-fixed",
+                **bundle_kwargs(basis=basis, target_bytes=100, max_age_seconds=3600),
+            )
+        )
+        s.flush()
+        bundle, member, created = enqueue_artifact(
+            s,
+            artifactclass="photo",
+            policy=policy,
+            logical_asset_hash=big_hash,
+            source_path=big,
+            bundle_id="funnel-fixed",
+        )
+        assert created
+        assert bundle.id == "funnel-fixed"
+        assert member.logical_asset_hash == big_hash
+        assert bundle.member_count == 1
+
+
+def test_f8_include_alone_mint_foreign_collision_is_domain_error(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """F8: a mint collision that is NOT an adoptable open funnel (the id is
+    occupied by a sealed bundle) translates to the retryable domain error,
+    never a raw IntegrityError."""
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        policy = _add_class(s, "photo", ["pool-a"], target_bytes=100)
+        big = _source(tmp_path, "big.bin", b"y" * 200)
+        big_hash = _add_asset(s, b"y" * 200)
+        from tests.bundle_group_helpers import bundle_kwargs
+
+        s.add(
+            Bundle(
+                id="occupied",
+                status="sealed",
+                **bundle_kwargs(seed="foreign", target_bytes=1, max_age_seconds=1),
+            )
+        )
+        s.flush()
+        with pytest.raises(BundleStateError):
+            enqueue_artifact(
+                s,
+                artifactclass="photo",
+                policy=policy,
+                logical_asset_hash=big_hash,
+                source_path=big,
+                bundle_id="occupied",
+            )
 
 
 # --- partial unique index ---------------------------------------------------
