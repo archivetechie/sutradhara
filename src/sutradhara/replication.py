@@ -139,35 +139,115 @@ def target_pools(
                 f"artifactclass {artifactclass!r} has duplicate pool {pool.id!r}"
             )
         seen.add(pool.id)
-
-        Representation(pool.representation)
-        backend = backends.get(pool.backend_id)
-        if backend is None:
-            raise PoolBackendUnavailable(
-                f"pool {pool.id!r} targets backend_id={pool.backend_id}, which was not supplied"
-            )
         targets.append(
-            (
-                backend,
-                PoolTarget(
-                    pool_id=pool.id,
-                    artifactclass=artifactclass,
-                    backend_id=pool.backend_id,
-                    backend_name=pool.backend.name,
-                    representation=pool.representation,
-                    key_epoch=(
-                        key_epoch
-                        if pool.representation == Representation.RAO_AEAD_V1.value
-                        else None
-                    ),
-                    location=pool.location,
-                    offsite_gate=pool.offsite_gate,
-                    tier=pool.tier,
-                    sort_order=membership.sort_order,
-                ),
+            _pool_target_entry(
+                pool,
+                backends,
+                artifactclass=artifactclass,
+                key_epoch=key_epoch,
+                sort_order=membership.sort_order,
             )
         )
     return targets
+
+
+def bundle_group_targets(
+    session: Session,
+    bundle: Bundle,
+    backends: Mapping[int, TBackend],
+    *,
+    key_epoch: str | None = None,
+    write_eligible_only: bool = True,
+) -> list[PoolTargetEntry[TBackend]]:
+    """Return pool targets for a group bundle from its frozen ``group_basis``.
+
+    The basis is the placement promised at open; fan-out order is basis order
+    (§2/§5), never a class's membership order. Live pool rows still govern
+    backend routing and write eligibility; a basis pool missing from the
+    catalog, or whose live representation drifted from the frozen witness, is
+    a loud invariant error, never a silent skip. Basis-sourced targets carry
+    an empty ``artifactclass`` — the group, not a class, owns the fan-out.
+    """
+    from sutradhara.bundle_group import basis_entries
+
+    entries = basis_entries(bundle.group_basis)
+    if not entries:
+        raise ReplicationPolicyMissing(
+            f"bundle {bundle.id!r} has an empty group_basis; no fan-out targets"
+        )
+    pools = {
+        pool.id: pool
+        for pool in session.scalars(
+            select(Pool)
+            .options(joinedload(Pool.backend))
+            .where(Pool.id.in_([str(entry["pool"]) for entry in entries]))
+        )
+    }
+    targets: list[PoolTargetEntry[TBackend]] = []
+    for sort_order, entry in enumerate(entries):
+        pool = pools.get(str(entry["pool"]))
+        if pool is None:
+            raise ReplicationInvariantError(
+                f"bundle {bundle.id!r} basis pool {entry['pool']!r} is not in the catalog"
+            )
+        witness = entry.get("representation")
+        if witness is not None and witness != pool.representation:
+            raise ReplicationInvariantError(
+                f"bundle {bundle.id!r} basis pool {pool.id!r} representation drifted: "
+                f"witness {witness!r} != live {pool.representation!r}"
+            )
+        if write_eligible_only and not pool.accepts_writes:
+            continue
+        targets.append(
+            _pool_target_entry(
+                pool,
+                backends,
+                artifactclass="",
+                key_epoch=key_epoch,
+                sort_order=sort_order,
+            )
+        )
+    if not targets:
+        raise ReplicationPolicyMissing(
+            f"bundle {bundle.id!r} has no write-eligible basis pools"
+        )
+    return targets
+
+
+def _pool_target_entry(
+    pool: Pool,
+    backends: Mapping[int, TBackend],
+    *,
+    artifactclass: str,
+    key_epoch: str | None,
+    sort_order: int,
+) -> PoolTargetEntry[TBackend]:
+    """The one PoolTarget constructor both target sources funnel through."""
+    Representation(pool.representation)
+    backend = backends.get(pool.backend_id)
+    if backend is None:
+        raise PoolBackendUnavailable(
+            f"pool {pool.id!r} targets backend_id={pool.backend_id}, which was not supplied"
+        )
+    return (
+        backend,
+        PoolTarget(
+            pool_id=pool.id,
+            artifactclass=artifactclass,
+            backend_id=pool.backend_id,
+            backend_name=pool.backend.name,
+            representation=pool.representation,
+            key_epoch=(
+                key_epoch
+                if pool.representation == Representation.RAO_AEAD_V1.value
+                else None
+            ),
+            location=pool.location,
+            offsite_gate=pool.offsite_gate,
+            tier=pool.tier,
+            sort_order=sort_order,
+        ),
+    )
 
 
 def replicate_asset(
@@ -542,6 +622,8 @@ def _user_restore_candidates(session: Session, target: Any) -> list[Copy]:
     from sutradhara.durability import AssetTarget, BundleTarget, durable_placements
 
     if isinstance(target, AssetTarget):
+        # Member-initiated restore: the member's own class restore_preference
+        # orders the candidates (§5) — never a co-resident class's preference.
         artifactclass = target.artifactclass
         copies = durable_placements(
             session,
@@ -549,29 +631,27 @@ def _user_restore_candidates(session: Session, target: Any) -> list[Copy]:
             require_verified=False,
             artifactclass=artifactclass,
         )
+        policy = get_artifactclass_policy(session, artifactclass)
+        pool_order = _restore_pool_order(session, artifactclass, policy.restore_preference)
     elif isinstance(target, BundleTarget):
+        # Whole-bundle operator restore: the bundle's frozen group_basis pool
+        # order ranks the candidates (§5) — a group bundle has no single class
+        # whose restore_preference could speak for every member.
+        from sutradhara.bundle_group import basis_pool_ids
+
         bundle = session.get(Bundle, target.bundle_id)
         if bundle is None:
-            return []
-        # BG-P4: representative member class; the real rewrite gives
-        # member-initiated restores the member's class restore_preference and
-        # whole-bundle operator restores the group_basis pool order.
-        from sutradhara.archive_bundle import bundle_primary_artifactclass
-
-        artifactclass = bundle_primary_artifactclass(session, bundle)
-        if artifactclass is None:
             return []
         copies = durable_placements(
             session,
             target,
             require_verified=False,
-            artifactclass=artifactclass,
+            artifactclass=None,
         )
+        pool_order = basis_pool_ids(bundle.group_basis)
     else:
         raise TypeError(f"unsupported source target {target!r}")
 
-    policy = get_artifactclass_policy(session, artifactclass)
-    pool_order = _restore_pool_order(session, artifactclass, policy.restore_preference)
     order_by_pool = {pool_id: index for index, pool_id in enumerate(pool_order)}
     return sorted(
         copies,

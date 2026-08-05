@@ -182,6 +182,22 @@ def effective_group_thresholds(
     return target_bytes, max_age_seconds
 
 
+def basis_entries(group_basis: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return the canonical ``(pool, representation)`` entries of a frozen witness.
+
+    The per-bundle ``group_basis`` document is the placement promised at open;
+    entries come back in canonical basis order, which is also the declared
+    fan-out order for a group bundle (§2/§5).
+    """
+    entries = (group_basis or {}).get("basis") or []
+    return [entry for entry in entries if isinstance(entry, dict) and "pool" in entry]
+
+
+def basis_pool_ids(group_basis: dict[str, Any] | None) -> list[str]:
+    """Return the pool ids of a frozen ``group_basis`` witness, in basis order."""
+    return [str(entry["pool"]) for entry in basis_entries(group_basis)]
+
+
 def refresh_bundle_group_projections(
     session: Session,
     artifactclasses: list[str],
