@@ -20,6 +20,7 @@ from sutradhara.archive_enqueue import (
     scan_enqueue_batch,
 )
 from sutradhara.archive_fanout import (
+    FlushPreflightShort,
     HmacManifestSigner,
     ManifestSigningError,
     RemArchiveBuilder,
@@ -312,7 +313,10 @@ def bundle_flush(
                 deliverables_dir=None if deliverables_dir is None else Path(deliverables_dir),
                 manifest_signer=_manifest_signer(manifest_signing_key_file),
             )
-        except ManifestSigningError as exc:
+        # FlushPreflightShort is the §8 skip-and-alarm verdict: the work dir
+        # cannot hold bundle x targets, nothing was mutated. That is an
+        # operator message ("come back with more space"), not a traceback.
+        except (ManifestSigningError, FlushPreflightShort) as exc:
             raise click.ClickException(str(exc)) from exc
     click.echo(
         f"sealed {result.bundle_id}: copies={list(result.copy_ids)} "

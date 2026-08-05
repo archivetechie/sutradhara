@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_fanout import BuildArtifact, BuiltMember, ConformanceScan, MemberInput
+from sutradhara.archive_fanout import BuildArtifact, BuiltMember, MemberInput
 from sutradhara.archive_restore import (
     RestoreNameError,
     resolve_member_asset_hash,
@@ -125,17 +125,10 @@ class _MapArchiveBuilder:
     def __init__(self, *, bad_ingest_path: str | None = None) -> None:
         self.bad_ingest_path = bad_ingest_path
         self.calls: list[tuple[Representation, Path | None, Path | None, str | None]] = []
-        self.scans = 0
 
-    def scan(
-        self,
-        *,
-        bundle: Bundle,
-        members: Sequence[MemberInput],
-        ruleset: str,
-    ) -> ConformanceScan:
-        self.scans += 1
-        raise AssertionError("map-mode submission archive must not call scan")
+    # No `scan` method by design: scanning left the ArchiveBuilder boundary
+    # entirely (design §4 — it lives at enqueue-batch grain now), so a stub
+    # that raises on a call nothing can make guards nothing.
 
     def build(
         self,
@@ -287,7 +280,6 @@ def test_archive_submission_fans_out_and_restores_arranged_member(
         )
         assert restored.read_bytes() == b"alpha-body"
 
-    assert builder.scans == 0
     assert [call[0] for call in builder.calls] == [
         Representation.RAO_PLAIN_V1,
         Representation.RAO_AEAD_V1,
