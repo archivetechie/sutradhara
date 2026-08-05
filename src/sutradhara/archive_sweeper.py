@@ -264,7 +264,16 @@ def sweep_bundles(
     nothing will ever restart.
 
     A flush that fails does not abort the pass — one bad bundle must not stop
-    every other group from sealing — but the failure is recorded and returned.
+    every other group from sealing — but the failure is recorded and returned,
+    and **it rolls back to its own savepoint**. Without that savepoint the pass
+    would carry the failed flush's partial state to the caller's commit: the
+    claim (``status='flushing'`` plus ``claimed_by``), the ``archive_id`` mint,
+    the ``scan_summary`` and any quarantine rows the attempt created. Under the
+    job worker that committed claim is unrecoverable — ``claimed_by`` names the
+    worker's own still-running pid, so the reaper's liveness check says "live"
+    forever, ``_open_bundles`` never sees a ``flushing`` bundle again, and the
+    material silently never reaches media. The savepoint rollback IS the
+    un-claim, which is the design's own rule (§4) applied to the batch caller.
     """
     result = SweepResult()
     if reap:
@@ -278,22 +287,28 @@ def sweep_bundles(
     flushed: list[str] = []
     for bundle_id in sorted({**drained, **due}):
         try:
-            flush_bundle(
-                session,
-                bundle_id=bundle_id,
-                backends=backends,
-                builder=builder,
-                key_epoch=key_epoch,
-                deliverables_dir=deliverables_dir,
-            )
+            # One savepoint per bundle: a failed flush discards its own partial
+            # catalog state (claim included) and the pass carries on. Nested
+            # inside it, `_fan_out_targets` keeps its per-target savepoints, so
+            # a post-write failure still seals partial rather than unwinding to
+            # here — the two levels encode the pre-write/post-write boundary.
+            with session.begin_nested():
+                flush_bundle(
+                    session,
+                    bundle_id=bundle_id,
+                    backends=backends,
+                    builder=builder,
+                    key_epoch=key_epoch,
+                    deliverables_dir=deliverables_dir,
+                )
         except Exception as exc:
             # Deliberately broad: the sweep is a batch over independent
             # bundles, and one group's bad member, missing source, or
             # unreachable backend must not stop every other group from
-            # sealing. Nothing is swallowed — the failure is recorded in the
-            # result, emitted as a structured event, and exits the CLI
-            # non-zero. FlushPreflightShort in particular already alarmed and
-            # mutated nothing.
+            # sealing. Nothing is swallowed and nothing partial survives — the
+            # savepoint above has already rolled this bundle back to ``open``
+            # and un-claimed, and the failure is recorded in the result,
+            # emitted as a structured event, and exits the CLI non-zero.
             result.failed.append((bundle_id, str(exc)))
             emit_structured_event(
                 "bundle_sweep_flush_failed",

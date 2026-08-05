@@ -58,8 +58,10 @@ from sutradhara.artifactclass_policy import (
 from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, VerifyResult
 from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, make_engine, session_scope
-from sutradhara.catalog.types import BackendKind, BackendTier, content_hash
+from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, content_hash
 from sutradhara.jobs.attempts import default_worker_id
+from sutradhara.jobs.models import ReconciliationCondition
+from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
 from sutradhara.jobs.worker_lock import exclusive_process_lock, process_lockfile_for
 from sutradhara.sealing.port import Representation
 
@@ -79,11 +81,24 @@ def _digest(data: bytes) -> bytes:
 
 
 class _WriteBackend:
-    """In-memory writable backend with a scriptable write failure."""
+    """In-memory writable backend with a scriptable write failure.
 
-    def __init__(self, name: str = "rem", *, fail_pools: tuple[str, ...] = ()) -> None:
+    ``fail_pools`` fails the *write* (transient: nothing reaches media).
+    ``bad_verify_pools`` lets the write succeed and fails the readback verify —
+    the non-transient post-write failure, where bytes are on media and the
+    check refuses them.
+    """
+
+    def __init__(
+        self,
+        name: str = "rem",
+        *,
+        fail_pools: tuple[str, ...] = (),
+        bad_verify_pools: tuple[str, ...] = (),
+    ) -> None:
         self._name = name
         self.fail_pools = set(fail_pools)
+        self.bad_verify_pools = set(bad_verify_pools)
         self.objects: dict[str, bytes] = {}
         self.writes: list[str] = []
         self._counter = 0
@@ -145,6 +160,8 @@ class _WriteBackend:
         yield chunks()
 
     def verify(self, locator: BackendLocator) -> VerifyResult:
+        if str(locator["pool_id"]) in self.bad_verify_pools:
+            return VerifyResult(ok=False, measured=False, detail="configured verify refusal")
         data = self.read_range(locator, ByteRange(0, 0))
         actual = content_hash(hashlib.sha256(data).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
@@ -671,6 +688,132 @@ def test_post_write_failure_seals_partial_with_the_earlier_copy_recorded(
         assert bundle.status == "sealed"
         copies = list(session.scalars(select(Copy).where(Copy.bundle_id == bundle_id)))
         assert [copy.pool_id for copy in copies] == ["p-aaa"]
+
+
+def test_a_failing_bundle_in_a_sweep_is_un_claimed_and_the_pass_carries_on(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Guards: the sweep committing a failed flush's partial state.
+
+    ``sweep_bundles`` records a per-bundle failure and continues, and the
+    caller (``session_scope``) then COMMITS. Without a per-bundle savepoint
+    that commit keeps the failed flush's claim — ``status='flushing'`` plus
+    ``claimed_by``, the ``archive_id`` mint and the ``scan_summary`` — and
+    under the job worker the bundle is then unrecoverable: ``claimed_by`` names
+    the worker's own live pid, so the reaper reads the claim as live forever
+    and ``bundle_due`` never sees a ``flushing`` bundle. The material silently
+    never reaches media.
+
+    Two groups, one healthy and one whose source vanished after enqueue: the
+    healthy one must seal, the broken one must come back ``open`` and
+    un-claimed, and ``SweepResult.failed`` must name it.
+    """
+    with session_scope(engine) as session:
+        _install_class(session, "photos", pools=("p-main",), target_bytes=100)
+        _install_class(session, "audio", pools=("p-other",), target_bytes=100)
+        # Two members each, under the target individually: real accumulators,
+        # so `archive_id` is minted by the flush and must not outlive it.
+        for name in ("a.tif", "b.tif"):
+            healthy = _enqueue(
+                session,
+                artifactclass="photos",
+                source=_source(tmp_path, name, size=60),
+                member_path=name,
+            )
+        for name in ("take.wav", "take2.wav"):
+            broken = _enqueue(
+                session,
+                artifactclass="audio",
+                source=_source(tmp_path, name, size=60),
+                member_path=name,
+            )
+        healthy_id, broken_id = healthy.id, broken.id
+        assert healthy_id != broken_id
+        assert broken.archive_id is None
+        vanishing = Path(broken.members[0].source_path)
+
+    vanishing.unlink()
+    backend = _WriteBackend()
+    with session_scope(engine) as session:
+        result = sweep_bundles(
+            session,
+            backends=_backends(session, backend),
+            builder=LocalArchiveBuilder(),
+        )
+        assert result.flushed == (healthy_id,)
+        assert [bundle_id for bundle_id, _ in result.failed] == [broken_id]
+
+    # After the commit: this is where a missing savepoint shows.
+    assert backend.writes == ["p-main"]
+    with session_scope(engine) as session:
+        assert session.get(Bundle, healthy_id).status == "sealed"
+        stranded = session.get(Bundle, broken_id)
+        assert stranded.status == "open"
+        assert stranded.claimed_by is None
+        assert stranded.archive_id is None
+        assert stranded.scan_summary is None
+        # Visible to the next pass again, which is the whole point.
+        assert [candidate.id for candidate in due_bundles(session)] == [broken_id]
+
+
+def test_post_write_verify_failure_seals_partial_through_the_sweep(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Guards: a NON-transient post-write failure unwinding real copies.
+
+    Only ``TransientPoolFanoutError`` used to be caught in the write loop, so a
+    hard post-write refusal — bytes on media, readback verify says no —
+    propagated out of ``flush_bundle``. Under the per-bundle savepoint above,
+    that propagation would roll the sibling target's committed copy back too:
+    the design's "post-write failures seal partial rather than roll back" would
+    hold for retryable failures only, and a later re-flush would append a
+    second unreclaimable object for the copy that was silently discarded.
+    """
+    with session_scope(engine) as session:
+        _install_class(session, "photos", pools=("p-aaa", "p-zzz"), target_bytes=100)
+        for name in ("a.tif", "b.tif"):
+            bundle = _enqueue(
+                session,
+                artifactclass="photos",
+                source=_source(tmp_path, name, size=60),
+                member_path=name,
+            )
+        bundle_id = bundle.id
+
+    backend = _WriteBackend(bad_verify_pools=("p-zzz",))
+    with session_scope(engine) as session:
+        result = sweep_bundles(
+            session,
+            backends=_backends(session, backend),
+            builder=LocalArchiveBuilder(),
+        )
+        # The pass reports it as flushed, not failed: the bundle sealed.
+        assert result.flushed == (bundle_id,)
+        assert result.failed == []
+
+    assert backend.writes == ["p-aaa", "p-zzz"]
+    with session_scope(engine) as session:
+        assert session.get(Bundle, bundle_id).status == "sealed"
+        copies = {
+            copy.pool_id: copy.health
+            for copy in session.scalars(select(Copy).where(Copy.bundle_id == bundle_id))
+        }
+        # The good placement survives...
+        assert copies["p-aaa"] == CopyHealth.OK
+        # ...and the refused one is recorded SUSPECT rather than erased: its
+        # bytes are on media and a discarded row would let a repair append a
+        # second object to the same pool.
+        assert copies["p-zzz"] == CopyHealth.SUSPECT
+        # And it alarms: blocked, not backed off — an automatic retry would
+        # append rather than replace.
+        condition = session.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "bundle_copy",
+                ReconciliationCondition.target_key == bundle_id,
+            )
+        ).one()
+        assert condition.condition == CONDITION_BLOCKED
+        assert condition.reason == "post-write-pool-failure"
 
 
 def test_hold_written_during_a_failing_enqueue_survives_the_rollback(
