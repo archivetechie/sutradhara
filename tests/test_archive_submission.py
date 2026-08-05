@@ -280,11 +280,15 @@ def test_archive_submission_fans_out_and_restores_arranged_member(
         )
         assert restored.read_bytes() == b"alpha-body"
 
+    # Fan-out order is group_basis order — pool id, canonically sorted (§2/§5)
+    # — not the class's placement sort_order: d2-shelf-pool, offsite-pool,
+    # working-pool. Placement order is operational state and never re-orders
+    # or re-partitions a group.
     assert [call[0] for call in builder.calls] == [
-        Representation.RAO_PLAIN_V1,
         Representation.RAO_AEAD_V1,
+        Representation.RAO_PLAIN_V1,
     ]
-    assert rem_backend.writes == ["working-pool", "offsite-pool"]
+    assert rem_backend.writes == ["offsite-pool", "working-pool"]
     assert d2_backend.writes == ["d2-shelf-pool"]
 
 
@@ -539,10 +543,30 @@ def test_resolve_member_rejects_valid_but_absent_name(
             )
 
 
-def test_identity_mismatch_fails_before_backend_write(
+def test_identity_mismatch_rolls_back_catalog_but_leaves_a_media_only_orphan(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
+    """What the identity cross-check does, and what it no longer prevents.
+
+    The check runs per target, inside that target's savepoint, before that
+    target's pool write — so a mismatch aborts the whole fan-out and the
+    catalog is left exactly as it was: no ``Copy``, no ``AssetLocator``, no
+    submission row moved.
+
+    It is no longer true that *no* backend write happens first. The mechanism:
+    ``_validate_artifact_members`` early-returns for representations outside
+    the RAO family, and basis-order fan-out (§2/§5) now sorts the D2 shelf pool
+    first — so the unchecked D2 write lands before the mismatch is caught on
+    the next target. The residue is media with no catalog row pointing at it: a
+    media-only orphan, not an inconsistent catalog. Flagged for the
+    submission-build rework, which retires this per-submission build entirely;
+    this test pins the behaviour as it stands, including that residue.
+
+    The fix — pre-write identity validation for every representation, not just
+    the RAO family — is scoped into
+    ``journal/sutradhara/prompt-bg-p3-sweeper-convergence.md`` scope item 3.
+    """
     setup = _create_submission(
         engine,
         tmp_path,
@@ -565,8 +589,14 @@ def test_identity_mismatch_fails_before_backend_write(
         )
 
     assert builder.calls
+    # No checked (RAO-family) representation is ever written.
     assert rem_backend.writes == []
-    assert d2_backend.writes == []
+    # The unchecked D2 shelf write lands first and is the media-only orphan.
+    assert d2_backend.writes == ["d2-shelf-pool"]
+    # The catalog is consistent: nothing points at that orphan.
+    with session_scope(engine) as session:
+        assert list(session.scalars(select(Copy))) == []
+        assert list(session.scalars(select(AssetLocator))) == []
 
 
 def test_long_paths_archive_through_widened_member_path_and_source_metadata(

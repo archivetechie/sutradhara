@@ -1267,16 +1267,23 @@ def test_zstd_staged_member_fans_out_manifests_and_restores_original(
 
         assert result.manifest_path is not None
         receipt = json.loads(Path(result.manifest_path).read_text())
+        # The receipt is member-grain (§5): each entry carries its own class,
+        # and the bundle-level `artifactclass`/`ruleset` keys are gone in
+        # favour of the group's `member_classes` roll-up.
         assert receipt["members"] == [
             {
                 "member_name": "images/disk.img",
                 "stored_member_name": "images/disk.img.zst",
+                "artifactclass": "o-archive",
                 "logical_sha256": _digest(original).hex(),
                 "stored_sha256": staged.staged_sha256.hex(),
                 "transforms": ["zstd-file-v1"],
                 "pfr_original": False,
             }
         ]
+        assert receipt["member_classes"] == ["o-archive"]
+        assert "artifactclass" not in receipt
+        assert "ruleset" not in receipt
         assert resolve_member_asset_hash(
             s,
             artifactclass="o-archive",

@@ -28,7 +28,6 @@ from sqlalchemy import event, select, update
 from sqlalchemy.orm import Session, joinedload
 
 from sutradhara.archive_bundle import (
-    bundle_primary_artifactclass,
     close_bundle,
     record_asset_locator,
     record_blob_root,
@@ -65,7 +64,7 @@ from sutradhara.rem_archive_cli import (
 from sutradhara.replication import (
     PoolTarget,
     WritableStorageBackend,
-    target_pools,
+    bundle_group_targets,
 )
 from sutradhara.resource_control import run_managed
 from sutradhara.sealing.port import Representation
@@ -581,21 +580,15 @@ def flush_bundle(
                     f"member {member.member_path!r} exceeds tape capacity; # TODO: oversize split"
                 )
 
-    # BG-P4: mechanical hop — bundle.artifactclass/ruleset/expect were dropped.
-    # A representative member class (identical pool set across member classes
-    # by fingerprint construction) resolves fan-out targets until P4 reads the
-    # pool list from group_basis. Scanning no longer happens here at all: the
-    # member-grain scan contract lives at enqueue-batch time
-    # (sutradhara.archive_enqueue), per (class, source tree root).
-    hop_class = bundle_primary_artifactclass(session, bundle)
-    if hop_class is None:
-        raise ArchiveFanoutError(
-            f"bundle {bundle.id!r} has no member class to resolve fan-out targets"
-        )
-    hop_policy = session.get(ArtifactClassPolicyRecord, hop_class)
-    ruleset = "" if hop_policy is None else hop_policy.ruleset
-    # BG-P4: target_pools by representative class; P4 reads group_basis order.
-    targets = target_pools(session, hop_class, backends, key_epoch=key_epoch)
+    # Scanning does not happen here at all: the member-grain scan contract
+    # lives at enqueue-batch time (``sutradhara.archive_enqueue``), per
+    # (class, source tree root) — ``--map`` conflicts with ``--rules``, and a
+    # single-file scan would match rules against the bare basename.
+    #
+    # Fan-out targets come from the bundle's frozen group_basis, in basis
+    # order (§2/§5) — never from a member class's live policy and never from a
+    # representative-class hop.
+    targets = bundle_group_targets(session, bundle, backends, key_epoch=key_epoch)
     _require_key_epoch(targets)
 
     with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-{bundle.id}-") as raw:
@@ -664,8 +657,6 @@ def flush_bundle(
                     work_dir=attempt_dir,
                     map_path=map_path,
                     map_sha256=map_digest,
-                    hop_class=hop_class,
-                    ruleset=ruleset,
                     deliverables_dir=deliverables_dir,
                     manifest_signer=manifest_signer,
                     artifact_validator=artifact_validator,
@@ -898,8 +889,6 @@ def _fan_out_targets(
     work_dir: Path,
     map_path: Path,
     map_sha256: str,
-    hop_class: str,
-    ruleset: str,
     deliverables_dir: Path | str | None,
     manifest_signer: ManifestSigner | None,
     artifact_validator: Callable[[PoolTarget, BuildArtifact], None] | None,
@@ -935,12 +924,12 @@ def _fan_out_targets(
                     artifact_observer=built.append,
                 )
                 [artifact] = built
+                # Member grain (§5): class and ruleset come from the matching
+                # member row, not from a representative-class hop.
                 _record_build_exclusions(
                     session,
                     bundle=bundle,
                     artifact=artifact,
-                    artifactclass=hop_class,
-                    ruleset_name=ruleset or None,
                 )
         except TransientPoolFanoutError as exc:
             transient_failures.append(exc)
@@ -963,13 +952,13 @@ def _fan_out_targets(
             in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}
         ):
             manifest_receipt = str(
+                # Member grain (§5): the receipt carries per-member classes as
+                # a `member_classes` roll-up, not one bundle-level class.
                 emit_customer_manifest(
                     bundle=bundle,
                     manifest_path=artifact.manifest_path,
                     destination_dir=Path(deliverables_dir),
                     signer=manifest_signer,
-                    artifactclass=hop_class,
-                    ruleset=ruleset or None,
                 )
             )
             bundle.customer_manifest_path = manifest_receipt
@@ -1182,14 +1171,6 @@ def build_bundle_copy_for_pool(
     from ``member_sources`` — every RAO build goes through the map route.
     """
 
-    # BG-P4: mechanical hop — the frozen bundle.ruleset column was dropped;
-    # the representative member class's applied policy ruleset stands in for
-    # metadata-only consumers until P4. The RAO build itself never scans:
-    # `--map` conflicts with `--rules`, and scanning lives at enqueue.
-    hop_class = bundle_primary_artifactclass(session, bundle)
-    hop_policy = (
-        None if hop_class is None else session.get(ArtifactClassPolicyRecord, hop_class)
-    )
     if map_path is None:
         ordered = sorted(member_sources, key=lambda member: member.member_path)
         map_text = _render_flush_map(session, ordered)
@@ -1206,7 +1187,11 @@ def build_bundle_copy_for_pool(
         builder=builder,
         key_epoch=key_epoch,
         work_dir=work_dir,
-        ruleset="" if hop_policy is None else hop_policy.ruleset,
+        # The map route retires build-time rules entirely: `--map` conflicts
+        # with `--rules`, and the member-grain scan already ran at enqueue
+        # under each class's own ruleset. No bundle-level ruleset is derived
+        # here — there is no honest one for a multi-class group bundle.
+        ruleset="",
         map_path=map_path,
         source_root=source_root,
         map_sha256=map_sha256,
@@ -1292,10 +1277,15 @@ def emit_customer_manifest(
     manifest_path: Path,
     destination_dir: Path,
     signer: ManifestSigner | None,
-    artifactclass: str | None = None,
-    ruleset: str | None = None,
 ) -> Path:
-    """Wrap rem's manifest with an archive id, timestamp, and keyed signature."""
+    """Wrap rem's manifest with an archive id, timestamp, and keyed signature.
+
+    The receipt is member-grain (§5): each member entry carries its own
+    ``artifactclass``, ``stored_member_name`` carries any disambiguation tag,
+    and ``member_name`` is the logical name — two co-resident same-named
+    members share a ``member_name`` and are distinguished by
+    ``stored_member_name``, so the receipt is not misread as a duplicate.
+    """
     if signer is None:
         raise ManifestSigningError("customer manifest requires a keyed signer")
     destination_dir.mkdir(parents=True, exist_ok=True)
@@ -1304,10 +1294,7 @@ def emit_customer_manifest(
     payload = {
         "archive_id": archive_id,
         "bundle_id": bundle.id,
-        # BG-P4: representative class/ruleset; P4 makes the receipt carry
-        # per-member class instead of a bundle-level one.
-        "artifactclass": artifactclass,
-        "ruleset": ruleset,
+        "member_classes": sorted({member.artifactclass for member in bundle.members}),
         "issued_at": dt.datetime.now(dt.UTC).isoformat(),
         "manifest": source,
         "members": _customer_manifest_members(bundle),
@@ -1334,6 +1321,7 @@ def _customer_manifest_members(bundle: Bundle) -> list[dict[str, Any]]:
             {
                 "member_name": logical_name,
                 "stored_member_name": member.member_path,
+                "artifactclass": member.artifactclass,
                 "logical_sha256": member.logical_asset_hash.hex(),
                 "stored_sha256": member.file_sha256.hex(),
                 "transforms": [transform.kind for transform in transforms],
@@ -1499,21 +1487,46 @@ def _record_build_exclusions(
     *,
     bundle: Bundle,
     artifact: BuildArtifact,
-    artifactclass: str | None,
-    ruleset_name: str | None,
 ) -> None:
-    # BG-P4: class and ruleset arrive from the flush's representative-class
-    # hop; under member-grain scanning (P2/P4) both come from the member.
+    """Record build exclusions with member-sourced class and ruleset (§5).
+
+    An exclusion whose path matches a member row exactly is a per-asset
+    exclusion: it records the member's class, that class's ruleset, and the
+    member's logical hash (joined through members by hash — the Sony-split
+    duplicate resolves to its own class's row). A cluster exclusion with no
+    matching member keys to the bundle's sole member class where one exists;
+    a multi-class bundle records it classless — the producing class is not
+    recoverable from the build artifact, and P2's enqueue-time scan keys
+    these by (class, root) scan identity instead.
+    """
+    members_by_path = {member.member_path: member for member in bundle.members}
+    classes = sorted({member.artifactclass for member in bundle.members})
+    sole_class = classes[0] if len(classes) == 1 else None
+    rulesets: dict[str, str | None] = {}
+
+    def _ruleset_for(artifactclass: str | None) -> str | None:
+        if not artifactclass:
+            return None
+        if artifactclass not in rulesets:
+            policy = session.get(ArtifactClassPolicyRecord, artifactclass)
+            rulesets[artifactclass] = None if policy is None else (policy.ruleset or None)
+        return rulesets[artifactclass]
+
     for exclusion in artifact.exclusions:
+        member = (
+            members_by_path.get(exclusion.path) if exclusion.count <= 1 else None
+        )
+        artifactclass = member.artifactclass if member is not None else sole_class
         record_exclusion(
             session,
             bundle_id=bundle.id,
             artifactclass=artifactclass or "",
+            logical_asset_hash=None if member is None else member.logical_asset_hash,
             path=exclusion.path,
             reason=exclusion.reason,
             count=exclusion.count,
             bytes_total=exclusion.bytes_total,
-            ruleset_name=ruleset_name,
+            ruleset_name=_ruleset_for(artifactclass),
             detail=exclusion.detail,
         )
 

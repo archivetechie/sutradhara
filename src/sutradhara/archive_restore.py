@@ -971,19 +971,23 @@ def _choose_bundle_restore_group(
     pool_rank = {pool_id: index for index, pool_id in enumerate(pool_order)}
     if not pool_rank:
         return None
-    # BG-P4: class filter through the member rows (a bundle may hold several
-    # classes; only locators whose bundle carries members of this class count).
+    # Member grain (§5): a locator counts only when its own asset sits in the
+    # locator's bundle under this class (hash + class, never path or bundle
+    # co-residence alone) — a group bundle may hold several classes, and the
+    # Sony-split duplicate must resolve through its own class membership.
     locators = list(
         session.scalars(
             select(AssetLocator)
             .options(joinedload(AssetLocator.copy).joinedload(Copy.backend))
             .where(
                 AssetLocator.logical_asset_hash.in_(asset_hashes),
-                AssetLocator.bundle_id.in_(
-                    select(BundleMember.bundle_id).where(
-                        BundleMember.artifactclass == artifactclass
-                    )
-                ),
+                select(BundleMember.id)
+                .where(
+                    BundleMember.bundle_id == AssetLocator.bundle_id,
+                    BundleMember.logical_asset_hash == AssetLocator.logical_asset_hash,
+                    BundleMember.artifactclass == artifactclass,
+                )
+                .exists(),
             )
         )
     )

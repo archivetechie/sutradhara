@@ -21,6 +21,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
+from sutradhara.bundle_group_report import PolicyApplyReport, build_policy_apply_report
 from sutradhara.catalog.models import ArtifactClassPolicyRecord, ArtifactClassPool, Pool
 
 
@@ -296,12 +297,16 @@ def apply_artifactclass_policy(
     *,
     source: str | None = None,
     source_text: str | None = None,
-) -> None:
+) -> PolicyApplyReport:
     """Apply placement membership from a validated policy document.
 
     Pools must already exist. Memberships listed in the document are upserted in
     document order. Existing memberships for the artifactclass that are absent
     from the document are marked inactive.
+
+    Returns the policy-apply report (§2): bundle groups are derived, never
+    declared, so the report is the operator's only read-back of which classes
+    now share a crate, on what thresholds, and what coalescing did *not* imply.
     """
     pool_ids = [placement.pool for placement in policy.placements]
     referenced_pool_ids = set(pool_ids) | set(policy.restore_preference)
@@ -371,6 +376,9 @@ def apply_artifactclass_policy(
     from sutradhara.bundle_group import refresh_bundle_group_projections
 
     refresh_bundle_group_projections(session, [artifactclass])
+    # Built after the projections are refreshed, so the report describes the
+    # estate this apply produced rather than the one it replaced.
+    return build_policy_apply_report(session, applied_artifactclass=artifactclass)
 
 
 def _warn_if_appledouble_ruleset_preservation_is_unproven(
@@ -439,18 +447,21 @@ def apply_artifactclass_policy_file(
     session: Session,
     artifactclass: str,
     path: Path | str,
-) -> ArtifactClassPolicy:
-    """Load, validate, and persist an artifactclass policy file."""
+) -> tuple[ArtifactClassPolicy, PolicyApplyReport]:
+    """Load, validate, and persist an artifactclass policy file.
+
+    Returns the parsed policy and the §2 policy-apply report.
+    """
     policy_path = Path(path)
     policy = load_artifactclass_policy(policy_path)
-    apply_artifactclass_policy(
+    report = apply_artifactclass_policy(
         session,
         artifactclass,
         policy,
         source=str(policy_path),
         source_text=policy_path.read_text(encoding="utf-8"),
     )
-    return policy
+    return policy, report
 
 
 def _parse_placement(raw: object, label: str) -> PlacementPolicy:
