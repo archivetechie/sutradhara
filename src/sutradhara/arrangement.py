@@ -74,7 +74,11 @@ class SourceMapEntry:
     source_path: str
     sha256: bytes
     size_bytes: int
-    ingest_item_id: int
+    # Widened for member grain (§5): a bundle group mixes arrangement-origin
+    # members, which always carry an ingest item, with intake-origin members,
+    # which do not. Absent is absent — never the literal string "None", which
+    # a bare str() would have written into a signed, hashed source map.
+    ingest_item_id: int | None
 
 
 @dataclass(frozen=True)
@@ -384,7 +388,7 @@ def render_source_map(entries: list[SourceMapEntry]) -> str:
                     entry.source_path,
                     entry.sha256.hex(),
                     str(entry.size_bytes),
-                    str(entry.ingest_item_id),
+                    "" if entry.ingest_item_id is None else str(entry.ingest_item_id),
                 )
             )
         )
