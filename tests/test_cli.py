@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
-from sqlalchemy import select
+from sqlalchemy import Engine, select
 
 from sutradhara.artifactclass_policy import AppleDoubleStagingPolicy, StagingPolicy
 from sutradhara.catalog.models import (
@@ -27,6 +27,8 @@ from sutradhara.catalog.models import (
     ArtifactClassPool,
     Backend,
     Bundle,
+    BundleMember,
+    ExclusionRecord,
     IngestItem,
     Intake,
     LogicalAsset,
@@ -637,6 +639,8 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
             "photo",
             hashlib.sha256(b"image-data").hexdigest(),
             str(source),
+            "--scan-root",
+            str(tmp_path),
         ],
         expect_exit=1,
     )
@@ -649,22 +653,8 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
         assert bundle.review_summary["clusters"][0]["reason"] == "appledouble-merge-failed"
 
 
-def test_archive_bundle_enqueue_reports_the_include_alone_bundle_not_the_accumulator(
-    cli_env: dict[str, str],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """P1 gate residue F6: the CLI used to re-derive the group accumulator and
-    print its id. A member at or over the group target routes include-alone to
-    its own non-adoptable bundle, so the printed id named a bundle the member
-    is not in — an operator following it reviews the wrong member set. The CLI
-    must report the bundle the member actually landed in."""
-    monkeypatch.setattr(
-        "sutradhara.archive_enqueue.run_rem_archive_scan",
-        lambda **kwargs: {"clusters": [], "exclusions": []},
-    )
-    _run(["db", "init"])
-    engine = make_engine()
+def _install_photo_class(engine: Engine, *, target_bytes: int) -> None:
+    """One artifactclass with one RAO pool, for the enqueue-wrapper tests."""
     with session_scope(engine) as session:
         backend = Backend(
             name="rem-photo",
@@ -684,17 +674,44 @@ def test_archive_bundle_enqueue_reports_the_include_alone_bundle_not_the_accumul
                 artifactclass="photo",
                 ruleset="rao.photo.v1",
                 expect="messy",
-                target_bytes=64,
+                target_bytes=target_bytes,
                 max_age_seconds=60,
                 restore_preference=[],
             )
         )
 
-    small = tmp_path / "small" / "small.tif"
-    small.parent.mkdir()
+
+def test_archive_bundle_enqueue_reports_the_include_alone_bundle_not_the_accumulator(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 gate residue F6: the CLI used to re-derive the group accumulator and
+    print its id. A member at or over the group target routes include-alone to
+    its own non-adoptable bundle, so the printed id named a bundle the member
+    is not in — an operator following it reviews the wrong member set. The CLI
+    must report the bundle the member actually landed in.
+
+    Both members live in ONE tree with the big one in a subdirectory, and both
+    are enqueued against that tree's root. Giving each fixture its own parent
+    directory would make ``--scan-root`` and ``source.parent`` coincide and
+    hide whether the wrapper scans the tree or just the file's own folder."""
+    scans: list[dict[str, Any]] = []
+
+    def fake_scan(**kwargs: Any) -> dict[str, Any]:
+        scans.append(kwargs)
+        return {"clusters": [], "exclusions": []}
+
+    monkeypatch.setattr("sutradhara.archive_enqueue.run_rem_archive_scan", fake_scan)
+    _run(["db", "init"])
+    engine = make_engine()
+    _install_photo_class(engine, target_bytes=64)
+
+    tree = tmp_path / "tree"
+    (tree / "proxies").mkdir(parents=True)
+    small = tree / "small.tif"
     small.write_bytes(b"s" * 8)
-    big = tmp_path / "big" / "big.tif"
-    big.parent.mkdir()
+    big = tree / "proxies" / "big.tif"
     big.write_bytes(b"b" * 128)
 
     accumulated = _run(
@@ -705,6 +722,8 @@ def test_archive_bundle_enqueue_reports_the_include_alone_bundle_not_the_accumul
             "photo",
             hashlib.sha256(b"s" * 8).hexdigest(),
             str(small),
+            "--scan-root",
+            str(tree),
         ]
     )
     include_alone = _run(
@@ -715,8 +734,14 @@ def test_archive_bundle_enqueue_reports_the_include_alone_bundle_not_the_accumul
             "photo",
             hashlib.sha256(b"b" * 128).hexdigest(),
             str(big),
+            "--scan-root",
+            str(tree),
         ]
     )
+
+    # Both scans ran over the TREE, never over the member's own directory:
+    # rules match paths relative to whatever root rem is handed.
+    assert [kwargs["inputs"] for kwargs in scans] == [[tree], [tree]]
 
     accumulator_id = accumulated.output.rsplit("bundle ", 1)[1].strip()
     funnel_id = include_alone.output.rsplit("bundle ", 1)[1].strip()
@@ -724,13 +749,107 @@ def test_archive_bundle_enqueue_reports_the_include_alone_bundle_not_the_accumul
     with session_scope(engine) as session:
         funnel = session.get(Bundle, funnel_id)
         assert funnel is not None
-        # Non-adoptable by construction, and it really holds the big member.
+        # Non-adoptable by construction, and it really holds the big member,
+        # recorded under its tree-relative name rather than a bare basename.
         assert funnel.archive_id is not None
-        assert [member.member_path for member in funnel.members] == ["big.tif"]
+        assert [member.member_path for member in funnel.members] == ["proxies/big.tif"]
         accumulator = session.get(Bundle, accumulator_id)
         assert accumulator is not None
         assert accumulator.status == "open"
         assert [member.member_path for member in accumulator.members] == ["small.tif"]
+
+
+def test_archive_bundle_enqueue_honours_a_path_scoped_exclusion_prefix(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The round-4 inversion, pinned at the CLI. The single-file wrapper used
+    to scan ``source.parent`` and call the member by its basename, so for
+    ``<tree>/proxies/x.mov`` rem saw a root containing only ``x.mov`` and a
+    rule scoped ``proxies/**`` could never fire — the member was silently
+    enqueued and archived under a rule that says do not archive it. The
+    wrapper must scan the tree root and match the member by its tree-relative
+    path, so a prefix verdict reported for that tree actually withholds it."""
+    monkeypatch.setattr(
+        "sutradhara.archive_enqueue.run_rem_archive_scan",
+        lambda **kwargs: {
+            "clusters": [],
+            "exclusions": [
+                {
+                    "prefix": "proxies",
+                    "reason": "exclude-rule",
+                    "count": 1,
+                    "bytes_total": 9,
+                    "samples": ["proxies/x.mov"],
+                }
+            ],
+        },
+    )
+    _run(["db", "init"])
+    engine = make_engine()
+    _install_photo_class(engine, target_bytes=1024)
+
+    tree = tmp_path / "tree"
+    (tree / "proxies").mkdir(parents=True)
+    proxy = tree / "proxies" / "x.mov"
+    proxy.write_bytes(b"proxy-fps")
+
+    result = _run(
+        [
+            "archive",
+            "bundle",
+            "enqueue",
+            "photo",
+            hashlib.sha256(b"proxy-fps").hexdigest(),
+            str(proxy),
+            "--scan-root",
+            str(tree),
+        ]
+    )
+
+    assert "not enqueued" in result.output
+    assert "'proxies/x.mov'" in result.output
+    assert "excluded=['proxies']" in result.output
+    with session_scope(engine) as session:
+        assert session.query(BundleMember).all() == []
+        [record] = session.query(ExclusionRecord).all()
+        assert record.path == "proxies"
+        assert record.logical_asset_hash is None
+        assert record.detail["scan_root"] == str(tree)
+
+
+def test_archive_bundle_enqueue_refuses_a_source_outside_the_scan_root(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """A source outside ``--scan-root`` has no tree-relative path, so no
+    path-scoped rule could match it. Guards a wrapper that quietly falls back
+    to the basename — the same silent-disarm the scan root exists to stop."""
+    _run(["db", "init"])
+    _install_photo_class(make_engine(), target_bytes=1024)
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    stray = elsewhere / "x.mov"
+    stray.write_bytes(b"stray")
+
+    result = _run(
+        [
+            "archive",
+            "bundle",
+            "enqueue",
+            "photo",
+            hashlib.sha256(b"stray").hexdigest(),
+            str(stray),
+            "--scan-root",
+            str(tree),
+        ],
+        expect_exit=1,
+    )
+    assert "is not under --scan-root" in result.output
 
 
 def test_admin_doctor_reports_rem_and_key_registry(

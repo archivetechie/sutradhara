@@ -154,7 +154,21 @@ def submission_flush(submission_id: str, rem_bin: str, key_epoch: str | None) ->
 @click.argument("artifactclass")
 @click.argument("asset_hash_hex")
 @click.argument("source_path", type=click.Path(exists=True, dir_okay=False))
-@click.option("--member-path", default=None, help="Path stored inside the archive.")
+@click.option(
+    "--scan-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help=(
+        "Source tree root the class ruleset is written against. "
+        "SOURCE_PATH must live under it; the member's rule-matched path is "
+        "its path relative to this root."
+    ),
+)
+@click.option(
+    "--member-path",
+    default=None,
+    help="Override the name stored inside the archive (default: the scan-root-relative path).",
+)
 @click.option(
     "--staging-dir",
     type=click.Path(file_okay=False),
@@ -166,6 +180,7 @@ def bundle_enqueue(
     artifactclass: str,
     asset_hash_hex: str,
     source_path: str,
+    scan_root: Path,
     member_path: str | None,
     staging_dir: str | None,
     rem_bin: str,
@@ -173,12 +188,28 @@ def bundle_enqueue(
     """Stage and add an existing logical asset to an artifactclass open bundle.
 
     A wrapper over a one-member enqueue batch: the class ruleset scan runs at
-    enqueue-batch grain against the file's tree root, and the reported bundle
-    is the one the member actually landed in — an include-alone member routes
-    to its own funnel bundle, not the group accumulator.
+    enqueue-batch grain against ``--scan-root``, and the reported bundle is the
+    one the member actually landed in — an include-alone member routes to its
+    own funnel bundle, not the group accumulator.
+
+    ``--scan-root`` is required, deliberately. Rules match paths relative to
+    the scan root, so deriving it from the file (its parent directory) would
+    hand rem a root under which ``proxies/x.mov`` is just ``x.mov`` and a rule
+    scoped ``proxies/**`` would never fire — the member would be silently
+    enqueued and archived. Only the operator knows which tree the class's
+    ruleset was written against, so the command asks instead of guessing.
     """
     expected_hash = bytes.fromhex(asset_hash_hex)
     source = Path(source_path).resolve()
+    root = Path(scan_root).resolve()
+    try:
+        relative_path = source.relative_to(root)
+    except ValueError as exc:
+        raise click.ClickException(
+            f"source {source} is not under --scan-root {root}; "
+            "rules match paths relative to the scan root, so a source outside "
+            "it has no path a path-scoped rule could match"
+        ) from exc
     engine = make_engine()
     held_summary: dict[str, object] | None = None
     message: str | None = None
@@ -187,14 +218,15 @@ def bundle_enqueue(
         item = EnqueueItem(
             logical_asset_hash=expected_hash,
             source_path=source,
-            member_path=member_path or source.name,
+            member_path=relative_path.as_posix(),
+            archive_path=member_path,
         )
         try:
             result = scan_enqueue_batch(
                 session,
                 artifactclass=artifactclass,
                 policy=policy,
-                scan_root=source.parent,
+                scan_root=root,
                 items=[item],
                 staging_root=_staging_root(source_path, staging_dir),
                 rem_bin=rem_bin,

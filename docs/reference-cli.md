@@ -205,9 +205,31 @@ across at least 2 implementation families).
 
 ### sutra archive bundle enqueue ARTIFACTCLASS ASSET_HASH_HEX SOURCE_PATH
 
-Stage and add an existing logical asset to an artifactclass open bundle.
-Flags: `--member-path TEXT` (path stored inside the archive),
-`--staging-dir DIRECTORY` (directory for copy-on-write staging transforms).
+Stage and add an existing logical asset to an artifactclass open bundle. This
+is a wrapper over a one-member enqueue batch, so the class ruleset scan runs
+at batch grain and the reported bundle is the one the member actually landed
+in (an oversized member routes include-alone to its own bundle).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--scan-root DIRECTORY` | required | Source tree root the class ruleset is written against. `SOURCE_PATH` must live under it. |
+| `--member-path TEXT` | scan-root-relative path | Override the name stored inside the archive. |
+| `--staging-dir DIRECTORY` | alongside the source | Directory for copy-on-write staging transforms. |
+| `--rem-bin TEXT` | `rem` | rem CLI binary. |
+
+`--scan-root` is required rather than derived. Conformance rules match paths
+*relative to the scan root*, so deriving the root from the file itself would
+hand rem a directory under which `proxies/x.mov` is merely `x.mov`: a rule
+scoped `proxies/**` would never fire and the member would be archived under a
+rule that says not to archive it. Only the operator knows which tree the
+class's ruleset was written against, so the command asks.
+
+### sutra archive bundle enqueue-intake INTAKE_ID
+
+Enqueue a registered intake's items as batches, one ruleset scan per
+(artifactclass, tree root) — the root being the intake manifest's
+`…/data` directory. Flags: `--staging-dir DIRECTORY`, `--rem-bin TEXT`
+(default `rem`).
 
 ### sutra archive bundle flush BUNDLE_ID
 
