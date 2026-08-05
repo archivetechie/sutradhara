@@ -365,6 +365,13 @@ def apply_artifactclass_policy(
     )
     session.flush()
 
+    # Bundle-group projection: the fingerprint of the class's sorted active
+    # (pool, representation) set, recomputed after the membership upserts above
+    # so "which classes share a crate" is one indexed join.
+    from sutradhara.bundle_group import refresh_bundle_group_projections
+
+    refresh_bundle_group_projections(session, [artifactclass])
+
 
 def _warn_if_appledouble_ruleset_preservation_is_unproven(
     policy: ArtifactClassPolicy,

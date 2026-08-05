@@ -11,14 +11,17 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from sqlalchemy import func as sa_func
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
+from sutradhara.archive_bundle import bundle_primary_artifactclass
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     ArtifactClassPool,
     Backend,
     Bundle,
+    BundleMember,
     Copy,
     Pool,
 )
@@ -96,11 +99,14 @@ def observe(session: Session, target_key: str) -> TargetObservation:
             desired=False,
             observed_state=OBSERVED_MISSING,
         )
-    desired_targets = _desired_targets_by_class(session, {bundle.artifactclass}).get(
-        bundle.artifactclass,
-        {},
+    # BG-P4: representative member class stands in for the dropped column.
+    artifactclass = bundle_primary_artifactclass(session, bundle)
+    desired_targets = (
+        {}
+        if artifactclass is None
+        else _desired_targets_by_class(session, {artifactclass}).get(artifactclass, {})
     )
-    if not desired_targets:
+    if not desired_targets or artifactclass is None:
         return TargetObservation(
             target_key=target_key,
             desired=False,
@@ -111,7 +117,7 @@ def observe(session: Session, target_key: str) -> TargetObservation:
         bundle_id=bundle.id,
         desired_targets=desired_targets,
         aggregate=aggregate,
-        floor=_floor_for_class(session, bundle.artifactclass),
+        floor=_floor_for_class(session, artifactclass),
     )
 
 
@@ -143,14 +149,17 @@ def blocked_projection_for_bundle(session: Session, bundle_id: str) -> tuple[str
     duplicate_message = _duplicate_message(bundle.id, aggregate)
     if duplicate_message is not None:
         return "duplicate-copy", duplicate_message
-    desired_targets = _desired_targets_by_class(session, {bundle.artifactclass}).get(
-        bundle.artifactclass,
-        {},
+    # BG-P4: representative member class stands in for the dropped column.
+    artifactclass = bundle_primary_artifactclass(session, bundle)
+    desired_targets = (
+        {}
+        if artifactclass is None
+        else _desired_targets_by_class(session, {artifactclass}).get(artifactclass, {})
     )
     structural_message = _structural_floor_message(
         session,
         desired_targets=desired_targets,
-        floor=_floor_for_class(session, bundle.artifactclass),
+        floor=_floor_for_class(session, artifactclass) if artifactclass else DurabilityFloor(),
         aggregate=aggregate,
     )
     if structural_message is None:
@@ -177,8 +186,27 @@ def _sealed_bundle_rows(
     cursor: int | None,
     batch: int,
 ) -> list[tuple[str, str]]:
+    # BG-P4: representative member class per bundle (deterministic first
+    # member); memberless funnel bundles fall back to any class whose
+    # projection derives their group.
+    representative_class = (
+        select(BundleMember.artifactclass)
+        .where(BundleMember.bundle_id == Bundle.id)
+        .order_by(BundleMember.id)
+        .limit(1)
+        .correlate(Bundle)
+        .scalar_subquery()
+    )
+    projection_class = (
+        select(ArtifactClassPolicyRecord.artifactclass)
+        .where(ArtifactClassPolicyRecord.bundle_group == Bundle.bundle_group)
+        .order_by(ArtifactClassPolicyRecord.artifactclass)
+        .limit(1)
+        .correlate(Bundle)
+        .scalar_subquery()
+    )
     query = (
-        select(Bundle.id, Bundle.artifactclass)
+        select(Bundle.id, sa_func.coalesce(representative_class, projection_class))
         .where(Bundle.status == "sealed")
         .order_by(Bundle.id)
         .limit(batch)
@@ -190,6 +218,7 @@ def _sealed_bundle_rows(
     return [
         (str(bundle_id), str(artifactclass))
         for bundle_id, artifactclass in session.execute(query)
+        if artifactclass is not None
     ]
 
 
@@ -300,11 +329,14 @@ def classify_condition(
     bundle = session.get(Bundle, target_key)
     if bundle is None or bundle.status != "sealed":
         return
-    desired_targets = _desired_targets_by_class(session, {bundle.artifactclass}).get(
-        bundle.artifactclass,
-        {},
+    # BG-P4: representative member class stands in for the dropped column.
+    artifactclass = bundle_primary_artifactclass(session, bundle)
+    desired_targets = (
+        {}
+        if artifactclass is None
+        else _desired_targets_by_class(session, {artifactclass}).get(artifactclass, {})
     )
-    floor = _floor_for_class(session, bundle.artifactclass)
+    floor = _floor_for_class(session, artifactclass) if artifactclass else DurabilityFloor()
     aggregate = _reconciler_aggregates(session, [bundle.id])[bundle.id]
     duplicate_message = _duplicate_message(bundle.id, aggregate)
     if duplicate_message is not None:

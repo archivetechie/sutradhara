@@ -23,6 +23,7 @@ from sutradhara.archive_fanout import (
     RemArchiveBuilder,
     build_bundle_copy_for_pool,
 )
+from sutradhara.archive_bundle import bundle_primary_artifactclass
 from sutradhara.archive_restore import ArchiveRestoreError, read_member_to_path
 from sutradhara.backend import factory
 from sutradhara.backend.port import BackendError
@@ -64,8 +65,13 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
     bundle = _load_sealed_bundle(ctx, bundle_id)
     for member in bundle.members:
         touch_asset(ctx, member.logical_asset_hash)
-    backends = _target_backends(ctx, bundle.artifactclass)
-    targets = target_pools(ctx.session, bundle.artifactclass, backends, key_epoch=key_epoch)
+    # BG-P4: representative member class (identical pool set across member
+    # classes by fingerprint construction); P4 reads group_basis pool order.
+    hop_class = bundle_primary_artifactclass(ctx.session, bundle)
+    if hop_class is None:
+        raise ValueError(f"bundle {bundle_id!r} has no member artifactclass for repair")
+    backends = _target_backends(ctx, hop_class)
+    targets = target_pools(ctx.session, hop_class, backends, key_epoch=key_epoch)
     missing = _missing_pool_ids(ctx, bundle.id)
     blocked_projection = bundle_copy.blocked_projection_for_bundle(ctx.session, bundle.id)
     if blocked_projection is not None:

@@ -1,9 +1,11 @@
 """Durable RAO archive bundle bookkeeping.
 
-This module owns the sutradhara-side accumulator state: an open bundle per
-artifactclass, its pending member set, flush thresholds copied from the applied
-artifactclass policy, per-copy asset locators, blob-root pointers, exclusion
-records, and held-bundle review decisions.
+This module owns the sutradhara-side accumulator state: one open bundle per
+**bundle group** (the derived fingerprint of a class's active pool set — see
+``sutradhara.bundle_group``), its pending member set, effective flush
+thresholds frozen at open from the group's declared class set, the canonical
+member-naming ladder both producers call, per-copy asset locators, blob-root
+pointers, exclusion records, and held-bundle review decisions.
 """
 
 from __future__ import annotations
@@ -11,13 +13,21 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.orm import Session
 
+from sutradhara.bundle_group import (
+    BASIS_SOURCE_DERIVED,
+    compute_bundle_group,
+    effective_group_thresholds,
+    group_basis_document,
+)
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     AssetLocator,
@@ -32,6 +42,7 @@ from sutradhara.catalog.models import (
     StagingTransform,
 )
 from sutradhara.catalog.types import is_content_hash
+from sutradhara.structured_logs import emit_structured_event
 from sutradhara_receive.member_name import escape_path_name, escape_path_text
 
 
@@ -63,6 +74,35 @@ class StagingTransformError(ArchiveBundleError):
     """A staging transform record is inconsistent with its bundle member."""
 
 
+class MemberNamingError(ArchiveBundleError):
+    """The canonical member-naming ladder could not produce a name.
+
+    Unreachable by construction: the terminal rung (full content hash plus
+    class slug) collides only if two different contents share a SHA-256.
+    """
+
+
+# Progressive hash-prefix rungs for the collision ladder; the terminal rung is
+# the full hash plus the class slug (appended by _name_ladder itself).
+_NAME_LADDER_PREFIXES = (10, 20, 32, 48, 64)
+
+
+def _find_open_accumulator(session: Session, fingerprint: str) -> Bundle | None:
+    return session.scalars(
+        select(Bundle)
+        .where(
+            Bundle.bundle_group == fingerprint,
+            Bundle.status == "open",
+            # Only true accumulators are adoptable. Externally-identified
+            # funnels (cloud-blob, quarantine, include-alone, per-submission
+            # bundles) carry archive_id from creation and must never absorb
+            # ordinary archive enqueues.
+            Bundle.archive_id.is_(None),
+        )
+        .order_by(Bundle.opened_at, Bundle.id)
+    ).first()
+
+
 def get_or_create_open_bundle(
     session: Session,
     *,
@@ -71,37 +111,96 @@ def get_or_create_open_bundle(
     bundle_id: str | None = None,
     now: dt.datetime | None = None,
 ) -> tuple[Bundle, bool]:
-    """Return the durable open accumulator for an artifactclass."""
-    existing = session.scalars(
-        select(Bundle)
-        .where(
-            Bundle.artifactclass == artifactclass,
-            Bundle.status == "open",
-            # Only true accumulators are adoptable. Externally-identified
-            # funnels (cloud-blob bundles) carry archive_id from creation and
-            # must never absorb ordinary archive enqueues — a failed cloud-blob
-            # job leaves its bundle open, and adopting it poisons the
-            # accumulator with the blob ruleset.
-            Bundle.archive_id.is_(None),
-        )
-        .order_by(Bundle.opened_at, Bundle.id)
-    ).first()
+    """Return the durable open accumulator for an artifactclass's bundle group."""
+    fingerprint, basis = compute_bundle_group(session, artifactclass)
+    existing = _find_open_accumulator(session, fingerprint)
     if existing is not None:
         return existing, False
 
-    bundle = Bundle(
-        id=bundle_id or f"bundle-{uuid.uuid4().hex}",
+    target_bytes, max_age_seconds = effective_group_thresholds(
+        session,
         artifactclass=artifactclass,
+        policy=policy,
+        fingerprint=fingerprint,
+        basis=basis,
+    )
+    bundle = _new_bundle(
+        fingerprint=fingerprint,
+        basis=basis,
+        target_bytes=target_bytes,
+        max_age_seconds=max_age_seconds,
+        bundle_id=bundle_id,
+        now=now,
+    )
+    try:
+        with session.begin_nested():
+            session.add(bundle)
+            session.flush()
+    except IntegrityError as exc:
+        # Check-then-insert race on the one-open-accumulator partial index:
+        # the loser adopts the winner's bundle. Bounded (single re-read);
+        # a raw IntegrityError never escapes.
+        _discard_pending(session, bundle)
+        winner = _find_open_accumulator(session, fingerprint)
+        if winner is None:
+            raise BundleStateError(
+                f"could not open accumulator for bundle group {fingerprint!r}: {exc.orig}"
+            ) from exc
+        return winner, False
+    return bundle, True
+
+
+def _new_bundle(
+    *,
+    fingerprint: str,
+    basis: list[dict[str, Any]],
+    target_bytes: int,
+    max_age_seconds: int,
+    bundle_id: str | None,
+    now: dt.datetime | None,
+    archive_id: str | None = None,
+) -> Bundle:
+    resolved_id = bundle_id or f"bundle-{uuid.uuid4().hex}"
+    document = group_basis_document(
+        basis,
+        basis_source=BASIS_SOURCE_DERIVED,
+        target_bytes=target_bytes,
+        max_age_seconds=max_age_seconds,
+    )
+    bundle = Bundle(
+        id=resolved_id,
+        bundle_group=fingerprint,
+        group_basis=document,
         status="open",
-        target_bytes=policy.target_bytes,
-        max_age_seconds=policy.max_age_seconds,
-        ruleset=policy.ruleset,
-        expect=policy.expect,
+        target_bytes=target_bytes,
+        max_age_seconds=max_age_seconds,
+        archive_id=archive_id,
         opened_at=now or dt.datetime.now(dt.UTC),
     )
-    session.add(bundle)
-    session.flush()
-    return bundle, True
+    _assert_open_witness(bundle)
+    return bundle
+
+
+def _assert_open_witness(bundle: Bundle) -> None:
+    """Open-time assert: the typed threshold columns equal the basis witness."""
+    effective = (bundle.group_basis or {}).get("effective") or {}
+    if (
+        effective.get("target_bytes") != bundle.target_bytes
+        or effective.get("max_age_seconds") != bundle.max_age_seconds
+    ):
+        raise BundleStateError(
+            f"bundle {bundle.id!r} typed thresholds "
+            f"({bundle.target_bytes}, {bundle.max_age_seconds}) do not equal "
+            f"the group_basis witness {effective!r}"
+        )
+
+
+def _discard_pending(session: Session, instance: object) -> None:
+    """Detach an instance whose savepoint-scoped insert was rolled back."""
+    try:
+        session.expunge(instance)
+    except InvalidRequestError:
+        pass  # already detached by the savepoint rollback
 
 
 def enqueue_artifact(
@@ -117,7 +216,14 @@ def enqueue_artifact(
     now: dt.datetime | None = None,
     source_metadata: dict[str, Any] | None = None,
 ) -> tuple[Bundle, BundleMember, bool]:
-    """Add one asset to the open accumulator for ``artifactclass``."""
+    """Add one asset to the open accumulator for ``artifactclass``'s group.
+
+    A member whose size meets or exceeds the group's effective ``target_bytes``
+    is routed include-alone: a fresh funnel-style bundle of its own, minted
+    non-adoptable (``archive_id`` set at creation, so it never collides with
+    the one-open-accumulator index) and immediately due for flush. The group
+    accumulator is untouched by an include-alone routing.
+    """
     _require_asset(session, logical_asset_hash)
     source = Path(source_path)
     size_bytes = source.stat().st_size
@@ -135,16 +241,56 @@ def enqueue_artifact(
     except UnicodeEncodeError:
         metadata["source_path_bytes_hex"] = os.fsencode(source).hex()
         stored_source_path = None
-    bundle, _ = get_or_create_open_bundle(
+
+    fingerprint, basis = compute_bundle_group(session, artifactclass)
+    target_bytes, max_age_seconds = effective_group_thresholds(
         session,
         artifactclass=artifactclass,
         policy=policy,
-        bundle_id=bundle_id,
-        now=now,
+        fingerprint=fingerprint,
+        basis=basis,
     )
+    if size_bytes >= target_bytes:
+        # Crash-retry idempotency: a re-enqueue of the same oversized member
+        # while its include-alone funnel is still open lands on its own row.
+        existing = session.execute(
+            select(Bundle, BundleMember)
+            .join(BundleMember, BundleMember.bundle_id == Bundle.id)
+            .where(
+                Bundle.bundle_group == fingerprint,
+                Bundle.status == "open",
+                Bundle.archive_id.is_not(None),
+                BundleMember.member_path == path_in_bundle,
+                BundleMember.artifactclass == artifactclass,
+                BundleMember.logical_asset_hash == logical_asset_hash,
+            )
+            .order_by(Bundle.opened_at, Bundle.id)
+        ).first()
+        if existing is not None:
+            return existing[0], existing[1], False
+        bundle = _new_bundle(
+            fingerprint=fingerprint,
+            basis=basis,
+            target_bytes=target_bytes,
+            max_age_seconds=max_age_seconds,
+            bundle_id=bundle_id,
+            now=now,
+        )
+        bundle.archive_id = f"archive-{bundle.id}"
+        session.add(bundle)
+        session.flush()
+    else:
+        bundle, _ = get_or_create_open_bundle(
+            session,
+            artifactclass=artifactclass,
+            policy=policy,
+            bundle_id=bundle_id,
+            now=now,
+        )
     member, created = add_bundle_member(
         session,
         bundle=bundle,
+        artifactclass=artifactclass,
         logical_asset_hash=logical_asset_hash,
         member_path=path_in_bundle,
         source_path=stored_source_path,
@@ -198,10 +344,114 @@ def hold_bundle(
     return bundle
 
 
+def tag_member_path(member_path: str, tag: str) -> str:
+    """Insert a disambiguation tag into a member path's final segment.
+
+    The tag lands after the first-dot stem of the basename, so tagging
+    commutes with suffix-appending transforms (``name.ext`` → ``name.TAG.ext``,
+    ``name.ext.zst`` → ``name.TAG.ext.zst``) and the staging-transform chain
+    stays linked after a re-key.
+    """
+    head, slash, base = member_path.rpartition("/")
+    stem, dot, rest = base.partition(".")
+    tagged = f"{stem}.{tag}.{rest}" if dot else f"{stem}.{tag}"
+    return f"{head}{slash}{tagged}"
+
+
+def extract_member_tag(requested: str, actual: str) -> str | None:
+    """Recover the tag that maps ``requested`` onto ``actual``, if any.
+
+    Catalog names are authoritative and are read, never re-derived; this
+    reads the recorded name back into the tag the ladder inserted.
+    """
+    if actual == requested:
+        return None
+    r_head, _, r_base = requested.rpartition("/")
+    a_head, _, a_base = actual.rpartition("/")
+    if r_head != a_head:
+        return None
+    stem, dot, rest = r_base.partition(".")
+    prefix = f"{stem}."
+    if not a_base.startswith(prefix):
+        return None
+    remainder = a_base[len(prefix) :]
+    if dot:
+        suffix = f".{rest}"
+        if not remainder.endswith(suffix) or len(remainder) <= len(suffix):
+            return None
+        return remainder[: -len(suffix)]
+    return remainder or None
+
+
+def _class_slug(artifactclass: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", artifactclass) or "class"
+
+
+def _name_ladder(requested: str, file_sha256: bytes, artifactclass: str) -> list[str]:
+    """The complete deterministic collision ladder for one requested name.
+
+    Rung 0 is the requested name; the following rungs insert progressively
+    longer prefixes of the member's own content hash (never arrival order);
+    the terminal rung is the full hash plus the class slug, so the ladder
+    always ends and every rung is arrival-order-independent.
+    """
+    digest = file_sha256.hex()
+    candidates = [requested]
+    candidates.extend(
+        tag_member_path(requested, digest[:length]) for length in _NAME_LADDER_PREFIXES
+    )
+    candidates.append(tag_member_path(requested, f"{digest}.{_class_slug(artifactclass)}"))
+    return candidates
+
+
+def _resolve_member_name(
+    session: Session,
+    *,
+    bundle_id: str,
+    artifactclass: str,
+    requested: str,
+    file_sha256: bytes,
+    logical_asset_hash: bytes,
+) -> tuple[str, BundleMember | None, BundleMember | None]:
+    """Run the canonical naming ladder for one requested member name.
+
+    Returns ``(final_path, existing, first_occupant)``: ``existing`` is the
+    caller's own row when the idempotency check hits (same class, same
+    logical hash) — re-checked at every rung so a crash-retry lands on its
+    own row; ``first_occupant`` is the row occupying the requested name when
+    disambiguation happened (for the recorded event).
+    """
+    first_occupant: BundleMember | None = None
+    for candidate in _name_ladder(requested, file_sha256, artifactclass):
+        row = session.scalars(
+            select(BundleMember).where(
+                BundleMember.bundle_id == bundle_id,
+                BundleMember.member_path == candidate,
+            )
+        ).one_or_none()
+        if row is None:
+            return candidate, None, first_occupant
+        if (
+            row.artifactclass == artifactclass
+            and row.logical_asset_hash == logical_asset_hash
+        ):
+            return candidate, row, first_occupant
+        if first_occupant is None:
+            first_occupant = row
+    # Same-key different-hash within a class is impossible by construction
+    # after the ladder (the terminal rung carries the full content hash and
+    # the class slug); reaching this line means a SHA-256 collision.
+    raise MemberNamingError(
+        f"member naming ladder exhausted for {requested!r} in bundle "
+        f"{bundle_id!r} (class {artifactclass!r})"
+    )
+
+
 def add_bundle_member(
     session: Session,
     *,
     bundle: Bundle,
+    artifactclass: str,
     logical_asset_hash: bytes,
     member_path: str,
     size_bytes: int,
@@ -209,32 +459,87 @@ def add_bundle_member(
     source_path: str | None = None,
     source_metadata: dict[str, Any] | None = None,
 ) -> tuple[BundleMember, bool]:
-    """Add a logical asset to a bundle and update accumulator totals."""
+    """Add a logical asset to a bundle through the canonical naming ladder.
+
+    A requested ``(bundle, member_path)`` already present with the same class
+    and same logical hash is the idempotent no-op. Any other hit gets a
+    deterministic disambiguated name from the collision ladder, recorded as
+    an event. Counter bumps are atomic SQL updates; a check-then-insert race
+    on the ``(bundle_id, member_path)`` unique surface recovers by re-running
+    the ladder against the now-visible winner (bounded, one retry) — a raw
+    ``IntegrityError`` never escapes.
+    """
     if bundle.status != "open":
         raise BundleStateError(f"bundle {bundle.id!r} is not open")
     _require_asset(session, logical_asset_hash)
-    existing = session.scalars(
-        select(BundleMember).where(
-            BundleMember.bundle_id == bundle.id,
-            BundleMember.member_path == member_path,
-        )
-    ).one_or_none()
-    if existing is not None:
-        return existing, False
 
-    member = BundleMember(
-        bundle_id=bundle.id,
-        logical_asset_hash=logical_asset_hash,
-        member_path=member_path,
-        source_path=source_path,
-        size_bytes=size_bytes,
-        file_sha256=file_sha256,
-        source_metadata=source_metadata,
+    member: BundleMember | None = None
+    final_path = member_path
+    first_occupant: BundleMember | None = None
+    for attempt in range(2):
+        final_path, existing, first_occupant = _resolve_member_name(
+            session,
+            bundle_id=bundle.id,
+            artifactclass=artifactclass,
+            requested=member_path,
+            file_sha256=file_sha256,
+            logical_asset_hash=logical_asset_hash,
+        )
+        if existing is not None:
+            return existing, False
+        candidate = BundleMember(
+            bundle_id=bundle.id,
+            logical_asset_hash=logical_asset_hash,
+            artifactclass=artifactclass,
+            member_path=final_path,
+            source_path=source_path,
+            size_bytes=size_bytes,
+            file_sha256=file_sha256,
+            source_metadata=source_metadata,
+        )
+        try:
+            with session.begin_nested():
+                session.add(candidate)
+                session.flush()
+        except IntegrityError as exc:
+            _discard_pending(session, candidate)
+            if attempt == 0:
+                # Naming race loser: re-run the ladder against the winner.
+                continue
+            raise BundleStateError(
+                f"could not add member {member_path!r} to bundle {bundle.id!r}: {exc.orig}"
+            ) from exc
+        member = candidate
+        break
+    if member is None:  # pragma: no cover - loop invariant
+        raise BundleStateError(f"could not add member {member_path!r} to bundle {bundle.id!r}")
+
+    session.execute(
+        update(Bundle)
+        .where(Bundle.id == bundle.id)
+        .values(
+            total_bytes=Bundle.total_bytes + size_bytes,
+            member_count=Bundle.member_count + 1,
+        )
     )
-    bundle.total_bytes += size_bytes
-    bundle.member_count += 1
-    session.add(member)
-    session.flush()
+    session.expire(bundle, ["total_bytes", "member_count"])
+
+    if final_path != member_path:
+        emit_structured_event(
+            "bundle_member_name_disambiguated",
+            bundle_id=bundle.id,
+            requested_path=member_path,
+            final_path=final_path,
+            artifactclass=artifactclass,
+            logical_asset_hash=logical_asset_hash.hex(),
+            occupant_path=None if first_occupant is None else first_occupant.member_path,
+            occupant_artifactclass=(
+                None if first_occupant is None else first_occupant.artifactclass
+            ),
+            occupant_logical_asset_hash=(
+                None if first_occupant is None else first_occupant.logical_asset_hash.hex()
+            ),
+        )
     return member, True
 
 
@@ -419,6 +724,36 @@ def record_review_decision(
     session.add(decision)
     session.flush()
     return decision
+
+
+# BG-P4: mechanical hop for consumers of the dropped bundle.artifactclass.
+# P4 rewrites each §5 consumer to member grain / group_basis; until then this
+# returns a deterministic representative class: the first member's class, or
+# (for memberless funnel bundles, e.g. cloud-blob) any class whose projection
+# derives this bundle's group.
+def bundle_primary_artifactclass(session: Session, bundle: Bundle) -> str | None:
+    member_class = session.scalars(
+        select(BundleMember.artifactclass)
+        .where(BundleMember.bundle_id == bundle.id)
+        .order_by(BundleMember.id)
+        .limit(1)
+    ).first()
+    if member_class is not None:
+        return member_class
+    return session.scalars(
+        select(ArtifactClassPolicyRecord.artifactclass)
+        .where(ArtifactClassPolicyRecord.bundle_group == bundle.bundle_group)
+        .order_by(ArtifactClassPolicyRecord.artifactclass)
+        .limit(1)
+    ).first()
+
+
+# BG-P4: mechanical hop for query filters that matched Bundle.artifactclass;
+# P4 replaces call sites with real member-grain rewrites.
+def bundle_ids_for_artifactclass(artifactclass: str) -> Any:
+    return select(BundleMember.bundle_id).where(
+        BundleMember.artifactclass == artifactclass
+    ).scalar_subquery()
 
 
 def _require_asset(session: Session, logical_asset_hash: bytes) -> LogicalAsset:

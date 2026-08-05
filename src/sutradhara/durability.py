@@ -21,6 +21,7 @@ from sutradhara.catalog.models import (
     AssetLocator,
     Backend,
     Bundle,
+    BundleMember,
     Copy,
     IngestItem,
     Intake,
@@ -476,10 +477,15 @@ def _locator_artifactclass_filter(
 ) -> Any:
     legacy_ok = asset_has_artifactclass_membership(session, asset_hash, artifactclass)
     legacy_clause = AssetLocator.bundle_id.is_(None) if legacy_ok else false()
+    # BG-P4: mechanical hop — bundle-class filter via the member class column.
     return or_(
         and_(
             AssetLocator.bundle_id.is_not(None),
-            Bundle.artifactclass == artifactclass,
+            Bundle.id.in_(
+                select(BundleMember.bundle_id).where(
+                    BundleMember.artifactclass == artifactclass
+                )
+            ),
         ),
         legacy_clause,
     )
@@ -491,7 +497,13 @@ def _artifactclass_for_target(session: Session, target: Target) -> str:
     bundle = session.get(Bundle, target.bundle_id)
     if bundle is None:
         raise ValueError(f"bundle {target.bundle_id!r} does not exist")
-    return bundle.artifactclass
+    # BG-P4: representative member class stands in for the dropped column.
+    from sutradhara.archive_bundle import bundle_primary_artifactclass
+
+    artifactclass = bundle_primary_artifactclass(session, bundle)
+    if artifactclass is None:
+        raise ValueError(f"bundle {target.bundle_id!r} has no member artifactclass")
+    return artifactclass
 
 
 def _policy_targets(session: Session, artifactclass: str) -> list[tuple[StorageBackend, PoolTarget]]:

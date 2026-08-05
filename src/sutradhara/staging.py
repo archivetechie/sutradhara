@@ -8,6 +8,7 @@ steps for reversible transforms.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 import shutil
@@ -24,9 +25,11 @@ from sqlalchemy.orm import Session
 
 from sutradhara.archive_bundle import (
     enqueue_artifact,
+    extract_member_tag,
     get_or_create_open_bundle,
     hold_bundle,
     record_staging_transform,
+    tag_member_path,
 )
 from sutradhara.artifactclass_policy import (
     AppleDoubleStagingPolicy,
@@ -167,6 +170,36 @@ def stage_and_enqueue_artifact(
         bundle_id=bundle_id,
         source_metadata=source_metadata,
     )
+    if member.member_path != staged.stored_member_path:
+        # The naming ladder disambiguated this member. Staged files keep their
+        # on-disk names; the transform chain and the source_metadata copy are
+        # re-keyed onto the enqueue-returned name before recording, so the
+        # final-step equality and the (bundle_id, stored_member_path,
+        # step_order) uniqueness both hold under tagging.
+        tag = extract_member_tag(staged.stored_member_path, member.member_path)
+        if tag is None:
+            raise StagingError(
+                f"cannot re-key transforms: {staged.stored_member_path!r} does not "
+                f"map onto recorded member name {member.member_path!r}"
+            )
+        staged = dataclasses.replace(
+            staged,
+            stored_member_path=member.member_path,
+            transforms=tuple(
+                dataclasses.replace(
+                    transform,
+                    original_member_path=tag_member_path(transform.original_member_path, tag),
+                    stored_member_path=tag_member_path(transform.stored_member_path, tag),
+                )
+                for transform in staged.transforms
+            ),
+        )
+        if created:
+            member.source_metadata = {
+                **(member.source_metadata or {}),
+                "stored_member_path": member.member_path,
+            }
+            session.flush()
     if not created and member.transforms:
         return staged
 

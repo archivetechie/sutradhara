@@ -25,6 +25,7 @@ from sutradhara.api.console import (
     sanitize_text,
 )
 from sutradhara.api.identity import parse_identity
+from sutradhara.archive_bundle import bundle_primary_artifactclass
 from sutradhara.archive_predicate import intake_archive_state_expr, legacy_archived_expr
 from sutradhara.catalog.models import (
     AssetDerivation,
@@ -210,11 +211,20 @@ def get_archive_bundles(
             .limit(page_limit)
         )
         if artifactclass_filter is not None:
-            query = query.where(Bundle.artifactclass == artifactclass_filter)
+            # BG-P4: class filter through the member class column.
+            query = query.where(
+                Bundle.id.in_(
+                    select(BundleMember.bundle_id).where(
+                        BundleMember.artifactclass == artifactclass_filter
+                    )
+                )
+            )
         if status_filter is not None:
             query = query.where(Bundle.status == status_filter)
         rows = list(session.execute(query))
-        bundles = [_bundle_payload(row[0], copy_count=int(row[1] or 0)) for row in rows]
+        bundles = [
+            _bundle_payload(session, row[0], copy_count=int(row[1] or 0)) for row in rows
+        ]
         total = int(rows[0][2]) if rows else 0
     return {"total": total, "truncated": total > len(bundles), "bundles": bundles}
 
@@ -449,10 +459,13 @@ def _derivation_payloads(session: Any, intake_id: str) -> list[dict[str, object]
     ]
 
 
-def _bundle_payload(bundle: Bundle, *, copy_count: int) -> dict[str, object]:
+def _bundle_payload(session: Any, bundle: Bundle, *, copy_count: int) -> dict[str, object]:
+    # BG-P4: representative member class keeps the payload shape until P4's
+    # member-grain rewrite of the operator surfaces.
+    artifactclass = bundle_primary_artifactclass(session, bundle)
     return {
         "id": _text(bundle.id),
-        "artifactclass": _text(bundle.artifactclass),
+        "artifactclass": None if artifactclass is None else _text(artifactclass),
         "status": _text(bundle.status),
         "member_count": bundle.member_count,
         "total_bytes": bundle.total_bytes,
@@ -515,8 +528,7 @@ def _latest_ingest_item(session: Any, digest: bytes) -> IngestItem | None:
 
 def _latest_bundle_artifactclass(session: Any, digest: bytes) -> str | None:
     row = session.execute(
-        select(Bundle.artifactclass)
-        .join(BundleMember, BundleMember.bundle_id == Bundle.id)
+        select(BundleMember.artifactclass)
         .where(BundleMember.logical_asset_hash == digest)
         .order_by(BundleMember.added_at.desc(), BundleMember.id.desc())
         .limit(1)
@@ -544,11 +556,9 @@ def _catalog_pairs(
     for content_hash, artifactclass, latest_at in session.execute(
         select(
             BundleMember.logical_asset_hash,
-            Bundle.artifactclass,
+            BundleMember.artifactclass,
             func.max(BundleMember.added_at),
-        )
-        .join(Bundle, BundleMember.bundle_id == Bundle.id)
-        .group_by(BundleMember.logical_asset_hash, Bundle.artifactclass)
+        ).group_by(BundleMember.logical_asset_hash, BundleMember.artifactclass)
     ):
         _merge_pair(pair_latest, content_hash, artifactclass, latest_at)
 

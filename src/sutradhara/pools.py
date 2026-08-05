@@ -75,6 +75,21 @@ def set_pool_representation(
         )
     pool.representation = new_value
     session.flush()
+    # Representation is a bundle-group fingerprint input mutated outside policy
+    # apply; recompute the projection for every class holding a membership to
+    # this pool (design-bundle-groups §2, writer set).
+    from sutradhara.bundle_group import refresh_bundle_group_projections
+
+    member_classes = sorted(
+        set(
+            session.scalars(
+                select(ArtifactClassPool.artifactclass).where(
+                    ArtifactClassPool.pool_id == pool_id
+                )
+            )
+        )
+    )
+    refresh_bundle_group_projections(session, member_classes)
     return pool
 
 
