@@ -978,7 +978,12 @@ def resolve_member_asset_hash(
         raise RestoreNameError(
             f"member name {member_name!r} is ambiguous in artifactclass "
             f"{artifactclass!r}: it names {len(hashes)} distinct assets. "
-            + _ambiguity_hint(session, artifactclass=artifactclass, hashes=hashes)
+            + _ambiguity_hint(
+                session,
+                artifactclass=artifactclass,
+                canonical=canonical,
+                hashes=hashes,
+            )
         )
     return next(iter(hashes))
 
@@ -987,33 +992,55 @@ def _ambiguity_hint(
     session: Session,
     *,
     artifactclass: str,
+    canonical: str,
     hashes: set[bytes],
 ) -> str:
     """Tell the operator how to name the asset they meant.
 
     Co-resident members that share a logical name are distinguished by their
     ``stored_member_name`` on the receipt, so naming those is the actionable
-    hint. When the stored names do not distinguish them either — the same
-    logical name in two different bundles, each the first arrival there — no
-    name can, and saying so is better than printing one string twice.
+    hint — but only when those names actually partition the assets, which
+    takes two exclusions:
+
+    * **the requested name is never recommended.** It is itself a stored name
+      whenever the ambiguity arose in the stored tier — the same untagged name
+      taken first in two different bundles — and an asset re-staged into a
+      bundle where a co-resident held the name contributes its *tagged* name
+      alongside. Recommending the name that just raised as its own remedy is
+      worse than offering no name at all.
+    * **a name shared by more than one of these assets picks out none of
+      them.** Only a name owned by exactly one asset can be acted on.
+
+    If what survives both exclusions does not leave every asset a name of its
+    own, then no name distinguishes them and the asset hashes are the only
+    thing that names them. Every command that takes ``--member-name`` takes a
+    hex asset hash in its place (``archive restore``, ``pfr status``, ``pfr
+    cut``, ``pfr reindex``), so the hashes are printed rather than merely
+    referred to.
     """
-    stored = sorted(
-        set(
-            session.scalars(
-                select(BundleMember.member_path).where(
-                    BundleMember.artifactclass == artifactclass,
-                    BundleMember.logical_asset_hash.in_(hashes),
-                )
-            )
+    owners: dict[str, set[bytes]] = {}
+    for member_path, logical_hash in session.execute(
+        select(BundleMember.member_path, BundleMember.logical_asset_hash).where(
+            BundleMember.artifactclass == artifactclass,
+            BundleMember.logical_asset_hash.in_(hashes),
         )
-    )
-    if len(stored) > 1:
+    ):
+        if member_path == canonical:
+            continue
+        owners.setdefault(member_path, set()).add(logical_hash)
+    distinguishing = {
+        member_path: next(iter(owned))
+        for member_path, owned in owners.items()
+        if len(owned) == 1
+    }
+    if set(distinguishing.values()) == hashes:
         return (
-            "Restore by one of the stored member names instead: " + ", ".join(stored)
+            "Restore by one of the stored member names instead: "
+            + ", ".join(sorted(distinguishing))
         )
     return (
-        "The stored member names do not distinguish them either (the same name in "
-        "more than one bundle); restore by asset hash"
+        "No stored member name distinguishes them; restore by asset hash: "
+        + ", ".join(sorted(digest.hex() for digest in hashes))
     )
 
 
