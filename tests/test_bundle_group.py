@@ -1307,6 +1307,60 @@ def test_tagged_transformed_member_restores_by_its_receipt_name(
         assert tagged.stored_member_path == members["disk.two"].member_path
 
 
+def test_tagged_untransformed_member_restores_by_its_receipt_name(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The same defect with no transform chain to fall back on.
+
+    A class that stages nothing (compression off, AppleDouble off) records no
+    ``staging_transform`` rows at all, so a member the ladder tagged had *no*
+    catalog row holding its logical name that ``resolve_member_asset_hash``
+    read — the receipt printed ``images/disk.img`` and the restore path
+    refused it. Untagging the transform chain cannot reach this case; only
+    resolving through the logical name the receipt itself reads does.
+    """
+    from sutradhara.archive_restore import resolve_member_asset_hash
+    from sutradhara.catalog.models import StagingTransform
+    from sutradhara.staging import stage_and_enqueue_artifact
+
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        first_policy = _staging_class(s, "disk.one", ["pool-a"], compression=False)
+        second_policy = _staging_class(s, "disk.two", ["pool-a"], compression=False)
+
+        first = _source(tmp_path / "one" / "images", "disk.img", b"one-bytes" * 20)
+        second = _source(tmp_path / "two" / "images", "disk.img", b"two-bytes" * 20)
+        stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.one",
+            policy=first_policy,
+            source_path=first,
+            staging_root=tmp_path / "stage-one",
+            member_path="images/disk.img",
+        )
+        staged_second = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.two",
+            policy=second_policy,
+            source_path=second,
+            staging_root=tmp_path / "stage-two",
+            member_path="images/disk.img",
+        )
+
+        assert list(s.scalars(select(StagingTransform))) == []
+        second_member = s.scalars(
+            select(BundleMember).where(BundleMember.artifactclass == "disk.two")
+        ).one()
+        assert second_member.member_path != "images/disk.img"
+        assert _receipt_member_name(second_member) == "images/disk.img"
+        assert (
+            resolve_member_asset_hash(
+                s, artifactclass="disk.two", member_name="images/disk.img"
+            )
+            == staged_second.logical_sha256
+        )
+
+
 def test_rekey_tags_every_intermediate_stored_path(
     engine: Engine, tmp_path: Path
 ) -> None:
@@ -1378,6 +1432,140 @@ def test_rekey_tags_every_intermediate_stored_path(
         # Step 0's original is untagged in both chains: it is the logical name.
         assert by_class["disk.one"][0].original_member_path == "images/disk.img"
         assert tagged_steps[0].original_member_path == "images/disk.img"
+
+
+def test_stored_member_name_wins_over_a_co_resident_logical_name(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Adding the logical tier must not cost the untagged member its own name.
+
+    Inside one class the first arrival keeps ``images/disk.img`` and its
+    neighbour is tagged, so that one string is both a *stored* name (the
+    first member's) and a *logical* name (the second's). Resolving both tiers
+    together would make it ambiguous and leave the untagged member
+    unrestorable by the only name it has — a fix that broke the case it was
+    meant to widen. The stored name is authoritative and wins; the tagged
+    member is reached by the ``stored_member_name`` its receipt prints.
+    """
+    from sutradhara.archive_restore import resolve_member_asset_hash
+    from sutradhara.staging import stage_and_enqueue_artifact
+
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        policy = _staging_class(s, "disk.one", ["pool-a"], compression=False)
+        first = _source(tmp_path / "one" / "images", "disk.img", b"one-bytes" * 20)
+        second = _source(tmp_path / "two" / "images", "disk.img", b"two-bytes" * 20)
+        staged_first = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.one",
+            policy=policy,
+            source_path=first,
+            staging_root=tmp_path / "stage-one",
+            member_path="images/disk.img",
+        )
+        staged_second = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.one",
+            policy=policy,
+            source_path=second,
+            staging_root=tmp_path / "stage-two",
+            member_path="images/disk.img",
+        )
+        assert staged_first.stored_member_path == "images/disk.img"
+        assert staged_second.stored_member_path != "images/disk.img"
+
+        assert (
+            resolve_member_asset_hash(
+                s, artifactclass="disk.one", member_name="images/disk.img"
+            )
+            == staged_first.logical_sha256
+        )
+        assert (
+            resolve_member_asset_hash(
+                s,
+                artifactclass="disk.one",
+                member_name=staged_second.stored_member_path,
+            )
+            == staged_second.logical_sha256
+        )
+
+
+def test_logical_name_shared_by_two_tagged_members_is_ambiguous(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """A logical name that maps to two assets must fail loudly and usefully.
+
+    Two bundles, each holding a co-resident ``other`` member that took
+    ``images/disk.img`` first, so **both** of this class's members are tagged
+    and the logical name matches no stored name of its own. Silently
+    returning either would restore the wrong bytes under a correctly-quoted
+    receipt name. The error names the two ``stored_member_name`` values that
+    tell them apart, and each of those still resolves.
+    """
+    from sutradhara.archive_restore import RestoreNameError, resolve_member_asset_hash
+    from sutradhara.staging import stage_and_enqueue_artifact
+
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        other = _staging_class(s, "disk.other", ["pool-a"], compression=False)
+        mine = _staging_class(s, "disk.mine", ["pool-a"], compression=False)
+
+        tagged: list[bytes] = []
+        for index in range(2):
+            occupant = _source(
+                tmp_path / f"occupant-{index}" / "images",
+                "disk.img",
+                f"occupant-{index}".encode() * 20,
+            )
+            stage_and_enqueue_artifact(
+                s,
+                artifactclass="disk.other",
+                policy=other,
+                source_path=occupant,
+                staging_root=tmp_path / f"stage-occupant-{index}",
+                member_path="images/disk.img",
+            )
+            source = _source(
+                tmp_path / f"mine-{index}" / "images",
+                "disk.img",
+                f"mine-{index}".encode() * 20,
+            )
+            staged = stage_and_enqueue_artifact(
+                s,
+                artifactclass="disk.mine",
+                policy=mine,
+                source_path=source,
+                staging_root=tmp_path / f"stage-mine-{index}",
+                member_path="images/disk.img",
+            )
+            assert staged.stored_member_path != "images/disk.img"
+            tagged.append(staged.logical_sha256)
+            # Seal the accumulator so the next pair opens a fresh one.
+            bundle = s.get(Bundle, staged.bundle_id)
+            bundle.status = "sealed"
+            s.flush()
+
+        paths = sorted(
+            member.member_path
+            for member in s.scalars(
+                select(BundleMember).where(BundleMember.artifactclass == "disk.mine")
+            )
+        )
+        assert len(paths) == 2
+        with pytest.raises(RestoreNameError) as excinfo:
+            resolve_member_asset_hash(
+                s, artifactclass="disk.mine", member_name="images/disk.img"
+            )
+        message = str(excinfo.value)
+        assert "ambiguous" in message
+        for path in paths:
+            assert path in message
+        # Each stored name still resolves to its own asset.
+        resolved = {
+            resolve_member_asset_hash(s, artifactclass="disk.mine", member_name=path)
+            for path in paths
+        }
+        assert resolved == set(tagged)
 
 
 # --- migration (§7 order) ---------------------------------------------------
