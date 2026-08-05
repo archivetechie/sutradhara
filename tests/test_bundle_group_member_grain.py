@@ -1186,6 +1186,25 @@ def _python_sources(*roots: str) -> list[Path]:
     )
 
 
+_BUNDLE_BINDINGS = {"bundle", "Bundle"}
+
+
+def _is_a_bundle_binding(base: ast.expr) -> bool:
+    """True when ``base`` names a bundle — bare, or at the end of a chain.
+
+    Matching the terminal name rather than only a bare ``ast.Name`` is what
+    makes ``self.bundle.artifactclass`` and ``ctx.bundle.artifactclass``
+    offenders too; the name-only form let an attribute chain slip through. The
+    token match stays exact so that ``bundle_member.artifactclass`` — the
+    correct member-grain read — is not swept up with it.
+    """
+    if isinstance(base, ast.Name):
+        return base.id in _BUNDLE_BINDINGS
+    if isinstance(base, ast.Attribute):
+        return base.attr in _BUNDLE_BINDINGS
+    return False
+
+
 def test_no_source_reads_the_dropped_bundle_artifactclass_column() -> None:
     """No reader of ``bundle.artifactclass`` survives anywhere in ``src/``.
 
@@ -1199,10 +1218,20 @@ def test_no_source_reads_the_dropped_bundle_artifactclass_column() -> None:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute) or node.attr != "artifactclass":
                 continue
-            base = node.value
-            if isinstance(base, ast.Name) and base.id in {"bundle", "Bundle"}:
+            if _is_a_bundle_binding(node.value):
                 offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
     assert offenders == []
+
+    # The matcher itself, pinned: a scan that only caught bare names would pass
+    # this file trivially while a chained read went unnoticed.
+    def _base_of(source: str) -> ast.expr:
+        node = ast.parse(source, mode="eval").body
+        assert isinstance(node, ast.Attribute)
+        return node.value
+
+    assert _is_a_bundle_binding(_base_of("bundle.artifactclass"))
+    assert _is_a_bundle_binding(_base_of("self.bundle.artifactclass"))
+    assert not _is_a_bundle_binding(_base_of("bundle_member.artifactclass"))
     # And the ORM no longer offers it to read.
     assert not hasattr(Bundle, "artifactclass")
 
