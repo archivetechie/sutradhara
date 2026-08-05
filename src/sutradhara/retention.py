@@ -21,6 +21,7 @@ from typing import Any, Literal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from sutradhara.archive_predicate import submission_is_archived
 from sutradhara.backend import factory
 from sutradhara.backend.port import (
     BackendLocator,
@@ -40,13 +41,11 @@ from sutradhara.catalog.models import (
     OffsiteConfirmation,
     Pool,
     RetentionEvent,
-    Submission,
 )
 from sutradhara.catalog.types import (
     ArrangementStatus,
     IntakeStatus,
     RetentionState,
-    SubmissionStatus,
 )
 from sutradhara.durability import AssetTarget, durable_placements
 from sutradhara.intake import media_kind_for_path
@@ -1008,8 +1007,12 @@ def _arrangement_holds(session: Session, intake: Intake) -> list[str]:
             if not arrangement.submission_id:
                 holds.append(f"arrangement:{arrangement.id}:submitted-missing-submission")
                 continue
-            submission = session.get(Submission, arrangement.submission_id)
-            if submission is not None and submission.status == SubmissionStatus.ARCHIVED:
+            # Derived, never the stored flag (design §4): the submission's
+            # status is a projection of this same predicate and reading it
+            # back would let a submission whose material is still sitting in
+            # an OPEN bundle release its sources. Material in an open bundle
+            # is not archive evidence.
+            if submission_is_archived(session, arrangement.submission_id):
                 continue
             holds.append(f"arrangement:{arrangement.id}:submitted-not-archived")
             continue

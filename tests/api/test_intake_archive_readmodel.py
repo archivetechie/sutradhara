@@ -15,6 +15,7 @@ from sutradhara.api.routes_intake_archive import MAX_LIMIT, _intake_payload
 from sutradhara.archive_predicate import intake_archive_state_expr
 from sutradhara.catalog.models import (
     Arrangement,
+    ArtifactClassPolicyRecord,
     AssetDerivation,
     AssetLocator,
     Backend,
@@ -221,6 +222,14 @@ def test_intake_contract_detail_uses_virtual_paths_and_cross_intake_derivations(
 
 
 def test_intakes_stage_filters_registered_archive_evidence(api_engine: Engine) -> None:
+    """Guards: a stored ``Submission.status == archived`` flag counting as
+    archive evidence.
+
+    ``registered-submission`` has nothing but that flag — no sealed bundle, no
+    verified copies. Under the derived predicate it is NOT archived, and this
+    test pins the deliberate tightening: an intake reaches the archived stage
+    only on sealed, sufficiently-replicated media.
+    """
     base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
     bundle_hash = _digest("stage-bundle-evidence")
     submission_hash = _digest("stage-submission-evidence")
@@ -316,6 +325,7 @@ def test_intakes_stage_filters_registered_archive_evidence(api_engine: Engine) -
             sealed_at=base + dt.timedelta(minutes=8),
         )
         _add_bundle_member(session, bundle, bundle_hash, size=10)
+        _make_archive_evidence(session, bundle)
     client = TestClient(make_api_app(api_engine))
 
     archived = client.get("/api/ui/intakes?stage=archived&limit=10", headers=auth_headers("viewer"))
@@ -339,18 +349,19 @@ def test_intakes_stage_filters_registered_archive_evidence(api_engine: Engine) -
 
     assert archived.status_code == 200
     archived_body = archived.json()
-    assert archived_body["total"] == 2
+    assert archived_body["total"] == 1
     assert archived_body["truncated"] is False
-    assert [row["intake_id"] for row in archived_body["intakes"]] == [
-        "registered-submission",
-        "registered-bundle",
-    ]
+    assert [row["intake_id"] for row in archived_body["intakes"]] == ["registered-bundle"]
     assert all(row["status"] == "registered" for row in archived_body["intakes"])
 
     assert unarchived.status_code == 200
-    assert unarchived.json()["total"] == 1
+    assert unarchived.json()["total"] == 2
     assert unarchived.json()["truncated"] is False
-    assert [row["intake_id"] for row in unarchived.json()["intakes"]] == ["registered-unarchived"]
+    # The submission-flag intake is here now, not in `archived`.
+    assert [row["intake_id"] for row in unarchived.json()["intakes"]] == [
+        "registered-unarchived",
+        "registered-submission",
+    ]
 
     assert quarantined.status_code == 200
     assert quarantined.json()["total"] == 1
@@ -412,6 +423,7 @@ def test_intake_archive_state_none_partial_complete_and_empty(api_engine: Engine
             sealed_at=base,
         )
         _add_bundle_member(session, bundle, sealed_hash, size=10)
+        _make_archive_evidence(session, bundle)
 
     with session_scope(api_engine) as session:
         rows = session.execute(
@@ -442,10 +454,18 @@ def test_intake_archive_state_none_partial_complete_and_empty(api_engine: Engine
     assert all(row["archiveSemantics"] == 2 for row in by_id.values())
 
 
-def test_archived_rollout_gate_flips_payload_and_stage_filter(
+def test_archived_boolean_is_all_semantics_with_no_gate_left(
     api_engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Guards: the deleted rollout gate coming back as an environment read.
+
+    ``SUTRADHARA_ARCHIVED_ALL_SEMANTICS`` is gone, not defaulted (pre-production,
+    no runtime flags). A partially-archived intake is ``archived: false`` and
+    stays out of the archived stage filter no matter what the environment says,
+    and an environment value that used to be *invalid* no longer fails app
+    creation because nothing reads it.
+    """
     base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
     archived_hash = _digest("gate-archived")
     missing_hash = _digest("gate-missing")
@@ -474,110 +494,80 @@ def test_archived_rollout_gate_flips_payload_and_stage_filter(
             sealed_at=base,
         )
         _add_bundle_member(session, bundle, archived_hash, size=10)
-    legacy_client = TestClient(make_api_app(api_engine))
+        _make_archive_evidence(session, bundle)
 
-    legacy = legacy_client.get("/api/ui/intakes/gate-partial", headers=auth_headers("viewer"))
-    legacy_stage = legacy_client.get(
-        "/api/ui/intakes?stage=archived", headers=auth_headers("viewer")
-    )
-
-    assert legacy.json()["archive_state"] == "partial"
-    assert legacy.json()["archived"] is True
-    assert [row["intake_id"] for row in legacy_stage.json()["intakes"]] == ["gate-partial"]
-
-    monkeypatch.setenv("SUTRADHARA_ARCHIVED_ALL_SEMANTICS", "true")
-    still_legacy = legacy_client.get(
-        "/api/ui/intakes/gate-partial", headers=auth_headers("viewer")
-    )
-    flipped_client = TestClient(make_api_app(api_engine))
-    flipped = flipped_client.get("/api/ui/intakes/gate-partial", headers=auth_headers("viewer"))
-    flipped_archived = flipped_client.get(
-        "/api/ui/intakes?stage=archived", headers=auth_headers("viewer")
-    )
-    flipped_unarchived = flipped_client.get(
+    monkeypatch.setenv("SUTRADHARA_ARCHIVED_ALL_SEMANTICS", "enabled")
+    client = TestClient(make_api_app(api_engine))
+    detail = client.get("/api/ui/intakes/gate-partial", headers=auth_headers("viewer"))
+    stage_archived = client.get("/api/ui/intakes?stage=archived", headers=auth_headers("viewer"))
+    stage_unarchived = client.get(
         "/api/ui/intakes?stage=registered_unarchived", headers=auth_headers("viewer")
     )
 
-    assert still_legacy.json()["archived"] is True
-    assert flipped.json()["archive_state"] == "partial"
-    assert flipped.json()["archived"] is False
-    assert flipped_archived.json()["intakes"] == []
-    assert [row["intake_id"] for row in flipped_unarchived.json()["intakes"]] == ["gate-partial"]
+    assert detail.json()["archive_state"] == "partial"
+    assert detail.json()["archived"] is False
+    assert stage_archived.json()["intakes"] == []
+    assert [row["intake_id"] for row in stage_unarchived.json()["intakes"]] == ["gate-partial"]
 
 
-def test_gate_off_cross_intake_submission_evidence_keeps_chip_and_filter_aligned(
+def test_gate_env_variable_has_no_reader_left_in_the_tree() -> None:
+    """Grep-level assertion: the env gate is deleted, not merely unread."""
+    import subprocess
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[2]
+    hits = subprocess.run(
+        ["git", "grep", "-l", "SUTRADHARA_ARCHIVED_ALL_SEMANTICS", "--", "src", "docs"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert hits.stdout.strip() == "", hits.stdout
+
+
+def test_sealed_bundle_without_enough_verified_copies_is_not_archive_evidence(
     api_engine: Engine,
 ) -> None:
+    """Guards: "sealed" being read as "durable".
+
+    A sealed bundle with copies that were never measured, or fewer verified
+    copies than the member class declares, is not archive evidence — releasing
+    a card on it would delete the only readable instance of material whose
+    single tape copy has never been read back.
+    """
     base = dt.datetime(2026, 7, 4, 8, 0, tzinfo=dt.UTC)
-    shared_hash = _digest("cross-intake-archived")
-    missing_hash = _digest("cross-intake-missing")
+    digest = _digest("under-replicated")
     with session_scope(api_engine) as session:
-        _add_asset(session, shared_hash, size=10)
-        _add_asset(session, missing_hash, size=20)
-        _add_intake(session, "victim", artifactclass="s-masters", created_at=base)
-        _add_intake(session, "donor", artifactclass="s-masters", created_at=base)
+        _add_asset(session, digest, size=10)
+        _add_intake(session, "under-replicated", artifactclass="s-masters", created_at=base)
         _add_item(
             session,
-            intake_id="victim",
-            digest=shared_hash,
+            intake_id="under-replicated",
+            digest=digest,
             artifactclass="s-masters",
-            virtual_path="victim/shared.mov",
-            as_received_path="/card/victim/shared.mov",
+            virtual_path="clip.mov",
+            as_received_path="/card/clip.mov",
             created_at=base,
         )
-        _add_item(
+        bundle = _add_bundle(
             session,
-            intake_id="victim",
-            digest=missing_hash,
+            "under-replicated-bundle",
             artifactclass="s-masters",
-            virtual_path="victim/missing.mov",
-            as_received_path="/card/victim/missing.mov",
-            created_at=base,
+            status="sealed",
+            total_bytes=10,
+            member_count=1,
+            opened_at=base,
+            sealed_at=base,
         )
-        donor_item = _add_item(
-            session,
-            intake_id="donor",
-            digest=shared_hash,
-            artifactclass="s-masters",
-            virtual_path="donor/shared.mov",
-            as_received_path="/card/donor/shared.mov",
-            created_at=base,
-        )
-        _add_archived_submission_member(
-            session,
-            item=donor_item,
-            submission_id="cross-intake-submission",
-            artifactclass="s-masters",
-            created_at=base,
-        )
+        _add_bundle_member(session, bundle, digest, size=10)
+        # Two copies demanded, one verified copy written.
+        _make_archive_evidence(session, bundle, min_copies=2, verified_copies=1)
 
     client = TestClient(make_api_app(api_engine))
-    victim = client.get("/api/ui/intakes/victim", headers=auth_headers("viewer"))
-    unarchived = client.get(
-        "/api/ui/intakes?stage=registered_unarchived", headers=auth_headers("viewer")
-    )
-    archived = client.get("/api/ui/intakes?stage=archived", headers=auth_headers("viewer"))
-
-    assert victim.status_code == 200
-    assert victim.json()["archive_state"] == "partial"
-    assert victim.json()["archived"] is False
-    assert [row["intake_id"] for row in unarchived.json()["intakes"]] == ["victim"]
-    assert all(row["archived"] is False for row in unarchived.json()["intakes"])
-    assert [row["intake_id"] for row in archived.json()["intakes"]] == ["donor"]
-    assert all(row["archived"] is True for row in archived.json()["intakes"])
-
-
-def test_invalid_archive_gate_fails_during_app_creation(
-    api_engine: Engine,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("SUTRADHARA_ARCHIVED_ALL_SEMANTICS", "enabled")
-
-    with pytest.raises(
-        RuntimeError,
-        match="invalid configuration: SUTRADHARA_ARCHIVED_ALL_SEMANTICS",
-    ):
-        make_api_app(api_engine)
+    detail = client.get("/api/ui/intakes/under-replicated", headers=auth_headers("viewer"))
+    assert detail.json()["archive_state"] == "none"
+    assert detail.json()["archived"] is False
 
 
 def test_archive_bundle_and_submission_contracts_and_status_vocabularies(
@@ -1112,6 +1102,58 @@ def _add_bundle_member(
     session.add(member)
     session.flush([member])
     return member
+
+
+def _make_archive_evidence(
+    session: Any,
+    bundle: Bundle,
+    *,
+    artifactclass: str = "s-masters",
+    min_copies: int = 1,
+    verified_copies: int = 1,
+) -> None:
+    """Give a sealed bundle what the archive predicate now requires.
+
+    Sealed is no longer sufficient on its own (design-bundle-groups §4): the
+    member's class declares ``min_copies`` and the copies must be *verified* —
+    healthy, live, and measured to their own integrity hash. Tests that mean
+    "this material is archived" say so explicitly here.
+    """
+    policy = session.get(ArtifactClassPolicyRecord, artifactclass)
+    if policy is None:
+        policy = ArtifactClassPolicyRecord(
+            artifactclass=artifactclass,
+            ruleset=f"{artifactclass}.rules",
+            expect="messy",
+            target_bytes=1_000_000,
+            max_age_seconds=3600,
+            restore_preference=[],
+            min_impl_families=1,
+        )
+        session.add(policy)
+    # Set the floor explicitly: the shared fixture seeds this class with the
+    # default min_copies=3, and a test that quietly wrote one copy against a
+    # three-copy floor would assert "archived" and get "none" with no clue why.
+    policy.min_copies = min_copies
+    session.flush()
+    for index in range(verified_copies):
+        backend, pool = _add_backend_pool(
+            session,
+            f"evidence-{bundle.id}-{index}",
+            BackendKind.REM_TAPE,
+            f"evidence-pool-{bundle.id}-{index}",
+        )
+        copy = _add_bundle_copy(
+            session,
+            bundle,
+            backend,
+            pool,
+            locator={"object_id": f"{bundle.id}-{index}"},
+        )
+        copy.last_measured_digest = copy.integrity_hash
+        copy.last_measured_at = bundle.sealed_at or bundle.opened_at
+        copy.last_checked_at = copy.last_measured_at
+    session.flush()
 
 
 def _add_bundle_copy(

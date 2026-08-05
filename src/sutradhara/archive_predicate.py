@@ -1,112 +1,115 @@
-"""Shared intake archive predicates and the phase-1c preservation audit.
+"""Shared intake archive predicates and the preservation-gap audit.
 
-The operator API, compatibility ``archived`` boolean, and rollout audit must
-use exactly the same archive-evidence definition.  Keeping the SQL expressions
-here prevents the legacy ANY predicate and the ALL-semantics read model from
-drifting apart during the phase-1c rollout.
+There is exactly one definition of archive evidence and every reader uses it:
+**a logical asset is archived when it sits in a SEALED bundle whose verified
+copies meet that member's own class ``min_copies``.**
+
+Two things that used to count no longer do, deliberately (design-bundle-groups
+§4, "derived ARCHIVED"):
+
+- **A stored ``Submission.status == archived`` flag is not evidence.** The flag
+  is now a projection of this predicate, so reading it back would be circular
+  and — worse — a submission that reached ``accumulated`` would have released
+  its sources while its material was still sitting in an OPEN bundle.
+- **A sealed bundle alone is not evidence.** Sealed with one unverified copy is
+  not durability; the member's class declares how many verified copies it takes.
+
+The phase-1c rollout environment gate that once selected between ANY and ALL
+semantics, and the legacy ANY predicate behind it, are **deleted** — not
+defaulted off: pre-production, no runtime flags, ``git revert`` is the backout.
+ALL semantics are the only semantics, which strictly tightens source-erasure
+eligibility. (The variable's name is deliberately not written anywhere in the
+tree; a test greps for it, so a reintroduction fails loudly.)
+
+Cost, accepted out loud: the evidence predicate carries a correlated COUNT over
+``copy`` per candidate bundle. Erasure decisions are rare and the count runs on
+indexed columns (``copy.bundle_id``); the alternative — a maintained rollup
+column — is a second source of truth for exactly the fact that must not drift.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import os
-from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, aliased
 
 from sutradhara.api.console import iso_utc
 from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
     Bundle,
     BundleMember,
+    Copy,
     IngestItem,
     Intake,
-    Submission,
     SubmissionMember,
 )
-from sutradhara.catalog.types import RetentionState, SubmissionStatus
+from sutradhara.catalog.types import CopyHealth, RetentionState
 
-ARCHIVED_ALL_SEMANTICS_ENV = "SUTRADHARA_ARCHIVED_ALL_SEMANTICS"
-ARCHIVE_AUDIT_SCHEMA = "sutradhara.archive-predicate-audit/v1"
-_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
-_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+ARCHIVE_AUDIT_SCHEMA = "sutradhara.archive-predicate-audit/v2"
 _RETENTION_PASSED = (RetentionState.RELEASED.value, RetentionState.PURGED.value)
 
 
-def archived_all_semantics_enabled(environ: Mapping[str, str] | None = None) -> bool:
-    """Return the rollout-gate value, defaulting safely to legacy ANY semantics."""
+def verified_bundle_copy_count(bundle_id: Any) -> Any:
+    """Return the scalar count of verified, live copies of one bundle.
 
-    source = os.environ if environ is None else environ
-    raw = source.get(ARCHIVED_ALL_SEMANTICS_ENV)
-    if raw is None or not raw.strip():
-        return False
-    normalized = raw.strip().lower()
-    if normalized in _TRUE_VALUES:
-        return True
-    if normalized in _FALSE_VALUES:
-        return False
-    accepted = ", ".join(sorted(_TRUE_VALUES | _FALSE_VALUES))
-    raise ValueError(f"{ARCHIVED_ALL_SEMANTICS_ENV} must be one of: {accepted}")
+    "Verified" carries the single meaning ``durability._measurement_filter``
+    gives it everywhere else: healthy, not deleted, and measured to its own
+    integrity hash. A sealed bundle whose copies were never measured is not
+    archive evidence.
+    """
 
-
-def intake_archive_evidence_exists() -> Any:
-    """Return legacy ANY-era archive evidence correlated to ``Intake``."""
-
-    sealed_bundle_evidence = (
-        select(1)
-        .select_from(IngestItem)
-        .join(BundleMember, BundleMember.logical_asset_hash == IngestItem.logical_asset_hash)
-        .join(Bundle, Bundle.id == BundleMember.bundle_id)
+    return (
+        select(func.count(Copy.id))
         .where(
-            IngestItem.intake_id == Intake.intake_id,
-            Bundle.status == "sealed",
+            Copy.bundle_id == bundle_id,
+            Copy.health == CopyHealth.OK,
+            Copy.deleted_at.is_(None),
+            Copy.last_measured_digest.is_not(None),
+            Copy.last_measured_digest == Copy.integrity_hash,
+        )
+        .scalar_subquery()
+    )
+
+
+def member_archive_evidence(member: Any = BundleMember) -> Any:
+    """Return the sealed-and-sufficiently-replicated condition for one member.
+
+    ``member`` is ``BundleMember`` or an alias of it; the caller supplies the
+    correlation. A member whose class has no applied policy row has no declared
+    ``min_copies`` and therefore no floor it can be shown to meet — the join is
+    an inner join on purpose, so such a member is never evidence.
+    """
+
+    policy = aliased(ArtifactClassPolicyRecord)
+    bundle = aliased(Bundle)
+    return (
+        select(1)
+        .select_from(bundle)
+        .join(policy, policy.artifactclass == member.artifactclass)
+        .where(
+            bundle.id == member.bundle_id,
+            bundle.status == "sealed",
+            verified_bundle_copy_count(bundle.id) >= policy.min_copies,
         )
         .exists()
     )
-    archived_submission_evidence = (
-        select(1)
-        .select_from(IngestItem)
-        .join(SubmissionMember, SubmissionMember.ingest_item_id == IngestItem.id)
-        .join(Submission, Submission.id == SubmissionMember.submission_id)
-        .where(
-            IngestItem.intake_id == Intake.intake_id,
-            Submission.status == SubmissionStatus.ARCHIVED.value,
-        )
-        .exists()
-    )
-    return or_(sealed_bundle_evidence, archived_submission_evidence)
 
 
 def hash_archive_evidence_exists() -> Any:
     """Return archive evidence for the current ``IngestItem`` content hash."""
 
-    archived_submission_item = aliased(IngestItem)
-    sealed_for_hash = (
+    member = aliased(BundleMember)
+    return (
         select(1)
-        .select_from(BundleMember)
-        .join(Bundle, Bundle.id == BundleMember.bundle_id)
+        .select_from(member)
         .where(
-            BundleMember.logical_asset_hash == IngestItem.logical_asset_hash,
-            Bundle.status == "sealed",
+            member.logical_asset_hash == IngestItem.logical_asset_hash,
+            member_archive_evidence(member),
         )
         .exists()
     )
-    archived_submission_for_hash = (
-        select(1)
-        .select_from(SubmissionMember)
-        .join(Submission, Submission.id == SubmissionMember.submission_id)
-        .join(
-            archived_submission_item,
-            archived_submission_item.id == SubmissionMember.ingest_item_id,
-        )
-        .where(
-            archived_submission_item.logical_asset_hash == IngestItem.logical_asset_hash,
-            Submission.status == SubmissionStatus.ARCHIVED.value,
-        )
-        .exists()
-    )
-    return or_(sealed_for_hash, archived_submission_for_hash)
 
 
 def intake_hash_archive_evidence_exists(*, hash_archived: Any | None = None) -> Any:
@@ -122,7 +125,7 @@ def intake_hash_archive_evidence_exists(*, hash_archived: Any | None = None) -> 
 
 
 def intake_archive_state_expr() -> Any:
-    """Return the ALL-semantics state using indexed correlated anti-joins."""
+    """Return the archive state using indexed correlated anti-joins."""
 
     hash_archived = hash_archive_evidence_exists()
     any_relevant = (
@@ -150,19 +153,46 @@ def intake_missing_hash_exists(*, hash_archived: Any | None = None) -> Any:
     )
 
 
-def legacy_archived_expr(*, all_semantics: bool) -> Any:
-    """Return the gated SQL predicate behind the legacy ``archived`` boolean."""
+def intake_archived_expr() -> Any:
+    """Return the compatibility ``archived`` boolean: ALL relevant hashes archived."""
 
-    if all_semantics:
-        any_relevant = (
-            select(1)
-            .select_from(IngestItem)
-            .where(IngestItem.intake_id == Intake.intake_id)
-            .exists()
+    any_relevant = (
+        select(1).select_from(IngestItem).where(IngestItem.intake_id == Intake.intake_id).exists()
+    )
+    return any_relevant & ~intake_missing_hash_exists()
+
+
+def submission_is_archived(session: Session, submission_id: str) -> bool:
+    """Return whether every member of one submission is archive evidence.
+
+    The strong predicate the deletion path gets. It is member-grain and does
+    not care which bundle each member landed in: a submission split across a
+    seal boundary is archived when *both* bundles are sealed and sufficiently
+    replicated, and not before.
+    """
+
+    member = aliased(BundleMember)
+    total = session.scalar(
+        select(func.count(SubmissionMember.id)).where(
+            SubmissionMember.submission_id == submission_id
         )
-        any_missing = intake_missing_hash_exists()
-        return any_relevant & ~any_missing
-    return intake_archive_evidence_exists()
+    )
+    if not total:
+        return False
+    archived = session.scalar(
+        select(func.count(SubmissionMember.id))
+        .where(
+            SubmissionMember.submission_id == submission_id,
+            select(1)
+            .select_from(member)
+            .where(
+                member.logical_asset_hash == SubmissionMember.sha256,
+                member_archive_evidence(member),
+            )
+            .exists(),
+        )
+    )
+    return archived == total
 
 
 def build_archive_predicate_audit(
@@ -181,12 +211,9 @@ def build_archive_predicate_audit(
     audited_intakes = int(
         session.scalar(select(func.count()).select_from(Intake).where(retention_filter)) or 0
     )
-    candidate_rows = list(
-        session.execute(
-            select(
-                Intake,
-                intake_archive_evidence_exists().label("legacy_archived"),
-            )
+    candidates = list(
+        session.scalars(
+            select(Intake)
             .where(
                 retention_filter,
                 intake_hash_archive_evidence_exists(),
@@ -195,7 +222,6 @@ def build_archive_predicate_audit(
             .order_by(Intake.intake_id)
         )
     )
-    candidates = [row[0] for row in candidate_rows]
     candidate_ids = [intake.intake_id for intake in candidates]
     missing_by_intake: dict[str, list[dict[str, object]]] = {
         intake_id: [] for intake_id in candidate_ids
@@ -233,7 +259,7 @@ def build_archive_predicate_audit(
             )
 
     affected: list[dict[str, Any]] = []
-    for intake, legacy_archived in candidate_rows:
+    for intake in candidates:
         missing_assets = missing_by_intake[intake.intake_id]
         affected.append(
             {
@@ -242,8 +268,6 @@ def build_archive_predicate_audit(
                 "released_at": _optional_iso(intake.released_at),
                 "staging_deleted_at": _optional_iso(intake.staging_deleted_at),
                 "archive_state": "partial",
-                "legacy_archived": bool(legacy_archived),
-                "flipped_archived": False,
                 "repair_action": "normal_archive_pipeline",
                 "missing_assets": missing_assets,
             }
@@ -256,15 +280,11 @@ def build_archive_predicate_audit(
     return {
         "schema": ARCHIVE_AUDIT_SCHEMA,
         "generated_at": iso_utc(now),
-        "rollout_gate": {
-            "environment_variable": ARCHIVED_ALL_SEMANTICS_ENV,
-            "enabled": archived_all_semantics_enabled(),
-        },
         "summary": {
             "audited_intakes": audited_intakes,
             "affected_intakes": len(affected),
             "missing_distinct_assets": len(distinct_missing),
-            "gate_safe": not affected,
+            "clean": not affected,
         },
         "affected_intakes": affected,
     }
@@ -272,3 +292,17 @@ def build_archive_predicate_audit(
 
 def _optional_iso(value: dt.datetime | None) -> str | None:
     return None if value is None else iso_utc(value)
+
+
+__all__ = [
+    "ARCHIVE_AUDIT_SCHEMA",
+    "build_archive_predicate_audit",
+    "hash_archive_evidence_exists",
+    "intake_archive_state_expr",
+    "intake_archived_expr",
+    "intake_hash_archive_evidence_exists",
+    "intake_missing_hash_exists",
+    "member_archive_evidence",
+    "submission_is_archived",
+    "verified_bundle_copy_count",
+]

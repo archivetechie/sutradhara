@@ -26,7 +26,7 @@ from sutradhara.api.console import (
 )
 from sutradhara.api.identity import parse_identity
 from sutradhara.archive_bundle import bundle_artifactclasses
-from sutradhara.archive_predicate import intake_archive_state_expr, legacy_archived_expr
+from sutradhara.archive_predicate import intake_archive_state_expr, intake_archived_expr
 from sutradhara.catalog.models import (
     AssetDerivation,
     AssetLocator,
@@ -56,7 +56,9 @@ DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
 INTAKE_STATUSES = frozenset(status.value for status in IntakeStatus)
 INTAKE_STAGES = frozenset({"archived", "registered_unarchived"})
-BUNDLE_STATUSES = frozenset({"open", "flushing", "sealed", "held", "aborted"})
+# ``void`` is the terminal seal for an empty orphan accumulator whose
+# fingerprint no longer derives from any live policy (design §4 / §7.6).
+BUNDLE_STATUSES = frozenset({"open", "flushing", "sealed", "held", "void", "aborted"})
 SUBMISSION_STATUSES = frozenset(status.value for status in SubmissionStatus)
 HEALTH_PRIORITY = {
     CopyHealth.CORRUPT.value: 4,
@@ -103,10 +105,9 @@ def get_intakes(
     stage_filter = _optional_enum(stage, INTAKE_STAGES, field="stage")
     days_filter = _optional_days(days)
     page_limit = _parse_limit(limit)
-    all_semantics = bool(request.app.state.archived_all_semantics)
     with session_scope(request.app.state.engine) as session:
         aggregates = _intake_aggregates_subquery()
-        archived = legacy_archived_expr(all_semantics=all_semantics)
+        archived = intake_archived_expr()
         query = (
             select(
                 Intake,
@@ -153,9 +154,8 @@ def get_intake(request: Request, intake_id: str) -> dict[str, object]:
     """Return one intake with virtual-path items and item-id derivation edges."""
 
     require_view(parse_identity(request.headers))
-    all_semantics = bool(request.app.state.archived_all_semantics)
     with session_scope(request.app.state.engine) as session:
-        row = _intake_row(session, intake_id, all_semantics=all_semantics)
+        row = _intake_row(session, intake_id)
         if row is None:
             raise_console_error(404, "not_found", f"unknown intake {intake_id!r}")
         intake, item_count, bytes_total, archive_state, archived = row
@@ -357,8 +357,6 @@ def _intake_aggregates_subquery() -> Any:
 def _intake_row(
     session: Any,
     intake_id: str,
-    *,
-    all_semantics: bool,
 ) -> tuple[Intake, int, int, str, bool] | None:
     aggregates = _intake_aggregates_subquery()
     row = session.execute(
@@ -367,7 +365,7 @@ def _intake_row(
             func.coalesce(aggregates.c.item_count, 0).label("item_count"),
             func.coalesce(aggregates.c.bytes_total, 0).label("bytes_total"),
             intake_archive_state_expr().label("archive_state"),
-            legacy_archived_expr(all_semantics=all_semantics).label("archived"),
+            intake_archived_expr().label("archived"),
         )
         .outerjoin(aggregates, aggregates.c.intake_id == Intake.intake_id)
         .where(Intake.intake_id == intake_id)
