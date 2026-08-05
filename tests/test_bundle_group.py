@@ -1662,6 +1662,96 @@ def test_ambiguity_hint_never_recommends_the_name_that_just_failed(
             assert digest.hex() in message
 
 
+def test_compressed_logical_name_main_resolved_uniquely_now_raises(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Pins the one request whose behaviour this branch changed to a failure.
+
+    ``original_member_path`` used to be read in the same breath as the stored
+    names, and the re-key tagged it, so exactly one chain in this shape
+    matched ``images/disk.img``: a compressed class stages one asset into
+    bundle one (chain: ``images/disk.img`` -> ``images/disk.img.zst``) and a
+    second into bundle two, where a co-resident from another class has taken
+    ``images/disk.img.zst`` and the ladder tags it. Main matched the untagged
+    chain only, called it unique, and returned the first asset's bytes without
+    a word — while both members' customer receipts print ``images/disk.img``
+    as ``member_name``.
+
+    Untagging step 0 makes both chains record the logical name, so the request
+    is now ``ambiguous``. That is not a regression: the name did name two
+    assets all along, and the operator gets the two ``stored_member_name``
+    values that tell them apart, each of which still resolves.
+    """
+    from sutradhara.archive_restore import RestoreNameError, resolve_member_asset_hash
+    from sutradhara.staging import stage_and_enqueue_artifact
+
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        other = _staging_class(s, "disk.other", ["pool-a"])
+        mine = _staging_class(s, "disk.mine", ["pool-a"])
+
+        first = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.mine",
+            policy=mine,
+            source_path=_source(tmp_path / "one" / "images", "disk.img", b"one-bytes" * 40),
+            staging_root=tmp_path / "stage-one",
+            member_path="images/disk.img",
+        )
+        assert first.stored_member_path == "images/disk.img.zst"
+        s.get(Bundle, first.bundle_id).status = "sealed"
+        s.flush()
+
+        stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.other",
+            policy=other,
+            source_path=_source(
+                tmp_path / "occupant" / "images", "disk.img", b"occupant-bytes" * 40
+            ),
+            staging_root=tmp_path / "stage-occupant",
+            member_path="images/disk.img",
+        )
+        second = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.mine",
+            policy=mine,
+            source_path=_source(tmp_path / "two" / "images", "disk.img", b"two-bytes" * 40),
+            staging_root=tmp_path / "stage-two",
+            member_path="images/disk.img",
+        )
+        assert second.bundle_id != first.bundle_id
+        assert second.stored_member_path != "images/disk.img.zst"
+
+        members = {
+            member.member_path: member
+            for member in s.scalars(
+                select(BundleMember).where(BundleMember.artifactclass == "disk.mine")
+            )
+        }
+        assert set(members) == {first.stored_member_path, second.stored_member_path}
+        # Both receipts print the same logical name — the ambiguity is real.
+        for member in members.values():
+            assert _receipt_member_name(member) == "images/disk.img"
+
+        with pytest.raises(RestoreNameError) as excinfo:
+            resolve_member_asset_hash(
+                s, artifactclass="disk.mine", member_name="images/disk.img"
+            )
+        message = str(excinfo.value)
+        assert "ambiguous" in message
+        assert "Restore by one of the stored member names" in message
+        for stored_name in members:
+            assert stored_name in message
+        # And the recommended names are not a dead end.
+        assert {
+            resolve_member_asset_hash(
+                s, artifactclass="disk.mine", member_name=stored_name
+            )
+            for stored_name in members
+        } == {first.logical_sha256, second.logical_sha256}
+
+
 # --- migration (§7 order) ---------------------------------------------------
 
 
