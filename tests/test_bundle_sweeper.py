@@ -827,7 +827,6 @@ def test_post_write_verify_failure_seals_partial_through_the_sweep(
             )
         ).one()
         assert condition.condition == CONDITION_BLOCKED
-        assert condition.reason == "post-write-pool-failure"
 
 
 def test_hold_written_during_a_failing_enqueue_survives_the_rollback(

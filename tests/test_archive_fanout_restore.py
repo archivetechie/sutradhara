@@ -91,7 +91,11 @@ from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register bund
 from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.handlers import bundle_repair
 from sutradhara.jobs.models import ReconciliationCondition
-from sutradhara.jobs.reconcilers.conditions import CONDITION_BACKOFF, OBSERVED_MISSING
+from sutradhara.jobs.reconcilers.conditions import (
+    CONDITION_BACKOFF,
+    CONDITION_BLOCKED,
+    OBSERVED_MISSING,
+)
 from sutradhara.keys import KeyEpoch
 from sutradhara.replication import target_pools
 from sutradhara.sealing.port import Representation
@@ -785,14 +789,30 @@ def test_oversize_member_surfaces_before_writes(
     assert backend.writes == []
 
 
-def test_member_locator_verification_runs_before_bundle_seals(
+def test_member_locator_verification_refuses_its_copy_and_seals_partial(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
+    """A locator that does not point at its member fails the readback verify.
+
+    The verdict is post-write — the bytes are on media by the time the readback
+    runs — so the refusal is recorded for that pool and the flush seals what it
+    placed, instead of propagating. Propagating would be the worse outcome
+    three times over: it would unwind the sibling pool's copy, which is already
+    on unreclaimable media and verified good; it would discard the catalog's
+    only record of the refused object; and it would leave the bundle ``open``
+    for the sweeper to flush again, writing both pools a second time. Sealed is
+    also what makes the bundle repairable — ``bundle-repair`` only works on
+    sealed bundles.
+
+    What must never happen is the refused copy passing itself off as good: it
+    is SUSPECT, it is not in ``copy_ids``, and the condition is BLOCKED rather
+    than a retry timer, because retrying appends rather than replaces.
+    """
     setup = _create_bundle(engine, tmp_path)
 
-    with pytest.raises(ArchiveFanoutError, match="member"), session_scope(engine) as s:
-        flush_bundle(
+    with session_scope(engine) as s:
+        result = flush_bundle(
             s,
             bundle_id=setup.bundle_id,
             backends={
@@ -801,12 +821,33 @@ def test_member_locator_verification_runs_before_bundle_seals(
             },
             builder=_BadLocatorBuilder(),
         )
+        assert result.partial is True
+        assert result.condition_reason == "post-write-pool-failure"
+        assert len(result.failed_pools) == 1
+        assert len(result.copy_ids) == 1
 
     with session_scope(engine) as s:
         bundle = s.get(Bundle, setup.bundle_id)
         assert bundle is not None
-        assert bundle.status == "open"
-        assert list(s.scalars(select(Copy))) == []
+        assert bundle.status == "sealed"
+        health = {
+            copy.pool_id: copy.health for copy in s.scalars(select(Copy).order_by(Copy.id))
+        }
+        # The good placement survives the bad one...
+        assert CopyHealth.OK in health.values()
+        # ...and the refused object is still recorded, as SUSPECT: the bytes
+        # are on media, and a discarded row would let a repair write a second
+        # object to the same pool.
+        assert health[result.failed_pools[0]] == CopyHealth.SUSPECT
+        condition = s.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "bundle_copy",
+                ReconciliationCondition.target_key == setup.bundle_id,
+            )
+        ).one()
+        # BLOCKED is the load-bearing part; the bundle_copy reconciler's own
+        # post-commit pass may reclassify the reason to its structural verdict.
+        assert condition.condition == CONDITION_BLOCKED
 
 
 def _manifest_inputs(tmp_path: Path) -> tuple[tuple[MemberInput, ...], dict[str, Any]]:
