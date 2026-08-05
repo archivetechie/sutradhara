@@ -40,17 +40,24 @@ from sutradhara.artifactclass_policy import (
     PlacementPolicy,
     apply_artifactclass_policy,
 )
-from sutradhara.bundle_group import compute_bundle_group
+from sutradhara.bundle_group import (
+    BASIS_SOURCE_BACKFILLED,
+    compute_bundle_group,
+    group_basis_document,
+)
 from sutradhara.bundle_group_report import (
     WARNING_CLAMP_ACTIVE,
     WARNING_MEMBERSHIP_CHANGED,
     WARNING_NEAR_MISS,
     WARNING_NO_FLOOR_DECLARED,
+    WARNING_ORPHAN_GROUP,
+    WARNING_STALE_PROJECTION,
     build_policy_apply_report,
     render_policy_apply_report,
 )
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
     AssetLocator,
     Backend,
     Bundle,
@@ -63,6 +70,7 @@ from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
 from sutradhara.durability import AssetTarget, BundleTarget, durable_placements
 from sutradhara.hdcache.fill import desired_target_for_asset, effective_privacy_level
+from sutradhara.pools import set_pool_representation
 from sutradhara.replication import select_source_candidates
 from sutradhara.sealing.port import Representation
 from sutradhara.virtual_arrangement import _healthy_archived_artifactclasses
@@ -745,6 +753,8 @@ def test_policy_apply_report_golden(engine: Engine) -> None:
                 ],
             }
         ],
+        # Every class on this estate still derives its own group's fingerprint.
+        "orphan_groups": [],
     }
 
     # The rendered operator view names every section the design promises.
@@ -808,6 +818,179 @@ def test_policy_apply_report_names_open_bundles_predating_a_membership_change(
         assert group.open_bundles_predating_change == ("open-accumulator",)
         assert WARNING_MEMBERSHIP_CHANGED in group.warning_kinds()
         assert bundle.max_age_seconds == 3600, "an open bundle's thresholds never change"
+
+
+def test_policy_apply_report_names_a_group_no_live_class_derives_any_more(
+    engine: Engine,
+) -> None:
+    """Guards: an orphaned accumulator vanishing from the report in silence.
+
+    ``set_pool_representation`` mutates a fingerprint input outside policy
+    apply and recomputes the projection (§2, writer set) — so flipping a pool's
+    representation under an open accumulator moves every class off the
+    fingerprint the accumulator carries. Nothing moves the *bundle*: it keeps
+    the old fingerprint and no live class derives it any more.
+
+    Total membership loss is the strictest form of "membership changed since
+    the last apply". Grouping the report by policy rows alone would drop the
+    orphan entirely — the operator would see only the new fingerprint and be
+    told nothing about the crate left behind, which can never be routed into
+    again.
+    """
+    with session_scope(engine) as session:
+        backend = _add_backend(session, "mem")
+        _add_pool(session, "pool-1", backend, min_object_bytes=2 * 1024**3)
+        _apply(session, "solo", pools=("pool-1",), target_gb=1.0, max_age_seconds=3600)
+        stranded_fingerprint, _basis = compute_bundle_group(session, "solo")
+        session.add(
+            Bundle(
+                id="stranded-accumulator",
+                **bundle_kwargs_for_class(
+                    session, "solo", target_bytes=2 * 1024**3, max_age_seconds=3600
+                ),
+                status="open",
+                target_bytes=2 * 1024**3,
+                max_age_seconds=3600,
+            )
+        )
+        session.flush()
+
+        set_pool_representation(session, "pool-1", Representation.RAO_PLAIN_V1)
+        report = build_policy_apply_report(session)
+        rendered = render_policy_apply_report(report)
+
+        # The class moved to a new fingerprint; the bundle did not follow it.
+        live_fingerprint, _ = compute_bundle_group(session, "solo")
+        assert live_fingerprint != stranded_fingerprint
+        assert [group.fingerprint for group in report.groups] == [live_fingerprint]
+        assert report.group(stranded_fingerprint) is None
+
+        orphan = report.orphan_group(stranded_fingerprint)
+        assert orphan is not None, "the orphaned group must not be dropped from the report"
+        assert orphan.bundle_ids == ("stranded-accumulator",)
+        assert orphan.open_bundle_ids == ("stranded-accumulator",)
+        assert orphan.basis_source_counts == {"derived": 1, "backfilled": 0}
+        # The basis is read back from the bundle's own frozen witness — the
+        # placement it was opened under, which is no longer derivable.
+        assert orphan.canonical_basis == ({"pool": "pool-1", "representation": "raw-bytes"},)
+        assert [(pool.pool_id, pool.min_object_bytes) for pool in orphan.pools] == [
+            ("pool-1", 2 * 1024**3)
+        ]
+        assert orphan.warning_kinds() == (WARNING_ORPHAN_GROUP,)
+        assert "no live artifactclass derives this fingerprint" in orphan.warnings[0].message
+        assert "stranded-accumulator" in orphan.warnings[0].message
+
+    # And the operator's text view says so, not just the JSON.
+    assert f"orphan group {stranded_fingerprint[:16]}" in rendered
+    assert "no live class derives this fingerprint" in rendered
+    assert "open           stranded-accumulator" in rendered
+    assert f"[{WARNING_ORPHAN_GROUP}]" in rendered
+
+
+def test_policy_apply_report_counts_a_backfilled_basis_and_excludes_it_from_drift(
+    engine: Engine,
+) -> None:
+    """A backfilled basis is a marked guess: counted, never used as evidence.
+
+    ``basis_source_counts`` is how an operator sees how much of the estate is
+    still the migration's guess rather than a derived basis, so the backfilled
+    arm has to be shown counting something. The same bundle also pins the other
+    half of §7.2: a backfilled witness is excluded from the agreement check, so
+    it never raises a membership-changed warning however far its frozen
+    thresholds have drifted from the group's.
+    """
+    with session_scope(engine) as session:
+        backend = _add_backend(session, "mem")
+        _add_pool(session, "pool-1", backend)
+        _apply(session, "solo", pools=("pool-1",), target_gb=1.0, max_age_seconds=3600)
+        fingerprint, basis = compute_bundle_group(session, "solo")
+        session.add(
+            Bundle(
+                id="migrated-accumulator",
+                bundle_group=fingerprint,
+                group_basis=group_basis_document(
+                    basis,
+                    basis_source=BASIS_SOURCE_BACKFILLED,
+                    # Deliberately nothing like the group's effective values.
+                    target_bytes=7,
+                    max_age_seconds=11,
+                ),
+                status="open",
+                target_bytes=7,
+                max_age_seconds=11,
+            )
+        )
+        session.flush()
+
+        group = build_policy_apply_report(session).group(fingerprint)
+
+    assert group is not None
+    assert group.basis_source_counts == {"derived": 0, "backfilled": 1}
+    assert group.open_bundles_predating_change == ()
+    assert WARNING_MEMBERSHIP_CHANGED not in group.warning_kinds()
+
+
+def test_policy_apply_report_states_the_class_set_divergence_of_a_stale_projection(
+    engine: Engine,
+) -> None:
+    """Guards: effective thresholds counting a class the group never lists.
+
+    Member classes and near-miss cohorts are live-derived from each class's
+    current placements. The threshold arithmetic is not: it comes from
+    ``group_thresholds``, whose declared set is the **stored** ``bundle_group``
+    projection — deliberately, because that is the set an accumulator actually
+    uses at open, so the report can never describe arithmetic the runtime does
+    not perform.
+
+    A missed projection writer pulls the two apart in both directions at once,
+    and here it is the numbers that lie by omission: ``alpha``'s group takes
+    ``beta``'s 4 GiB target and 600 s ceiling while listing only ``alpha``, and
+    no cohort mentions ``beta`` at all. The report states the divergence rather
+    than leaving a reader to assume one class set produced both.
+    """
+    with session_scope(engine) as session:
+        backend = _add_backend(session, "mem")
+        _add_pool(session, "pool-1", backend)
+        _add_pool(session, "pool-2", backend)
+        _apply(session, "alpha", pools=("pool-1",), target_gb=1.0, max_age_seconds=3600)
+        _apply(session, "beta", pools=("pool-1",), target_gb=4.0, max_age_seconds=600)
+        shared_fingerprint, _basis = compute_bundle_group(session, "alpha")
+
+        # beta is re-placed onto its own pool, then its projection write is
+        # undone — the "a fingerprint-input writer was missed" state.
+        _apply(session, "beta", pools=("pool-2",), target_gb=4.0, max_age_seconds=600)
+        beta_record = session.get(ArtifactClassPolicyRecord, "beta")
+        assert beta_record is not None
+        beta_record.bundle_group = shared_fingerprint
+        session.flush()
+
+        report = build_policy_apply_report(session)
+        rendered = render_policy_apply_report(report)
+
+    alpha_group = report.group(shared_fingerprint)
+    assert alpha_group is not None
+    assert alpha_group.member_classes == ("alpha",)
+    assert [cohort.artifactclasses for cohort in alpha_group.near_miss_cohorts] == [("alpha",)]
+    # beta's declaration is still counted into alpha's effective thresholds...
+    assert alpha_group.declared_target_bytes == 4 * 1024**3
+    assert alpha_group.effective_max_age_seconds == 600
+    # ...so the warning names it as counted-but-not-a-member.
+    counted = next(
+        warning
+        for warning in alpha_group.warnings
+        if warning.kind == WARNING_STALE_PROJECTION
+    )
+    assert "beta" in counted.message
+    assert "still counted in its thresholds" in counted.message
+    assert "live-derived" in counted.message
+
+    # And from beta's own live group, the same row reads as a stale projection.
+    beta_group = report.group_of("beta")
+    assert beta_group is not None
+    assert beta_group.fingerprint != shared_fingerprint
+    assert WARNING_STALE_PROJECTION in beta_group.warning_kinds()
+
+    assert rendered.count(f"[{WARNING_STALE_PROJECTION}]") == 2
 
 
 # --------------------------------------------------------------------------
