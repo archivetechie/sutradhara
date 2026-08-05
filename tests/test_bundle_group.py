@@ -169,6 +169,63 @@ def test_fingerprint_sort_stability(engine: Engine) -> None:
         assert basis_one == basis_two
 
 
+def _migration_module():
+    """Import the bundle-groups schema migration by file path."""
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "b9c8d7e6f5a4_bundle_groups_schema.py"
+    )
+    spec = importlib.util.spec_from_file_location("bundle_groups_schema_migration", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Golden fingerprint for a fixed mixed-case ASCII basis (F9). Pinned before the
+# canonical sort moved from SQL ORDER BY to Python sorted(): byte order for
+# ASCII pool ids ('A' < 'Z' < 'a') under SQLite BINARY collation and Python
+# codepoint sort must agree, so this constant must never change.
+_F9_GOLDEN_BASIS = [
+    {"pool": "A-Pool", "representation": "rao-plain-v1"},
+    {"pool": "Z-pool", "representation": "d2tar-raw"},
+    {"pool": "a-pool", "representation": "rao-aead-v1"},
+]
+_F9_GOLDEN_FINGERPRINT = "f0286b4b680bf2f8a19fb2d2c9071853486fb35bc60c43d4f70e68ca4d8a4ca1"
+
+
+def test_f9_fingerprint_parity_library_vs_migration(engine: Engine) -> None:
+    """F9: the canonical order must be collation-independent and identical
+    across the library and the migration backfill — for ASCII pool ids the
+    fingerprint must equal the pre-change pinned golden value."""
+    migration = _migration_module()
+    with session_scope(engine) as s:
+        backend = Backend(
+            name="rem", kind=BackendKind.REM_TAPE, tier=BackendTier.SELF_DESCRIBING
+        )
+        s.add(backend)
+        s.flush()
+        # Mixed-case ids seeded in non-canonical insertion order: exposes any
+        # collation- or insertion-order-dependent sort.
+        s.add(Pool(id="a-pool", backend_id=backend.id, representation="rao-aead-v1"))
+        s.add(Pool(id="Z-pool", backend_id=backend.id, representation="d2tar-raw"))
+        s.add(Pool(id="A-Pool", backend_id=backend.id, representation="rao-plain-v1"))
+        s.flush()
+        _add_class(s, "mixed-case", ["a-pool", "Z-pool", "A-Pool"])
+        fingerprint, basis = compute_bundle_group(s, "mixed-case")
+
+        assert basis == _F9_GOLDEN_BASIS
+        assert fingerprint == _F9_GOLDEN_FINGERPRINT
+
+        migration_bases = migration._class_bases(s.connection())
+        assert migration_bases["mixed-case"] == _F9_GOLDEN_BASIS
+        assert migration._fingerprint(migration_bases["mixed-case"]) == fingerprint
+
+
 def test_inactive_membership_leaves_fingerprint(engine: Engine) -> None:
     """Only active memberships are identity."""
     with session_scope(engine) as s:
