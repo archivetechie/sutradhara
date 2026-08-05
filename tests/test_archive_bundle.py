@@ -22,6 +22,7 @@ from sutradhara.archive_bundle import (
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
+    ArtifactClassPool,
     AssetLocator,
     Backend,
     BlobRoot,
@@ -76,6 +77,11 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
                 representation=Representation.RAO_PLAIN_V1.value,
             )
         )
+        s.add(
+            ArtifactClassPool(
+                artifactclass="o-archive", pool_id="archive-pool", active=True
+            )
+        )
         s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=6))
         s.add(policy)
         s.flush()
@@ -94,6 +100,7 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
         member, member_created = add_bundle_member(
             s,
             bundle=bundle,
+            artifactclass="o-archive",
             logical_asset_hash=asset_hash,
             member_path="member.bin",
             size_bytes=6,
@@ -194,6 +201,25 @@ def test_enqueue_artifact_escapes_default_member_path_from_raw_filename(
             target_bytes=1024,
             max_age_seconds=3600,
             restore_preference=[],
+        )
+        backend = Backend(
+            name="rem",
+            kind=BackendKind.REM_TAPE,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        s.add(backend)
+        s.flush()
+        s.add(
+            Pool(
+                id="archive-pool",
+                backend_id=backend.id,
+                representation=Representation.RAO_PLAIN_V1.value,
+            )
+        )
+        s.add(
+            ArtifactClassPool(
+                artifactclass="o-archive", pool_id="archive-pool", active=True
+            )
         )
         s.add_all([policy, LogicalAsset(content_sha256=asset_hash, size_bytes=7)])
         s.flush()
