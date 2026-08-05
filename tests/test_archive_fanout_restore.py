@@ -20,10 +20,7 @@ from sutradhara.archive_fanout import (
     BuildArtifact,
     BuiltBlobRoot,
     BuiltExclusion,
-    BundleHeld,
     BundleOversize,
-    ConformanceScan,
-    DeviationCluster,
     HmacManifestSigner,
     LocalArchiveBuilder,
     ManifestSigningError,
@@ -203,21 +200,6 @@ class _TransientWriteBackend(_ArchiveWriteBackend):
         if pool in self.failing_pools:
             raise BackendError(f"transport unavailable for pool {pool}")
         return super().write_object_to_pool(source, pool)
-
-
-class _DeviationBuilder(LocalArchiveBuilder):
-    def scan(self, **kwargs: Any) -> ConformanceScan:
-        return ConformanceScan(
-            clusters=(
-                DeviationCluster(
-                    prefix="tmp/",
-                    reason="unsupported-entry",
-                    count=2,
-                    samples=("tmp/socket",),
-                    proposed_default="exclude",
-                ),
-            )
-        )
 
 
 class _BadLocatorBuilder(LocalArchiveBuilder):
@@ -780,51 +762,6 @@ def test_manifest_receipt_requires_keyed_signer(
             builder=LocalArchiveBuilder(),
             deliverables_dir=tmp_path / "manifests",
         )
-
-
-def test_compliant_expectation_holds_bundle_for_review(
-    engine: Engine,
-    tmp_path: Path,
-) -> None:
-    setup = _create_bundle(engine, tmp_path, expect="compliant")
-
-    with session_scope(engine) as s, pytest.raises(BundleHeld):
-        flush_bundle(
-            s,
-            bundle_id=setup.bundle_id,
-            backends={
-                setup.rem_backend_id: _ArchiveWriteBackend("rem"),
-                setup.d2_backend_id: _ArchiveWriteBackend("d2"),
-            },
-            builder=_DeviationBuilder(),
-        )
-
-    with session_scope(engine) as s:
-        bundle = s.get(Bundle, setup.bundle_id)
-        assert bundle is not None
-        assert bundle.status == "held"
-        # Member-grain scanning (§2/§5): the top-level keys keep their
-        # pre-group shape for existing consumers, and `by_class` carries the
-        # per-class verdict that decides the hold — a `compliant` class holds
-        # on its own members' deviations, scanned under its own ruleset.
-        class_summary = {
-            "clusters": [
-                {
-                    "bytes_total": 0,
-                    "count": 2,
-                    "prefix": "tmp/",
-                    "proposed_default": "exclude",
-                    "reason": "unsupported-entry",
-                    "samples": ["tmp/socket"],
-                }
-            ],
-            "exclusions": [],
-        }
-        assert bundle.review_summary == {
-            **class_summary,
-            "by_class": {"o-archive": class_summary},
-        }
-        assert list(s.scalars(select(Copy))) == []
 
 
 def test_oversize_member_surfaces_before_writes(

@@ -12,8 +12,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from sutradhara.archive_bundle import record_review_decision
+from sutradhara.archive_enqueue import (
+    ArchiveEnqueueError,
+    BatchScanHeld,
+    EnqueueItem,
+    enqueue_intake_batch,
+    scan_enqueue_batch,
+)
 from sutradhara.archive_fanout import (
-    BundleHeld,
+    FlushPreflightShort,
     HmacManifestSigner,
     ManifestSigningError,
     RemArchiveBuilder,
@@ -35,14 +42,7 @@ from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
 from sutradhara.bundle_group import basis_pool_ids
 from sutradhara.bundle_group_report import render_policy_apply_report
-from sutradhara.catalog.models import (
-    ArtifactClassPool,
-    Backend,
-    Bundle,
-    BundleMember,
-    Pool,
-    Submission,
-)
+from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool, Submission
 from sutradhara.catalog.session import make_engine, make_read_only_engine, session_scope
 from sutradhara.hdcache.manager import (
     PrivacyOverride,
@@ -51,7 +51,7 @@ from sutradhara.hdcache.manager import (
     restore_to_path,
 )
 from sutradhara.replication import WritableStorageBackend
-from sutradhara.staging import StagingHeld, stage_and_enqueue_artifact
+from sutradhara.staging import StagingHeld
 
 
 @click.group("archive")
@@ -150,7 +150,7 @@ def submission_flush(submission_id: str, rem_bin: str, key_epoch: str | None) ->
                 builder=RemArchiveBuilder(rem_bin),
                 key_epoch=key_epoch,
             )
-        except (ArchiveSubmissionError, BundleHeld, ManifestSigningError) as exc:
+        except (ArchiveSubmissionError, ManifestSigningError) as exc:
             raise click.ClickException(str(exc)) from exc
     action = "already archived" if result.noop else "archived"
     click.echo(
@@ -162,65 +162,156 @@ def submission_flush(submission_id: str, rem_bin: str, key_epoch: str | None) ->
 @click.argument("artifactclass")
 @click.argument("asset_hash_hex")
 @click.argument("source_path", type=click.Path(exists=True, dir_okay=False))
-@click.option("--member-path", default=None, help="Path stored inside the archive.")
+@click.option(
+    "--scan-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help=(
+        "Source tree root the class ruleset is written against. "
+        "SOURCE_PATH must live under it; the member's rule-matched path is "
+        "its path relative to this root."
+    ),
+)
+@click.option(
+    "--member-path",
+    default=None,
+    help="Override the name stored inside the archive (default: the scan-root-relative path).",
+)
 @click.option(
     "--staging-dir",
     type=click.Path(file_okay=False),
     default=None,
     help="Directory for copy-on-write staging transforms.",
 )
+@click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
 def bundle_enqueue(
     artifactclass: str,
     asset_hash_hex: str,
     source_path: str,
+    scan_root: Path,
     member_path: str | None,
     staging_dir: str | None,
+    rem_bin: str,
 ) -> None:
-    """Stage and add an existing logical asset to an artifactclass open bundle."""
+    """Stage and add an existing logical asset to an artifactclass open bundle.
+
+    A wrapper over a one-member enqueue batch: the class ruleset scan runs at
+    enqueue-batch grain against ``--scan-root``, and the reported bundle is the
+    one the member actually landed in — an include-alone member routes to its
+    own funnel bundle, not the group accumulator.
+
+    ``--scan-root`` is required, deliberately. Rules match paths relative to
+    the scan root, so deriving it from the file (its parent directory) would
+    hand rem a root under which ``proxies/x.mov`` is just ``x.mov`` and a rule
+    scoped ``proxies/**`` would never fire — the member would be silently
+    enqueued and archived. Only the operator knows which tree the class's
+    ruleset was written against, so the command asks instead of guessing.
+    """
     expected_hash = bytes.fromhex(asset_hash_hex)
+    source = Path(source_path).resolve()
+    root = Path(scan_root).resolve()
+    try:
+        relative_path = source.relative_to(root)
+    except ValueError as exc:
+        raise click.ClickException(
+            f"source {source} is not under --scan-root {root}; "
+            "rules match paths relative to the scan root, so a source outside "
+            "it has no path a path-scoped rule could match"
+        ) from exc
     engine = make_engine()
     held_summary: dict[str, object] | None = None
     message: str | None = None
     with session_scope(engine) as session:
         policy = get_artifactclass_policy(session, artifactclass)
+        item = EnqueueItem(
+            logical_asset_hash=expected_hash,
+            source_path=source,
+            member_path=relative_path.as_posix(),
+            archive_path=member_path,
+        )
         try:
-            staged = stage_and_enqueue_artifact(
+            result = scan_enqueue_batch(
                 session,
                 artifactclass=artifactclass,
                 policy=policy,
-                source_path=source_path,
+                scan_root=root,
+                items=[item],
                 staging_root=_staging_root(source_path, staging_dir),
-                member_path=member_path,
+                rem_bin=rem_bin,
             )
         except StagingHeld as exc:
             held_summary = exc.summary
-            staged = None
-        if staged is not None:
-            if staged.logical_sha256 != expected_hash:
-                raise click.ClickException(
-                    f"source hash {staged.logical_sha256.hex()} does not match {asset_hash_hex}"
+            result = None
+        except ArchiveEnqueueError as exc:
+            raise click.ClickException(_enqueue_error_text(exc)) from exc
+        if result is not None:
+            if result.enqueued:
+                # Member grain (§5, P1 residue F6): report the bundle this
+                # member actually landed in — `EnqueuedMember.bundle_id` is
+                # copied straight off the member's own catalog row, never a
+                # group-wide accumulator lookup, which would misreport an
+                # include-alone funnel routing.
+                member = result.enqueued[0]
+                message = f"enqueued {member.member_path!r} in bundle {member.bundle_id}"
+            else:
+                message = (
+                    f"not enqueued: {item.member_path!r} matched scan verdicts "
+                    f"(excluded={list(result.excluded_prefixes)} "
+                    f"blob={list(result.blob_prefixes)})"
                 )
-            # Member grain (§5): report the bundle this member actually landed
-            # in, read from its own catalog row (hash + class + recorded name
-            # — never a group-wide guess, which would misreport include-alone
-            # funnel routings).
-            member = session.scalars(
-                select(BundleMember)
-                .where(
-                    BundleMember.artifactclass == artifactclass,
-                    BundleMember.logical_asset_hash == staged.logical_sha256,
-                    BundleMember.member_path == staged.stored_member_path,
-                )
-                .order_by(BundleMember.id.desc())
-                .limit(1)
-            ).first()
-            if member is None:
-                raise click.ClickException("staging did not enqueue a bundle member")
-            message = f"enqueued {staged.stored_member_path!r} in bundle {member.bundle_id}"
     if held_summary is not None:
         raise click.ClickException(json.dumps(held_summary, indent=2, sort_keys=True))
     if message is not None:
         click.echo(message)
+
+
+@bundle_group.command("enqueue-intake")
+@click.argument("intake_id")
+@click.option(
+    "--staging-dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Directory for copy-on-write staging transforms.",
+)
+@click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
+def bundle_enqueue_intake(
+    intake_id: str,
+    staging_dir: str | None,
+    rem_bin: str,
+) -> None:
+    """Enqueue a registered intake's items, one ruleset scan per (class, tree root)."""
+    engine = make_engine()
+    lines: list[str] = []
+    with session_scope(engine) as session:
+        try:
+            results = enqueue_intake_batch(
+                session,
+                intake_id=intake_id,
+                staging_root=None if staging_dir is None else Path(staging_dir),
+                rem_bin=rem_bin,
+            )
+        except StagingHeld as exc:
+            raise click.ClickException(
+                json.dumps(exc.summary, indent=2, sort_keys=True)
+            ) from exc
+        except ArchiveEnqueueError as exc:
+            raise click.ClickException(_enqueue_error_text(exc)) from exc
+        for result in results:
+            bundle_ids = sorted({member.bundle_id for member in result.enqueued})
+            lines.append(
+                f"{result.artifactclass}: enqueued={len(result.enqueued)} "
+                f"bundles={bundle_ids} "
+                f"excluded={list(result.excluded_prefixes)} "
+                f"blob={list(result.blob_prefixes)}"
+            )
+    for line in lines:
+        click.echo(line)
+
+
+def _enqueue_error_text(exc: Exception) -> str:
+    if isinstance(exc, BatchScanHeld):
+        return json.dumps(exc.summary, indent=2, sort_keys=True)
+    return str(exc)
 
 
 @bundle_group.command("flush")
@@ -265,7 +356,10 @@ def bundle_flush(
                 deliverables_dir=None if deliverables_dir is None else Path(deliverables_dir),
                 manifest_signer=_manifest_signer(manifest_signing_key_file),
             )
-        except (BundleHeld, ManifestSigningError) as exc:
+        # FlushPreflightShort is the §8 skip-and-alarm verdict: the work dir
+        # cannot hold bundle x targets, nothing was mutated. That is an
+        # operator message ("come back with more space"), not a traceback.
+        except (ManifestSigningError, FlushPreflightShort) as exc:
             raise click.ClickException(str(exc)) from exc
     click.echo(
         f"sealed {result.bundle_id}: copies={list(result.copy_ids)} "

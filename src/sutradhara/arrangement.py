@@ -68,16 +68,21 @@ class ArrangementSubmitRace(ArrangementError):
 
 @dataclass(frozen=True)
 class SourceMapEntry:
-    """One frozen source-map row ready for TSV export and DB mirroring."""
+    """One frozen source-map row ready for TSV export and DB mirroring.
+
+    ``ingest_item_id`` is ``None`` for members with no submission lineage.
+    Member grain (§5) makes that routine: a bundle group mixes
+    arrangement-origin members, which always carry an ingest item, with
+    intake-accumulator members in a flush-time map, which do not. The
+    renderer emits the empty string for those — rem accepts an empty
+    ingest_item_id column — never the literal string "None", which a bare
+    ``str()`` would have written into a signed, hashed source map.
+    """
 
     archive_path: str
     source_path: str
     sha256: bytes
     size_bytes: int
-    # Widened for member grain (§5): a bundle group mixes arrangement-origin
-    # members, which always carry an ingest item, with intake-origin members,
-    # which do not. Absent is absent — never the literal string "None", which
-    # a bare str() would have written into a signed, hashed source map.
     ingest_item_id: int | None
 
 
@@ -388,6 +393,7 @@ def render_source_map(entries: list[SourceMapEntry]) -> str:
                     entry.source_path,
                     entry.sha256.hex(),
                     str(entry.size_bytes),
+                    # Absent lineage renders as the empty string, never "None".
                     "" if entry.ingest_item_id is None else str(entry.ingest_item_id),
                 )
             )
