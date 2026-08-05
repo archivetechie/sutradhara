@@ -452,20 +452,95 @@ def test_flush_map_sha256_is_the_staged_digest_not_the_logical_hash(
     assert columns[3] == str(len(staged_bytes))
 
 
-def test_flush_map_round_trips_a_non_utf8_source_path(
+def test_non_utf8_source_path_is_quarantined_and_the_rest_of_the_bundle_builds(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
-    """A member whose source path is not valid UTF-8 stores its raw bytes in
-    ``source_metadata['source_path_bytes_hex']`` and ``_member_source_path``
-    surrogate-decodes it. The map must encode back to those exact bytes.
-    Guards a map row that points rem at a mangled (or replacement-charactered)
-    path — the build then fails on iron for a file that is sitting right
-    there, and a plain ``.encode('utf-8')`` raises outright."""
+    """A member whose source path is not valid UTF-8 carries its raw bytes in
+    ``source_metadata['source_path_bytes_hex']`` (written by
+    ``archive_bundle`` whenever the path is not encodable, and by
+    ``archive_submission`` for every submission member), and
+    ``_member_source_path`` surrogate-decodes them back.
+
+    rem parses the map with ``std::str::from_utf8`` over the WHOLE file
+    (``remanence-cli/src/archive_map.rs``), so one such row rejects every row,
+    and that rejection names neither a map line nor an archive path —
+    ``_identify_member_failure`` returns None and the failure propagates,
+    letting one odd filename kill a whole multi-class bundle. Guards exactly
+    that: the unmappable member must be quarantined by the ordinary hold
+    split, the map rem actually receives must be strict UTF-8 and must not
+    mention it, and its co-residents must reach media."""
     raw_name = b"caf\xe9.mov"  # latin-1 bytes, not valid UTF-8
-    source = tmp_path / os.fsdecode(raw_name)
+    odd = tmp_path / os.fsdecode(raw_name)
+    odd_data = b"movie bytes"
+    odd.write_bytes(odd_data)
+
+    bundle_id, backend = _two_member_bundle(engine, tmp_path)
+    with session_scope(engine) as s:
+        s.add(LogicalAsset(content_sha256=_digest(odd_data), size_bytes=len(odd_data)))
+        s.flush()
+        s.add(
+            BundleMember(
+                bundle_id=bundle_id,
+                logical_asset_hash=_digest(odd_data),
+                artifactclass="o-archive",
+                member_path="cafe.mov",
+                source_path=None,
+                source_metadata={"source_path_bytes_hex": os.fsencode(odd).hex()},
+                size_bytes=len(odd_data),
+                file_sha256=_digest(odd_data),
+            )
+        )
+        accumulator = s.get(Bundle, bundle_id)
+        assert accumulator is not None
+        accumulator.member_count += 1
+        accumulator.total_bytes += len(odd_data)
+        s.flush()
+
+    builder = _FailingBuilder([])
+    with session_scope(engine) as s:
+        result = flush_bundle(
+            s,
+            bundle_id=bundle_id,
+            backends=_backends_for(s, backend),
+            builder=builder,
+        )
+        assert len(result.copy_ids) == 1
+
+    # Attempt 1 never reached the builder (the render refused first); the
+    # retry's map carries the two clean members and is plain UTF-8.
+    assert len(builder.maps) == 1
+    assert _map_archive_paths(builder.maps[0]) == ["a.bin", "nested/b.bin"]
+    assert "cafe.mov" not in builder.maps[0]
+    builder.maps[0].encode("utf-8")  # strict: no surrogates survived
+
+    with session_scope(engine) as s:
+        sealed = s.get(Bundle, bundle_id)
+        assert sealed is not None
+        assert sealed.status == "sealed"
+        assert [row.member_path for row in _member_rows_for_flush(s, sealed)] == [
+            "a.bin",
+            "nested/b.bin",
+        ]
+        [quarantine] = list(s.scalars(select(Bundle).where(Bundle.status == "held")))
+        assert [row.member_path for row in _member_rows_for_flush(s, quarantine)] == [
+            "cafe.mov"
+        ]
+        reason = quarantine.review_summary["quarantined_members"][0]["reason"]
+        assert "not UTF-8" in reason
+
+
+def test_repair_path_names_the_unmappable_member_instead_of_failing_opaquely(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """The bundle-repair rebuild renders its own map and has no quarantine loop
+    to fall back on (finding 7 leaves its work dirs to a later prompt). It must
+    still refuse by NAME rather than hand rem a map that cannot load and let
+    the operator read ``source map ... is not UTF-8`` with nothing to act on."""
+    odd = tmp_path / os.fsdecode(b"caf\xe9.mov")
     data = b"movie bytes"
-    source.write_bytes(data)
+    odd.write_bytes(data)
 
     with session_scope(engine) as s:
         s.add(Bundle(id="bundle-raw", **bundle_kwargs(seed="raw"), status="open"))
@@ -478,7 +553,7 @@ def test_flush_map_round_trips_a_non_utf8_source_path(
                 artifactclass="video",
                 member_path="cafe.mov",
                 source_path=None,
-                source_metadata={"source_path_bytes_hex": os.fsencode(source).hex()},
+                source_metadata={"source_path_bytes_hex": os.fsencode(odd).hex()},
                 size_bytes=len(data),
                 file_sha256=_digest(data),
             )
@@ -487,12 +562,8 @@ def test_flush_map_round_trips_a_non_utf8_source_path(
         bundle = s.get(Bundle, "bundle-raw")
         assert bundle is not None
         members = [_member_input(row) for row in _member_rows_for_flush(s, bundle)]
-        rendered = _render_flush_map(s, members)
-
-    encoded = rendered.encode("utf-8", "surrogateescape")
-    assert os.fsencode(source) in encoded
-    [_, row] = encoded.strip(b"\n").split(b"\n")
-    assert row.split(b"\t")[1] == os.fsencode(source)
+        with pytest.raises(ArchiveFanoutError, match="not UTF-8 encodable"):
+            _render_flush_map(s, members)
 
 
 # --- the map-only rem route ------------------------------------------------

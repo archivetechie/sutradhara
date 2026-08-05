@@ -628,17 +628,31 @@ def flush_bundle(
                     f"all were quarantined"
                 )
             members = [_member_input(row) for row in member_rows]
-            map_text = _render_flush_map(session, members)
-            map_bytes = map_text.encode("utf-8", "surrogateescape")
-            map_path = work_dir / f"{bundle.id}.map.{attempt}.tsv"
-            map_path.write_bytes(map_bytes)
-            map_digest = hashlib.sha256(map_bytes).hexdigest()
-            bundle.scan_summary = {
-                "mode": "map",
-                "map_sha256": map_digest,
-                "member_count": len(member_rows),
-            }
+            # §8 work-dir hygiene: each quarantine retry gets its own
+            # subdirectory. Reusing per-target dirs across attempts leaves an
+            # earlier attempt's artifact in place, and a target that built then
+            # failed transiently on the backend write would meet its own stale
+            # `--out already exists` on the retry.
+            attempt_dir = work_dir / f"attempt-{attempt}"
+            attempt_dir.mkdir()
             try:
+                # Rendering is inside the try because a member whose source
+                # path is not UTF-8 encodable is a member verdict, and the
+                # quarantine loop below is what moves it out of the way.
+                map_text = _render_flush_map(session, members, member_rows=member_rows)
+                # Strict: the renderer has already rejected every member the
+                # map could not carry, so a surviving surrogate is a hole in
+                # that check and must fail loudly rather than reach rem, whose
+                # --map loader is strict UTF-8 over the whole file.
+                map_bytes = map_text.encode("utf-8")
+                map_path = attempt_dir / f"{bundle.id}.map.tsv"
+                map_path.write_bytes(map_bytes)
+                map_digest = hashlib.sha256(map_bytes).hexdigest()
+                bundle.scan_summary = {
+                    "mode": "map",
+                    "map_sha256": map_digest,
+                    "member_count": len(member_rows),
+                }
                 copy_ids, transient_failures, manifest_receipt = _fan_out_targets(
                     session,
                     bundle=bundle,
@@ -647,7 +661,7 @@ def flush_bundle(
                     member_rows=member_rows,
                     builder=builder,
                     key_epoch=key_epoch,
-                    work_dir=work_dir,
+                    work_dir=attempt_dir,
                     map_path=map_path,
                     map_sha256=map_digest,
                     hop_class=hop_class,
@@ -722,17 +736,26 @@ class _MemberBuildFailure(Exception):
 
 
 def _member_rows_for_flush(session: Session, bundle: Bundle) -> list[BundleMember]:
-    """Return the bundle's member rows in map order (sorted by archive path)."""
-    return list(
-        session.scalars(
-            select(BundleMember)
-            .where(BundleMember.bundle_id == bundle.id)
-            .order_by(BundleMember.member_path)
-        )
+    """Return the bundle's member rows in map order (sorted by archive path).
+
+    The sort is Python's, not SQL's, on purpose: design §4 gives sutradhara
+    ownership of on-media member order, and a SQL ``ORDER BY`` would hand that
+    order to whatever collation the database happens to be configured with —
+    the same catalog could then lay members down in one order on SQLite and
+    another on Postgres. Python compares by codepoint, everywhere.
+    """
+    rows = list(
+        session.scalars(select(BundleMember).where(BundleMember.bundle_id == bundle.id))
     )
+    return sorted(rows, key=lambda row: row.member_path)
 
 
-def _render_flush_map(session: Session, members: Sequence[MemberInput]) -> str:
+def _render_flush_map(
+    session: Session,
+    members: Sequence[MemberInput],
+    *,
+    member_rows: Sequence[BundleMember] | None = None,
+) -> str:
     """Render the flush-time catalog map for one build attempt.
 
     Rows arrive sorted by archive path (rem's own ``--inputs`` convention —
@@ -741,7 +764,19 @@ def _render_flush_map(session: Session, members: Sequence[MemberInput]) -> str:
     staged bytes, which rem's writer verifies against the streamed payload.
     ``ingest_item_id`` fills from the ``SubmissionMember`` join where the
     member has one, else the empty string.
+
+    ``member_rows`` is the flush's row snapshot, index-aligned with
+    ``members``. When it is supplied a member the map cannot carry is reported
+    as a ``_MemberBuildFailure`` against its row, so the flush's quarantine
+    loop moves that one member aside and the rest of the bundle still builds.
+    Without it (the bundle-repair rebuild path, which has no quarantine loop)
+    the same condition raises a plain, named ``ArchiveFanoutError``.
     """
+    for index, member in enumerate(members):
+        _reject_unmappable_member(
+            member,
+            None if member_rows is None else member_rows[index],
+        )
     ingest_ids = _submission_ingest_item_ids(session, members)
     entries = [
         SourceMapEntry(
@@ -754,6 +789,49 @@ def _render_flush_map(session: Session, members: Sequence[MemberInput]) -> str:
         for member in members
     ]
     return render_source_map(entries)
+
+
+def _reject_unmappable_member(
+    member: MemberInput,
+    member_row: BundleMember | None,
+) -> None:
+    """Refuse one member whose paths cannot survive the map's UTF-8 contract.
+
+    rem parses the map with ``std::str::from_utf8`` over the WHOLE file
+    (``remanence-cli/src/archive_map.rs``), so a single non-UTF-8-encodable
+    byte rejects every row: the error names no map line and no archive path,
+    ``_identify_member_failure`` cannot attribute it, and one odd filename
+    kills a whole multi-class bundle — precisely what the quarantine loop
+    exists to prevent. This is a live case, not a hypothetical: members whose
+    source path is not UTF-8 encodable carry it as
+    ``source_metadata['source_path_bytes_hex']`` (``archive_bundle.py``,
+    ``archive_submission.py``) and ``_member_source_path`` surrogate-decodes
+    it back.
+
+    The member is quarantined rather than rescued. Rescuing it would mean
+    republishing the bytes under a UTF-8-safe name in the flush work dir, and
+    a hardlink only works within one filesystem — across the staging/work-dir
+    boundary that degrades to a full copy of a possibly very large member, at
+    flush time, to paper over a filename the operator should see. A
+    non-UTF-8 filename is a data-hygiene fact worth surfacing; the split hold
+    surfaces it while the rest of the bundle reaches media.
+    """
+    for label, value in (
+        ("source_path", str(member.source_path)),
+        ("member_path", member.member_path),
+    ):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            message = (
+                f"member {member.member_path!r} has a {label} that is not UTF-8 "
+                f"encodable ({os.fsencode(value)!r}); rem's --map loader is "
+                f"strict UTF-8 over the whole file, so this row would reject "
+                f"the entire map"
+            )
+            if member_row is None:
+                raise ArchiveFanoutError(message) from None
+            raise _MemberBuildFailure(member_row, message) from None
 
 
 def _submission_ingest_item_ids(
@@ -1115,7 +1193,7 @@ def build_bundle_copy_for_pool(
     if map_path is None:
         ordered = sorted(member_sources, key=lambda member: member.member_path)
         map_text = _render_flush_map(session, ordered)
-        map_bytes = map_text.encode("utf-8", "surrogateescape")
+        map_bytes = map_text.encode("utf-8")
         map_path = work_dir / f"{bundle.id}.map.tsv"
         map_path.write_bytes(map_bytes)
         map_sha256 = hashlib.sha256(map_bytes).hexdigest()
