@@ -1023,6 +1023,12 @@ class Bundle(Base):
     ``group_basis`` are immutable at open; the typed threshold columns remain
     authoritative for ``bundle_due`` and must equal the ``group_basis``
     witness (asserted at open).
+
+    ``claimed_by`` is the flusher's process identity (``hostname:pid``, per
+    ``jobs/attempts.py::default_worker_id``) written by the guarded
+    ``open -> flushing`` compare-and-set. It is the reaper's liveness handle
+    and the token ``close_bundle`` demands, so a reaped-then-returning flusher
+    fails loudly instead of sealing a member set that is not on media.
     """
 
     __tablename__ = "bundle"
@@ -1036,6 +1042,7 @@ class Bundle(Base):
     target_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     max_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     archive_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     scan_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     review_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     customer_manifest_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)

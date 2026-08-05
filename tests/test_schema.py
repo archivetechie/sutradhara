@@ -94,6 +94,11 @@ def _assert_archive_invariants(db_path: Path) -> None:
     assert "min_impl_families" in policy_sql
     assert "member_path VARCHAR(2048)" in _table_sql(db_path, "bundle_member")
     assert "member_path VARCHAR(2048)" in _table_sql(db_path, "asset_locator")
+    # The flush claim identity. Asserted in the shared invariant block so the
+    # migration and create_all() are checked to agree: a column present only
+    # in the model would leave every migrated deployment's claim CAS matching
+    # nothing, and every flush would fail its close.
+    assert "claimed_by VARCHAR(255)" in _table_sql(db_path, "bundle")
     assert (
         "copy_id",
         "logical_asset_hash",
