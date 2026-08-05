@@ -404,22 +404,27 @@ pool twice.
 
 ### `bundle`
 
-A synthetic archive object that groups multiple logical assets before fan-out.
-Bundling makes tape and object-store writes tractable while the locator layer
-keeps individual-file restoration possible.
+One row = one synthetic archive object accumulating (or sealed) for one
+**bundle group** — the set of artifactclasses whose storage placement is
+identical. Bundling makes tape and object-store writes tractable while the
+locator layer keeps individual-file restoration possible.
 
 | Field | Type / key | Meaning |
 |---|---|---|
 | `id` | text, PK | Bundle identifier. |
-| `artifactclass` | text, indexed | Bundle policy class. |
-| `status` | text | Lifecycle state; starts `open`, then may be flushed, sealed, or held. |
+| `bundle_group` | text, indexed | Fingerprint of the class's sorted active (pool, representation) set. Immutable at open. |
+| `group_basis` | json | The canonical serialization the fingerprint hashes, plus `basis_source` (`derived`/`backfilled`) and the writer version. Immutable at open; the fan-out reads its pool order from here. |
+| `status` | text | `open`, `flushing`, `held`, `sealed`, or `void` (terminal seal for an empty orphan accumulator whose fingerprint no live policy derives). |
 | `total_bytes`, `member_count` | bigint / integer | Current aggregate size and member count. |
-| `target_bytes`, `max_age_seconds` | bigint / integer | Policy thresholds captured for this bundle. |
-| `ruleset`, `expect` | text, optional | Captured policy descriptors. |
-| `archive_id` | text, optional | Backend/archive identifier after write. |
-| `scan_summary`, `review_summary` | json, optional | Scanner and operator-review results. |
+| `target_bytes`, `max_age_seconds` | bigint / integer | Effective thresholds frozen at open from the group's declared class set; asserted equal to the `group_basis` witness. |
+| `archive_id` | text, optional | Backend/archive identifier. Set at creation for non-accumulating **funnel** bundles (cloud-blob, quarantine, include-alone), which is exactly what makes them non-adoptable — the accumulator lookup requires `archive_id IS NULL`. |
+| `claimed_by` | text, optional | The flushing process's identity (`hostname:pid`), written by the guarded `open → flushing` compare-and-set. The reaper's liveness handle and the token `close_bundle` demands. |
+| `scan_summary`, `review_summary` | json, optional | Build-map summary and operator-review results. |
 | `customer_manifest_path` | text, optional | Generated customer manifest receipt. |
 | `opened_at`, `flushed_at`, `sealed_at`, `held_at` | time | Lifecycle timestamps; all but `opened_at` are optional. |
+
+A partial unique index enforces **one open accumulator per bundle group**:
+`UNIQUE (bundle_group) WHERE status = 'open' AND archive_id IS NULL`.
 
 ### `bundle_member`
 

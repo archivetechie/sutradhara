@@ -139,13 +139,13 @@ def test_archive_predicate_audit_writes_artifact(cli_env: dict[str, str], tmp_pa
 
     result = _run(["archive", "predicate-audit", "--output", str(output)])
 
-    assert "audited=0 affected=0 gate_safe=True" in result.output
+    assert "audited=0 affected=0 clean=True" in result.output
     report = json.loads(output.read_text())
     assert report["summary"] == {
         "audited_intakes": 0,
         "affected_intakes": 0,
         "missing_distinct_assets": 0,
-        "gate_safe": True,
+        "clean": True,
     }
     duplicate = _run(["archive", "predicate-audit", "--output", str(output)], expect_exit=1)
     assert "pass --force" in duplicate.output
@@ -170,7 +170,7 @@ def test_archive_predicate_audit_accepts_mode_ro_url_without_changing_journal(
 
     result = _run(["archive", "predicate-audit", "--output", str(output)])
 
-    assert "gate_safe=True" in result.output
+    assert "clean=True" in result.output
     assert output.exists()
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)

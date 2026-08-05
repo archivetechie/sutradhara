@@ -223,16 +223,25 @@ The intended flow, each step naming the code that implements it:
    `submit` freezes an immutable, validated source-map
    (`/replica/submissions/<id>/source-map.tsv`, mirrored to
    `submission_member` rows).
-5. **Archive** (`archive_submission.py`, `archive_fanout.py`). `sutra
-   archive submission flush` builds the arranged archive object straight
-   from the original files via `rem archive build --map` (no staging
-   copy), fans out to every active pool of the artifactclass — sealing
-   per placement (plain RAO for the working copy, RAO-AEAD for offsite,
-   d2 tar for the legacy shelf) — records the bundle `Copy` and
-   per-member `AssetLocator`s, and flips the submission to `archived`.
-   The accumulator path (`archive_bundle.py`, `sutra archive bundle
-   enqueue/flush`) does the same for individually enqueued assets, with
-   held-bundle review (`sutra review`) for messy input.
+5. **Archive** (`archive_submission.py`, `archive_bundle.py`,
+   `archive_sweeper.py`, `archive_fanout.py`). There is one archive path
+   now, not two. `sutra archive submission accumulate` appends the
+   submission's members to the open accumulator for its **bundle group**
+   — the set of artifactclasses whose storage placement is identical —
+   exactly as `sutra archive bundle enqueue` does for individually
+   enqueued assets, so two submissions and an intake batch that share a
+   placement converge into one object. Nothing is built at that point.
+   `sutra archive bundle sweep` (also the `bundle-sweep` job) is what
+   seals: it flushes every accumulator `bundle_due` says is full or
+   overdue — the age arm's only caller — plus the immediately-due funnel
+   bundles (include-alone, cloud-blob). A flush claims the bundle
+   (`open → flushing`, a guarded compare-and-set carrying the flusher's
+   `hostname:pid`), renders a build map from the bundle's own member
+   rows, builds and validates every pool target, and only then writes
+   them, sealing the bundle and recording its `Copy` plus per-member
+   `AssetLocator`s. Held-bundle review (`sutra review`) covers messy
+   input; a member whose build fails is quarantined into its own held
+   bundle rather than holding the whole group.
 6. **Organize forever** (`virtual_arrangement.py`). Virtual arrangements
    are the permanent, mutable organizational layer over the archived
    truth: place, move, exclude, tag, reject — all catalog-only. Restore
@@ -291,8 +300,11 @@ engine moves jobs between `pending`, `running`, `succeeded`, and
 
 **Handlers** (`jobs/handlers/`). Registered kinds: `copy`,
 `hdcache_fill`, `cloud-blob`, `restore`, `validate`, `pfr-index`,
-`bundle-repair`, `transcode`, `verify`. (Naming is mixed hyphen/underscore
-for historical reasons.)
+`bundle-repair`, `bundle-sweep`, `transcode`, `verify`. (Naming is mixed
+hyphen/underscore for historical reasons.) `bundle-sweep` is the periodic
+accumulator pass: it reaps stuck flush claims, void-seals empty orphan
+accumulators, and flushes every bundle that is due — the only caller of
+the accumulator age arm.
 
 **Worker** (`jobs/worker.py`, `sutra worker`). Single-node,
 lease-aware. A `LeaseManager` keeps in-memory counted pools; the defaults
@@ -679,11 +691,16 @@ the gate: `GET /api/devices` still surfaces a `receivedBefore` badge per
 card from the history projection (`latest_card_history`), purely as
 operator-facing display. The intake archive read models separately add
 an additive `archive_state` (`none`/`partial`/`complete`, ALL-semantics
-over nonempty distinct ingest-item hashes) alongside the legacy
-`archived` boolean; phase 1c gates that compatibility boolean and its
-stage filters with `SUTRADHARA_ARCHIVED_ALL_SEMANTICS` — the default
-remains ANY-semantics until the read-only `sutra archive predicate-audit`
-is clean, after which it derives from `archive_state == complete`.
+over nonempty distinct ingest-item hashes) alongside the compatibility
+`archived` boolean, which now derives from `archive_state == complete`
+unconditionally. The rollout environment gate that once selected between
+ANY and ALL semantics is deleted: there is one predicate, and archive
+evidence means a **sealed** bundle carrying the member whose **verified**
+copies meet that member's own class `min_copies`. A stored
+`Submission.status == archived` flag is not evidence — the flag is a
+projection of this predicate — and neither is a sealed bundle whose copies
+were never measured. `sutra archive predicate-audit` reports the intakes
+that sit only partially covered.
 
 <!-- code-anchor: src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 5688438 -->
 ## Deletion evidence and the retention witness gate

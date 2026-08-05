@@ -11,7 +11,7 @@ import click
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sutradhara.archive_bundle import record_review_decision
+from sutradhara.archive_bundle import bundle_artifactclasses, record_review_decision
 from sutradhara.archive_enqueue import (
     ArchiveEnqueueError,
     BatchScanHeld,
@@ -34,6 +34,7 @@ from sutradhara.archive_restore import (
     resolve_member_asset_hash,
 )
 from sutradhara.archive_submission import ArchiveSubmissionError, archive_submission
+from sutradhara.archive_sweeper import sweep_bundles
 from sutradhara.artifactclass_policy import (
     apply_artifactclass_policy_file,
     get_artifactclass_policy,
@@ -50,6 +51,7 @@ from sutradhara.hdcache.manager import (
     RestoreManagerError,
     restore_to_path,
 )
+from sutradhara.jobs.handlers.bundle_sweep import sweep_backends
 from sutradhara.replication import WritableStorageBackend
 from sutradhara.staging import StagingHeld
 
@@ -102,7 +104,7 @@ def submission_group() -> None:
 )
 @click.option("--force", is_flag=True, help="Replace an existing output artifact.")
 def predicate_audit(output: Path, force: bool) -> None:
-    """Audit retention-passed intakes before enabling ALL semantics."""
+    """Report retention-passed intakes with an incomplete archive state."""
 
     if output.exists() and not force:
         raise click.ClickException(f"output already exists: {output}; pass --force to replace it")
@@ -126,36 +128,40 @@ def predicate_audit(output: Path, force: bool) -> None:
     assert isinstance(summary, dict)
     click.echo(
         f"wrote {output}: audited={summary['audited_intakes']} "
-        f"affected={summary['affected_intakes']} gate_safe={summary['gate_safe']}"
+        f"affected={summary['affected_intakes']} clean={summary['clean']}"
     )
 
 
-@submission_group.command("flush")
+@submission_group.command("accumulate")
 @click.argument("submission_id")
-@click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
-@click.option("--key-epoch", default=None, help="Key epoch for rao-aead-v1 pools.")
-def submission_flush(submission_id: str, rem_bin: str, key_epoch: str | None) -> None:
-    """Flush one pending arrangement submission to its artifactclass pools."""
+def submission_accumulate(submission_id: str) -> None:
+    """Append one arrangement submission to its bundle group's accumulator.
+
+    A submission no longer builds an object of its own. It converges on the
+    group accumulator and the sweeper (`sutra archive bundle sweep`) seals that
+    accumulator when it is full or overdue, so this command writes catalog rows
+    and touches no backend. The submission reports `archived` only once every
+    member sits in a sealed bundle with enough verified copies.
+    """
     engine = make_engine()
     with session_scope(engine) as session:
-        submission = session.get(Submission, submission_id)
-        if submission is None:
+        if session.get(Submission, submission_id) is None:
             raise click.ClickException(f"no submission {submission_id!r}")
-        backends = _target_backends(session, submission.artifactclass)
         try:
-            result = archive_submission(
-                session,
-                submission_id,
-                backends=backends,
-                builder=RemArchiveBuilder(rem_bin),
-                key_epoch=key_epoch,
-            )
-        except (ArchiveSubmissionError, ManifestSigningError) as exc:
+            result = archive_submission(session, submission_id)
+        except ArchiveSubmissionError as exc:
             raise click.ClickException(str(exc)) from exc
-    action = "already archived" if result.noop else "archived"
-    click.echo(
-        f"{action} {result.submission_id}: bundle={result.bundle_id} copies={list(result.copy_ids)}"
-    )
+        lines = [
+            f"{'already accumulated' if result.noop else 'accumulated'} "
+            f"{result.submission_id}: archived={result.archived}"
+        ]
+        for bundle_id in result.bundle_ids:
+            bundle = session.get(Bundle, bundle_id)
+            status = "?" if bundle is None else bundle.status
+            copies = list(result.copies_by_bundle.get(bundle_id, ()))
+            lines.append(f"  bundle {bundle_id} status={status} copies={copies}")
+    for line in lines:
+        click.echo(line)
 
 
 @bundle_group.command("enqueue")
@@ -282,6 +288,7 @@ def bundle_enqueue_intake(
     """Enqueue a registered intake's items, one ruleset scan per (class, tree root)."""
     engine = make_engine()
     lines: list[str] = []
+    held_summary: dict[str, object] | None = None
     with session_scope(engine) as session:
         try:
             results = enqueue_intake_batch(
@@ -291,9 +298,13 @@ def bundle_enqueue_intake(
                 rem_bin=rem_bin,
             )
         except StagingHeld as exc:
-            raise click.ClickException(
-                json.dumps(exc.summary, indent=2, sort_keys=True)
-            ) from exc
+            # A hold must SURVIVE the failure that produced it: staging wrote
+            # `held` on the bundle before raising, and raising from inside the
+            # session scope would roll that write back with everything else —
+            # the operator would then see a hold message with no held bundle to
+            # review. The summary is carried out and raised after the commit.
+            held_summary = exc.summary
+            results = []
         except ArchiveEnqueueError as exc:
             raise click.ClickException(_enqueue_error_text(exc)) from exc
         for result in results:
@@ -306,6 +317,8 @@ def bundle_enqueue_intake(
             )
     for line in lines:
         click.echo(line)
+    if held_summary is not None:
+        raise click.ClickException(json.dumps(held_summary, indent=2, sort_keys=True))
 
 
 def _enqueue_error_text(exc: Exception) -> str:
@@ -337,12 +350,22 @@ def bundle_flush(
     key_epoch: str | None,
     manifest_signing_key_file: str | None,
 ) -> None:
-    """Flush one open bundle to all active artifactclass pools."""
+    """Force-flush one open bundle to its bundle group's basis pools.
+
+    Force-flush is **group grain**, not class grain: the bundle holds every
+    class whose storage placement matches, so sealing it here seals other
+    classes' material too, at whatever fill it has reached. The command reports
+    that fill and those classes before it seals, because an operator sealing a
+    12%-full accumulator to get one class's material onto tape is spending the
+    whole group's tape efficiency to do it.
+    """
     engine = make_engine()
     with session_scope(engine) as session:
         bundle = session.get(Bundle, bundle_id)
         if bundle is None:
             raise click.ClickException(f"no bundle {bundle_id!r}")
+        for line in _force_flush_fill_warning(session, bundle):
+            click.echo(line, err=True)
         # Group grain (§5): the flush's backends come from the bundle's frozen
         # group_basis pool set, not from any member class's live policy.
         backends = _bundle_basis_backends(session, bundle)
@@ -365,6 +388,59 @@ def bundle_flush(
         f"sealed {result.bundle_id}: copies={list(result.copy_ids)} "
         f"manifest={result.manifest_path or '(none)'}"
     )
+
+
+def _force_flush_fill_warning(session: Session, bundle: Bundle) -> list[str]:
+    """The §4 force-flush disclosure: current fill and the classes it seals."""
+    if bundle.status != "open":
+        return []
+    classes = bundle_artifactclasses(session, bundle)
+    fill = (
+        f"{100 * bundle.total_bytes / bundle.target_bytes:.1f}%"
+        if bundle.target_bytes
+        else "n/a (no target)"
+    )
+    return [
+        f"force-flush is group grain: bundle {bundle.id} is the accumulator for "
+        f"bundle group {bundle.bundle_group[:12]}…",
+        f"  fill: {bundle.total_bytes} / {bundle.target_bytes} bytes ({fill}), "
+        f"{bundle.member_count} member(s)",
+        f"  member classes sealed by this flush: {classes}",
+    ]
+
+
+@bundle_group.command("sweep")
+@click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
+@click.option("--key-epoch", default=None, help="Key epoch for rao-aead-v1 pools.")
+@click.option(
+    "--no-reap",
+    is_flag=True,
+    help="Skip the stuck-claim reaper (diagnosis only; the sweep still flushes).",
+)
+def bundle_sweep(rem_bin: str, key_epoch: str | None, no_reap: bool) -> None:
+    """Run one sweeper pass: reap, void-seal orphans, drain, flush what is due.
+
+    The same pass the `bundle-sweep` job runs. This is the only caller of
+    `bundle_due`'s age arm, so a quiet class's accumulator seals here or not at
+    all.
+    """
+    engine = make_engine()
+    with session_scope(engine) as session:
+        result = sweep_bundles(
+            session,
+            backends=sweep_backends(session),
+            builder=RemArchiveBuilder(rem_bin),
+            key_epoch=key_epoch,
+            reap=not no_reap,
+        )
+    click.echo(
+        f"sweep: reaped={list(result.reaped)} voided={list(result.voided)} "
+        f"drained={list(result.drained)} flushed={list(result.flushed)}"
+    )
+    for bundle_id, reason in result.failed:
+        click.echo(f"  failed {bundle_id}: {reason}", err=True)
+    if result.failed:
+        raise SystemExit(1)
 
 
 @archive_group.command("review")
