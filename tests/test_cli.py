@@ -24,16 +24,21 @@ from sqlalchemy import select
 from sutradhara.artifactclass_policy import AppleDoubleStagingPolicy, StagingPolicy
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
+    ArtifactClassPool,
+    Backend,
     Bundle,
     IngestItem,
     Intake,
     LogicalAsset,
+    Pool,
     ReviewDecision,
     Submission,
 )
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import (
     AssetValidity,
+    BackendKind,
+    BackendTier,
     IntakeSourceKind,
     IntakeStatus,
     SubmissionStatus,
@@ -586,6 +591,23 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
     source.with_name("._photo.tif").write_bytes(b"not-appledouble")
     engine = make_engine()
     with session_scope(engine) as session:
+        backend = Backend(
+            name="rem-photo",
+            kind=BackendKind.REM_TAPE,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        session.add(backend)
+        session.flush()
+        session.add(
+            Pool(
+                id="pool-photo",
+                backend_id=backend.id,
+                representation="rao-plain-v1",
+            )
+        )
+        session.add(
+            ArtifactClassPool(artifactclass="photo", pool_id="pool-photo", active=True)
+        )
         session.add(
             ArtifactClassPolicyRecord(
                 artifactclass="photo",
@@ -615,7 +637,6 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
     assert "appledouble-merge-failed" in result.output
     with session_scope(engine) as session:
         [bundle] = session.query(Bundle).all()
-        assert bundle.artifactclass == "photo"
         assert bundle.status == "held"
         assert bundle.review_summary is not None
         assert bundle.review_summary["clusters"][0]["reason"] == "appledouble-merge-failed"

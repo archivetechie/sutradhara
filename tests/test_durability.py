@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from sutradhara.archive_restore import restore_asset
@@ -21,6 +21,7 @@ from sutradhara.catalog.models import (
     AssetLocator,
     Backend,
     Bundle,
+    BundleMember,
     Copy,
     IngestItem,
     Intake,
@@ -150,6 +151,7 @@ def test_durable_placements_axes_and_direct_copies(engine: Engine) -> None:
             pool=pool,
             locator_id="proxies-copy",
             verified=True,
+            artifactclass="proxies",
         )
 
         accounting = durable_placements(
@@ -267,6 +269,19 @@ def test_bundle_replication_status_reports_complete_and_missing(engine: Engine) 
         pool_a = _add_pool(session, "pool-a", artifactclass="masters", sort_order=0)
         pool_b = _add_pool(session, "pool-b", artifactclass="masters", sort_order=1)
         session.add(Bundle(id="bundle-1", **bundle_kwargs(seed="masters"), status="sealed"))
+        member_hash = _digest(b"bundle-1-member")
+        session.add(LogicalAsset(content_sha256=member_hash, size_bytes=1))
+        session.flush()
+        session.add(
+            BundleMember(
+                bundle_id="bundle-1",
+                logical_asset_hash=member_hash,
+                artifactclass="masters",
+                member_path="member.bin",
+                size_bytes=1,
+                file_sha256=member_hash,
+            )
+        )
         session.flush()
         copy_a, _ = add_bundle_copy(
             session,
@@ -364,6 +379,7 @@ def test_restore_asset_filters_cross_class_bundle_locators(engine: Engine, tmp_p
             pool=wrong_pool,
             locator_id="proxy-copy",
             verified=True,
+            artifactclass="proxies",
         )
         right_copy = _add_bundle_copy_with_locator(
             session,
@@ -489,6 +505,7 @@ def _add_bundle_copy_with_locator(
     pool: Pool,
     locator_id: str,
     verified: bool,
+    artifactclass: str = "masters",
 ) -> Copy:
     copy, _ = add_bundle_copy(
         session,
@@ -510,6 +527,7 @@ def _add_bundle_copy_with_locator(
         pool_id=pool.id,
         bundle_id=bundle_id,
         member_path=f"{locator_id}.bin",
+        artifactclass=artifactclass,
     )
     return copy
 
@@ -528,7 +546,27 @@ def _add_locator(
     pool_id: str,
     bundle_id: str | None,
     member_path: str,
+    artifactclass: str = "masters",
 ) -> None:
+    if bundle_id is not None:
+        existing = session.scalars(
+            select(BundleMember).where(
+                BundleMember.bundle_id == bundle_id,
+                BundleMember.member_path == member_path,
+            )
+        ).one_or_none()
+        if existing is None:
+            session.add(
+                BundleMember(
+                    bundle_id=bundle_id,
+                    logical_asset_hash=asset_hash,
+                    artifactclass=artifactclass,
+                    member_path=member_path,
+                    size_bytes=1,
+                    file_sha256=asset_hash,
+                )
+            )
+            session.flush()
     session.add(
         AssetLocator(
             logical_asset_hash=asset_hash,
