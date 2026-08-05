@@ -14,7 +14,15 @@ from sutradhara.artifactclass_policy import (
     AppleDoubleStagingPolicy,
     StagingPolicy,
 )
-from sutradhara.catalog.models import ArtifactClassPolicyRecord, BundleMember, StagingTransform
+from sutradhara.catalog.models import (
+    ArtifactClassPolicyRecord,
+    ArtifactClassPool,
+    Backend,
+    BundleMember,
+    Pool,
+    StagingTransform,
+)
+from sutradhara.catalog.types import BackendKind, BackendTier
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.staging import StagingHeld, stage_and_enqueue_artifact
 
@@ -25,6 +33,21 @@ def engine() -> Iterator[Engine]:
     create_all(eng)
     yield eng
     eng.dispose()
+
+
+def _add_placement(s, artifactclass: str) -> None:
+    backend = Backend(
+        name=f"rem-{artifactclass}",
+        kind=BackendKind.REM_TAPE,
+        tier=BackendTier.SELF_DESCRIBING,
+    )
+    s.add(backend)
+    s.flush()
+    pool_id = f"pool-{artifactclass}"
+    if s.get(Pool, pool_id) is None:
+        s.add(Pool(id=pool_id, backend_id=backend.id, representation="rao-plain-v1"))
+    s.add(ArtifactClassPool(artifactclass=artifactclass, pool_id=pool_id, active=True))
+    s.flush()
 
 
 def test_appledouble_merge_records_transform_and_consumes_sidecar(
@@ -59,6 +82,7 @@ def test_appledouble_merge_records_transform_and_consumes_sidecar(
         )
         s.add(policy)
         s.flush()
+        _add_placement(s, "photo")
 
         staged = stage_and_enqueue_artifact(
             s,
@@ -108,6 +132,7 @@ def test_malformed_appledouble_holds_open_bundle(
         )
         s.add(policy)
         s.flush()
+        _add_placement(s, "photo")
 
         with pytest.raises(StagingHeld):
             stage_and_enqueue_artifact(
@@ -143,6 +168,7 @@ def test_appledouble_sidecar_source_holds_instead_of_enqueuing(
         )
         s.add(policy)
         s.flush()
+        _add_placement(s, "photo")
 
         with pytest.raises(StagingHeld) as raised:
             stage_and_enqueue_artifact(
