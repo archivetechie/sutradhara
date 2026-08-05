@@ -20,11 +20,13 @@ import pytest
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
+from sutradhara.archive_fanout import _customer_manifest_members
 from sutradhara.archive_restore import (
     RestoreNameError,
     _choose_bundle_restore_group,
     resolve_member_asset_hash,
 )
+from sutradhara.arrangement import SourceMapEntry, render_source_map
 from sutradhara.artifactclass_policy import (
     ArtifactClassPolicy,
     BundlingPolicy,
@@ -800,6 +802,108 @@ def test_policy_apply_report_names_open_bundles_predating_a_membership_change(
         assert group.open_bundles_predating_change == ("open-accumulator",)
         assert WARNING_MEMBERSHIP_CHANGED in group.warning_kinds()
         assert bundle.max_age_seconds == 3600, "an open bundle's thresholds never change"
+
+
+# --------------------------------------------------------------------------
+# The customer manifest is a member-grain receipt (§5)
+# --------------------------------------------------------------------------
+
+
+def test_customer_manifest_carries_per_member_class_and_distinguishes_by_stored_name(
+    engine: Engine,
+) -> None:
+    """Two co-resident same-named members share ``member_name`` by design.
+
+    The receipt is customer-facing, so the logical ``member_name`` stays
+    untagged — which means the two rows repeat it. They are distinguished by
+    ``stored_member_name``, which carries the disambiguation tag and matches
+    the on-media layout, and by their own ``artifactclass``. Stated here so the
+    repetition is never read as a duplicated member.
+    """
+    hash_one = _digest(b"event one clip")
+    hash_two = _digest(b"event two clip")
+
+    with session_scope(engine) as session:
+        backend = _add_backend(session, "mem")
+        _add_pool(session, "pool-1", backend)
+        _apply(session, "cls-one", pools=("pool-1",))
+        _apply(session, "cls-two", pools=("pool-1",))
+        bundle = Bundle(
+            id="receipt",
+            **bundle_kwargs_for_class(session, "cls-one"),
+            status="sealed",
+        )
+        session.add(bundle)
+        session.flush()
+        first = _add_member(
+            session,
+            bundle_id="receipt",
+            artifactclass="cls-one",
+            asset_hash=hash_one,
+            member_path="CLIP.MOV",
+        )
+        first.source_metadata = {"logical_path": "CLIP.MOV"}
+        # The ladder tagged the second member's stored name; its logical name
+        # is unchanged.
+        second = _add_member(
+            session,
+            bundle_id="receipt",
+            artifactclass="cls-two",
+            asset_hash=hash_two,
+            member_path=f"CLIP.{hash_two.hex()[:10]}.MOV",
+        )
+        second.source_metadata = {"logical_path": "CLIP.MOV"}
+        session.flush()
+        session.refresh(bundle)
+
+        entries = _customer_manifest_members(bundle)
+
+    assert [entry["member_name"] for entry in entries] == ["CLIP.MOV", "CLIP.MOV"]
+    assert len({entry["stored_member_name"] for entry in entries}) == 2
+    by_class = {entry["artifactclass"]: entry for entry in entries}
+    assert set(by_class) == {"cls-one", "cls-two"}
+    assert by_class["cls-one"]["stored_member_name"] == "CLIP.MOV"
+    assert by_class["cls-two"]["stored_member_name"].startswith("CLIP.")
+    assert by_class["cls-two"]["stored_member_name"].endswith(".MOV")
+
+
+# --------------------------------------------------------------------------
+# The source-map renderer: absent is absent, never the string "None" (§5)
+# --------------------------------------------------------------------------
+
+
+def test_source_map_renders_an_absent_ingest_item_id_as_empty() -> None:
+    """Guards: the literal string ``None`` reaching a hashed source map.
+
+    A bundle group mixes arrangement-origin members (which always carry an
+    ingest item) with intake-origin members (which do not). The source map is
+    hashed into the submission manifest, so a stringified ``None`` would be a
+    durable, signed lie about provenance rather than a display glitch.
+    """
+    rendered = render_source_map(
+        [
+            SourceMapEntry(
+                archive_path="day-1/from-arrangement.mov",
+                source_path="/src/a.mov",
+                sha256=_digest(b"a"),
+                size_bytes=11,
+                ingest_item_id=7,
+            ),
+            SourceMapEntry(
+                archive_path="day-1/from-intake.mov",
+                source_path="/src/b.mov",
+                sha256=_digest(b"b"),
+                size_bytes=22,
+                ingest_item_id=None,
+            ),
+        ]
+    )
+
+    rows = rendered.splitlines()
+    assert rows[0].split("\t")[-1] == "ingest_item_id"
+    assert rows[1].split("\t")[-1] == "7"
+    assert rows[2].split("\t")[-1] == ""
+    assert "None" not in rendered
 
 
 # --------------------------------------------------------------------------
