@@ -51,6 +51,7 @@ from sutradhara.evidence_recorder import record_measured, record_unmeasured_prom
 from sutradhara.hdcache.fill import enqueue_post_flush_hdcache_fills
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
+    CONDITION_BLOCKED,
     OBSERVED_MISSING,
     record_condition,
     record_observation,
@@ -101,6 +102,28 @@ class TransientPoolFanoutError(BackendError, ArchiveFanoutError):
         self.cause = cause
         super().__init__(
             f"transient backend failure for pool {pool_id!r} on backend {backend_name!r}: {cause}"
+        )
+
+
+class PoolWriteFailure(ArchiveFanoutError):
+    """A target pool failed **after** its bytes reached media, non-transiently.
+
+    The readback verify refused the object, or a post-write catalog step
+    rejected it. Distinct from ``TransientPoolFanoutError`` in both directions:
+    it is not retried on a backoff (a tape append is unreclaimable, so an
+    automatic retry appends a *second* object rather than replacing the first),
+    and it does not abort the flush — the design's "post-write failures seal
+    partial rather than roll back" applies to every post-write failure, not
+    only the retryable ones. Raising it out of the fan-out would roll back the
+    sibling targets whose copies are already on media.
+    """
+
+    def __init__(self, pool_id: str, backend_name: str, cause: BaseException) -> None:
+        self.pool_id = pool_id
+        self.backend_name = backend_name
+        self.cause = cause
+        super().__init__(
+            f"post-write failure for pool {pool_id!r} on backend {backend_name!r}: {cause}"
         )
 
 
@@ -672,7 +695,12 @@ def flush_bundle(
                     "map_sha256": map_digest,
                     "member_count": len(member_rows),
                 }
-                copy_ids, transient_failures, manifest_receipt = _fan_out_targets(
+                (
+                    copy_ids,
+                    transient_failures,
+                    write_failures,
+                    manifest_receipt,
+                ) = _fan_out_targets(
                     session,
                     bundle=bundle,
                     targets=targets,
@@ -703,6 +731,8 @@ def flush_bundle(
             break
 
     close_bundle(session, bundle, claim_token=claim_token)
+    condition_message: str | None = None
+    condition_reason: str | None = None
     if transient_failures:
         condition_message = _record_bundle_copy_transient_backoff(
             session,
@@ -710,18 +740,29 @@ def flush_bundle(
             transient_failures,
         )
         condition_reason = "transient-backend-failure"
-    else:
+    if write_failures:
+        # Recorded second, deliberately: a post-write failure blocks where a
+        # transient one backs off, and the more severe verdict must own the
+        # condition row. Bytes on media that failed their own check are a
+        # human's call, not a retry timer's.
+        condition_message = _record_bundle_copy_write_failure(
+            session,
+            bundle.id,
+            write_failures,
+        )
+        condition_reason = "post-write-pool-failure"
+    if not transient_failures and not write_failures:
         _record_bundle_copy_outbox(session, bundle.id)
-        condition_message = None
-        condition_reason = None
     _schedule_bundle_copy_fast_path(session, bundle.id)
     enqueue_post_flush_hdcache_fills(session, bundle.id)
     return FanoutResult(
         bundle.id,
         tuple(copy_ids),
         manifest_receipt,
-        partial=bool(transient_failures),
-        failed_pools=tuple(failure.pool_id for failure in transient_failures),
+        partial=bool(transient_failures or write_failures),
+        failed_pools=tuple(
+            failure.pool_id for failure in (*transient_failures, *write_failures)
+        ),
         condition_reason=condition_reason,
         condition_message=condition_message,
     )
@@ -1052,7 +1093,7 @@ def _fan_out_targets(
     map_sha256: str,
     deliverables_dir: Path | str | None,
     manifest_signer: ManifestSigner | None,
-) -> tuple[list[int], list[TransientPoolFanoutError], str | None]:
+) -> tuple[list[int], list[TransientPoolFanoutError], list[PoolWriteFailure], str | None]:
     """Build and validate EVERY target, then write them.
 
     The two phases are separate on purpose (design §4, C3): with build and
@@ -1070,6 +1111,14 @@ def _fan_out_targets(
     used to propagate instead of quarantining once any copy existed, because a
     retry would have rebuilt the written targets. No copy exists during the
     build phase, so every member failure now reaches the quarantine loop.
+
+    In the write phase **no** failure propagates, transient or not. Design §4's
+    "post-write failures seal partial rather than roll back" is a statement
+    about physics, not about error taxonomy: once ``write_object_to_pool``
+    returns, a tape append is unreclaimable, so an exception that escaped here
+    would undo the *sibling* targets whose bytes are already on media too. The
+    two failure lists carry the verdicts back out, and the flush seals what it
+    placed.
     """
     prepared: list[tuple[WritableStorageBackend, PoolTarget, Path, BuildArtifact]] = []
     for index, (backend, target) in enumerate(targets):
@@ -1103,30 +1152,54 @@ def _fan_out_targets(
 
     copy_ids: list[int] = []
     transient_failures: list[TransientPoolFanoutError] = []
+    write_failures: list[PoolWriteFailure] = []
     manifest_receipt: str | None = None
     for backend, target, target_dir, artifact in prepared:
         # Each target owns a savepoint so retryable backend failures do not
         # erase catalog rows for earlier successful placements.
+        copy: Copy | None = None
         try:
             with session.begin_nested():
-                copy = write_bundle_copy_for_pool(
-                    session,
-                    bundle=bundle,
-                    target=target,
-                    artifact=artifact,
-                    builder=builder,
-                    backend=backend,
-                    work_dir=target_dir,
-                )
-                # Member grain (§5): class and ruleset come from the matching
-                # member row, not from a representative-class hop.
-                _record_build_exclusions(
-                    session,
-                    bundle=bundle,
-                    artifact=artifact,
-                )
+                try:
+                    copy = write_bundle_copy_for_pool(
+                        session,
+                        bundle=bundle,
+                        target=target,
+                        artifact=artifact,
+                        builder=builder,
+                        backend=backend,
+                        work_dir=target_dir,
+                    )
+                except TransientPoolFanoutError:
+                    # Retryable: let it out of the savepoint, which discards
+                    # this target's rows so the copy outbox can re-place it.
+                    raise
+                except ArchiveFanoutError as exc:
+                    # Post-write by construction: the first line of
+                    # `write_bundle_copy_for_pool` is the physical write, so
+                    # everything that raises out of it happened after the bytes
+                    # were committed to media. Caught INSIDE the savepoint so
+                    # the SUSPECT copy row and the measurement evidence survive
+                    # — the same handling `jobs/handlers/bundle_repair.py` gives
+                    # this failure, and the reason is preservation, not
+                    # symmetry: discarding the row would leave an unrecorded
+                    # object on unreclaimable media and let a later repair
+                    # append a second one.
+                    write_failures.append(
+                        PoolWriteFailure(target.pool_id, target.backend_name, exc)
+                    )
+                else:
+                    # Member grain (§5): class and ruleset come from the
+                    # matching member row, not from a representative-class hop.
+                    _record_build_exclusions(
+                        session,
+                        bundle=bundle,
+                        artifact=artifact,
+                    )
         except TransientPoolFanoutError as exc:
             transient_failures.append(exc)
+            continue
+        if copy is None:
             continue
         copy_ids.append(copy.id)
         if (
@@ -1147,7 +1220,7 @@ def _fan_out_targets(
                 )
             )
             bundle.customer_manifest_path = manifest_receipt
-    return copy_ids, transient_failures, manifest_receipt
+    return copy_ids, transient_failures, write_failures, manifest_receipt
 
 
 def _pool_slug(pool_id: str) -> str:
@@ -1302,6 +1375,48 @@ def _record_bundle_copy_transient_backoff(
         condition=CONDITION_BACKOFF,
         reason="transient-backend-failure",
         message=message,
+    )
+    return message
+
+
+def _record_bundle_copy_write_failure(
+    session: Session,
+    bundle_id: str,
+    failures: Sequence[PoolWriteFailure],
+) -> str:
+    """Alarm on pools whose bytes reached media and then failed their check.
+
+    ``CONDITION_BLOCKED``, not ``CONDITION_BACKOFF``: the write is not known to
+    have failed — it is known to have *landed and not verified*, and on tape
+    that is unreclaimable. An automatic retry would append a second object; a
+    human decides whether to re-place, re-verify, or condemn the media.
+    """
+    detail = "; ".join(f"pool {failure.pool_id}: {failure.cause}" for failure in failures)
+    message = (
+        f"bundle {bundle_id} sealed with partial fan-out; post-write failure for {detail}"
+    )
+    record_observation(
+        session,
+        domain="bundle_copy",
+        target_key=bundle_id,
+        desired=True,
+        observed_state=OBSERVED_MISSING,
+        reason="post-write-pool-failure",
+        message=message,
+    )
+    record_condition(
+        session,
+        domain="bundle_copy",
+        target_key=bundle_id,
+        condition=CONDITION_BLOCKED,
+        reason="post-write-pool-failure",
+        message=message,
+    )
+    emit_structured_event(
+        "bundle_copy_post_write_failure",
+        bundle_id=bundle_id,
+        pools=[failure.pool_id for failure in failures],
+        message=message[:500],
     )
     return message
 
