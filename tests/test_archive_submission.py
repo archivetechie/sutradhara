@@ -545,10 +545,26 @@ def test_resolve_member_rejects_valid_but_absent_name(
             )
 
 
-def test_identity_mismatch_fails_before_backend_write(
+def test_identity_mismatch_rolls_back_catalog_but_leaves_a_media_only_orphan(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
+    """What the identity cross-check does, and what it no longer prevents.
+
+    The check runs per target, inside that target's savepoint, before that
+    target's pool write — so a mismatch aborts the whole fan-out and the
+    catalog is left exactly as it was: no ``Copy``, no ``AssetLocator``, no
+    submission row moved.
+
+    It is no longer true that *no* backend write happens first. The mechanism:
+    ``_validate_artifact_members`` early-returns for representations outside
+    the RAO family, and basis-order fan-out (§2/§5) now sorts the D2 shelf pool
+    first — so the unchecked D2 write lands before the mismatch is caught on
+    the next target. The residue is media with no catalog row pointing at it: a
+    media-only orphan, not an inconsistent catalog. Flagged for the
+    submission-build rework, which retires this per-submission build entirely;
+    this test pins the behaviour as it stands, including that residue.
+    """
     setup = _create_submission(
         engine,
         tmp_path,
@@ -571,17 +587,11 @@ def test_identity_mismatch_fails_before_backend_write(
         )
 
     assert builder.calls
-    # The identity cross-check runs per target, inside that target's savepoint,
-    # before that target's pool write — so no checked representation is ever
-    # written, and the whole fan-out is rolled back with it.
+    # No checked (RAO-family) representation is ever written.
     assert rem_backend.writes == []
-    # Basis-order fan-out (§2/§5) now builds the D2 shelf pool first, and
-    # `_validate_artifact_members` is a no-op for representations outside the
-    # RAO family — so that one write lands before the mismatch is caught on the
-    # next target. It leaves no catalog row (the whole submission rolls back);
-    # the residue is a media-only orphan. Flagged for the submission-build
-    # rework, which retires this per-submission build entirely.
+    # The unchecked D2 shelf write lands first and is the media-only orphan.
     assert d2_backend.writes == ["d2-shelf-pool"]
+    # The catalog is consistent: nothing points at that orphan.
     with session_scope(engine) as session:
         assert list(session.scalars(select(Copy))) == []
         assert list(session.scalars(select(AssetLocator))) == []
