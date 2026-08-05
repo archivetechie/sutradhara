@@ -13,12 +13,12 @@ from sqlalchemy import select
 
 from sutradhara.archive_fanout import MemberInput
 from sutradhara.backend import factory
+from sutradhara.backend.port import CopyRecord
 from sutradhara.bundle_group import (
     BASIS_SOURCE_DERIVED,
     compute_bundle_group,
     group_basis_document,
 )
-from sutradhara.backend.port import CopyRecord
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import Backend, Bundle, Copy, IngestItem, Intake, Pool
 from sutradhara.catalog.types import CopyHealth, CopySource, RetentionState

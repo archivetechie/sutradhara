@@ -10,6 +10,7 @@ pointers, exclusion records, and held-bundle review decisions.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import os
@@ -197,10 +198,9 @@ def _assert_open_witness(bundle: Bundle) -> None:
 
 def _discard_pending(session: Session, instance: object) -> None:
     """Detach an instance whose savepoint-scoped insert was rolled back."""
-    try:
+    # Already-detached (by the savepoint rollback) is fine.
+    with contextlib.suppress(InvalidRequestError):
         session.expunge(instance)
-    except InvalidRequestError:
-        pass  # already detached by the savepoint rollback
 
 
 def enqueue_artifact(

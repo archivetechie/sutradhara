@@ -16,6 +16,7 @@ from typing import cast
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
+from sutradhara.archive_bundle import bundle_primary_artifactclass
 from sutradhara.archive_fanout import (
     ArchiveBuilder,
     ArchiveFanoutError,
@@ -23,7 +24,6 @@ from sutradhara.archive_fanout import (
     RemArchiveBuilder,
     build_bundle_copy_for_pool,
 )
-from sutradhara.archive_bundle import bundle_primary_artifactclass
 from sutradhara.archive_restore import ArchiveRestoreError, read_member_to_path
 from sutradhara.backend import factory
 from sutradhara.backend.port import BackendError

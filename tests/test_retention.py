@@ -24,6 +24,7 @@ from sutradhara.catalog.models import (
     AssetLocator,
     Backend,
     Bundle,
+    BundleMember,
     Copy,
     IngestItem,
     Intake,
@@ -253,6 +254,16 @@ def test_bundle_asset_locator_copy_counts_for_durability(
         )
         session.add(copy)
         session.flush()
+        session.add(
+            BundleMember(
+                bundle_id=bundle.id,
+                logical_asset_hash=item.logical_asset_hash,
+                artifactclass="s-masters",
+                member_path=item.as_received_path,
+                size_bytes=item.size_bytes,
+                file_sha256=item.logical_asset_hash,
+            )
+        )
         session.add(
             AssetLocator(
                 logical_asset_hash=item.logical_asset_hash,
