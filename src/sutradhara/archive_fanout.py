@@ -19,15 +19,16 @@ import re
 import tarfile
 import tempfile
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from sqlalchemy import event, select, update
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, noload
 
 from sutradhara.archive_bundle import (
+    claim_bundle_for_flush,
     close_bundle,
     record_asset_locator,
     record_blob_root,
@@ -105,13 +106,20 @@ class TransientPoolFanoutError(BackendError, ArchiveFanoutError):
 
 @dataclass(frozen=True)
 class MemberInput:
-    """One source member sent to an archive builder."""
+    """One source member sent to an archive builder.
+
+    ``ingest_item_id`` is the submission lineage the map's last column carries,
+    resolved once at flush time from the recorded submission linkage. ``None``
+    means no lineage — the routine intake-accumulator case — and renders as the
+    empty string, never the literal ``"None"``.
+    """
 
     logical_asset_hash: bytes
     member_path: str
     source_path: Path
     size_bytes: int
     file_sha256: bytes
+    ingest_item_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -280,8 +288,6 @@ class FanoutResult:
     condition_reason: str | None = None
     condition_message: str | None = None
 
-
-ArtifactObserver = Callable[[BuildArtifact], None]
 
 
 class LocalArchiveBuilder:
@@ -542,7 +548,6 @@ def flush_bundle(
     deliverables_dir: Path | str | None = None,
     manifest_signer: ManifestSigner | None = None,
     tape_capacity_bytes: int | None = None,
-    artifact_validator: Callable[[PoolTarget, BuildArtifact], None] | None = None,
 ) -> FanoutResult:
     """Flush one open bundle, build each pool copy, and record catalog state.
 
@@ -562,23 +567,20 @@ def flush_bundle(
     """
     if deliverables_dir is not None and manifest_signer is None:
         raise ManifestSigningError("deliverables_dir requires a manifest_signer")
+    # noload: the member snapshot must be read AFTER the claim, never before.
+    # Bundle.members is lazy="selectin", so an ordinary load would take the
+    # very snapshot the claim exists to serialise.
     bundle = (
         session.scalars(
-            select(Bundle).options(joinedload(Bundle.members)).where(Bundle.id == bundle_id)
+            select(Bundle).options(noload(Bundle.members)).where(Bundle.id == bundle_id)
         )
         .unique()
         .one()
     )
     if bundle.status != "open":
         raise ArchiveFanoutError(f"bundle {bundle.id!r} is not open")
-    if not bundle.members:
+    if bundle.member_count == 0:
         raise ArchiveFanoutError(f"bundle {bundle.id!r} has no members")
-    if tape_capacity_bytes is not None:
-        for member in bundle.members:
-            if member.size_bytes > tape_capacity_bytes:
-                raise BundleOversize(
-                    f"member {member.member_path!r} exceeds tape capacity; # TODO: oversize split"
-                )
 
     # Scanning does not happen here at all: the member-grain scan contract
     # lives at enqueue-batch time (``sutradhara.archive_enqueue``), per
@@ -594,25 +596,33 @@ def flush_bundle(
     with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-{bundle.id}-") as raw:
         work_dir = Path(raw)
         # §8 preflight: the flush materialises the bundle once per pool target.
-        # Skip-and-alarm BEFORE anything is mutated — the archive_id mint and
-        # the status transition both sit after it, so a short work dir leaves
-        # the bundle exactly as it found it.
+        # Skip-and-alarm BEFORE anything is mutated — the claim, the archive_id
+        # mint and the status transition all sit after it, so a short work dir
+        # leaves the bundle exactly as it found it (and un-claimed).
         _preflight_flush_work_dir(
             work_dir,
             bundle_id=bundle.id,
             required_bytes=bundle.total_bytes * max(len(targets), 1),
             target_count=len(targets),
         )
+        # The claim comes FIRST, ahead of the member load: round 3 showed a
+        # claim taken after the snapshot lets an appender slip a member into a
+        # sealing bundle, silently unmaterialised. Everything from here to the
+        # first physical write is one transaction (the caller's), so a
+        # pre-write failure rolls back and the rollback IS the un-claim.
+        claim_token = claim_bundle_for_flush(session, bundle)
         if bundle.archive_id is None:
             bundle.archive_id = f"archive-{bundle.id}"
-        bundle.status = "flushing"
-        bundle.flushed_at = dt.datetime.now(dt.UTC)
+        # The claim is taken; ``bundle.members`` may now be loaded normally.
+        # The flush's own snapshot is ``_member_rows_for_flush``; this
+        # collection serves the consumers that want *current* membership —
+        # the customer manifest and the build-exclusion recorder, both of
+        # which must see a quarantine move.
+        session.expire(bundle, ["members"])
 
         quarantine: Bundle | None = None
         attempt = 0
-        # Each retry quarantines exactly one member, so the loop is bounded by
-        # the member count; an empty remainder fails the flush loudly below.
-        max_attempts = len(bundle.members)
+        max_attempts: int | None = None
         while True:
             member_rows = _member_rows_for_flush(session, bundle)
             if not member_rows:
@@ -620,7 +630,23 @@ def flush_bundle(
                     f"bundle {bundle.id!r} has no members left to flush; "
                     f"all were quarantined"
                 )
-            members = [_member_input(row) for row in member_rows]
+            if max_attempts is None:
+                # Each retry quarantines exactly one member, so the loop is
+                # bounded by the claimed snapshot's member count.
+                max_attempts = len(member_rows)
+            if tape_capacity_bytes is not None:
+                for row in member_rows:
+                    if row.size_bytes > tape_capacity_bytes:
+                        raise BundleOversize(
+                            f"member {row.member_path!r} exceeds tape capacity; "
+                            "# TODO: oversize split"
+                        )
+            # C3 (P4): member identity is validated HERE — once, before any
+            # physical write, for every representation. See the function's
+            # docstring for why this cannot live in the per-target
+            # artifact_validator slot.
+            validate_submission_member_identity(session, member_rows)
+            members = _member_inputs_for_flush(session, member_rows)
             # §8 work-dir hygiene: each quarantine retry gets its own
             # subdirectory. Reusing per-target dirs across attempts leaves an
             # earlier attempt's artifact in place, and a target that built then
@@ -659,7 +685,6 @@ def flush_bundle(
                     map_sha256=map_digest,
                     deliverables_dir=deliverables_dir,
                     manifest_signer=manifest_signer,
-                    artifact_validator=artifact_validator,
                 )
             except _MemberBuildFailure as failure:
                 attempt += 1
@@ -677,7 +702,7 @@ def flush_bundle(
                 continue
             break
 
-    close_bundle(session, bundle)
+    close_bundle(session, bundle, claim_token=claim_token)
     if transient_failures:
         condition_message = _record_bundle_copy_transient_backoff(
             session,
@@ -753,8 +778,13 @@ def _render_flush_map(
     sutradhara owns on-media member order now, so it is declared, not
     incidental). ``sha256`` is the catalog ``file_sha256`` — the digest of the
     staged bytes, which rem's writer verifies against the streamed payload.
-    ``ingest_item_id`` fills from the ``SubmissionMember`` join where the
-    member has one, else the empty string.
+    ``ingest_item_id`` comes from the member's own recorded submission linkage
+    when the caller resolved one (the flush path), else from the
+    ``(archive_path, staged digest)`` join for callers that did not (the
+    bundle-repair rebuild path), else the empty string. The recorded linkage
+    is preferred because it survives the naming ladder: a disambiguated member
+    no longer matches its submission row on ``archive_path``, and the join
+    alone would silently drop that member's lineage from the map.
 
     ``member_rows`` is the flush's row snapshot, index-aligned with
     ``members``. When it is supplied a member the map cannot carry is reported
@@ -768,14 +798,19 @@ def _render_flush_map(
             member,
             None if member_rows is None else member_rows[index],
         )
-    ingest_ids = _submission_ingest_item_ids(session, members)
+    unresolved = [member for member in members if member.ingest_item_id is None]
+    ingest_ids = _submission_ingest_item_ids(session, unresolved) if unresolved else {}
     entries = [
         SourceMapEntry(
             archive_path=member.member_path,
             source_path=str(member.source_path),
             sha256=member.file_sha256,
             size_bytes=member.size_bytes,
-            ingest_item_id=ingest_ids.get((member.member_path, member.file_sha256)),
+            ingest_item_id=(
+                member.ingest_item_id
+                if member.ingest_item_id is not None
+                else ingest_ids.get((member.member_path, member.file_sha256))
+            ),
         )
         for member in members
     ]
@@ -823,6 +858,132 @@ def _reject_unmappable_member(
             if member_row is None:
                 raise ArchiveFanoutError(message) from None
             raise _MemberBuildFailure(member_row, message) from None
+
+
+def validate_submission_member_identity(
+    session: Session,
+    member_rows: Sequence[BundleMember],
+) -> None:
+    """Assert every submission-linked member row still matches its source map.
+
+    This is the pre-write identity gate (design §4, P4 gate condition C3). It
+    runs **once per flush attempt, before any build and before any physical
+    write, for every representation** — which is why it lives here and not in
+    a per-target artifact hook. The old per-submission ``artifact_validator``
+    early-returned for representations outside the RAO family, and
+    basis-ordered fan-out sorts a D2 shelf pool first, so an identity mismatch
+    was caught only after the shelf write and left a media-only orphan.
+
+    The check is catalog-grain and representation-blind: for every member the
+    submission convergence recorded a linkage for, the ``SubmissionMember`` row
+    must still exist and still agree on content hash, staged digest, size, and
+    the ``ingest_item_id`` the map render will carry. Members with no
+    submission linkage are **co-residents** — intake enqueues, other bundles'
+    material — and are tolerated by construction: a group bundle holds whatever
+    the group accumulated.
+    """
+    linked: dict[int, BundleMember] = {}
+    for row in member_rows:
+        member_id = (row.source_metadata or {}).get("submission_member_id")
+        if isinstance(member_id, int):
+            linked[member_id] = row
+    if not linked:
+        return
+    found = {
+        record.id: record
+        for record in session.scalars(
+            select(SubmissionMember).where(SubmissionMember.id.in_(linked))
+        )
+    }
+    for member_id, row in sorted(linked.items()):
+        record = found.get(member_id)
+        if record is None:
+            raise ArchiveFanoutError(
+                f"bundle member {row.member_path!r} names submission member "
+                f"{member_id}, which is not in the catalog"
+            )
+        if row.logical_asset_hash != record.sha256:
+            raise ArchiveFanoutError(
+                f"bundle member {row.member_path!r} has logical hash "
+                f"{row.logical_asset_hash.hex()}, but submission member "
+                f"{member_id} records {record.sha256.hex()}"
+            )
+        if row.file_sha256 != record.sha256:
+            raise ArchiveFanoutError(
+                f"bundle member {row.member_path!r} has staged digest "
+                f"{row.file_sha256.hex()}, but submission member {member_id} "
+                f"records {record.sha256.hex()}"
+            )
+        if row.size_bytes != record.size_bytes:
+            raise ArchiveFanoutError(
+                f"bundle member {row.member_path!r} has size {row.size_bytes}, "
+                f"but submission member {member_id} records {record.size_bytes}"
+            )
+        if record.ingest_item_id is None:
+            raise ArchiveFanoutError(
+                f"submission member {member_id} ({row.member_path!r}) has no "
+                "ingest_item_id to cross-check"
+            )
+
+
+def validate_built_members(
+    target: PoolTarget,
+    artifact: BuildArtifact,
+    members: Sequence[MemberInput],
+) -> None:
+    """Assert one built artifact carries exactly the members the map asked for.
+
+    Runs for **every** representation, and — since ``_fan_out_targets`` builds
+    and validates all targets before writing any — always before any physical
+    write. Scope stated honestly: for ``D2TAR_RAW`` the artifact is assembled
+    by our own ``_build_d2_tar`` from these same inputs, so the comparison is
+    near-tautological there; the load-bearing checks on that leg are
+    ``validate_submission_member_identity`` before the build and the readback
+    verify after the write. For the RAO family the artifact comes back from
+    rem, and this is where a builder that mis-associated a member surfaces.
+    """
+    expected = {member.member_path: member for member in members}
+    seen: set[str] = set()
+    for built in artifact.members:
+        member = expected.get(built.member_path)
+        if member is None:
+            raise ArchiveFanoutError(
+                f"archive build for pool {target.pool_id!r} returned unexpected "
+                f"member {built.member_path!r}"
+            )
+        seen.add(built.member_path)
+        if built.logical_asset_hash != member.logical_asset_hash:
+            raise ArchiveFanoutError(
+                f"archive build member {built.member_path!r} has logical hash "
+                f"{built.logical_asset_hash.hex()}, expected "
+                f"{member.logical_asset_hash.hex()}"
+            )
+        if built.file_sha256 != member.file_sha256:
+            raise ArchiveFanoutError(
+                f"archive build member {built.member_path!r} has sha256 "
+                f"{built.file_sha256.hex()}, expected {member.file_sha256.hex()}"
+            )
+        if built.size_bytes != member.size_bytes:
+            raise ArchiveFanoutError(
+                f"archive build member {built.member_path!r} has size "
+                f"{built.size_bytes}, expected {member.size_bytes}"
+            )
+        # A builder that reports no lineage at all is tolerated (rem's report
+        # may omit the column); one that reports a *different* lineage is the
+        # mis-association this check exists to catch.
+        if member.ingest_item_id is not None and built.ingest_item_id not in {
+            None,
+            str(member.ingest_item_id),
+        }:
+            raise ArchiveFanoutError(
+                f"archive build member {built.member_path!r} echoed ingest_item_id "
+                f"{built.ingest_item_id!r}, expected {member.ingest_item_id!r}"
+            )
+    missing = sorted(set(expected) - seen)
+    if missing:
+        raise ArchiveFanoutError(
+            f"archive build for pool {target.pool_id!r} omitted members: {missing!r}"
+        )
 
 
 def _submission_ingest_item_ids(
@@ -891,39 +1052,72 @@ def _fan_out_targets(
     map_sha256: str,
     deliverables_dir: Path | str | None,
     manifest_signer: ManifestSigner | None,
-    artifact_validator: Callable[[PoolTarget, BuildArtifact], None] | None,
 ) -> tuple[list[int], list[TransientPoolFanoutError], str | None]:
-    """Run one full per-target build/write/verify pass for the current map."""
-    copy_ids: list[int] = []
-    transient_failures: list[TransientPoolFanoutError] = []
-    manifest_receipt: str | None = None
+    """Build and validate EVERY target, then write them.
+
+    The two phases are separate on purpose (design §4, C3): with build and
+    write interleaved per target, an identity defect on the second
+    representation was only caught after the first representation's bytes were
+    already on media — a media-only orphan. Every artifact is now built and
+    checked against the flush's member snapshot before the first
+    ``write_object_to_pool``, so an identity failure costs nothing physical.
+
+    The phase split is free on disk: the work dir already holds one artifact
+    per target for the life of the flush (each target owns a subdirectory) and
+    ``_preflight_flush_work_dir`` already reserves ``bundle x targets``.
+
+    It also removes a stated limitation: a member-attributable build failure
+    used to propagate instead of quarantining once any copy existed, because a
+    retry would have rebuilt the written targets. No copy exists during the
+    build phase, so every member failure now reaches the quarantine loop.
+    """
+    prepared: list[tuple[WritableStorageBackend, PoolTarget, Path, BuildArtifact]] = []
     for index, (backend, target) in enumerate(targets):
         # §8 work-dir hygiene: two same-representation pool targets used to
         # collide on the work-dir artifact filename; every target now owns a
         # subdirectory, so artifact filenames are per-target.
         target_dir = work_dir / f"target-{index:02d}-{_pool_slug(target.pool_id)}"
         target_dir.mkdir(exist_ok=True)
+        try:
+            artifact = _build_for_target(
+                bundle=bundle,
+                members=members,
+                target=target,
+                builder=builder,
+                key_epoch=key_epoch,
+                work_dir=target_dir,
+                map_path=map_path,
+                source_root=_MAP_SOURCE_ROOT,
+                map_sha256=map_sha256,
+            )
+        except RuntimeError as exc:
+            member_row = _identify_member_failure(str(exc), member_rows)
+            if member_row is not None:
+                # The quarantine-re-render-retry loop in flush_bundle handles
+                # this. Nothing is on media yet, so every attributable member
+                # failure can be quarantined and retried.
+                raise _MemberBuildFailure(member_row, str(exc)) from exc
+            raise
+        validate_built_members(target, artifact, members)
+        prepared.append((backend, target, target_dir, artifact))
+
+    copy_ids: list[int] = []
+    transient_failures: list[TransientPoolFanoutError] = []
+    manifest_receipt: str | None = None
+    for backend, target, target_dir, artifact in prepared:
         # Each target owns a savepoint so retryable backend failures do not
         # erase catalog rows for earlier successful placements.
-        built: list[BuildArtifact] = []
         try:
             with session.begin_nested():
-                copy = build_bundle_copy_for_pool(
+                copy = write_bundle_copy_for_pool(
                     session,
                     bundle=bundle,
                     target=target,
-                    member_sources=members,
+                    artifact=artifact,
                     builder=builder,
                     backend=backend,
-                    key_epoch=key_epoch,
                     work_dir=target_dir,
-                    map_path=map_path,
-                    source_root=_MAP_SOURCE_ROOT,
-                    map_sha256=map_sha256,
-                    artifact_validator=artifact_validator,
-                    artifact_observer=built.append,
                 )
-                [artifact] = built
                 # Member grain (§5): class and ruleset come from the matching
                 # member row, not from a representative-class hop.
                 _record_build_exclusions(
@@ -934,15 +1128,6 @@ def _fan_out_targets(
         except TransientPoolFanoutError as exc:
             transient_failures.append(exc)
             continue
-        except RuntimeError as exc:
-            member_row = _identify_member_failure(str(exc), member_rows)
-            if member_row is not None and not copy_ids:
-                # The quarantine-re-render-retry loop in flush_bundle handles
-                # this. With copies already written for earlier targets a
-                # retry would rebuild them (duplicate physical writes), so a
-                # late member failure propagates instead — stated limitation.
-                raise _MemberBuildFailure(member_row, str(exc)) from exc
-            raise
         copy_ids.append(copy.id)
         if (
             deliverables_dir is not None
@@ -1159,16 +1344,19 @@ def build_bundle_copy_for_pool(
     map_path: Path | None = None,
     source_root: Path | None = None,
     map_sha256: str | None = None,
-    artifact_validator: Callable[[PoolTarget, BuildArtifact], None] | None = None,
-    artifact_observer: ArtifactObserver | None = None,
 ) -> Copy:
-    """Build, write, verify, and record one pool's bundle copy.
+    """Build, validate, write, verify, and record one pool's bundle copy.
 
     This primitive records the bundle ``Copy`` plus its ``AssetLocator`` and
     ``BlobRoot`` rows only. Bundle lifecycle, customer manifests, and
     ``ExclusionRecord`` rows stay with ``flush_bundle``. When the caller does
     not hand in a map (the bundle-repair rebuild path), one is rendered here
     from ``member_sources`` — every RAO build goes through the map route.
+
+    ``flush_bundle`` does not use this composed form: it builds and validates
+    every target first, then writes them, so no representation's bytes reach
+    media before every representation has been checked. Single-target callers
+    (bundle repair) get the same guarantee from the composition here.
     """
 
     if map_path is None:
@@ -1196,8 +1384,36 @@ def build_bundle_copy_for_pool(
         source_root=source_root,
         map_sha256=map_sha256,
     )
-    if artifact_validator is not None:
-        artifact_validator(target, artifact)
+    validate_built_members(target, artifact, member_sources)
+    return write_bundle_copy_for_pool(
+        session,
+        bundle=bundle,
+        target=target,
+        artifact=artifact,
+        builder=builder,
+        backend=backend,
+        work_dir=work_dir,
+    )
+
+
+def write_bundle_copy_for_pool(
+    session: Session,
+    *,
+    bundle: Bundle,
+    target: PoolTarget,
+    artifact: BuildArtifact,
+    builder: ArchiveBuilder,
+    backend: WritableStorageBackend,
+    work_dir: Path,
+) -> Copy:
+    """Write one already-built, already-validated artifact and record its copy.
+
+    The first line of this function is the flush's first physical write. Every
+    identity check the design places "before any physical write" has run by the
+    time control reaches here; everything after it is post-write, where a
+    rollback would orphan media (a tape append is unreclaimable and costs a
+    bootstrap row) and the flush therefore seals partial instead.
+    """
     try:
         committed_record = backend.write_object_to_pool(
             artifact.artifact_path,
@@ -1266,8 +1482,6 @@ def build_bundle_copy_for_pool(
         copy.health = CopyHealth.SUSPECT
     if not verify_result.ok:
         raise ArchiveFanoutError(f"backend verify failed: {verify_result.detail}")
-    if artifact_observer is not None:
-        artifact_observer(artifact)
     return copy
 
 
@@ -1421,6 +1635,13 @@ def _build_d2_tar(
                         "block_range": [info.offset_data, info.offset_data + info.size],
                         "size_bytes": info.size,
                     },
+                    # Carried through so the built-member check reads the same
+                    # lineage column on every representation, not just RAO.
+                    ingest_item_id=(
+                        None
+                        if member.ingest_item_id is None
+                        else str(member.ingest_item_id)
+                    ),
                 )
             )
     manifest_path = work_dir / f"{bundle.id}-d2tar-raw.manifest.json"
@@ -1614,7 +1835,11 @@ def _verified_member_bytes(
     return data, cached_container
 
 
-def _member_input(member: BundleMember) -> MemberInput:
+def _member_input(
+    member: BundleMember,
+    *,
+    ingest_item_id: int | None = None,
+) -> MemberInput:
     source_path = _member_source_path(member)
     if source_path is None:
         raise ArchiveFanoutError(
@@ -1626,7 +1851,42 @@ def _member_input(member: BundleMember) -> MemberInput:
         source_path=source_path,
         size_bytes=member.size_bytes,
         file_sha256=member.file_sha256,
+        ingest_item_id=ingest_item_id,
     )
+
+
+def _member_inputs_for_flush(
+    session: Session,
+    member_rows: Sequence[BundleMember],
+) -> list[MemberInput]:
+    """Build the flush's member inputs with submission lineage resolved once.
+
+    Lineage comes from the linkage the submission append recorded on the member
+    row, so it survives the naming ladder — the ``archive_path`` join that
+    predates the linkage misses a disambiguated member and would drop its
+    ``ingest_item_id`` from the map.
+    """
+    linked = {
+        member_id: row
+        for row in member_rows
+        if isinstance(
+            member_id := (row.source_metadata or {}).get("submission_member_id"), int
+        )
+    }
+    lineage: dict[int, int] = {}
+    if linked:
+        lineage = {
+            record.id: record.ingest_item_id
+            for record in session.scalars(
+                select(SubmissionMember).where(SubmissionMember.id.in_(linked))
+            )
+            if record.ingest_item_id is not None
+        }
+    resolved: dict[int, int] = {}
+    for member_id, row in linked.items():
+        if member_id in lineage:
+            resolved[row.id] = lineage[member_id]
+    return [_member_input(row, ingest_item_id=resolved.get(row.id)) for row in member_rows]
 
 
 def _member_source_path(member: BundleMember) -> Path | None:

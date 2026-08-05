@@ -43,6 +43,7 @@ from sutradhara.catalog.models import (
     StagingTransform,
 )
 from sutradhara.catalog.types import is_content_hash
+from sutradhara.jobs.attempts import default_worker_id
 from sutradhara.structured_logs import emit_structured_event
 from sutradhara_receive.member_name import escape_path_name, escape_path_text
 
@@ -73,6 +74,17 @@ class BundleStateError(ArchiveBundleError):
 
 class StagingTransformError(ArchiveBundleError):
     """A staging transform record is inconsistent with its bundle member."""
+
+
+class BundleClaimLost(ArchiveBundleError):
+    """A guarded bundle claim transition did not apply to exactly one row.
+
+    Either the ``open -> flushing`` claim lost the race (another flusher, or a
+    seal that already happened), or a ``flushing -> sealed`` close found the
+    claim gone — the reaper returned the bundle to ``open`` and something else
+    may already be building it. Sealing on a lost claim would record a member
+    set that is not on media, so the close fails loudly instead.
+    """
 
 
 class MemberNamingError(ArchiveBundleError):
@@ -219,6 +231,8 @@ def enqueue_artifact(
     bundle_id: str | None = None,
     now: dt.datetime | None = None,
     source_metadata: dict[str, Any] | None = None,
+    size_bytes: int | None = None,
+    file_sha256: bytes | None = None,
 ) -> tuple[Bundle, BundleMember, bool]:
     """Add one asset to the open accumulator for ``artifactclass``'s group.
 
@@ -227,10 +241,18 @@ def enqueue_artifact(
     non-adoptable (``archive_id`` set at creation, so it never collides with
     the one-open-accumulator index) and immediately due for flush. The group
     accumulator is untouched by an include-alone routing.
+
+    ``size_bytes``/``file_sha256`` let a caller that has *just* measured the
+    source hand those facts in rather than have them re-derived — the
+    submission convergence path verifies every member's digest against the
+    frozen manifest immediately before appending, and re-hashing there would
+    read the whole submission a second time for no new information. Omitted,
+    both are measured here as before.
     """
     _require_asset(session, logical_asset_hash)
     source = Path(source_path)
-    size_bytes = source.stat().st_size
+    if size_bytes is None:
+        size_bytes = source.stat().st_size
     if member_path is None:
         path_in_bundle = escape_path_name(source)
     elif member_path_is_escaped:
@@ -321,7 +343,7 @@ def enqueue_artifact(
         member_path=path_in_bundle,
         source_path=stored_source_path,
         size_bytes=size_bytes,
-        file_sha256=_sha256_file(source),
+        file_sha256=_sha256_file(source) if file_sha256 is None else file_sha256,
         source_metadata=metadata or None,
     )
     return bundle, member, created
@@ -333,7 +355,16 @@ def bundle_due(
     now: dt.datetime | None = None,
     force: bool = False,
 ) -> bool:
-    """Return whether an open bundle should be flushed."""
+    """Return whether an open bundle should be flushed.
+
+    The age arm reads ``opened_at`` through ``_as_utc``. SQLite does not store
+    the offset behind ``DateTime(timezone=True)``, so a bundle *re-read* from
+    the catalog comes back naive while a freshly-constructed one is aware —
+    and subtracting the two raises. Every caller until the sweeper compared a
+    bundle it had just built in the same session, which is why this never
+    surfaced; the first production caller of the age arm would have hit it on
+    its first pass.
+    """
     if bundle.status != "open":
         return False
     if force:
@@ -344,15 +375,91 @@ def bundle_due(
         return True
     if not bundle.max_age_seconds:
         return False
-    reference = now or dt.datetime.now(dt.UTC)
-    return (reference - bundle.opened_at).total_seconds() >= bundle.max_age_seconds
+    reference = _as_utc(now) or dt.datetime.now(dt.UTC)
+    opened_at = _as_utc(bundle.opened_at)
+    if opened_at is None:  # pragma: no cover - opened_at is NOT NULL
+        return False
+    return (reference - opened_at).total_seconds() >= bundle.max_age_seconds
 
 
-def close_bundle(session: Session, bundle: Bundle) -> Bundle:
-    """Mark a bundle as sealed after all copy materialisations are verified."""
-    bundle.status = "sealed"
-    bundle.sealed_at = dt.datetime.now(dt.UTC)
-    session.flush()
+def _as_utc(value: dt.datetime | None) -> dt.datetime | None:
+    """Read a catalog timestamp as UTC-aware; naive values are UTC by convention."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
+
+
+def claim_bundle_for_flush(
+    session: Session,
+    bundle: Bundle,
+    *,
+    worker_id: str | None = None,
+    now: dt.datetime | None = None,
+) -> str:
+    """Claim one open bundle for flushing and return the claim token.
+
+    The guarded ``open -> flushing`` compare-and-set (design-bundle-groups §4).
+    SQLite is the default dialect, where ``FOR UPDATE`` compiles to nothing, so
+    the race is closed by rowcount on a conditional ``UPDATE``, never a row
+    lock. The caller runs this **ahead of the member load**: claiming after the
+    snapshot would let an appender slip a member into a sealing bundle, where
+    it would sit unmaterialised.
+
+    The claim, the ``archive_id`` assignment, and everything up to the first
+    physical write belong to one transaction — the caller's. Any
+    pre-physical-write failure rolls back, and that rollback IS the un-claim:
+    the bundle returns to ``open``, visible again to ``bundle_due``, the drain
+    check, and the one-open-accumulator partial index.
+    """
+    token = worker_id or default_worker_id()
+    stamp = now or dt.datetime.now(dt.UTC)
+    result = session.execute(
+        update(Bundle)
+        .where(Bundle.id == bundle.id, Bundle.status == "open")
+        .values(status="flushing", claimed_by=token, flushed_at=stamp)
+    )
+    if result.rowcount != 1:
+        session.expire(bundle, ["status", "claimed_by", "flushed_at"])
+        raise BundleClaimLost(
+            f"bundle {bundle.id!r} could not be claimed for flush; "
+            f"status is {bundle.status!r}, not 'open'"
+        )
+    session.expire(bundle, ["status", "claimed_by", "flushed_at"])
+    return token
+
+
+def close_bundle(session: Session, bundle: Bundle, *, claim_token: str) -> Bundle:
+    """Seal a claimed bundle after all copy materialisations are verified.
+
+    A guarded compare-and-set on ``status = 'flushing' AND claimed_by = :token``
+    (design-bundle-groups §4). A flusher whose claim the reaper already took
+    back fails here rather than sealing a member set that is not on media —
+    the reaped bundle may have been re-claimed and rebuilt meanwhile, and its
+    member set is no longer the one this flusher wrote.
+
+    ``claimed_by`` is deliberately left in place on the sealed row: it is the
+    evidence of who sealed it, and the reaper only ever looks at ``flushing``.
+    """
+    sealed_at = dt.datetime.now(dt.UTC)
+    result = session.execute(
+        update(Bundle)
+        .where(
+            Bundle.id == bundle.id,
+            Bundle.status == "flushing",
+            Bundle.claimed_by == claim_token,
+        )
+        .values(status="sealed", sealed_at=sealed_at)
+    )
+    if result.rowcount != 1:
+        session.expire(bundle, ["status", "claimed_by", "sealed_at"])
+        raise BundleClaimLost(
+            f"bundle {bundle.id!r} lost its flush claim {claim_token!r} before seal "
+            f"(status={bundle.status!r}, claimed_by={bundle.claimed_by!r}); "
+            "refusing to seal a member set that may not be on media"
+        )
+    session.expire(bundle, ["status", "claimed_by", "sealed_at"])
     return bundle
 
 

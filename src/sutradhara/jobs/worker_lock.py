@@ -79,6 +79,44 @@ def exclusive_process_lock(lockfile: Path, *, purpose: str) -> Iterator[Path]:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
+def held_process_lock_identity(lockfile: Path) -> str | None:
+    """Return the ``hostname:pid`` identity of a *currently held* process lock.
+
+    ``None`` means nobody holds it — a stale lockfile left behind by a dead
+    worker reads as unheld, which is exactly what the bundle-claim reaper needs
+    (design-bundle-groups §4: liveness checked against the worker-lock holder,
+    not against a timeout). The recorded identity is the same string
+    ``jobs/attempts.py::default_worker_id`` produces, so a bundle's
+    ``claimed_by`` can be compared to it directly.
+
+    flock() locks belong to the open file *description*, not the process, so a
+    second ``open()`` from the worker's own process still reports the lock as
+    held — the sweeper running inside the worker correctly sees its own claim
+    as live.
+    """
+
+    if not lockfile.exists():
+        return None
+    with lockfile.open("a+", encoding="utf-8") as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            fh.seek(0)
+            return _holder_identity(fh.read())
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return None
+
+
+def _holder_identity(content: str) -> str | None:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if ":" in stripped and not stripped.startswith(("pid=", "purpose=")):
+            return stripped
+    return None
+
+
 def process_lockfile_for(engine_or_url: Engine | str, *, namespace: str) -> Path:
     """Return one database-scoped singleton lock path for a safe namespace."""
 
