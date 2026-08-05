@@ -41,7 +41,6 @@ from sutradhara.archive_sweeper import (
     claim_is_live,
     drain_candidates,
     due_bundles,
-    flush_if_due,
     live_group_fingerprints,
     reap_stuck_flushing,
     sweep_bundles,
@@ -62,7 +61,11 @@ from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, conte
 from sutradhara.jobs.attempts import default_worker_id
 from sutradhara.jobs.models import ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED
-from sutradhara.jobs.worker_lock import exclusive_process_lock, process_lockfile_for
+from sutradhara.jobs.worker_lock import (
+    exclusive_process_lock,
+    held_process_lock_identity,
+    process_lockfile_for,
+)
 from sutradhara.sealing.port import Representation
 
 
@@ -949,6 +952,41 @@ def test_stuck_flushing_bundle_with_a_live_claimer_is_not_reaped(
         assert session.get(Bundle, bundle_id).status == "flushing"
 
 
+def test_the_reaper_emits_an_event_for_every_claim_it_leaves_alone(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guards: silence on the skip path.
+
+    "Live claimer, left alone" and "claim this check can never retire" look
+    identical from outside, and only the second is a defect — but a reaper that
+    says nothing when it skips gives an operator no way to tell them apart, and
+    no way to notice a bundle that has been skipped on every pass for a week.
+    That silence is what made the committed-claim strand invisible.
+    """
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "sutradhara.archive_sweeper.emit_structured_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+    lockfile = process_lockfile_for(engine, namespace="worker")
+    with session_scope(engine) as session:
+        _install_class(session, "photos", pools=("p-main",), target_bytes=10_000_000)
+        bundle = _enqueue(
+            session,
+            artifactclass="photos",
+            source=_source(tmp_path, "a.tif"),
+            member_path="a.tif",
+        )
+        token = f"{socket.gethostname()}:{os.getpid()}"
+        claim_bundle_for_flush(session, bundle, worker_id=token)
+
+        with exclusive_process_lock(lockfile, purpose="worker"):
+            assert reap_stuck_flushing(session) == []
+    skipped = [fields for name, fields in events if name == "bundle_flush_claim_live"]
+    assert [fields["bundle_id"] for fields in skipped] == [bundle.id]
+    assert skipped[0]["claimed_by"] == token
+
+
 def test_claim_on_a_foreign_host_without_the_worker_lock_is_not_live(
     engine: Engine,
 ) -> None:
@@ -958,6 +996,27 @@ def test_claim_on_a_foreign_host_without_the_worker_lock_is_not_live(
     with session_scope(engine) as session:
         assert claim_is_live(session, f"not-this-host:{os.getpid()}") is False
         assert claim_is_live(session, None) is False
+
+
+def test_a_foreground_flush_on_this_host_is_live_without_the_worker_lock(
+    engine: Engine,
+) -> None:
+    """Guards: reaping an operator's `sutra archive bundle flush` mid-write.
+
+    A foreground CLI flush claims under its own ``hostname:pid`` and never
+    holds the worker lock, so the lock check alone would call it dead. The pid
+    probe is the second conjunct that saves it — and it was unreached by the
+    existing tests, which held the worker lock and short-circuited before it.
+    """
+    lockfile = process_lockfile_for(engine, namespace="worker")
+    with session_scope(engine) as session:
+        assert held_process_lock_identity(lockfile) is None
+        assert claim_is_live(session, f"{socket.gethostname()}:{os.getpid()}") is True
+        # Same host, dead pid: not live, which is what makes the probe useful.
+        assert claim_is_live(session, f"{socket.gethostname()}:{_dead_pid()}") is False
+        # Malformed tokens are not live either.
+        assert claim_is_live(session, f"{socket.gethostname()}:not-a-pid") is False
+        assert claim_is_live(session, f"{socket.gethostname()}:0") is False
 
 
 def test_a_reaped_drain_flush_is_still_reachable_without_an_age_arm(
@@ -1053,50 +1112,3 @@ def test_reaped_then_returning_flusher_fails_the_close_cas_loudly(
         with pytest.raises(BundleClaimLost, match="lost its flush claim"):
             close_bundle(session, bundle, claim_token=token)
         assert session.get(Bundle, bundle.id).status == "open"
-
-
-# --------------------------------------------------------------------------
-# The post-append check
-# --------------------------------------------------------------------------
-
-
-def test_post_append_check_flushes_the_member_that_crossed_the_target(
-    engine: Engine, tmp_path: Path
-) -> None:
-    """Guards: latency. The periodic pass guarantees the seal eventually; the
-    post-append check takes the case the appender can already see."""
-    with session_scope(engine) as session:
-        _install_class(session, "photos", pools=("p-main",), target_bytes=100)
-        first = _enqueue(
-            session,
-            artifactclass="photos",
-            source=_source(tmp_path, "a.tif", size=40),
-            member_path="a.tif",
-        )
-        backend = _WriteBackend()
-        assert (
-            flush_if_due(
-                session,
-                first,
-                backends=_backends(session, backend),
-                builder=LocalArchiveBuilder(),
-            )
-            is False
-        )
-        second = _enqueue(
-            session,
-            artifactclass="photos",
-            source=_source(tmp_path, "b.tif", size=80),
-            member_path="b.tif",
-        )
-        assert second.id == first.id
-        assert (
-            flush_if_due(
-                session,
-                second,
-                backends=_backends(session, backend),
-                builder=LocalArchiveBuilder(),
-            )
-            is True
-        )
-        assert session.get(Bundle, first.id).status == "sealed"

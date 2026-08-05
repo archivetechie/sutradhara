@@ -28,6 +28,16 @@ not just accumulators. Include-alone bundles are minted immediately-due funnels
 with no flusher of their own; a sweeper that scanned only accumulators would
 strand every oversized member forever. That is P1 gate condition C3 and it is
 the reason ``_open_bundles`` filters on nothing but ``status``.
+
+**Deferred, stated:** §4 also names a post-append check — flush the bundle the
+appender can already see is due, as a latency shortcut. It is not here. The
+enqueue seam (``archive_enqueue.scan_enqueue_batch``) is reached by the CLI and
+by the intake-archive API route, and neither has, or should have, a writable
+backend set and an archive builder to hand: wiring it there would make an HTTP
+request write to tape synchronously, inside the enqueue's own transaction,
+where a flush failure would roll the whole enqueue batch back. The periodic
+pass is what guarantees the seal; the shortcut only ever bought latency, and it
+belongs behind a job enqueue rather than inside the appender's transaction.
 """
 
 from __future__ import annotations
@@ -259,6 +269,19 @@ def reap_stuck_flushing(session: Session) -> list[str]:
     for bundle in stuck:
         token = bundle.claimed_by
         if claim_is_live(session, token):
+            # Emitted, not passed over in silence: a claim that reads as live
+            # is indistinguishable from a claim that IS live, and the two have
+            # opposite meanings. A flush in progress produces one of these per
+            # pass and stops; a bundle stuck behind a claim the liveness check
+            # cannot retire produces one every pass, forever, which is the only
+            # signal that says so.
+            emit_structured_event(
+                "bundle_flush_claim_live",
+                bundle_id=bundle.id,
+                bundle_group=bundle.bundle_group,
+                claimed_by=token,
+                flushed_at=None if bundle.flushed_at is None else bundle.flushed_at.isoformat(),
+            )
             continue
         result = session.execute(
             update(Bundle)
@@ -354,31 +377,3 @@ def sweep_bundles(
         flushed.append(bundle_id)
     result.flushed = tuple(flushed)
     return result
-
-
-def flush_if_due(
-    session: Session,
-    bundle: Bundle,
-    *,
-    backends: Mapping[int, WritableStorageBackend],
-    builder: ArchiveBuilder,
-    key_epoch: str | None = None,
-    now: dt.datetime | None = None,
-) -> bool:
-    """The post-append check: flush one bundle immediately if it is now due.
-
-    The periodic pass is what guarantees an accumulator eventually seals; this
-    is the latency shortcut for the case the appender can see for itself — the
-    member that just landed pushed the accumulator over its target, or landed
-    in an immediately-due include-alone funnel. Returns whether it flushed.
-    """
-    if not bundle_due(bundle, now=now):
-        return False
-    flush_bundle(
-        session,
-        bundle_id=bundle.id,
-        backends=backends,
-        builder=builder,
-        key_epoch=key_epoch,
-    )
-    return True

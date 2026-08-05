@@ -586,21 +586,6 @@ def _bundle_basis_backends(
     return {row.id: cast(WritableStorageBackend, backend_from_row(row)) for row in rows}
 
 
-def _target_backends(session: Session, artifactclass: str) -> dict[int, WritableStorageBackend]:
-    rows = list(
-        session.scalars(
-            select(Backend)
-            .join(Backend.pools)
-            .join(ArtifactClassPool, ArtifactClassPool.pool_id == Pool.id)
-            .where(
-                ArtifactClassPool.artifactclass == artifactclass,
-                ArtifactClassPool.active.is_(True),
-            )
-        )
-    )
-    return {row.id: cast(WritableStorageBackend, backend_from_row(row)) for row in rows}
-
-
 def _resolve_member_hash(session: Session, artifactclass: str, member_name: str | None) -> bytes:
     try:
         return resolve_member_asset_hash(
