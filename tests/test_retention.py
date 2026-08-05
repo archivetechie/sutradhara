@@ -20,6 +20,7 @@ from sutradhara.arrangement import ArrangementError, create_from_intake
 from sutradhara.backend.port import ByteRange, VerifyResult, WitnessResult
 from sutradhara.catalog.models import (
     Arrangement,
+    ArtifactClassPolicyRecord,
     ArtifactClassPool,
     AssetLocator,
     Backend,
@@ -31,6 +32,8 @@ from sutradhara.catalog.models import (
     LogicalAsset,
     Pool,
     RetentionEvent,
+    Submission,
+    SubmissionMember,
 )
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import (
@@ -42,6 +45,7 @@ from sutradhara.catalog.types import (
     IntakeSourceKind,
     IntakeStatus,
     RetentionState,
+    SubmissionStatus,
 )
 from sutradhara.cli.retention import _resolve_media_id
 from sutradhara.intake import prepare_intake
@@ -185,6 +189,143 @@ def test_gate_truth_table_offsite_and_proxy_only(engine: Engine, tmp_path: Path)
             verified=True,
         )
         assert releasable(session, "intake-proxy")
+
+
+def test_open_bundle_holds_the_source_and_a_sealed_verified_one_releases_it(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """The erasure wiring itself, through the real gate.
+
+    Every other test of the derived predicate calls ``archive_predicate``
+    directly, so nothing pinned the one line that actually decides whether
+    sources may be deleted: ``retention._arrangement_holds`` reading the
+    predicate instead of the stored ``Submission.status`` flag. A regression
+    there — reinstating the stored flag, or dropping the call — is invisible to
+    every predicate test and releases sources whose material is still sitting
+    in an open bundle.
+    """
+    with session_scope(engine) as session:
+        pool = _add_pool(session, artifactclass="s-masters", pool_id="release-pool")
+        item = _add_intake_with_item(
+            session, tmp_path, "intake-release", artifactclass="s-masters"
+        )
+        _add_asset_copy(
+            session,
+            item,
+            backend_id=pool.backend_id,
+            pool_id=pool.id,
+            verified=True,
+        )
+        # The member's own class declares the durability floor the predicate
+        # measures against; a class with no applied policy is never evidence.
+        session.add(
+            ArtifactClassPolicyRecord(
+                artifactclass="s-masters",
+                ruleset="s-masters.rules",
+                expect="messy",
+                target_bytes=1024,
+                max_age_seconds=3600,
+                restore_preference=[],
+                min_copies=1,
+                min_impl_families=1,
+            )
+        )
+        arrangement = Arrangement(
+            label="release",
+            intake_id="intake-release",
+            artifactclass="s-masters",
+            status=ArrangementStatus.SUBMITTED,
+            submitted_at=_now(),
+        )
+        session.add(arrangement)
+        session.flush()
+        submission = Submission(
+            id="submit-release",
+            arrangement_id=arrangement.id,
+            artifactclass="s-masters",
+            source_map_path=str(tmp_path / "release.tsv"),
+            manifest_digest="d" * 64,
+            member_count=1,
+            # Deliberately the strongest stored claim available: the gate must
+            # ignore it and ask the predicate.
+            status=SubmissionStatus.ARCHIVED,
+            submitted_by="tester",
+            submitted_at=_now(),
+            archived_at=_now(),
+        )
+        session.add(submission)
+        session.flush()
+        arrangement.submission_id = submission.id
+        session.flush()
+        session.add(
+            SubmissionMember(
+                submission_id=submission.id,
+                ingest_item_id=item.id,
+                archive_path="clip.mov",
+                source_path=str(item.item_metadata["source_path"]),
+                sha256=item.logical_asset_hash,
+                size_bytes=item.size_bytes,
+                ord=0,
+            )
+        )
+        session.flush()
+
+        # The material is accumulated but the bundle is still OPEN.
+        bundle = Bundle(
+            id="bundle-release",
+            **bundle_kwargs(seed="bundle-release"),
+            status="open",
+            total_bytes=item.size_bytes,
+            member_count=1,
+            target_bytes=1024,
+            max_age_seconds=3600,
+            opened_at=_now(),
+        )
+        session.add(bundle)
+        session.flush()
+        session.add(
+            BundleMember(
+                bundle_id=bundle.id,
+                logical_asset_hash=item.logical_asset_hash,
+                artifactclass="s-masters",
+                member_path="clip.mov",
+                size_bytes=item.size_bytes,
+                file_sha256=item.logical_asset_hash,
+                added_at=_now(),
+            )
+        )
+        session.flush()
+
+        status = retention_status(session, "intake-release")
+        assert not status.releasable
+        assert f"arrangement:{arrangement.id}:submitted-not-archived" in status.holds
+
+        # Sealed, but with no verified copy of its own: still not evidence.
+        bundle.status = "sealed"
+        bundle.sealed_at = _now()
+        session.flush()
+        assert not releasable(session, "intake-release")
+
+        bundle_locator = {"object": "bundle-release-copy"}
+        session.add(
+            Copy(
+                bundle_id=bundle.id,
+                backend_id=pool.backend_id,
+                pool_id=pool.id,
+                native_locator=bundle_locator,
+                native_locator_key=locator_key(bundle_locator),
+                storage_metadata={"representation": Representation.RAW_BYTES.value},
+                integrity_hash=item.logical_asset_hash,
+                last_measured_digest=item.logical_asset_hash,
+                last_measured_at=_now(),
+                last_checked_at=_now(),
+                health=CopyHealth.OK,
+                source=CopySource.INGEST,
+            )
+        )
+        session.flush()
+        assert releasable(session, "intake-release")
 
 
 def test_cli_tape_label_resolves_unique_d2_canonical_identity(

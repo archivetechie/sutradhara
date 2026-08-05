@@ -305,6 +305,13 @@ def test_sweeper_flushes_an_accumulator_that_is_due_only_by_age(
     Guards: a trickle class holding one open accumulator forever. The bundle
     is nowhere near its byte target — only its ``max_age_seconds`` has passed —
     and before the sweeper existed nothing in the tree would ever have looked.
+
+    The sweep runs against an EXPIRED identity map on purpose. SQLite does not
+    store the offset behind ``DateTime(timezone=True)``, so ``opened_at`` comes
+    back naive only on a genuine re-read; a bundle still cached from the append
+    hands ``_as_utc`` the aware value it was constructed with, and the
+    naive-minus-aware subtraction that ``_as_utc`` exists to prevent never
+    happens. That is the shape the production sweeper always sees.
     """
     with session_scope(engine) as session:
         _install_class(session, "audio", pools=("p-main",), target_bytes=10_000_000)
@@ -317,9 +324,13 @@ def test_sweeper_flushes_an_accumulator_that_is_due_only_by_age(
         bundle_id = bundle.id
         assert bundle.total_bytes < bundle.target_bytes
         assert bundle_due(bundle) is False
-
         overdue = bundle.opened_at + dt.timedelta(seconds=bundle.max_age_seconds + 1)
-        assert bundle_due(bundle, now=overdue) is True
+
+        session.expire_all()
+        reread = session.get(Bundle, bundle_id)
+        assert reread.opened_at.tzinfo is None, "the read-back must be naive to test _as_utc"
+
+        assert bundle_due(reread, now=overdue) is True
         result = sweep_bundles(
             session,
             backends=_backends(session, _WriteBackend()),
@@ -947,6 +958,74 @@ def test_claim_on_a_foreign_host_without_the_worker_lock_is_not_live(
     with session_scope(engine) as session:
         assert claim_is_live(session, f"not-this-host:{os.getpid()}") is False
         assert claim_is_live(session, None) is False
+
+
+def test_a_reaped_drain_flush_is_still_reachable_without_an_age_arm(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Guards: a reaped bundle that no rule can reach any more.
+
+    The reaper keeps ``archive_id`` on purpose — the bundle must stay
+    non-adoptable so it cannot collide with the accumulator that opened while
+    it sat ``flushing``. But that same ``archive_id`` disqualifies it from the
+    drain rule, and a bundle the DRAIN rule flushed is short by construction:
+    under its byte target, and with ``max_age_seconds`` at its default 0 there
+    is no age arm either. ``bundle_due`` therefore says False forever, nothing
+    else looks, and nothing alarms. The material silently never reaches media.
+    """
+    with session_scope(engine) as session:
+        _install_class(session, "photos", pools=("p-main",), target_bytes=10_000_000)
+        bundle = _enqueue(
+            session,
+            artifactclass="photos",
+            source=_source(tmp_path, "a.tif"),
+            member_path="a.tif",
+        )
+        bundle_id = bundle.id
+
+        # The whole group moves away: the drain rule is what flushes this one.
+        _install_class(session, "photos", pools=("p-other",), target_bytes=10_000_000)
+        assert [candidate.id for candidate in drain_candidates(session)] == [bundle_id]
+
+        # A drain flush that died after claiming: `flush_bundle` mints
+        # `archive_id` right after the claim.
+        claim_bundle_for_flush(
+            session, bundle, worker_id=f"{socket.gethostname()}:{_dead_pid()}"
+        )
+        bundle.archive_id = f"archive-{bundle_id}"
+        session.flush()
+        assert reap_stuck_flushing(session) == [bundle_id]
+
+        reaped = session.get(Bundle, bundle_id)
+        assert reaped.status == "open"
+        assert reaped.archive_id is not None
+        # An accumulator always carries a positive age arm (zero thresholds are
+        # refused at open), so this one would eventually flush late — the drain
+        # rule exists precisely to say that waiting buys nothing. A funnel does
+        # not even get that: `jobs/handlers/cloud_blob.py` mints its funnels
+        # with `max_age_seconds=0`, and one member quarantined out of a failing
+        # flush leaves it under its own target. Set both here, which is the
+        # state a reaped cloud-blob funnel is genuinely in.
+        reaped.max_age_seconds = 0
+        session.flush()
+        assert reaped.total_bytes < reaped.target_bytes
+        # Neither arm of `bundle_due` can ever fire for it...
+        assert bundle_due(reaped) is False
+        assert bundle_due(reaped, now=reaped.opened_at + dt.timedelta(days=3650)) is False
+        # ...and the drain rule refuses it, because it is no longer adoptable.
+        assert drain_candidates(session) == []
+
+        # The sweep reaches it anyway: it was already judged flush-worthy when
+        # it was claimed, and it can never grow.
+        assert [candidate.id for candidate in due_bundles(session)] == [bundle_id]
+        result = sweep_bundles(
+            session,
+            backends=_backends(session, _WriteBackend()),
+            builder=LocalArchiveBuilder(),
+            reap=False,
+        )
+        assert result.flushed == (bundle_id,)
+        assert session.get(Bundle, bundle_id).status == "sealed"
 
 
 def test_reaped_then_returning_flusher_fails_the_close_cas_loudly(

@@ -156,9 +156,43 @@ def drain_candidates(session: Session, *, live: set[str] | None = None) -> list[
     ]
 
 
+def was_reaped(bundle: Bundle) -> bool:
+    """Return whether the reaper is what put this bundle back to ``open``.
+
+    ``flushed_at`` is written by ``claim_bundle_for_flush`` and by nothing else,
+    and the reaper is the only thing that clears ``claimed_by`` while leaving
+    the bundle ``open``. So an open bundle with a flush stamp and no claimer was
+    claimed once and returned — and it kept ``archive_id``, which makes it
+    non-adoptable: no member can ever be appended to it again.
+    """
+    return (
+        bundle.status == "open"
+        and bundle.archive_id is not None
+        and bundle.flushed_at is not None
+        and bundle.claimed_by is None
+        and bundle.member_count > 0
+    )
+
+
 def due_bundles(session: Session, *, now: dt.datetime | None = None) -> list[Bundle]:
-    """Return every open bundle ``bundle_due`` says should flush — funnels included."""
-    return [bundle for bundle in _open_bundles(session) if bundle_due(bundle, now=now)]
+    """Return every open bundle that should flush — funnels and reaped ones included.
+
+    A reaped bundle is due *because it was reaped*, without consulting
+    ``bundle_due`` again. It was already judged flush-worthy when it was
+    claimed, and it cannot grow: the reaper deliberately keeps ``archive_id``
+    so the bundle stays non-adoptable and cannot collide with the fresh
+    accumulator that opened while it sat ``flushing``. Re-asking ``bundle_due``
+    therefore asks the wrong question, and answers it wrongly in the ordinary
+    case: a short accumulator sealed by the DRAIN rule is under its byte target
+    by construction, and ``max_age_seconds`` defaults to 0 (no age arm), so
+    ``bundle_due`` returns False forever. Nothing else would ever look at it and
+    nothing would alarm — the material would simply never reach media.
+    """
+    return [
+        bundle
+        for bundle in _open_bundles(session)
+        if was_reaped(bundle) or bundle_due(bundle, now=now)
+    ]
 
 
 def claim_is_live(session: Session, token: str | None) -> bool:
