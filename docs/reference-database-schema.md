@@ -447,6 +447,15 @@ unique so an archive object cannot contain two entries at the same path.
 An auditable pre-fan-out transformation of a bundle member. The two uniqueness
 constraints keep step order unambiguous per member and output path.
 
+When the member-naming ladder disambiguates a co-resident name collision, the
+tag it inserts is a *catalog-name* artifact: every `stored_member_path` in the
+chain carries it (each step's output path shares the `(bundle_id,
+stored_member_path, step_order)` unique surface, not just the last), and
+`original_member_path` carries it for every step after the first, so step N
+still links to step N-1's output. Step 0's `original_member_path` never carries
+it — that is the member's logical name, the same string the customer manifest
+prints as `member_name`, and restore-by-name resolves through it.
+
 | Field | Type / key | Meaning |
 |---|---|---|
 | `id` | integer, PK | Transform identifier. |
