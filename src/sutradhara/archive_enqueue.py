@@ -67,11 +67,31 @@ class BatchScanHeld(ArchiveEnqueueError):
 
 @dataclass(frozen=True)
 class EnqueueItem:
-    """One candidate member of an enqueue batch."""
+    """One candidate member of an enqueue batch.
+
+    Two path roles, deliberately separate columns rather than one overloaded
+    field. Collapsing them is the round-4 inversion in a second costume: a
+    caller that puts an archive name in ``member_path`` (a bare basename for a
+    nested file, say) makes ``_prefix_covers`` compare incomparable paths, so
+    every path-scoped cluster verdict silently misses and the member is
+    enqueued exactly as if the rule had never fired.
+
+    - ``member_path`` is what RULES match: the item's path relative to the
+      batch's scan root, POSIX separators.
+    - ``archive_path`` overrides the name stored inside the archive. ``None``
+      means "the same as ``member_path``" — the intake-batch case, where the
+      tree-relative path IS the archive name.
+    """
 
     logical_asset_hash: bytes
     source_path: Path
     member_path: str  # relative to the scan root, POSIX separators
+    archive_path: str | None = None  # stored name override; None = member_path
+
+    @property
+    def stored_archive_path(self) -> str:
+        """The name this item is stored under inside the archive."""
+        return self.archive_path or self.member_path
 
 
 @dataclass(frozen=True)
@@ -160,7 +180,10 @@ def scan_enqueue_batch(
             policy=policy,
             source_path=item.source_path,
             staging_root=staging_root,
-            member_path=item.member_path,
+            # The stored name, which is the scan-relative path unless the
+            # caller explicitly overrode it. Rule matching above uses
+            # item.member_path; these two roles never share a field.
+            member_path=item.stored_archive_path,
         )
         if staged.logical_sha256 != item.logical_asset_hash:
             raise ArchiveEnqueueError(
