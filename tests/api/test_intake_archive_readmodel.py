@@ -42,6 +42,7 @@ from sutradhara.catalog.types import (
     SubmissionStatus,
 )
 from tests.api.conftest import auth_headers, make_api_app
+from tests.bundle_group_helpers import bundle_kwargs
 
 INTAKE_KEYS = {
     "intake_id",
@@ -1005,7 +1006,7 @@ def _add_bundle(
 ) -> Bundle:
     bundle = Bundle(
         id=bundle_id,
-        artifactclass=artifactclass,
+        **bundle_kwargs(seed=artifactclass),
         status=status,
         total_bytes=total_bytes,
         member_count=member_count,
@@ -1014,6 +1015,8 @@ def _add_bundle(
     )
     session.add(bundle)
     session.flush([bundle])
+    # The class moved to member grain; remember it for _add_bundle_member.
+    bundle._test_artifactclass = artifactclass
     return bundle
 
 
@@ -1029,6 +1032,7 @@ def _add_bundle_member(
     member = BundleMember(
         bundle_id=bundle.id,
         logical_asset_hash=digest,
+        artifactclass=getattr(bundle, "_test_artifactclass", "s-masters"),
         member_path=member_path,
         source_path="/private/source/clip.mov",
         size_bytes=size,

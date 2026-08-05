@@ -49,6 +49,7 @@ from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.registry import CHECKPOINT_BATCH_STATE_KEY
 from sutradhara.replication import replication_status
 from sutradhara.sealing.port import Representation
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 @pytest.fixture
@@ -101,9 +102,9 @@ def test_durable_placements_axes_and_direct_copies(engine: Engine) -> None:
         session.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(payload)))
         session.add_all(
             [
-                Bundle(id="masters-1", artifactclass="masters", status="sealed"),
-                Bundle(id="masters-2", artifactclass="masters", status="sealed"),
-                Bundle(id="proxies-1", artifactclass="proxies", status="sealed"),
+                Bundle(id="masters-1", **bundle_kwargs(seed="masters"), status="sealed"),
+                Bundle(id="masters-2", **bundle_kwargs(seed="masters"), status="sealed"),
+                Bundle(id="proxies-1", **bundle_kwargs(seed="proxies"), status="sealed"),
             ]
         )
         session.flush()
@@ -265,7 +266,7 @@ def test_bundle_replication_status_reports_complete_and_missing(engine: Engine) 
     with session_scope(engine) as session:
         pool_a = _add_pool(session, "pool-a", artifactclass="masters", sort_order=0)
         pool_b = _add_pool(session, "pool-b", artifactclass="masters", sort_order=1)
-        session.add(Bundle(id="bundle-1", artifactclass="masters", status="sealed"))
+        session.add(Bundle(id="bundle-1", **bundle_kwargs(seed="masters"), status="sealed"))
         session.flush()
         copy_a, _ = add_bundle_copy(
             session,
@@ -308,7 +309,7 @@ def test_replication_status_ignores_bundle_only_asset_copy(engine: Engine) -> No
     with session_scope(engine) as session:
         pool = _add_pool(session, "pool-a", artifactclass="masters")
         session.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(payload)))
-        session.add(Bundle(id="bundle-asset-only", artifactclass="masters", status="sealed"))
+        session.add(Bundle(id="bundle-asset-only", **bundle_kwargs(seed="masters"), status="sealed"))
         session.flush()
         bundle_copy = _add_bundle_copy_with_locator(
             session,
@@ -350,8 +351,8 @@ def test_restore_asset_filters_cross_class_bundle_locators(engine: Engine, tmp_p
         session.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(payload)))
         session.add_all(
             [
-                Bundle(id="proxy-bundle", artifactclass="proxies", status="sealed"),
-                Bundle(id="master-bundle", artifactclass="masters", status="sealed"),
+                Bundle(id="proxy-bundle", **bundle_kwargs(seed="proxies"), status="sealed"),
+                Bundle(id="master-bundle", **bundle_kwargs(seed="masters"), status="sealed"),
             ]
         )
         _add_policy_record(session, "masters", ["wrong-pool", "right-pool"])

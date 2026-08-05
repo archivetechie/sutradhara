@@ -53,6 +53,7 @@ from sutradhara.jobs.engine import pending_candidates, submit
 from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_OPEN, CONDITION_SATISFIED
 from sutradhara.sealing.port import Representation
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 @pytest.fixture
@@ -897,7 +898,7 @@ def _seed_bundle(
     object_hash = memory.add(bundle_bytes)
     bundle = Bundle(
         id=bundle_id,
-        artifactclass="s-masters",
+        **bundle_kwargs(seed="s-masters"),
         status="sealed",
         target_bytes=1024,
         max_age_seconds=3600,
@@ -929,6 +930,7 @@ def _seed_bundle(
             BundleMember(
                 bundle_id=bundle_id,
                 logical_asset_hash=digest,
+                artifactclass="s-masters",
                 member_path=member_path,
                 source_path=None if source_paths is None else str(source_paths[index]),
                 size_bytes=len(data),

@@ -41,6 +41,7 @@ from sutradhara.hdcache.walker import (
     walk_disk,
 )
 from sutradhara.sealing.port import Representation
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 @pytest.fixture
@@ -506,7 +507,7 @@ def _seed_archived_asset(session, *, data: bytes) -> bytes:
         session.add(
             Bundle(
                 id=bundle_id,
-                artifactclass="s-masters",
+                **bundle_kwargs(seed="s-masters"),
                 status="sealed",
                 target_bytes=1024,
                 max_age_seconds=3600,
@@ -517,6 +518,7 @@ def _seed_archived_asset(session, *, data: bytes) -> bytes:
             BundleMember(
                 bundle_id=bundle_id,
                 logical_asset_hash=digest,
+                artifactclass="s-masters",
                 member_path=f"{digest.hex()}.mov",
                 size_bytes=len(data),
                 file_sha256=digest,

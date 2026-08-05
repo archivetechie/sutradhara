@@ -72,6 +72,7 @@ from sutradhara.catalog.models import (
     Backend,
     BlobRoot,
     Bundle,
+    BundleMember,
     Copy,
     ExclusionRecord,
     LogicalAsset,
@@ -99,6 +100,7 @@ from sutradhara.replication import target_pools
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rao import RAO_CHUNK_SIZE
 from sutradhara.staging import stage_and_enqueue_artifact
+from tests.bundle_group_helpers import bundle_kwargs
 
 
 @pytest.fixture
@@ -388,7 +390,7 @@ def _create_rao_plain_copy(
     assets = {_digest(data): data for _, data, _ in members}
 
     with session_scope(engine) as s:
-        s.add(Bundle(id="bundle-plain", artifactclass="o-archive", status="sealed"))
+        s.add(Bundle(id="bundle-plain", **bundle_kwargs(seed="o-archive"), status="sealed"))
         for asset_hash, data in assets.items():
             s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(data)))
         s.flush()
@@ -415,6 +417,16 @@ def _create_rao_plain_copy(
             }
             if first_lba is not None:
                 native_locator["first_chunk_lba"] = first_lba
+            s.add(
+                BundleMember(
+                    bundle_id="bundle-plain",
+                    logical_asset_hash=_digest(data),
+                    artifactclass="o-archive",
+                    member_path=member_path,
+                    size_bytes=len(data),
+                    file_sha256=_digest(data),
+                )
+            )
             s.add(
                 AssetLocator(
                     logical_asset_hash=_digest(data),
@@ -446,7 +458,7 @@ def _create_raw_bytes_copy(
         pool = s.get(Pool, "d2-shelf-pool")
         assert pool is not None
         pool.representation = Representation.RAW_BYTES.value
-        s.add(Bundle(id="bundle-raw", artifactclass="o-archive", status="sealed"))
+        s.add(Bundle(id="bundle-raw", **bundle_kwargs(seed="o-archive"), status="sealed"))
         s.add(LogicalAsset(content_sha256=_digest(payload), size_bytes=len(payload)))
         s.flush()
         record = backend.write_object_to_pool(object_path, "d2-shelf-pool")
@@ -463,6 +475,16 @@ def _create_raw_bytes_copy(
                 "representation": Representation.RAW_BYTES.value,
                 "stored_size_bytes": record.size_bytes,
             },
+        )
+        s.add(
+            BundleMember(
+                bundle_id="bundle-raw",
+                logical_asset_hash=_digest(payload),
+                artifactclass="o-archive",
+                member_path="large.raw",
+                size_bytes=len(payload),
+                file_sha256=_digest(payload),
+            )
         )
         s.add(
             AssetLocator(
@@ -486,7 +508,7 @@ def test_enqueue_due_and_flush_fans_out_bundle_copies(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
-    setup = _create_bundle(engine, tmp_path, target_gb=0.000000001)
+    setup = _create_bundle(engine, tmp_path, target_gb=0.000000014)
     rem_backend = _ArchiveWriteBackend("rem")
     d2_backend = _ArchiveWriteBackend("d2")
 
@@ -534,7 +556,7 @@ def test_flush_bundle_transient_partial_seals_and_repair_heals(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    setup = _create_bundle(engine, tmp_path, target_gb=0.000000001)
+    setup = _create_bundle(engine, tmp_path, target_gb=0.000000014)
     rem_backend = _ArchiveWriteBackend("rem")
     d2_backend = _TransientWriteBackend("d2", {"d2-shelf-pool"})
 
@@ -715,7 +737,7 @@ def test_local_archive_builder_aead_offsets_verify_without_builder_fallback(
             ArtifactClassPolicy(
                 ruleset="rao.aead.test",
                 placements=(PlacementPolicy("aead-pool", role="offsite"),),
-                bundling=BundlingPolicy(target_gb=0.000000001, max_age_seconds=60),
+                bundling=BundlingPolicy(target_gb=0.000000014, max_age_seconds=60),
                 restore_preference=("aead-pool",),
                 expect="messy",
                 durability=DurabilityPolicy(min_copies=1, min_impl_families=1),
@@ -1663,7 +1685,7 @@ else:
             )
         )
         s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(restored)))
-        s.add(Bundle(id="bundle-enc", artifactclass="o-archive", status="sealed"))
+        s.add(Bundle(id="bundle-enc", **bundle_kwargs(seed="o-archive"), status="sealed"))
         s.flush()
         apply_artifactclass_policy(
             s,
@@ -1691,6 +1713,16 @@ else:
                 "recipient_epochs": [key_epoch, recovery_epoch],
                 "stored_size_bytes": record.size_bytes,
             },
+        )
+        s.add(
+            BundleMember(
+                bundle_id="bundle-enc",
+                logical_asset_hash=asset_hash,
+                artifactclass="o-archive",
+                member_path="nested/encrypted.bin",
+                size_bytes=len(restored),
+                file_sha256=asset_hash,
+            )
         )
         s.add(
             AssetLocator(
