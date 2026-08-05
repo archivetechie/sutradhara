@@ -1568,6 +1568,100 @@ def test_logical_name_shared_by_two_tagged_members_is_ambiguous(
         assert resolved == set(tagged)
 
 
+def test_ambiguity_hint_never_recommends_the_name_that_just_failed(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The hint must not answer "which name?" with the name that raised.
+
+    An ordinary history reaches this: asset X is the first arrival in bundle
+    one and keeps ``images/disk.img``; re-staged into bundle two it finds a
+    co-resident holding that name and is tagged; asset Y is then the first
+    arrival in bundle three and keeps ``images/disk.img`` too. The request
+    matches two members in the *stored* tier, so the name that just raised is
+    itself one of the stored names the hint collects — it used to be echoed
+    back as the remedy ("… instead: images/disk.<tag>.img, images/disk.img").
+
+    Excluding it is not enough on its own: what remains is X's tagged name,
+    which leaves Y with no name of its own, so no name partitions the two and
+    the hint must fall through to the hashes rather than half-answer.
+    """
+    from sutradhara.archive_restore import RestoreNameError, resolve_member_asset_hash
+    from sutradhara.staging import stage_and_enqueue_artifact
+
+    def seal(bundle_id: str) -> None:
+        s.get(Bundle, bundle_id).status = "sealed"
+        s.flush()
+
+    with session_scope(engine) as s:
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        other = _staging_class(s, "disk.other", ["pool-a"], compression=False)
+        mine = _staging_class(s, "disk.mine", ["pool-a"], compression=False)
+
+        x_source = _source(tmp_path / "x" / "images", "disk.img", b"asset-x" * 20)
+        y_source = _source(tmp_path / "y" / "images", "disk.img", b"asset-y" * 20)
+        occupant = _source(tmp_path / "occupant" / "images", "disk.img", b"occupant" * 20)
+
+        # Bundle one: X is the first arrival and keeps the name.
+        first = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.mine",
+            policy=mine,
+            source_path=x_source,
+            staging_root=tmp_path / "stage-x-1",
+            member_path="images/disk.img",
+        )
+        assert first.stored_member_path == "images/disk.img"
+        seal(first.bundle_id)
+
+        # Bundle two: a co-resident takes the name first, so X is tagged here.
+        stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.other",
+            policy=other,
+            source_path=occupant,
+            staging_root=tmp_path / "stage-occupant",
+            member_path="images/disk.img",
+        )
+        again = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.mine",
+            policy=mine,
+            source_path=x_source,
+            staging_root=tmp_path / "stage-x-2",
+            member_path="images/disk.img",
+        )
+        assert again.logical_sha256 == first.logical_sha256
+        tagged_x = again.stored_member_path
+        assert tagged_x != "images/disk.img"
+        seal(again.bundle_id)
+
+        # Bundle three: Y is the first arrival and keeps the name too.
+        third = stage_and_enqueue_artifact(
+            s,
+            artifactclass="disk.mine",
+            policy=mine,
+            source_path=y_source,
+            staging_root=tmp_path / "stage-y",
+            member_path="images/disk.img",
+        )
+        assert third.stored_member_path == "images/disk.img"
+        assert third.logical_sha256 != first.logical_sha256
+
+        with pytest.raises(RestoreNameError) as excinfo:
+            resolve_member_asset_hash(
+                s, artifactclass="disk.mine", member_name="images/disk.img"
+            )
+        message = str(excinfo.value)
+        assert "ambiguous" in message
+        assert "Restore by one of the stored member names" not in message
+        # X's tagged name is a real stored name, but recommending it alone
+        # would leave Y unnameable, so no name is recommended at all.
+        assert tagged_x not in message
+        assert "restore by asset hash" in message
+        for digest in (first.logical_sha256, third.logical_sha256):
+            assert digest.hex() in message
+
+
 # --- migration (§7 order) ---------------------------------------------------
 
 
