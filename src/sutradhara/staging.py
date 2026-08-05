@@ -97,6 +97,10 @@ class StagedArtifact:
     staged_size_bytes: int
     transforms: tuple[TransformSpec, ...]
     pfr_original: bool
+    # The bundle the member actually landed in. An include-alone member routes
+    # to its own funnel bundle, not the group accumulator, so callers must
+    # report this id rather than re-deriving the accumulator (P1 residue F6).
+    bundle_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,6 +174,7 @@ def stage_and_enqueue_artifact(
         bundle_id=bundle_id,
         source_metadata=source_metadata,
     )
+    staged = dataclasses.replace(staged, bundle_id=member.bundle_id)
     if member.member_path != staged.stored_member_path:
         # The naming ladder disambiguated this member. Staged files keep their
         # on-disk names; the transform chain and the source_metadata copy are
