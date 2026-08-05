@@ -894,24 +894,57 @@ def resolve_member_asset_hash(
     artifactclass: str,
     member_name: str,
 ) -> bytes:
-    """Resolve a customer escaped member name to a logical asset hash."""
+    """Resolve a customer escaped member name to a logical asset hash.
+
+    A restore request may legitimately quote any name the catalog records for
+    a member, and they fall into two tiers, resolved in order:
+
+    1. **Stored names** — the on-media name (``BundleMember.member_path``,
+       which the naming ladder may have tagged) and the transform chain's
+       ``stored_member_path``. These are what the customer manifest prints as
+       ``stored_member_name``, and they are authoritative: a request that
+       matches one names that member and stops there.
+    2. **Logical names** — the pre-transform names in the chain
+       (``StagingTransform.original_member_path``) and
+       ``BundleMember.source_metadata["logical_path"]``, which is what the
+       manifest prints as ``member_name``
+       (``archive_fanout._customer_manifest_members``).
+
+    The ``logical_path`` source was missing, and its absence is what made a
+    tagged member unrestorable by the name on its own receipt: an
+    untransformed member records no transform chain at all, so nothing in the
+    catalog that this function read held its logical name. Resolving through
+    the same field the receipt prints makes "the name on the receipt restores"
+    true by construction rather than by convention.
+
+    The tiers exist because a co-resident collision inside one class makes one
+    string both a stored name and another member's logical name: the first
+    arrival keeps ``IMG_0001.JPG`` while its neighbour is tagged, and both
+    receipts print ``IMG_0001.JPG`` as ``member_name``. Flattening the tiers
+    would make that string resolve to nothing, taking the *untagged* member's
+    own stored name down with it. Stored-name precedence keeps every stored
+    name resolving exactly as it did, so adding the logical tier can only turn
+    failures into successes.
+
+    Names are **read, never re-derived** (design §3): resolution is equality
+    against recorded strings. A tagged name is never reconstructed from the
+    requested one, so a member whose literal name happens to look like a
+    tagged name still needs no special case.
+    """
     try:
         canonical = escape_member_name(unescape_member_name(member_name))
     except MemberNameError as exc:
         raise RestoreNameError(f"invalid escaped member name {member_name!r}: {exc}") from exc
 
-    hashes: set[bytes] = set(
+    stored: set[bytes] = set(
         session.scalars(
             select(StagingTransform.logical_asset_hash).where(
                 StagingTransform.artifactclass == artifactclass,
-                (
-                    (StagingTransform.original_member_path == canonical)
-                    | (StagingTransform.stored_member_path == canonical)
-                ),
+                StagingTransform.stored_member_path == canonical,
             )
         )
     )
-    hashes.update(
+    stored.update(
         session.scalars(
             select(BundleMember.logical_asset_hash).where(
                 BundleMember.artifactclass == artifactclass,
@@ -919,15 +952,69 @@ def resolve_member_asset_hash(
             )
         )
     )
+    hashes = stored
+    if not hashes:
+        hashes = set(
+            session.scalars(
+                select(StagingTransform.logical_asset_hash).where(
+                    StagingTransform.artifactclass == artifactclass,
+                    StagingTransform.original_member_path == canonical,
+                )
+            )
+        )
+        hashes.update(
+            session.scalars(
+                select(BundleMember.logical_asset_hash).where(
+                    BundleMember.artifactclass == artifactclass,
+                    BundleMember.source_metadata["logical_path"].as_string() == canonical,
+                )
+            )
+        )
     if not hashes:
         raise RestoreNameError(
             f"no catalog member {member_name!r} in artifactclass {artifactclass!r}"
         )
     if len(hashes) > 1:
         raise RestoreNameError(
-            f"member name {member_name!r} is ambiguous in artifactclass {artifactclass!r}"
+            f"member name {member_name!r} is ambiguous in artifactclass "
+            f"{artifactclass!r}: it names {len(hashes)} distinct assets. "
+            + _ambiguity_hint(session, artifactclass=artifactclass, hashes=hashes)
         )
     return next(iter(hashes))
+
+
+def _ambiguity_hint(
+    session: Session,
+    *,
+    artifactclass: str,
+    hashes: set[bytes],
+) -> str:
+    """Tell the operator how to name the asset they meant.
+
+    Co-resident members that share a logical name are distinguished by their
+    ``stored_member_name`` on the receipt, so naming those is the actionable
+    hint. When the stored names do not distinguish them either — the same
+    logical name in two different bundles, each the first arrival there — no
+    name can, and saying so is better than printing one string twice.
+    """
+    stored = sorted(
+        set(
+            session.scalars(
+                select(BundleMember.member_path).where(
+                    BundleMember.artifactclass == artifactclass,
+                    BundleMember.logical_asset_hash.in_(hashes),
+                )
+            )
+        )
+    )
+    if len(stored) > 1:
+        return (
+            "Restore by one of the stored member names instead: " + ", ".join(stored)
+        )
+    return (
+        "The stored member names do not distinguish them either (the same name in "
+        "more than one bundle); restore by asset hash"
+    )
 
 
 def _locator_transforms(
