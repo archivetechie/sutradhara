@@ -295,7 +295,10 @@ def test_library_drives_two_vtl_filter_and_admin_shaping(api_engine: Engine) -> 
                         element_address=2,
                         drive_serial="DRV-D2-1",
                         status=layer5_pb2.Drive.DRIVE_STATUS_UNREACHABLE,
-                    )
+                    ),
+                    layer5_pb2.Drive(
+                        status=layer5_pb2.Drive.DRIVE_STATUS_UNREACHABLE,
+                    ),
                 ],
                 slots=[layer5_pb2.Slot(element_address=201)],
             ),
@@ -333,6 +336,8 @@ def test_library_drives_two_vtl_filter_and_admin_shaping(api_engine: Engine) -> 
     assert main_admin["drives"][0]["voltag"] == "VOL001"
     assert main_admin["slots"][0]["voltag"] == "VOL001"
     assert admin_libraries[1]["drives"][0]["status"] == "unreachable"
+    assert admin_libraries[1]["drives"][0]["bay"] == "2"
+    assert admin_libraries[1]["drives"][1]["bay"] is None
 
 
 def test_library_drives_unreachable_uses_nested_error_envelope(api_engine: Engine) -> None:

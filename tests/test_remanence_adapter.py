@@ -36,6 +36,16 @@ from sutradhara.backend.remanence import (
 from sutradhara.catalog.session import locator_key
 from sutradhara.catalog.types import content_hash
 
+
+def test_tape_finalization_wire_tags_keep_health_and_progress_distinct() -> None:
+    fields = {
+        field.name: field.number
+        for field in layer5_pb2.TapeFinalization.DESCRIPTOR.fields
+    }
+    assert fields["replica_health"] == 5
+    assert fields["replica_progress"] == 11
+
+
 FIXTURE = Path(__file__).parent / "fixtures" / "remanence_objects.json"
 
 

@@ -397,7 +397,7 @@ def _library_payload(
         "changer_revision": _text(library.product_revision),
         "drives": [
             _drive_payload(drive, uuid_to_voltag=uuid_to_voltag, is_admin=is_admin)
-            for drive in sorted(state.drives, key=lambda item: item.element_address)
+            for drive in sorted(state.drives, key=_drive_sort_key)
         ],
         "slots": [
             _slot_payload(slot, is_admin=is_admin)
@@ -429,6 +429,12 @@ def _revision_rank(revision: str) -> int:
     return 2
 
 
+def _drive_sort_key(drive: layer5_pb2.Drive) -> tuple[bool, int]:
+    """Order known bays numerically and retain unknown bays at the end."""
+    known = drive.HasField("element_address")
+    return (not known, int(drive.element_address) if known else 0)
+
+
 def _drive_payload(
     drive: layer5_pb2.Drive,
     *,
@@ -436,7 +442,11 @@ def _drive_payload(
     is_admin: bool,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
-        "bay": str(int(drive.element_address)),
+        "bay": (
+            str(int(drive.element_address))
+            if drive.HasField("element_address")
+            else None
+        ),
         "status": _drive_status(drive.status),
     }
     if is_admin:

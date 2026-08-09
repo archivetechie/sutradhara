@@ -192,6 +192,7 @@ service LibraryService {
   rpc GetDriveHistory   (GetDriveHistoryRequest)      returns (GetDriveHistoryResponse);
   rpc AnnotateDrive     (AnnotateDriveRequest)        returns (DriveCatalogEntry);
   rpc RetireDrive       (RetireDriveRequest)          returns (RetireDriveResponse);
+  rpc ReinstateDrive    (ReinstateDriveRequest)       returns (ReinstateDriveResponse);
   rpc PollDrive         (PollDriveRequest)            returns (DriveHealthSnapshot);
   rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
   // Resume an existing durable media-readiness fence in place. Progress is
@@ -233,14 +234,51 @@ message LibraryState {
   string managed           = 6; // "rem" or "foreign" for drive-stewardship views.
 }
 
+// How the drive catalog answered when the live-status projection looked up the
+// drive occupying a changer-reported bay.
+enum DriveCatalogState {
+  DRIVE_CATALOG_STATE_UNSPECIFIED = 0;
+  // An active catalog row was found; drive_uuid and the catalog-derived fields
+  // are populated.
+  DRIVE_CATALOG_STATE_CATALOGED   = 1;
+  // The bay's only catalog row is retired. Identity is still reported, and the
+  // drive is excluded from mount resolution and every selection path.
+  DRIVE_CATALOG_STATE_RETIRED     = 2;
+  // The changer reports this bay but the catalog holds no row for it. Identity
+  // and every catalog-derived field are absent, not zero.
+  DRIVE_CATALOG_STATE_UNCATALOGUED = 3;
+  // More than one catalog row claims this bay. The reported identity is the
+  // most recently seen active row; the condition needs operator attention.
+  DRIVE_CATALOG_STATE_AMBIGUOUS   = 4;
+}
+
+// A live report about one drive bay, as the daemon currently understands it.
+//
+// Almost every field here is `optional`, and that is the honest shape: this
+// message is an OBSERVATION, and each part of the observation is separately
+// capable of failing. The changer reports a bay; a host-side INQUIRY supplies
+// the identity; the catalog supplies the history; the transfer engine supplies
+// the telemetry. Any of those can be unavailable while the others succeed.
+//
+// The cost of getting this wrong is on record. `drive_serial` was a plain
+// string, so a bay whose identity lookup failed reported an empty serial --
+// indistinguishable from a bay with no drive in it. That defect took a month to
+// find, because every layer above faithfully passed on a value that was never
+// true. The rule now is the plain one: if a value can be unknown, it is
+// `optional`; if it must always be known, it is not.
+//
+// Telemetry deserves a specific note. A gap of 0us is an excellent measurement.
+// No measurement at all is not a measurement of zero. When these were plain,
+// an idle drive and a perfectly-performing drive produced identical bytes.
 message Drive {
-  uint32 element_address  = 1;  // library-reported drive bay
-  string drive_serial     = 2;  // joined from host-side INQUIRY
-  string host_device_path = 3;  // e.g., /dev/sg7
-  string vendor           = 4;
-  string product          = 5;
-  // Loaded tape (UUID); empty if drive is idle.
-  bytes  loaded_tape_uuid = 6;
+  optional uint32 element_address  = 1;  // library-reported bay; absent for a drive the changer cannot see
+  optional string drive_serial     = 2;  // joined from host-side INQUIRY; absent when the join fails
+  optional string host_device_path = 3;  // e.g., /dev/sg7; absent when no host device is matched
+  optional string vendor           = 4;  // from INQUIRY
+  optional string product          = 5;  // from INQUIRY
+  // Loaded tape (UUID). Absent means either no cartridge or a cartridge whose
+  // identity could not be read -- `status` distinguishes those.
+  optional bytes  loaded_tape_uuid = 6;
   enum Status {
     DRIVE_STATUS_UNSPECIFIED   = 0;
     DRIVE_STATUS_IDLE          = 1;
@@ -250,58 +288,77 @@ message Drive {
     DRIVE_STATUS_CLEANING      = 5;
     DRIVE_STATUS_FENCED        = 6;
   }
-  Status status           = 7;
-  bytes  drive_uuid       = 8;
-  string cleaning_due     = 9;
-  bool   fenced           = 10;
-  uint64 lifetime_read_bytes = 11;
-  uint64 lifetime_write_bytes = 12;
-  uint64 counter_epoch    = 13;
-  bytes  session_id       = 14;
+  Status status           = 7;           // always known: UNSPECIFIED already says "unknown"
+  // Catalog identity. Absent ONLY when catalog_state is UNCATALOGUED, i.e. the
+  // changer reports a bay for which the drive catalog holds no row at all.
+  // A retired drive keeps its identity and is reported with catalog_state
+  // RETIRED; consumers must not infer absence of a drive from an absent value.
+  optional bytes  drive_uuid       = 8;
+  optional string cleaning_due     = 9;
+  optional bool   fenced           = 10;  // unknown for a bay with no catalog row
+  optional uint64 lifetime_read_bytes = 11;   // 0 bytes is a real answer for a new drive
+  optional uint64 lifetime_write_bytes = 12;  // 0 bytes is a real answer for a new drive
+  optional uint64 counter_epoch    = 13;
+  optional bytes  session_id       = 14;  // absent when the drive is not in a session
   repeated string active_alert_names = 15;
   reserved 16;
   reserved "tape_io_pipelined_submission";
-  uint32 tape_io_staging_ring_buffers = 17;
-  uint32 tape_io_effective_batch_blocks = 18;
-  uint64 tape_io_gap_p50_us = 19;
-  uint64 tape_io_gap_p95_us = 20;
-  uint64 tape_io_gap_max_us = 21;
-  uint64 tape_io_ioctl_p50_us = 22;
-  uint64 tape_io_ioctl_p95_us = 23;
-  uint64 tape_io_ioctl_max_us = 24;
-  uint64 tape_io_cadence_us = 25;
+  optional uint32 tape_io_staging_ring_buffers = 17;
+  optional uint32 tape_io_effective_batch_blocks = 18;
+  optional uint64 tape_io_gap_p50_us = 19;
+  optional uint64 tape_io_gap_p95_us = 20;
+  optional uint64 tape_io_gap_max_us = 21;
+  optional uint64 tape_io_ioctl_p50_us = 22;
+  optional uint64 tape_io_ioctl_p95_us = 23;
+  optional uint64 tape_io_ioctl_max_us = 24;
+  optional uint64 tape_io_cadence_us = 25;
   // Cumulative average over the current/most recently published transfer.
-  uint64 tape_io_effective_feed_bytes_per_second = 26;
-  // Changer-reported seated cartridge barcode; empty when no cartridge is loaded.
-  string loaded_tape_barcode = 27;
-  // Seconds since this daemon first observed the current barcode seated in this bay.
-  uint64 mount_age_seconds = 28;
+  optional uint64 tape_io_effective_feed_bytes_per_second = 26;
+  // Changer-reported seated cartridge barcode. Absent means either no cartridge
+  // or a cartridge whose label could not be read.
+  optional string loaded_tape_barcode = 27;
+  // Seconds since this daemon first observed the current barcode seated in this
+  // bay. Absent when nothing is seated, or when the daemon has not observed the
+  // seating -- a fresh mount reads 0, which is why absence must be separable.
+  optional uint64 mount_age_seconds = 28;
   // Combined read/write byte rate over the daemon's rolling ~5 second window.
-  uint64 tape_io_window_feed_bytes_per_second = 29;
+  optional uint64 tape_io_window_feed_bytes_per_second = 29;
+  // How the drive catalog answered for this bay. Present on every row, so a
+  // consumer never has to infer catalog state from an absent identity.
+  DriveCatalogState catalog_state = 30;   // always known: UNSPECIFIED already says "unknown"
 }
 
+// A row of the drive catalog. Field presence here MIRRORS the nullability of
+// the `drives` table, column for column: a column declared NOT NULL is a plain
+// field, a nullable column is `optional`. That is not a convention, it is the
+// only honest mapping — a plain field promises the value is always known, and
+// the proto has no business promising what the storage does not.
+//
+// tools/wire_presence_census.py records the verdict per field; the derivation
+// is the schema itself, so a future column that gains or loses NOT NULL must
+// move its field with it.
 message DriveCatalogEntry {
-  bytes drive_uuid = 1;
-  string serial = 2;
-  string identity_source = 3;
-  bool actionable = 4;
-  string vendor = 5;
-  string product = 6;
-  string firmware_rev = 7;
-  string managed = 8;
-  string state = 9;
-  string cleaning_due = 10;
-  bool fenced = 11;
+  bytes drive_uuid = 1;                    // primary key: always known
+  optional string serial = 2;              // drives.serial is nullable: INQUIRY can fail
+  string identity_source = 3;              // NOT NULL
+  bool actionable = 4;                     // NOT NULL DEFAULT 1
+  optional string vendor = 5;              // nullable
+  optional string product = 6;             // nullable
+  optional string firmware_rev = 7;        // nullable
+  string managed = 8;                      // NOT NULL
+  string state = 9;                        // NOT NULL DEFAULT 'active'
+  string cleaning_due = 10;                // NOT NULL DEFAULT 'none'
+  bool fenced = 11;                        // NOT NULL DEFAULT 0
   google.protobuf.Timestamp first_seen_utc = 12;
   google.protobuf.Timestamp last_seen_utc = 13;
-  string last_library_serial = 14;
-  uint32 last_element_address = 15;
-  string purchase_date = 16;
-  string warranty_until = 17;
-  string cost = 18;
-  string notes = 19;
+  optional string last_library_serial = 14;   // nullable: never seen in a library
+  optional uint32 last_element_address = 15;  // nullable; bay 0 is also a real bay
+  optional string purchase_date = 16;      // nullable: operator-supplied, often absent
+  optional string warranty_until = 17;     // nullable
+  optional string cost = 18;               // nullable
+  optional string notes = 19;              // nullable
   google.protobuf.Timestamp retired_at_utc = 20;
-  string retire_reason = 21;
+  optional string retire_reason = 21;      // nullable: set only on retirement
   repeated DriveCorrelationRollup correlation_rollups = 22;
 }
 
@@ -331,22 +388,29 @@ message DriveHistoryEvent {
   string detail = 8;
 }
 
+// Presence mirrors `drive_health_snapshots` nullability, as for DriveCatalogEntry.
+//
+// The four error counters matter most here: zero corrected errors is a real and
+// good reading, and "the log page could not be read" is a completely different
+// fact about the drive. Collapsing the second into the first reports a healthy
+// drive when what actually happened is that nobody could tell.
 message DriveHealthSnapshot {
-  uint64 snapshot_id = 1;
-  bytes drive_uuid = 2;
-  google.protobuf.Timestamp at_utc = 3;
-  string trigger = 4;
+  uint64 snapshot_id = 1;                  // primary key: always known
+  bytes drive_uuid = 2;                    // NOT NULL
+  google.protobuf.Timestamp at_utc = 3;    // NOT NULL
+  string trigger = 4;                      // NOT NULL
   // Deprecated canonical UUID text retained for compatibility.
-  string session_id = 5;
-  string tape_alert_flags = 6;
-  uint64 write_errors_corrected = 7;
-  uint64 write_errors_uncorrected = 8;
-  uint64 read_errors_corrected = 9;
-  uint64 read_errors_uncorrected = 10;
-  string raw_pages = 11;
+  optional string session_id = 5;          // nullable: snapshot need not be in a session
+  optional string tape_alert_flags = 6;    // nullable: log-page read can fail
+  optional uint64 write_errors_corrected = 7;    // nullable; 0 errors is a real reading
+  optional uint64 write_errors_uncorrected = 8;  // nullable
+  optional uint64 read_errors_corrected = 9;     // nullable
+  optional uint64 read_errors_uncorrected = 10;  // nullable
+  optional string raw_pages = 11;          // nullable
   // Canonical 16-byte UUID form shared with Drive.session_id and
-  // DriveAssignment.current_session_id.
-  bytes session_uuid = 12;
+  // DriveAssignment.current_session_id. Derived from session_id, so it is
+  // absent exactly when that is.
+  optional bytes session_uuid = 12;
 }
 
 message Alarm {
@@ -406,8 +470,22 @@ message AnnotateDriveRequest {
 message RetireDriveRequest {
   bytes drive_uuid = 1;
   string reason = 2;
-  bool i_understand_fleet_removal_is_permanent = 3;
+  // 3 held an acknowledgement that fleet removal was permanent. It is not:
+  // ReinstateDrive returns a retired drive to service.
+  reserved 3;
+  reserved "i_understand_fleet_removal_is_permanent";
   bool allow_derived_identity = 4;
+}
+
+message ReinstateDriveRequest {
+  bytes drive_uuid = 1;
+  string reason = 2;
+  bool allow_derived_identity = 3;
+}
+
+message ReinstateDriveResponse {
+  DriveCatalogEntry drive = 1;
+  bool newly_reinstated = 2;
 }
 
 message RetireDriveResponse {
@@ -451,7 +529,7 @@ message DriveAssignment {
   string library_serial = 1;
   uint32 bay = 2;
   // Operator-legibility hint only; not an arbitration key.
-  bytes drive_uuid = 3;
+  optional bytes drive_uuid = 3;
   enum State {
     DRIVE_ASSIGNMENT_STATE_UNSPECIFIED = 0;
     DRIVE_ASSIGNMENT_STATE_IDLE = 1;
@@ -459,9 +537,9 @@ message DriveAssignment {
   }
   State state = 4;
   // Empty during reservation/mount transitions and non-session operations.
-  bytes current_session_id = 5;
+  optional bytes current_session_id = 5;
   // Empty when no cataloged tape is known to be loaded in this bay.
-  bytes loaded_tape_uuid = 6;
+  optional bytes loaded_tape_uuid = 6;
 }
 
 message GetLiveStatusResponse {
@@ -477,15 +555,15 @@ message GetLiveStatusResponse {
 message Slot {
   uint32 element_address  = 1;
   // Voltag (operator-visible cartridge label). Empty if slot is empty.
-  string voltag           = 2;
+  optional string voltag           = 2;
   // Remanence UUID for the cartridge in this slot. Empty if slot is empty.
-  bytes  tape_uuid        = 3;
+  optional bytes  tape_uuid        = 3;
 }
 
 message PortalSlot {
   uint32 element_address  = 1;
-  string voltag           = 2;
-  bytes  tape_uuid        = 3;
+  optional string voltag           = 2;
+  optional bytes  tape_uuid        = 3;
   enum Direction {
     PORTAL_DIRECTION_UNSPECIFIED = 0;
     PORTAL_DIRECTION_IMPORT      = 1;
@@ -585,6 +663,14 @@ message LibraryEvent {
 service Catalog {
   rpc ListTapes        (ListTapesRequest)        returns (ListTapesResponse);
   rpc GetTape          (GetTapeRequest)          returns (Tape);
+  // Read the terminal triple index of one exact tape through the same
+  // exact-tape/read owner used by ordinary read sessions. This is a bounded
+  // fast inventory, not a whole-tape physical verification.
+  rpc GetTapeInventory (TapeInventoryRequest)    returns (stream TapeInventoryStreamItem);
+  // Perform the slow physical verification: measure EOD, walk the complete
+  // prefix, compare its canonical map, and read all three replicas and both
+  // typed separation extents. This is distinct from GetTapeInventory.
+  rpc VerifyTapeIndex  (VerifyTapeIndexRequest)  returns (TapeIndexVerification);
   rpc ListTapeFiles    (ListTapeFilesRequest)    returns (ListTapeFilesResponse);
   rpc ListTapePools    (ListTapePoolsRequest)    returns (ListTapePoolsResponse);
   rpc GetTapePool      (GetTapePoolRequest)      returns (TapePool);
@@ -607,6 +693,13 @@ service Catalog {
   // periodic scrub or after suspected drift.
   rpc ReconcileTape    (ReconcileTapeRequest)    returns (OperationRef);
 
+  // Permanently finalize an exact reconciled tape at its current Object
+  // boundary. This is valid below the pool low watermark and bypasses only
+  // that automatic trigger; all fit, fence, ownership, and format checks stay
+  // mandatory. An accepted request can never reopen the tape for Objects.
+  rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
+  rpc GetTapeFinalization (GetTapeFinalizationRequest) returns (TapeFinalization);
+
   // Body-format-aware queries. The daemon delegates to the registered
   // format adapter (rem-tar-v1, rem-tar-legacy, rem-bru, future).
   rpc ListFilesInObject (ListFilesInObjectRequest) returns (ListFilesInObjectResponse);
@@ -620,16 +713,33 @@ service Catalog {
   rpc ListEntriesInUnit (ListEntriesInUnitRequest) returns (ListEntriesInUnitResponse);
 }
 
+// Presence mirrors the `tapes` table, column for column, as for the drive
+// messages. Nearly every column there is nullable, and for good reason: a tape
+// can be known to exist -- inventoried from a barcode -- long before anything
+// has read its format, its block size or its parity scheme.
+//
+// Field 13 below already said this, and named the precedent it was avoiding:
+// block_size_bytes used 0 for unknown. That is now fixed rather than worked
+// around, so the warning in its comment no longer describes live behaviour.
 message Tape {
-  bytes tape_uuid              = 1;
-  string voltag                = 2;
-  string body_format           = 3; // "rem-tar-v1", "tar-legacy", "bru", ...
-  uint64 block_size_bytes      = 4;
-  // Parity scheme summary (per layer4 addendum tapes table).
-  uint32 data_blocks_per_stripe   = 5;
-  uint32 parity_blocks_per_stripe = 6;
-  uint32 stripes_per_neighborhood = 7;
-  uint64 last_committed_tape_file = 8;
+  bytes tape_uuid              = 1;  // primary key: always known
+  optional string voltag       = 2;  // tapes.voltag is nullable
+  // "rem-tar-v1", "tar-legacy", "bru", ... Absent until something has read the
+  // volume far enough to say; an inventoried tape has a barcode and no format.
+  optional string body_format  = 3;
+  // Absent means nobody has read the volume's block size. It is never zero: a
+  // zero block size is not a tape, and treating unknown as 0 is precisely the
+  // conflation field 13 was written to avoid.
+  optional uint64 block_size_bytes = 4;
+  // Parity scheme summary (per layer4 addendum tapes table). All three columns
+  // are nullable and are absent together on an unscanned volume; an unprotected
+  // tape is a scheme that says so, not a scheme of zero parity blocks.
+  optional uint32 data_blocks_per_stripe   = 5;
+  optional uint32 parity_blocks_per_stripe = 6;
+  optional uint32 stripes_per_neighborhood = 7;
+  // Absent means no tape file has been committed, which is not the same as
+  // having committed tape file 0 -- the first one.
+  optional uint64 last_committed_tape_file = 8;
   enum State {
     TAPE_STATE_UNSPECIFIED = 0;
     TAPE_STATE_INVENTORIED = 1; // known but not yet catalog-scanned
@@ -637,20 +747,314 @@ message Tape {
     TAPE_STATE_DEGRADED    = 3;
     TAPE_STATE_FAILED      = 4;
     TAPE_STATE_SEALED      = 5;
+    TAPE_STATE_FINALIZING  = 6;
+    TAPE_STATE_FINALIZED_DEGRADED = 7;
+    TAPE_STATE_COMPLETION_UNKNOWN = 8;
+    TAPE_STATE_RECOVERY_REQUIRED = 9;
   }
-  State state                  = 9;
+  State state                  = 9;  // NOT NULL; UNSPECIFIED already says "unknown"
   google.protobuf.Timestamp updated_at = 10;
-  // Current operator/orchestrator pool assignment. Empty means unassigned.
-  string pool_id               = 11;
+  // Current operator/orchestrator pool assignment. Absent means unassigned.
+  optional string pool_id      = 11;
   repeated DriveCorrelationRollup correlation_rollups = 12;
   // Written extent: the maximum barrier-proved EOD LBA over this volume's
   // checkpoint records — a measurement that covers trailing sidecars,
   // parity maps and checkpoint files by construction, never a rollup over
   // object commits. Exclusive: last written block + 1. Absent = no barrier
-  // has proved one; absent is never zero, and 0 is never a stand-in for
-  // unknown (the block_size_bytes 0-as-unknown precedent is exactly the
-  // conflation this field avoids).
+  // has proved one; absent is never zero.
   optional uint64 written_extent_lba = 13;
+  // Catalog classification is required when ListTapes kind="all" mixes data
+  // and cleaning rows. Absent is reserved for older peers.
+  optional string kind = 14;
+  // Stable parity implementation identifier; widths alone do not identify the
+  // codec. Absent on no-parity or not-yet-inventoried rows.
+  optional string scheme_id = 15;
+  // Monotonic exact pool-assignment generation from the catalog row.
+  uint64 assignment_generation = 16;
+}
+
+message FinalizeTapeRequest {
+  // Exact 16-byte Remanence tape UUID. Voltags are deliberately not accepted.
+  bytes tape_uuid = 1;
+  // Wire-optional so an unpooled tape can be finalized. If the tape is pooled,
+  // this field is mandatory and must equal the assignment reread under the
+  // per-tape owner.
+  optional string expected_pool_id = 2;
+  // Exact non-empty operator reason preserved in audit/idempotency authority.
+  string reason = 3;
+  // Required durable key, scoped by actor and operation kind.
+  IdempotencyKey idempotency_key = 4;
+}
+
+message GetTapeFinalizationRequest {
+  bytes tape_uuid = 1;
+}
+
+enum TapeFinalizationProgress {
+  TAPE_FINALIZATION_PROGRESS_UNSPECIFIED = 0;
+  TAPE_FINALIZATION_PROGRESS_BEFORE_REPLICA_A = 1;
+  TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_A = 2;
+  TAPE_FINALIZATION_PROGRESS_AFTER_SEPARATION_AB = 3;
+  TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_B = 4;
+  TAPE_FINALIZATION_PROGRESS_AFTER_SEPARATION_BC = 5;
+  TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_C = 6;
+}
+
+enum TapeFinalizationOutcome {
+  TAPE_FINALIZATION_OUTCOME_UNSPECIFIED = 0;
+  TAPE_FINALIZATION_OUTCOME_FINALIZING = 1;
+  TAPE_FINALIZATION_OUTCOME_FINALIZED = 2;
+  TAPE_FINALIZATION_OUTCOME_FINALIZED_DEGRADED = 3;
+  TAPE_FINALIZATION_OUTCOME_RECOVERY_REQUIRED = 4;
+  TAPE_FINALIZATION_OUTCOME_FAILED = 5;
+  // Exact tape ownership is held by an in-flight Object/read operation or by
+  // another close-out admission. No state or media motion occurred.
+  TAPE_FINALIZATION_OUTCOME_BUSY = 6;
+}
+
+message TapeIndexReplicaHealth {
+  uint32 replica_ordinal = 1;
+  enum State {
+    TAPE_INDEX_REPLICA_STATE_UNSPECIFIED = 0;
+    TAPE_INDEX_REPLICA_STATE_PENDING = 1;
+    TAPE_INDEX_REPLICA_STATE_COMPLETE = 2;
+    TAPE_INDEX_REPLICA_STATE_INVALID = 3;
+    TAPE_INDEX_REPLICA_STATE_UNKNOWN = 4;
+    // Header/footer, local placement, and common edition facts agree. Fast
+    // inventory did not stream this older member's payload.
+    TAPE_INDEX_REPLICA_STATE_ENVELOPE_VALID = 5;
+  }
+  State state = 2;
+  string detail = 3;
+}
+
+// Historical write-progress evidence. This does not claim that a replica is
+// readable or healthy at the time the status is queried; only inventory or
+// full verification may make that observation-backed claim.
+message TapeIndexReplicaProgress {
+  uint32 replica_ordinal = 1;
+  enum State {
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_UNSPECIFIED = 0;
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_PENDING = 1;
+    // The replica's trailing filemark, zero-count barrier, and external
+    // checkpoint progress were durably proved in the finalization history.
+    // Parity-enabled histories additionally prove the sink-journal transition.
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_BARRIER_PROVED = 2;
+    // Finalization stopped at or immediately before this replica and current
+    // completion cannot be inferred from historical progress alone.
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_COMPLETION_UNKNOWN = 3;
+  }
+  State state = 2;
+  string detail = 3;
+}
+
+message TapeInventoryRequest {
+  // Exact 16-byte Remanence tape UUID. Voltags are deliberately not accepted.
+  bytes tape_uuid = 1;
+}
+
+// One bounded event in the book-like inventory stream. Replica rows are
+// provisional until the final summary selects their attempt_id: payload
+// validation can reject C after emitting rows, then continue with B and A.
+message TapeInventoryStreamItem {
+  oneof item {
+    TapeInventoryReplicaAttemptStarted replica_attempt_started = 1;
+    TapeInventoryStructuralEntry structural_entry = 2;
+    TapeInventoryObjectRow object_row = 3;
+    TapeInventoryReplicaAttemptRejected replica_attempt_rejected = 4;
+    TapeInventoryBotObject bot_object = 5;
+    TapeInventory summary = 6;
+  }
+}
+
+message TapeInventoryReplicaAttemptStarted {
+  uint64 attempt_id = 1;
+  uint32 replica_ordinal = 2;
+}
+
+message TapeInventoryReplicaAttemptRejected {
+  uint64 attempt_id = 1;
+  uint32 replica_ordinal = 2;
+  string failure_kind = 3;
+  string detail = 4;
+}
+
+enum TapeInventoryStructuralKind {
+  TAPE_INVENTORY_STRUCTURAL_KIND_UNSPECIFIED = 0;
+  TAPE_INVENTORY_STRUCTURAL_KIND_OBJECT = 1;
+  TAPE_INVENTORY_STRUCTURAL_KIND_PARITY_SIDECAR = 2;
+  TAPE_INVENTORY_STRUCTURAL_KIND_BOOTSTRAP = 3;
+  TAPE_INVENTORY_STRUCTURAL_KIND_PARITY_MAP = 4;
+  TAPE_INVENTORY_STRUCTURAL_KIND_TAPE_INDEX_REPLICA = 5;
+  TAPE_INVENTORY_STRUCTURAL_KIND_INDEX_SEPARATION_EXTENT = 6;
+}
+
+message TapeInventoryStructuralEntry {
+  uint64 attempt_id = 1;
+  uint32 replica_ordinal = 2;
+  uint64 tape_file_number = 3;
+  TapeInventoryStructuralKind kind = 4;
+  uint64 block_count = 5;
+  optional uint64 first_parity_data_ordinal = 6;
+  optional uint64 protected_ordinal_start = 7;
+  optional uint64 protected_ordinal_end_exclusive = 8;
+  optional uint64 epoch_id = 9;
+}
+
+message TapeInventoryPlaintextRecovery {
+  uint64 manifest_first_chunk_lba = 1;
+  uint64 manifest_size_bytes = 2;
+  uint64 manifest_chunk_count = 3;
+  bytes manifest_sha256 = 4;
+}
+
+message TapeInventoryEncryptedRecovery {
+  repeated bytes recipient_epoch_ids = 1;
+  uint64 metadata_frame_len = 2;
+  uint32 key_frame_len = 3;
+}
+
+message TapeInventoryObjectRow {
+  uint64 attempt_id = 1;
+  uint32 replica_ordinal = 2;
+  uint64 tape_file_number = 3;
+  uint64 stored_block_count = 4;
+  bytes object_id = 5;
+  oneof representation {
+    TapeInventoryPlaintextRecovery plaintext = 6;
+    TapeInventoryEncryptedRecovery encrypted = 7;
+  }
+}
+
+enum TapeInventoryBotObjectState {
+  TAPE_INVENTORY_BOT_OBJECT_STATE_UNSPECIFIED = 0;
+  TAPE_INVENTORY_BOT_OBJECT_STATE_RECOVERED = 1;
+  TAPE_INVENTORY_BOT_OBJECT_STATE_UNKNOWN = 2;
+  TAPE_INVENTORY_BOT_OBJECT_STATE_INCOMPLETE = 3;
+}
+
+message TapeInventoryBotObject {
+  uint64 tape_file_number = 1;
+  uint64 stored_block_count = 2;
+  optional bytes object_id = 3;
+  TapeInventoryBotObjectState state = 4;
+}
+
+enum TapeInventoryOutcome {
+  TAPE_INVENTORY_OUTCOME_UNSPECIFIED = 0;
+  TAPE_INVENTORY_OUTCOME_COMPLETE = 1;
+  TAPE_INVENTORY_OUTCOME_DEGRADED = 2;
+  // No terminal member is authoritative. The caller must invoke structural
+  // recovery from BOT; zero counts in this outcome are never empty success.
+  TAPE_INVENTORY_OUTCOME_BOT_STRUCTURAL_RECOVERY_REQUIRED = 3;
+  // No terminal member survived, but the daemon completed the explicit BOT
+  // structural recovery and classified every physical Object candidate.
+  TAPE_INVENTORY_OUTCOME_BOT_STRUCTURAL_RECOVERED = 4;
+}
+
+message TapeInventory {
+  bytes tape_uuid = 1;
+  TapeInventoryOutcome outcome = 2;
+  // One-based member ordinal (A=1, B=2, C=3); selection prefers C, then B,
+  // then A. Zero only for BOT recovery required.
+  uint32 selected_replica_ordinal = 3;
+  repeated TapeIndexReplicaHealth replica_health = 4;
+  uint64 structural_entry_count = 5;
+  uint64 object_row_count = 6;
+  bytes edition_digest = 7;
+  bytes layout_digest = 8;
+  bytes payload_digest = 9;
+  bytes canonical_map_digest = 10;
+  // Stable basis label: "terminal_index_fast" or
+  // "bot_structural_recovery".
+  string inventory_basis = 11;
+  string detail = 12;
+  // BOT recovery classifications are streamed internally; the unary summary
+  // stays bounded instead of materialising a whole-tape row set.
+  uint64 recovered_object_count = 13;
+  uint64 unknown_object_count = 14;
+  uint64 incomplete_object_count = 15;
+  uint64 damaged_region_count = 16;
+  // Attempt whose structural and Object rows are authoritative. Zero for BOT
+  // recovery outcomes, whose rows use TapeInventoryBotObject instead.
+  uint64 selected_attempt_id = 17;
+}
+
+message VerifyTapeIndexRequest {
+  // Exact 16-byte Remanence tape UUID. Voltags are deliberately not accepted.
+  bytes tape_uuid = 1;
+}
+
+enum TapeIndexVerificationState {
+  TAPE_INDEX_VERIFICATION_STATE_UNSPECIFIED = 0;
+  // Retained for older daemons that truthfully lacked the physical verifier.
+  TAPE_INDEX_VERIFICATION_STATE_DEFERRED_FULL_PHYSICAL_VERIFY = 1;
+  // Every physical prefix row and all five terminal components validated.
+  TAPE_INDEX_VERIFICATION_STATE_VERIFIED_COMPLETE = 2;
+  // The canonical physical prefix has a valid survivor, but one or more
+  // redundant replicas/separations are damaged or incomplete.
+  TAPE_INDEX_VERIFICATION_STATE_VERIFIED_DEGRADED = 3;
+  // No surviving terminal authority could prove the measured physical prefix;
+  // explicit BOT recovery evidence is attached.
+  TAPE_INDEX_VERIFICATION_STATE_RECOVERY_REQUIRED = 4;
+}
+
+message TapeIndexSeparationHealth {
+  // One-based gap ordinal (AB=1, BC=2).
+  uint32 separation_ordinal = 1;
+  enum State {
+    TAPE_INDEX_SEPARATION_STATE_UNSPECIFIED = 0;
+    TAPE_INDEX_SEPARATION_STATE_VALID = 1;
+    TAPE_INDEX_SEPARATION_STATE_INVALID = 2;
+    TAPE_INDEX_SEPARATION_STATE_UNKNOWN = 3;
+  }
+  State state = 2;
+  // Number of zero-filled interior records read and validated.
+  uint64 verified_interior_record_count = 3;
+  string detail = 4;
+}
+
+message TapeIndexVerification {
+  bytes tape_uuid = 1;
+  TapeIndexVerificationState state = 2;
+  // Present only in the legacy deferred response. A verified response carries
+  // full physical evidence below and does not pretend fast inventory was the
+  // basis of verification.
+  TapeInventory fast_inventory = 3;
+  string detail = 4;
+  repeated TapeIndexReplicaHealth replica_health = 5;
+  repeated TapeIndexSeparationHealth separation_health = 6;
+  uint64 measured_eod_lba = 7;
+  uint64 verified_prefix_tape_file_count = 8;
+  uint64 verified_prefix_record_count = 9;
+  uint64 measured_tape_file_count = 10;
+  bytes edition_digest = 11;
+  bytes layout_digest = 12;
+  bytes payload_digest = 13;
+  bytes canonical_map_digest = 14;
+  // Stable basis label: "measured_full_physical" or
+  // "bot_structural_recovery".
+  string verification_basis = 15;
+  // Present only for RECOVERY_REQUIRED. This is a real BOT scan summary, not
+  // a zero-count placeholder or fast terminal inventory.
+  TapeInventory recovery_inventory = 16;
+}
+
+message TapeFinalization {
+  bytes tape_uuid = 1;
+  bytes operation_id = 2;
+  TapeFinalizationProgress progress = 3;
+  uint32 completed_replicas = 4;
+  // Deprecated draft field. Finalization no longer claims observation-backed
+  // media health; servers leave this empty. Retaining tag 5 prevents older
+  // clients from decoding progress states as health states.
+  repeated TapeIndexReplicaHealth replica_health = 5 [deprecated = true];
+  bytes edition_digest = 6;
+  bytes layout_digest = 7;
+  TapeFinalizationOutcome outcome = 8;
+  string trigger = 9;
+  string detail = 10;
+  repeated TapeIndexReplicaProgress replica_progress = 11;
 }
 
 // A daemon-local tape eligibility group. Sutradhara decides the policy that maps
@@ -714,13 +1118,19 @@ message AppendCommitInfo {
 
 // One object's catalog-level record. Body-format-agnostic.
 message ObjectRecord {
-  bytes object_id              = 1;  // Remanence-assigned UUID
-  string caller_object_id      = 2;  // opaque string from orchestrator (§4.2)
+  bytes object_id              = 1;  // primary key: always known
+  // Nullable in `objects`: the orchestrator need not supply one, and absent is
+  // not the same as an orchestrator that supplied an empty string.
+  optional string caller_object_id = 2;  // opaque string from orchestrator (§4.2)
   // The logical-asset identity Sutradhara keys on. For rem-tar-v1 this is the
   // canonical manifest_sha256 / content hash of the object's contents.
-  bytes content_sha256         = 3;
-  uint64 logical_size_bytes    = 4;
-  string body_format           = 5;
+  // Nullable: an object catalogued before its content was hashed has none, and
+  // the objects_content_hash_idx index is explicitly partial on `is not null`.
+  optional bytes content_sha256 = 3;
+  // Nullable. A zero-byte object is a real and perfectly ordinary object, so
+  // zero cannot double as "size not recorded".
+  optional uint64 logical_size_bytes = 4;
+  optional string body_format  = 5;  // nullable: derived from the body, once read
   // Caller-supplied opaque metadata (per §4.2). Free-form key/value.
   map<string, string> caller_metadata = 6;
   google.protobuf.Timestamp created_at = 7;
@@ -772,9 +1182,12 @@ message FileRecord {
   uint64 size_bytes            = 4;
   bytes  file_sha256           = 5;
   // BodyLba within the object where this file's data starts (rem-tar-v1
-  // chunk-aligned start).
-  uint64 first_chunk_body_lba  = 6;
-  uint32 chunk_count           = 7;
+  // chunk-aligned start). The only nullable column in `object_files`: LBA 0 is
+  // a real and common address -- the very start of the body -- so it cannot
+  // also stand for "not recorded". Every other field here is NOT NULL, because
+  // a catalogued file genuinely does know its own path, size and digest.
+  optional uint64 first_chunk_body_lba = 6;
+  uint64 chunk_count           = 7;
   // Algorithm-aware mirror of file_sha256. During the compatibility window
   // servers populate both fields with the same SHA-256 value.
   Digest file_digest           = 8;
@@ -1046,10 +1459,15 @@ service WriteSessionService {
 }
 
 message WriteSession {
-  bytes session_id           = 1; // UUID
-  bytes tape_uuid            = 2;
-  uint32 drive_element_address = 3;
-  string body_format         = 4;
+  bytes session_id           = 1; // UUID; primary key, always known
+  // sessions.tape_uuid is nullable, and for a good reason: a pool-targeted
+  // session exists before a tape has been selected for it. Absent means no
+  // volume chosen yet, which is a normal state, not a missing one.
+  optional bytes tape_uuid   = 2;
+  // sessions.drive_bay is nullable: a session can be open without currently
+  // holding a drive. Bay 0 is a real bay, so zero cannot also mean "none".
+  optional uint32 drive_element_address = 3;
+  string body_format         = 4;  // fixed when the session opens; always known
   enum State {
     WRITE_SESSION_STATE_UNSPECIFIED = 0;
     WRITE_SESSION_STATE_OPEN        = 1;
@@ -1074,7 +1492,11 @@ message WriteSession {
   uint32 current_tape_index   = 12;
   uint64 pending_checkpoint_objects = 13;
   uint64 pending_checkpoint_bytes = 14;
-  uint64 oldest_pending_age_seconds = 15;
+  // Age of the oldest object still awaiting a checkpoint. Absent when nothing
+  // is pending -- which is not the same as something pending for zero seconds,
+  // the state of every object the instant it is written. Same conflation as
+  // Drive.mount_age_seconds had.
+  optional uint64 oldest_pending_age_seconds = 15;
   google.protobuf.Timestamp checkpoint_deadline = 16;
   // Durable receipts not previously returned by CheckpointSession. A close
   // response carries these so close-triggered barriers do not lose locators.
@@ -1090,10 +1512,16 @@ message OpenWriteSessionRequest {
     TapeTarget    tape_target  = 2;
     TapePoolTarget pool_target  = 6;
   }
-  string body_format             = 3; // "rem-object-v1" by default (the only wired format)
+  // Absent means "no preference, use the daemon's default" -- the only wired
+  // format, rem-object-v1. Present-and-empty is a caller that named no format
+  // at all, which is a malformed request rather than a request for the
+  // default, and is refused.
+  optional string body_format    = 3;
   IdempotencyKey idempotency_key = 4;
   // Recover an existing orphaned session by id (no new session created).
-  bytes recover_session_id       = 5;
+  // Absent is an ordinary open; an id is only ever present because the caller
+  // is resuming something.
+  optional bytes recover_session_id = 5;
 }
 
 message DriveTarget {
@@ -1142,19 +1570,30 @@ enum SourceReplayCapability {
 
 message AppendObjectStart {
   bytes session_id                    = 1;
-  string caller_object_id             = 2; // §4.2 orchestrator opaque id
+  // §4.2 orchestrator opaque id. REQUIRED, and plain for that reason: an
+  // append that names no object is refused (rem-object layout admission,
+  // "caller_object_id must not be empty", surfaced as INVALID_ARGUMENT), so
+  // absence here is a rejected request rather than a value the daemon has to
+  // interpret. `objects.caller_object_id` is nullable and no writer fills it
+  // with NULL; see tools/wire-presence-ledger.txt for that mismatch.
+  string caller_object_id             = 2;
   map<string, string> caller_metadata = 3; // §4.2 opaque metadata
-  // Optional: declared size_bytes for capacity-reserve planning (rem-tar-v1
-  // §9.1 P1 projected_size_blocks). If unknown, daemon estimates.
-  uint64 declared_size_bytes          = 4;
+  // Declared size for capacity-reserve planning (rem-tar-v1 §9.1 P1
+  // projected_size_blocks). Absent means the caller does not know, and the
+  // daemon estimates. Zero is a declaration that the object is empty, which is
+  // an ordinary object -- the same reason ObjectRecord.size_bytes is optional.
+  optional uint64 declared_size_bytes = 4;
   // For rem-tar-v1: pre-supplied per-file manifest (paths, sizes, hashes,
   // optional pre-computed file_sha256). The writer validates and writes
   // accordingly. The exact shape is body-format-specific; this draft leaves
-  // it as a serialized blob owned by the format adapter.
-  bytes body_format_manifest          = 5;
+  // it as a serialized blob owned by the format adapter. Absent means the
+  // caller supplied no manifest.
+  optional bytes body_format_manifest = 5;
   // Binding payload digest used for overlap admission. New clients mirror
-  // this value in AppendObjectFinish during the compatibility window.
-  bytes expected_content_sha256       = 6;
+  // this value in AppendObjectFinish during the compatibility window. Absent
+  // means the caller pre-computed no digest, so there is nothing to bind
+  // against; it is not a digest of no bytes.
+  optional bytes expected_content_sha256 = 6;
   // Whether the caller retains immutable source bytes and can replay them
   // from byte zero after an interrupted overlap append.
   SourceReplayCapability source_replay_capability = 7;
@@ -1170,8 +1609,8 @@ message AppendObjectChunk {
 message AppendObjectFinish {
   bytes session_id = 1;
   // If client pre-computed the object's content_sha256, daemon validates
-  // before committing.
-  bytes expected_content_sha256 = 2;
+  // before committing. Absent means it computed none.
+  optional bytes expected_content_sha256 = 2;
   // Algorithm-aware mirror of expected_content_sha256.
   Digest expected_content_digest = 3;
 }
@@ -1199,7 +1638,11 @@ message CloseWriteSessionRequest {
 message AbortWriteSessionRequest {
   bytes session_id               = 1;
   IdempotencyKey idempotency_key = 2;
-  string reason                  = 3;
+  // Why the caller is abandoning the session. Absent means the caller gave no
+  // reason -- an abort with no explanation is a normal thing for a client that
+  // is itself dying, and is not the same as one that explained itself with an
+  // empty string.
+  optional string reason         = 3;
 }
 
 message GetWriteSessionRequest { bytes session_id = 1; }
@@ -1230,9 +1673,16 @@ service ReadSessionService {
 }
 
 message ReadSession {
-  bytes session_id           = 1;
-  bytes tape_uuid            = 2;
-  uint32 drive_element_address = 3;
+  bytes session_id           = 1;  // primary key, always known
+  // A read session can be opened against a DRIVE rather than a named tape --
+  // "read whatever is seated here" -- so the volume's identity need not be
+  // known at open, and may stay unknown for an unidentified or foreign tape.
+  // Absent is a session reading a volume it cannot yet name, not a session
+  // with no volume.
+  optional bytes tape_uuid   = 2;
+  // Nullable in `sessions`: a session opened against a TapeTarget exists before
+  // the volume is mounted, so it holds no bay yet. Bay 0 is a real bay.
+  optional uint32 drive_element_address = 3;
   enum State {
     READ_SESSION_STATE_UNSPECIFIED = 0;
     READ_SESSION_STATE_OPEN        = 1;
