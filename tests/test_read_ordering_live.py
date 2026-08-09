@@ -185,7 +185,13 @@ tape_catalog_dir = "{self.state}/cache/tapes"
             conn.execute(
                 "insert into tapes(tape_uuid, voltag, block_size, written_extent_lba,"
                 " state, updated_at_utc) values(?, ?, ?, ?, 'ready', ?)",
-                (bytes.fromhex(TAPE_CAL), "RO0001L8", BLOCK_SIZE, WRITTEN_EXTENT, now),
+                (
+                    bytes.fromhex(TAPE_CAL),
+                    "RO0001L8",
+                    BLOCK_SIZE,
+                    WRITTEN_EXTENT.to_bytes(8, "big"),
+                    now,
+                ),
             )
             # A volume with the R1 field absent: absent must map to None, not 0.
             conn.execute(
@@ -204,13 +210,24 @@ tape_catalog_dir = "{self.state}/cache/tapes"
             conn.execute(
                 "insert into object_copies(object_id, tape_uuid, tape_file_number,"
                 " first_body_lba, status, representation, pool_id)"
-                " values(?, ?, 2, 0, 'committed', 'raw-bytes', 'pool-a')",
-                (str(OBJECT_ID), bytes.fromhex(TAPE_CAL)),
+                " values(?, ?, ?, ?, 'committed', 'plaintext', 'pool-a')",
+                (
+                    str(OBJECT_ID),
+                    bytes.fromhex(TAPE_CAL),
+                    (2).to_bytes(8, "big"),
+                    (0).to_bytes(8, "big"),
+                ),
             )
             conn.execute(
                 "insert into tape_files(tape_uuid, tape_file_number, kind, block_count,"
-                " physical_start_hint, object_id) values(?, 2, 'object', ?, ?, ?)",
-                (bytes.fromhex(TAPE_CAL), SPAN_BLOCKS, SPAN_START, str(OBJECT_ID)),
+                " physical_start_hint, object_id) values(?, ?, 'object', ?, ?, ?)",
+                (
+                    bytes.fromhex(TAPE_CAL),
+                    (2).to_bytes(8, "big"),
+                    SPAN_BLOCKS.to_bytes(8, "big"),
+                    SPAN_START.to_bytes(8, "big"),
+                    str(OBJECT_ID),
+                ),
             )
             conn.execute(
                 "insert into objects(object_id, caller_object_id, body_format,"
@@ -221,13 +238,23 @@ tape_catalog_dir = "{self.state}/cache/tapes"
             conn.execute(
                 "insert into object_copies(object_id, tape_uuid, tape_file_number,"
                 " first_body_lba, status, representation, pool_id)"
-                " values(?, ?, 3, 0, 'committed', 'raw-bytes', 'pool-a')",
-                (str(UNSPANNED_OBJECT_ID), bytes.fromhex(TAPE_CAL)),
+                " values(?, ?, ?, ?, 'committed', 'plaintext', 'pool-a')",
+                (
+                    str(UNSPANNED_OBJECT_ID),
+                    bytes.fromhex(TAPE_CAL),
+                    (3).to_bytes(8, "big"),
+                    (0).to_bytes(8, "big"),
+                ),
             )
             conn.execute(
                 "insert into tape_files(tape_uuid, tape_file_number, kind, block_count,"
-                " physical_start_hint, object_id) values(?, 3, 'object', ?, NULL, ?)",
-                (bytes.fromhex(TAPE_CAL), SPAN_BLOCKS, str(UNSPANNED_OBJECT_ID)),
+                " physical_start_hint, object_id) values(?, ?, 'object', ?, NULL, ?)",
+                (
+                    bytes.fromhex(TAPE_CAL),
+                    (3).to_bytes(8, "big"),
+                    SPAN_BLOCKS.to_bytes(8, "big"),
+                    str(UNSPANNED_OBJECT_ID),
+                ),
             )
             conn.commit()
         finally:

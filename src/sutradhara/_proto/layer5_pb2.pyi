@@ -21,6 +21,67 @@ class OperationState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     OPERATION_STATE_CANCELLED: _ClassVar[OperationState]
     OPERATION_STATE_COMPLETION_UNKNOWN: _ClassVar[OperationState]
 
+class DriveCatalogState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    DRIVE_CATALOG_STATE_UNSPECIFIED: _ClassVar[DriveCatalogState]
+    DRIVE_CATALOG_STATE_CATALOGED: _ClassVar[DriveCatalogState]
+    DRIVE_CATALOG_STATE_RETIRED: _ClassVar[DriveCatalogState]
+    DRIVE_CATALOG_STATE_UNCATALOGUED: _ClassVar[DriveCatalogState]
+    DRIVE_CATALOG_STATE_AMBIGUOUS: _ClassVar[DriveCatalogState]
+
+class TapeFinalizationProgress(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    TAPE_FINALIZATION_PROGRESS_UNSPECIFIED: _ClassVar[TapeFinalizationProgress]
+    TAPE_FINALIZATION_PROGRESS_BEFORE_REPLICA_A: _ClassVar[TapeFinalizationProgress]
+    TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_A: _ClassVar[TapeFinalizationProgress]
+    TAPE_FINALIZATION_PROGRESS_AFTER_SEPARATION_AB: _ClassVar[TapeFinalizationProgress]
+    TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_B: _ClassVar[TapeFinalizationProgress]
+    TAPE_FINALIZATION_PROGRESS_AFTER_SEPARATION_BC: _ClassVar[TapeFinalizationProgress]
+    TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_C: _ClassVar[TapeFinalizationProgress]
+
+class TapeFinalizationOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    TAPE_FINALIZATION_OUTCOME_UNSPECIFIED: _ClassVar[TapeFinalizationOutcome]
+    TAPE_FINALIZATION_OUTCOME_FINALIZING: _ClassVar[TapeFinalizationOutcome]
+    TAPE_FINALIZATION_OUTCOME_FINALIZED: _ClassVar[TapeFinalizationOutcome]
+    TAPE_FINALIZATION_OUTCOME_FINALIZED_DEGRADED: _ClassVar[TapeFinalizationOutcome]
+    TAPE_FINALIZATION_OUTCOME_RECOVERY_REQUIRED: _ClassVar[TapeFinalizationOutcome]
+    TAPE_FINALIZATION_OUTCOME_FAILED: _ClassVar[TapeFinalizationOutcome]
+    TAPE_FINALIZATION_OUTCOME_BUSY: _ClassVar[TapeFinalizationOutcome]
+
+class TapeInventoryStructuralKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    TAPE_INVENTORY_STRUCTURAL_KIND_UNSPECIFIED: _ClassVar[TapeInventoryStructuralKind]
+    TAPE_INVENTORY_STRUCTURAL_KIND_OBJECT: _ClassVar[TapeInventoryStructuralKind]
+    TAPE_INVENTORY_STRUCTURAL_KIND_PARITY_SIDECAR: _ClassVar[TapeInventoryStructuralKind]
+    TAPE_INVENTORY_STRUCTURAL_KIND_BOOTSTRAP: _ClassVar[TapeInventoryStructuralKind]
+    TAPE_INVENTORY_STRUCTURAL_KIND_PARITY_MAP: _ClassVar[TapeInventoryStructuralKind]
+    TAPE_INVENTORY_STRUCTURAL_KIND_TAPE_INDEX_REPLICA: _ClassVar[TapeInventoryStructuralKind]
+    TAPE_INVENTORY_STRUCTURAL_KIND_INDEX_SEPARATION_EXTENT: _ClassVar[TapeInventoryStructuralKind]
+
+class TapeInventoryBotObjectState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    TAPE_INVENTORY_BOT_OBJECT_STATE_UNSPECIFIED: _ClassVar[TapeInventoryBotObjectState]
+    TAPE_INVENTORY_BOT_OBJECT_STATE_RECOVERED: _ClassVar[TapeInventoryBotObjectState]
+    TAPE_INVENTORY_BOT_OBJECT_STATE_UNKNOWN: _ClassVar[TapeInventoryBotObjectState]
+    TAPE_INVENTORY_BOT_OBJECT_STATE_INCOMPLETE: _ClassVar[TapeInventoryBotObjectState]
+
+class TapeInventoryOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    TAPE_INVENTORY_OUTCOME_UNSPECIFIED: _ClassVar[TapeInventoryOutcome]
+    TAPE_INVENTORY_OUTCOME_COMPLETE: _ClassVar[TapeInventoryOutcome]
+    TAPE_INVENTORY_OUTCOME_DEGRADED: _ClassVar[TapeInventoryOutcome]
+    TAPE_INVENTORY_OUTCOME_BOT_STRUCTURAL_RECOVERY_REQUIRED: _ClassVar[TapeInventoryOutcome]
+    TAPE_INVENTORY_OUTCOME_BOT_STRUCTURAL_RECOVERED: _ClassVar[TapeInventoryOutcome]
+
+class TapeIndexVerificationState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    TAPE_INDEX_VERIFICATION_STATE_UNSPECIFIED: _ClassVar[TapeIndexVerificationState]
+    TAPE_INDEX_VERIFICATION_STATE_DEFERRED_FULL_PHYSICAL_VERIFY: _ClassVar[TapeIndexVerificationState]
+    TAPE_INDEX_VERIFICATION_STATE_VERIFIED_COMPLETE: _ClassVar[TapeIndexVerificationState]
+    TAPE_INDEX_VERIFICATION_STATE_VERIFIED_DEGRADED: _ClassVar[TapeIndexVerificationState]
+    TAPE_INDEX_VERIFICATION_STATE_RECOVERY_REQUIRED: _ClassVar[TapeIndexVerificationState]
+
 class AppendMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     APPEND_MODE_UNSPECIFIED: _ClassVar[AppendMode]
@@ -132,6 +193,46 @@ OPERATION_STATE_SUCCEEDED: OperationState
 OPERATION_STATE_FAILED: OperationState
 OPERATION_STATE_CANCELLED: OperationState
 OPERATION_STATE_COMPLETION_UNKNOWN: OperationState
+DRIVE_CATALOG_STATE_UNSPECIFIED: DriveCatalogState
+DRIVE_CATALOG_STATE_CATALOGED: DriveCatalogState
+DRIVE_CATALOG_STATE_RETIRED: DriveCatalogState
+DRIVE_CATALOG_STATE_UNCATALOGUED: DriveCatalogState
+DRIVE_CATALOG_STATE_AMBIGUOUS: DriveCatalogState
+TAPE_FINALIZATION_PROGRESS_UNSPECIFIED: TapeFinalizationProgress
+TAPE_FINALIZATION_PROGRESS_BEFORE_REPLICA_A: TapeFinalizationProgress
+TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_A: TapeFinalizationProgress
+TAPE_FINALIZATION_PROGRESS_AFTER_SEPARATION_AB: TapeFinalizationProgress
+TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_B: TapeFinalizationProgress
+TAPE_FINALIZATION_PROGRESS_AFTER_SEPARATION_BC: TapeFinalizationProgress
+TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_C: TapeFinalizationProgress
+TAPE_FINALIZATION_OUTCOME_UNSPECIFIED: TapeFinalizationOutcome
+TAPE_FINALIZATION_OUTCOME_FINALIZING: TapeFinalizationOutcome
+TAPE_FINALIZATION_OUTCOME_FINALIZED: TapeFinalizationOutcome
+TAPE_FINALIZATION_OUTCOME_FINALIZED_DEGRADED: TapeFinalizationOutcome
+TAPE_FINALIZATION_OUTCOME_RECOVERY_REQUIRED: TapeFinalizationOutcome
+TAPE_FINALIZATION_OUTCOME_FAILED: TapeFinalizationOutcome
+TAPE_FINALIZATION_OUTCOME_BUSY: TapeFinalizationOutcome
+TAPE_INVENTORY_STRUCTURAL_KIND_UNSPECIFIED: TapeInventoryStructuralKind
+TAPE_INVENTORY_STRUCTURAL_KIND_OBJECT: TapeInventoryStructuralKind
+TAPE_INVENTORY_STRUCTURAL_KIND_PARITY_SIDECAR: TapeInventoryStructuralKind
+TAPE_INVENTORY_STRUCTURAL_KIND_BOOTSTRAP: TapeInventoryStructuralKind
+TAPE_INVENTORY_STRUCTURAL_KIND_PARITY_MAP: TapeInventoryStructuralKind
+TAPE_INVENTORY_STRUCTURAL_KIND_TAPE_INDEX_REPLICA: TapeInventoryStructuralKind
+TAPE_INVENTORY_STRUCTURAL_KIND_INDEX_SEPARATION_EXTENT: TapeInventoryStructuralKind
+TAPE_INVENTORY_BOT_OBJECT_STATE_UNSPECIFIED: TapeInventoryBotObjectState
+TAPE_INVENTORY_BOT_OBJECT_STATE_RECOVERED: TapeInventoryBotObjectState
+TAPE_INVENTORY_BOT_OBJECT_STATE_UNKNOWN: TapeInventoryBotObjectState
+TAPE_INVENTORY_BOT_OBJECT_STATE_INCOMPLETE: TapeInventoryBotObjectState
+TAPE_INVENTORY_OUTCOME_UNSPECIFIED: TapeInventoryOutcome
+TAPE_INVENTORY_OUTCOME_COMPLETE: TapeInventoryOutcome
+TAPE_INVENTORY_OUTCOME_DEGRADED: TapeInventoryOutcome
+TAPE_INVENTORY_OUTCOME_BOT_STRUCTURAL_RECOVERY_REQUIRED: TapeInventoryOutcome
+TAPE_INVENTORY_OUTCOME_BOT_STRUCTURAL_RECOVERED: TapeInventoryOutcome
+TAPE_INDEX_VERIFICATION_STATE_UNSPECIFIED: TapeIndexVerificationState
+TAPE_INDEX_VERIFICATION_STATE_DEFERRED_FULL_PHYSICAL_VERIFY: TapeIndexVerificationState
+TAPE_INDEX_VERIFICATION_STATE_VERIFIED_COMPLETE: TapeIndexVerificationState
+TAPE_INDEX_VERIFICATION_STATE_VERIFIED_DEGRADED: TapeIndexVerificationState
+TAPE_INDEX_VERIFICATION_STATE_RECOVERY_REQUIRED: TapeIndexVerificationState
 APPEND_MODE_UNSPECIFIED: AppendMode
 APPEND_MODE_FRESH: AppendMode
 APPEND_MODE_APPEND: AppendMode
@@ -392,7 +493,7 @@ class LibraryState(_message.Message):
     def __init__(self, library: _Optional[_Union[Library, _Mapping]] = ..., drives: _Optional[_Iterable[_Union[Drive, _Mapping]]] = ..., slots: _Optional[_Iterable[_Union[Slot, _Mapping]]] = ..., import_export_ports: _Optional[_Iterable[_Union[PortalSlot, _Mapping]]] = ..., last_inventory_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., managed: _Optional[str] = ...) -> None: ...
 
 class Drive(_message.Message):
-    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status", "drive_uuid", "cleaning_due", "fenced", "lifetime_read_bytes", "lifetime_write_bytes", "counter_epoch", "session_id", "active_alert_names", "tape_io_staging_ring_buffers", "tape_io_effective_batch_blocks", "tape_io_gap_p50_us", "tape_io_gap_p95_us", "tape_io_gap_max_us", "tape_io_ioctl_p50_us", "tape_io_ioctl_p95_us", "tape_io_ioctl_max_us", "tape_io_cadence_us", "tape_io_effective_feed_bytes_per_second", "loaded_tape_barcode", "mount_age_seconds", "tape_io_window_feed_bytes_per_second")
+    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status", "drive_uuid", "cleaning_due", "fenced", "lifetime_read_bytes", "lifetime_write_bytes", "counter_epoch", "session_id", "active_alert_names", "tape_io_staging_ring_buffers", "tape_io_effective_batch_blocks", "tape_io_gap_p50_us", "tape_io_gap_p95_us", "tape_io_gap_max_us", "tape_io_ioctl_p50_us", "tape_io_ioctl_p95_us", "tape_io_ioctl_max_us", "tape_io_cadence_us", "tape_io_effective_feed_bytes_per_second", "loaded_tape_barcode", "mount_age_seconds", "tape_io_window_feed_bytes_per_second", "catalog_state")
     class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         DRIVE_STATUS_UNSPECIFIED: _ClassVar[Drive.Status]
@@ -437,6 +538,7 @@ class Drive(_message.Message):
     LOADED_TAPE_BARCODE_FIELD_NUMBER: _ClassVar[int]
     MOUNT_AGE_SECONDS_FIELD_NUMBER: _ClassVar[int]
     TAPE_IO_WINDOW_FEED_BYTES_PER_SECOND_FIELD_NUMBER: _ClassVar[int]
+    CATALOG_STATE_FIELD_NUMBER: _ClassVar[int]
     element_address: int
     drive_serial: str
     host_device_path: str
@@ -465,7 +567,8 @@ class Drive(_message.Message):
     loaded_tape_barcode: str
     mount_age_seconds: int
     tape_io_window_feed_bytes_per_second: int
-    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ..., drive_uuid: _Optional[bytes] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., lifetime_read_bytes: _Optional[int] = ..., lifetime_write_bytes: _Optional[int] = ..., counter_epoch: _Optional[int] = ..., session_id: _Optional[bytes] = ..., active_alert_names: _Optional[_Iterable[str]] = ..., tape_io_staging_ring_buffers: _Optional[int] = ..., tape_io_effective_batch_blocks: _Optional[int] = ..., tape_io_gap_p50_us: _Optional[int] = ..., tape_io_gap_p95_us: _Optional[int] = ..., tape_io_gap_max_us: _Optional[int] = ..., tape_io_ioctl_p50_us: _Optional[int] = ..., tape_io_ioctl_p95_us: _Optional[int] = ..., tape_io_ioctl_max_us: _Optional[int] = ..., tape_io_cadence_us: _Optional[int] = ..., tape_io_effective_feed_bytes_per_second: _Optional[int] = ..., loaded_tape_barcode: _Optional[str] = ..., mount_age_seconds: _Optional[int] = ..., tape_io_window_feed_bytes_per_second: _Optional[int] = ...) -> None: ...
+    catalog_state: DriveCatalogState
+    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ..., drive_uuid: _Optional[bytes] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., lifetime_read_bytes: _Optional[int] = ..., lifetime_write_bytes: _Optional[int] = ..., counter_epoch: _Optional[int] = ..., session_id: _Optional[bytes] = ..., active_alert_names: _Optional[_Iterable[str]] = ..., tape_io_staging_ring_buffers: _Optional[int] = ..., tape_io_effective_batch_blocks: _Optional[int] = ..., tape_io_gap_p50_us: _Optional[int] = ..., tape_io_gap_p95_us: _Optional[int] = ..., tape_io_gap_max_us: _Optional[int] = ..., tape_io_ioctl_p50_us: _Optional[int] = ..., tape_io_ioctl_p95_us: _Optional[int] = ..., tape_io_ioctl_max_us: _Optional[int] = ..., tape_io_cadence_us: _Optional[int] = ..., tape_io_effective_feed_bytes_per_second: _Optional[int] = ..., loaded_tape_barcode: _Optional[str] = ..., mount_age_seconds: _Optional[int] = ..., tape_io_window_feed_bytes_per_second: _Optional[int] = ..., catalog_state: _Optional[_Union[DriveCatalogState, str]] = ...) -> None: ...
 
 class DriveCatalogEntry(_message.Message):
     __slots__ = ("drive_uuid", "serial", "identity_source", "actionable", "vendor", "product", "firmware_rev", "managed", "state", "cleaning_due", "fenced", "first_seen_utc", "last_seen_utc", "last_library_serial", "last_element_address", "purchase_date", "warranty_until", "cost", "notes", "retired_at_utc", "retire_reason", "correlation_rollups")
@@ -686,16 +789,32 @@ class AnnotateDriveRequest(_message.Message):
     def __init__(self, drive_uuid: _Optional[bytes] = ..., purchase_date: _Optional[str] = ..., warranty_until: _Optional[str] = ..., cost: _Optional[str] = ..., note: _Optional[str] = ..., notes_set: _Optional[str] = ..., allow_derived_identity: _Optional[bool] = ...) -> None: ...
 
 class RetireDriveRequest(_message.Message):
-    __slots__ = ("drive_uuid", "reason", "i_understand_fleet_removal_is_permanent", "allow_derived_identity")
+    __slots__ = ("drive_uuid", "reason", "allow_derived_identity")
     DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
     REASON_FIELD_NUMBER: _ClassVar[int]
-    I_UNDERSTAND_FLEET_REMOVAL_IS_PERMANENT_FIELD_NUMBER: _ClassVar[int]
     ALLOW_DERIVED_IDENTITY_FIELD_NUMBER: _ClassVar[int]
     drive_uuid: bytes
     reason: str
-    i_understand_fleet_removal_is_permanent: bool
     allow_derived_identity: bool
-    def __init__(self, drive_uuid: _Optional[bytes] = ..., reason: _Optional[str] = ..., i_understand_fleet_removal_is_permanent: _Optional[bool] = ..., allow_derived_identity: _Optional[bool] = ...) -> None: ...
+    def __init__(self, drive_uuid: _Optional[bytes] = ..., reason: _Optional[str] = ..., allow_derived_identity: _Optional[bool] = ...) -> None: ...
+
+class ReinstateDriveRequest(_message.Message):
+    __slots__ = ("drive_uuid", "reason", "allow_derived_identity")
+    DRIVE_UUID_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_DERIVED_IDENTITY_FIELD_NUMBER: _ClassVar[int]
+    drive_uuid: bytes
+    reason: str
+    allow_derived_identity: bool
+    def __init__(self, drive_uuid: _Optional[bytes] = ..., reason: _Optional[str] = ..., allow_derived_identity: _Optional[bool] = ...) -> None: ...
+
+class ReinstateDriveResponse(_message.Message):
+    __slots__ = ("drive", "newly_reinstated")
+    DRIVE_FIELD_NUMBER: _ClassVar[int]
+    NEWLY_REINSTATED_FIELD_NUMBER: _ClassVar[int]
+    drive: DriveCatalogEntry
+    newly_reinstated: bool
+    def __init__(self, drive: _Optional[_Union[DriveCatalogEntry, _Mapping]] = ..., newly_reinstated: _Optional[bool] = ...) -> None: ...
 
 class RetireDriveResponse(_message.Message):
     __slots__ = ("drive", "newly_retired")
@@ -955,7 +1074,7 @@ class LibraryEvent(_message.Message):
     def __init__(self, at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., kind: _Optional[_Union[LibraryEvent.Kind, str]] = ..., detail: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class Tape(_message.Message):
-    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id", "correlation_rollups", "written_extent_lba")
+    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id", "correlation_rollups", "written_extent_lba", "kind", "scheme_id", "assignment_generation")
     class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         TAPE_STATE_UNSPECIFIED: _ClassVar[Tape.State]
@@ -964,12 +1083,20 @@ class Tape(_message.Message):
         TAPE_STATE_DEGRADED: _ClassVar[Tape.State]
         TAPE_STATE_FAILED: _ClassVar[Tape.State]
         TAPE_STATE_SEALED: _ClassVar[Tape.State]
+        TAPE_STATE_FINALIZING: _ClassVar[Tape.State]
+        TAPE_STATE_FINALIZED_DEGRADED: _ClassVar[Tape.State]
+        TAPE_STATE_COMPLETION_UNKNOWN: _ClassVar[Tape.State]
+        TAPE_STATE_RECOVERY_REQUIRED: _ClassVar[Tape.State]
     TAPE_STATE_UNSPECIFIED: Tape.State
     TAPE_STATE_INVENTORIED: Tape.State
     TAPE_STATE_READY: Tape.State
     TAPE_STATE_DEGRADED: Tape.State
     TAPE_STATE_FAILED: Tape.State
     TAPE_STATE_SEALED: Tape.State
+    TAPE_STATE_FINALIZING: Tape.State
+    TAPE_STATE_FINALIZED_DEGRADED: Tape.State
+    TAPE_STATE_COMPLETION_UNKNOWN: Tape.State
+    TAPE_STATE_RECOVERY_REQUIRED: Tape.State
     TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
     VOLTAG_FIELD_NUMBER: _ClassVar[int]
     BODY_FORMAT_FIELD_NUMBER: _ClassVar[int]
@@ -983,6 +1110,9 @@ class Tape(_message.Message):
     POOL_ID_FIELD_NUMBER: _ClassVar[int]
     CORRELATION_ROLLUPS_FIELD_NUMBER: _ClassVar[int]
     WRITTEN_EXTENT_LBA_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    SCHEME_ID_FIELD_NUMBER: _ClassVar[int]
+    ASSIGNMENT_GENERATION_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     voltag: str
     body_format: str
@@ -996,7 +1126,316 @@ class Tape(_message.Message):
     pool_id: str
     correlation_rollups: _containers.RepeatedCompositeFieldContainer[DriveCorrelationRollup]
     written_extent_lba: int
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ..., written_extent_lba: _Optional[int] = ...) -> None: ...
+    kind: str
+    scheme_id: str
+    assignment_generation: int
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ..., written_extent_lba: _Optional[int] = ..., kind: _Optional[str] = ..., scheme_id: _Optional[str] = ..., assignment_generation: _Optional[int] = ...) -> None: ...
+
+class FinalizeTapeRequest(_message.Message):
+    __slots__ = ("tape_uuid", "expected_pool_id", "reason", "idempotency_key")
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_POOL_ID_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    expected_pool_id: str
+    reason: str
+    idempotency_key: IdempotencyKey
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., expected_pool_id: _Optional[str] = ..., reason: _Optional[str] = ..., idempotency_key: _Optional[_Union[IdempotencyKey, _Mapping]] = ...) -> None: ...
+
+class GetTapeFinalizationRequest(_message.Message):
+    __slots__ = ("tape_uuid",)
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    def __init__(self, tape_uuid: _Optional[bytes] = ...) -> None: ...
+
+class TapeIndexReplicaHealth(_message.Message):
+    __slots__ = ("replica_ordinal", "state", "detail")
+    class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        TAPE_INDEX_REPLICA_STATE_UNSPECIFIED: _ClassVar[TapeIndexReplicaHealth.State]
+        TAPE_INDEX_REPLICA_STATE_PENDING: _ClassVar[TapeIndexReplicaHealth.State]
+        TAPE_INDEX_REPLICA_STATE_COMPLETE: _ClassVar[TapeIndexReplicaHealth.State]
+        TAPE_INDEX_REPLICA_STATE_INVALID: _ClassVar[TapeIndexReplicaHealth.State]
+        TAPE_INDEX_REPLICA_STATE_UNKNOWN: _ClassVar[TapeIndexReplicaHealth.State]
+        TAPE_INDEX_REPLICA_STATE_ENVELOPE_VALID: _ClassVar[TapeIndexReplicaHealth.State]
+    TAPE_INDEX_REPLICA_STATE_UNSPECIFIED: TapeIndexReplicaHealth.State
+    TAPE_INDEX_REPLICA_STATE_PENDING: TapeIndexReplicaHealth.State
+    TAPE_INDEX_REPLICA_STATE_COMPLETE: TapeIndexReplicaHealth.State
+    TAPE_INDEX_REPLICA_STATE_INVALID: TapeIndexReplicaHealth.State
+    TAPE_INDEX_REPLICA_STATE_UNKNOWN: TapeIndexReplicaHealth.State
+    TAPE_INDEX_REPLICA_STATE_ENVELOPE_VALID: TapeIndexReplicaHealth.State
+    REPLICA_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    replica_ordinal: int
+    state: TapeIndexReplicaHealth.State
+    detail: str
+    def __init__(self, replica_ordinal: _Optional[int] = ..., state: _Optional[_Union[TapeIndexReplicaHealth.State, str]] = ..., detail: _Optional[str] = ...) -> None: ...
+
+class TapeIndexReplicaProgress(_message.Message):
+    __slots__ = ("replica_ordinal", "state", "detail")
+    class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        TAPE_INDEX_REPLICA_PROGRESS_STATE_UNSPECIFIED: _ClassVar[TapeIndexReplicaProgress.State]
+        TAPE_INDEX_REPLICA_PROGRESS_STATE_PENDING: _ClassVar[TapeIndexReplicaProgress.State]
+        TAPE_INDEX_REPLICA_PROGRESS_STATE_BARRIER_PROVED: _ClassVar[TapeIndexReplicaProgress.State]
+        TAPE_INDEX_REPLICA_PROGRESS_STATE_COMPLETION_UNKNOWN: _ClassVar[TapeIndexReplicaProgress.State]
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_UNSPECIFIED: TapeIndexReplicaProgress.State
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_PENDING: TapeIndexReplicaProgress.State
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_BARRIER_PROVED: TapeIndexReplicaProgress.State
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_COMPLETION_UNKNOWN: TapeIndexReplicaProgress.State
+    REPLICA_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    replica_ordinal: int
+    state: TapeIndexReplicaProgress.State
+    detail: str
+    def __init__(self, replica_ordinal: _Optional[int] = ..., state: _Optional[_Union[TapeIndexReplicaProgress.State, str]] = ..., detail: _Optional[str] = ...) -> None: ...
+
+class TapeInventoryRequest(_message.Message):
+    __slots__ = ("tape_uuid",)
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    def __init__(self, tape_uuid: _Optional[bytes] = ...) -> None: ...
+
+class TapeInventoryStreamItem(_message.Message):
+    __slots__ = ("replica_attempt_started", "structural_entry", "object_row", "replica_attempt_rejected", "bot_object", "summary")
+    REPLICA_ATTEMPT_STARTED_FIELD_NUMBER: _ClassVar[int]
+    STRUCTURAL_ENTRY_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_ROW_FIELD_NUMBER: _ClassVar[int]
+    REPLICA_ATTEMPT_REJECTED_FIELD_NUMBER: _ClassVar[int]
+    BOT_OBJECT_FIELD_NUMBER: _ClassVar[int]
+    SUMMARY_FIELD_NUMBER: _ClassVar[int]
+    replica_attempt_started: TapeInventoryReplicaAttemptStarted
+    structural_entry: TapeInventoryStructuralEntry
+    object_row: TapeInventoryObjectRow
+    replica_attempt_rejected: TapeInventoryReplicaAttemptRejected
+    bot_object: TapeInventoryBotObject
+    summary: TapeInventory
+    def __init__(self, replica_attempt_started: _Optional[_Union[TapeInventoryReplicaAttemptStarted, _Mapping]] = ..., structural_entry: _Optional[_Union[TapeInventoryStructuralEntry, _Mapping]] = ..., object_row: _Optional[_Union[TapeInventoryObjectRow, _Mapping]] = ..., replica_attempt_rejected: _Optional[_Union[TapeInventoryReplicaAttemptRejected, _Mapping]] = ..., bot_object: _Optional[_Union[TapeInventoryBotObject, _Mapping]] = ..., summary: _Optional[_Union[TapeInventory, _Mapping]] = ...) -> None: ...
+
+class TapeInventoryReplicaAttemptStarted(_message.Message):
+    __slots__ = ("attempt_id", "replica_ordinal")
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    REPLICA_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    attempt_id: int
+    replica_ordinal: int
+    def __init__(self, attempt_id: _Optional[int] = ..., replica_ordinal: _Optional[int] = ...) -> None: ...
+
+class TapeInventoryReplicaAttemptRejected(_message.Message):
+    __slots__ = ("attempt_id", "replica_ordinal", "failure_kind", "detail")
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    REPLICA_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    FAILURE_KIND_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    attempt_id: int
+    replica_ordinal: int
+    failure_kind: str
+    detail: str
+    def __init__(self, attempt_id: _Optional[int] = ..., replica_ordinal: _Optional[int] = ..., failure_kind: _Optional[str] = ..., detail: _Optional[str] = ...) -> None: ...
+
+class TapeInventoryStructuralEntry(_message.Message):
+    __slots__ = ("attempt_id", "replica_ordinal", "tape_file_number", "kind", "block_count", "first_parity_data_ordinal", "protected_ordinal_start", "protected_ordinal_end_exclusive", "epoch_id")
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    REPLICA_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    TAPE_FILE_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    BLOCK_COUNT_FIELD_NUMBER: _ClassVar[int]
+    FIRST_PARITY_DATA_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    PROTECTED_ORDINAL_START_FIELD_NUMBER: _ClassVar[int]
+    PROTECTED_ORDINAL_END_EXCLUSIVE_FIELD_NUMBER: _ClassVar[int]
+    EPOCH_ID_FIELD_NUMBER: _ClassVar[int]
+    attempt_id: int
+    replica_ordinal: int
+    tape_file_number: int
+    kind: TapeInventoryStructuralKind
+    block_count: int
+    first_parity_data_ordinal: int
+    protected_ordinal_start: int
+    protected_ordinal_end_exclusive: int
+    epoch_id: int
+    def __init__(self, attempt_id: _Optional[int] = ..., replica_ordinal: _Optional[int] = ..., tape_file_number: _Optional[int] = ..., kind: _Optional[_Union[TapeInventoryStructuralKind, str]] = ..., block_count: _Optional[int] = ..., first_parity_data_ordinal: _Optional[int] = ..., protected_ordinal_start: _Optional[int] = ..., protected_ordinal_end_exclusive: _Optional[int] = ..., epoch_id: _Optional[int] = ...) -> None: ...
+
+class TapeInventoryPlaintextRecovery(_message.Message):
+    __slots__ = ("manifest_first_chunk_lba", "manifest_size_bytes", "manifest_chunk_count", "manifest_sha256")
+    MANIFEST_FIRST_CHUNK_LBA_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_CHUNK_COUNT_FIELD_NUMBER: _ClassVar[int]
+    MANIFEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    manifest_first_chunk_lba: int
+    manifest_size_bytes: int
+    manifest_chunk_count: int
+    manifest_sha256: bytes
+    def __init__(self, manifest_first_chunk_lba: _Optional[int] = ..., manifest_size_bytes: _Optional[int] = ..., manifest_chunk_count: _Optional[int] = ..., manifest_sha256: _Optional[bytes] = ...) -> None: ...
+
+class TapeInventoryEncryptedRecovery(_message.Message):
+    __slots__ = ("recipient_epoch_ids", "metadata_frame_len", "key_frame_len")
+    RECIPIENT_EPOCH_IDS_FIELD_NUMBER: _ClassVar[int]
+    METADATA_FRAME_LEN_FIELD_NUMBER: _ClassVar[int]
+    KEY_FRAME_LEN_FIELD_NUMBER: _ClassVar[int]
+    recipient_epoch_ids: _containers.RepeatedScalarFieldContainer[bytes]
+    metadata_frame_len: int
+    key_frame_len: int
+    def __init__(self, recipient_epoch_ids: _Optional[_Iterable[bytes]] = ..., metadata_frame_len: _Optional[int] = ..., key_frame_len: _Optional[int] = ...) -> None: ...
+
+class TapeInventoryObjectRow(_message.Message):
+    __slots__ = ("attempt_id", "replica_ordinal", "tape_file_number", "stored_block_count", "object_id", "plaintext", "encrypted")
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    REPLICA_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    TAPE_FILE_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    STORED_BLOCK_COUNT_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    PLAINTEXT_FIELD_NUMBER: _ClassVar[int]
+    ENCRYPTED_FIELD_NUMBER: _ClassVar[int]
+    attempt_id: int
+    replica_ordinal: int
+    tape_file_number: int
+    stored_block_count: int
+    object_id: bytes
+    plaintext: TapeInventoryPlaintextRecovery
+    encrypted: TapeInventoryEncryptedRecovery
+    def __init__(self, attempt_id: _Optional[int] = ..., replica_ordinal: _Optional[int] = ..., tape_file_number: _Optional[int] = ..., stored_block_count: _Optional[int] = ..., object_id: _Optional[bytes] = ..., plaintext: _Optional[_Union[TapeInventoryPlaintextRecovery, _Mapping]] = ..., encrypted: _Optional[_Union[TapeInventoryEncryptedRecovery, _Mapping]] = ...) -> None: ...
+
+class TapeInventoryBotObject(_message.Message):
+    __slots__ = ("tape_file_number", "stored_block_count", "object_id", "state")
+    TAPE_FILE_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    STORED_BLOCK_COUNT_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    tape_file_number: int
+    stored_block_count: int
+    object_id: bytes
+    state: TapeInventoryBotObjectState
+    def __init__(self, tape_file_number: _Optional[int] = ..., stored_block_count: _Optional[int] = ..., object_id: _Optional[bytes] = ..., state: _Optional[_Union[TapeInventoryBotObjectState, str]] = ...) -> None: ...
+
+class TapeInventory(_message.Message):
+    __slots__ = ("tape_uuid", "outcome", "selected_replica_ordinal", "replica_health", "structural_entry_count", "object_row_count", "edition_digest", "layout_digest", "payload_digest", "canonical_map_digest", "inventory_basis", "detail", "recovered_object_count", "unknown_object_count", "incomplete_object_count", "damaged_region_count", "selected_attempt_id")
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    SELECTED_REPLICA_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    REPLICA_HEALTH_FIELD_NUMBER: _ClassVar[int]
+    STRUCTURAL_ENTRY_COUNT_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_ROW_COUNT_FIELD_NUMBER: _ClassVar[int]
+    EDITION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    LAYOUT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CANONICAL_MAP_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    INVENTORY_BASIS_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    RECOVERED_OBJECT_COUNT_FIELD_NUMBER: _ClassVar[int]
+    UNKNOWN_OBJECT_COUNT_FIELD_NUMBER: _ClassVar[int]
+    INCOMPLETE_OBJECT_COUNT_FIELD_NUMBER: _ClassVar[int]
+    DAMAGED_REGION_COUNT_FIELD_NUMBER: _ClassVar[int]
+    SELECTED_ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    outcome: TapeInventoryOutcome
+    selected_replica_ordinal: int
+    replica_health: _containers.RepeatedCompositeFieldContainer[TapeIndexReplicaHealth]
+    structural_entry_count: int
+    object_row_count: int
+    edition_digest: bytes
+    layout_digest: bytes
+    payload_digest: bytes
+    canonical_map_digest: bytes
+    inventory_basis: str
+    detail: str
+    recovered_object_count: int
+    unknown_object_count: int
+    incomplete_object_count: int
+    damaged_region_count: int
+    selected_attempt_id: int
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., outcome: _Optional[_Union[TapeInventoryOutcome, str]] = ..., selected_replica_ordinal: _Optional[int] = ..., replica_health: _Optional[_Iterable[_Union[TapeIndexReplicaHealth, _Mapping]]] = ..., structural_entry_count: _Optional[int] = ..., object_row_count: _Optional[int] = ..., edition_digest: _Optional[bytes] = ..., layout_digest: _Optional[bytes] = ..., payload_digest: _Optional[bytes] = ..., canonical_map_digest: _Optional[bytes] = ..., inventory_basis: _Optional[str] = ..., detail: _Optional[str] = ..., recovered_object_count: _Optional[int] = ..., unknown_object_count: _Optional[int] = ..., incomplete_object_count: _Optional[int] = ..., damaged_region_count: _Optional[int] = ..., selected_attempt_id: _Optional[int] = ...) -> None: ...
+
+class VerifyTapeIndexRequest(_message.Message):
+    __slots__ = ("tape_uuid",)
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    def __init__(self, tape_uuid: _Optional[bytes] = ...) -> None: ...
+
+class TapeIndexSeparationHealth(_message.Message):
+    __slots__ = ("separation_ordinal", "state", "verified_interior_record_count", "detail")
+    class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        TAPE_INDEX_SEPARATION_STATE_UNSPECIFIED: _ClassVar[TapeIndexSeparationHealth.State]
+        TAPE_INDEX_SEPARATION_STATE_VALID: _ClassVar[TapeIndexSeparationHealth.State]
+        TAPE_INDEX_SEPARATION_STATE_INVALID: _ClassVar[TapeIndexSeparationHealth.State]
+        TAPE_INDEX_SEPARATION_STATE_UNKNOWN: _ClassVar[TapeIndexSeparationHealth.State]
+    TAPE_INDEX_SEPARATION_STATE_UNSPECIFIED: TapeIndexSeparationHealth.State
+    TAPE_INDEX_SEPARATION_STATE_VALID: TapeIndexSeparationHealth.State
+    TAPE_INDEX_SEPARATION_STATE_INVALID: TapeIndexSeparationHealth.State
+    TAPE_INDEX_SEPARATION_STATE_UNKNOWN: TapeIndexSeparationHealth.State
+    SEPARATION_ORDINAL_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    VERIFIED_INTERIOR_RECORD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    separation_ordinal: int
+    state: TapeIndexSeparationHealth.State
+    verified_interior_record_count: int
+    detail: str
+    def __init__(self, separation_ordinal: _Optional[int] = ..., state: _Optional[_Union[TapeIndexSeparationHealth.State, str]] = ..., verified_interior_record_count: _Optional[int] = ..., detail: _Optional[str] = ...) -> None: ...
+
+class TapeIndexVerification(_message.Message):
+    __slots__ = ("tape_uuid", "state", "fast_inventory", "detail", "replica_health", "separation_health", "measured_eod_lba", "verified_prefix_tape_file_count", "verified_prefix_record_count", "measured_tape_file_count", "edition_digest", "layout_digest", "payload_digest", "canonical_map_digest", "verification_basis", "recovery_inventory")
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    FAST_INVENTORY_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    REPLICA_HEALTH_FIELD_NUMBER: _ClassVar[int]
+    SEPARATION_HEALTH_FIELD_NUMBER: _ClassVar[int]
+    MEASURED_EOD_LBA_FIELD_NUMBER: _ClassVar[int]
+    VERIFIED_PREFIX_TAPE_FILE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    VERIFIED_PREFIX_RECORD_COUNT_FIELD_NUMBER: _ClassVar[int]
+    MEASURED_TAPE_FILE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    EDITION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    LAYOUT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    CANONICAL_MAP_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    VERIFICATION_BASIS_FIELD_NUMBER: _ClassVar[int]
+    RECOVERY_INVENTORY_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    state: TapeIndexVerificationState
+    fast_inventory: TapeInventory
+    detail: str
+    replica_health: _containers.RepeatedCompositeFieldContainer[TapeIndexReplicaHealth]
+    separation_health: _containers.RepeatedCompositeFieldContainer[TapeIndexSeparationHealth]
+    measured_eod_lba: int
+    verified_prefix_tape_file_count: int
+    verified_prefix_record_count: int
+    measured_tape_file_count: int
+    edition_digest: bytes
+    layout_digest: bytes
+    payload_digest: bytes
+    canonical_map_digest: bytes
+    verification_basis: str
+    recovery_inventory: TapeInventory
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., state: _Optional[_Union[TapeIndexVerificationState, str]] = ..., fast_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., detail: _Optional[str] = ..., replica_health: _Optional[_Iterable[_Union[TapeIndexReplicaHealth, _Mapping]]] = ..., separation_health: _Optional[_Iterable[_Union[TapeIndexSeparationHealth, _Mapping]]] = ..., measured_eod_lba: _Optional[int] = ..., verified_prefix_tape_file_count: _Optional[int] = ..., verified_prefix_record_count: _Optional[int] = ..., measured_tape_file_count: _Optional[int] = ..., edition_digest: _Optional[bytes] = ..., layout_digest: _Optional[bytes] = ..., payload_digest: _Optional[bytes] = ..., canonical_map_digest: _Optional[bytes] = ..., verification_basis: _Optional[str] = ..., recovery_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ...) -> None: ...
+
+class TapeFinalization(_message.Message):
+    __slots__ = ("tape_uuid", "operation_id", "progress", "completed_replicas", "replica_health", "edition_digest", "layout_digest", "outcome", "trigger", "detail", "replica_progress")
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    PROGRESS_FIELD_NUMBER: _ClassVar[int]
+    COMPLETED_REPLICAS_FIELD_NUMBER: _ClassVar[int]
+    REPLICA_HEALTH_FIELD_NUMBER: _ClassVar[int]
+    EDITION_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    LAYOUT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    TRIGGER_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    REPLICA_PROGRESS_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    operation_id: bytes
+    progress: TapeFinalizationProgress
+    completed_replicas: int
+    replica_health: _containers.RepeatedCompositeFieldContainer[TapeIndexReplicaHealth]
+    edition_digest: bytes
+    layout_digest: bytes
+    outcome: TapeFinalizationOutcome
+    trigger: str
+    detail: str
+    replica_progress: _containers.RepeatedCompositeFieldContainer[TapeIndexReplicaProgress]
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., operation_id: _Optional[bytes] = ..., progress: _Optional[_Union[TapeFinalizationProgress, str]] = ..., completed_replicas: _Optional[int] = ..., replica_health: _Optional[_Iterable[_Union[TapeIndexReplicaHealth, _Mapping]]] = ..., edition_digest: _Optional[bytes] = ..., layout_digest: _Optional[bytes] = ..., outcome: _Optional[_Union[TapeFinalizationOutcome, str]] = ..., trigger: _Optional[str] = ..., detail: _Optional[str] = ..., replica_progress: _Optional[_Iterable[_Union[TapeIndexReplicaProgress, _Mapping]]] = ...) -> None: ...
 
 class TapePool(_message.Message):
     __slots__ = ("pool_id", "display_name", "copy_class", "content_class")

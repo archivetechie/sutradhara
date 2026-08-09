@@ -382,6 +382,11 @@ class LibraryServiceStub:
                 request_serializer=layer5__pb2.RetireDriveRequest.SerializeToString,
                 response_deserializer=layer5__pb2.RetireDriveResponse.FromString,
                 _registered_method=True)
+        self.ReinstateDrive = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/ReinstateDrive',
+                request_serializer=layer5__pb2.ReinstateDriveRequest.SerializeToString,
+                response_deserializer=layer5__pb2.ReinstateDriveResponse.FromString,
+                _registered_method=True)
         self.PollDrive = channel.unary_unary(
                 '/remanence.api.v1.LibraryService/PollDrive',
                 request_serializer=layer5__pb2.PollDriveRequest.SerializeToString,
@@ -494,6 +499,12 @@ class LibraryServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def RetireDrive(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReinstateDrive(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -619,6 +630,11 @@ def add_LibraryServiceServicer_to_server(servicer, server):
                     servicer.RetireDrive,
                     request_deserializer=layer5__pb2.RetireDriveRequest.FromString,
                     response_serializer=layer5__pb2.RetireDriveResponse.SerializeToString,
+            ),
+            'ReinstateDrive': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReinstateDrive,
+                    request_deserializer=layer5__pb2.ReinstateDriveRequest.FromString,
+                    response_serializer=layer5__pb2.ReinstateDriveResponse.SerializeToString,
             ),
             'PollDrive': grpc.unary_unary_rpc_method_handler(
                     servicer.PollDrive,
@@ -901,6 +917,33 @@ class LibraryService:
             '/remanence.api.v1.LibraryService/RetireDrive',
             layer5__pb2.RetireDriveRequest.SerializeToString,
             layer5__pb2.RetireDriveResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReinstateDrive(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/ReinstateDrive',
+            layer5__pb2.ReinstateDriveRequest.SerializeToString,
+            layer5__pb2.ReinstateDriveResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1263,6 +1306,16 @@ class CatalogStub:
                 request_serializer=layer5__pb2.GetTapeRequest.SerializeToString,
                 response_deserializer=layer5__pb2.Tape.FromString,
                 _registered_method=True)
+        self.GetTapeInventory = channel.unary_stream(
+                '/remanence.api.v1.Catalog/GetTapeInventory',
+                request_serializer=layer5__pb2.TapeInventoryRequest.SerializeToString,
+                response_deserializer=layer5__pb2.TapeInventoryStreamItem.FromString,
+                _registered_method=True)
+        self.VerifyTapeIndex = channel.unary_unary(
+                '/remanence.api.v1.Catalog/VerifyTapeIndex',
+                request_serializer=layer5__pb2.VerifyTapeIndexRequest.SerializeToString,
+                response_deserializer=layer5__pb2.TapeIndexVerification.FromString,
+                _registered_method=True)
         self.ListTapeFiles = channel.unary_unary(
                 '/remanence.api.v1.Catalog/ListTapeFiles',
                 request_serializer=layer5__pb2.ListTapeFilesRequest.SerializeToString,
@@ -1297,6 +1350,16 @@ class CatalogStub:
                 '/remanence.api.v1.Catalog/ReconcileTape',
                 request_serializer=layer5__pb2.ReconcileTapeRequest.SerializeToString,
                 response_deserializer=layer5__pb2.OperationRef.FromString,
+                _registered_method=True)
+        self.FinalizeTape = channel.unary_unary(
+                '/remanence.api.v1.Catalog/FinalizeTape',
+                request_serializer=layer5__pb2.FinalizeTapeRequest.SerializeToString,
+                response_deserializer=layer5__pb2.TapeFinalization.FromString,
+                _registered_method=True)
+        self.GetTapeFinalization = channel.unary_unary(
+                '/remanence.api.v1.Catalog/GetTapeFinalization',
+                request_serializer=layer5__pb2.GetTapeFinalizationRequest.SerializeToString,
+                response_deserializer=layer5__pb2.TapeFinalization.FromString,
                 _registered_method=True)
         self.ListFilesInObject = channel.unary_unary(
                 '/remanence.api.v1.Catalog/ListFilesInObject',
@@ -1344,6 +1407,24 @@ class CatalogServicer:
 
     def GetTape(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetTapeInventory(self, request, context):
+        """Read the terminal triple index of one exact tape through the same
+        exact-tape/read owner used by ordinary read sessions. This is a bounded
+        fast inventory, not a whole-tape physical verification.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def VerifyTapeIndex(self, request, context):
+        """Perform the slow physical verification: measure EOD, walk the complete
+        prefix, compare its canonical map, and read all three replicas and both
+        typed separation extents. This is distinct from GetTapeInventory.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -1400,6 +1481,22 @@ class CatalogServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def FinalizeTape(self, request, context):
+        """Permanently finalize an exact reconciled tape at its current Object
+        boundary. This is valid below the pool low watermark and bypasses only
+        that automatic trigger; all fit, fence, ownership, and format checks stay
+        mandatory. An accepted request can never reopen the tape for Objects.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetTapeFinalization(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListFilesInObject(self, request, context):
         """Body-format-aware queries. The daemon delegates to the registered
         format adapter (rem-tar-v1, rem-tar-legacy, rem-bru, future).
@@ -1448,6 +1545,16 @@ def add_CatalogServicer_to_server(servicer, server):
                     request_deserializer=layer5__pb2.GetTapeRequest.FromString,
                     response_serializer=layer5__pb2.Tape.SerializeToString,
             ),
+            'GetTapeInventory': grpc.unary_stream_rpc_method_handler(
+                    servicer.GetTapeInventory,
+                    request_deserializer=layer5__pb2.TapeInventoryRequest.FromString,
+                    response_serializer=layer5__pb2.TapeInventoryStreamItem.SerializeToString,
+            ),
+            'VerifyTapeIndex': grpc.unary_unary_rpc_method_handler(
+                    servicer.VerifyTapeIndex,
+                    request_deserializer=layer5__pb2.VerifyTapeIndexRequest.FromString,
+                    response_serializer=layer5__pb2.TapeIndexVerification.SerializeToString,
+            ),
             'ListTapeFiles': grpc.unary_unary_rpc_method_handler(
                     servicer.ListTapeFiles,
                     request_deserializer=layer5__pb2.ListTapeFilesRequest.FromString,
@@ -1482,6 +1589,16 @@ def add_CatalogServicer_to_server(servicer, server):
                     servicer.ReconcileTape,
                     request_deserializer=layer5__pb2.ReconcileTapeRequest.FromString,
                     response_serializer=layer5__pb2.OperationRef.SerializeToString,
+            ),
+            'FinalizeTape': grpc.unary_unary_rpc_method_handler(
+                    servicer.FinalizeTape,
+                    request_deserializer=layer5__pb2.FinalizeTapeRequest.FromString,
+                    response_serializer=layer5__pb2.TapeFinalization.SerializeToString,
+            ),
+            'GetTapeFinalization': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTapeFinalization,
+                    request_deserializer=layer5__pb2.GetTapeFinalizationRequest.FromString,
+                    response_serializer=layer5__pb2.TapeFinalization.SerializeToString,
             ),
             'ListFilesInObject': grpc.unary_unary_rpc_method_handler(
                     servicer.ListFilesInObject,
@@ -1571,6 +1688,60 @@ class Catalog:
             '/remanence.api.v1.Catalog/GetTape',
             layer5__pb2.GetTapeRequest.SerializeToString,
             layer5__pb2.Tape.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetTapeInventory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/remanence.api.v1.Catalog/GetTapeInventory',
+            layer5__pb2.TapeInventoryRequest.SerializeToString,
+            layer5__pb2.TapeInventoryStreamItem.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def VerifyTapeIndex(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.Catalog/VerifyTapeIndex',
+            layer5__pb2.VerifyTapeIndexRequest.SerializeToString,
+            layer5__pb2.TapeIndexVerification.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1760,6 +1931,60 @@ class Catalog:
             '/remanence.api.v1.Catalog/ReconcileTape',
             layer5__pb2.ReconcileTapeRequest.SerializeToString,
             layer5__pb2.OperationRef.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def FinalizeTape(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.Catalog/FinalizeTape',
+            layer5__pb2.FinalizeTapeRequest.SerializeToString,
+            layer5__pb2.TapeFinalization.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetTapeFinalization(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.Catalog/GetTapeFinalization',
+            layer5__pb2.GetTapeFinalizationRequest.SerializeToString,
+            layer5__pb2.TapeFinalization.FromString,
             options,
             channel_credentials,
             insecure,
