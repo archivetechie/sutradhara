@@ -46,6 +46,11 @@ def test_tape_finalization_wire_tags_keep_health_and_progress_distinct() -> None
     assert fields["replica_progress"] == 11
 
 
+def test_tape_state_retired_keeps_authoritative_wire_tag() -> None:
+    state = layer5_pb2.Tape.State.DESCRIPTOR
+    assert state.values_by_name["TAPE_STATE_RETIRED"].number == 10
+
+
 FIXTURE = Path(__file__).parent / "fixtures" / "remanence_objects.json"
 
 
