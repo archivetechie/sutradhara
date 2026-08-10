@@ -1087,6 +1087,7 @@ class Tape(_message.Message):
         TAPE_STATE_FINALIZED_DEGRADED: _ClassVar[Tape.State]
         TAPE_STATE_COMPLETION_UNKNOWN: _ClassVar[Tape.State]
         TAPE_STATE_RECOVERY_REQUIRED: _ClassVar[Tape.State]
+        TAPE_STATE_RETIRED: _ClassVar[Tape.State]
     TAPE_STATE_UNSPECIFIED: Tape.State
     TAPE_STATE_INVENTORIED: Tape.State
     TAPE_STATE_READY: Tape.State
@@ -1097,6 +1098,7 @@ class Tape(_message.Message):
     TAPE_STATE_FINALIZED_DEGRADED: Tape.State
     TAPE_STATE_COMPLETION_UNKNOWN: Tape.State
     TAPE_STATE_RECOVERY_REQUIRED: Tape.State
+    TAPE_STATE_RETIRED: Tape.State
     TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
     VOLTAG_FIELD_NUMBER: _ClassVar[int]
     BODY_FORMAT_FIELD_NUMBER: _ClassVar[int]
