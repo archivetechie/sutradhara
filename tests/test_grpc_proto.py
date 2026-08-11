@@ -2,7 +2,32 @@
 
 from __future__ import annotations
 
-from sutradhara._proto import device_pb2, intake_pb2
+from sutradhara._proto import device_pb2, intake_pb2, layer5_pb2
+
+
+def test_layer5_canonical_plaintext_object_start_round_trips() -> None:
+    object_id = bytes.fromhex("53" * 16)
+    digest = bytes.fromhex("a7" * 32)
+    message = layer5_pb2.AppendObjectMessage(
+        canonical_start=layer5_pb2.AppendCanonicalPlaintextObjectStart(
+            session_id=bytes.fromhex("31" * 16),
+            declared_size_bytes=262_144,
+            expected_plaintext_digest=layer5_pb2.Digest(
+                algorithm="sha256",
+                value=digest,
+            ),
+            source_replay_capability=(
+                layer5_pb2.SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START
+            ),
+            expected_object_id=object_id,
+            expected_caller_object_id="bundle-53",
+        )
+    )
+
+    parsed = layer5_pb2.AppendObjectMessage.FromString(message.SerializeToString())
+    assert parsed.WhichOneof("payload") == "canonical_start"
+    assert parsed.canonical_start.expected_object_id == object_id
+    assert parsed.canonical_start.expected_plaintext_digest.value == digest
 
 
 def test_intake_proto_messages_round_trip_on_server_stubs() -> None:

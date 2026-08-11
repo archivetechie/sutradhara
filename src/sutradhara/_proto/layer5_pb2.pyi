@@ -1963,14 +1963,16 @@ class TapePoolTarget(_message.Message):
     def __init__(self, pool_id: _Optional[str] = ..., library_uuid: _Optional[bytes] = ..., mount_if_needed: _Optional[bool] = ...) -> None: ...
 
 class AppendObjectMessage(_message.Message):
-    __slots__ = ("start", "chunk", "finish")
+    __slots__ = ("start", "chunk", "finish", "canonical_start")
     START_FIELD_NUMBER: _ClassVar[int]
     CHUNK_FIELD_NUMBER: _ClassVar[int]
     FINISH_FIELD_NUMBER: _ClassVar[int]
+    CANONICAL_START_FIELD_NUMBER: _ClassVar[int]
     start: AppendObjectStart
     chunk: AppendObjectChunk
     finish: AppendObjectFinish
-    def __init__(self, start: _Optional[_Union[AppendObjectStart, _Mapping]] = ..., chunk: _Optional[_Union[AppendObjectChunk, _Mapping]] = ..., finish: _Optional[_Union[AppendObjectFinish, _Mapping]] = ...) -> None: ...
+    canonical_start: AppendCanonicalPlaintextObjectStart
+    def __init__(self, start: _Optional[_Union[AppendObjectStart, _Mapping]] = ..., chunk: _Optional[_Union[AppendObjectChunk, _Mapping]] = ..., finish: _Optional[_Union[AppendObjectFinish, _Mapping]] = ..., canonical_start: _Optional[_Union[AppendCanonicalPlaintextObjectStart, _Mapping]] = ...) -> None: ...
 
 class AppendObjectStart(_message.Message):
     __slots__ = ("session_id", "caller_object_id", "caller_metadata", "declared_size_bytes", "body_format_manifest", "expected_content_sha256", "source_replay_capability", "expected_content_digest")
@@ -1998,6 +2000,22 @@ class AppendObjectStart(_message.Message):
     source_replay_capability: SourceReplayCapability
     expected_content_digest: Digest
     def __init__(self, session_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., declared_size_bytes: _Optional[int] = ..., body_format_manifest: _Optional[bytes] = ..., expected_content_sha256: _Optional[bytes] = ..., source_replay_capability: _Optional[_Union[SourceReplayCapability, str]] = ..., expected_content_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
+
+class AppendCanonicalPlaintextObjectStart(_message.Message):
+    __slots__ = ("session_id", "declared_size_bytes", "expected_plaintext_digest", "source_replay_capability", "expected_object_id", "expected_caller_object_id")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    DECLARED_SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_PLAINTEXT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_REPLAY_CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_CALLER_OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: bytes
+    declared_size_bytes: int
+    expected_plaintext_digest: Digest
+    source_replay_capability: SourceReplayCapability
+    expected_object_id: bytes
+    expected_caller_object_id: str
+    def __init__(self, session_id: _Optional[bytes] = ..., declared_size_bytes: _Optional[int] = ..., expected_plaintext_digest: _Optional[_Union[Digest, _Mapping]] = ..., source_replay_capability: _Optional[_Union[SourceReplayCapability, str]] = ..., expected_object_id: _Optional[bytes] = ..., expected_caller_object_id: _Optional[str] = ...) -> None: ...
 
 class AppendObjectChunk(_message.Message):
     __slots__ = ("session_id", "data")
