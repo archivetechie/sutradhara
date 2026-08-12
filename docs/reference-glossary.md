@@ -4,7 +4,7 @@ The internal vocabulary of Sutradhara, as the code actually uses it. Each
 entry names the defining module so you can check the source. Terms that
 appear in older design docs but not in the code are flagged as such.
 
-<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ 5688438 -->
+<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ 8ecf3c8 -->
 ## Receive and intake
 
 **bag / BagIt** — the on-disk form of a received intake: a BagIt 1.0 bag
@@ -65,7 +65,7 @@ check — see "duplicate warning" under
 [Relay and enrollment](#relay-and-enrollment) for the live, pre-registration
 half computed by `receive_novelty.py`.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py src/sutradhara/bundle_group.py src/sutradhara/archive_bundle.py src/sutradhara/archive_sweeper.py @ 8ecf3c8 -->
 ## Catalog identities
 
 **logical asset** — content identity. One row per distinct SHA-256; the
@@ -87,9 +87,59 @@ backend-reported digest that disagrees with the asset hash
 health to `ok`; retention tombstones copies via `deleted_at` instead of
 deleting rows.
 
-**bundle / bundle member** — a synthetic archive object packing one or
-more assets for tape efficiency (`Bundle`, `BundleMember`). Bundles are
-built open, sealed at flush, and stored as bundle-scoped copies.
+**bundle / bundle member** — a synthetic archive object packing members from
+one **bundle group** for tape efficiency (`Bundle`, `BundleMember`). A
+bundle opens, accumulates member rows — each carrying its own
+`artifactclass`, so one bundle can hold members from several classes as
+long as they share a group — and moves `open` → `flushing` → `sealed`, or
+terminally `held` (needs review) or `void` (an empty accumulator whose
+group no live policy derives any more). Sealing records the bundle's
+`Copy` plus one `AssetLocator` per member.
+
+**bundle group** — the actual grouping key for a bundle: the SHA-256
+fingerprint of an artifactclass's sorted active `(pool, representation)`
+set (`compute_bundle_group` in `bundle_group.py`), not a stored or
+declared entity — it's recomputed from `artifactclass_pool`/`pool` rows
+every time. Two classes with identical placement fingerprint the same way
+and therefore share bundles.
+`ArtifactClassPolicyRecord.bundle_group` caches this fingerprint,
+refreshed on policy apply; the sweeper re-derives it live rather than
+trusting the cache, reporting a mismatch as `bundle_group_projection_drift`.
+A bundle's `group_basis` column is the canonical JSON the fingerprint
+hashes, plus the group's frozen effective `target_bytes`/`max_age_seconds`
+(the min age / max size-floor-clamped-target across every class that
+declares the group, so no single class's policy edit can silently starve
+or bloat bundles other classes are also filling).
+
+**accumulator vs. funnel bundle** — most bundles are accumulators: opened
+with `archive_id` unset, at most one open accumulator per bundle group at
+a time (a partial unique index enforces it), filled by `archive submission
+accumulate` / `bundle enqueue`, and sealed only by the sweeper below. A few
+kinds set `archive_id` at creation instead and skip the accumulator
+entirely — **funnel bundles** (include-alone, for a member at or over the
+group's target size; cloud-blob; quarantine) — because there is nothing
+worth waiting to fill.
+
+**naming ladder** — the deterministic collision resolver for a bundle
+member's stored path (`archive_bundle.py::_name_ladder`). It tries the
+requested name, then five hash-prefix-tagged variants, then a terminal
+class-scoped tag; landing on a row with the same artifactclass and content
+hash is the crash-retry idempotency hit, any other occupant advances to
+the next rung. The tag is a storage-name artifact only: a member's
+*logical* name — what a customer manifest prints as `member_name`, what
+restore-by-name resolves through — is always the untagged name recorded on
+the first `StagingTransform` step, never a tagged `stored_member_path`.
+
+**sweeper / bundle-sweep** — the only code that seals bundles
+(`archive_sweeper.py`; CLI `sutra archive bundle sweep`; job kind
+`bundle-sweep`). One pass, in order: reap `flushing` bundles whose flusher
+(`claimed_by`, `hostname:pid`) is no longer alive back to `open`;
+void-seal empty orphan accumulators (group no live policy derives); queue
+non-empty orphans for flush; then flush every bundle — including open
+funnel bundles, which have no flusher of their own — that is full or past
+`max_age_seconds`. It is the only caller of that age check, so a quiet
+class's bundle seals here or never; a single bundle's flush failure is
+recorded and skipped without stopping the rest of the pass.
 
 **asset locator** — the per-asset pointer into a (possibly bundle-scoped)
 copy: pool, member path, representation (`AssetLocator`). It is what
@@ -120,7 +170,7 @@ to override), never deletion or preservation. `sutra unreject` clears it.
 **tag** — a soft-deleted governance label on an asset (`AssetTag`);
 removal tombstones the row for audit.
 
-<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ 8ecf3c8 -->
 ## Policy and placement
 
 **artifactclass** — the policy class of a piece of content (e.g. masters
@@ -160,7 +210,7 @@ uploaded at registration to the `cloud-temp` backend/pool (an encrypted
 RAO of the whole intake). Temporary by design: the retention gate deletes
 it once durable copies are proven.
 
-<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys/registry.py @ 46bb240 -->
+<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 8ecf3c8 -->
 ## Sealing
 
 **representation** — the stored form of a copy: `raw-bytes`,
@@ -176,14 +226,25 @@ back (`sealing/port.py`). Every restore and self-heal goes through an
 opener, so no path can skip verification.
 
 **key epoch / recipient epoch** — one domain-tagged X-Wing recipient identity
-in the local `KeyRegistry`, encoded as `<domain>-<32hex>`. Encrypted copies
-record a list: the copy-domain hot epoch (`archive`, `hdcache`, or `backup`)
-and a public-only `recovery` epoch. Public REMR files seal; locally held
-private material opens through a short-lived `0600` REMP file that is
-best-effort zeroized before removal. Recovery private material stays offline.
-Retiring an epoch stops new seals but preserves its retained material.
+in the local `KeyRegistry`, encoded as `<domain>-<32hex>`. Sutradhara holds
+only a 32-byte random seed per epoch; deriving and validating the actual
+1216-byte X-Wing public key from that seed is delegated to Remanence's `rem`
+CLI through `keys/remanence.py` (`RemRecipientKeyCodec`, wrapping `rem
+archive recipient derive`/`inspect`) — Remanence owns X-Wing key material,
+Sutradhara owns epoch lifecycle and custody, and the codec is the one
+subprocess adapter between those two responsibilities. It accepts only
+exactly one JSON object on that subprocess's stdout, nothing more or less.
+Encrypted copies record a list: the copy-domain hot epoch (`archive`,
+`hdcache`, or `backup`) and a public-only `recovery` epoch. Public REMR
+files seal; locally held private material opens through a short-lived
+`0600` REMP file materialized from the exact seed bytes the registry just
+validated — never re-read from disk in between, closing a window where a
+concurrent write could make the validated and materialized key disagree —
+and best-effort zeroized before removal. Recovery private material stays
+offline. Retiring an epoch stops new seals but preserves its retained
+material.
 
-<!-- code-anchor: src/sutradhara/arrangement.py src/sutradhara/virtual_arrangement.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/arrangement.py src/sutradhara/virtual_arrangement.py src/sutradhara/archive_submission.py @ 8ecf3c8 -->
 ## Arrangement
 
 **arrangement** — the mutable pre-archive workspace: registered masters
@@ -198,7 +259,17 @@ an immutable, validated, ordered `source-map.tsv`
 (`archive_path ← source_path, sha256, size, ingest_item_id`) written
 file-first under `/replica/submissions/<id>/` and mirrored to
 `submission_member` rows. Submissions are terminal; revise by cloning the
-arrangement.
+arrangement. A submission does not build its own archive object: `archive
+submission accumulate` appends its members into the shared bundle-group
+**accumulator** (see [Catalog identities](#catalog-identities)) the same
+way an ordinary intake enqueue does, so a submission and an intake batch
+with matching placement can converge into one bundle. Status walks
+`pending_archive` → `accumulated` (members appended, not yet archive
+evidence) → `archived` — the last step is derived, never written directly:
+true only once every member sits in a sealed, sufficiently replicated
+bundle. Because duplicate content can let one bundle member serve several
+submissions, the `SubmissionMember → BundleMember` link is recorded, not
+derivable, in `bundle_member.source_metadata["submission_links"]`.
 
 **virtual arrangement** — the post-archive, permanently mutable
 organizational view (`VirtualArrangement`). Members key on
@@ -206,7 +277,7 @@ organizational view (`VirtualArrangement`). Members key on
 catalog-only. Older docs call this "virtual segregation" or "VS" — same
 thing, renamed 2026-06-27.
 
-<!-- code-anchor: src/sutradhara/jobs @ 5688438 -->
+<!-- code-anchor: src/sutradhara/jobs @ 8ecf3c8 -->
 ## Jobs and reconciliation
 
 **job / job attempt** — a `Job` row is one unit of work dispatched by
@@ -231,6 +302,14 @@ call `submit` (`restore_open` reopens an agent-delivery restore item
 whose lease expired before the device finished; see "The restore path"
 in `architecture-overview.md`).
 
+**dispatch gate** — a registered, per-job-`kind` release check consulted
+right before the engine claims a pending job (`jobs/registry.py::
+register_dispatch_gate`/`get_dispatch_gate`, `jobs/engine.py::
+_dispatch_gate_allows`). It must be read-only and must fail open — a
+raising gate is treated as "release it." The only gate registered today is
+restore's read-ordering release check (`restore_release_allowed`); see
+"The restore path" in `architecture-overview.md`.
+
 **condition** — the durable `(domain, target_key)` row recording the gap
 between desired and observed (`ReconciliationCondition`). Two axes:
 observation (creates rows; `satisfied` vs `open`) and attempt outcome
@@ -248,7 +327,7 @@ substitute it (e.g. "the `rem.tape.write_object` seam", "the hdcache read
 seam" around `resolve_read_source`). An architecture term, not a data
 model term.
 
-<!-- code-anchor: src/sutradhara/scrub.py src/sutradhara/replication.py src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/scrub.py src/sutradhara/replication.py src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py @ 8ecf3c8 -->
 ## Verification and lifecycle
 
 **scrub** — re-enumerating a backend and reconciling it against the
@@ -308,7 +387,7 @@ reading the whole stored object: a `pfr-index-v1` container-index sidecar
 plus Remanence byte-range reads, with a fallback ladder to whole-member
 restore (`pfr.py`, `sutra pfr`).
 
-<!-- code-anchor: src/sutradhara/hdcache @ 5688438 -->
+<!-- code-anchor: src/sutradhara/hdcache @ 8ecf3c8 -->
 ## HD cache
 
 **hdcache** — the expendable disk cache tier: independent JBOD disks in
@@ -344,7 +423,28 @@ the restore-serving path: after enough cache-read failures within a
 window, the disk is treated as down (skip straight to fallback) until a
 recovery probe succeeds, so a wedged disk isn't retried into the ground.
 
-<!-- code-anchor: src/sutradhara/grpc src/sutradhara/api/routes_devices.py @ 5688438 -->
+**read-ordering plan (release-slot whiteboard)** — the ordered
+`(item_id, tag)` list Sutradhara plans, per tape volume, for one
+`server_local` restore before dispatch (`restore_read_plan_slot`,
+`hdcache/read_ordering.py`; agent-delivered restore has no ordering
+enforcement yet). It is a whiteboard, not a log: a re-plan deletes and
+rewrites a volume's rows wholesale. A `planned` slot's `tag` is the exact
+value sent on Remanence's `PlanBatchRead`; an item the plan never reached
+is an unplanned "tail" slot, ordered last by ascending item id since it's
+never sent on the wire and needs no reproducible order. The **dispatch
+gate** (see [Jobs and reconciliation](#jobs-and-reconciliation)) releases
+a planned slot only once every earlier same-volume slot has settled.
+
+**ordering outcome** — an append-only, never-updated ledger row
+(`restore_ordering_outcome`) recording one ordering decision — phase
+`initial`, `post_mount`, or `read_failure`, and a closed status vocabulary
+(e.g. `ordered`, `unavailable_uncalibrated`, `tag_collision`,
+`rpc_unimplemented`) — for one volume of one restore request. There is no
+stored "was this restore ordered" flag anywhere; it's derived by asking
+whether planned slots or a favorable-status outcome exist for the phase
+you're asking about.
+
+<!-- code-anchor: src/sutradhara/grpc src/sutradhara/api/routes_devices.py src/sutradhara/api/routes_intake_archive.py src/sutradhara/archive_predicate.py @ 8ecf3c8 -->
 ## Relay and enrollment
 
 **agent / helper** — the Rust `sutra-agent` workstation program (separate
@@ -387,7 +487,13 @@ is in flight gets a `source_busy` 409 instead of racing the first.
 
 **archive_state** — an additive read-model field on intake rows
 (`api/routes_intake_archive.py`, `archiveSemantics: 2`) computed with
-ALL-semantics: `none` | `partial` | `complete`, true only when every
-ingest item's content hash is sealed into a bundle or an archived
-submission. Coexists with the older `archived` boolean, which stays
-any-semantics until a later phase retires it.
+ALL-semantics: `none` | `partial` | `complete`. An ingest item counts only
+when its content hash is archive evidence — sitting in a **sealed** bundle
+whose **verified** copy count meets that member's own class `min_copies`
+(`member_archive_evidence` in `archive_predicate.py`); a merely-sealed but
+unverified bundle, or a `Submission.status == archived` flag on its own,
+is not evidence. The legacy `archived` boolean on `Intake` is now a
+projection of this same ALL-semantics predicate, not a separate
+any-semantics compatibility value — the rollout gate that once let it lag
+behind (`SUTRADHARA_ARCHIVED_ALL_SEMANTICS`) was deleted outright once
+`sutra archive predicate-audit` came back clean, not merely defaulted off.

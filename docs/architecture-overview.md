@@ -26,7 +26,7 @@ not a data-loss event.
 
 *Fig. 1 — What talks to what: three entry surfaces over one catalog database, the reconciler enqueuing what the job engine runs, and storage below. The tape-side path is where durable copies are written.*
 
-<!-- code-anchor: src/sutradhara pyproject.toml @ 5688438 -->
+<!-- code-anchor: src/sutradhara pyproject.toml @ 8ecf3c8 -->
 ## The shape of the code
 
 One Python package, `src/sutradhara/`, plus one workspace package. The
@@ -41,7 +41,7 @@ Subpackages:
 | `jobs/` | Job engine (`engine.py`), worker (`worker.py`), counted leases (`leases.py`), retry policy (`config.py`), attempt log (`attempts.py`), handlers (`handlers/`), and the reconciler spine (`reconcilers/`). |
 | `backend/` | The storage port (`port.py`), the factory, and one adapter per backend kind. |
 | `sealing/` | `Sealer`/`Opener` ports and the RAO codec that shells out to the Remanence `rem` CLI. |
-| `keys/` | The local key registry for RAO-AEAD encryption epochs. |
+| `keys/` | The local key registry for RAO-AEAD encryption epochs (`registry.py`), plus the subprocess adapter that delegates X-Wing key derivation and validation to Remanence's `rem` CLI (`remanence.py`). |
 | `hdcache/` | The expendable HD cache disk tier: store layout, fills, placement, walker, lifecycle, repopulation, restore manager, alarms. |
 | `api/` | The FastAPI operator console API (`/api/...`), identity/capability parsing, the live operator-capability cache (`live_capabilities.py`), the durable receive-intent/idempotency store (`store.py`), the card-history projection (`receive_history.py`), and the read models the browser console consumes. |
 | `grpc/` | The mTLS gRPC server: streaming intake (`IntakeService`), the device relay (`DeviceService`), and agent-delivered restore streaming (`RestoreService`, `restore_service.py`); an in-memory live-progress registry for active uploads (`progress.py`); plus enrollment admin. |
@@ -53,9 +53,18 @@ The top-level modules carry most of the domain logic: `intake.py`
 (acceptance boundary), `intake_watch.py` (landing registrar),
 `receive_novelty.py` (the content-novelty estimate behind the receive
 duplicate check), `arrangement.py` and `virtual_arrangement.py`,
-`archive_bundle.py` / `archive_fanout.py` / `archive_submission.py` /
-`archive_restore.py` / `archive_predicate.py` (bundle build, fan-out,
-restore, and the phase-1c ALL-semantics archived predicate), `staging.py`
+`bundle_group.py` (the bundle-group fingerprint: which artifactclasses
+share a crate, and their effective thresholds), `bundle_group_report.py`
+(the operator-facing policy-apply report over that fingerprint),
+`archive_enqueue.py` (enqueue-batch conformance scanning and accumulator
+routing), `archive_bundle.py` (bundle accumulation, the member-naming
+ladder, funnel bundles), `archive_sweeper.py` (the only code that seals
+bundles — reap, void-seal, drain, flush-if-due), `archive_fanout.py`
+(build and write), `archive_submission.py` (submissions append into the
+shared accumulator, never build their own object), `archive_restore.py`,
+`archive_predicate.py` (the single archive-evidence predicate: sealed
+bundle plus verified copies meeting the member's class `min_copies` — no
+rollout gate, no separate any/all-semantics split), `staging.py`
 (pre-fanout transforms), `replication.py` (copy policy and self-heal),
 `restore.py` (the verified whole-copy read primitive), `retention.py`
 (the only code that deletes bytes, gated on independent backend witnesses
@@ -75,7 +84,7 @@ canonical implementation is Python (`core.py`), with a Rust crate under
 (a separate repository) links the same crate. The server imports the
 package as `sutradhara_receive` via the uv workspace.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/catalog/types.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/catalog/types.py src/sutradhara/bundle_group.py @ 8ecf3c8 -->
 ## Data model
 
 Two identities anchor everything:
@@ -115,17 +124,44 @@ mutable pre-archive namespace over master ingest items (status `draft`,
 own clone lineage (`cloned_from_arrangement_id`) when one arrangement is
 created from another. `Submission` + `SubmissionMember` mirror the frozen
 `source-map.tsv` an arrangement freezes into (status `pending_archive` →
-`archived`). Submissions are terminal; you revise by cloning the
-arrangement.
+`accumulated` → `archived`). Submissions are terminal; you revise by
+cloning the arrangement. A submission never builds an archive object of
+its own — see "Archive" under Lifecycle below — so `archived` is derived,
+not written directly: true only once every member sits in a sealed,
+sufficiently replicated bundle.
 
 **Storage**: `Backend` (a registered backend instance; its
 `implementation_family` — tape, d2tape, disk, cloud, memory — is derived
 from the kind by an ORM event listener), `Pool` (the storage-policy
-surface: representation, location, `offsite_gate`, write fence,
-retired flag), `ArtifactClassPool` and `ArtifactClassPolicyRecord`
-(which pools an artifactclass writes to, and the strict policy TOML bound
-to it), `Bundle` + `BundleMember` + `StagingTransform` (synthetic archive
-objects and per-member transforms), and the two grains of stored truth:
+surface: representation, location, `offsite_gate`, write fence, retired
+flag, and `min_object_bytes`, a per-pool tape/object-store efficiency
+floor), `ArtifactClassPool` and `ArtifactClassPolicyRecord` (which pools
+an artifactclass writes to, the strict policy TOML bound to it, and a
+cached `bundle_group` fingerprint — see below), `Bundle` + `BundleMember`
++ `StagingTransform` (synthetic archive objects and per-member
+transforms), and the two grains of stored truth:
+
+A `Bundle` belongs to a **bundle group**: the SHA-256 fingerprint of an
+artifactclass's sorted active `(pool, representation)` set
+(`bundle_group.py::compute_bundle_group`), recomputed from catalog rows
+rather than declared anywhere — two classes with identical placement
+fingerprint the same way and share bundles, so `BundleMember` carries its
+own `artifactclass` (member-grain, not bundle-grain: one bundle can hold
+several classes' material). Most bundles are **accumulators** — opened
+with `archive_id` unset, at most one open accumulator per group at a time
+(a partial unique index), filled by `archive submission accumulate` /
+`bundle enqueue`, and sealed only by the sweeper (see "Archive" under
+Lifecycle). A few kinds are **funnel bundles** instead — include-alone
+(a member at or over the group's target size), cloud-blob, quarantine —
+which set `archive_id` at creation and skip the accumulator because
+there's nothing to wait for. A bundle's status walks `open` → `flushing`
+→ `sealed`, or terminally `held` (needs review) or `void` (an empty
+accumulator whose group no live policy derives any more). Within a
+bundle, the **naming ladder** (`archive_bundle.py::_name_ladder`)
+resolves member-path collisions deterministically; the tag it inserts is
+a storage-name artifact only — a member's logical name, the one a
+customer manifest prints and restore-by-name resolves through, is always
+the untagged name on the first `StagingTransform` step.
 
 - **`Copy`** — one realization of a logical asset *or* a bundle on one
   backend (a check constraint enforces the XOR). Unique on
@@ -281,7 +317,7 @@ insert unknown objects, mark absentees `missing`, flag hash conflicts
 `suspect` — never delete), and **self-heal** (`replication.py`) re-seals
 missing placements from a healthy copy.
 
-<!-- code-anchor: src/sutradhara/jobs @ 5688438 -->
+<!-- code-anchor: src/sutradhara/jobs @ 8ecf3c8 -->
 ## Job engine and reconciler spine
 
 Intent lives in the catalog; jobs are ephemeral attempts. That is the
@@ -293,10 +329,15 @@ priority (lower runs earlier), `not_before`, and an optional `dedupe_key`
 enforced live-only by a partial unique index, so retrying a submit cannot
 double-enqueue while a job is pending or running. Claiming is a guarded
 `PENDING → RUNNING` update, deliberately shaped so a Postgres
-`SKIP LOCKED` implementation can replace it in one place. `JobStatus` has
-six values; `queued` and `cancelled` are declared but reserved — today the
-engine moves jobs between `pending`, `running`, `succeeded`, and
-`failed`. Every run appends an immutable `JobAttempt` transcript.
+`SKIP LOCKED` implementation can replace it in one place. Beyond
+prerequisites, a pending job can also be held back by a registered
+**dispatch gate** (`jobs/registry.py::register_dispatch_gate`) — a
+per-kind, read-only, fail-open release check consulted at claim time. The
+only one registered today is restore's read-ordering release gate; see
+"The restore path" below. `JobStatus` has six values; `queued` and
+`cancelled` are declared but reserved — today the engine moves jobs
+between `pending`, `running`, `succeeded`, and `failed`. Every run appends
+an immutable `JobAttempt` transcript.
 
 **Handlers** (`jobs/handlers/`). Registered kinds: `copy`,
 `hdcache_fill`, `cloud-blob`, `restore`, `validate`, `pfr-index`,
@@ -364,7 +405,7 @@ a batch of targets, process due conditions, and enqueue at most one live
 job per target. Level-triggered and idempotent: running it twice is safe,
 and crashed state converges on the next cycle.
 
-<!-- code-anchor: src/sutradhara/backend src/sutradhara/replication.py src/sutradhara/jobs/registry.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/backend src/sutradhara/replication.py src/sutradhara/jobs/registry.py src/sutradhara/hdcache/read_ordering.py @ 8ecf3c8 -->
 ## Storage backends
 
 The port (`backend/port.py`) is deliberately small: `enumerate()` yields
@@ -413,6 +454,18 @@ every turn still calls `OpenReadSession`, and a lost reservation race is
 simply requeued for another turn — and it degrades to no ordering at all
 if the daemon doesn't support the live-status RPC.
 
+`RemanenceBackend` also exposes a metadata-only read-ordering planner
+surface — `get_tape_facts`, `get_copy_read_span`, `plan_batch_read`
+(wrapping Remanence's `ReadPlanService.PlanBatchRead`) — used only by
+`hdcache/read_ordering.py`'s planning pass (see "The restore path"
+below); a dead daemon can never block restore admission, since these
+calls carry their own short timeouts independent of the read path. Self-
+heal's fan-out (`replication.py::bundle_group_targets`) reads a sealed
+bundle's pool order from its own frozen `group_basis` rather than the
+artifactclass's current membership, and treats a basis pool that's
+vanished from the catalog, or whose live representation has drifted from
+the frozen witness, as a loud invariant error rather than a silent skip.
+
 **Checkpoint vs. WRITTEN: what counts as a durable copy.** Remanence's
 write protocol distinguishes a fast, provisional per-object `WRITTEN`
 append receipt from a `CHECKPOINTED` one, returned only once a batch is
@@ -444,7 +497,7 @@ every write of a given copy, so a legitimate re-write (self-heal
 re-encrypting a placement to a new key epoch, for instance) collided with
 Remanence's own conflict check and was wrongly refused.
 
-<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 46bb240 -->
+<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 8ecf3c8 -->
 ## Sealing and keys
 
 A copy's on-backend form is its **representation**: `raw-bytes`
@@ -461,18 +514,28 @@ keyless and reports format version plus every `{epoch_id, label}` recipient.
 
 Encrypted copies record a **recipient epoch list** from the `KeyRegistry`
 (`keys/registry.py`). Each hot domain (`archive`, `hdcache`, or `backup`)
-has an OS-random X-Wing seed and derived public key; every seal uses that
-domain's public epoch plus the active public-only `recovery` epoch. Public REMR files persist for
-sealing. Opens select a matching locally held private epoch and materialize
-a canonical REMP file as `0600` only for one `rem` call, then best-effort
-zeroize and unlink it. Recovery private keys are minted offline and never
-stored beneath the serving-host registry. X-Wing public derivation and
-canonical key-file validation run through Remanence's hardware-free `archive
-recipient` commands, so Sutradhara does not carry a second cryptographic
-implementation. Epoch IDs are explicitly
-domain-tagged and all seal/open sites assert their domain.
+holds only an OS-random 32-byte seed; every seal uses that domain's public
+epoch plus the active public-only `recovery` epoch. Public REMR files
+persist for sealing. Opens select a matching locally held private epoch
+and materialize a canonical REMP file as `0600` only for one `rem` call —
+from the exact seed bytes the registry just validated, never re-read from
+disk in between, closing a window where a concurrent write could make the
+validated and materialized key disagree — then best-effort zeroize and
+unlink it. Recovery private keys are minted offline and never stored
+beneath the serving-host registry.
 
-<!-- code-anchor: src/sutradhara/hdcache @ 5688438 -->
+Deriving and validating the actual 1216-byte X-Wing public key from a
+seed is delegated entirely to Remanence: `keys/remanence.py`
+(`RemRecipientKeyCodec`) is the one subprocess adapter that calls `rem
+archive recipient derive`/`inspect`, so Sutradhara owns epoch lifecycle
+and custody while Remanence owns X-Wing key material and never carries a
+second cryptographic implementation of it. That subprocess boundary is a
+trust boundary: the codec accepts only exactly one JSON object on the
+`rem` call's stdout — no extra lines, no leading notices, no trailing
+garbage — and raises rather than tolerate anything looser. Epoch IDs are
+explicitly domain-tagged and all seal/open sites assert their domain.
+
+<!-- code-anchor: src/sutradhara/hdcache @ 8ecf3c8 -->
 ## The HD cache tier
 
 `hdcache/` is a speed layer of independent JBOD disks in front of tape.
@@ -501,7 +564,9 @@ degrades silently to tape. Encrypted entries are staged through scratch
 under a separate stream cap, with a per-disk circuit breaker (opens after
 repeated failures within a window) so a wedged disk doesn't get retried
 into the ground. Operator restores enter through `admit_restore_request`
-(capability, privacy, validity checks recorded on the request items).
+(capability, privacy, validity checks recorded on the request items),
+which also triggers the read-ordering planning pass described in "The
+restore path" below.
 
 hdcache serves both restore delivery modes off the same bounded, digest-
 and-size-reverifying chunk producer (`open_verified_cache_plaintext` /

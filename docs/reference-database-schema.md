@@ -15,7 +15,7 @@ production database: use the CLI/API and Alembic migrations. When this
 reference and the models disagree, the models and migrations win; please fix
 this page.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
 ## Reading this reference
 
 - `PK` means primary key. `FK -> table.column` means a foreign key. Fields not
@@ -28,7 +28,7 @@ this page.
   a bundle copy, never both. `asset_locator` is the bridge that lets a member
   of a stored bundle count as coverage for one logical asset.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
 ## Why these boundaries exist
 
 The most important modelling choice is to keep *content identity* separate
@@ -47,20 +47,27 @@ catalog-authoritative ones are explicitly marked so their database backup
 requirements are visible. That trade-off is described in more depth in
 [`architecture-overview.md`](architecture-overview.md).
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
 ## Relationship map
 
 `logical_asset` is the content identity. `ingest_item` records each appearance
 of that content in an `intake`. An `arrangement` turns intake items into a
 mutable archive namespace; a `submission` freezes that namespace. `bundle` is
-the other archive unit: a synthetic object that holds `bundle_member` rows.
-Backends contain policy-facing `pool` rows; `copy` records what was written and
-`asset_locator` connects bundle members to those writes.
+the other archive unit: a synthetic object that accumulates `bundle_member`
+rows for one **bundle group** (classes sharing an active pool/representation
+set) and seals them together. A submission does not build a bundle of its
+own — its members are appended into the same group accumulator an ordinary
+intake enqueue uses, and the link back from a bundle member to every
+submission it satisfies is recorded in `bundle_member.source_metadata`,
+because duplicate content can let one bundle member satisfy several
+submissions at once. Backends contain policy-facing `pool` rows; `copy`
+records what was written and `asset_locator` connects bundle members to
+those writes.
 
 The job, reconciliation, cache, and restore tables share the same database so
 operators can explain a decision without joining separate operational stores.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
 ## Content and intake
 
 ### `logical_asset`
@@ -146,7 +153,7 @@ the same kind of edge being recorded twice for one source/derived pair.
 | `kind` | text | Derivation kind, such as a transcode profile. |
 | `created_at` | time | When the provenance edge was recorded. |
 
-<!-- code-anchor: src/sutradhara/api/store.py src/sutradhara/grpc/store.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/api/store.py src/sutradhara/grpc/store.py @ 8ecf3c8 -->
 ## Receive API and device relay
 
 These tables make duplicate-receive decisions, live source ownership, and
@@ -262,7 +269,7 @@ by the agent restore-delivery path.
 | `dest_root` | text | Destination root path for delivered restores. |
 | `created_at` | time | Grant time. |
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
 ## Arrangement and submission
 
 ### `arrangement`
@@ -311,8 +318,8 @@ cloning the arrangement, never editing this record.
 | `source_map_path` | text | Filesystem path of the frozen source map. |
 | `manifest_digest` | text | SHA-256 hex digest of the source map. |
 | `member_count` | integer | Number of frozen members. |
-| `status` | enum | `pending_archive` or `archived`; defaults to `pending_archive`. |
-| `archived_at` | time, optional | When fan-out completed. |
+| `status` | enum | `pending_archive` → `accumulated` (members appended to a bundle-group accumulator, not yet archive evidence) → `archived`; defaults to `pending_archive`. The last step is derived, not written directly — true only once every member sits in a sealed, sufficiently replicated bundle. |
+| `archived_at` | time, optional | When every member became archive evidence. |
 | `submitted_by` | text | Actor who froze the source map. |
 | `submitted_at` | time | Freeze time. |
 
@@ -331,7 +338,7 @@ The immutable member rows represented by a submission's source map.
 | `size_bytes` | bigint | Member byte length. |
 | `ord` | integer | Stable source-map order. |
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
 ## Storage policy and archive objects
 
 ### `backend`
@@ -367,6 +374,7 @@ talk to storage; a pool describes where a policy is allowed to place data.
 | `accepts_writes` | boolean | Write fence; false prevents new placements. |
 | `retired` | boolean | Whether the pool is retired from ordinary selection. |
 | `media_generation` | text, optional | Media-generation or compatibility label. |
+| `min_object_bytes` | bigint, optional | Per-pool tape/object-store efficiency floor (non-negative). Clamps every bundle group this pool belongs to: a group's effective `target_bytes` can never sit below the strictest member pool's floor. |
 | `created_at` | time | Creation time. |
 
 ### `artifactclass_policy`
@@ -382,6 +390,7 @@ defines routing; this table keeps the validated values the runtime uses.
 | `restore_preference` | json | Ordered pool preference for restore. |
 | `min_copies`, `min_impl_families` | integer | Durability floor; defaults are 3 copies and 2 implementation families. |
 | `staging_config`, `hdcache_config` | json | Validated feature-specific policy sections. |
+| `bundle_group` | text, optional, indexed | Cached fingerprint of this class's sorted active `(pool, representation)` set, refreshed on every policy apply. Classes sharing a fingerprint share bundles. It is a projection, not authoritative — the sweeper re-derives the fingerprint live from `artifactclass_pool`/`pool` rows rather than trusting a possibly-stale value here. |
 | `policy_source` | text, optional | Source file/path used when applied. |
 | `policy_sha256` | text, optional | SHA-256 hex digest of the applied policy. |
 | `updated_at` | time | Last policy application time. |
@@ -436,10 +445,11 @@ unique so an archive object cannot contain two entries at the same path.
 | `id` | integer, PK | Member identifier. |
 | `bundle_id` | text, FK -> `bundle.id` | Parent bundle. |
 | `logical_asset_hash` | hash, FK -> `logical_asset.content_sha256` | Content represented in the bundle. |
+| `artifactclass` | text, indexed | This member's own policy class. Member-grain, not bundle-grain: one bundle's members can span every class that shares its bundle group. |
 | `member_path` | text | Path inside the bundle. |
 | `source_path` | text, optional | Original path used to build it. |
 | `size_bytes`, `file_sha256` | bigint / hash | Stored member size and content hash. |
-| `source_metadata` | json, optional | Source-specific context retained with the member. |
+| `source_metadata` | json, optional | Source-specific context retained with the member, including `submission_links`: a list of `{submission_id, submission_member_id}` pairs recording every submission this member satisfies (duplicate content can let one row satisfy several submissions, so this is a recorded fact, not a derivable one). |
 | `added_at` | time | Addition time. |
 
 ### `staging_transform`
@@ -527,7 +537,7 @@ Root-level metadata for blob-style bundle storage, separate from member-level
 | `archive_id` | text, optional | Backend archive identifier. |
 | `created_at` | time | Creation time. |
 
-<!-- code-anchor: src/sutradhara/catalog/models.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 8ecf3c8 -->
 ## Organization, retention, and review
 
 ### `virtual_arrangement`
@@ -692,7 +702,7 @@ applies only to this ingest or becomes a persisted rule.
 | `persisted_rule` | json, optional | Rule created for future matching input. |
 | `decided_at` | time | Decision time. |
 
-<!-- code-anchor: src/sutradhara/jobs/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/jobs/models.py @ 8ecf3c8 -->
 ## Jobs and reconciliation
 
 ### `job`
@@ -763,7 +773,7 @@ null `reconciliation_condition.last_attempt_id` without removing this lookup.
 | `condition_id` | integer, FK -> `reconciliation_condition.id` | Parked condition; cascades on condition deletion. |
 | `component` | text, indexed | Exact component string used by `record-fix`; unique per condition. |
 
-<!-- code-anchor: src/sutradhara/hdcache/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/hdcache/models.py @ 8ecf3c8 -->
 ## HD cache and restore
 
 The HD cache is expendable operational state. These tables intentionally do
@@ -876,7 +886,52 @@ a stale or duplicate agent session cannot race a live one.
 | `expires_at` | time | Lease expiry. |
 | `created_at`, `updated_at` | time | Lease creation and last renewal time. |
 
-<!-- code-anchor: src/sutradhara/api/live_capabilities.py @ 5688438 -->
+### `restore_read_plan_slot`
+
+The dispatcher's release-slot whiteboard for `server_local` restores: item X
+is the Nth tape read released for volume V under a request's *current* plan.
+Rewritten wholesale, per volume, on every re-plan — it holds live workflow
+state, not history (that is `restore_ordering_outcome` below). Agent-delivered
+restore has no ordering enforcement yet, so it never populates this table.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Slot identifier. |
+| `request_id` | text, FK -> `restore_request.id` | Parent request. |
+| `tape_uuid` | binary(16) | Tape volume this slot orders a read on. |
+| `position` | integer, unique with `request_id`/`tape_uuid` | Release order within the volume. |
+| `item_id` | integer, FK -> `restore_request_item.id`, unique | Restore item this slot releases. An item occupies at most one slot. |
+| `planned` | boolean | Whether this slot came from an adopted plan. |
+| `tag` | binary(64), optional | The exact tag sent on Remanence's `PlanBatchRead`; set only when `planned`. Unique per `(request_id, tag)`. |
+| `start_block`, `end_block` | bigint, optional | Inclusive block span actually requested; set only when `planned`. |
+| `created_at` | time | Slot creation time. |
+
+A check constraint enforces the planned/unplanned shape: a `planned` row must
+carry `tag`/`start_block`/`end_block`; an unplanned row (the volume's
+unspanned tail, ordered last by ascending item id) must carry none of them —
+it was never sent on the wire.
+
+### `restore_ordering_outcome`
+
+An append-only, never-updated ledger row for one read-ordering decision on
+one volume of one restore request. Whether a volume is "ordered right now" is
+derived from `restore_read_plan_slot`, never stored; this table is the
+history of *why* — recorded once per planning phase (`initial`, one
+`post_mount` re-plan, or a `read_failure` re-plan) so an operator can see
+that a restore ran unordered, and the reason.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Outcome identifier. |
+| `request_id` | text, FK -> `restore_request.id` | Parent request. |
+| `tape_uuid` | binary(16) | Volume this decision covers. |
+| `phase` | enum | `initial`, `post_mount`, or `read_failure`. |
+| `status` | enum | One of a closed 19-value vocabulary — e.g. `ok`, `degraded_ascending_fallback` (order adopted); `unavailable_*` (Remanence answered "can't order," a normal recorded result); `rpc_unimplemented`/`rpc_invalid_argument`/`rpc_transport_error` (the plan call itself failed); `tag_collision`, `read_failure_unordered`, `planning_error` (Sutradhara-side decisions). Every value has exactly one writer in `hdcache/read_ordering.py`. |
+| `detail` | text, optional | Operator-visible outcome detail. |
+| `calibration_generation` | bigint, optional | Remanence calibration generation the decision was made against. |
+| `created_at` | time | Decision time. |
+
+<!-- code-anchor: src/sutradhara/api/live_capabilities.py @ 8ecf3c8 -->
 ## Operator capability cache
 
 Restore admission trusts an HTTP session's capability headers as a snapshot,
@@ -906,7 +961,7 @@ capability)` is unique.
 | `operator` | text, FK -> `operator_capability_sync.operator`, unique with `capability` | Granted operator. |
 | `capability` | enum, unique with `operator` | One of `can_view`, `can_receive`, `can_restore`, `can_logs`, `can_admin`, `can_restore_p2`, `can_restore_p3`. |
 
-<!-- code-anchor: src/sutradhara/catalog/models.py alembic @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py alembic @ 8ecf3c8 -->
 ## Integrity constraints and migration practice
 
 Besides the primary and foreign keys shown above, the implementation enforces
