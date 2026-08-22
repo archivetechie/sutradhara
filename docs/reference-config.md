@@ -15,7 +15,7 @@ Types: "bool" variables accept `1`, `true`, `yes`, `on` and `0`, `false`,
 raise on non-numeric values. An empty string is treated the same as unset
 in the hdcache/placement helpers.
 
-<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/jobs/config.py src/sutradhara/jobs/worker_lock.py src/sutradhara/logs_store.py src/sutradhara/retention.py @ 46bb240 -->
+<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/jobs/config.py src/sutradhara/jobs/worker_lock.py src/sutradhara/logs_store.py src/sutradhara/retention.py @ 072cb02 -->
 ## Core
 
 | Variable | Default | Purpose |
@@ -42,7 +42,7 @@ older RAOR/RAOP registry cannot be relabelled: move it intact to a protected
 backup and initialize new epochs, or perform a separately designed migration
 when old encrypted objects must remain readable.
 
-<!-- code-anchor: src/sutradhara/cli/api.py src/sutradhara/api/app.py src/sutradhara/api/sources.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/api.py src/sutradhara/api/app.py src/sutradhara/api/sources.py @ 072cb02 -->
 ## Operator API and servers
 
 | Variable | Default | Purpose |
@@ -66,7 +66,7 @@ CPU sharing. These variables control that wrapper.
 | `SUTRADHARA_RESOURCE_CONTROL_REQUIRE` | unset (off) | When truthy (`1`, `on`, `true`, `yes`, `require`, `required`), a failed capability probe raises `ResourceControlUnavailable` instead of degrading to plain execution. Degradation is otherwise logged once per process. |
 | `SUTRADHARA_RESOURCE_CONTROL_PROBE_TIMEOUT` | `2.0` | Seconds allowed for the `systemd-run` capability probe, clamped to at least `0.1`. Non-numeric values silently fall back to `2.0`. |
 
-<!-- code-anchor: src/sutradhara/hdcache/fill.py src/sutradhara/hdcache/manager.py src/sutradhara/hdcache/placement.py src/sutradhara/hdcache/repopulate.py src/sutradhara/hdcache/lifecycle.py src/sutradhara/hdcache/store.py src/sutradhara/artifactclass_policy.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/hdcache/fill.py src/sutradhara/hdcache/manager.py src/sutradhara/hdcache/placement.py src/sutradhara/hdcache/repopulate.py src/sutradhara/hdcache/lifecycle.py src/sutradhara/hdcache/store.py src/sutradhara/artifactclass_policy.py @ 072cb02 -->
 ## HD cache tier
 
 The hdcache subsystem reads its knobs at call time through
@@ -146,7 +146,7 @@ prove it is looking at the disk the catalog thinks it is.
 | `SUTRADHARA_PFR_BLOB_CACHE_BYTES` | `21474836480` (20 GiB) | Size of the local LRU cache of fetched archive blobs that serves partial reads. Must be non-negative; `0` disables caching. |
 | `SUTRADHARA_PFR_SCRATCH_ROOT` | `/var/lib/replica/pfr-scratch` | Scratch directory for PFR cuts and the blob cache. |
 
-<!-- code-anchor: src/sutradhara/jobs/handlers/cloud_blob.py src/sutradhara/jobs/handlers/transcode.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/jobs/handlers/cloud_blob.py src/sutradhara/jobs/handlers/transcode.py @ 072cb02 -->
 ## Test and harness knobs
 
 Set only in tests and CI; never in production.
@@ -178,7 +178,7 @@ the path is configurable via the backend row's `device_env_path`).
 | `D2TAPE_STINIT_SCRIPT` | unset | Optional stinit script passed to the CLI. |
 | `D2TAPE_JAR` | newest `~/d2tape/d2tape-cli/target/d2tape-cli-*-jar-with-dependencies.jar` | Path to the d2tape CLI fat jar. Env-only (not read from `device.env`). |
 
-<!-- code-anchor: src/sutradhara/jobs/worker_lock.py src/sutradhara/keys/registry.py @ 46bb240 -->
+<!-- code-anchor: src/sutradhara/jobs/worker_lock.py src/sutradhara/keys/registry.py @ 072cb02 -->
 ## Standard variables Sutradhara also honors
 
 | Variable | Used for |

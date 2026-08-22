@@ -42,7 +42,7 @@ Local append-only destinations are available through the library API for
 hermetic tests and DR drills. They use the same names and collision rules as the
 SSH destination; they are not a second exporter.
 
-<!-- code-anchor: src/sutradhara/retention_journal.py src/sutradhara/cli/retention.py src/sutradhara/catalog/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/retention_journal.py src/sutradhara/cli/retention.py src/sutradhara/catalog/models.py @ 072cb02 -->
 ## Checking and corrections
 
 `sutra retention journal check` walks every entry and footer, verifies sequence

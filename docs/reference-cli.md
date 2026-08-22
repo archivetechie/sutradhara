@@ -163,7 +163,7 @@ Record a prepare profile for the derivation reconciler. Flags:
 code registry in `src/sutradhara/jobs/reconcilers/profiles.py`; the
 derivation reconciler picks the desired state up on its next cycle.
 
-<!-- code-anchor: src/sutradhara/cli/arrangement.py src/sutradhara/arrangement.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/arrangement.py src/sutradhara/arrangement.py @ 072cb02 -->
 ## sutra arrangement
 
 Arrange registered masters into an archive namespace, then freeze the
@@ -181,7 +181,7 @@ workspaces; submissions are terminal (revise by cloning, not resubmitting).
 
 `create`, `list`, `show`, and `submit` accept `--json`.
 
-<!-- code-anchor: src/sutradhara/cli/archive.py src/sutradhara/archive_restore.py src/sutradhara/artifactclass_policy.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/archive.py src/sutradhara/archive_restore.py src/sutradhara/artifactclass_policy.py @ 072cb02 -->
 ## sutra archive
 
 Artifactclass policy, durable bundles, held-bundle review, archiving frozen
@@ -203,6 +203,15 @@ error. The policy document names the placements (pools), bundling targets,
 restore preference order, and optional staging/hdcache/durability sections;
 applying it also validates the durability floor (default: at least 3 copies
 across at least 2 implementation families).
+
+After applying, the command prints a bundle-group readback: for every bundle
+group the artifactclass now belongs to (and any orphan groups no live class
+derives any more), it prints the group's fingerprint, canonical basis, member
+artifactclasses, pools, effective target bytes/max-age versus each member's
+declared values, any near-miss cohorts, any fields where member classes
+disagree, derived-vs-backfilled bundle counts, and warnings. Bundle groups are
+derived from shared storage placement, never declared, so this printout is
+the operator's only read-back of which classes now share a crate.
 
 ### sutra archive bundle enqueue ARTIFACTCLASS ASSET_HASH_HEX SOURCE_PATH
 
@@ -316,7 +325,7 @@ the held summary.
 | `--why TEXT` | | Reason for the review decision. |
 | `--who TEXT` | | Reviewer/operator name. |
 
-<!-- code-anchor: src/sutradhara/cli/virtual.py src/sutradhara/virtual_arrangement.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/virtual.py src/sutradhara/virtual_arrangement.py @ 072cb02 -->
 ## sutra virtual, tag, reject, unreject
 
 Post-archive organization and governance. Virtual arrangements are named,
@@ -354,7 +363,7 @@ Catalog queries. Currently one subcommand:
 - `sutra list assets` — list logical assets. `--limit INTEGER` (default
   `50`, `0` = unlimited), `--json`.
 
-<!-- code-anchor: src/sutradhara/cli/reconcile.py src/sutradhara/jobs/reconcilers @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/reconcile.py src/sutradhara/jobs/reconcilers @ 072cb02 -->
 ## sutra reconcile DOMAIN / record-fix
 
 Run one bounded reconcile cycle for DOMAIN: observe desired state, discover
@@ -381,7 +390,7 @@ The reopen audit message records the local actor and supplied note.
 | `--reason TEXT` | | Filter `--reopen-blocked` by reason. |
 | `--note TEXT` | | Required with `record-fix`; audited operator note. |
 
-<!-- code-anchor: src/sutradhara/cli/jobs.py src/sutradhara/cli/worker.py src/sutradhara/jobs @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/jobs.py src/sutradhara/cli/worker.py src/sutradhara/jobs @ 072cb02 -->
 ## sutra jobs and sutra worker
 
 Direct job control and the worker loop. Most jobs are created by
@@ -439,7 +448,7 @@ are marked `MISSING`. Scrub never deletes. This is the working proof of the
 rebuildable-index principle. Flags: `--backend TEXT` (required, a
 registered backend name).
 
-<!-- code-anchor: src/sutradhara/cli/hdcache.py src/sutradhara/hdcache @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/hdcache.py src/sutradhara/hdcache @ 072cb02 -->
 ## sutra hdcache
 
 Manage the expendable HD cache disk tier: enrollment and lifecycle of
@@ -468,7 +477,7 @@ operation is reversible from the archive.
 | `rebuild` | | Rebuild untrusted cache rows from self-describing disk filenames (rows stay untrusted until cross-checked against the catalog). `--json`. |
 | `drill status` | `[DISK_ID]` | Show remaining/refilled counts and ETA for dead-disk repopulation drills. `--json`. |
 
-<!-- code-anchor: src/sutradhara/cli/retention.py src/sutradhara/retention.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/retention.py src/sutradhara/retention.py @ 072cb02 -->
 ## sutra retention and sutra offsite
 
 The only place in the system that deletes bytes. Both stages require current

@@ -580,7 +580,7 @@ today — a cache miss there defers to disk-only archive candidates and
 explicitly refuses tape (see below). One producer, two callers, so a cache
 read is never less verified for one delivery mode than the other.
 
-<!-- code-anchor: src/sutradhara/restore.py src/sutradhara/archive_restore.py src/sutradhara/hdcache/manager.py src/sutradhara/grpc/restore_service.py proto/restore.proto @ 5688438 -->
+<!-- code-anchor: src/sutradhara/restore.py src/sutradhara/archive_restore.py src/sutradhara/hdcache/manager.py src/sutradhara/hdcache/read_ordering.py src/sutradhara/grpc/restore_service.py proto/restore.proto proto/layer5.proto @ 072cb02 -->
 ## The restore path
 
 Bytes reach a requester in one of two ways, sharing the same gates,
@@ -647,6 +647,42 @@ also serializes drive access through the advisory `(library, bay)` queue
 described under "Storage backends" so two restores don't fight over one
 physical drive.
 
+**Read ordering across a restore request.** Server-local restore requests
+get a request-level planning pass (`hdcache/read_ordering.py`, run inside
+`admit_restore_request` right after items are accepted, before dispatch —
+this is the "read-ordering planning pass" referenced above and under "The
+HD cache tier"). It predicts, per queued item, whether serving will hit
+cache or tape using the same choice logic serving itself uses; cache-bound
+items are left alone. Tape-bound items are grouped by physical volume and
+planned with one call to Remanence's `ReadPlanService.PlanBatchRead` per
+volume (via `RemanenceBackend`'s `get_tape_facts`/`get_copy_read_span`/
+`plan_batch_read`, wrapping the `GetTape`/`GetObject` metadata RPCs and the
+`ReadPlanService` added in the layer5.proto bump), persisting the ordered
+list to `restore_read_plan_slot` — the release-slot whiteboard. A
+registered job-engine dispatch gate (`restore_release_allowed`, "The only
+one registered today," referenced under "Job engine and reconciler spine")
+then releases each volume's items in that planned order: a planned slot
+only once every earlier slot on its volume has settled, an unplanned tail
+item once all planned slots have settled, and an item outside any plan
+releases exactly as it did before this feature existed. Two runtime hooks
+(`note_restore_item_outcome`, called from the `restore` job handler after
+serving) keep the plan honest: a post-mount re-plan, run at most once per
+volume per job when the initial plan was made before the tape was
+calibrated, and a read-failure re-plan, which starts a fresh plan from the
+last completed target's end (or skips re-planning entirely if nothing on
+that volume completed yet, since the head's position is then unknown).
+Every step degrades to unordered dispatch rather than failing or
+deadlocking a restore — including a gRPC `UNIMPLEMENTED` from an older
+Remanence daemon without `ReadPlanService` — with the outcome (adopted,
+degraded, or why not) recorded on `restore_ordering_outcome`, the
+append-only ordering-outcome ledger. This is purely a scheduling
+optimization for restores sharing one physical tape's serialized head: it
+never gates or blocks correctness, and the fixity chain in step 3 above is
+unaffected either way. Agent-delivered restore has no ordering enforcement
+yet — `delivery_mode=agent` requests skip the planning pass entirely. There
+is no CLI, UI, or API surface for either table; the ordering outcome is
+visible only via a direct database query or worker logs.
+
 **Agent delivery in detail.** The receiving device calls
 `WatchAssignments` to see its queued restore items (mTLS-scoped to its
 own device id), then `OpenRestore(restore_request_item_id, lease_token?,
@@ -675,7 +711,7 @@ ranges let ffmpeg cut a clip without reading the whole object, through a
 bounded local blob cache, with a fallback ladder down to whole-member
 restore.
 
-<!-- code-anchor: src/sutradhara/api src/sutradhara/grpc proto @ 5688438 -->
+<!-- code-anchor: src/sutradhara/api src/sutradhara/grpc proto @ 072cb02 -->
 ## Operator surface
 
 The HTTP API (`api/app.py`, FastAPI) binds to a Unix socket behind a
@@ -769,7 +805,7 @@ projection of this predicate — and neither is a sealed bundle whose copies
 were never measured. `sutra archive predicate-audit` reports the intakes
 that sit only partially covered.
 
-<!-- code-anchor: src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 072cb02 -->
 ## Deletion evidence and the retention witness gate
 
 Retention already refused to delete anything until every recipe copy was
@@ -822,19 +858,30 @@ history into a tamper-evident evidence journal are in
 `sutra retention journal export|check|correct` /
 `sutra retention sitrep` in [`reference-cli.md`](reference-cli.md).
 
-<!-- code-anchor: alembic @ 5688438 -->
+<!-- code-anchor: alembic @ 072cb02 -->
 ## Migrations
 
-Schema history is alembic, in `alembic/`: 35 migrations in a single
+Schema history is alembic, in `alembic/`: 38 migrations in a single
 linear chain from `ea7254a77d7a` (the initial logical-asset/backend/copy
-tables) to head `f2a3b4c5d6e7` (retention-journal checkpoint and
-supersession targets). The three revisions immediately before head layer
-in the deletion-evidence work: `c8d2e4f6a1b3` (indexed component
+tables) to head `c2d3e4f5a6b7` (`bundle.claimed_by`, the flush
+compare-and-set/reaper identity column). The three revisions immediately
+before head layer in the bundle-groups and restore-read-ordering work:
+`a4b5c6d7e8f9` (restore read ordering: `restore_read_plan_slot`, the
+persisted per-volume release-order whiteboard, and
+`restore_ordering_outcome`, the append-only ordering-outcome ledger),
+`b9c8d7e6f5a4` (bundle-groups schema: `bundle_member.artifactclass`
+backfilled from the bundle's own former class column,
+`bundle.bundle_group`/`group_basis` — the derived fingerprint and its
+frozen open-time witness — `artifactclass_policy.bundle_group`,
+`pool.min_object_bytes`, dropping the now-obsolete
+`bundle.artifactclass`/`ruleset`/`expect` columns, and admitting
+`accumulated` to submission status), and `c2d3e4f5a6b7` itself. Before
+that, the deletion-evidence work: `c8d2e4f6a1b3` (indexed component
 snapshots for parked reconciliation conditions — the state `sutra
 reconcile record-fix` matches against), `e1f2a3b4c5d6` (deletion
 evidence: the `verify_receipt` table, `integrity_hash_provenance` and
 related `copy` columns, the `tombstoned`/`abandoned` retention states,
-and expanded `retention_event` vocabulary), and `f2a3b4c5d6e7` itself
+and expanded `retention_event` vocabulary), and `f2a3b4c5d6e7`
 (`retention_journal_checkpoint` and append-only `retention_event`
 correction targets). Before that: `b7c1d9e3f5a2` (restore-agent protocol
 foundations: device/scope/grant tables, per-item delivery checkpoints,
@@ -848,8 +895,13 @@ job table, pools, staging transforms, leases, the reconciler spine,
 arrangements and submissions, virtual arrangements, retention, gRPC
 intake and relay state, the hdcache tier, restore admission and
 progress, copy-grain durability, the agent-delivery restore protocol,
-and now the deletion-evidence witness gate and retention evidence
-journal. `alembic/env.py` resolves the database from `SUTRADHARA_DB_URL`
+the deletion-evidence witness gate and retention evidence journal, and
+now restore read ordering and bundle-group accumulation. Migration
+`b9c8d7e6f5a4` also runs a hard pre-flight gate — it aborts with an
+actionable error, rather than transforming data, if two currently-open
+per-class accumulators already share a bundle-group fingerprint, since
+the operator must drain one through the old per-class path first.
+`alembic/env.py` resolves the database from `SUTRADHARA_DB_URL`
 exactly like the runtime. `sutra db init` (create-all) exists for
 development; production schema changes go through `alembic upgrade
 head`.
