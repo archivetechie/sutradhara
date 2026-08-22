@@ -31,7 +31,7 @@ data-loss event.
 - Not a vendor product like Miria — it is first-party software designed to
   outlive its dependencies.
 
-<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 072cb02 -->
 ## Status
 
 Beyond the v0.1 anchor spec (see [`docs/spec-v0.1.md`](docs/spec-v0.1.md) for
@@ -109,7 +109,7 @@ The Rust workstation helper (`sutra-agent`, tray + headless binaries) lives
 in its own repository and links `packages/sutradhara-receive` as a crate;
 an earlier in-tree `packages/sutra-agent` was removed when it moved.
 
-<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ 5688438 -->
+<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ 072cb02 -->
 ## Install & verify
 
 Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/).
@@ -136,7 +136,7 @@ init`. [`docs/guide-quickstart.md`](docs/guide-quickstart.md) walks a full
 local tour, including a catalog rebuild from a fixture backend and one
 receive → register pass, plus troubleshooting.
 
-<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 072cb02 -->
 ## CLI overview
 
 `sutra --help` lists every command group; each group has its own `--help`,
@@ -151,6 +151,7 @@ order:
 | `sutra prepare` | Record a derivation profile (transcode/index) for an intake. |
 | `sutra arrangement` | Arrange registered masters into an archive namespace and submit a frozen source-map. |
 | `sutra archive` | Manage artifactclass policy, build/review durable bundles, archive submissions, restore assets. |
+| `sutra review` | Shortcut for `sutra archive review`: show or record a held-bundle review decision. |
 | `sutra virtual` | Post-archive, permanently-mutable views: place, move, exclude, restore members by virtual path. |
 | `sutra tag` / `reject` / `unreject` | Content-level governance: tags and reject markers (gate restore, never delete). |
 | `sutra list` | Query the catalog (`list assets`). |
@@ -171,7 +172,7 @@ CLI adapter for the legacy d2 tape library), `s3` (cloud), `ssh_disk`
 accepted by `backends add` (`rem_disk`, `plain_disk`, `gcs`, `azure_blob`)
 are reserved names without adapters yet.
 
-<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 072cb02 -->
 ## Configuration
 
 Beyond `SUTRADHARA_DB_URL`, the environment variables most operators need:
@@ -192,7 +193,7 @@ Every other knob — hdcache tuning, resource control, PFR, the d2tape
 backend, test fakes — is documented with exact defaults in
 [`docs/reference-config.md`](docs/reference-config.md).
 
-<!-- code-anchor: src/sutradhara/sealing @ 5688438 -->
+<!-- code-anchor: src/sutradhara/sealing @ 072cb02 -->
 ## Scenario O — sealed RAO copies
 
 Scenario O seals per-copy representations before storage instead of storing

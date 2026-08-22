@@ -22,7 +22,7 @@ The CLI lands in the virtualenv as `.venv/bin/sutra`. The examples below
 assume `.venv/bin` is on your `PATH` or you prefix each command with
 `uv run`.
 
-<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/cli/db.py src/sutradhara/cli/admin.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/cli/db.py src/sutradhara/cli/admin.py @ 072cb02 -->
 ## A scratch catalog
 
 Without `SUTRADHARA_DB_URL`, sutra writes `./sutradhara.db` in whatever
@@ -37,7 +37,7 @@ sutra admin doctor   # readiness report; WARNs are fine for this tour
 `doctor` will warn that the `rem` binary and the key registry are missing
 unless you have Remanence built. Nothing in this quickstart needs them.
 
-<!-- code-anchor: src/sutradhara/cli/backends.py src/sutradhara/cli/scrub.py tests/test_cli.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/backends.py src/sutradhara/cli/scrub.py tests/test_cli.py @ 072cb02 -->
 ## Rebuild a catalog from a backend
 
 This is the system's founding claim — the catalog is derived state,
@@ -110,7 +110,7 @@ flow. The maintainer's end-to-end truth lives in the separate `~/system`
 scenario harness (per `CLAUDE.md`), which drives this repo as an editable
 dependency.
 
-<!-- code-anchor: src/sutradhara/cli/admin.py src/sutradhara/jobs/worker_lock.py src/sutradhara/resource_control.py src/sutradhara/jobs/reconcilers/conditions.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/cli/admin.py src/sutradhara/jobs/worker_lock.py src/sutradhara/resource_control.py src/sutradhara/jobs/reconcilers/conditions.py @ 072cb02 -->
 ## Troubleshooting
 
 **"Remanence CLI not found."** Archive/restore/seal paths resolve the

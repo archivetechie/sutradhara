@@ -1,6 +1,6 @@
 # The life of a shot — a guided tour of the Sutradhara data model
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 072cb02 -->
 > **Scope note.** Most of this walkthrough describes tables that exist in this
 > repository today — verify any specific field against
 > [`reference-database-schema.md`](reference-database-schema.md), the
