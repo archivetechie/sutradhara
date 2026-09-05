@@ -98,7 +98,7 @@ def test_run_rem_archive_build_uses_current_flags(
         recipient.write_bytes(b"public")
     inputs = [tmp_path / "intake"]
     inputs[0].mkdir()
-    output = tmp_path / "out.rao"
+    output = tmp_path / "out.rem-object"
     manifest = tmp_path / "manifest.json"
     captured: dict[str, list[str]] = {}
 
@@ -111,7 +111,7 @@ def test_run_rem_archive_build_uses_current_flags(
             "text": True,
             "check": False,
         }
-        output.write_bytes(b"rao bytes")
+        output.write_bytes(b"rem-object bytes")
         return subprocess.CompletedProcess(
             cmd,
             0,
@@ -143,7 +143,7 @@ def test_run_rem_archive_build_uses_current_flags(
     assert "--encrypt" not in cmd
     assert "--key-file" not in cmd
     assert "--key-id" not in cmd
-    assert result.stored_digest == hashlib.sha256(b"rao bytes").digest()
+    assert result.stored_digest == hashlib.sha256(b"rem-object bytes").digest()
 
 
 def test_run_rem_archive_build_uses_map_flags(
@@ -158,14 +158,14 @@ def test_run_rem_archive_build_uses_map_flags(
         "archive_path\tsource_path\tsha256\tsize\tingest_item_id\n",
         encoding="utf-8",
     )
-    output = tmp_path / "out.rao"
+    output = tmp_path / "out.rem-object"
     captured: dict[str, list[str]] = {}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         captured["cmd"] = cmd
         assert kwargs["role"] == "medium"
         assert kwargs["cpu_lease"] is None
-        output.write_bytes(b"map rao bytes")
+        output.write_bytes(b"map rem-object bytes")
         return subprocess.CompletedProcess(
             cmd,
             0,
@@ -200,7 +200,7 @@ def test_run_rem_archive_build_rejects_map_inputs_mix(tmp_path: Path) -> None:
             inputs=[tmp_path / "input"],
             map_path=tmp_path / "source-map.tsv",
             source_root=tmp_path,
-            output_path=tmp_path / "out.rao",
+            output_path=tmp_path / "out.rem-object",
         )
 
 
@@ -209,7 +209,7 @@ def test_run_rem_archive_build_failure_includes_command_and_stderr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rem = _write_executable(tmp_path / "rem")
-    output = tmp_path / "out.rao"
+    output = tmp_path / "out.rem-object"
 
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         assert kwargs["role"] == "medium"

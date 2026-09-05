@@ -18,6 +18,10 @@ contracts; migration notes accompany incompatible changes.
 
 ### Changed
 
+- Adopted REM-OBJECT and REM-ENCRYPT terminology throughout the code, catalog,
+  new cache paths, CLI, and documentation. The database migration rewrites the
+  obsolete pre-production catalog labels and dependent bundle-group
+  fingerprints; affected expendable cache entries are invalidated for refill.
 - Partial-file restore is an optional integration, so a standalone checkout can
   install and run without the separate `format-anatomy` repository.
 - Remanence gRPC clients reject TCP until an mTLS client path exists.

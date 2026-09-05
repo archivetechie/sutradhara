@@ -1,4 +1,4 @@
-"""Remanence RAO CLI sealing tests.
+"""Remanence REM-OBJECT CLI sealing tests.
 
 The unit tests drive a fake `rem` binary so the sealing port's command
 construction, digest mapping, inspection, cleanup, and pass-through behavior
@@ -20,11 +20,11 @@ import pytest
 from sutradhara.keys import KeyRegistry
 from sutradhara.keys.remanence import RemRecipientKeyCodec
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import (
-    RAO_CHUNK_SIZE,
-    RaoCliOpener,
-    RaoCliSealer,
-    inspect_rao,
+from sutradhara.sealing.rem_object import (
+    REM_OBJECT_CHUNK_SIZE,
+    RemObjectCliOpener,
+    RemObjectCliSealer,
+    inspect_rem_object,
     resolve_rem_bin,
 )
 from tests.key_helpers import registry_with_recovery
@@ -125,7 +125,7 @@ def _fake_rem_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 obj = Path(opt("--object")).read_bytes()
                 encrypted = obj.startswith(b"REMO")
                 if encrypted and opt("--private-key") is None:
-                    print("error: encrypted RAO extract requires --private-key", file=sys.stderr)
+                    print("error: encrypted REM-OBJECT extract requires --private-key", file=sys.stderr)
                     sys.exit(1)
                 body = json.loads((obj[4:] if encrypted else obj).decode())
                 dest = Path(opt("--dest"))
@@ -152,35 +152,35 @@ def _sha256(path: Path) -> bytes:
     return hashlib.sha256(path.read_bytes()).digest()
 
 
-def test_rao_cli_sealer_plain_round_trip_with_fake_cli(
+def test_rem_object_cli_sealer_plain_round_trip_with_fake_cli(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _fake_rem_bin(tmp_path, monkeypatch)
     source = tmp_path / "asset.bin"
-    source.write_bytes(b"rao plain round trip")
+    source.write_bytes(b"rem-object plain round trip")
     source_digest = _sha256(source)
-    sealer = RaoCliSealer(KeyRegistry(tmp_path / "keys"))
-    opener = RaoCliOpener(KeyRegistry(tmp_path / "keys"))
+    sealer = RemObjectCliSealer(KeyRegistry(tmp_path / "keys"))
+    opener = RemObjectCliOpener(KeyRegistry(tmp_path / "keys"))
 
-    with sealer.seal(source, Representation.RAO_PLAIN_V1) as result:
+    with sealer.seal(source, Representation.REM_OBJECT_V1) as result:
         sealed_path = result.sealed_path
         sealed_parent = sealed_path.parent
         assert result.plaintext_digest == source_digest
         assert result.stored_digest == _sha256(sealed_path)
-        inspection = inspect_rao(sealed_path)
-        assert inspection.representation is Representation.RAO_PLAIN_V1
+        inspection = inspect_rem_object(sealed_path)
+        assert inspection.representation is Representation.REM_OBJECT_V1
         assert inspection.format_version is None
         assert inspection.recipient_epochs == ()
-        assert inspection.report["chunk_size"] == RAO_CHUNK_SIZE
-        with opener.open(sealed_path, Representation.RAO_PLAIN_V1) as opened:
+        assert inspection.report["chunk_size"] == REM_OBJECT_CHUNK_SIZE
+        with opener.open(sealed_path, Representation.REM_OBJECT_V1) as opened:
             assert opened.read_bytes() == source.read_bytes()
 
     assert not sealed_path.exists()
     assert not sealed_parent.exists()
 
 
-def test_rao_cli_sealer_uses_configured_work_dir(
+def test_rem_object_cli_sealer_uses_configured_work_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -188,33 +188,33 @@ def test_rao_cli_sealer_uses_configured_work_dir(
     source = tmp_path / "asset.bin"
     source.write_bytes(b"work dir")
     work_dir = tmp_path / "scratch"
-    sealer = RaoCliSealer(KeyRegistry(tmp_path / "keys"), work_dir=work_dir)
+    sealer = RemObjectCliSealer(KeyRegistry(tmp_path / "keys"), work_dir=work_dir)
 
-    with sealer.seal(source, Representation.RAO_PLAIN_V1) as result:
+    with sealer.seal(source, Representation.REM_OBJECT_V1) as result:
         assert result.sealed_path.is_relative_to(work_dir)
         assert result.sealed_path.exists()
 
     assert work_dir.is_dir()
 
 
-def test_rao_cli_sealer_encrypted_round_trip_and_key_id_with_fake_cli(
+def test_rem_object_cli_sealer_encrypted_round_trip_and_key_id_with_fake_cli(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _fake_rem_bin(tmp_path, monkeypatch)
     source = tmp_path / "asset.bin"
-    source.write_bytes(b"rao encrypted round trip")
+    source.write_bytes(b"rem-object encrypted round trip")
     registry, recovery = registry_with_recovery(tmp_path / "keys")
     epoch = registry.create_epoch()
-    sealer = RaoCliSealer(registry)
-    opener = RaoCliOpener(registry)
+    sealer = RemObjectCliSealer(registry)
+    opener = RemObjectCliOpener(registry)
 
-    with sealer.seal(source, Representation.RAO_AEAD_V1, key_epoch=epoch) as result:
+    with sealer.seal(source, Representation.REM_ENCRYPT_V1, key_epoch=epoch) as result:
         sealed_path = result.sealed_path
         assert result.plaintext_digest == _sha256(source)
         assert result.stored_digest == _sha256(sealed_path)
-        inspection = inspect_rao(sealed_path)
-        assert inspection.representation is Representation.RAO_AEAD_V1
+        inspection = inspect_rem_object(sealed_path)
+        assert inspection.representation is Representation.REM_ENCRYPT_V1
         assert inspection.format_version == 2
         assert [item.label for item in inspection.recipient_epochs] == [
             epoch.key_id,
@@ -223,24 +223,24 @@ def test_rao_cli_sealer_encrypted_round_trip_and_key_id_with_fake_cli(
         assert result.recipient_epochs == (epoch.key_id, recovery.key_id)
         with opener.open(
             sealed_path,
-            Representation.RAO_AEAD_V1,
+            Representation.REM_ENCRYPT_V1,
             recipient_epochs=result.recipient_epochs,
         ) as opened:
             assert opened.read_bytes() == source.read_bytes()
 
 
-def test_rao_cli_sealer_cleans_temp_file_on_body_exception(
+def test_rem_object_cli_sealer_cleans_temp_file_on_body_exception(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _fake_rem_bin(tmp_path, monkeypatch)
     source = tmp_path / "asset.bin"
     source.write_bytes(b"cleanup")
-    sealer = RaoCliSealer(KeyRegistry(tmp_path / "keys"))
+    sealer = RemObjectCliSealer(KeyRegistry(tmp_path / "keys"))
     paths: dict[str, Path] = {}
 
     def force_body_exception() -> None:
-        with sealer.seal(source, Representation.RAO_PLAIN_V1) as result:
+        with sealer.seal(source, Representation.REM_OBJECT_V1) as result:
             paths["sealed_path"] = result.sealed_path
             paths["sealed_parent"] = result.sealed_path.parent
             raise RuntimeError("forced")
@@ -252,11 +252,11 @@ def test_rao_cli_sealer_cleans_temp_file_on_body_exception(
     assert not paths["sealed_parent"].exists()
 
 
-def test_rao_cli_sealer_passes_through_d2tar_representation(tmp_path: Path) -> None:
+def test_rem_object_cli_sealer_passes_through_d2tar_representation(tmp_path: Path) -> None:
     source = tmp_path / "asset.bin"
     source.write_bytes(b"d2tar plaintext")
-    sealer = RaoCliSealer(KeyRegistry(tmp_path / "keys"))
-    opener = RaoCliOpener(KeyRegistry(tmp_path / "keys"))
+    sealer = RemObjectCliSealer(KeyRegistry(tmp_path / "keys"))
+    opener = RemObjectCliOpener(KeyRegistry(tmp_path / "keys"))
     source_digest = _sha256(source)
 
     with sealer.seal(source, Representation.D2TAR_RAW) as result:
@@ -269,37 +269,37 @@ def test_rao_cli_sealer_passes_through_d2tar_representation(tmp_path: Path) -> N
         assert opened == source
 
 
-def test_rao_real_binary_round_trips_and_v2_recipients(tmp_path: Path) -> None:
+def test_rem_object_real_binary_round_trips_and_v2_recipients(tmp_path: Path) -> None:
     rem_bin = _rem_bin_or_skip()
     source = tmp_path / "asset.bin"
-    source.write_bytes(b"real remanence rao integration")
+    source.write_bytes(b"real remanence rem-object integration")
     registry, recovery = registry_with_recovery(
         tmp_path / "keys",
         recipient_codec=RemRecipientKeyCodec(rem_bin),
     )
     epoch = registry.create_epoch()
-    sealer = RaoCliSealer(registry)
-    opener = RaoCliOpener(registry)
+    sealer = RemObjectCliSealer(registry)
+    opener = RemObjectCliOpener(registry)
 
-    with sealer.seal(source, Representation.RAO_PLAIN_V1) as plain:
+    with sealer.seal(source, Representation.REM_OBJECT_V1) as plain:
         plain_bytes = plain.sealed_path.read_bytes()
         assert plain.plaintext_digest == _sha256(source)
         assert plain.stored_digest == _sha256(plain.sealed_path)
-        assert inspect_rao(plain.sealed_path).representation is Representation.RAO_PLAIN_V1
-        with opener.open(plain.sealed_path, Representation.RAO_PLAIN_V1) as opened:
+        assert inspect_rem_object(plain.sealed_path).representation is Representation.REM_OBJECT_V1
+        with opener.open(plain.sealed_path, Representation.REM_OBJECT_V1) as opened:
             assert opened.read_bytes() == source.read_bytes()
 
-    with sealer.seal(source, Representation.RAO_PLAIN_V1) as resealed_plain:
+    with sealer.seal(source, Representation.REM_OBJECT_V1) as resealed_plain:
         assert resealed_plain.sealed_path.read_bytes() == plain_bytes
 
-    with sealer.seal(source, Representation.RAO_AEAD_V1, key_epoch=epoch) as encrypted:
+    with sealer.seal(source, Representation.REM_ENCRYPT_V1, key_epoch=epoch) as encrypted:
         encrypted_bytes = encrypted.sealed_path.read_bytes()
-        encrypted_path = tmp_path / "encrypted.rao"
+        encrypted_path = tmp_path / "encrypted.rem-object"
         encrypted_path.write_bytes(encrypted_bytes)
         assert encrypted.plaintext_digest == _sha256(source)
         assert encrypted.stored_digest == _sha256(encrypted.sealed_path)
-        inspection = inspect_rao(encrypted.sealed_path)
-        assert inspection.representation is Representation.RAO_AEAD_V1
+        inspection = inspect_rem_object(encrypted.sealed_path)
+        assert inspection.representation is Representation.REM_ENCRYPT_V1
         assert inspection.format_version == 2
         assert encrypted.recipient_epochs == (epoch.key_id, recovery.key_id)
         assert [item.epoch_id for item in inspection.recipient_epochs] == [
@@ -308,7 +308,7 @@ def test_rao_real_binary_round_trips_and_v2_recipients(tmp_path: Path) -> None:
         ]
         with opener.open(
             encrypted.sealed_path,
-            Representation.RAO_AEAD_V1,
+            Representation.REM_ENCRYPT_V1,
             recipient_epochs=encrypted.recipient_epochs,
         ) as opened:
             assert opened.read_bytes() == source.read_bytes()

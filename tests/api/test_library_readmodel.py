@@ -464,7 +464,7 @@ def _add_cache_entry(
         content_sha256=digest,
         artifactclass="s-masters",
         disk_id=disk_id,
-        relpath=f"{digest.hex()}.rao",
+        relpath=f"{digest.hex()}.rem-object",
         size_bytes=size_bytes,
         state=state,
         lost_origin_disk_id=lost_origin_disk_id,
@@ -493,7 +493,7 @@ def _add_backend_pool(
     pool = Pool(
         id=pool_id,
         backend_id=backend.id,
-        representation="RAO_PLAIN",
+        representation="REM_OBJECT_V1",
         location="test",
         tier="archive",
     )

@@ -45,7 +45,7 @@ def _add_placement(s, artifactclass: str) -> None:
     s.flush()
     pool_id = f"pool-{artifactclass}"
     if s.get(Pool, pool_id) is None:
-        s.add(Pool(id=pool_id, backend_id=backend.id, representation="rao-plain-v1"))
+        s.add(Pool(id=pool_id, backend_id=backend.id, representation="rem-object-v1"))
     s.add(ArtifactClassPool(artifactclass=artifactclass, pool_id=pool_id, active=True))
     s.flush()
 
@@ -71,7 +71,7 @@ def test_appledouble_merge_records_transform_and_consumes_sidecar(
     with session_scope(engine) as s:
         policy = ArtifactClassPolicyRecord(
             artifactclass="photo",
-            ruleset="rao.photo.v1",
+            ruleset="rem-object.photo.v1",
             expect="messy",
             target_bytes=1024,
             max_age_seconds=60,
@@ -121,7 +121,7 @@ def test_malformed_appledouble_holds_open_bundle(
     with session_scope(engine) as s:
         policy = ArtifactClassPolicyRecord(
             artifactclass="photo",
-            ruleset="rao.photo.v1",
+            ruleset="rem-object.photo.v1",
             expect="messy",
             target_bytes=1024,
             max_age_seconds=60,
@@ -157,7 +157,7 @@ def test_appledouble_sidecar_source_holds_instead_of_enqueuing(
     with session_scope(engine) as s:
         policy = ArtifactClassPolicyRecord(
             artifactclass="photo",
-            ruleset="rao.photo.v1",
+            ruleset="rem-object.photo.v1",
             expect="messy",
             target_bytes=1024,
             max_age_seconds=60,

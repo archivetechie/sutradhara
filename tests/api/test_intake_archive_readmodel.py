@@ -760,7 +760,10 @@ def test_archive_asset_uses_asset_locator_origin_rule_and_locator_shaping(
             bundle,
             backend,
             pool,
-            locator={"media_id": "VOL001", "object_path": "/var/lib/replica/private/bundle.rao"},
+            locator={
+                "media_id": "VOL001",
+                "object_path": "/var/lib/replica/private/bundle.rem-object",
+            },
             health=CopyHealth.SUSPECT,
             last_checked_at=base + dt.timedelta(hours=2),
         )
@@ -772,7 +775,7 @@ def test_archive_asset_uses_asset_locator_origin_rule_and_locator_shaping(
                 bundle_id=bundle.id,
                 native_locator={"first_chunk_lba": 7, "debug_path": "/srv/archive/member.mov"},
                 member_path="clip.mov",
-                representation="RAO_PLAIN",
+                representation="REM_OBJECT_V1",
                 created_at=base + dt.timedelta(hours=2),
             )
         )
@@ -802,7 +805,7 @@ def test_archive_asset_uses_asset_locator_origin_rule_and_locator_shaping(
     assert admin_copy["backend_kind"] == "rem_tape"
     assert admin_copy["tier"] == "self_describing"
     assert admin_copy["health"] == "suspect"
-    assert admin_copy["representation"] == "RAO_PLAIN"
+    assert admin_copy["representation"] == "REM_OBJECT_V1"
     assert admin_copy["locator_summary"] == "media VOL001"
     admin_text = json.dumps(admin_body)
     assert "/var/lib" not in admin_text
@@ -1043,7 +1046,7 @@ def _add_backend_pool(
     pool = Pool(
         id=pool_id,
         backend_id=backend.id,
-        representation="RAO_PLAIN",
+        representation="REM_OBJECT_V1",
         location="test",
         tier="archive",
     )

@@ -190,7 +190,7 @@ def test_add_bundle_copy_records_bundle_without_logical_asset(engine: Engine) ->
             Pool(
                 id="archive-pool",
                 backend_id=backend_id,
-                representation="rao-plain-v1",
+                representation="rem-object-v1",
             )
         )
         s.flush()
@@ -202,7 +202,7 @@ def test_add_bundle_copy_records_bundle_without_logical_asset(engine: Engine) ->
             native_locator=locator,
             integrity_hash=_hash("bundle"),
             source=CopySource.INGEST,
-            storage_metadata={"representation": "rao-plain-v1"},
+            storage_metadata={"representation": "rem-object-v1"},
         )
         second, second_created = add_bundle_copy(
             s,

@@ -130,7 +130,7 @@ def test_outstanding_checkpoint_batch_tracking_survives_failed_run_restart(
                 batch_id="batch-a",
                 provisional_ordinal=ordinal,
                 caller_object_id=f"object-{ordinal}",
-                source=f"/staging/object-{ordinal}.rao",
+                source=f"/staging/object-{ordinal}.rem-object",
             )
         raise RuntimeError("checkpoint stream disconnected")
 

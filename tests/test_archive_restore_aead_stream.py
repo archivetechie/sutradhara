@@ -1,4 +1,4 @@
-"""Integration tests for bounded, fail-closed RAO AEAD plan restores."""
+"""Integration tests for bounded, fail-closed REM-OBJECT AEAD plan restores."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopyS
 from sutradhara.keys.remanence import RemRecipientKeyCodec
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE, RemObjectCliSealer
 from tests.bundle_group_helpers import bundle_kwargs
 from tests.key_helpers import registry_with_recovery
 
@@ -214,7 +214,7 @@ else:
     return path
 
 
-def _synthetic_rao_prefix() -> bytes:
+def _synthetic_rem_object_prefix() -> bytes:
     """Return framing sufficient for Python to bound input to the Rust query."""
 
     header = bytearray(128)
@@ -241,21 +241,21 @@ def _transient_member(
         bundle_id="bundle-ranged",
         member_path=member_path,
         native_locator={
-            "first_chunk_lba": plaintext_start // RAO_CHUNK_SIZE,
+            "first_chunk_lba": plaintext_start // REM_OBJECT_CHUNK_SIZE,
             "size_bytes": plaintext_len,
         },
-        representation=Representation.RAO_AEAD_V1.value,
+        representation=Representation.REM_ENCRYPT_V1.value,
     )
     return copy, locator
 
 
 def test_aead_member_reads_only_rust_covering_stored_range(tmp_path: Path) -> None:
     plaintext = b"byte-identical member plaintext"
-    plaintext_start = RAO_CHUNK_SIZE
+    plaintext_start = REM_OBJECT_CHUNK_SIZE
     stored_start = 1024
     stored_end = stored_start + len(plaintext)
     stored = bytearray(b"x" * 8192)
-    prefix = _synthetic_rao_prefix()
+    prefix = _synthetic_rem_object_prefix()
     stored[: len(prefix)] = prefix
     stored[stored_start:stored_end] = plaintext
     backend = _StreamingObjectBackend()
@@ -274,7 +274,7 @@ def test_aead_member_reads_only_rust_covering_stored_range(tmp_path: Path) -> No
     private_key = tmp_path / "private.raop"
     private_key.write_bytes(b"test-private-key")
 
-    with archive_restore_module._open_rao_aead_plaintext_stream(
+    with archive_restore_module._open_rem_encrypt_plaintext_stream(
         backend=backend,
         copy=copy,
         locator=locator,
@@ -291,7 +291,7 @@ def test_aead_member_reads_only_rust_covering_stored_range(tmp_path: Path) -> No
 def test_encrypted_bundle_reads_sum_of_member_covering_ranges(tmp_path: Path) -> None:
     members = [b"first encrypted member", b"second member", b"third payload"]
     stored = bytearray(b"x" * 32_768)
-    prefix = _synthetic_rao_prefix()
+    prefix = _synthetic_rem_object_prefix()
     stored[: len(prefix)] = prefix
     query_ranges: dict[str, tuple[int, int, int, int]] = {}
     locators: list[AssetLocator] = []
@@ -300,7 +300,7 @@ def test_encrypted_bundle_reads_sum_of_member_covering_ranges(tmp_path: Path) ->
         stored_end = stored_start + len(plaintext)
         stored[stored_start:stored_end] = plaintext
         member_path = f"member-{index}.bin"
-        plaintext_start = RAO_CHUNK_SIZE * index
+        plaintext_start = REM_OBJECT_CHUNK_SIZE * index
         query_ranges[member_path] = (
             plaintext_start,
             len(plaintext),
@@ -321,7 +321,7 @@ def test_encrypted_bundle_reads_sum_of_member_covering_ranges(tmp_path: Path) ->
         object_id="bundle-object",
         stored_size=len(stored),
         member_path="unused",
-        plaintext_start=RAO_CHUNK_SIZE,
+        plaintext_start=REM_OBJECT_CHUNK_SIZE,
         plaintext_len=1,
     )
     helper = _write_ranged_stream_helper(tmp_path / "bundle-rem", query_ranges)
@@ -330,7 +330,7 @@ def test_encrypted_bundle_reads_sum_of_member_covering_ranges(tmp_path: Path) ->
 
     restored: list[bytes] = []
     for locator in locators:
-        with archive_restore_module._open_rao_aead_plaintext_stream(
+        with archive_restore_module._open_rem_encrypt_plaintext_stream(
             backend=backend,
             copy=copy,
             locator=locator,
@@ -368,7 +368,7 @@ def _install_candidates(
             Pool(
                 id=pool_id,
                 backend_id=backend_row.id,
-                representation=Representation.RAO_AEAD_V1.value,
+                representation=Representation.REM_ENCRYPT_V1.value,
             )
             for pool_id in pool_ids
         )
@@ -397,7 +397,7 @@ def _install_candidates(
             session,
             "aead-test",
             ArtifactClassPolicy(
-                ruleset="rao.aead.stream.test",
+                ruleset="rem-object.aead.stream.test",
                 placements=tuple(PlacementPolicy(pool_id) for pool_id in pool_ids),
                 bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
                 restore_preference=tuple(pool_ids),
@@ -416,7 +416,7 @@ def _install_candidates(
                 native_locator=native,
                 native_locator_key=locator_key(native),
                 storage_metadata={
-                    "representation": Representation.RAO_AEAD_V1.value,
+                    "representation": Representation.REM_ENCRYPT_V1.value,
                     "recipient_epochs": list(recipient_epochs),
                     "stored_size_bytes": len(stored),
                 },
@@ -436,14 +436,14 @@ def _install_candidates(
                     member_path="asset.bin",
                     native_locator={
                         "member_path": "asset.bin",
-                        # RAO reserves chunk 0 for the pax/rao header; the member payload
-                        # begins at chunk 1 (member_byte_base = 1 * RAO_CHUNK_SIZE), matching
+                        # REM-OBJECT reserves chunk 0 for the pax/rem-object header; the member payload
+                        # begins at chunk 1 (member_byte_base = 1 * REM_OBJECT_CHUNK_SIZE), matching
                         # the real sealed object's data_offset. (Was 0 — which sliced the
                         # framing, not the member, and only surfaced against a real rem.)
                         "first_chunk_lba": 1,
                         "size_bytes": len(logical),
                     },
-                    representation=Representation.RAO_AEAD_V1.value,
+                    representation=Representation.REM_ENCRYPT_V1.value,
                 )
             )
         return backend_row.id, copy_ids
@@ -463,9 +463,9 @@ def test_real_encrypted_copy_round_trips_through_unbuffered_plan(
     )
     epoch = registry.create_epoch()
     backend = _StreamingObjectBackend()
-    with RaoCliSealer(registry).seal(
+    with RemObjectCliSealer(registry).seal(
         source,
-        Representation.RAO_AEAD_V1,
+        Representation.REM_ENCRYPT_V1,
         key_epoch=epoch,
     ) as sealed:
         stored = sealed.sealed_path.read_bytes()

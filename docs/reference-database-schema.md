@@ -367,7 +367,7 @@ talk to storage; a pool describes where a policy is allowed to place data.
 |---|---|---|
 | `id` | text, PK | Pool identifier. |
 | `backend_id` | integer, FK -> `backend.id` | Owning backend. |
-| `representation` | text | Stored representation, for example raw bytes or RAO. |
+| `representation` | text | Stored representation, for example raw bytes or REM-OBJECT. |
 | `location` | text | Operator-defined location label. |
 | `offsite_gate` | boolean | Whether offsite confirmation gates retention. |
 | `tier` | text | Policy tier label. |
@@ -493,7 +493,7 @@ an individual-file copy.
 | `pool_id` | text, optional FK -> `pool.id` | Policy pool when the copy is policy-routed; null for legacy or discovered copies without one. |
 | `native_locator` | json | Adapter-specific address for read, verify, and delete. |
 | `native_locator_key` | text | Canonical indexed locator; unique with `backend_id`. |
-| `storage_metadata` | json | Representation-specific facts, such as RAO metadata. |
+| `storage_metadata` | json | Representation-specific facts, such as REM-OBJECT metadata. |
 | `integrity_hash` | hash | Required digest of the stored representation. |
 | `integrity_hash_provenance` | enum | `locally_computed` or `backend_discovered`. |
 | `health` | enum | `ok`, `suspect`, `corrupt`, or `missing`; defaults to `ok`. |
@@ -808,7 +808,7 @@ logical asset across the current cache inventory.
 | `relpath` | text | Relative path beneath the cache mount. |
 | `size_bytes` | bigint | Cached byte count. |
 | `state` | enum | `filling`, `present`, or `lost`. |
-| `representation` | enum | `raw-bytes` or `rao-aead-v1`. |
+| `representation` | enum | `raw-bytes` or `rem-encrypt-v1`. |
 | `key_epoch` | text, optional | Encryption-key epoch for encrypted cache content. |
 | `stored_digest` | hash, optional | Digest of stored representation. |
 | `trusted` | boolean | Whether the cache result is trusted for use. |

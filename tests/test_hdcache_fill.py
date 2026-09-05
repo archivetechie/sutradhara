@@ -461,7 +461,7 @@ def test_hdcache_convergence_marks_privacy_raise_and_retired_epoch_lost(
     monkeypatch.setenv("SUTRADHARA_KEY_REGISTRY_DIR", str(registry.registry_dir))
     monkeypatch.setenv("SUTRADHARA_HDCACHE_SCRATCH_ROOT", str(tmp_path / "scratch"))
     monkeypatch.setenv("SUTRADHARA_HDCACHE_HMAC_SECRET_HEX", TEST_HDCACHE_HMAC_SECRET.hex())
-    monkeypatch.setattr("sutradhara.hdcache.fill.RaoCliSealer", FakeSealer)
+    monkeypatch.setattr("sutradhara.hdcache.fill.RemObjectCliSealer", FakeSealer)
     monkeypatch.setattr(_hdcache_reconciler, "fill_config_from_env", lambda: _config(tmp_path))
     raw_source = tmp_path / "raw.mov"
     raw_source.write_bytes(b"raw")
@@ -755,18 +755,20 @@ class FakeSealer:
         key_epoch: KeyEpoch | None = None,
         work_dir: Path | str | None = None,
     ) -> Iterator[SealResult]:
-        assert representation is Representation.RAO_AEAD_V1
+        assert representation is Representation.REM_ENCRYPT_V1
         assert key_epoch is not None
         assert key_epoch.key_id.startswith("hdcache-")
         assert work_dir is not None
         source = Path(source_path)
-        sealed = Path(work_dir) / f"sealed-{hashlib.sha256(source.read_bytes()).hexdigest()}.rao"
+        sealed = (
+            Path(work_dir) / f"sealed-{hashlib.sha256(source.read_bytes()).hexdigest()}.rem-object"
+        )
         sealed.write_bytes(b"sealed:" + source.read_bytes())
         yield SealResult(
             sealed_path=sealed,
             stored_digest=hashlib.sha256(sealed.read_bytes()).digest(),
             plaintext_digest=hashlib.sha256(source.read_bytes()).digest(),
-            representation=Representation.RAO_AEAD_V1,
+            representation=Representation.REM_ENCRYPT_V1,
         )
 
 

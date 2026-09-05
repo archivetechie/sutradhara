@@ -1,4 +1,4 @@
-"""Durable RAO archive bundle bookkeeping.
+"""Durable REM-OBJECT archive bundle bookkeeping.
 
 This module owns the sutradhara-side accumulator state: one open bundle per
 **bundle group** (the derived fingerprint of a class's active pool set — see

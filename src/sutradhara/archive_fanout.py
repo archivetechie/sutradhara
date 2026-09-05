@@ -1,8 +1,8 @@
-"""RAO archive bundle flush and fan-out orchestration.
+"""REM-OBJECT archive bundle flush and fan-out orchestration.
 
 Sutradhara owns policy, accumulator state, fan-out, and catalog records. The
 archive mechanics are delegated through ``ArchiveBuilder``: remanence implements
-the canonical RAO builder, while tests can inject an in-process deterministic
+the canonical REM-OBJECT builder, while tests can inject an in-process deterministic
 builder. d2 copies are materialized as ordinary tar files here because they are
 the rem-independent shelf copy.
 """
@@ -71,7 +71,7 @@ from sutradhara.replication import (
 )
 from sutradhara.resource_control import run_managed
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 from sutradhara.structured_logs import emit_structured_event
 
 LOGGER = logging.getLogger(__name__)
@@ -316,7 +316,7 @@ class LocalArchiveBuilder:
 
     The object format is intentionally simple and self-describing:
     ``8-byte header length`` + JSON header + concatenated member bytes. It is
-    not RAO; production callers should use ``RemArchiveBuilder``.
+    not REM-OBJECT; production callers should use ``RemArchiveBuilder``.
 
     WARNING: this builder reads member bytes from ``members`` directly and
     IGNORES ``map_path``/``source_root``/``map_sha256`` — a map defect cannot
@@ -387,7 +387,7 @@ class LocalArchiveBuilder:
             members=tuple(built_members),
             manifest_path=manifest_path,
             recipient_epochs=(key_epoch, self._TEST_RECOVERY_EPOCH)
-            if representation is Representation.RAO_AEAD_V1 and key_epoch is not None
+            if representation is Representation.REM_ENCRYPT_V1 and key_epoch is not None
             else (),
         )
 
@@ -429,7 +429,7 @@ class RemArchiveBuilder:
         source_root: Path | None = None,
         map_sha256: str | None = None,
     ) -> BuildArtifact:
-        output_path = work_dir / f"{bundle.id}-{representation.value}.rao"
+        output_path = work_dir / f"{bundle.id}-{representation.value}.rem-object"
         manifest_path = work_dir / f"{bundle.id}-{representation.value}.manifest.json"
         expected_recipient_epochs: tuple[str, ...] = ()
         if map_path is None:
@@ -438,9 +438,9 @@ class RemArchiveBuilder:
             )
         if source_root is None:
             raise ArchiveFanoutError("map archive build requires source_root")
-        if representation is Representation.RAO_AEAD_V1:
+        if representation is Representation.REM_ENCRYPT_V1:
             if key_epoch is None:
-                raise ArchiveFanoutError("encrypted RAO archive build requires key_epoch")
+                raise ArchiveFanoutError("encrypted REM-OBJECT archive build requires key_epoch")
             try:
                 assert_key_epoch_domain(
                     key_epoch,
@@ -481,11 +481,11 @@ class RemArchiveBuilder:
         manifest = _normalized_rem_build_report(result.stdout_report)
         recipient_epochs = (
             recipient_registry_ids(result.stdout_report, failure_label="rem archive build")
-            if representation is Representation.RAO_AEAD_V1
+            if representation is Representation.REM_ENCRYPT_V1
             else ()
         )
         if (
-            representation is Representation.RAO_AEAD_V1
+            representation is Representation.REM_ENCRYPT_V1
             and recipient_epochs != expected_recipient_epochs
         ):
             raise ArchiveFanoutError(
@@ -512,12 +512,13 @@ class RemArchiveBuilder:
         work_dir: Path,
     ) -> bytes:
         """Extract one member from the stored copy through rem for verification."""
-        if representation not in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
+        if representation not in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}:
             raise ArchiveFanoutError(
                 f"RemArchiveBuilder cannot verify representation {representation.value!r}"
             )
         object_path = (
-            work_dir / f"verify-{hashlib.sha256(member.member_path.encode()).hexdigest()}.rao"
+            work_dir
+            / f"verify-{hashlib.sha256(member.member_path.encode()).hexdigest()}.rem-object"
         )
         _materialize_copy_to_path(backend, copy_locator, storage_metadata, object_path)
         verify_id = hashlib.sha256(member.member_path.encode() + b"\0" + member.file_sha256)
@@ -541,8 +542,8 @@ class RemArchiveBuilder:
             f"0:{member.size_bytes}",
             "--overwrite",
         ]
-        if representation is Representation.RAO_PLAIN_V1:
-            cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
+        if representation is Representation.REM_OBJECT_V1:
+            cmd.extend(["--chunk-size", str(REM_OBJECT_CHUNK_SIZE)])
             _run_rem(cmd)
         else:
             recipient_epochs = _metadata_recipient_epochs(storage_metadata)
@@ -904,7 +905,7 @@ def validate_submission_member_identity(
     runs **once per flush attempt, before any build and before any physical
     write, for every representation** — which is why it lives here and not in
     a per-target artifact hook. The old per-submission ``artifact_validator``
-    early-returned for representations outside the RAO family, and
+    early-returned for representations outside the REM-OBJECT family, and
     basis-ordered fan-out sorts a D2 shelf pool first, so an identity mismatch
     was caught only after the shelf write and left a media-only orphan.
 
@@ -972,7 +973,7 @@ def validate_built_members(
     by our own ``_build_d2_tar`` from these same inputs, so the comparison is
     near-tautological there; the load-bearing checks on that leg are
     ``validate_submission_member_identity`` before the build and the readback
-    verify after the write. For the RAO family the artifact comes back from
+    verify after the write. For the REM-OBJECT family the artifact comes back from
     rem, and this is where a builder that mis-associated a member surfaces.
     """
     expected = {member.member_path: member for member in members}
@@ -1199,7 +1200,7 @@ def _fan_out_targets(
             and artifact.manifest_path is not None
             and manifest_receipt is None
             and Representation(target.representation)
-            in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}
+            in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}
         ):
             manifest_receipt = str(
                 # Member grain (§5): the receipt carries per-member classes as
@@ -1454,7 +1455,7 @@ def build_bundle_copy_for_pool(
     ``BlobRoot`` rows only. Bundle lifecycle, customer manifests, and
     ``ExclusionRecord`` rows stay with ``flush_bundle``. When the caller does
     not hand in a map (the bundle-repair rebuild path), one is rendered here
-    from ``member_sources`` — every RAO build goes through the map route.
+    from ``member_sources`` — every REM-OBJECT build goes through the map route.
 
     ``flush_bundle`` does not use this composed form: it builds and validates
     every target first, then writes them, so no representation's bytes reach
@@ -1669,14 +1670,14 @@ def _build_for_target(
         # staged sources directly and carries only the post-write readback
         # check, so a legacy-pool leg pays one wasted write on a bad source,
         # never silent corruption. The map's pre-write digest check is the
-        # RAO writer's.
+        # REM-OBJECT writer's.
         return _build_d2_tar(bundle, members, work_dir)
     return builder.build(
         bundle=bundle,
         members=members,
         representation=representation,
         ruleset=ruleset,
-        key_epoch=key_epoch if representation is Representation.RAO_AEAD_V1 else None,
+        key_epoch=key_epoch if representation is Representation.REM_ENCRYPT_V1 else None,
         work_dir=work_dir,
         map_path=map_path,
         source_root=source_root,
@@ -1688,7 +1689,10 @@ def _require_key_epoch(
     targets: Sequence[tuple[WritableStorageBackend, PoolTarget]],
 ) -> None:
     for _, target in targets:
-        if target.representation == Representation.RAO_AEAD_V1.value and target.key_epoch is None:
+        if (
+            target.representation == Representation.REM_ENCRYPT_V1.value
+            and target.key_epoch is None
+        ):
             raise ArchiveFanoutError(f"encrypted pool {target.pool_id!r} requires key_epoch")
 
 
@@ -1703,11 +1707,11 @@ def _copy_storage_metadata(
         "stored_size_bytes": stored_size_bytes,
     }
     if representation in {
-        Representation.RAO_PLAIN_V1.value,
-        Representation.RAO_AEAD_V1.value,
+        Representation.REM_OBJECT_V1.value,
+        Representation.REM_ENCRYPT_V1.value,
     }:
-        metadata["chunk_size"] = RAO_CHUNK_SIZE
-    if representation == Representation.RAO_AEAD_V1.value:
+        metadata["chunk_size"] = REM_OBJECT_CHUNK_SIZE
+    if representation == Representation.REM_ENCRYPT_V1.value:
         if not recipient_epochs:
             raise ArchiveFanoutError("encrypted archive artifact is missing recipient epochs")
         metadata["recipient_epochs"] = list(recipient_epochs)
@@ -1739,7 +1743,7 @@ def _build_d2_tar(
                         "size_bytes": info.size,
                     },
                     # Carried through so the built-member check reads the same
-                    # lineage column on every representation, not just RAO.
+                    # lineage column on every representation, not just REM-OBJECT.
                     ingest_item_id=(
                         None if member.ingest_item_id is None else str(member.ingest_item_id)
                     ),
@@ -1911,7 +1915,7 @@ def _verified_member_bytes(
             work_dir=work_dir,
         )
     except ArchiveRestoreError as exc:
-        if representation is not Representation.RAO_AEAD_V1:
+        if representation is not Representation.REM_ENCRYPT_V1:
             raise ArchiveFanoutError(str(exc)) from exc
         fallback_error = exc
     else:
@@ -2180,7 +2184,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _member_first_chunk_lba(locator: Mapping[str, Any]) -> int:
     try:
-        return member_byte_base(locator) // RAO_CHUNK_SIZE
+        return member_byte_base(locator) // REM_OBJECT_CHUNK_SIZE
     except ArchiveRestoreError as exc:
         raise ArchiveFanoutError(str(exc)) from exc
 
@@ -2207,8 +2211,8 @@ def _materialize_copy_to_path(
     size = storage_metadata.get("stored_size_bytes")
     if isinstance(size, int) and size >= 0:
         with destination.open("wb") as handle:
-            for start in range(0, size, RAO_CHUNK_SIZE):
-                end = min(start + RAO_CHUNK_SIZE, size)
+            for start in range(0, size, REM_OBJECT_CHUNK_SIZE):
+                end = min(start + REM_OBJECT_CHUNK_SIZE, size)
                 handle.write(backend.read_range(dict(copy_locator), ByteRange(start, end)))
         return
     destination.write_bytes(backend.read_range(dict(copy_locator), ByteRange(0, 0)))

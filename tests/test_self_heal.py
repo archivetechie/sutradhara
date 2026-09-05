@@ -2,7 +2,7 @@
 
 Scenario Q rebuilds missing target pools from an existing healthy copy,
 not from an external original source. These tests use a readable in-process
-write backend for deterministic control-flow coverage, plus one real RAO round
+write backend for deterministic control-flow coverage, plus one real REM-OBJECT round
 trip to prove an encrypted copy rebuilt from a plaintext survivor opens to the
 original bytes.
 """
@@ -56,7 +56,7 @@ from sutradhara.replication import (
     self_heal,
 )
 from sutradhara.sealing.port import Representation, SealResult
-from sutradhara.sealing.rao import RaoCliOpener, RaoCliSealer, resolve_rem_bin
+from sutradhara.sealing.rem_object import RemObjectCliOpener, RemObjectCliSealer, resolve_rem_bin
 from tests.key_helpers import registry_with_recovery
 
 ARCHIVE_EPOCH = "archive-" + "1" * 32
@@ -227,14 +227,14 @@ def _add_o_archive_pools(engine: Engine, backend_id: int) -> None:
             Pool(
                 id="o-copy-1-pool",
                 backend_id=backend_id,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         s.add(
             Pool(
                 id="o-copy-2-pool",
                 backend_id=backend_id,
-                representation=Representation.RAO_AEAD_V1.value,
+                representation=Representation.REM_ENCRYPT_V1.value,
             )
         )
         s.add(
@@ -259,7 +259,7 @@ def _metadata(
     key_epoch: str | None = None,
 ) -> dict[str, object]:
     metadata: dict[str, object] = {"representation": representation.value}
-    if representation is Representation.RAO_AEAD_V1:
+    if representation is Representation.REM_ENCRYPT_V1:
         metadata["recipient_epochs"] = [key_epoch or ARCHIVE_EPOCH, RECOVERY_EPOCH]
     return metadata
 
@@ -313,9 +313,9 @@ def test_self_heal_noop_when_nothing_is_missing(engine: Engine) -> None:
                 source=CopySource.INGEST,
                 pool_id=str(record.native_locator["pool_id"]),
                 storage_metadata=_metadata(
-                    Representation.RAO_PLAIN_V1
+                    Representation.REM_OBJECT_V1
                     if record.native_locator["pool_id"] == "o-copy-1-pool"
-                    else Representation.RAO_AEAD_V1
+                    else Representation.REM_ENCRYPT_V1
                 ),
             )
             _record_fixture_measurement(s, copy, backend)
@@ -459,7 +459,7 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
     sealer = _FakeSealer()
     key_id = ARCHIVE_EPOCH
 
-    source_bytes = b"rao-plain-v1::" + data
+    source_bytes = b"rem-object-v1::" + data
     source_record = backend.put_object("o-copy-1-pool", source_bytes)
     missing_record = backend.put_object("o-copy-2-pool", b"lost old copy")
 
@@ -472,7 +472,7 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
             integrity_hash=source_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-1-pool",
-            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
         )
         add_copy(
             s,
@@ -483,7 +483,7 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
             source=CopySource.INGEST,
             health=CopyHealth.MISSING,
             pool_id="o-copy-2-pool",
-            storage_metadata=_metadata(Representation.RAO_AEAD_V1),
+            storage_metadata=_metadata(Representation.REM_ENCRYPT_V1),
         )
 
         repaired = self_heal(
@@ -508,8 +508,8 @@ def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
     assert repaired[0].native_locator["pool_id"] == "o-copy-2-pool"
     assert status["complete"] is True
     assert backend.writes == ["o-copy-2-pool"]
-    assert opener.calls == [(Representation.RAO_PLAIN_V1, None)]
-    assert sealer.calls == [(Representation.RAO_AEAD_V1, key_id)]
+    assert opener.calls == [(Representation.REM_OBJECT_V1, None)]
+    assert sealer.calls == [(Representation.REM_ENCRYPT_V1, key_id)]
 
 
 def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
@@ -528,7 +528,7 @@ def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
     missing_record = backend.put_object("o-copy-1-pool", b"lost old copy")
     source_record = backend.put_object(
         "o-copy-2-pool",
-        b"rao-aead-v1:" + old_key_id.encode("ascii") + b":" + data,
+        b"rem-encrypt-v1:" + old_key_id.encode("ascii") + b":" + data,
     )
 
     with session_scope(engine) as s:
@@ -541,7 +541,7 @@ def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
             source=CopySource.INGEST,
             health=CopyHealth.MISSING,
             pool_id="o-copy-1-pool",
-            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
         )
         add_copy(
             s,
@@ -551,7 +551,7 @@ def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
             integrity_hash=source_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-2-pool",
-            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=old_key_id),
+            storage_metadata=_metadata(Representation.REM_ENCRYPT_V1, key_epoch=old_key_id),
         )
 
         repaired = self_heal(
@@ -567,8 +567,8 @@ def test_self_heal_reads_encrypted_source_with_recorded_epoch_after_rotation(
 
     assert len(repaired) == 1
     assert repaired[0].native_locator["pool_id"] == "o-copy-1-pool"
-    assert opener.calls == [(Representation.RAO_AEAD_V1, (old_key_id, RECOVERY_EPOCH))]
-    assert sealer.calls == [(Representation.RAO_PLAIN_V1, None)]
+    assert opener.calls == [(Representation.REM_ENCRYPT_V1, (old_key_id, RECOVERY_EPOCH))]
+    assert sealer.calls == [(Representation.REM_OBJECT_V1, None)]
 
 
 def test_self_heal_marks_bad_source_suspect_on_candidate_exhaustion(
@@ -579,7 +579,7 @@ def test_self_heal_marks_bad_source_suspect_on_candidate_exhaustion(
     backend_id = _add_backend(engine)
     _add_o_archive_pools(engine, backend_id)
     backend = _backend()
-    source_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::tampered")
+    source_record = backend.put_object("o-copy-1-pool", b"rem-object-v1::tampered")
 
     with session_scope(engine) as s:
         add_copy(
@@ -590,7 +590,7 @@ def test_self_heal_marks_bad_source_suspect_on_candidate_exhaustion(
             integrity_hash=source_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-1-pool",
-            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
         )
 
         with pytest.raises(SelfHealUnavailable, match="content-corrupt"):
@@ -618,7 +618,7 @@ def test_self_heal_preserves_corrupt_for_measured_stored_byte_mismatch(
     backend_id = _add_backend(engine)
     _add_o_archive_pools(engine, backend_id)
     backend = _backend()
-    source_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::" + data)
+    source_record = backend.put_object("o-copy-1-pool", b"rem-object-v1::" + data)
 
     with session_scope(engine) as session:
         copy, _ = add_copy(
@@ -629,7 +629,7 @@ def test_self_heal_preserves_corrupt_for_measured_stored_byte_mismatch(
             integrity_hash=source_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-1-pool",
-            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
         )
         _record_fixture_measurement(session, copy, backend)
         backend._objects[str(source_record.native_locator["object_id"])] = b"tampered stored"
@@ -658,9 +658,9 @@ def test_self_heal_falls_back_after_proven_bad_source(
     backend_id = _add_backend(engine)
     _add_o_archive_pools(engine, backend_id)
     backend = _backend()
-    bad_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::tampered")
+    bad_record = backend.put_object("o-copy-1-pool", b"rem-object-v1::tampered")
     good_record = backend.put_object(
-        "o-copy-2-pool", b"rao-aead-v1:" + ARCHIVE_EPOCH.encode() + b":" + data
+        "o-copy-2-pool", b"rem-encrypt-v1:" + ARCHIVE_EPOCH.encode() + b":" + data
     )
 
     with session_scope(engine) as s:
@@ -668,7 +668,7 @@ def test_self_heal_falls_back_after_proven_bad_source(
             Pool(
                 id="o-copy-3-pool",
                 backend_id=backend_id,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         s.add(
@@ -687,7 +687,7 @@ def test_self_heal_falls_back_after_proven_bad_source(
             integrity_hash=bad_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-1-pool",
-            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
         )
         _record_fixture_measurement(
             s,
@@ -703,7 +703,7 @@ def test_self_heal_falls_back_after_proven_bad_source(
             integrity_hash=good_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-2-pool",
-            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=ARCHIVE_EPOCH),
+            storage_metadata=_metadata(Representation.REM_ENCRYPT_V1, key_epoch=ARCHIVE_EPOCH),
         )
         _record_fixture_measurement(
             s,
@@ -736,10 +736,10 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
     backend_id = _add_backend(engine)
     _add_o_archive_pools(engine, backend_id)
     backend = _backend()
-    first_record = backend.put_object("o-copy-1-pool", b"rao-plain-v1::" + data)
+    first_record = backend.put_object("o-copy-1-pool", b"rem-object-v1::" + data)
     second_record = backend.put_object(
         "o-copy-2-pool",
-        b"rao-aead-v1:" + ARCHIVE_EPOCH.encode() + b":" + data,
+        b"rem-encrypt-v1:" + ARCHIVE_EPOCH.encode() + b":" + data,
     )
 
     with session_scope(engine) as s:
@@ -747,7 +747,7 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             Pool(
                 id="o-copy-3-pool",
                 backend_id=backend_id,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         s.add(
@@ -766,7 +766,7 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             integrity_hash=first_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-1-pool",
-            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
         )
         _record_fixture_measurement(
             s,
@@ -782,7 +782,7 @@ def test_self_heal_transport_error_falls_back_without_suspect_latch(
             integrity_hash=second_record.integrity_hash,
             source=CopySource.INGEST,
             pool_id="o-copy-2-pool",
-            storage_metadata=_metadata(Representation.RAO_AEAD_V1, key_epoch=ARCHIVE_EPOCH),
+            storage_metadata=_metadata(Representation.REM_ENCRYPT_V1, key_epoch=ARCHIVE_EPOCH),
         )
         _record_fixture_measurement(
             s,
@@ -817,7 +817,7 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
     except FileNotFoundError as exc:
         pytest.skip(str(exc))
 
-    data = b"real rao self heal"
+    data = b"real rem-object self heal"
     asset_hash = _add_asset(engine, data)
     backend_id = _add_backend(engine)
     _add_o_archive_pools(engine, backend_id)
@@ -837,7 +837,7 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
             source,
             "o-archive",
             backends={backend_id: backend},
-            sealer=RaoCliSealer(registry),
+            sealer=RemObjectCliSealer(registry),
             key_epoch=epoch.key_id,
         )
         copy2 = next(
@@ -853,19 +853,19 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
             asset_hash,
             "o-archive",
             backends={backend_id: backend},
-            opener=RaoCliOpener(registry),
-            sealer=RaoCliSealer(registry),
+            opener=RemObjectCliOpener(registry),
+            sealer=RemObjectCliSealer(registry),
             key_epoch=epoch.key_id,
-            execution_id="self-heal:rao",
+            execution_id="self-heal:rem-object",
         )
         [rebuilt] = repaired
         stored = backend.read_range(rebuilt.native_locator, ByteRange(0, 0))
 
-    rebuilt_rao = tmp_path / "rebuilt.rao"
-    rebuilt_rao.write_bytes(stored)
-    with RaoCliOpener(registry).open(
-        rebuilt_rao,
-        Representation.RAO_AEAD_V1,
+    rebuilt_rem_object = tmp_path / "rebuilt.rem-object"
+    rebuilt_rem_object.write_bytes(stored)
+    with RemObjectCliOpener(registry).open(
+        rebuilt_rem_object,
+        Representation.REM_ENCRYPT_V1,
         recipient_epochs=(epoch.key_id, _recovery.key_id),
     ) as plaintext_path:
         assert plaintext_path.read_bytes() == data

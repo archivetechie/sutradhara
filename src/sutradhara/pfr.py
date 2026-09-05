@@ -1,8 +1,8 @@
-"""Partial-file-restore wiring over pfr_core sidecars and RAO archive copies.
+"""Partial-file-restore wiring over pfr_core sidecars and REM-OBJECT archive copies.
 
 This module is the Sutradhara integration boundary for the standalone
 ``format-anatomy``/``pfr_core`` package.  It keeps the ingest-time sidecar
-contract, blob validation, RAO byte-source adapter, fallback ladder, and CLI
+contract, blob validation, REM-OBJECT byte-source adapter, fallback ladder, and CLI
 result envelopes in one place so the job handler and CLI do not duplicate PFR
 semantics.
 """
@@ -141,8 +141,8 @@ class PFRCutResult:
         }
 
 
-class RaoObject(ByteRangeSource):
-    """pfr_core ByteRangeSource backed by one RAO member over one read session."""
+class RemObject(ByteRangeSource):
+    """pfr_core ByteRangeSource backed by one REM-OBJECT member over one read session."""
 
     def __init__(
         self,
@@ -157,7 +157,7 @@ class RaoObject(ByteRangeSource):
         self._base = member_byte_base(native_locator)
         self._size = _locator_size(native_locator)
         self._identity = {
-            "kind": "rao_object",
+            "kind": "rem_object",
             "copy_id": copy.id,
             "locator_id": locator.id,
             "pool_id": locator.pool_id,
@@ -585,7 +585,7 @@ def pfr_status(
                 "pool_id": locator.pool_id,
                 "representation": locator.representation,
                 "member_path": locator.member_path,
-                "ranged_pfr": locator.representation == Representation.RAO_PLAIN_V1.value,
+                "ranged_pfr": locator.representation == Representation.REM_OBJECT_V1.value,
             }
             for locator in locators
         ],
@@ -624,13 +624,13 @@ def cut_pfr_asset(
         if sidecar is not None and sidecar.sidecar.grammar_id == "mxf":
             ranged = _first_supported_locator(
                 locators,
-                representation=Representation.RAO_PLAIN_V1,
+                representation=Representation.REM_OBJECT_V1,
                 backends=backends,
             )
             if ranged is not None:
                 locator, copy, backend = ranged
                 try:
-                    result = _cut_ranged_rao(
+                    result = _cut_ranged_rem_object(
                         sidecar=sidecar,
                         locator=locator,
                         copy=copy,
@@ -657,7 +657,7 @@ def cut_pfr_asset(
                     )
                     attempts.append(PFRRungAttempt(1, "fallback", reason, str(exc)))
             else:
-                attempts.append(PFRRungAttempt(1, "skipped", "no-rao-plain-locator"))
+                attempts.append(PFRRungAttempt(1, "skipped", "no-rem-object-plain-locator"))
         elif sidecar is None:
             attempts.append(PFRRungAttempt(1, "skipped", "sidecar-missing"))
         else:
@@ -692,7 +692,7 @@ def cut_pfr_asset(
 
         aead = _first_supported_locator(
             locators,
-            representation=Representation.RAO_AEAD_V1,
+            representation=Representation.REM_ENCRYPT_V1,
             backends=backends,
         )
         if aead is not None:
@@ -761,7 +761,7 @@ class _BackendReadSession:
         return self._backend.read_range(self._locator, byte_range)
 
 
-def _cut_ranged_rao(
+def _cut_ranged_rem_object(
     *,
     sidecar: SidecarRecord,
     locator: AssetLocator,
@@ -776,7 +776,7 @@ def _cut_ranged_rao(
     for _attempt in range(2):
         try:
             with _open_read_session(backend, copy.native_locator) as reader:
-                source = RaoObject(
+                source = RemObject(
                     reader=reader,
                     copy=copy,
                     locator=locator,
@@ -820,7 +820,7 @@ def _cut_ranged_rao(
             raise PFRUnavailable(str(exc)) from exc
         except RuntimeError as exc:
             raise PFRUnavailable(str(exc)) from exc
-    raise PFRUnavailable(str(last_error or "RAO read failed after retry"))
+    raise PFRUnavailable(str(last_error or "REM-OBJECT read failed after retry"))
 
 
 def _cut_to_temp_then_publish(
@@ -948,7 +948,7 @@ def _first_non_aead_locator(
     backends: Mapping[int, StorageBackend],
 ) -> tuple[AssetLocator, Copy, StorageBackend] | None:
     for locator in locators:
-        if locator.representation == Representation.RAO_AEAD_V1.value:
+        if locator.representation == Representation.REM_ENCRYPT_V1.value:
             continue
         copy = locator.copy
         if copy is None:

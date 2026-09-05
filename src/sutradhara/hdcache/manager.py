@@ -78,7 +78,7 @@ from sutradhara.hdcache.store import (
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import atomic_write_verified_file, restore_progress_context, sha256_file
 from sutradhara.sealing.port import Opener, Representation
-from sutradhara.sealing.rao import RaoCliOpener
+from sutradhara.sealing.rem_object import RemObjectCliOpener
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1212,7 +1212,7 @@ def open_verified_cache_plaintext(
     """Open one cache entry through the shared stored/plaintext verification funnel.
 
     Raw and private entries both stage through the existing verified disk reader;
-    private entries additionally use the configured RAO opener and hdcache key
+    private entries additionally use the configured REM-OBJECT opener and hdcache key
     epoch validation. The yielded producer remains bounded and verifies the
     catalog plaintext digest and size again as it is consumed.
     """
@@ -1305,7 +1305,7 @@ def open_verified_cache_plaintext(
                         deadline_monotonic=deadline,
                         disk_id=disk.disk_id,
                     )
-                opener = final_config.opener or RaoCliOpener(
+                opener = final_config.opener or RemObjectCliOpener(
                     final_config.registry(), work_dir=final_config.scratch_root
                 )
                 recipient_epochs = _cache_recipient_epochs(entry)
@@ -1313,7 +1313,7 @@ def open_verified_cache_plaintext(
                     _optional_unheld_aead_slot(),
                     opener.open(
                         sealed,
-                        Representation.RAO_AEAD_V1,
+                        Representation.REM_ENCRYPT_V1,
                         recipient_epochs=recipient_epochs,
                         key_domain=KEY_DOMAIN_HDCACHE,
                         work_dir=final_config.scratch_root,

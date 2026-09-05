@@ -1022,7 +1022,7 @@ def test_policy_apply_report_names_a_group_no_live_class_derives_any_more(
         )
         session.flush()
 
-        set_pool_representation(session, "pool-1", Representation.RAO_PLAIN_V1)
+        set_pool_representation(session, "pool-1", Representation.REM_OBJECT_V1)
         report = build_policy_apply_report(session)
         rendered = render_policy_apply_report(report)
 
