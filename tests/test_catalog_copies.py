@@ -180,7 +180,12 @@ def test_add_bundle_copy_records_bundle_without_logical_asset(engine: Engine) ->
     }
 
     with session_scope(engine) as s:
-        s.add(Bundle(id="bundle-001", **bundle_kwargs(seed="o-archive"),))
+        s.add(
+            Bundle(
+                id="bundle-001",
+                **bundle_kwargs(seed="o-archive"),
+            )
+        )
         s.add(
             Pool(
                 id="archive-pool",

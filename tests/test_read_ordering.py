@@ -497,9 +497,7 @@ def _install_fake_serve(
         )
 
     monkeypatch.setattr("sutradhara.jobs.handlers.restore.serve_restore_item", fake_serve)
-    monkeypatch.setattr(
-        "sutradhara.jobs.handlers.restore.restore_config_from_env", lambda: config
-    )
+    monkeypatch.setattr("sutradhara.jobs.handlers.restore.restore_config_from_env", lambda: config)
 
 
 # ---------------------------------------------------------------------------
@@ -845,9 +843,7 @@ def test_unimplemented_is_the_transport_row_old_rem_is_not_an_error(
             assert item.state == "queued"
 
 
-def test_rpc_transport_failure_reads_unordered_and_records(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_rpc_transport_failure_reads_unordered_and_records(engine: Engine, tmp_path: Path) -> None:
     """Guards: a dead daemon failing admission instead of degrading."""
 
     planner = FakePlanner()
@@ -923,9 +919,7 @@ def test_unknown_plan_status_downgrades_to_unordered(engine: Engine, tmp_path: P
         assert _slots(session, request.id) == []
 
 
-def test_unspecified_plan_status_sentinel_downgrades_too(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_unspecified_plan_status_sentinel_downgrades_too(engine: Engine, tmp_path: Path) -> None:
     """Guards: the never-emitted wire sentinel slipping through as success."""
 
     planner = FakePlanner()
@@ -942,9 +936,7 @@ def test_unspecified_plan_status_sentinel_downgrades_too(
         assert [(row.phase, row.status) for row in rows] == [("initial", "unknown_plan_status")]
 
 
-def test_unknown_cost_model_basis_downgrades_to_unordered(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_unknown_cost_model_basis_downgrades_to_unordered(engine: Engine, tmp_path: Path) -> None:
     """Guards: an unrecognised CostModelBasis passing as success (§5)."""
 
     planner = FakePlanner()
@@ -977,9 +969,7 @@ def test_degraded_ascending_fallback_reads_in_returned_order(
         backend_obj, digests, _copies = _seed_world(session, planner)
         config = _config(tmp_path, _backend_map(session, backend_obj))
         planner.responses.append(
-            lambda request: _ok_response(
-                request, status=layer5_pb2.DEGRADED_ASCENDING_FALLBACK
-            )
+            lambda request: _ok_response(request, status=layer5_pb2.DEGRADED_ASCENDING_FALLBACK)
         )
         request = _admit(session, config, digests)
 
@@ -992,9 +982,7 @@ def test_degraded_ascending_fallback_reads_in_returned_order(
         ]
 
 
-def test_all_unspanned_volume_records_no_spanned_targets(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_all_unspanned_volume_records_no_spanned_targets(engine: Engine, tmp_path: Path) -> None:
     """Guards: a tape-bound volume with no spans going invisibly unordered."""
 
     planner = FakePlanner()
@@ -1023,9 +1011,7 @@ def test_uncalibrated_then_post_mount_replan_exactly_once(
     with session_scope(engine) as session:
         backend_obj, digests, copies = _seed_world(session, planner)
         config = _config(tmp_path, _backend_map(session, backend_obj))
-        planner.responses.append(
-            _unavailable_response(layer5_pb2.UNAVAILABLE_UNCALIBRATED)
-        )
+        planner.responses.append(_unavailable_response(layer5_pb2.UNAVAILABLE_UNCALIBRATED))
         request = _admit(session, config, digests)
         items = [_item_by_digest(request, digest) for digest in digests]
         assert _slots(session, request.id) == []
@@ -1075,9 +1061,7 @@ def test_post_mount_replan_still_unavailable_stays_unordered_no_third_plan(
     with session_scope(engine) as session:
         backend_obj, digests, copies = _seed_world(session, planner)
         config = _config(tmp_path, _backend_map(session, backend_obj))
-        planner.responses.append(
-            _unavailable_response(layer5_pb2.UNAVAILABLE_UNCALIBRATED)
-        )
+        planner.responses.append(_unavailable_response(layer5_pb2.UNAVAILABLE_UNCALIBRATED))
         request = _admit(session, config, digests)
         items = [_item_by_digest(request, digest) for digest in digests]
         _submit_restore_jobs(session, request)
@@ -1123,9 +1107,7 @@ def test_read_failure_with_completed_target_replans_from_its_end(
         config = _config(tmp_path, _backend_map(session, backend_obj))
         request = _admit(session, config, digests)  # ordered [1, 2, 3]
         items = [_item_by_digest(request, digest) for digest in digests]
-        original_tags = {
-            slot.item_id: slot.tag for slot in _slots(session, request.id)
-        }
+        original_tags = {slot.item_id: slot.tag for slot in _slots(session, request.id)}
         _submit_restore_jobs(session, request)
         session.commit()
         order_log: list[int] = []
@@ -1145,9 +1127,9 @@ def test_read_failure_with_completed_target_replans_from_its_end(
         assert replan.start_position.block == span_item1[1] - 1, (
             "origin must be the last completed target's end, not the load point"
         )
-        assert [bytes(target.tag) for target in replan.targets] == [
-            original_tags[items[2].id]
-        ], "tags must be stable across re-plans"
+        assert [bytes(target.tag) for target in replan.targets] == [original_tags[items[2].id]], (
+            "tags must be stable across re-plans"
+        )
         rows = _outcomes(session, request.id)
         assert [(row.phase, row.status) for row in rows] == [
             ("initial", "ok"),

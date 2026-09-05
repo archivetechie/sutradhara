@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from importlib import import_module
 from pathlib import Path
 
 import click
@@ -19,15 +20,8 @@ from sutradhara.catalog.session import make_engine, session_scope
 from sutradhara.jobs.config import derivation_cache_root
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.leases import LeaseError
-from sutradhara.jobs.reconcilers import derivation as derivation_reconciler
 from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, record_observation
-from sutradhara.pfr import (
-    PFRUnavailable,
-    current_pfr_recipe_version,
-    cut_pfr_asset,
-    pfr_status,
-    sidecar_for_asset,
-)
+from sutradhara.optional import OptionalDependencyError, require_pfr_core
 
 
 @click.group("pfr")
@@ -47,6 +41,9 @@ def status_cmd(
     as_json: bool,
 ) -> None:
     """Show PFR readiness for one asset or member selector."""
+
+    _require_pfr_cli()
+    from sutradhara.pfr import pfr_status
 
     engine = make_engine()
     with session_scope(engine) as session:
@@ -92,13 +89,14 @@ def cut_cmd(
 ) -> None:
     """Cut a clip, falling back to whole-member restore when needed."""
 
+    _require_pfr_cli()
+    from sutradhara.pfr import PFRUnavailable, cut_pfr_asset
+
     engine = make_engine()
     with session_scope(engine) as session:
         asset_hash = _resolve_asset_hash(session, artifactclass, asset_hash_hex, member_name)
         destination = (
-            Path(output)
-            if output
-            else Path(f"{asset_hash.hex()}-{from_time:g}-{to_time:g}.mxf")
+            Path(output) if output else Path(f"{asset_hash.hex()}-{from_time:g}-{to_time:g}.mxf")
         )
         try:
             with _inline_io_lease():
@@ -139,6 +137,9 @@ def reindex_cmd(
     as_json: bool,
 ) -> None:
     """Enqueue forced pfr-index jobs without the presence-gated reconciler."""
+
+    _require_pfr_cli()
+    from sutradhara.jobs.reconcilers import derivation as derivation_reconciler
 
     if (grammar is None) == (not all_sidecars):
         raise click.ClickException("provide exactly one of --grammar fallback or --all")
@@ -183,6 +184,14 @@ def reindex_cmd(
         click.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
     click.echo(f"enqueued {len(jobs)} pfr-index job(s) for recipe {recipe_version}")
+
+
+def current_pfr_recipe_version() -> str:
+    """Return the optional integration's current recipe without eager importing it."""
+
+    from sutradhara.pfr import current_pfr_recipe_version as integration_recipe_version
+
+    return integration_recipe_version()
 
 
 def _resolve_asset_hash(
@@ -247,6 +256,8 @@ def _reindex_items(
     asset_hash: bytes | None,
     grammar: str | None,
 ) -> list[IngestItem]:
+    from sutradhara.pfr import sidecar_for_asset
+
     query = select(IngestItem).order_by(IngestItem.id)
     if asset_hash is not None:
         query = query.where(IngestItem.logical_asset_hash == asset_hash)
@@ -263,3 +274,16 @@ def _reindex_items(
         if record is not None and record.sidecar.grammar_id == grammar:
             selected.append(item)
     return selected
+
+
+def _require_pfr_cli() -> None:
+    """Translate missing or incompatible integration errors into a user-facing form."""
+
+    try:
+        require_pfr_core()
+        import_module("sutradhara.pfr")
+    except (OptionalDependencyError, ImportError, AttributeError) as exc:
+        raise click.ClickException(
+            "partial-file restore requires a compatible optional format-anatomy package; "
+            "install or upgrade format-anatomy in this environment"
+        ) from exc

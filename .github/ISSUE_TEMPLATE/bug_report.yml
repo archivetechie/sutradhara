@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible Sutradhara defect without sensitive archive data.
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private hostnames, customer data, or vulnerability details. Use the private security-reporting path for security issues.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The exact Sutradhara commit or package version.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened, including a minimal redacted error or log excerpt.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Minimal steps using synthetic or redacted data.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, database, backend kind, and relevant non-secret configuration.

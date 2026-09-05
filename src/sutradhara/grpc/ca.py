@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cryptography import x509
+from cryptography.x509.oid import NameOID
 from sqlalchemy import Engine
 
 from sutradhara.catalog.session import make_session_factory
@@ -279,13 +281,18 @@ def cert_fingerprint(cert_path: Path | str) -> str:
 
 
 def csr_common_name(csr_path: Path | str) -> str:
-    """Return the subject CN from a CSR."""
+    """Return one unambiguous subject CN from a valid PEM CSR."""
 
-    output = _run_openssl(["req", "-noout", "-subject", "-in", str(csr_path)])
-    match = re.search(r"(?:^|[,/= ])CN\s*=\s*([^,/]+)", output)
-    if match is None:
-        raise CertificateError("CSR subject has no common name")
-    return match.group(1).strip()
+    try:
+        request = x509.load_pem_x509_csr(Path(csr_path).read_bytes())
+    except (OSError, ValueError) as exc:
+        raise CertificateError(f"invalid CSR: {exc}") from exc
+    if not request.is_signature_valid:
+        raise CertificateError("CSR signature is invalid")
+    common_names = request.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    if len(common_names) != 1 or not common_names[0].value.strip():
+        raise CertificateError("CSR subject must have exactly one non-empty common name")
+    return common_names[0].value.strip()
 
 
 def resolve_peer_identity(engine: Engine, context: Any) -> store.DeviceIdentity:

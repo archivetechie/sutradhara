@@ -180,9 +180,7 @@ def submission_bundle_members(
     """
     digests = set(
         session.scalars(
-            select(SubmissionMember.sha256).where(
-                SubmissionMember.submission_id == submission.id
-            )
+            select(SubmissionMember.sha256).where(SubmissionMember.submission_id == submission.id)
         )
     )
     if not digests:
@@ -199,9 +197,7 @@ def submission_bundle_members(
 
 def submission_bundles(session: Session, submission: Submission) -> list[Bundle]:
     """Return the submission's bundles ordered by ``opened_at``, then id."""
-    bundle_ids = {
-        row.bundle_id for row in submission_bundle_members(session, submission).values()
-    }
+    bundle_ids = {row.bundle_id for row in submission_bundle_members(session, submission).values()}
     if not bundle_ids:
         return []
     return list(
@@ -240,9 +236,7 @@ def _result(
     copies: dict[str, tuple[int, ...]] = {}
     for bundle in bundles:
         copies[bundle.id] = tuple(
-            session.scalars(
-                select(Copy.id).where(Copy.bundle_id == bundle.id).order_by(Copy.id)
-            )
+            session.scalars(select(Copy.id).where(Copy.bundle_id == bundle.id).order_by(Copy.id))
         )
     return ArchiveSubmissionResult(
         submission_id=submission.id,

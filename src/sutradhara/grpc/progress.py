@@ -104,7 +104,9 @@ class ReceiveProgressRegistry:
             if intake_id not in self._planned_totals and intake_id not in self._files:
                 return None
             planned = self._planned_totals.get(intake_id)
-            files = tuple(sorted(self._files.get(intake_id, {}).values(), key=lambda item: item.relpath))
+            files = tuple(
+                sorted(self._files.get(intake_id, {}).values(), key=lambda item: item.relpath)
+            )
         return ReceiveProgressSnapshot(
             intake_id=intake_id,
             planned_bytes_total=planned,

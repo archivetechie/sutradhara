@@ -174,7 +174,8 @@ def _fake_transcode(source: Path, mezz: Path, preview: Path) -> dict[str, Any]:
             "invalid data found via fake transcode marker",
             origin="fake-transcode-marker",
         )
-        assert result is not None
+        if result is None:
+            raise RuntimeError("decode-failure marker did not produce a classification")
         return result
     source_digest = sha256_file(source).hex()
     mezz.write_bytes(f"fake mezzanine for {source_digest}\n".encode())

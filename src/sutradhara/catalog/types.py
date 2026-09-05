@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import NewType
 
 # A SHA-256 content hash. 32 raw bytes. This is the logical-asset identity
-# (docs/spec-v0.1.md §2, §4.1) — there is no surrogate ID.
+# (docs/architecture-overview.md) — there is no surrogate ID.
 ContentHash = NewType("ContentHash", bytes)
 
 CONTENT_HASH_LEN = 32
@@ -28,7 +28,7 @@ class BackendKind(StrEnum):
     """The kind of storage a backend represents.
 
     The set is not closed — new kinds land alongside new adapters. This
-    enum is the registered set as of spec-v0.1.md §4.5.
+    enum is the registered set described in docs/architecture-overview.md.
     """
 
     REM_TAPE = "rem_tape"
@@ -68,7 +68,7 @@ def implementation_family_for_kind(kind: BackendKind | str) -> str:
 
 
 class BackendTier(StrEnum):
-    """First-class distinction from spec-v0.1.md §5.2 / §5.3.
+    """First-class backend distinction documented in the architecture overview.
 
     Tier-1 (self_describing) backends carry the content hash on the medium
     itself; a scan rebuilds the catalog without any central state.

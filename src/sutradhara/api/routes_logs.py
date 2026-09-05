@@ -372,7 +372,8 @@ def _time_filter(start: dt.datetime | None, end: dt.datetime | None) -> str | No
         return f"_time:[{format_vl_timestamp(start)}, {format_vl_timestamp(end)}]"
     if start is not None:
         return f"_time:>={format_vl_timestamp(start)}"
-    assert end is not None
+    if end is None:
+        raise RuntimeError("time filter bounds disappeared during validation")
     return f"_time:<={format_vl_timestamp(end)}"
 
 

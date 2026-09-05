@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Sutradhara reconcile pass for %i
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=false
+Unit=sutradhara-reconcile@%i.service
+
+[Install]
+WantedBy=timers.target

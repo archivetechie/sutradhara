@@ -324,7 +324,9 @@ def test_replication_status_ignores_bundle_only_asset_copy(engine: Engine) -> No
     with session_scope(engine) as session:
         pool = _add_pool(session, "pool-a", artifactclass="masters")
         session.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(payload)))
-        session.add(Bundle(id="bundle-asset-only", **bundle_kwargs(seed="masters"), status="sealed"))
+        session.add(
+            Bundle(id="bundle-asset-only", **bundle_kwargs(seed="masters"), status="sealed")
+        )
         session.flush()
         bundle_copy = _add_bundle_copy_with_locator(
             session,

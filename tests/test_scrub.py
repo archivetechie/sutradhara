@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from sqlalchemy import Engine, select
@@ -569,11 +570,11 @@ def test_scrub_during_open_batch_neither_marks_missing_nor_synthesizes(
         assert session.get(LogicalAsset, written_hash) is None
 
 
-def test_scrub_against_live_backend_surfaces_unavailable(engine: Engine) -> None:
+def test_scrub_against_live_backend_surfaces_unavailable(engine: Engine, tmp_path: Path) -> None:
     from sutradhara.backend.port import BackendUnavailableError
     from sutradhara.backend.remanence import RemanenceBackend
 
-    live = RemanenceBackend.from_grpc("primary-tape", "127.0.0.1:1")
+    live = RemanenceBackend.from_grpc("primary-tape", f"unix:{tmp_path / 'missing.sock'}")
     with session_scope(engine) as s:
         row = Backend(
             name="primary-tape",

@@ -169,16 +169,22 @@ def test_file_receipt_renewal_honors_floor_timer(api_engine: Engine) -> None:
         assert claim is not None
         claim.last_heartbeat = old
 
-    assert api_store.renew_device_intake_lease(
-        api_engine,
-        intake_id="renew-intake",
-        floor=dt.timedelta(seconds=5),
-    ) == "renewed"
-    assert api_store.renew_device_intake_lease(
-        api_engine,
-        intake_id="renew-intake",
-        floor=dt.timedelta(seconds=5),
-    ) == "throttled"
+    assert (
+        api_store.renew_device_intake_lease(
+            api_engine,
+            intake_id="renew-intake",
+            floor=dt.timedelta(seconds=5),
+        )
+        == "renewed"
+    )
+    assert (
+        api_store.renew_device_intake_lease(
+            api_engine,
+            intake_id="renew-intake",
+            floor=dt.timedelta(seconds=5),
+        )
+        == "throttled"
+    )
 
 
 def test_stale_same_key_terminalizes_and_fresh_key_rechecks_history(api_engine: Engine) -> None:

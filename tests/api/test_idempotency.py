@@ -46,7 +46,10 @@ def test_same_key_different_body_is_409(
     client = TestClient(app)
     key = str(uuid4())
 
-    assert client.post("/api/receive", headers=post_headers("operator"), json=_body(key)).status_code == 200
+    assert (
+        client.post("/api/receive", headers=post_headers("operator"), json=_body(key)).status_code
+        == 200
+    )
     response = client.post(
         "/api/receive",
         headers=post_headers("operator"),

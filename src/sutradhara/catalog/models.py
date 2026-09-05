@@ -1,6 +1,6 @@
 """SQLAlchemy 2.0 declarative models for the catalog.
 
-Day-1 vertical slice tables only (docs/spec-v0.1.md §4):
+Catalog tables described in docs/reference-database-schema.md:
   - logical_asset  (content-addressed; PK is the SHA-256 itself)
   - backend        (registered storage backends)
   - copy           (one row per realization of an asset on a backend)
@@ -69,7 +69,7 @@ class LogicalAsset(Base):
 
     The primary key is the SHA-256 of the asset's bytes — there is no
     surrogate ID. Same hash means same row (full deduplication, per
-    docs/spec-v0.1.md §2 principle 3).
+    docs/architecture-overview.md).
     """
 
     __tablename__ = "logical_asset"
@@ -1073,9 +1073,7 @@ class Bundle(Base):
     )
 
     def __repr__(self) -> str:
-        return (
-            f"<Bundle id={self.id!r} group={self.bundle_group[:12]}… status={self.status!r}>"
-        )
+        return f"<Bundle id={self.id!r} group={self.bundle_group[:12]}… status={self.status!r}>"
 
 
 class BundleMember(Base):
@@ -1355,7 +1353,7 @@ class ReviewDecision(Base):
 class Copy(Base):
     """One realization of a logical asset or bundle on one backend.
 
-    Many copies per asset (per docs/spec-v0.1.md §4.2). UNIQUE on
+    Many copies per asset (per docs/reference-database-schema.md). UNIQUE on
     (backend_id, native_locator_key) so a backend cannot register the
     same locator twice; multiplicity is on (asset, backend) not on the
     locator.

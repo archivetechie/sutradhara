@@ -1,0 +1,20 @@
+[Unit]
+Description=Sutradhara landing intake watcher
+After=network-online.target sutradhara-serve.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=replica
+Group=replica
+WorkingDirectory=/opt/sutradhara
+EnvironmentFile=/etc/sutradhara/sutradhara.env
+ExecStart=/opt/sutradhara/.venv/bin/sutra intake watch --landing-root ${SUTRA_RECEIVE_LANDING_ROOT} --interval 5 --settle-seconds 2 --stable-polls 2 --cache-root /var/cache/sutradhara/intake-watch
+Restart=on-failure
+RestartSec=5
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

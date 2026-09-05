@@ -207,9 +207,7 @@ def test_open_bundle_holds_the_source_and_a_sealed_verified_one_releases_it(
     """
     with session_scope(engine) as session:
         pool = _add_pool(session, artifactclass="s-masters", pool_id="release-pool")
-        item = _add_intake_with_item(
-            session, tmp_path, "intake-release", artifactclass="s-masters"
-        )
+        item = _add_intake_with_item(session, tmp_path, "intake-release", artifactclass="s-masters")
         _add_asset_copy(
             session,
             item,
@@ -442,7 +440,9 @@ def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
         item = _add_intake_with_item(
             session, tmp_path, "intake-mismatch", artifactclass="s-masters"
         )
-        bundle = Bundle(id="submission-mismatch", **bundle_kwargs(seed="s-masters"), status="sealed")
+        bundle = Bundle(
+            id="submission-mismatch", **bundle_kwargs(seed="s-masters"), status="sealed"
+        )
         session.add(bundle)
         session.flush()
         locator = {"tape_uuid": "tape-mismatch", "object_id": "bundle-copy"}

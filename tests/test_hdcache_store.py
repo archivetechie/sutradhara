@@ -47,7 +47,9 @@ def engine(tmp_path: Path) -> Iterator[Engine]:
     eng.dispose()
 
 
-def test_hdcache_schema_round_trips_inventory_and_restore_rows(engine: Engine, tmp_path: Path) -> None:
+def test_hdcache_schema_round_trips_inventory_and_restore_rows(
+    engine: Engine, tmp_path: Path
+) -> None:
     digest = hashlib.sha256(b"clip").digest()
     with session_scope(engine) as session:
         session.add(LogicalAsset(content_sha256=digest, size_bytes=4))
@@ -400,40 +402,57 @@ def test_disk_identity_matrix(tmp_path: Path) -> None:
         fs_uuid="fs-001",
         wwn="wwn-001",
     )
-    ok_probe = FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001", wwn="wwn-001"))
+    ok_probe = FakeProbe(
+        ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001", wwn="wwn-001")
+    )
     write_disk_sentinel(mount, expected, hmac_secret=secret)
 
     assert verify_disk_identity(mount, expected, hmac_secret=secret, probe=ok_probe).ok
-    assert _identity_status(
-        mount,
-        expected,
-        secret,
-        FakeProbe(ObservedBlockIdentity(False)),
-    ) == "not_mounted"
-    assert _identity_status(
-        mount,
-        expected,
-        secret,
-        FakeProbe(ObservedBlockIdentity(True, serial="OTHER", fs_uuid="fs-001")),
-    ) == "wrong_serial"
-    assert _identity_status(
-        mount,
-        expected,
-        secret,
-        FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="other")),
-    ) == "wrong_fs_uuid"
-    assert _identity_status(
-        mount,
-        expected,
-        secret,
-        FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001", wwn="other")),
-    ) == "wrong_wwn"
-    assert _identity_status(
-        mount,
-        expected,
-        secret,
-        FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001")),
-    ) == "identity_unavailable"
+    assert (
+        _identity_status(
+            mount,
+            expected,
+            secret,
+            FakeProbe(ObservedBlockIdentity(False)),
+        )
+        == "not_mounted"
+    )
+    assert (
+        _identity_status(
+            mount,
+            expected,
+            secret,
+            FakeProbe(ObservedBlockIdentity(True, serial="OTHER", fs_uuid="fs-001")),
+        )
+        == "wrong_serial"
+    )
+    assert (
+        _identity_status(
+            mount,
+            expected,
+            secret,
+            FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="other")),
+        )
+        == "wrong_fs_uuid"
+    )
+    assert (
+        _identity_status(
+            mount,
+            expected,
+            secret,
+            FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001", wwn="other")),
+        )
+        == "wrong_wwn"
+    )
+    assert (
+        _identity_status(
+            mount,
+            expected,
+            secret,
+            FakeProbe(ObservedBlockIdentity(True, serial="SER001", fs_uuid="fs-001")),
+        )
+        == "identity_unavailable"
+    )
 
     (mount / "hdcache-disk.json").unlink()
     assert _identity_status(mount, expected, secret, ok_probe) == "missing_sentinel"

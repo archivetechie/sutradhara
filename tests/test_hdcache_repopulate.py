@@ -119,7 +119,9 @@ def test_repopulation_planner_groups_by_source_tape_and_tags_drill(
         assert plan.scheduled == 2
         assert [job.priority for job in jobs] == [75, 75]
         assert {job.recon_domain for job in jobs} == {"hdcache"}
-        assert all((job.recon_target_key or "").startswith("repop:d001:20260703T080000Z:") for job in jobs)
+        assert all(
+            (job.recon_target_key or "").startswith("repop:d001:20260703T080000Z:") for job in jobs
+        )
         batch = next(job for job in jobs if job.params.get("repopulate_batch") is True)
         assert batch.params["source_tape"].endswith("tape_uuid:tape-a")
         assert batch.params["origin_drill_ids"] == ["d001:20260703T080000Z"]
@@ -127,7 +129,9 @@ def test_repopulation_planner_groups_by_source_tape_and_tags_drill(
             targets[0]["digest"].hex(),
             targets[1]["digest"].hex(),
         }
-        singleton = next(job for job in jobs if job.params["source_tape"].endswith("tape_uuid:tape-b"))
+        singleton = next(
+            job for job in jobs if job.params["source_tape"].endswith("tape_uuid:tape-b")
+        )
         assert singleton.params["repopulate_batch"] is True
         assert singleton.params["origin_drill_ids"] == ["d001:20260703T080000Z"]
         assert [item["lost_drill_id"] for item in singleton.params["items"]] == [
@@ -466,7 +470,9 @@ def test_drain_retiring_disk_verified_local_move_and_auto_dead(
         )
 
         entry = session.get(CacheEntry, target["digest"])
-        assert result == result.__class__(disk_id="d001", moved=1, fallback_to_tape=0, failed=0, auto_dead=True)
+        assert result == result.__class__(
+            disk_id="d001", moved=1, fallback_to_tape=0, failed=0, auto_dead=True
+        )
         assert entry is not None
         assert entry.disk_id == "d002"
         assert session.get(CacheDisk, "d001").state == "dead"
@@ -734,7 +740,9 @@ def test_alarm_condition_matrix(engine: Engine, tmp_path: Path) -> None:
         )
         record_restore_event_alarm(
             session,
-            RestoreEvent(code="privacy-unmapped", severity="alarm", detail="privacy level p4 unmapped"),
+            RestoreEvent(
+                code="privacy-unmapped", severity="alarm", detail="privacy level p4 unmapped"
+            ),
         )
         record_walker_event_alarm(
             session,

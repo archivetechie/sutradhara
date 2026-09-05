@@ -7,6 +7,7 @@ live gRPC mapping without requiring the real daemon in unit tests.
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import threading
 from collections.abc import Iterator
 from concurrent import futures
@@ -37,11 +38,23 @@ from sutradhara.catalog.session import locator_key
 from sutradhara.catalog.types import content_hash
 
 
+@contextmanager
+def _serve_uds(server: grpc.Server) -> Iterator[str]:
+    """Start a test gRPC server on a temporary Unix-domain socket."""
+
+    with tempfile.TemporaryDirectory(prefix="sutradhara-grpc-test-") as root:
+        endpoint = f"unix:{Path(root) / 'server.sock'}"
+        if server.add_insecure_port(endpoint) != 1:
+            raise RuntimeError(f"failed to bind test gRPC server at {endpoint}")
+        server.start()
+        try:
+            yield endpoint
+        finally:
+            server.stop(grace=None)
+
+
 def test_tape_finalization_wire_tags_keep_health_and_progress_distinct() -> None:
-    fields = {
-        field.name: field.number
-        for field in layer5_pb2.TapeFinalization.DESCRIPTOR.fields
-    }
+    fields = {field.name: field.number for field in layer5_pb2.TapeFinalization.DESCRIPTOR.fields}
     assert fields["replica_health"] == 5
     assert fields["replica_progress"] == 11
 
@@ -392,12 +405,8 @@ def catalog_server(
     servicer = _Catalog(proto_object)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
     layer5_pb2_grpc.add_CatalogServicer_to_server(servicer, server)  # type: ignore[no-untyped-call]
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    try:
-        yield f"127.0.0.1:{port}", servicer
-    finally:
-        server.stop(grace=None)
+    with _serve_uds(server) as endpoint:
+        yield endpoint, servicer
 
 
 @pytest.fixture
@@ -760,12 +769,8 @@ class _ReadSession(layer5_pb2_grpc.ReadSessionServiceServicer):
 def _serve_read(servicer: _ReadSession) -> Iterator[str]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
     layer5_pb2_grpc.add_ReadSessionServiceServicer_to_server(servicer, server)  # type: ignore[no-untyped-call]
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    try:
-        yield f"127.0.0.1:{port}"
-    finally:
-        server.stop(grace=None)
+    with _serve_uds(server) as endpoint:
+        yield endpoint
 
 
 def test_read_range_whole_object() -> None:
@@ -856,10 +861,19 @@ def test_verify_grpc_error_propagates() -> None:
             backend.verify(_read_locator(hashlib.sha256(b"x").hexdigest()))
 
 
-def test_live_endpoint_unavailable_raises_backend_unavailable() -> None:
-    backend = RemanenceBackend.from_grpc("primary-tape", "127.0.0.1:1")
-    with pytest.raises(BackendUnavailableError, match=r"127\.0\.0\.1:1"):
+def test_live_endpoint_unavailable_raises_backend_unavailable(tmp_path: Path) -> None:
+    endpoint = f"unix:{tmp_path / 'missing.sock'}"
+    backend = RemanenceBackend.from_grpc("primary-tape", endpoint)
+    with pytest.raises(BackendUnavailableError, match=r"missing\.sock"):
         list(backend.enumerate())
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["127.0.0.1:50051", "http://localhost:50051", "https://rem:50051"]
+)
+def test_from_grpc_rejects_tcp_without_mtls(endpoint: str) -> None:
+    with pytest.raises(ValueError, match="TCP requires mTLS"):
+        RemanenceBackend.from_grpc("primary-tape", endpoint)
 
 
 def test_unix_grpc_endpoint_sets_dummy_authority() -> None:
@@ -1151,12 +1165,8 @@ class _CheckpointBatchClient:
 def _serve_write(servicer: _WriteSession) -> Iterator[str]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
     layer5_pb2_grpc.add_WriteSessionServiceServicer_to_server(servicer, server)  # type: ignore[no-untyped-call]
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    try:
-        yield f"127.0.0.1:{port}"
-    finally:
-        server.stop(grace=None)
+    with _serve_uds(server) as endpoint:
+        yield endpoint
 
 
 @pytest.fixture
@@ -1570,12 +1580,8 @@ def _serve_roundtrip(store: _RoundTripStore) -> Iterator[str]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     layer5_pb2_grpc.add_WriteSessionServiceServicer_to_server(_RTWrite(store), server)  # type: ignore[no-untyped-call]
     layer5_pb2_grpc.add_ReadSessionServiceServicer_to_server(_RTRead(store), server)  # type: ignore[no-untyped-call]
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    try:
-        yield f"127.0.0.1:{port}"
-    finally:
-        server.stop(grace=None)
+    with _serve_uds(server) as endpoint:
+        yield endpoint
 
 
 def test_write_then_read_roundtrip_byte_equal(tmp_path: Path) -> None:

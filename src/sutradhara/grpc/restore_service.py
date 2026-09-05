@@ -595,7 +595,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
     ) -> bool:
         """Verify a cache hit to EOF before any restore frame can be emitted."""
 
-        assert item.size_bytes is not None
+        if item.size_bytes is None:
+            raise RuntimeError("cache probe requires a restore item size")
         try:
             with open_cache_plaintext_chunks(
                 session,
@@ -1009,7 +1010,8 @@ def _lease_proto(lease: _Lease) -> Any:
 
 
 def _assignment_proto(item: RestoreRequestItem) -> Any:
-    assert item.request is not None
+    if item.request is None:
+        raise RuntimeError("restore assignment item is detached from its request")
     digest = b""
     if item.final_rel_path is not None and item.size_bytes is not None:
         digest = _manifest_digest(

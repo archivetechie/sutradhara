@@ -6,6 +6,10 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from sqlalchemy import Engine
 
 from sutradhara.catalog.session import create_all, make_engine, session_scope
@@ -112,6 +116,17 @@ def test_token_device_id_must_match_csr_common_name(engine: Engine, tmp_path) ->
             csr_path=material.csr_path,
             token=token,
         )
+
+
+def test_csr_common_name_preserves_punctuation(tmp_path: Path) -> None:
+    csr_path = _write_csr(tmp_path, ["camera,west/site"])
+    assert ca.csr_common_name(csr_path) == "camera,west/site"
+
+
+def test_csr_common_name_rejects_ambiguous_subject(tmp_path: Path) -> None:
+    csr_path = _write_csr(tmp_path, ["camera-a", "camera-b"])
+    with pytest.raises(ca.CertificateError, match="exactly one"):
+        ca.csr_common_name(csr_path)
 
 
 def test_signing_failure_releases_enrollment_token(engine: Engine, tmp_path, monkeypatch) -> None:
@@ -222,3 +237,16 @@ class _FakeContext:
             "x509_common_name": [self._common_name.encode("utf-8")],
             "x509_pem_cert": [self._pem.encode("utf-8")],
         }
+
+
+def _write_csr(tmp_path: Path, common_names: list[str]) -> Path:
+    """Create a signed PEM CSR with the requested CN attributes."""
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name) for name in common_names])
+    request = (
+        x509.CertificateSigningRequestBuilder().subject_name(subject).sign(key, hashes.SHA256())
+    )
+    path = tmp_path / "device.csr"
+    path.write_bytes(request.public_bytes(serialization.Encoding.PEM))
+    return path

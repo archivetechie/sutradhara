@@ -138,9 +138,7 @@ def config_from_json(raw: dict[str, Any] | None = None) -> WorkerConfig:
                 raw.get("aging_threshold_scans", config.aging_threshold_scans)
             ),
             executor_workers=config.executor_workers,
-            max_backoff_seconds=int(
-                raw.get("max_backoff_seconds", config.max_backoff_seconds)
-            ),
+            max_backoff_seconds=int(raw.get("max_backoff_seconds", config.max_backoff_seconds)),
         )
     return config
 

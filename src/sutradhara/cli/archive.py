@@ -125,7 +125,8 @@ def predicate_audit(output: Path, force: bool) -> None:
     finally:
         temporary.unlink(missing_ok=True)
     summary = report["summary"]
-    assert isinstance(summary, dict)
+    if not isinstance(summary, dict):
+        raise click.ClickException("archive predicate audit returned an invalid summary")
     click.echo(
         f"wrote {output}: audited={summary['audited_intakes']} "
         f"affected={summary['affected_intakes']} clean={summary['clean']}"
@@ -571,17 +572,13 @@ def restore_cmd(
     click.echo(f"restored {asset_hash.hex()} from {result.source} to {result.output_path}")
 
 
-def _bundle_basis_backends(
-    session: Session, bundle: Bundle
-) -> dict[int, WritableStorageBackend]:
+def _bundle_basis_backends(session: Session, bundle: Bundle) -> dict[int, WritableStorageBackend]:
     """Backends for the pools in a bundle's frozen group_basis (§5)."""
     pool_ids = basis_pool_ids(bundle.group_basis)
     if not pool_ids:
         raise click.ClickException(f"bundle {bundle.id!r} has an empty group_basis")
     rows = list(
-        session.scalars(
-            select(Backend).join(Backend.pools).where(Pool.id.in_(pool_ids)).distinct()
-        )
+        session.scalars(select(Backend).join(Backend.pools).where(Pool.id.in_(pool_ids)).distinct())
     )
     return {row.id: cast(WritableStorageBackend, backend_from_row(row)) for row in rows}
 

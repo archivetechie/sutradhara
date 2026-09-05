@@ -16,9 +16,7 @@ def test_layer5_canonical_plaintext_object_start_round_trips() -> None:
                 algorithm="sha256",
                 value=digest,
             ),
-            source_replay_capability=(
-                layer5_pb2.SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START
-            ),
+            source_replay_capability=(layer5_pb2.SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START),
             expected_object_id=object_id,
             expected_caller_object_id="bundle-53",
         )
@@ -28,6 +26,21 @@ def test_layer5_canonical_plaintext_object_start_round_trips() -> None:
     assert parsed.WhichOneof("payload") == "canonical_start"
     assert parsed.canonical_start.expected_object_id == object_id
     assert parsed.canonical_start.expected_plaintext_digest.value == digest
+
+
+def test_layer5_bot_recovery_inventory_events_round_trip() -> None:
+    """The vendored client retains Remanence's BOT-recovery stream arms."""
+
+    event = layer5_pb2.TapeInventoryStreamItem(
+        bot_recovery_started=layer5_pb2.TapeInventoryBotRecoveryStarted(
+            tape_uuid=bytes.fromhex("42" * 16),
+            block_size=262_144,
+            reason=(layer5_pb2.TAPE_INVENTORY_BOT_RECOVERY_REASON_NO_USABLE_TERMINAL_LAYOUT),
+        )
+    )
+    parsed = layer5_pb2.TapeInventoryStreamItem.FromString(event.SerializeToString())
+    assert parsed.WhichOneof("item") == "bot_recovery_started"
+    assert parsed.bot_recovery_started.block_size == 262_144
 
 
 def test_intake_proto_messages_round_trip_on_server_stubs() -> None:

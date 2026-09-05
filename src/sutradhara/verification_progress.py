@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 VERIFICATION_PROGRESS_NAME = ".verification-progress.json"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -46,7 +48,9 @@ def write_verification_progress(
     }
     path = intake_dir / VERIFICATION_PROGRESS_NAME
     tmp_path = path.with_name(f"{path.name}.tmp")
-    tmp_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    tmp_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
     tmp_path.replace(path)
 
 
@@ -59,6 +63,7 @@ def read_verification_progress(intake_dir: Path) -> VerificationProgress | None:
     except FileNotFoundError:
         return None
     except Exception:
+        logger.debug("failed to read verification progress from %s", path, exc_info=True)
         return None
     return _progress_from_payload(payload)
 

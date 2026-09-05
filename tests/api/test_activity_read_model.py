@@ -145,8 +145,7 @@ def test_activity_read_model_caps_newest_rows(api_engine: Engine, tmp_path: Path
             api_engine,
             tmp_path,
             intake_id=f"intake-{index:03d}",
-            created_at=dt.datetime(2026, 7, 2, 0, 0, tzinfo=dt.UTC)
-            + dt.timedelta(minutes=index),
+            created_at=dt.datetime(2026, 7, 2, 0, 0, tzinfo=dt.UTC) + dt.timedelta(minutes=index),
         )
 
     payload = read_activity(api_engine, days=1, now=now)

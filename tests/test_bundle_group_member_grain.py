@@ -233,10 +233,15 @@ def test_mixed_bundle_restore_honours_each_member_own_restore_preference(
         pool_two = _add_pool(session, "pool-2", backend)
         # Same pool set -> same fingerprint -> one group. Opposing read orders:
         # restore_preference is explicitly excluded from group identity (§2).
-        _apply(session, "cls-alpha", pools=("pool-1", "pool-2"),
-               restore_preference=("pool-2", "pool-1"))
-        _apply(session, "cls-beta", pools=("pool-1", "pool-2"),
-               restore_preference=("pool-1", "pool-2"))
+        _apply(
+            session,
+            "cls-alpha",
+            pools=("pool-1", "pool-2"),
+            restore_preference=("pool-2", "pool-1"),
+        )
+        _apply(
+            session, "cls-beta", pools=("pool-1", "pool-2"), restore_preference=("pool-1", "pool-2")
+        )
         alpha_group, _ = compute_bundle_group(session, "cls-alpha")
         beta_group, _ = compute_bundle_group(session, "cls-beta")
         assert alpha_group == beta_group, "the two classes must coalesce for this test to bite"
@@ -307,10 +312,15 @@ def test_bundle_restore_group_selection_ranks_by_the_member_class_preference(
         backend = _add_backend(session, "mem")
         pool_one = _add_pool(session, "pool-1", backend)
         pool_two = _add_pool(session, "pool-2", backend)
-        _apply(session, "cls-alpha", pools=("pool-1", "pool-2"),
-               restore_preference=("pool-2", "pool-1"))
-        _apply(session, "cls-beta", pools=("pool-1", "pool-2"),
-               restore_preference=("pool-1", "pool-2"))
+        _apply(
+            session,
+            "cls-alpha",
+            pools=("pool-1", "pool-2"),
+            restore_preference=("pool-2", "pool-1"),
+        )
+        _apply(
+            session, "cls-beta", pools=("pool-1", "pool-2"), restore_preference=("pool-1", "pool-2")
+        )
         bundle = Bundle(
             id="mixed-2",
             **bundle_kwargs_for_class(session, "cls-alpha"),
@@ -543,9 +553,7 @@ def test_sony_split_duplicate_content_resolves_by_hash_and_class(engine: Engine)
                 member_path="event-2/solo.mov",
             ),
         ]
-        _place_bundle_in_pool(
-            session, bundle_id="sony-split", pool=pool, members=members
-        )
+        _place_bundle_in_pool(session, bundle_id="sony-split", pool=pool, members=members)
 
         # durability.py::_locator_artifactclass_filter — the shared hash is
         # placed under both classes; the solo hash under exactly one.
@@ -601,8 +609,7 @@ def test_sony_split_duplicate_content_resolves_by_hash_and_class(engine: Engine)
         # no cls-one member row, so no locator qualifies for cls-one.
         backends = {backend.id: object()}
         assert (
-            _choose_bundle_restore_group(session, [solo_hash], "cls-one", backends=backends)
-            is None
+            _choose_bundle_restore_group(session, [solo_hash], "cls-one", backends=backends) is None
         )
         assert (
             _choose_bundle_restore_group(session, [solo_hash], "cls-two", backends=backends)
@@ -954,9 +961,7 @@ def test_policy_apply_report_names_open_bundles_predating_a_membership_change(
         _apply(session, "solo", pools=("pool-1",), target_gb=1.0, max_age_seconds=3600)
         bundle = Bundle(
             id="open-accumulator",
-            **bundle_kwargs_for_class(
-                session, "solo", target_bytes=1024**3, max_age_seconds=3600
-            ),
+            **bundle_kwargs_for_class(session, "solo", target_bytes=1024**3, max_age_seconds=3600),
             status="open",
             target_bytes=1024**3,
             max_age_seconds=3600,
@@ -971,9 +976,7 @@ def test_policy_apply_report_names_open_bundles_predating_a_membership_change(
 
         # A second class joins the group with a tighter latency ceiling. The
         # group's effective max_age drops; the open bundle keeps its own.
-        report = _apply(
-            session, "joiner", pools=("pool-1",), target_gb=1.0, max_age_seconds=600
-        )
+        report = _apply(session, "joiner", pools=("pool-1",), target_gb=1.0, max_age_seconds=600)
 
         group = report.group_of("solo")
         assert group is not None
@@ -1140,9 +1143,7 @@ def test_policy_apply_report_states_the_class_set_divergence_of_a_stale_projecti
     assert alpha_group.effective_max_age_seconds == 600
     # ...so the warning names it as counted-but-not-a-member.
     counted = next(
-        warning
-        for warning in alpha_group.warnings
-        if warning.kind == WARNING_STALE_PROJECTION
+        warning for warning in alpha_group.warnings if warning.kind == WARNING_STALE_PROJECTION
     )
     assert "beta" in counted.message
     assert "still counted in its thresholds" in counted.message
@@ -1218,10 +1219,7 @@ def test_build_exclusions_source_class_and_ruleset_from_the_member(
                 ),
             ),
         )
-        records = {
-            record.path: record
-            for record in session.scalars(select(ExclusionRecord))
-        }
+        records = {record.path: record for record in session.scalars(select(ExclusionRecord))}
 
         member_sourced = records["two/kept.mov"]
         assert member_sourced.artifactclass == "cls-two"

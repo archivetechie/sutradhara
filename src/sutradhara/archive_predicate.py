@@ -180,8 +180,7 @@ def submission_is_archived(session: Session, submission_id: str) -> bool:
     if not total:
         return False
     archived = session.scalar(
-        select(func.count(SubmissionMember.id))
-        .where(
+        select(func.count(SubmissionMember.id)).where(
             SubmissionMember.submission_id == submission_id,
             select(1)
             .select_from(member)

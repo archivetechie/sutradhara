@@ -373,8 +373,7 @@ def test_ssh_journal_destination_exports_only_append_only_dated_objects(
     assert exported.shipping_error is None
     assert exported.shipped_segments == 1
     segment_key = (
-        "audit/journal/2026-07-20/"
-        "retention-journal-00000000000000000001-00000000000000000002.jsonl"
+        "audit/journal/2026-07-20/retention-journal-00000000000000000001-00000000000000000002.jsonl"
     )
     head_key = f"{segment_key}.head.json"
     assert set(transport.objects) == {segment_key, head_key}
@@ -384,7 +383,9 @@ def test_ssh_journal_destination_exports_only_append_only_dated_objects(
     ]
 
     assert exported.segment is not None
-    assert not destination.publish_file(exported.segment, segment_key.removeprefix("audit/journal/"))
+    assert not destination.publish_file(
+        exported.segment, segment_key.removeprefix("audit/journal/")
+    )
     head_bytes = transport.objects[head_key]
     assert not destination.publish_bytes(head_bytes, head_key.removeprefix("audit/journal/"))
 

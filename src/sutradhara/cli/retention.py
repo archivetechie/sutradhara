@@ -485,7 +485,8 @@ def _resolve_media_id(
         raise ValueError("provide exactly one of --tape or --media-id")
     if media_id:
         return media_id
-    assert tape is not None
+    if tape is None:
+        raise ValueError("provide exactly one of --tape or --media-id")
     matches: set[str] = set()
     for copy in session.scalars(select(Copy).where(Copy.deleted_at.is_(None))):
         canonical = _copy_media_id(copy)

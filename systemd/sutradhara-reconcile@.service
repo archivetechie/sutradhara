@@ -1,0 +1,14 @@
+[Unit]
+Description=Sutradhara reconcile pass for %i
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=replica
+Group=replica
+WorkingDirectory=/opt/sutradhara
+EnvironmentFile=/etc/sutradhara/sutradhara.env
+ExecStart=/opt/sutradhara/.venv/bin/sutra reconcile %i
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true

@@ -27,6 +27,34 @@ from sutradhara.pfr import (
 )
 from sutradhara.resource_control import cpu_lease_from_job, resource_role_for_job
 
+_RETRYABLE_REASON_IDS = frozenset(
+    {
+        ReasonId.SOURCE_CHANGED,
+        ReasonId.BUDGET_EXCEEDED,
+        ReasonId.BUDGET_EXHAUSTED,
+        ReasonId.EXCEPTION,
+    }
+)
+_FALLBACK_REASON_IDS = frozenset(
+    {
+        ReasonId.CAP_EXCEEDED_FALLBACK,
+        ReasonId.OP_ATOM_UNSUPPORTED,
+        ReasonId.PLUGIN_MISSING,
+        ReasonId.FALLBACK,
+    }
+)
+_PARSE_DETERMINATION_REASON_IDS = frozenset({ReasonId.INDEX_UNAVAILABLE})
+_LOUD_STOP_REASON_IDS = frozenset(
+    {
+        ReasonId.BUNDLE_NOT_ADDRESSABLE,
+        ReasonId.REWRAP_NOT_DEPLOYED,
+        ReasonId.UNSUPPORTED_TIME_BASIS,
+        ReasonId.RIP_MISMATCH,
+        ReasonId.GOP_REWRAP_UNSUPPORTED,
+        ReasonId.SIDECAR_SOURCE_MISMATCH,
+    }
+)
+
 
 @register_handler("pfr-index")
 def handle_pfr_index(ctx: JobContext) -> JobResult:
@@ -92,35 +120,6 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
             }
         },
     )
-
-
-_RETRYABLE_REASON_IDS = frozenset(
-    {
-        ReasonId.SOURCE_CHANGED,
-        ReasonId.BUDGET_EXCEEDED,
-        ReasonId.BUDGET_EXHAUSTED,
-        ReasonId.EXCEPTION,
-    }
-)
-_FALLBACK_REASON_IDS = frozenset(
-    {
-        ReasonId.CAP_EXCEEDED_FALLBACK,
-        ReasonId.OP_ATOM_UNSUPPORTED,
-        ReasonId.PLUGIN_MISSING,
-        ReasonId.FALLBACK,
-    }
-)
-_PARSE_DETERMINATION_REASON_IDS = frozenset({ReasonId.INDEX_UNAVAILABLE})
-_LOUD_STOP_REASON_IDS = frozenset(
-    {
-        ReasonId.BUNDLE_NOT_ADDRESSABLE,
-        ReasonId.REWRAP_NOT_DEPLOYED,
-        ReasonId.UNSUPPORTED_TIME_BASIS,
-        ReasonId.RIP_MISMATCH,
-        ReasonId.GOP_REWRAP_UNSUPPORTED,
-        ReasonId.SIDECAR_SOURCE_MISMATCH,
-    }
-)
 
 
 def _failure_result(
@@ -200,7 +199,9 @@ def _is_parse_determination(failure: ScrapeFailure) -> bool:
         return False
     if failure.reason_id in _PARSE_DETERMINATION_REASON_IDS:
         return True
-    return failure.reason_id == ReasonId.EXCEPTION and failure.exception_class == "MXFParseError"
+    return bool(
+        failure.reason_id == ReasonId.EXCEPTION and failure.exception_class == "MXFParseError"
+    )
 
 
 def _previous_same_failure(ctx: JobContext, failure: ScrapeFailure) -> bool:

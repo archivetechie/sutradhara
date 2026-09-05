@@ -95,8 +95,7 @@ def test_parse_identity_display_role_uses_precedence_not_gates() -> None:
         {
             "X-Authentik-Username": "ada",
             "X-Authentik-Groups": (
-                "sutradhara-oversight|sutradhara-ingest|"
-                "sutradhara-restore|sutradhara-admin"
+                "sutradhara-oversight|sutradhara-ingest|sutradhara-restore|sutradhara-admin"
             ),
         }
     )
@@ -119,9 +118,7 @@ def test_parse_identity_old_group_names_grant_no_capabilities(group: str) -> Non
 
 
 def test_parse_identity_old_group_name_in_union_grants_nothing_itself() -> None:
-    identity = parse_identity(
-        {"X-Authentik-Groups": "sutradhara-operator|sutradhara-restore-p3"}
-    )
+    identity = parse_identity({"X-Authentik-Groups": "sutradhara-operator|sutradhara-restore-p3"})
 
     assert identity.role is None
     assert identity.capabilities == ("can_restore_p2", "can_restore_p3")

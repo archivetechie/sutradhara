@@ -614,9 +614,7 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
                 representation="rao-plain-v1",
             )
         )
-        session.add(
-            ArtifactClassPool(artifactclass="photo", pool_id="pool-photo", active=True)
-        )
+        session.add(ArtifactClassPool(artifactclass="photo", pool_id="pool-photo", active=True))
         session.add(
             ArtifactClassPolicyRecord(
                 artifactclass="photo",
@@ -663,12 +661,8 @@ def _install_photo_class(engine: Engine, *, target_bytes: int) -> None:
         )
         session.add(backend)
         session.flush()
-        session.add(
-            Pool(id="pool-photo", backend_id=backend.id, representation="rao-plain-v1")
-        )
-        session.add(
-            ArtifactClassPool(artifactclass="photo", pool_id="pool-photo", active=True)
-        )
+        session.add(Pool(id="pool-photo", backend_id=backend.id, representation="rao-plain-v1"))
+        session.add(ArtifactClassPool(artifactclass="photo", pool_id="pool-photo", active=True))
         session.add(
             ArtifactClassPolicyRecord(
                 artifactclass="photo",

@@ -559,8 +559,8 @@ def sweep_staging(
         _record_purge_hold(session, row, actor=actor, reasons=precheck_holds)
         session.commit()
         return StagingSweepResult(intake_id, False, None, precheck_holds[0])
-    assert staging_root is not None
-    assert tombstone_path is not None
+    if staging_root is None or tombstone_path is None:
+        raise RuntimeError("purge precheck passed without resolved staging and tombstone paths")
 
     operation_id = f"purge:{intake_id}"
     session.commit()
@@ -626,7 +626,8 @@ def sweep_staging(
                 _record_purge_hold(session, row, actor=actor, reasons=reasons)
                 session.commit()
                 return StagingSweepResult(intake_id, False, None, reasons[0])
-            assert requests is not None
+            if requests is None:
+                raise RuntimeError("witness refresh was requested without prepared requests")
             if session.in_transaction():
                 raise RuntimeError("witness refresh must run outside a transaction")
             witnesses = _execute_witness_requests(requests)
@@ -1297,7 +1298,8 @@ def _execute_witness_requests(
                 observed_at=_utcnow(),
             )
             continue
-        assert request.adapter is not None
+        if request.adapter is None:
+            raise RuntimeError("eligible retention witness request has no backend adapter")
         try:
             result = request.adapter.witness_copy(
                 request.locator,

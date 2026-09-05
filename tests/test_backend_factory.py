@@ -55,7 +55,7 @@ def test_memory_backend_ignores_empty_config() -> None:
 
 def test_retention_witness_capability_follows_registered_adapter_class() -> None:
     assert backend_declares_retention_witness(
-        _rem_tape_row({"daemon_endpoint": "http://localhost:50051"})
+        _rem_tape_row({"daemon_endpoint": "unix:/run/remanence/rem.sock"})
     )
     assert not backend_declares_retention_witness(_memory_row({}))
     assert not backend_declares_retention_witness(_d2_tape_row({}))
@@ -79,7 +79,7 @@ def test_obsolete_placements_config_is_rejected() -> None:
 
 
 def test_daemon_endpoint_builds_live_adapter() -> None:
-    backend = backend_from_row(_rem_tape_row({"daemon_endpoint": "http://localhost:50051"}))
+    backend = backend_from_row(_rem_tape_row({"daemon_endpoint": "unix:/run/remanence/rem.sock"}))
     assert isinstance(backend, RemanenceBackend)
     assert backend.name == "primary-tape"
 

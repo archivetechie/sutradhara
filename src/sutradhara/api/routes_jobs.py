@@ -257,8 +257,7 @@ def _is_pathish_key(key: str) -> bool:
 def _resource_list(raw: list[dict[str, Any]] | None) -> list[dict[str, object]]:
     normalized = normalize_required_resources(raw)
     return [
-        {"pool": sanitize_text(pool), "count": count}
-        for pool, count in sorted(normalized.items())
+        {"pool": sanitize_text(pool), "count": count} for pool, count in sorted(normalized.items())
     ]
 
 

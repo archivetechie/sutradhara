@@ -1,0 +1,20 @@
+[Unit]
+Description=Sutradhara job worker
+After=network-online.target sutradhara-serve.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=replica
+Group=replica
+WorkingDirectory=/opt/sutradhara
+EnvironmentFile=/etc/sutradhara/sutradhara.env
+ExecStart=/opt/sutradhara/.venv/bin/sutra worker
+Restart=on-failure
+RestartSec=3
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

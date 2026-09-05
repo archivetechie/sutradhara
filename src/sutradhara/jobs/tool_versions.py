@@ -10,6 +10,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from collections.abc import Callable
+from importlib.metadata import PackageNotFoundError, version
 
 from sutradhara.resource_control import run_managed
 
@@ -61,5 +62,16 @@ def _command_tool_version(tool: str) -> str:
     return lines[0][:128] if lines else "unknown"
 
 
+def _distribution_version(distribution: str) -> str:
+    """Return an installed Python distribution version without importing it."""
+
+    try:
+        return version(distribution)[:128]
+    except PackageNotFoundError:
+        return "unknown"
+
+
 register_tool_version("ffmpeg", lambda: _command_tool_version("ffmpeg"))
 register_tool_version("ffprobe", lambda: _command_tool_version("ffprobe"))
+register_tool_version("format-anatomy", lambda: _distribution_version("format-anatomy"))
+register_tool_version("pfr_core", lambda: _distribution_version("format-anatomy"))

@@ -262,9 +262,7 @@ def reap_stuck_flushing(session: Session) -> list[str]:
     """
     reaped: list[str] = []
     stuck = list(
-        session.scalars(
-            select(Bundle).where(Bundle.status == "flushing").order_by(Bundle.id)
-        )
+        session.scalars(select(Bundle).where(Bundle.status == "flushing").order_by(Bundle.id))
     )
     for bundle in stuck:
         token = bundle.claimed_by

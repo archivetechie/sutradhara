@@ -221,7 +221,7 @@ def test_parse_artifactclass_policy_rejects_duplicate_pools() -> None:
 
 def test_apply_artifactclass_policy_upserts_memberships(engine: Engine) -> None:
     policy = parse_artifactclass_policy(
-        _staging_policy_text() + '\n[hdcache]\nenabled = true\n' + _durability_override()
+        _staging_policy_text() + "\n[hdcache]\nenabled = true\n" + _durability_override()
     )
     with session_scope(engine) as s:
         backend = Backend(

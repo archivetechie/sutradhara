@@ -117,11 +117,14 @@ def test_device_reenrollment_requires_rotation_proof(engine: Engine) -> None:
 
     with session_scope(engine) as session:
         assert store.operator_for_device(session, "mac-1") == "ada"
-        assert store.resolve_device(
-            session,
-            device_id="mac-1",
-            cert_fingerprint="AA" * 32,
-        ).operator == "ada"
+        assert (
+            store.resolve_device(
+                session,
+                device_id="mac-1",
+                cert_fingerprint="AA" * 32,
+            ).operator
+            == "ada"
+        )
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="BB" * 32)
         assert _active_enrollment_count(session, "mac-1") == 1
@@ -177,11 +180,14 @@ def test_device_reenrollment_allows_admin_rotation(engine: Engine) -> None:
     with session_scope(engine) as session:
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="AA" * 32)
-        assert store.resolve_device(
-            session,
-            device_id="mac-1",
-            cert_fingerprint="BB" * 32,
-        ).operator == "ada"
+        assert (
+            store.resolve_device(
+                session,
+                device_id="mac-1",
+                cert_fingerprint="BB" * 32,
+            ).operator
+            == "ada"
+        )
 
 
 def test_device_reenrollment_same_fingerprint_is_idempotent(engine: Engine) -> None:
@@ -229,11 +235,14 @@ def test_device_reenrollment_refuses_different_operator_without_mutation(engine:
 
     with session_scope(engine) as session:
         assert _active_enrollment_count(session, "mac-1") == 1
-        assert store.resolve_device(
-            session,
-            device_id="mac-1",
-            cert_fingerprint="AA" * 32,
-        ).operator == "ada"
+        assert (
+            store.resolve_device(
+                session,
+                device_id="mac-1",
+                cert_fingerprint="AA" * 32,
+            ).operator
+            == "ada"
+        )
         with pytest.raises(PermissionError):
             store.resolve_device(session, device_id="mac-1", cert_fingerprint="CC" * 32)
 

@@ -122,8 +122,7 @@ def _check_receive_fact_skew(receive_facts: Any) -> None:
     profile = str(receive_facts.package_profile_version or "")
     if profile and profile != PACKAGE_PROFILE_VERSION:
         raise AssemblyError(
-            "package profile mismatch: "
-            f"expected {PACKAGE_PROFILE_VERSION}, actual {profile!r}"
+            f"package profile mismatch: expected {PACKAGE_PROFILE_VERSION}, actual {profile!r}"
         )
 
 

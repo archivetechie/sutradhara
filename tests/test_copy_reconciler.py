@@ -212,12 +212,15 @@ def test_write_fenced_pool_does_not_open_copy_condition(engine: Engine) -> None:
         discover(session, "copy")
 
         assert _condition(session, active_key).condition == CONDITION_OPEN
-        assert session.scalars(
-            select(ReconciliationCondition).where(
-                ReconciliationCondition.domain == "copy",
-                ReconciliationCondition.target_key == fenced_key,
-            )
-        ).one_or_none() is None
+        assert (
+            session.scalars(
+                select(ReconciliationCondition).where(
+                    ReconciliationCondition.domain == "copy",
+                    ReconciliationCondition.target_key == fenced_key,
+                )
+            ).one_or_none()
+            is None
+        )
         fenced = copy_reconciler.observe(session, fenced_key)
         assert fenced.desired is False
         assert fenced.observed_state == "missing"

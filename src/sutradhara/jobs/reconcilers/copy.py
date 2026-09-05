@@ -170,14 +170,8 @@ def _active_pool_ids_for_class(session: Session, artifactclass: str) -> set[str]
 def _observed_pool_ids(session: Session, asset_hash: bytes) -> set[str]:
     measured = direct_copies(session, asset_hash, require_verified=True)
     pending_ids = pending_verification_copy_ids(session)
-    pending = [
-        copy
-        for copy in _healthy_copies(session, asset_hash)
-        if copy.id in pending_ids
-    ]
-    return {
-        copy.pool_id for copy in [*measured, *pending] if copy.pool_id is not None
-    }
+    pending = [copy for copy in _healthy_copies(session, asset_hash) if copy.id in pending_ids]
+    return {copy.pool_id for copy in [*measured, *pending] if copy.pool_id is not None}
 
 
 def _live_classes_for_asset(session: Session, asset_hash: bytes) -> set[str]:

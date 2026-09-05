@@ -573,7 +573,9 @@ def _one_excluded_member_by_path(arrangement: Arrangement, member_path: str) -> 
         if member.member_path == member_path and member.excluded
     ]
     if not matches:
-        raise ArrangementError(f"arrangement {arrangement.id} has no excluded member {member_path!r}")
+        raise ArrangementError(
+            f"arrangement {arrangement.id} has no excluded member {member_path!r}"
+        )
     if len(matches) > 1:
         raise ArrangementError(
             f"arrangement {arrangement.id} has ambiguous excluded member {member_path!r}"

@@ -56,7 +56,8 @@ def create_cmd(
             if from_intake is not None:
                 arrangement = create_from_intake(session, from_intake, label=label)
             else:
-                assert from_arrangement is not None
+                if from_arrangement is None:
+                    raise click.ClickException("provide --from-intake or --from-arrangement")
                 arrangement = create_from_arrangement(session, from_arrangement, label=label)
             payload = _arrangement_payload(arrangement)
     except ArrangementError as exc:

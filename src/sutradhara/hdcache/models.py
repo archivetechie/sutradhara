@@ -363,9 +363,7 @@ class RestoreOrderingOutcome(Base):
             name="ck_restore_ordering_outcome_phase",
         ),
         CheckConstraint(
-            "status IN ("
-            + ", ".join(f"'{status}'" for status in ORDERING_OUTCOME_STATUSES)
-            + ")",
+            "status IN (" + ", ".join(f"'{status}'" for status in ORDERING_OUTCOME_STATUSES) + ")",
             name="ck_restore_ordering_outcome_status",
         ),
         Index("ix_restore_ordering_outcome_request_volume", "request_id", "tape_uuid"),

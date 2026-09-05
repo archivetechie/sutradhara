@@ -616,7 +616,9 @@ def test_stream_drop_releases_card_lease_for_immediate_retry(api_engine: Engine)
         assert list(session.scalars(select(api_store.SourceClaim))) == []
 
 
-def test_stream_drop_after_start_keeps_live_receive_and_lease(api_engine: Engine, tmp_path: Path) -> None:
+def test_stream_drop_after_start_keeps_live_receive_and_lease(
+    api_engine: Engine, tmp_path: Path
+) -> None:
     """An ack-stream failure cannot terminalize a StartIntake-claimed receive."""
 
     registry = _online_registry(api_engine)

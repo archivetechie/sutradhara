@@ -173,8 +173,10 @@ def process_lockfile_for(engine_or_url: Engine | str, *, namespace: str) -> Path
         raise ValueError("lock namespace must contain only lowercase letters, digits, and hyphens")
     url = engine_or_url.url if isinstance(engine_or_url, Engine) else make_url(engine_or_url)
     if url.drivername.startswith("sqlite") and url.database not in {None, "", ":memory:"}:
-        assert isinstance(url.database, str)
-        db_path = Path(url.database).expanduser()
+        database = url.database
+        if not isinstance(database, str):
+            raise ValueError("file-backed SQLite worker lock requires a string database path")
+        db_path = Path(database).expanduser()
         if not db_path.is_absolute():
             db_path = Path.cwd() / db_path
         return db_path.resolve(strict=False).with_name(db_path.name + f".{namespace}.lock")

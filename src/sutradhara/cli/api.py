@@ -25,10 +25,20 @@ DEFAULT_API_SOCKET = "/run/sutradhara/api.sock"
     show_default="$SUTRA_API_SOCKET or /run/sutradhara/api.sock",
     help="Unix domain socket path for Caddy to proxy.",
 )
-@click.option("--tcp", is_flag=True, default=False, help="Serve loopback TCP for local dev.")
+@click.option(
+    "--tcp",
+    is_flag=True,
+    default=False,
+    help=(
+        "Serve loopback TCP for local development; local processes can forge "
+        "the trusted identity headers."
+    ),
+)
 @click.option("--host", default="127.0.0.1", show_default=True, help="Loopback TCP host.")
 @click.option("--port", default=8770, show_default=True, type=int, help="Loopback TCP port.")
-@click.option("--socket-mode", default="660", show_default=True, help="Octal mode for the API Unix socket.")
+@click.option(
+    "--socket-mode", default="660", show_default=True, help="Octal mode for the API Unix socket."
+)
 def serve_api_cmd(socket_path: Path, tcp: bool, host: str, port: int, socket_mode: str) -> None:
     """Serve the operator API on a UDS by default, never on a tailnet/public bind."""
 

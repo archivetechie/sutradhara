@@ -196,9 +196,7 @@ def walk_disk(
 ) -> HdcacheWalkResult:
     """Walk one cache disk according to the design §8.2 matrix."""
 
-    if disk.state == "absent" and not _probe_absent_disk_recovery(
-        session, disk, config=config
-    ):
+    if disk.state == "absent" and not _probe_absent_disk_recovery(session, disk, config=config):
         _emit(config, "walker-disk-absent", "info", disk.disk_id, detail="disk state is absent")
         return HdcacheWalkResult(disk_id=disk.disk_id, destructive=False)
 
@@ -266,7 +264,9 @@ def walk_disk(
         )
 
     try:
-        unknown_deleted = _delete_unknown_files(session, unknown, config, disk) if destructive else 0
+        unknown_deleted = (
+            _delete_unknown_files(session, unknown, config, disk) if destructive else 0
+        )
         tmp_deleted = _gc_tmp_files(session, disk, mount, config=config) if destructive else 0
     except (DiskWalkAborted, StoreReadTimeout) as exc:
         if isinstance(exc, StoreReadTimeout):
@@ -685,7 +685,9 @@ def _rebuild_observed_entry(
     return True
 
 
-def _rebuild_failure(disk: CacheDisk, observed: EnumeratedEntry, reason: str) -> RebuildFailureError:
+def _rebuild_failure(
+    disk: CacheDisk, observed: EnumeratedEntry, reason: str
+) -> RebuildFailureError:
     return RebuildFailureError(
         RebuildFailure(
             disk_id=disk.disk_id,
@@ -894,7 +896,9 @@ def _delete_unknown_files(
     return deleted
 
 
-def _gc_tmp_files(session: Session, disk: CacheDisk, mount: Path, *, config: HdcacheWalkerConfig) -> int:
+def _gc_tmp_files(
+    session: Session, disk: CacheDisk, mount: Path, *, config: HdcacheWalkerConfig
+) -> int:
     tmp = tmp_root(mount)
     if not _disk_io(
         disk,
@@ -946,7 +950,9 @@ def _tmp_job_live(session: Session, path: Path) -> bool:
     if match is not None:
         return _live_hdcache_job(session, bytes.fromhex(match.group(0)))
     count = session.scalar(
-        select(func.count()).select_from(Job).where(
+        select(func.count())
+        .select_from(Job)
+        .where(
             Job.kind == JOB_KIND,
             Job.status.in_(LIVE_JOB_STATUS_VALUES),
         )
@@ -992,7 +998,9 @@ def _filling_is_live_or_young(
 
 def _live_hdcache_job(session: Session, digest: bytes) -> bool:
     count = session.scalar(
-        select(func.count()).select_from(Job).where(
+        select(func.count())
+        .select_from(Job)
+        .where(
             Job.kind == JOB_KIND,
             Job.status.in_(LIVE_JOB_STATUS_VALUES),
             Job.dedupe_key == dedupe_key(digest),

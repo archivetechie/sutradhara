@@ -1,6 +1,6 @@
 """Storage backend contract — the trait every backend adapter implements.
 
-See docs/spec-v0.1.md §5 (backend adapter contract). Each adapter is one
+See docs/architecture-overview.md (backend adapter contract). Each adapter is one
 thin layer per backend kind. Sutradhara treats every backend uniformly:
 enumerate() yields the per-copy identity, read_range() reads bytes,
 verify() re-checks integrity.
@@ -66,7 +66,7 @@ class CopyRecord:
     The shape returned by `StorageBackend.enumerate()`. This is what the
     catalog turns into rows in `copy` (sutradhara.catalog.models.Copy).
 
-    See spec-v0.1.md §5.1: the union of every backend's enumerate() output
+    See docs/architecture-overview.md: the union of every backend's enumerate() output
     IS the rebuilt catalog.
     """
 
@@ -115,7 +115,7 @@ class StorageBackend(Protocol):
         Each `CopyRecord` carries `logical_id` (the content hash) so the
         catalog can be rebuilt from the union of every backend's
         enumeration. This is the load-bearing operation that makes the
-        rebuildable-index discipline real (spec-v0.1.md §2 principle 1).
+        rebuildable-index discipline real (docs/architecture-overview.md).
 
         Implementations MUST NOT yield a copy whose backend durability state
         is short of CHECKPOINTED. In particular, a Remanence WRITTEN append is

@@ -59,7 +59,9 @@ class SelfHealUnavailable(ReplicationError):
 class WritableStorageBackend(StorageBackend, Protocol):
     """Storage backend surface needed by the fan-out writer."""
 
-    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
+    def write_object_to_pool(
+        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+    ) -> CopyRecord:
         """Return only after `source` is durable and copy-accountable.
 
         Checkpoint-capable implementations must return the copy selected from
@@ -208,9 +210,7 @@ def bundle_group_targets(
             )
         )
     if not targets:
-        raise ReplicationPolicyMissing(
-            f"bundle {bundle.id!r} has no write-eligible basis pools"
-        )
+        raise ReplicationPolicyMissing(f"bundle {bundle.id!r} has no write-eligible basis pools")
     return targets
 
 
@@ -238,9 +238,7 @@ def _pool_target_entry(
             backend_name=pool.backend.name,
             representation=pool.representation,
             key_epoch=(
-                key_epoch
-                if pool.representation == Representation.RAO_AEAD_V1.value
-                else None
+                key_epoch if pool.representation == Representation.RAO_AEAD_V1.value else None
             ),
             location=pool.location,
             offsite_gate=pool.offsite_gate,

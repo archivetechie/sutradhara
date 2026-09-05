@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import logging
 import os
 import subprocess
 from collections.abc import Callable, Sequence
@@ -29,6 +30,7 @@ from sutradhara.hdcache.store import (
 
 DEFAULT_MOUNT_ROOT = Path("/srv/hdcache")
 LOST_MARK_BATCH_SIZE = 1000
+logger = logging.getLogger(__name__)
 
 
 class LifecycleError(RuntimeError):
@@ -148,6 +150,7 @@ class ShellDiskProvisioner:
             )
             payload = json.loads(output)
         except Exception:
+            logger.debug("failed to enumerate cache block devices with lsblk", exc_info=True)
             return ()
         devices: list[BlockDeviceCandidate] = []
         for node in payload.get("blockdevices", []):
@@ -246,7 +249,9 @@ class HdcacheLifecycleManager:
         try:
             with factory.begin() as session:
                 if candidate is not None and self._serial_exists(session, candidate.serial):
-                    raise LifecycleError(f"cache disk serial is already enrolled: {candidate.serial}")
+                    raise LifecycleError(
+                        f"cache disk serial is already enrolled: {candidate.serial}"
+                    )
                 disk_id = self._next_disk_id(session)
                 provisioned = self.provisioner.provision(
                     block_dev,
@@ -304,14 +309,15 @@ class HdcacheLifecycleManager:
             self.provisioner.cleanup_failed_enrollment(disk)
         except Exception as cleanup_exc:
             raise LifecycleError(
-                f"failed to enroll {disk.block_dev}: {original}; "
-                f"cleanup also failed: {cleanup_exc}"
+                f"failed to enroll {disk.block_dev}: {original}; cleanup also failed: {cleanup_exc}"
             ) from cleanup_exc
 
     def add_scan(self) -> list[DiskAddResult]:
         """Provision every currently unenrolled scan candidate."""
 
-        return [self._add_disk(candidate.block_dev, candidate=candidate) for candidate in self.scan()]
+        return [
+            self._add_disk(candidate.block_dev, candidate=candidate) for candidate in self.scan()
+        ]
 
     def disks(self, *, include_dead: bool = False) -> list[CacheDisk]:
         """Return enrolled disks sorted by disk_id."""
@@ -496,7 +502,9 @@ class HdcacheLifecycleManager:
     @staticmethod
     def _serial_exists(session: Any, serial: str) -> bool:
         return (
-            session.scalar(select(func.count()).select_from(CacheDisk).where(CacheDisk.serial == serial))
+            session.scalar(
+                select(func.count()).select_from(CacheDisk).where(CacheDisk.serial == serial)
+            )
             or 0
         ) > 0
 

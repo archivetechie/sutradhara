@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=oneshot
 User=replica
 Group=replica
+WorkingDirectory=/opt/sutradhara
 EnvironmentFile=-/etc/sutradhara/sutradhara.env
-ExecStart=/usr/bin/env sutra retention journal export
+ExecStart=/opt/sutradhara/.venv/bin/sutra retention journal export
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-

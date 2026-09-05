@@ -132,9 +132,7 @@ def scan_enqueue_batch(
     if not root.is_dir():
         raise ArchiveEnqueueError(f"scan root is not a directory: {root}")
     if not items:
-        raise ArchiveEnqueueError(
-            f"enqueue batch for {artifactclass!r} under {root} has no items"
-        )
+        raise ArchiveEnqueueError(f"enqueue batch for {artifactclass!r} under {root} has no items")
     report = run_rem_archive_scan(
         inputs=[root],
         ruleset=policy.ruleset or None,
@@ -191,9 +189,7 @@ def scan_enqueue_batch(
                 f"expected {item.logical_asset_hash.hex()}"
             )
         if staged.bundle_id is None:  # pragma: no cover - enqueue always routes
-            raise ArchiveEnqueueError(
-                f"staging did not report a bundle for {item.member_path!r}"
-            )
+            raise ArchiveEnqueueError(f"staging did not report a bundle for {item.member_path!r}")
         enqueued.append(
             EnqueuedMember(
                 member_path=staged.stored_member_path,
@@ -237,9 +233,7 @@ def enqueue_intake_batch(
     if not scan_root.is_dir():
         raise ArchiveEnqueueError(f"intake {intake_id!r} scan root is missing: {scan_root}")
     resolved_staging = (
-        Path(staging_root)
-        if staging_root is not None
-        else scan_root.parent / ".sutradhara-stage"
+        Path(staging_root) if staging_root is not None else scan_root.parent / ".sutradhara-stage"
     )
 
     items_by_class: dict[str, list[EnqueueItem]] = {}
@@ -380,9 +374,7 @@ def _cluster_already_recorded(
             ExclusionRecord.logical_asset_hash.is_(None),
         )
     )
-    return any(
-        (row.detail or {}).get("scan_root") == str(scan_root) for row in rows
-    )
+    return any((row.detail or {}).get("scan_root") == str(scan_root) for row in rows)
 
 
 def _prefix_covers(prefix: str, member_path: str) -> bool:

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v9
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync --locked --extra dev
+      - run: uv run pytest -q
+
+  quality:
+    name: lint, format, types, generated contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v9
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --extra dev
+      - run: uv run ruff check src tests packages/sutradhara-receive/src
+      - run: uv run ruff format --check src tests packages/sutradhara-receive/src
+      - run: uv run python scripts/check-mypy-baseline.py
+      - name: Verify committed protobuf stubs
+        run: |
+          ./scripts/regenerate-proto.sh
+          git diff --exit-code -- proto src/sutradhara/_proto
+
+  remanence-wire:
+    name: pinned rem-daemon wire proof
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: archivetechie/remanence
+          ref: 1ca0a9e6098b9000695752fb19b2bf07403a7c7c
+          path: .ci/remanence
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v9
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - run: uv sync --locked --extra dev
+      - run: cargo build --manifest-path .ci/remanence/Cargo.toml --bin rem-daemon
+      - name: Run real-daemon read/planning contract
+        env:
+          REM_DAEMON_BIN: ${{ github.workspace }}/.ci/remanence/target/debug/rem-daemon
+        run: uv run pytest -q tests/test_read_ordering_live.py

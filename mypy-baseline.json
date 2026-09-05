@@ -1,0 +1,1389 @@
+{
+  "diagnostics": [
+    {
+      "code": "call-overload",
+      "column": 17,
+      "count": 1,
+      "file": "src/sutradhara/api/activity.py",
+      "line": 151,
+      "message": "No overload variant of \"int\" matches argument type \"object\""
+    },
+    {
+      "code": "unused-ignore",
+      "column": -1,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 78,
+      "message": "Unused \"type: ignore\" comment"
+    },
+    {
+      "code": "no-any-return",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 78,
+      "message": "Returning Any from function declared to return \"Response\""
+    },
+    {
+      "code": "operator",
+      "column": 21,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 78,
+      "message": "\"object\" not callable"
+    },
+    {
+      "code": "unreachable",
+      "column": 27,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 85,
+      "message": "Subclass of \"str\" and \"dict[Any, Any]\" cannot exist: have distinct disjoint bases"
+    },
+    {
+      "code": "unreachable",
+      "column": 16,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 86,
+      "message": "Right operand of \"and\" is never evaluated"
+    },
+    {
+      "code": "unreachable",
+      "column": 12,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 88,
+      "message": "Statement is unreachable"
+    },
+    {
+      "code": "unreachable",
+      "column": 22,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 93,
+      "message": "Subclass of \"str\" and \"dict[Any, Any]\" cannot exist: have distinct disjoint bases"
+    },
+    {
+      "code": "unreachable",
+      "column": 40,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 93,
+      "message": "Right operand of \"and\" is never evaluated"
+    },
+    {
+      "code": "unreachable",
+      "column": 12,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 94,
+      "message": "Statement is unreachable"
+    },
+    {
+      "code": "arg-type",
+      "column": 83,
+      "count": 1,
+      "file": "src/sutradhara/api/app.py",
+      "line": 95,
+      "message": "Argument \"headers\" to \"_error_response\" has incompatible type \"Mapping[str, str] | None\"; expected \"dict[str, str] | None\""
+    },
+    {
+      "code": "assignment",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/receive_history.py",
+      "line": 99,
+      "message": "Incompatible types in assignment (expression has type \"GrpcIntake\", variable has type \"Intake\")"
+    },
+    {
+      "code": "assignment",
+      "column": 23,
+      "count": 1,
+      "file": "src/sutradhara/api/receive_history.py",
+      "line": 106,
+      "message": "Incompatible types in assignment (expression has type \"Intake\", variable has type \"GrpcIntake | None\")"
+    },
+    {
+      "code": "arg-type",
+      "column": 45,
+      "count": 1,
+      "file": "src/sutradhara/api/receive_history.py",
+      "line": 110,
+      "message": "Argument 1 to \"intake_receipt_summary\" has incompatible type \"Intake\"; expected \"GrpcIntake\""
+    },
+    {
+      "code": "assignment",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/receive_history.py",
+      "line": 123,
+      "message": "Incompatible types in assignment (expression has type \"IdempotencyRecord\", variable has type \"Intake\")"
+    },
+    {
+      "code": "attr-defined",
+      "column": 21,
+      "count": 1,
+      "file": "src/sutradhara/api/receive_history.py",
+      "line": 129,
+      "message": "\"Intake\" has no attribute \"operator_username\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 24,
+      "count": 1,
+      "file": "src/sutradhara/api/receive_history.py",
+      "line": 130,
+      "message": "\"Intake\" has no attribute \"started_at\""
+    },
+    {
+      "code": "assignment",
+      "column": 25,
+      "count": 1,
+      "file": "src/sutradhara/api/receive_history.py",
+      "line": 132,
+      "message": "Incompatible types in assignment (expression has type \"Intake\", variable has type \"IdempotencyRecord | None\")"
+    },
+    {
+      "code": "attr-defined",
+      "column": 51,
+      "count": 1,
+      "file": "src/sutradhara/api/receive_history.py",
+      "line": 133,
+      "message": "\"Intake\" has no attribute \"card_label\""
+    },
+    {
+      "code": "arg-type",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 144,
+      "message": "Argument 1 to \"run_sync\" has incompatible type \"Callable[[object, str, list[object]], list[dict[str, object]]]\"; expected \"Callable[[Any, str, list[DeviceView]], list[dict[str, object]]]\""
+    },
+    {
+      "code": "arg-type",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 156,
+      "message": "Argument 1 to \"run_sync\" has incompatible type \"Callable[[object, str, list[object]], list[dict[str, object]]]\"; expected \"Callable[[Any, str, list[DeviceView]], list[dict[str, object]]]\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 25,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 259,
+      "message": "\"object\" has no attribute \"entries\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 21,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 261,
+      "message": "\"object\" has no attribute \"truncated\""
+    },
+    {
+      "code": "union-attr",
+      "column": 26,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 405,
+      "message": "Item \"None\" of \"Card | None\" has no attribute \"card_id\""
+    },
+    {
+      "code": "union-attr",
+      "column": 23,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 406,
+      "message": "Item \"None\" of \"Card | None\" has no attribute \"label\""
+    },
+    {
+      "code": "union-attr",
+      "column": 55,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 424,
+      "message": "Item \"None\" of \"dict[str, Any] | None\" has no attribute \"items\""
+    },
+    {
+      "code": "arg-type",
+      "column": 22,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 513,
+      "message": "Argument \"intake_id\" to \"_complete_http_receive\" has incompatible type \"str | None\"; expected \"str\""
+    },
+    {
+      "code": "dict-item",
+      "column": 12,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 519,
+      "message": "Dict entry 0 has incompatible type \"str\": \"str | None\"; expected \"str\": \"str\""
+    },
+    {
+      "code": "union-attr",
+      "column": 11,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 542,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"operator\""
+    },
+    {
+      "code": "arg-type",
+      "column": 25,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 546,
+      "message": "Argument 1 to \"intake_status\" has incompatible type \"GrpcIntake | None\"; expected \"GrpcIntake\""
+    },
+    {
+      "code": "union-attr",
+      "column": 20,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 548,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"intake_id\""
+    },
+    {
+      "code": "arg-type",
+      "column": 36,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 554,
+      "message": "Argument 1 to \"_receive_progress_payload\" has incompatible type \"GrpcIntake | None\"; expected \"GrpcIntake\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 652,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 653,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 654,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 658,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 659,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 660,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 661,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 662,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 663,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 665,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 12,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 666,
+      "message": "\"object\" has no attribute \"state\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 671,
+      "message": "Returning Any from function declared to return \"ConnectedDeviceRegistry\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 675,
+      "message": "Returning Any from function declared to return \"ReceiveProgressRegistry\""
+    },
+    {
+      "code": "return",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 842,
+      "message": "Missing return statement"
+    },
+    {
+      "code": "arg-type",
+      "column": 35,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 907,
+      "message": "Argument 1 to \"make_session_factory\" has incompatible type \"object\"; expected \"Engine\""
+    },
+    {
+      "code": "arg-type",
+      "column": 35,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 917,
+      "message": "Argument 1 to \"make_session_factory\" has incompatible type \"object\"; expected \"Engine\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 20,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 950,
+      "message": "\"object\" has no attribute \"device_id\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 22,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 951,
+      "message": "\"object\" has no attribute \"operator\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 40,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 953,
+      "message": "\"object\" has no attribute \"last_seen\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 29,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 954,
+      "message": "\"object\" has no attribute \"capabilities\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 24,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 964,
+      "message": "\"object\" has no attribute \"cards\""
+    },
+    {
+      "code": "arg-type",
+      "column": 35,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 976,
+      "message": "Argument 1 to \"make_session_factory\" has incompatible type \"object\"; expected \"Engine\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 24,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 985,
+      "message": "\"object\" has no attribute \"cards\""
+    },
+    {
+      "code": "arg-type",
+      "column": 35,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1007,
+      "message": "Argument 1 to \"make_session_factory\" has incompatible type \"object\"; expected \"Engine\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 20,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1010,
+      "message": "\"object\" has no attribute \"device_id\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 44,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1017,
+      "message": "\"object\" has no attribute \"last_seen\""
+    },
+    {
+      "code": "arg-type",
+      "column": 35,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1030,
+      "message": "Argument 1 to \"make_session_factory\" has incompatible type \"object\"; expected \"Engine\""
+    },
+    {
+      "code": "assignment",
+      "column": 25,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1086,
+      "message": "Incompatible types in assignment (expression has type \"int | None\", variable has type \"int\")"
+    },
+    {
+      "code": "var-annotated",
+      "column": 14,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1124,
+      "message": "Need type annotation for \"wrapped\""
+    },
+    {
+      "code": "arg-type",
+      "column": 34,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1124,
+      "message": "Argument 1 to \"wrap_future\" has incompatible type \"object\"; expected \"concurrent.futures._base.Future[Never] | _asyncio.Future[Never]\""
+    },
+    {
+      "code": "var-annotated",
+      "column": 14,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1129,
+      "message": "Need type annotation for \"wrapped\""
+    },
+    {
+      "code": "arg-type",
+      "column": 34,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1129,
+      "message": "Argument 1 to \"wrap_future\" has incompatible type \"object\"; expected \"concurrent.futures._base.Future[Never] | _asyncio.Future[Never]\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 36,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1208,
+      "message": "\"object\" has no attribute \"truncated\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 21,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1209,
+      "message": "\"object\" has no attribute \"entries\""
+    },
+    {
+      "code": "return",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1244,
+      "message": "Missing return statement"
+    },
+    {
+      "code": "attr-defined",
+      "column": 13,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1252,
+      "message": "\"object\" has no attribute \"status\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 13,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1279,
+      "message": "\"object\" has no attribute \"detail\""
+    },
+    {
+      "code": "arg-type",
+      "column": 35,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1310,
+      "message": "Argument 1 to \"make_session_factory\" has incompatible type \"object\"; expected \"Engine\""
+    },
+    {
+      "code": "arg-type",
+      "column": 35,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_devices.py",
+      "line": 1343,
+      "message": "Argument 1 to \"make_session_factory\" has incompatible type \"object\"; expected \"Engine\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_intake_archive.py",
+      "line": 529,
+      "message": "Returning Any from function declared to return \"IngestItem | None\""
+    },
+    {
+      "code": "operator",
+      "column": 20,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_jobs.py",
+      "line": 106,
+      "message": "Unsupported operand types for + (\"object\" and \"int\")"
+    },
+    {
+      "code": "operator",
+      "column": 20,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_jobs.py",
+      "line": 108,
+      "message": "Unsupported operand types for + (\"object\" and \"int\")"
+    },
+    {
+      "code": "arg-type",
+      "column": 32,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_library.py",
+      "line": 175,
+      "message": "Argument 1 to \"_group_tape_copies\" has incompatible type \"list[Row[tuple[Copy, Backend]]]\"; expected \"list[tuple[Copy, Backend]]\""
+    },
+    {
+      "code": "assignment",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_library.py",
+      "line": 470,
+      "message": "Incompatible types in assignment (expression has type \"PortalSlot\", variable has type \"Slot\")"
+    },
+    {
+      "code": "assignment",
+      "column": 18,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_library.py",
+      "line": 534,
+      "message": "Incompatible types in assignment (expression has type \"list[Any] | tuple[Any, ...]\", variable has type \"dict_values[Any, Any]\")"
+    },
+    {
+      "code": "assignment",
+      "column": 18,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_library.py",
+      "line": 536,
+      "message": "Incompatible types in assignment (expression has type \"list[Never]\", variable has type \"dict_values[Any, Any]\")"
+    },
+    {
+      "code": "arg-type",
+      "column": 25,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_logs.py",
+      "line": 360,
+      "message": "Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_logs.py",
+      "line": 592,
+      "message": "Returning Any from function declared to return \"dict[str, Any]\""
+    },
+    {
+      "code": "unused-ignore",
+      "column": -1,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_logs.py",
+      "line": 659,
+      "message": "Unused \"type: ignore\" comment"
+    },
+    {
+      "code": "no-any-return",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_logs.py",
+      "line": 659,
+      "message": "Returning Any from function declared to return \"int\""
+    },
+    {
+      "code": "call-overload",
+      "column": 15,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_logs.py",
+      "line": 659,
+      "message": "No overload variant of \"int\" matches argument type \"object\""
+    },
+    {
+      "code": "call-overload",
+      "column": 62,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_logs.py",
+      "line": 672,
+      "message": "No overload variant of \"int\" matches argument type \"object\""
+    },
+    {
+      "code": "call-overload",
+      "column": 62,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_logs.py",
+      "line": 683,
+      "message": "No overload variant of \"int\" matches argument type \"object\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_logs.py",
+      "line": 694,
+      "message": "Returning Any from function declared to return \"VictoriaLogsClient\""
+    },
+    {
+      "code": "return",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_receive.py",
+      "line": 79,
+      "message": "Missing return statement"
+    },
+    {
+      "code": "union-attr",
+      "column": 55,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_receive.py",
+      "line": 104,
+      "message": "Item \"None\" of \"dict[str, Any] | None\" has no attribute \"items\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_receive.py",
+      "line": 265,
+      "message": "Returning Any from function declared to return \"list[SourceEntry]\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_receive.py",
+      "line": 269,
+      "message": "Returning Any from function declared to return \"list[LandingEntry]\""
+    },
+    {
+      "code": "return",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_receive.py",
+      "line": 272,
+      "message": "Missing return statement"
+    },
+    {
+      "code": "no-any-return",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_receive.py",
+      "line": 274,
+      "message": "Returning Any from function declared to return \"SourceEntry\""
+    },
+    {
+      "code": "return",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_receive.py",
+      "line": 279,
+      "message": "Missing return statement"
+    },
+    {
+      "code": "no-any-return",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/api/routes_receive.py",
+      "line": 281,
+      "message": "Returning Any from function declared to return \"LandingEntry\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 7,
+      "count": 1,
+      "file": "src/sutradhara/api/store.py",
+      "line": 295,
+      "message": "\"Result[Any]\" has no attribute \"rowcount\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 11,
+      "count": 1,
+      "file": "src/sutradhara/api/store.py",
+      "line": 457,
+      "message": "\"Result[Any]\" has no attribute \"rowcount\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 19,
+      "count": 1,
+      "file": "src/sutradhara/api/store.py",
+      "line": 537,
+      "message": "\"Result[Any]\" has no attribute \"rowcount\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 11,
+      "count": 1,
+      "file": "src/sutradhara/api/store.py",
+      "line": 896,
+      "message": "\"Result[Any]\" has no attribute \"rowcount\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 15,
+      "count": 1,
+      "file": "src/sutradhara/api/store.py",
+      "line": 1012,
+      "message": "\"Result[Any]\" has no attribute \"rowcount\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 27,
+      "count": 1,
+      "file": "src/sutradhara/archive_fanout.py",
+      "line": 760,
+      "message": "\"ArchiveFanoutError\" has no attribute \"pool_id\""
+    },
+    {
+      "code": "arg-type",
+      "column": 44,
+      "count": 1,
+      "file": "src/sutradhara/archive_fanout.py",
+      "line": 2110,
+      "message": "Argument 1 to \"fromhex\" of \"bytes\" has incompatible type \"Any | None\"; expected \"str\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 11,
+      "count": 1,
+      "file": "src/sutradhara/archive_sweeper.py",
+      "line": 140,
+      "message": "\"Result[Any]\" has no attribute \"rowcount\""
+    },
+    {
+      "code": "arg-type",
+      "column": 36,
+      "count": 1,
+      "file": "src/sutradhara/archive_sweeper.py",
+      "line": 226,
+      "message": "Argument 1 to \"process_lockfile_for\" has incompatible type \"Engine | Connection\"; expected \"Engine | str\""
+    },
+    {
+      "code": "attr-defined",
+      "column": 11,
+      "count": 1,
+      "file": "src/sutradhara/archive_sweeper.py",
+      "line": 289,
+      "message": "\"Result[Any]\" has no attribute \"rowcount\""
+    },
+    {
+      "code": "no-untyped-call",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/catalog/models.py",
+      "line": 1517,
+      "message": "Call to untyped function \"DDL\" in typed context"
+    },
+    {
+      "code": "arg-type",
+      "column": 34,
+      "count": 1,
+      "file": "src/sutradhara/cli/hdcache.py",
+      "line": 476,
+      "message": "Argument 1 to \"asdict\" has incompatible type \"DataclassInstance | type[DataclassInstance]\"; expected \"DataclassInstance\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"Callable[[float], None]\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"Engine | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"WatchState | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"bool\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"float\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"int\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"sessionmaker[Session] | Callable[[], Session] | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"str | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"str | Path | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 54,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 255,
+      "message": "Argument 2 to \"process_landing_once\" has incompatible type \"**dict[str, object]\"; expected \"str\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"Callable[[], bool] | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"Callable[[float], None]\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"Engine | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"bool\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"float\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"int | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"int\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"sessionmaker[Session] | Callable[[], Session] | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"str | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"str | Path | None\""
+    },
+    {
+      "code": "arg-type",
+      "column": 49,
+      "count": 1,
+      "file": "src/sutradhara/cli/intake.py",
+      "line": 265,
+      "message": "Argument 3 to \"watch_landing\" has incompatible type \"**dict[str, object]\"; expected \"str\""
+    },
+    {
+      "code": "no-redef",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/durability.py",
+      "line": 217,
+      "message": "Name \"counts_by_key\" already defined on line 209"
+    },
+    {
+      "code": "unreachable",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/evidence_recorder.py",
+      "line": 151,
+      "message": "Statement is unreachable"
+    },
+    {
+      "code": "unreachable",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/evidence_recorder.py",
+      "line": 173,
+      "message": "Statement is unreachable"
+    },
+    {
+      "code": "return-value",
+      "column": 11,
+      "count": 1,
+      "file": "src/sutradhara/grpc/ca.py",
+      "line": 295,
+      "message": "Incompatible return value type (got \"str | bytes\", expected \"str\")"
+    },
+    {
+      "code": "return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/grpc/device_service.py",
+      "line": 238,
+      "message": "Missing return statement"
+    },
+    {
+      "code": "assignment",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/grpc/registry.py",
+      "line": 605,
+      "message": "Incompatible types in assignment (expression has type \"PendingListing\", variable has type \"PendingCommand\")"
+    },
+    {
+      "code": "return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 416,
+      "message": "Missing return statement"
+    },
+    {
+      "code": "union-attr",
+      "column": 15,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 429,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"operator\""
+    },
+    {
+      "code": "union-attr",
+      "column": 52,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 429,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"device_id\""
+    },
+    {
+      "code": "return-value",
+      "column": 19,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 432,
+      "message": "Incompatible return value type (got \"GrpcIntake | None\", expected \"GrpcIntake\")"
+    },
+    {
+      "code": "union-attr",
+      "column": 15,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 477,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"operator\""
+    },
+    {
+      "code": "union-attr",
+      "column": 52,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 477,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"device_id\""
+    },
+    {
+      "code": "union-attr",
+      "column": 15,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 479,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"source_plan_digest\""
+    },
+    {
+      "code": "union-attr",
+      "column": 16,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 486,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"artifactclass\""
+    },
+    {
+      "code": "union-attr",
+      "column": 19,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 487,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"source_kind\""
+    },
+    {
+      "code": "union-attr",
+      "column": 20,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 488,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"source_ref\""
+    },
+    {
+      "code": "union-attr",
+      "column": 20,
+      "count": 1,
+      "file": "src/sutradhara/grpc/servicer.py",
+      "line": 489,
+      "message": "Item \"None\" of \"GrpcIntake | None\" has no attribute \"label\""
+    },
+    {
+      "code": "arg-type",
+      "column": 20,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/fill.py",
+      "line": 663,
+      "message": "Argument 2 to \"_write_source_to_disk\" has incompatible type \"_DiskWriteTarget\"; expected \"CacheDisk\""
+    },
+    {
+      "code": "arg-type",
+      "column": 16,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/fill.py",
+      "line": 786,
+      "message": "Argument 2 to \"_write_source_to_disk\" has incompatible type \"_DiskWriteTarget\"; expected \"CacheDisk\""
+    },
+    {
+      "code": "no-untyped-def",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/fill.py",
+      "line": 1067,
+      "message": "Function is missing a return type annotation"
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/store.py",
+      "line": 388,
+      "message": "Returning Any from function declared to return \"DiskIdentityResult\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/store.py",
+      "line": 421,
+      "message": "Returning Any from function declared to return \"DiskIdentityResult\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/store.py",
+      "line": 586,
+      "message": "Returning Any from function declared to return \"EntryReadResult\""
+    },
+    {
+      "code": "no-any-return",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/store.py",
+      "line": 612,
+      "message": "Returning Any from function declared to return \"bool\""
+    },
+    {
+      "code": "misc",
+      "column": 16,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/walker.py",
+      "line": 420,
+      "message": "Cannot infer type of lambda"
+    },
+    {
+      "code": "misc",
+      "column": 16,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/walker.py",
+      "line": 426,
+      "message": "Cannot infer type of lambda"
+    },
+    {
+      "code": "no-untyped-def",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/walker.py",
+      "line": 701,
+      "message": "Function is missing a return type annotation"
+    },
+    {
+      "code": "no-any-return",
+      "column": 4,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/walker.py",
+      "line": 763,
+      "message": "Returning Any from function declared to return \"tuple[bool, int | None]\""
+    },
+    {
+      "code": "misc",
+      "column": 12,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/walker.py",
+      "line": 922,
+      "message": "Cannot infer type of lambda"
+    },
+    {
+      "code": "misc",
+      "column": 16,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/walker.py",
+      "line": 931,
+      "message": "Cannot infer type of lambda"
+    },
+    {
+      "code": "misc",
+      "column": 20,
+      "count": 1,
+      "file": "src/sutradhara/hdcache/walker.py",
+      "line": 990,
+      "message": "Cannot infer type of lambda"
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/jobs/handlers/pfr_index.py",
+      "line": 7,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core\""
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/jobs/handlers/pfr_index.py",
+      "line": 8,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core.failure\""
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/jobs/handlers/pfr_index.py",
+      "line": 9,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core.source\""
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/pfr.py",
+      "line": 29,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core\""
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/pfr.py",
+      "line": 30,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core.cut\""
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/pfr.py",
+      "line": 31,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core.failure\""
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/pfr.py",
+      "line": 32,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core.isolation\""
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/pfr.py",
+      "line": 33,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core.registry\""
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/pfr.py",
+      "line": 34,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core.schema\""
+    },
+    {
+      "code": "import-not-found",
+      "column": 0,
+      "count": 1,
+      "file": "src/sutradhara/pfr.py",
+      "line": 35,
+      "message": "Cannot find implementation or library stub for module named \"pfr_core.source\""
+    },
+    {
+      "code": "misc",
+      "column": 16,
+      "count": 1,
+      "file": "src/sutradhara/pfr.py",
+      "line": 144,
+      "message": "Class cannot subclass \"ByteRangeSource\" (has type \"Any\")"
+    },
+    {
+      "code": "no-any-return",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/pfr.py",
+      "line": 855,
+      "message": "Returning Any from function declared to return \"Mapping[str, Any]\""
+    },
+    {
+      "code": "assignment",
+      "column": 15,
+      "count": 1,
+      "file": "src/sutradhara/retention.py",
+      "line": 481,
+      "message": "Incompatible types in assignment (expression has type \"Copy | None\", variable has type \"Copy\")"
+    },
+    {
+      "code": "assignment",
+      "column": 8,
+      "count": 1,
+      "file": "src/sutradhara/retention.py",
+      "line": 557,
+      "message": "Incompatible types in assignment (expression has type \"None\", variable has type \"Path\")"
+    },
+    {
+      "code": "arg-type",
+      "column": 30,
+      "count": 1,
+      "file": "src/sutradhara/retention.py",
+      "line": 1306,
+      "message": "Argument \"expected_hash\" to \"witness_copy\" of \"RetentionWitnessBackend\" has incompatible type \"bytes\"; expected \"ContentHash\""
+    }
+  ],
+  "version": 2
+}

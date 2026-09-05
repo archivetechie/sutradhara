@@ -158,9 +158,7 @@ def test_set_pool_representation_recomputes_projection(engine: Engine) -> None:
 def test_fingerprint_sort_stability(engine: Engine) -> None:
     """Membership insertion order must not change identity."""
     with session_scope(engine) as s:
-        _add_backend_pools(
-            s, [("pool-a", "rao-plain-v1"), ("pool-b", "rao-aead-v1")]
-        )
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1"), ("pool-b", "rao-aead-v1")])
         _add_class(s, "one", ["pool-a", "pool-b"])
         _add_class(s, "two", ["pool-b", "pool-a"])
         fp_one, basis_one = compute_bundle_group(s, "one")
@@ -205,9 +203,7 @@ def test_f9_fingerprint_parity_library_vs_migration(engine: Engine) -> None:
     fingerprint must equal the pre-change pinned golden value."""
     migration = _migration_module()
     with session_scope(engine) as s:
-        backend = Backend(
-            name="rem", kind=BackendKind.REM_TAPE, tier=BackendTier.SELF_DESCRIBING
-        )
+        backend = Backend(name="rem", kind=BackendKind.REM_TAPE, tier=BackendTier.SELF_DESCRIBING)
         s.add(backend)
         s.flush()
         # Mixed-case ids seeded in non-canonical insertion order: exposes any
@@ -230,16 +226,10 @@ def test_f9_fingerprint_parity_library_vs_migration(engine: Engine) -> None:
 def test_inactive_membership_leaves_fingerprint(engine: Engine) -> None:
     """Only active memberships are identity."""
     with session_scope(engine) as s:
-        _add_backend_pools(
-            s, [("pool-a", "rao-plain-v1"), ("pool-b", "rao-aead-v1")]
-        )
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1"), ("pool-b", "rao-aead-v1")])
         _add_class(s, "photo", ["pool-a"])
         before, _ = compute_bundle_group(s, "photo")
-        s.add(
-            ArtifactClassPool(
-                artifactclass="photo", pool_id="pool-b", active=False
-            )
-        )
+        s.add(ArtifactClassPool(artifactclass="photo", pool_id="pool-b", active=False))
         s.flush()
         after, _ = compute_bundle_group(s, "photo")
         assert before == after
@@ -263,9 +253,7 @@ def test_thresholds_min_age_max_target_over_declared_set(engine: Engine) -> None
         _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
         _add_class(s, "audio", ["pool-a"], target_bytes=1 * 1024, max_age_seconds=7200)
         _add_class(s, "photo", ["pool-a"], target_bytes=20 * 1024, max_age_seconds=3600)
-        policy = _add_class(
-            s, "video", ["pool-a"], target_bytes=5 * 1024, max_age_seconds=86400
-        )
+        policy = _add_class(s, "video", ["pool-a"], target_bytes=5 * 1024, max_age_seconds=86400)
         fingerprint, basis = compute_bundle_group(s, "video")
         target, age = effective_group_thresholds(
             s,
@@ -281,9 +269,7 @@ def test_thresholds_min_age_max_target_over_declared_set(engine: Engine) -> None
 def test_threshold_clamp_activates_on_declared_floor(engine: Engine) -> None:
     """The strictest member pool's declared floor clamps the target up."""
     with session_scope(engine) as s:
-        _add_backend_pools(
-            s, [("pool-a", "rao-plain-v1"), ("pool-b", "rao-aead-v1")]
-        )
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1"), ("pool-b", "rao-aead-v1")])
         s.get(Pool, "pool-a").min_object_bytes = 50 * 1024
         s.get(Pool, "pool-b").min_object_bytes = 80 * 1024
         s.flush()
@@ -377,9 +363,7 @@ def test_open_freezes_thresholds_and_witness(engine: Engine) -> None:
         }
         # A stricter class joining the group is honoured from the NEXT bundle.
         _add_class(s, "audio", ["pool-a"], target_bytes=8192, max_age_seconds=60)
-        again, created_again = get_or_create_open_bundle(
-            s, artifactclass="photo", policy=policy
-        )
+        again, created_again = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         assert not created_again
         assert again.id == bundle.id
         assert again.target_bytes == 4096
@@ -403,15 +387,11 @@ def test_same_pool_set_classes_share_accumulator(engine: Engine) -> None:
 def test_different_pool_sets_get_own_accumulators(engine: Engine) -> None:
     """Confidentiality needs no mechanism: a different pool set = own crate."""
     with session_scope(engine) as s:
-        _add_backend_pools(
-            s, [("pool-a", "rao-plain-v1"), ("pool-priv", "rao-aead-v1")]
-        )
+        _add_backend_pools(s, [("pool-a", "rao-plain-v1"), ("pool-priv", "rao-aead-v1")])
         public = _add_class(s, "public", ["pool-a"])
         confidential = _add_class(s, "confidential", ["pool-priv"])
         b1, _ = get_or_create_open_bundle(s, artifactclass="public", policy=public)
-        b2, _ = get_or_create_open_bundle(
-            s, artifactclass="confidential", policy=confidential
-        )
+        b2, _ = get_or_create_open_bundle(s, artifactclass="confidential", policy=confidential)
         assert b1.id != b2.id
         assert b1.bundle_group != b2.bundle_group
 
@@ -436,12 +416,8 @@ def test_accumulator_race_loser_adopts_winner(
                 return None  # stale read: the check misses the winner
             return real_find(session, fingerprint)
 
-        monkeypatch.setattr(
-            archive_bundle_module, "_find_open_accumulator", racing_find
-        )
-        adopted, created = get_or_create_open_bundle(
-            s, artifactclass="photo", policy=policy
-        )
+        monkeypatch.setattr(archive_bundle_module, "_find_open_accumulator", racing_find)
+        adopted, created = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         assert not created
         assert adopted.id == winner.id
         assert calls["n"] == 2
@@ -457,16 +433,12 @@ def test_accumulator_race_translates_foreign_integrity_error(
         policy = _add_class(s, "photo", ["pool-a"])
         _winner, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         s.flush()
-        monkeypatch.setattr(
-            archive_bundle_module, "_find_open_accumulator", lambda *a, **k: None
-        )
+        monkeypatch.setattr(archive_bundle_module, "_find_open_accumulator", lambda *a, **k: None)
         with pytest.raises(BundleStateError):
             get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
 
 
-def test_member_race_loser_reruns_ladder(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_member_race_loser_reruns_ladder(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
     """Forced IntegrityError on (bundle_id, member_path): the loser re-runs
     the ladder against the now-visible winner and lands on a tagged name."""
     with session_scope(engine) as s:
@@ -496,9 +468,7 @@ def test_member_race_loser_reruns_ladder(
                 return kwargs["requested"], None, None
             return real_resolve(session, **kwargs)
 
-        monkeypatch.setattr(
-            archive_bundle_module, "_resolve_member_name", racing_resolve
-        )
+        monkeypatch.setattr(archive_bundle_module, "_resolve_member_name", racing_resolve)
         member, created = add_bundle_member(
             s,
             bundle=bundle,
@@ -725,9 +695,7 @@ def test_arrival_order_independence_both_orders(engine: Engine) -> None:
         with session_scope(eng) as s:
             _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
             policy = _add_class(s, "photo", ["pool-a"])
-            bundle, _ = get_or_create_open_bundle(
-                s, artifactclass="photo", policy=policy
-            )
+            bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
             for data in order:
                 digest = _add_asset(s, data)
                 add_bundle_member(
@@ -741,9 +709,7 @@ def test_arrival_order_independence_both_orders(engine: Engine) -> None:
                 )
             second_digest = _hash(order[1])
             tagged = s.scalars(
-                select(BundleMember).where(
-                    BundleMember.member_path != "IMG_0001.JPG"
-                )
+                select(BundleMember).where(BundleMember.member_path != "IMG_0001.JPG")
             ).one()
             assert tagged.member_path == f"IMG_0001.{second_digest.hex()[:10]}.JPG"
             assert tagged.logical_asset_hash == second_digest
@@ -759,9 +725,7 @@ def test_ladder_exhaustion_is_a_hash_collision_assert(engine: Engine) -> None:
         bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         newcomer = _add_asset(s, b"newcomer")
         # Occupy every rung of the newcomer's ladder with foreign rows.
-        ladder = archive_bundle_module._name_ladder(
-            "IMG_0001.JPG", newcomer, "photo"
-        )
+        ladder = archive_bundle_module._name_ladder("IMG_0001.JPG", newcomer, "photo")
         for index, candidate in enumerate(ladder):
             squatter = _add_asset(s, f"squatter-{index}".encode())
             s.add(
@@ -856,9 +820,7 @@ def test_tag_helpers_roundtrip() -> None:
     assert extract_member_tag("dir/name.ext.zst", tagged) == "abc123"
     assert extract_member_tag("a.bin", "a.bin") is None
     # Tagging commutes with suffix appends (the staging chain linkage).
-    assert tag_member_path("name.ext", "t") + ".zst" == tag_member_path(
-        "name.ext.zst", "t"
-    )
+    assert tag_member_path("name.ext", "t") + ".zst" == tag_member_path("name.ext.zst", "t")
     assert tag_member_path("noext", "t") == "noext.t"
     assert extract_member_tag("noext", "noext.t") == "t"
 
@@ -866,9 +828,7 @@ def test_tag_helpers_roundtrip() -> None:
 # --- include-alone ---------------------------------------------------------
 
 
-def test_include_alone_routes_oversized_member_to_funnel(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_include_alone_routes_oversized_member_to_funnel(engine: Engine, tmp_path: Path) -> None:
     """Oversized member with a non-empty accumulator: fresh non-adoptable
     bundle, accumulator untouched, no partial-index violation."""
     with session_scope(engine) as s:
@@ -917,9 +877,7 @@ def test_include_alone_routes_oversized_member_to_funnel(
         assert again.id == accumulator.id
 
 
-def test_include_alone_retry_lands_on_open_funnel(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_include_alone_retry_lands_on_open_funnel(engine: Engine, tmp_path: Path) -> None:
     """A crash-retry of the same oversized enqueue must not mint a second
     funnel while the first is still open."""
     with session_scope(engine) as s:
@@ -1048,9 +1006,7 @@ def test_partial_index_ignores_funnels_and_sealed(engine: Engine) -> None:
 # --- staging re-key ---------------------------------------------------------
 
 
-def test_staging_rekey_tags_transformed_member_chain(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_staging_rekey_tags_transformed_member_chain(engine: Engine, tmp_path: Path) -> None:
     """A zstd-transformed member that collides gets tagged; the final
     transform equality and the (bundle_id, stored_member_path, step_order)
     uniqueness both hold, and the restore join still resolves the recorded
@@ -1124,9 +1080,7 @@ def test_staging_rekey_tags_transformed_member_chain(
             assert transform.stored_member_path == member.member_path
             assert transform.stored_sha256 == member.file_sha256
         # The (bundle_id, stored_member_path, step_order) surface is distinct.
-        keys = {
-            (t.bundle_id, t.stored_member_path, t.step_order) for t in transforms
-        }
+        keys = {(t.bundle_id, t.stored_member_path, t.step_order) for t in transforms}
         assert len(keys) == len(transforms)
 
         # Restore join resolves each recorded (tagged) name to its own asset.
@@ -1138,9 +1092,7 @@ def test_staging_rekey_tags_transformed_member_chain(
         assert resolved == staged_second.logical_sha256
 
 
-def test_staging_rekey_crash_retry_is_idempotent(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_staging_rekey_crash_retry_is_idempotent(engine: Engine, tmp_path: Path) -> None:
     """Re-running the tagged member's stage-and-enqueue lands on its own row
     and does not duplicate transform records."""
     from sutradhara.catalog.models import StagingTransform
@@ -1275,10 +1227,7 @@ def test_tagged_transformed_member_restores_by_its_receipt_name(
         assert staged_first.stored_member_path == "images/disk.img.zst"
         assert staged_second.stored_member_path != "images/disk.img.zst"
 
-        members = {
-            member.artifactclass: member
-            for member in s.scalars(select(BundleMember))
-        }
+        members = {member.artifactclass: member for member in s.scalars(select(BundleMember))}
         # Both receipts print the same logical name (design §5), so both must
         # restore by it.
         assert _receipt_member_name(members["disk.one"]) == "images/disk.img"
@@ -1354,16 +1303,12 @@ def test_tagged_untransformed_member_restores_by_its_receipt_name(
         assert second_member.member_path != "images/disk.img"
         assert _receipt_member_name(second_member) == "images/disk.img"
         assert (
-            resolve_member_asset_hash(
-                s, artifactclass="disk.two", member_name="images/disk.img"
-            )
+            resolve_member_asset_hash(s, artifactclass="disk.two", member_name="images/disk.img")
             == staged_second.logical_sha256
         )
 
 
-def test_rekey_tags_every_intermediate_stored_path(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_rekey_tags_every_intermediate_stored_path(engine: Engine, tmp_path: Path) -> None:
     """Tagging only the *final* stored name breaks a two-step chain.
 
     Guards the alternative fix for the finding above. Two classes staging the
@@ -1380,12 +1325,8 @@ def test_rekey_tags_every_intermediate_stored_path(
 
     with session_scope(engine) as s:
         _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
-        first_policy = _staging_class(
-            s, "disk.one", ["pool-a"], appledouble="merge-to-xattrs"
-        )
-        second_policy = _staging_class(
-            s, "disk.two", ["pool-a"], appledouble="merge-to-xattrs"
-        )
+        first_policy = _staging_class(s, "disk.one", ["pool-a"], appledouble="merge-to-xattrs")
+        second_policy = _staging_class(s, "disk.two", ["pool-a"], appledouble="merge-to-xattrs")
         first = _source(tmp_path / "one" / "images", "disk.img", b"one-bytes" * 20)
         second = _source(tmp_path / "two" / "images", "disk.img", b"two-bytes" * 20)
         stage_and_enqueue_artifact(
@@ -1475,9 +1416,7 @@ def test_stored_member_name_wins_over_a_co_resident_logical_name(
         assert staged_second.stored_member_path != "images/disk.img"
 
         assert (
-            resolve_member_asset_hash(
-                s, artifactclass="disk.one", member_name="images/disk.img"
-            )
+            resolve_member_asset_hash(s, artifactclass="disk.one", member_name="images/disk.img")
             == staged_first.logical_sha256
         )
         assert (
@@ -1553,9 +1492,7 @@ def test_logical_name_shared_by_two_tagged_members_is_ambiguous(
         )
         assert len(paths) == 2
         with pytest.raises(RestoreNameError) as excinfo:
-            resolve_member_asset_hash(
-                s, artifactclass="disk.mine", member_name="images/disk.img"
-            )
+            resolve_member_asset_hash(s, artifactclass="disk.mine", member_name="images/disk.img")
         message = str(excinfo.value)
         assert "ambiguous" in message
         for path in paths:
@@ -1648,9 +1585,7 @@ def test_ambiguity_hint_never_recommends_the_name_that_just_failed(
         assert third.logical_sha256 != first.logical_sha256
 
         with pytest.raises(RestoreNameError) as excinfo:
-            resolve_member_asset_hash(
-                s, artifactclass="disk.mine", member_name="images/disk.img"
-            )
+            resolve_member_asset_hash(s, artifactclass="disk.mine", member_name="images/disk.img")
         message = str(excinfo.value)
         assert "ambiguous" in message
         assert "Restore by one of the stored member names" not in message
@@ -1735,9 +1670,7 @@ def test_compressed_logical_name_main_resolved_uniquely_now_raises(
             assert _receipt_member_name(member) == "images/disk.img"
 
         with pytest.raises(RestoreNameError) as excinfo:
-            resolve_member_asset_hash(
-                s, artifactclass="disk.mine", member_name="images/disk.img"
-            )
+            resolve_member_asset_hash(s, artifactclass="disk.mine", member_name="images/disk.img")
         message = str(excinfo.value)
         assert "ambiguous" in message
         assert "Restore by one of the stored member names" in message
@@ -1745,9 +1678,7 @@ def test_compressed_logical_name_main_resolved_uniquely_now_raises(
             assert stored_name in message
         # And the recommended names are not a dead end.
         assert {
-            resolve_member_asset_hash(
-                s, artifactclass="disk.mine", member_name=stored_name
-            )
+            resolve_member_asset_hash(s, artifactclass="disk.mine", member_name=stored_name)
             for stored_name in members
         } == {first.logical_sha256, second.logical_sha256}
 
@@ -1860,9 +1791,7 @@ def test_migration_backfills_drained_estate(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr.decode() + result.stdout.decode()
 
     with sqlite3.connect(db_path) as conn:
-        member_classes = dict(
-            conn.execute("SELECT bundle_id, artifactclass FROM bundle_member")
-        )
+        member_classes = dict(conn.execute("SELECT bundle_id, artifactclass FROM bundle_member"))
         assert member_classes == {
             "bundle-photo": "photo",
             "bundle-audio": "audio",
@@ -1877,9 +1806,7 @@ def test_migration_backfills_drained_estate(tmp_path: Path) -> None:
         for _bundle_id, _group, basis_raw in rows:
             document = json_module.loads(basis_raw)
             assert document["basis_source"] == "backfilled"
-            assert document["basis"] == [
-                {"pool": "pool-a", "representation": "rao-plain-v1"}
-            ]
+            assert document["basis"] == [{"pool": "pool-a", "representation": "rao-plain-v1"}]
             assert document["effective"]["target_bytes"] == 1024
         projections = dict(
             conn.execute("SELECT artifactclass, bundle_group FROM artifactclass_policy")
@@ -1891,8 +1818,7 @@ def test_migration_backfills_drained_estate(tmp_path: Path) -> None:
         assert "ruleset" not in bundle_cols
         assert "expect" not in bundle_cols
         index_sql = conn.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE name='uq_bundle_open_accumulator_per_group'"
+            "SELECT sql FROM sqlite_master WHERE name='uq_bundle_open_accumulator_per_group'"
         ).fetchone()[0]
         assert "WHERE status = 'open' AND archive_id IS NULL" in index_sql
         submission_sql = conn.execute(

@@ -1041,18 +1041,14 @@ def _ambiguity_hint(
             continue
         owners.setdefault(member_path, set()).add(logical_hash)
     distinguishing = {
-        member_path: next(iter(owned))
-        for member_path, owned in owners.items()
-        if len(owned) == 1
+        member_path: next(iter(owned)) for member_path, owned in owners.items() if len(owned) == 1
     }
     if set(distinguishing.values()) == hashes:
-        return (
-            "Restore by one of the stored member names instead: "
-            + ", ".join(sorted(distinguishing))
+        return "Restore by one of the stored member names instead: " + ", ".join(
+            sorted(distinguishing)
         )
-    return (
-        "No stored member name distinguishes them; restore by asset hash: "
-        + ", ".join(sorted(digest.hex() for digest in hashes))
+    return "No stored member name distinguishes them; restore by asset hash: " + ", ".join(
+        sorted(digest.hex() for digest in hashes)
     )
 
 
@@ -1695,7 +1691,8 @@ def _iter_rem_plaintext(
 ) -> Generator[bytes, None, None]:
     """Yield helper stdout and require clean ciphertext input plus exit zero."""
 
-    assert process.stdout is not None
+    if process.stdout is None:
+        raise ArchiveRestoreError("REM-OBJECT extractor did not expose a stdout stream")
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     try:

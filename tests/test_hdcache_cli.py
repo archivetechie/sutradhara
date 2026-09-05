@@ -43,8 +43,12 @@ def test_hdcache_disk_add_scan_list_status_and_locate(
     provisioner = FakeProvisioner(
         tmp_path,
         [
-            BlockDeviceCandidate("/dev/sda", "SER001", enclosure="shelf-a", slot="01", capacity_bytes=1000),
-            BlockDeviceCandidate("/dev/sdb", "SER002", enclosure="shelf-a", slot="02", capacity_bytes=2000),
+            BlockDeviceCandidate(
+                "/dev/sda", "SER001", enclosure="shelf-a", slot="01", capacity_bytes=1000
+            ),
+            BlockDeviceCandidate(
+                "/dev/sdb", "SER002", enclosure="shelf-a", slot="02", capacity_bytes=2000
+            ),
         ],
     )
     manager = HdcacheLifecycleManager(
@@ -133,7 +137,8 @@ def test_hdcache_dead_marks_entries_lost_in_batches_and_forget_checks_references
 
         with session_scope(engine) as session:
             assert {
-                row.state for row in session.scalars(select(CacheEntry).where(CacheEntry.disk_id == "d001"))
+                row.state
+                for row in session.scalars(select(CacheEntry).where(CacheEntry.disk_id == "d001"))
             } == {"lost"}
             assert session.get(CacheDisk, "d001").filled_bytes == 0
 
@@ -301,7 +306,9 @@ def test_hdcache_dead_reports_luks_drop_failure_without_rolling_back_entry_loss(
         assert dead.exit_code == 0
         payload = json.loads(dead.output)
         assert payload["entries_lost"] == 1
-        assert payload["luks_key_drop"] == "WARNING: failed to drop LUKS key slot for d001: slot busy"
+        assert (
+            payload["luks_key_drop"] == "WARNING: failed to drop LUKS key slot for d001: slot busy"
+        )
         with session_scope(engine) as session:
             assert session.scalar(select(CacheEntry.state)) == "lost"
     finally:

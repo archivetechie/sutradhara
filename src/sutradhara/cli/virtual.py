@@ -246,9 +246,7 @@ def restore_cmd(
         raise click.ClickException(exc.detail) from exc
     except (ArchiveRestoreError, RestoreManagerError, VirtualArrangementError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(
-        f"restored {asset_hash.hex()} from {result.source} to {result.output_path}"
-    )
+    click.echo(f"restored {asset_hash.hex()} from {result.source} to {result.output_path}")
 
 
 @click.command("reject")

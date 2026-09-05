@@ -128,7 +128,7 @@ def test_jobs_target_summary_and_errors_never_expose_raw_paths(api_engine: Engin
     assert "/var/lib/replica" not in payload_text
     assert "/home/user" not in payload_text
     row = response.json()["jobs"][0]
-    assert row["target_summary"] == "dest_path=<redacted>, nested={\"source_path\":\"<path>\"}"
+    assert row["target_summary"] == 'dest_path=<redacted>, nested={"source_path":"<path>"}'
     assert row["last_error"] == "restore failed under <path>"
 
 

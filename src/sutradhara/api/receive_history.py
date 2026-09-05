@@ -121,7 +121,8 @@ def latest_card_history(
     if exclude_intent_id is not None:
         intent_query = intent_query.where(api_store.IdempotencyRecord.id != exclude_intent_id)
     for row in session.scalars(intent_query):
-        assert row.intake_id is not None
+        if row.intake_id is None:
+            raise RuntimeError("completed receive intent has no intake id")
         attempt = _attempt(
             attempts,
             intake_id=row.intake_id,

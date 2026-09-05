@@ -99,7 +99,9 @@ class _WriteBackend:
     def name(self) -> str:
         return self._name
 
-    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
+    def write_object_to_pool(
+        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+    ) -> CopyRecord:
         self._counter += 1
         if self.fail_on_write == self._counter:
             raise RuntimeError(f"configured write failure for {pool}")
@@ -288,9 +290,7 @@ def test_two_submissions_and_intake_members_converge_into_one_object(
         # Nothing is on media yet, so neither submission is archived.
         assert first_result.archived is False
         assert second_result.archived is False
-        assert session.get(Submission, first.submission_id).status == (
-            SubmissionStatus.ACCUMULATED
-        )
+        assert session.get(Submission, first.submission_id).status == (SubmissionStatus.ACCUMULATED)
 
     rem_backend, d2_backend = _flush_all(engine, first)
     with session_scope(engine) as session:
@@ -350,13 +350,9 @@ def test_a_co_resident_enqueue_does_not_swallow_the_submission_linkage(
 
         # The co-resident row carries the linkage, merged rather than replaced.
         row = session.scalars(
-            select(BundleMember).where(
-                BundleMember.logical_asset_hash == co_resident.sha256
-            )
+            select(BundleMember).where(BundleMember.logical_asset_hash == co_resident.sha256)
         ).one()
-        assert submission_links(row.source_metadata) == [
-            (setup.submission_id, co_resident.id)
-        ]
+        assert submission_links(row.source_metadata) == [(setup.submission_id, co_resident.id)]
 
         for member in members:
             Path(member.source_path).unlink()
@@ -433,9 +429,7 @@ def test_result_shape_carries_bundle_ids_by_opened_at_and_copies_per_bundle(
             session.delete(member)
         session.flush()
         archive_submission(session, setup.submission_id)
-        first_bundle_id = session.scalars(
-            select(Bundle.id).where(Bundle.status == "open")
-        ).one()
+        first_bundle_id = session.scalars(select(Bundle.id).where(Bundle.status == "open")).one()
 
     _flush_all(engine, setup)
 
