@@ -31,7 +31,7 @@ def engine() -> Iterator[Engine]:
 
 def _policy_text() -> str:
     return """
-ruleset = "rao.o.v1"
+ruleset = "rem-object.o.v1"
 expect = "messy"
 
 [[placements]]
@@ -92,7 +92,7 @@ min_impl_families = {min_impl_families}
 def test_parse_artifactclass_policy_accepts_strict_document() -> None:
     policy = parse_artifactclass_policy(_policy_text())
 
-    assert policy.ruleset == "rao.o.v1"
+    assert policy.ruleset == "rem-object.o.v1"
     assert policy.expect == "messy"
     assert [placement.pool for placement in policy.placements] == [
         "o-copy-1-pool",
@@ -236,12 +236,12 @@ def test_apply_artifactclass_policy_upserts_memberships(engine: Engine) -> None:
                 Pool(
                     id="o-copy-1-pool",
                     backend_id=backend.id,
-                    representation=Representation.RAO_PLAIN_V1.value,
+                    representation=Representation.REM_OBJECT_V1.value,
                 ),
                 Pool(
                     id="o-copy-2-pool",
                     backend_id=backend.id,
-                    representation=Representation.RAO_AEAD_V1.value,
+                    representation=Representation.REM_ENCRYPT_V1.value,
                 ),
                 Pool(
                     id="stale-pool",
@@ -274,7 +274,7 @@ def test_apply_artifactclass_policy_upserts_memberships(engine: Engine) -> None:
         ]
         record = get_artifactclass_policy(s, "o-archive")
         assert isinstance(record, ArtifactClassPolicyRecord)
-        assert record.ruleset == "rao.o.v1"
+        assert record.ruleset == "rem-object.o.v1"
         assert record.expect == "messy"
         assert record.target_bytes == 32 * 1024**3
         assert record.max_age_seconds == 48 * 3600
@@ -304,12 +304,12 @@ def test_apply_artifactclass_policy_rejects_unmapped_private_hdcache_level(
                 Pool(
                     id="o-copy-1-pool",
                     backend_id=backend.id,
-                    representation=Representation.RAO_PLAIN_V1.value,
+                    representation=Representation.REM_OBJECT_V1.value,
                 ),
                 Pool(
                     id="o-copy-2-pool",
                     backend_id=backend.id,
-                    representation=Representation.RAO_AEAD_V1.value,
+                    representation=Representation.REM_ENCRYPT_V1.value,
                 ),
             ]
         )
@@ -345,12 +345,12 @@ def test_apply_artifactclass_policy_rejects_unknown_restore_preference_pool(
                 Pool(
                     id="o-copy-1-pool",
                     backend_id=backend.id,
-                    representation=Representation.RAO_PLAIN_V1.value,
+                    representation=Representation.REM_OBJECT_V1.value,
                 ),
                 Pool(
                     id="o-copy-2-pool",
                     backend_id=backend.id,
-                    representation=Representation.RAO_AEAD_V1.value,
+                    representation=Representation.REM_ENCRYPT_V1.value,
                 ),
             ]
         )
@@ -383,7 +383,7 @@ pool = "o-copy-3-pool"
                 Pool(
                     id=f"o-copy-{index}-pool",
                     backend_id=backend.id,
-                    representation=Representation.RAO_PLAIN_V1.value,
+                    representation=Representation.REM_OBJECT_V1.value,
                 )
                 for index in (1, 2, 3)
             ]
@@ -410,12 +410,12 @@ def test_apply_artifactclass_policy_warns_for_write_fenced_restore_pool(
                 Pool(
                     id="o-copy-1-pool",
                     backend_id=backend.id,
-                    representation=Representation.RAO_PLAIN_V1.value,
+                    representation=Representation.REM_OBJECT_V1.value,
                 ),
                 Pool(
                     id="o-copy-2-pool",
                     backend_id=backend.id,
-                    representation=Representation.RAO_AEAD_V1.value,
+                    representation=Representation.REM_ENCRYPT_V1.value,
                     accepts_writes=False,
                 ),
             ]

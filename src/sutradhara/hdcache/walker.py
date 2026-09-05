@@ -54,7 +54,7 @@ from sutradhara.jobs.models import LIVE_JOB_STATUS_VALUES, Job
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import sha256_file
 from sutradhara.sealing.port import Opener, Representation
-from sutradhara.sealing.rao import RaoCliOpener
+from sutradhara.sealing.rem_object import RemObjectCliOpener
 
 DEFAULT_UNKNOWN_FILE_TRIPWIRE = 100
 DEFAULT_TMP_GC_AGE_SECONDS = 6 * 60 * 60
@@ -233,7 +233,15 @@ def walk_disk(
             .order_by(CacheEntry.content_sha256)
         )
     )
-    known_paths = {_entry_final_path(mount, entry) for entry in db_entries}
+    canonical_paths = {_entry_final_path(mount, entry) for entry in db_entries}
+    stale_lost_paths = {
+        recorded
+        for entry in db_entries
+        if entry.state == "lost"
+        and (recorded := _recorded_entry_path(mount, entry)) is not None
+        and recorded not in canonical_paths
+    }
+    known_paths = canonical_paths | stale_lost_paths
     try:
         unknown = _disk_io(
             disk,
@@ -264,8 +272,9 @@ def walk_disk(
         )
 
     try:
+        cleanup_paths = [*unknown, *sorted(stale_lost_paths)]
         unknown_deleted = (
-            _delete_unknown_files(session, unknown, config, disk) if destructive else 0
+            _delete_unknown_files(session, cleanup_paths, config, disk) if destructive else 0
         )
         tmp_deleted = _gc_tmp_files(session, disk, mount, config=config) if destructive else 0
     except (DiskWalkAborted, StoreReadTimeout) as exc:
@@ -620,10 +629,12 @@ def _verify_aead_entry(disk: CacheDisk, entry: CacheEntry, *, config: HdcacheWal
                 deadline_monotonic=_deadline(config.disk_io_deadline_seconds),
                 disk_id=disk.disk_id,
             )
-        opener = config.opener or RaoCliOpener(config.registry(), work_dir=config.scratch_root)
+        opener = config.opener or RemObjectCliOpener(
+            config.registry(), work_dir=config.scratch_root
+        )
         with opener.open(
             sealed,
-            Representation.RAO_AEAD_V1,
+            Representation.REM_ENCRYPT_V1,
             recipient_epochs=(entry.key_epoch,),
             key_domain=KEY_DOMAIN_HDCACHE,
             work_dir=config.scratch_root,
@@ -888,6 +899,8 @@ def _delete_unknown_files(
                 "walker unknown-file delete deadline exceeded",
             )
             deleted += 1
+        except FileNotFoundError:
+            continue
         except OSError as exc:
             _emit(config, "walker-delete-failed", "alarm", disk.disk_id, detail=str(exc))
         except StoreReadTimeout as exc:
@@ -1019,6 +1032,29 @@ def _entry_final_path(mount: Path, entry: CacheEntry) -> Path:
         )
     except StoreError:
         return entries_root(mount) / entry.relpath
+
+
+def _recorded_entry_path(mount: Path, entry: CacheEntry) -> Path | None:
+    """Resolve a catalog relpath only when it stays inside the cache layout."""
+
+    relpath = Path(entry.relpath)
+    if relpath.is_absolute() or any(part in {"", ".", ".."} for part in relpath.parts):
+        return None
+    digest = entry.content_sha256.hex()
+    if (
+        len(relpath.parts) != 2
+        or relpath.parts[0] != digest[:2]
+        or not relpath.parts[1].startswith(f"{digest}.")
+    ):
+        return None
+    root = entries_root(mount)
+    candidate = root / relpath
+    try:
+        if not _is_relative_to(candidate.parent.resolve(), root.resolve()):
+            return None
+    except OSError:
+        return None
+    return candidate
 
 
 def _correct_filled_bytes(session: Session, disk: CacheDisk) -> None:

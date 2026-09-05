@@ -1,4 +1,4 @@
-"""`sutra archive` commands for RAO artifactclass bundling and restore."""
+"""`sutra archive` commands for REM-OBJECT artifactclass bundling and restore."""
 
 from __future__ import annotations
 
@@ -337,7 +337,7 @@ def _enqueue_error_text(exc: Exception) -> str:
     help="Directory for customer manifest receipts.",
 )
 @click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
-@click.option("--key-epoch", default=None, help="Key epoch for rao-aead-v1 pools.")
+@click.option("--key-epoch", default=None, help="Key epoch for rem-encrypt-v1 pools.")
 @click.option(
     "--manifest-signing-key-file",
     type=click.Path(exists=True, dir_okay=False),
@@ -412,7 +412,7 @@ def _force_flush_fill_warning(session: Session, bundle: Bundle) -> list[str]:
 
 @bundle_group.command("sweep")
 @click.option("--rem-bin", default="rem", show_default=True, help="rem CLI binary.")
-@click.option("--key-epoch", default=None, help="Key epoch for rao-aead-v1 pools.")
+@click.option("--key-epoch", default=None, help="Key epoch for rem-encrypt-v1 pools.")
 @click.option(
     "--no-reap",
     is_flag=True,

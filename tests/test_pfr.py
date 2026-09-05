@@ -1,4 +1,4 @@
-"""Unit coverage for PFR sidecar handling, RAO cuts, and failure projection."""
+"""Unit coverage for PFR sidecar handling, REM-OBJECT cuts, and failure projection."""
 
 from __future__ import annotations
 
@@ -73,14 +73,14 @@ from sutradhara.jobs.reconcilers.conditions import (
 from sutradhara.jobs.registry import JobContext
 from sutradhara.pfr import (
     PFR_SIDECAR_METADATA_KEY,
-    RaoObject,
+    RemObject,
     atomic_write_sidecar,
     cut_pfr_asset,
     enforce_blob_lru,
     sidecar_blobs_complete,
 )
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 
 
 @pytest.fixture
@@ -193,7 +193,7 @@ def test_cut_pfr_asset_reuses_one_read_session_and_member_relative_ranges(
 ) -> None:
     member = b"0123456789"
     first_chunk_lba = 2
-    base = first_chunk_lba * RAO_CHUNK_SIZE
+    base = first_chunk_lba * REM_OBJECT_CHUNK_SIZE
     object_bytes = b"x" * base + member + b"tail"
     read = _ReadSession(object_bytes)
     object_id = bytes.fromhex("1cd8ebd3d70a4998a02ab868b8aafbf3")
@@ -215,14 +215,14 @@ def test_cut_pfr_asset_reuses_one_read_session_and_member_relative_ranges(
                 asset_hash=asset_hash,
                 member_size=len(member),
                 sidecar_path=sidecar_path,
-                representation=Representation.RAO_PLAIN_V1,
+                representation=Representation.REM_OBJECT_V1,
                 object_id=object_id,
                 first_chunk_lba=first_chunk_lba,
             )
 
         def fake_cut(
             sidecar: PFRSidecar,
-            source: RaoObject,
+            source: RemObject,
             *,
             t_in: float,
             t_out: float,
@@ -288,7 +288,7 @@ def test_cut_refusal_records_reason_and_does_not_reopen_ranged_session(
                 asset_hash=asset_hash,
                 member_size=len(member),
                 sidecar_path=sidecar_path,
-                representation=Representation.RAO_PLAIN_V1,
+                representation=Representation.REM_OBJECT_V1,
                 object_id=object_id,
                 first_chunk_lba=0,
             )
@@ -324,7 +324,7 @@ def test_cut_refusal_records_reason_and_does_not_reopen_ranged_session(
     assert read.open_count == 1
 
 
-def test_rao_object_uses_shared_member_base_and_translates_session_invalid(
+def test_rem_object_uses_shared_member_base_and_translates_session_invalid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
@@ -344,7 +344,7 @@ def test_rao_object_uses_shared_member_base_and_translates_session_invalid(
     copy, locator = _copy_and_locator(member_size=10, first_chunk_lba=7)
     monkeypatch.setattr("sutradhara.pfr.member_byte_base", fake_member_base)
     reader = Reader()
-    source = RaoObject(reader=reader, copy=copy, locator=locator)
+    source = RemObject(reader=reader, copy=copy, locator=locator)
 
     assert source.read(2, 3) == b"abc"
     assert calls == [dict(locator.native_locator)]
@@ -355,7 +355,7 @@ def test_rao_object_uses_shared_member_base_and_translates_session_invalid(
             raise BackendSessionInvalidatedError("lost session")
 
     with pytest.raises(SourceChanged):
-        RaoObject(reader=InvalidatingReader(), copy=copy, locator=locator).read(0, 1)
+        RemObject(reader=InvalidatingReader(), copy=copy, locator=locator).read(0, 1)
 
 
 def test_remanence_read_range_maps_grpc_codes_to_typed_errors() -> None:
@@ -642,7 +642,7 @@ def test_cut_regenerates_missing_blobs_and_protects_them_from_trim(
             asset_hash=asset_hash,
             member_size=len(member),
             sidecar_path=sidecar_path,
-            representation=Representation.RAO_PLAIN_V1,
+            representation=Representation.REM_OBJECT_V1,
             object_id=bytes.fromhex("1cd8ebd3d70a4998a02ab868b8aafbf3"),
             first_chunk_lba=0,
         )
@@ -667,7 +667,7 @@ def test_cut_regenerates_missing_blobs_and_protects_them_from_trim(
             return self.data[byte_range.start : byte_range.end]
 
     class Registry:
-        def scrape_source(self, source: RaoObject, *, blob_dir: Path) -> PFRSidecar:
+        def scrape_source(self, source: RemObject, *, blob_dir: Path) -> PFRSidecar:
             _write_blob(blob_dir, blob_payload)
             return _sidecar(blobs=(blob,))
 
@@ -676,7 +676,7 @@ def test_cut_regenerates_missing_blobs_and_protects_them_from_trim(
 
     def fake_cut(
         sidecar: PFRSidecar,
-        source: RaoObject,
+        source: RemObject,
         *,
         t_in: float,
         t_out: float,
@@ -987,7 +987,7 @@ def _copy_and_locator(
             "size_bytes": member_size,
         },
         member_path="clip.mxf",
-        representation=Representation.RAO_PLAIN_V1.value,
+        representation=Representation.REM_OBJECT_V1.value,
     )
     return copy, locator
 

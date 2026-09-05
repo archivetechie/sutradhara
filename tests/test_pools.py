@@ -65,9 +65,9 @@ def test_pool_representation_can_change_until_first_copy(engine: Engine) -> None
         pool = set_pool_representation(
             s,
             "archive-pool",
-            Representation.RAO_PLAIN_V1,
+            Representation.REM_OBJECT_V1,
         )
-        assert pool.representation == Representation.RAO_PLAIN_V1.value
+        assert pool.representation == Representation.REM_OBJECT_V1.value
 
 
 def test_pool_representation_is_immutable_after_first_copy(engine: Engine) -> None:
@@ -84,7 +84,7 @@ def test_pool_representation_is_immutable_after_first_copy(engine: Engine) -> No
             Pool(
                 id="archive-pool",
                 backend_id=backend.id,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=5))
@@ -97,22 +97,22 @@ def test_pool_representation_is_immutable_after_first_copy(engine: Engine) -> No
             native_locator={"pool_id": "archive-pool", "object_id": "one"},
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
-            storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
+            storage_metadata={"representation": Representation.REM_OBJECT_V1.value},
         )
 
         same = set_pool_representation(
             s,
             "archive-pool",
-            Representation.RAO_PLAIN_V1,
+            Representation.REM_OBJECT_V1,
         )
-        assert same.representation == Representation.RAO_PLAIN_V1.value
+        assert same.representation == Representation.REM_OBJECT_V1.value
         with pytest.raises(PoolRepresentationImmutable):
             set_pool_representation(s, "archive-pool", Representation.D2TAR_RAW)
 
 
 def test_set_pool_representation_rejects_unknown_pool(engine: Engine) -> None:
     with session_scope(engine) as s, pytest.raises(UnknownPool):
-        set_pool_representation(s, "missing", Representation.RAO_PLAIN_V1)
+        set_pool_representation(s, "missing", Representation.REM_OBJECT_V1)
 
 
 def test_set_pool_write_fence_refuses_floor_critical_pool(engine: Engine) -> None:
@@ -124,7 +124,7 @@ def test_set_pool_write_fence_refuses_floor_critical_pool(engine: Engine) -> Non
         s.add_all(
             [
                 Pool(
-                    id="p-rem", backend_id=rem.id, representation=Representation.RAO_PLAIN_V1.value
+                    id="p-rem", backend_id=rem.id, representation=Representation.REM_OBJECT_V1.value
                 ),
                 Pool(id="p-d2", backend_id=d2.id, representation=Representation.D2TAR_RAW.value),
                 ArtifactClassPool(artifactclass="masters", pool_id="p-rem", active=True),
@@ -174,7 +174,7 @@ def test_set_pool_retired_refuses_live_locator(engine: Engine) -> None:
             Pool(
                 id="archive-pool",
                 backend_id=backend.id,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=5))
@@ -185,7 +185,7 @@ def test_set_pool_retired_refuses_live_locator(engine: Engine) -> None:
                 pool_id="archive-pool",
                 native_locator={"object": "one"},
                 member_path="asset.bin",
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         s.flush()

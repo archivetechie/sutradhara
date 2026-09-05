@@ -611,14 +611,14 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
             Pool(
                 id="pool-photo",
                 backend_id=backend.id,
-                representation="rao-plain-v1",
+                representation="rem-object-v1",
             )
         )
         session.add(ArtifactClassPool(artifactclass="photo", pool_id="pool-photo", active=True))
         session.add(
             ArtifactClassPolicyRecord(
                 artifactclass="photo",
-                ruleset="rao.photo.v1",
+                ruleset="rem-object.photo.v1",
                 expect="messy",
                 target_bytes=1024,
                 max_age_seconds=60,
@@ -652,7 +652,7 @@ def test_archive_bundle_enqueue_persists_held_bundle_after_staging_failure(
 
 
 def _install_photo_class(engine: Engine, *, target_bytes: int) -> None:
-    """One artifactclass with one RAO pool, for the enqueue-wrapper tests."""
+    """One artifactclass with one REM-OBJECT pool, for the enqueue-wrapper tests."""
     with session_scope(engine) as session:
         backend = Backend(
             name="rem-photo",
@@ -661,12 +661,12 @@ def _install_photo_class(engine: Engine, *, target_bytes: int) -> None:
         )
         session.add(backend)
         session.flush()
-        session.add(Pool(id="pool-photo", backend_id=backend.id, representation="rao-plain-v1"))
+        session.add(Pool(id="pool-photo", backend_id=backend.id, representation="rem-object-v1"))
         session.add(ArtifactClassPool(artifactclass="photo", pool_id="pool-photo", active=True))
         session.add(
             ArtifactClassPolicyRecord(
                 artifactclass="photo",
-                ruleset="rao.photo.v1",
+                ruleset="rem-object.photo.v1",
                 expect="messy",
                 target_bytes=target_bytes,
                 max_age_seconds=60,

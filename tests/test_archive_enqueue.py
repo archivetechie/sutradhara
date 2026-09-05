@@ -64,7 +64,7 @@ def _install_pool(s) -> None:
         Pool(
             id="shared-pool",
             backend_id=backend.id,
-            representation=Representation.RAO_PLAIN_V1.value,
+            representation=Representation.REM_OBJECT_V1.value,
         )
     )
     s.flush()

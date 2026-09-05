@@ -2,13 +2,13 @@
 
 ## What this repo is
 The archive orchestrator (formerly "lodestar"): content-addressed catalog,
-multi-backend copy fan-out with per-placement sealing (via Remanence RAO),
+multi-backend copy fan-out with per-placement sealing (via Remanence REM-OBJECT),
 scrub + self-heal, key registry. Code in `src/sutradhara/`; CLI `sutra`
 (`.venv/bin/sutra`); DB via `SUTRADHARA_DB_URL`
 (default sqlite at /var/lib/replica/sutradhara.db).
 Backends: `rem_tape` (gRPC to remanence), `d2_tape` (java CLI adapter),
 `memory` (tests), `s3` (ingest v2). Sealing: `sealing/` (Sealer/Opener ports,
-RAO = stateless local `rem-debug` codec — NEVER a daemon/gRPC service, by
+REM-OBJECT = stateless local `rem-debug` codec — NEVER a daemon/gRPC service, by
 decision).
 
 ## Verify

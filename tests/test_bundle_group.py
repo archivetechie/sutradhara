@@ -84,7 +84,7 @@ def _add_class(
 ) -> ArtifactClassPolicyRecord:
     policy = ArtifactClassPolicyRecord(
         artifactclass=artifactclass,
-        ruleset="rao.v1",
+        ruleset="rem-object.v1",
         expect="messy",
         target_bytes=target_bytes,
         max_age_seconds=max_age_seconds,
@@ -122,7 +122,7 @@ def _source(tmp_path: Path, name: str, data: bytes) -> Path:
 def test_fingerprint_ignores_accepts_writes_flip(engine: Engine) -> None:
     """A maintenance fence must never re-partition groups."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         _add_class(s, "photo", ["pool-a"])
         before, _ = compute_bundle_group(s, "photo")
         pool = s.get(Pool, "pool-a")
@@ -135,10 +135,10 @@ def test_fingerprint_ignores_accepts_writes_flip(engine: Engine) -> None:
 def test_fingerprint_changes_on_representation_change(engine: Engine) -> None:
     """Representation is a fingerprint input; a change must re-partition."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         _add_class(s, "photo", ["pool-a"])
         before, _ = compute_bundle_group(s, "photo")
-        set_pool_representation(s, "pool-a", Representation.RAO_AEAD_V1)
+        set_pool_representation(s, "pool-a", Representation.REM_ENCRYPT_V1)
         after, _ = compute_bundle_group(s, "photo")
         assert before != after
 
@@ -146,10 +146,10 @@ def test_fingerprint_changes_on_representation_change(engine: Engine) -> None:
 def test_set_pool_representation_recomputes_projection(engine: Engine) -> None:
     """The out-of-apply representation writer must maintain the projection."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         stale = policy.bundle_group
-        set_pool_representation(s, "pool-a", Representation.RAO_AEAD_V1)
+        set_pool_representation(s, "pool-a", Representation.REM_ENCRYPT_V1)
         assert policy.bundle_group != stale
         live, _ = compute_bundle_group(s, "photo")
         assert policy.bundle_group == live
@@ -158,7 +158,7 @@ def test_set_pool_representation_recomputes_projection(engine: Engine) -> None:
 def test_fingerprint_sort_stability(engine: Engine) -> None:
     """Membership insertion order must not change identity."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1"), ("pool-b", "rao-aead-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1"), ("pool-b", "rem-encrypt-v1")])
         _add_class(s, "one", ["pool-a", "pool-b"])
         _add_class(s, "two", ["pool-b", "pool-a"])
         fp_one, basis_one = compute_bundle_group(s, "one")
@@ -185,22 +185,23 @@ def _migration_module():
     return module
 
 
-# Golden fingerprint for a fixed mixed-case ASCII basis (F9). Pinned before the
-# canonical sort moved from SQL ORDER BY to Python sorted(): byte order for
-# ASCII pool ids ('A' < 'Z' < 'a') under SQLite BINARY collation and Python
-# codepoint sort must agree, so this constant must never change.
+# Golden fingerprint for a fixed mixed-case ASCII basis (F9). The REM-OBJECT
+# clean-break migration deliberately changed this value once because stored
+# representation names are part of the basis. Byte order for ASCII pool ids
+# ('A' < 'Z' < 'a') under SQLite BINARY collation and Python codepoint sort
+# must continue to agree after that explicit identity migration.
 _F9_GOLDEN_BASIS = [
-    {"pool": "A-Pool", "representation": "rao-plain-v1"},
+    {"pool": "A-Pool", "representation": "rem-object-v1"},
     {"pool": "Z-pool", "representation": "d2tar-raw"},
-    {"pool": "a-pool", "representation": "rao-aead-v1"},
+    {"pool": "a-pool", "representation": "rem-encrypt-v1"},
 ]
-_F9_GOLDEN_FINGERPRINT = "f0286b4b680bf2f8a19fb2d2c9071853486fb35bc60c43d4f70e68ca4d8a4ca1"
+_F9_GOLDEN_FINGERPRINT = "f7231c635ac52700911e70ba0131a226169ee968630e1874b1bb88c8aa640359"
 
 
 def test_f9_fingerprint_parity_library_vs_migration(engine: Engine) -> None:
     """F9: the canonical order must be collation-independent and identical
     across the library and the migration backfill — for ASCII pool ids the
-    fingerprint must equal the pre-change pinned golden value."""
+    fingerprint must equal the post-migration pinned golden value."""
     migration = _migration_module()
     with session_scope(engine) as s:
         backend = Backend(name="rem", kind=BackendKind.REM_TAPE, tier=BackendTier.SELF_DESCRIBING)
@@ -208,9 +209,9 @@ def test_f9_fingerprint_parity_library_vs_migration(engine: Engine) -> None:
         s.flush()
         # Mixed-case ids seeded in non-canonical insertion order: exposes any
         # collation- or insertion-order-dependent sort.
-        s.add(Pool(id="a-pool", backend_id=backend.id, representation="rao-aead-v1"))
+        s.add(Pool(id="a-pool", backend_id=backend.id, representation="rem-encrypt-v1"))
         s.add(Pool(id="Z-pool", backend_id=backend.id, representation="d2tar-raw"))
-        s.add(Pool(id="A-Pool", backend_id=backend.id, representation="rao-plain-v1"))
+        s.add(Pool(id="A-Pool", backend_id=backend.id, representation="rem-object-v1"))
         s.flush()
         _add_class(s, "mixed-case", ["a-pool", "Z-pool", "A-Pool"])
         fingerprint, basis = compute_bundle_group(s, "mixed-case")
@@ -226,7 +227,7 @@ def test_f9_fingerprint_parity_library_vs_migration(engine: Engine) -> None:
 def test_inactive_membership_leaves_fingerprint(engine: Engine) -> None:
     """Only active memberships are identity."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1"), ("pool-b", "rao-aead-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1"), ("pool-b", "rem-encrypt-v1")])
         _add_class(s, "photo", ["pool-a"])
         before, _ = compute_bundle_group(s, "photo")
         s.add(ArtifactClassPool(artifactclass="photo", pool_id="pool-b", active=False))
@@ -250,7 +251,7 @@ def test_null_values_canonicalise_as_absent_keys() -> None:
 def test_thresholds_min_age_max_target_over_declared_set(engine: Engine) -> None:
     """min over ages (a promise), max over targets (a goal) — never min-of-targets."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         _add_class(s, "audio", ["pool-a"], target_bytes=1 * 1024, max_age_seconds=7200)
         _add_class(s, "photo", ["pool-a"], target_bytes=20 * 1024, max_age_seconds=3600)
         policy = _add_class(s, "video", ["pool-a"], target_bytes=5 * 1024, max_age_seconds=86400)
@@ -269,7 +270,7 @@ def test_thresholds_min_age_max_target_over_declared_set(engine: Engine) -> None
 def test_threshold_clamp_activates_on_declared_floor(engine: Engine) -> None:
     """The strictest member pool's declared floor clamps the target up."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1"), ("pool-b", "rao-aead-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1"), ("pool-b", "rem-encrypt-v1")])
         s.get(Pool, "pool-a").min_object_bytes = 50 * 1024
         s.get(Pool, "pool-b").min_object_bytes = 80 * 1024
         s.flush()
@@ -288,7 +289,7 @@ def test_threshold_clamp_activates_on_declared_floor(engine: Engine) -> None:
 def test_threshold_clamp_inactive_without_declared_floor(engine: Engine) -> None:
     """NULL min_object_bytes = no floor declared — never an implicit zero."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"], target_bytes=1024)
         fingerprint, basis = compute_bundle_group(s, "photo")
         target, _ = effective_group_thresholds(
@@ -312,7 +313,7 @@ def test_empty_declared_set_errors_at_open(engine: Engine) -> None:
 def test_zero_thresholds_never_written(engine: Engine) -> None:
     """A defective policy row (zero threshold) must fail loudly at open."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"], target_bytes=1024)
         policy.max_age_seconds = 0
         s.flush()
@@ -324,7 +325,7 @@ def test_opener_union_covers_stale_projection(engine: Engine) -> None:
     """The declared-set query includes the opener even when its stored
     projection points at an old fingerprint (a missed writer)."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         _add_class(s, "photo", ["pool-a"], target_bytes=10 * 1024, max_age_seconds=3600)
         opener = _add_class(
             s,
@@ -352,7 +353,7 @@ def test_opener_union_covers_stale_projection(engine: Engine) -> None:
 def test_open_freezes_thresholds_and_witness(engine: Engine) -> None:
     """Thresholds are frozen on the open bundle and equal the witness."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"], target_bytes=4096, max_age_seconds=600)
         bundle, created = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         assert created
@@ -375,7 +376,7 @@ def test_open_freezes_thresholds_and_witness(engine: Engine) -> None:
 
 def test_same_pool_set_classes_share_accumulator(engine: Engine) -> None:
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         photo = _add_class(s, "photo", ["pool-a"])
         audio = _add_class(s, "audio", ["pool-a"])
         b1, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=photo)
@@ -387,7 +388,7 @@ def test_same_pool_set_classes_share_accumulator(engine: Engine) -> None:
 def test_different_pool_sets_get_own_accumulators(engine: Engine) -> None:
     """Confidentiality needs no mechanism: a different pool set = own crate."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1"), ("pool-priv", "rao-aead-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1"), ("pool-priv", "rem-encrypt-v1")])
         public = _add_class(s, "public", ["pool-a"])
         confidential = _add_class(s, "confidential", ["pool-priv"])
         b1, _ = get_or_create_open_bundle(s, artifactclass="public", policy=public)
@@ -402,7 +403,7 @@ def test_accumulator_race_loser_adopts_winner(
     """Forced IntegrityError on the accumulator index: the loser adopts and
     a raw IntegrityError never escapes."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         winner, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         s.flush()
@@ -429,7 +430,7 @@ def test_accumulator_race_translates_foreign_integrity_error(
     """An IntegrityError with no adoptable winner surfaces as a domain error,
     never raw."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         _winner, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         s.flush()
@@ -442,7 +443,7 @@ def test_member_race_loser_reruns_ladder(engine: Engine, monkeypatch: pytest.Mon
     """Forced IntegrityError on (bundle_id, member_path): the loser re-runs
     the ladder against the now-visible winner and lands on a tagged name."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         winner_hash = _add_asset(s, b"winner")
@@ -486,7 +487,7 @@ def test_member_race_loser_reruns_ladder(engine: Engine, monkeypatch: pytest.Mon
 
 def test_atomic_counters_accumulate(engine: Engine) -> None:
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         for index in range(3):
@@ -511,7 +512,7 @@ def test_cross_class_same_path_disambiguates_with_own_hash(engine: Engine) -> No
     """Two cameras' IMG_0001.JPG across classes is routine intake, not an
     outage: the later member gets its own content-hash tag."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         photo = _add_class(s, "photo", ["pool-a"])
         _add_class(s, "audio", ["pool-a"])
         bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=photo)
@@ -542,7 +543,7 @@ def test_cross_class_same_path_disambiguates_with_own_hash(engine: Engine) -> No
 
 def test_same_class_same_path_different_hash_disambiguates(engine: Engine) -> None:
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         first = _add_asset(s, b"one")
@@ -572,7 +573,7 @@ def test_same_class_same_path_different_hash_disambiguates(engine: Engine) -> No
 def test_idempotent_noop_same_class_same_hash(engine: Engine) -> None:
     """The no-op requires class AND hash agreement — never path alone."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         digest = _add_asset(s, b"same")
@@ -604,7 +605,7 @@ def test_collision_at_tagged_name_climbs_ladder(engine: Engine) -> None:
     """A literal name occupying a tag-syntax rung is just a name; the ladder
     climbs past it, re-checking idempotency per rung."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         blocker = _add_asset(s, b"blocker")
@@ -647,7 +648,7 @@ def test_crash_retry_lands_on_own_row_at_tagged_rung(engine: Engine) -> None:
     """Re-running the exact insert after a crash must land on the previously
     tagged row, not mint a second name."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         first = _add_asset(s, b"first")
@@ -693,7 +694,7 @@ def test_arrival_order_independence_both_orders(engine: Engine) -> None:
         eng = make_engine("sqlite:///:memory:")
         create_all(eng)
         with session_scope(eng) as s:
-            _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+            _add_backend_pools(s, [("pool-a", "rem-object-v1")])
             policy = _add_class(s, "photo", ["pool-a"])
             bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
             for data in order:
@@ -720,7 +721,7 @@ def test_ladder_exhaustion_is_a_hash_collision_assert(engine: Engine) -> None:
     """Same-key different-hash within a class is impossible by construction
     after the ladder; exhausting it must raise the assert, not insert."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"])
         bundle, _ = get_or_create_open_bundle(s, artifactclass="photo", policy=policy)
         newcomer = _add_asset(s, b"newcomer")
@@ -769,7 +770,7 @@ def test_f5_slug_collision_classes_get_distinct_terminal_rungs(engine: Engine) -
     assert ladder_a[-1] != ladder_b[-1]
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy_a = _add_class(s, "photo.raw", ["pool-a"])
         _add_class(s, "photo-raw", ["pool-a"])
         asset = _add_asset(s, content)
@@ -832,7 +833,7 @@ def test_include_alone_routes_oversized_member_to_funnel(engine: Engine, tmp_pat
     """Oversized member with a non-empty accumulator: fresh non-adoptable
     bundle, accumulator untouched, no partial-index violation."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"], target_bytes=100)
         small = _source(tmp_path, "small.bin", b"x" * 10)
         big = _source(tmp_path, "big.bin", b"y" * 200)
@@ -881,7 +882,7 @@ def test_include_alone_retry_lands_on_open_funnel(engine: Engine, tmp_path: Path
     """A crash-retry of the same oversized enqueue must not mint a second
     funnel while the first is still open."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"], target_bytes=100)
         big = _source(tmp_path, "big.bin", b"y" * 200)
         big_hash = _add_asset(s, b"y" * 200)
@@ -910,7 +911,7 @@ def test_f8_include_alone_mint_savepoint_guard(engine: Engine, tmp_path: Path) -
     through the savepoint guard — adopt the open funnel, add the member, and
     never let a raw IntegrityError escape."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"], target_bytes=100)
         big = _source(tmp_path, "big.bin", b"y" * 200)
         big_hash = _add_asset(s, b"y" * 200)
@@ -950,7 +951,7 @@ def test_f8_include_alone_mint_foreign_collision_is_domain_error(
     occupied by a sealed bundle) translates to the retryable domain error,
     never a raw IntegrityError."""
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"], target_bytes=100)
         big = _source(tmp_path, "big.bin", b"y" * 200)
         big_hash = _add_asset(s, b"y" * 200)
@@ -1016,7 +1017,7 @@ def test_staging_rekey_tags_transformed_member_chain(engine: Engine, tmp_path: P
     from sutradhara.staging import stage_and_enqueue_artifact
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"], target_bytes=1 << 30)
         policy.staging_config = {
             "appledouble": {
@@ -1099,7 +1100,7 @@ def test_staging_rekey_crash_retry_is_idempotent(engine: Engine, tmp_path: Path)
     from sutradhara.staging import stage_and_enqueue_artifact
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _add_class(s, "photo", ["pool-a"], target_bytes=1 << 30)
         policy.staging_config = {
             "appledouble": {
@@ -1199,7 +1200,7 @@ def test_tagged_transformed_member_restores_by_its_receipt_name(
     from sutradhara.staging import stage_and_enqueue_artifact
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         first_policy = _staging_class(s, "disk.one", ["pool-a"])
         second_policy = _staging_class(s, "disk.two", ["pool-a"])
 
@@ -1273,7 +1274,7 @@ def test_tagged_untransformed_member_restores_by_its_receipt_name(
     from sutradhara.staging import stage_and_enqueue_artifact
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         first_policy = _staging_class(s, "disk.one", ["pool-a"], compression=False)
         second_policy = _staging_class(s, "disk.two", ["pool-a"], compression=False)
 
@@ -1324,7 +1325,7 @@ def test_rekey_tags_every_intermediate_stored_path(engine: Engine, tmp_path: Pat
     from sutradhara.staging import stage_and_enqueue_artifact
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         first_policy = _staging_class(s, "disk.one", ["pool-a"], appledouble="merge-to-xattrs")
         second_policy = _staging_class(s, "disk.two", ["pool-a"], appledouble="merge-to-xattrs")
         first = _source(tmp_path / "one" / "images", "disk.img", b"one-bytes" * 20)
@@ -1392,7 +1393,7 @@ def test_stored_member_name_wins_over_a_co_resident_logical_name(
     from sutradhara.staging import stage_and_enqueue_artifact
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         policy = _staging_class(s, "disk.one", ["pool-a"], compression=False)
         first = _source(tmp_path / "one" / "images", "disk.img", b"one-bytes" * 20)
         second = _source(tmp_path / "two" / "images", "disk.img", b"two-bytes" * 20)
@@ -1445,7 +1446,7 @@ def test_logical_name_shared_by_two_tagged_members_is_ambiguous(
     from sutradhara.staging import stage_and_enqueue_artifact
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         other = _staging_class(s, "disk.other", ["pool-a"], compression=False)
         mine = _staging_class(s, "disk.mine", ["pool-a"], compression=False)
 
@@ -1530,7 +1531,7 @@ def test_ambiguity_hint_never_recommends_the_name_that_just_failed(
         s.flush()
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         other = _staging_class(s, "disk.other", ["pool-a"], compression=False)
         mine = _staging_class(s, "disk.mine", ["pool-a"], compression=False)
 
@@ -1621,7 +1622,7 @@ def test_compressed_logical_name_main_resolved_uniquely_now_raises(
     from sutradhara.staging import stage_and_enqueue_artifact
 
     with session_scope(engine) as s:
-        _add_backend_pools(s, [("pool-a", "rao-plain-v1")])
+        _add_backend_pools(s, [("pool-a", "rem-object-v1")])
         other = _staging_class(s, "disk.other", ["pool-a"])
         mine = _staging_class(s, "disk.mine", ["pool-a"])
 
@@ -1714,7 +1715,7 @@ def _seed_pre_migration_estate(db_path: Path, *, duplicate_open: bool) -> None:
         conn.execute(
             "INSERT INTO pool (id, backend_id, representation, location, offsite_gate, "
             "tier, accepts_writes, retired, created_at) "
-            "VALUES ('pool-a', 1, 'rao-plain-v1', '', 0, '', 1, 0, '2026-01-01')"
+            "VALUES ('pool-a', 1, 'rem-object-v1', '', 0, '', 1, 0, '2026-01-01')"
         )
         for artifactclass in ("photo", "audio"):
             conn.execute(
@@ -1806,7 +1807,7 @@ def test_migration_backfills_drained_estate(tmp_path: Path) -> None:
         for _bundle_id, _group, basis_raw in rows:
             document = json_module.loads(basis_raw)
             assert document["basis_source"] == "backfilled"
-            assert document["basis"] == [{"pool": "pool-a", "representation": "rao-plain-v1"}]
+            assert document["basis"] == [{"pool": "pool-a", "representation": "rem-object-v1"}]
             assert document["effective"]["target_bytes"] == 1024
         projections = dict(
             conn.execute("SELECT artifactclass, bundle_group FROM artifactclass_policy")

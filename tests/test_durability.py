@@ -239,7 +239,7 @@ def test_open_batch_tracking_does_not_contribute_to_durability_floor(
                                 {
                                     "caller_object_id": asset_hash.hex(),
                                     "provisional_ordinal": 1,
-                                    "source": "/staging/object.rao",
+                                    "source": "/staging/object.rem-object",
                                     "restart_offset": 0,
                                 }
                             ]

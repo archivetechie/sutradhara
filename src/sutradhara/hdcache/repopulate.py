@@ -63,7 +63,7 @@ from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, record_obse
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import sha256_file
 from sutradhara.sealing.port import Opener, Representation
-from sutradhara.sealing.rao import RaoCliOpener
+from sutradhara.sealing.rem_object import RemObjectCliOpener
 
 DEFAULT_REPOP_SCRATCH_ROOT = Path("/var/lib/replica/hdcache-repopulate-scratch")
 DEFAULT_REPOP_BATCH_SECONDS = 30 * 60
@@ -826,10 +826,10 @@ def _read_entry_plaintext(
             deadline_monotonic=deadline,
             disk_id=disk.disk_id,
         )
-    opener = config.opener or RaoCliOpener(config.registry(), work_dir=config.scratch_root)
+    opener = config.opener or RemObjectCliOpener(config.registry(), work_dir=config.scratch_root)
     with opener.open(
         sealed,
-        Representation.RAO_AEAD_V1,
+        Representation.REM_ENCRYPT_V1,
         recipient_epochs=(entry.key_epoch,),
         key_domain=KEY_DOMAIN_HDCACHE,
         work_dir=config.scratch_root,

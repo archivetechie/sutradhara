@@ -500,7 +500,7 @@ def _flushed_bundle(
                 Pool(
                     id=pool_id,
                     backend_id=row.id,
-                    representation=Representation.RAO_PLAIN_V1.value,
+                    representation=Representation.REM_OBJECT_V1.value,
                 )
             )
         s.flush()

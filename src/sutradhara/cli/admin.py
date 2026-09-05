@@ -11,7 +11,7 @@ import click
 
 from sutradhara.catalog.session import database_url, make_engine, reset_all
 from sutradhara.keys import KeyRegistry, mint_recovery_keypair
-from sutradhara.sealing.rao import resolve_rem_bin
+from sutradhara.sealing.rem_object import resolve_rem_bin
 
 
 @dataclass(frozen=True)

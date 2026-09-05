@@ -40,7 +40,7 @@ from sutradhara.catalog.types import (
 from sutradhara.evidence_recorder import record_unmeasured_promotion
 from sutradhara.jobs.engine import submit
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 
 
 class ScrubInvariantError(Exception):
@@ -291,8 +291,8 @@ def _storage_metadata_for_record(
 
     representation = Representation(pool.representation)
     metadata["representation"] = representation.value
-    if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
-        metadata.setdefault("chunk_size", RAO_CHUNK_SIZE)
+    if representation in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}:
+        metadata.setdefault("chunk_size", REM_OBJECT_CHUNK_SIZE)
     return metadata
 
 
@@ -321,17 +321,24 @@ def _is_archive_body_format(value: str) -> bool:
         "sutradhara-local-archive-v1",
         "sutradhara-archive-bundle-v1",
         "rem-archive-v1",
+        "rem-object-archive-v1",
+        # Recognition-only compatibility for immutable pre-rename media.
         "rao-archive-v1",
-    } or normalized.startswith(("rem-archive-", "rao-archive-"))
+    } or normalized.startswith(("rem-archive-", "rem-object-archive-", "rao-archive-"))
 
 
 def _looks_like_bundle_container_name(value: str) -> bool:
     name = PurePosixPath(value).name
     return name.endswith(
         (
+            "-rem-object-v1.rem-object",
+            "-rem-encrypt-v1.rem-object",
+            # Recognition-only compatibility for immutable pre-rename names.
             "-rao-plain-v1.rao",
             "-rao-aead-v1.rao",
             "-d2tar-raw.tar",
+            "-rem-object-v1.sra",
+            "-rem-encrypt-v1.sra",
             "-rao-plain-v1.sra",
             "-rao-aead-v1.sra",
             "-d2tar-raw.sra",

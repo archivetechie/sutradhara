@@ -99,7 +99,7 @@ from sutradhara.jobs.reconcilers.conditions import (
 from sutradhara.keys import KeyEpoch
 from sutradhara.replication import target_pools
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 from sutradhara.staging import stage_and_enqueue_artifact
 from tests.bundle_group_helpers import bundle_kwargs
 
@@ -284,7 +284,7 @@ def _install_policy(
                 Pool(
                     id="o-copy-1-pool",
                     backend_id=rem.id,
-                    representation=Representation.RAO_PLAIN_V1.value,
+                    representation=Representation.REM_OBJECT_V1.value,
                 ),
                 Pool(
                     id="d2-shelf-pool",
@@ -298,7 +298,7 @@ def _install_policy(
             s,
             "o-archive",
             ArtifactClassPolicy(
-                ruleset="rao.o.v1",
+                ruleset="rem-object.o.v1",
                 placements=(
                     PlacementPolicy("o-copy-1-pool", role="primary"),
                     PlacementPolicy("d2-shelf-pool", role="shelf"),
@@ -356,7 +356,7 @@ def _create_bundle(
         return _ArchiveSetup(bundle_id, rem_id, d2_id, assets)
 
 
-def _create_rao_plain_copy(
+def _create_rem_object_copy(
     engine: Engine,
     tmp_path: Path,
     backend: _ArchiveWriteBackend,
@@ -367,15 +367,15 @@ def _create_rao_plain_copy(
     for _, data, first_lba in members:
         if first_lba is None:
             continue
-        object_size = max(object_size, first_lba * RAO_CHUNK_SIZE + len(data))
+        object_size = max(object_size, first_lba * REM_OBJECT_CHUNK_SIZE + len(data))
     payload = bytearray(b"\0" * object_size)
     for _, data, first_lba in members:
         if first_lba is None:
             continue
-        start = first_lba * RAO_CHUNK_SIZE
+        start = first_lba * REM_OBJECT_CHUNK_SIZE
         payload[start : start + len(data)] = data
 
-    object_path = tmp_path / "manual-plain.rao"
+    object_path = tmp_path / "manual-plain.rem-object"
     object_path.write_bytes(payload)
     assets = {_digest(data): data for _, data, _ in members}
 
@@ -395,8 +395,8 @@ def _create_rao_plain_copy(
             source=CopySource.INGEST,
             health=CopyHealth.OK,
             storage_metadata={
-                "representation": Representation.RAO_PLAIN_V1.value,
-                "chunk_size": RAO_CHUNK_SIZE,
+                "representation": Representation.REM_OBJECT_V1.value,
+                "chunk_size": REM_OBJECT_CHUNK_SIZE,
                 "stored_size_bytes": record.size_bytes,
             },
         )
@@ -425,7 +425,7 @@ def _create_rao_plain_copy(
                     bundle_id="bundle-plain",
                     member_path=member_path,
                     native_locator=native_locator,
-                    representation=Representation.RAO_PLAIN_V1.value,
+                    representation=Representation.REM_OBJECT_V1.value,
                 )
             )
     return rem_id, assets
@@ -528,7 +528,7 @@ def test_enqueue_due_and_flush_fans_out_bundle_copies(
         receipt = json.loads(Path(result.manifest_path).read_text())
         assert receipt["signature"]["algorithm"] == "hmac-sha256"
         assert receipt["signature"]["key_id"] == "test-key"
-        assert receipt["manifest"]["representation"] == Representation.RAO_PLAIN_V1.value
+        assert receipt["manifest"]["representation"] == Representation.REM_OBJECT_V1.value
 
         copies = list(s.scalars(select(Copy).order_by(Copy.pool_id)))
         assert {copy.pool_id for copy in copies} == {
@@ -714,7 +714,7 @@ def test_local_archive_builder_aead_offsets_verify_without_builder_fallback(
             Pool(
                 id="aead-pool",
                 backend_id=row.id,
-                representation=Representation.RAO_AEAD_V1.value,
+                representation=Representation.REM_ENCRYPT_V1.value,
             )
         )
         s.add(LogicalAsset(content_sha256=_digest(data), size_bytes=len(data)))
@@ -723,7 +723,7 @@ def test_local_archive_builder_aead_offsets_verify_without_builder_fallback(
             s,
             "aead-archive",
             ArtifactClassPolicy(
-                ruleset="rao.aead.test",
+                ruleset="rem-object.aead.test",
                 placements=(PlacementPolicy("aead-pool", role="offsite"),),
                 bundling=BundlingPolicy(target_gb=0.000000014, max_age_seconds=60),
                 restore_preference=("aead-pool",),
@@ -1002,14 +1002,14 @@ def test_restore_excludes_copy_in_retired_artifactclass_pool(
             )
 
 
-def test_rao_plain_restore_reads_only_member_range(
+def test_rem_object_restore_reads_only_member_range(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
     backend = _ArchiveWriteBackend("rem")
     target = b"beta body" * 7
     first_lba = 2
-    rem_id, assets = _create_rao_plain_copy(
+    rem_id, assets = _create_rem_object_copy(
         engine,
         tmp_path,
         backend,
@@ -1030,18 +1030,18 @@ def test_rao_plain_restore_reads_only_member_range(
             backends={rem_id: backend},
         )
 
-    start = first_lba * RAO_CHUNK_SIZE
+    start = first_lba * REM_OBJECT_CHUNK_SIZE
     assert restored.output_path.read_bytes() == assets[asset_hash]
     assert backend.reads == [ByteRange(start, start + len(target))]
 
 
-def test_rao_plain_streamed_restore_has_bounded_python_peak_memory(
+def test_rem_object_streamed_restore_has_bounded_python_peak_memory(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
     backend = _ArchiveWriteBackend("rem")
     payload = b"x" * (32 * 1024 * 1024)
-    rem_id, _ = _create_rao_plain_copy(
+    rem_id, _ = _create_rem_object_copy(
         engine,
         tmp_path,
         backend,
@@ -1092,12 +1092,12 @@ def test_raw_bytes_streamed_restore_round_trip_has_bounded_python_peak_memory(
     assert peak < len(payload) // 4
 
 
-def test_zero_byte_rao_plain_member_restores_without_backend_read(
+def test_zero_byte_rem_object_member_restores_without_backend_read(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
     backend = _ArchiveWriteBackend("rem")
-    rem_id, _ = _create_rao_plain_copy(
+    rem_id, _ = _create_rem_object_copy(
         engine,
         tmp_path,
         backend,
@@ -1125,7 +1125,7 @@ def test_restore_resolves_relative_nested_destination_and_keeps_existing_on_fail
 ) -> None:
     backend = _ArchiveWriteBackend("rem")
     payload = b"durable restore payload"
-    rem_id, _ = _create_rao_plain_copy(
+    rem_id, _ = _create_rem_object_copy(
         engine,
         tmp_path,
         backend,
@@ -1170,9 +1170,11 @@ def test_read_member_primitive_matches_bytes_wrapper_and_streams_large_member(
     tmp_path: Path,
 ) -> None:
     backend = _ArchiveWriteBackend("rem")
-    payload = (b"large member\n" * ((RAO_CHUNK_SIZE // len(b"large member\n")) + 2)) + b"tail"
+    payload = (
+        b"large member\n" * ((REM_OBJECT_CHUNK_SIZE // len(b"large member\n")) + 2)
+    ) + b"tail"
     first_lba = 1
-    _rem_id, _ = _create_rao_plain_copy(
+    _rem_id, _ = _create_rem_object_copy(
         engine,
         tmp_path,
         backend,
@@ -1193,7 +1195,7 @@ def test_read_member_primitive_matches_bytes_wrapper_and_streams_large_member(
         wrapper_bytes = read_member_bytes(backend, copy, locator, work_dir=tmp_path)
         wrapper_ranges = list(backend.reads)
 
-    start = first_lba * RAO_CHUNK_SIZE
+    start = first_lba * REM_OBJECT_CHUNK_SIZE
     end = start + len(payload)
     assert written == len(payload)
     assert output_path.read_bytes() == payload
@@ -1591,7 +1593,7 @@ def test_bundle_member_mismatch_does_not_retry_group_or_mark_suspect(
         assert [copy.health for copy in copies] == [CopyHealth.OK, CopyHealth.OK]
 
 
-def test_encrypted_restore_plumbing_uses_recipient_epochs_and_rao_range_args(
+def test_encrypted_restore_plumbing_uses_recipient_epochs_and_rem_object_range_args(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -1651,7 +1653,7 @@ else:
     rem_script.chmod(0o755)
     keys = _FakeKeyRegistry(key_file)
     backend = _ArchiveWriteBackend("enc")
-    object_path = tmp_path / "encrypted.rao"
+    object_path = tmp_path / "encrypted.rem-object"
     stored = bytearray(b"x" * 4096)
     header = bytearray(128)
     header[:4] = b"REMO"
@@ -1674,7 +1676,7 @@ else:
             Pool(
                 id="encrypted-pool",
                 backend_id=row.id,
-                representation=Representation.RAO_AEAD_V1.value,
+                representation=Representation.REM_ENCRYPT_V1.value,
             )
         )
         s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=len(restored)))
@@ -1684,7 +1686,7 @@ else:
             s,
             "o-archive",
             ArtifactClassPolicy(
-                ruleset="rao.o.v1",
+                ruleset="rem-object.o.v1",
                 placements=(PlacementPolicy("encrypted-pool"),),
                 bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
                 restore_preference=("encrypted-pool",),
@@ -1702,7 +1704,7 @@ else:
             integrity_hash=record.integrity_hash,
             source=CopySource.INGEST,
             storage_metadata={
-                "representation": Representation.RAO_AEAD_V1.value,
+                "representation": Representation.REM_ENCRYPT_V1.value,
                 "recipient_epochs": [key_epoch, recovery_epoch],
                 "stored_size_bytes": record.size_bytes,
             },
@@ -1729,7 +1731,7 @@ else:
                     "first_chunk_lba": 4,
                     "size_bytes": len(restored),
                 },
-                representation=Representation.RAO_AEAD_V1.value,
+                representation=Representation.REM_ENCRYPT_V1.value,
             )
         )
         s.flush()

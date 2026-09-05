@@ -383,7 +383,7 @@ def test_bundle_asset_locator_copy_counts_for_durability(
             pool_id=pool.id,
             native_locator=locator,
             native_locator_key=locator_key(locator),
-            storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
+            storage_metadata={"representation": Representation.REM_OBJECT_V1.value},
             integrity_hash=item.logical_asset_hash,
             health=CopyHealth.OK,
             last_checked_at=_now(),
@@ -411,7 +411,7 @@ def test_bundle_asset_locator_copy_counts_for_durability(
                 bundle_id=bundle.id,
                 native_locator={"first_chunk_lba": 1, "size_bytes": item.size_bytes},
                 member_path=item.as_received_path,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         confirm_offsite(session, media_id="tape:tape-b", confirmed_by="ops")
@@ -452,7 +452,7 @@ def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
             pool_id=offsite.id,
             native_locator=locator,
             native_locator_key=locator_key(locator),
-            storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
+            storage_metadata={"representation": Representation.REM_OBJECT_V1.value},
             integrity_hash=item.logical_asset_hash,
             health=CopyHealth.OK,
             last_checked_at=_now(),
@@ -470,7 +470,7 @@ def test_bundle_locator_pool_mismatch_does_not_satisfy_retention_pool(
                 bundle_id=bundle.id,
                 native_locator={"first_chunk_lba": 1, "size_bytes": item.size_bytes},
                 member_path=item.as_received_path,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         confirm_offsite(session, media_id="tape:tape-mismatch", confirmed_by="ops")
@@ -1532,7 +1532,7 @@ def _add_cloud_copy(session: Session, intake_id: str, locator: dict[str, str]) -
     pool = Pool(
         id=f"cloud-temp-{intake_id}",
         backend_id=backend.id,
-        representation=Representation.RAO_AEAD_V1.value,
+        representation=Representation.REM_ENCRYPT_V1.value,
         location="cloud-temp",
     )
     bundle = Bundle(
@@ -1548,7 +1548,7 @@ def _add_cloud_copy(session: Session, intake_id: str, locator: dict[str, str]) -
         pool_id=pool.id,
         native_locator=locator,
         native_locator_key=locator_key(locator),
-        storage_metadata={"representation": Representation.RAO_AEAD_V1.value},
+        storage_metadata={"representation": Representation.REM_ENCRYPT_V1.value},
         integrity_hash=b"0" * 32,
         health=CopyHealth.OK,
         last_checked_at=_now(),

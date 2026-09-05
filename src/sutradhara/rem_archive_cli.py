@@ -1,6 +1,6 @@
 """Shared Remanence archive-build CLI adapter.
 
-Sutradhara has multiple workers that need to create Remanence RAO archive
+Sutradhara has multiple workers that need to create Remanence REM-OBJECT archive
 objects. This module owns the executable discovery, `rem archive build` flag
 surface, subprocess error reporting, JSON report parsing, and stored-object
 digest calculation so those workers do not grow separate command contracts.

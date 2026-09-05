@@ -193,7 +193,7 @@ Beyond `SUTRADHARA_DB_URL`, the environment variables most operators need:
   `PATH`, then `~/remanence/target/release/rem`. Run `sutra admin doctor`
   to check availability.
 - `SUTRADHARA_KEY_REGISTRY_DIR` — root of the local key registry for
-  encrypted REM-OBJECT copies (`rao-aead-v1` in stored catalog identifiers).
+  REM-ENCRYPT copies (`rem-encrypt-v1` in stored catalog identifiers).
   Defaults to
   `/var/lib/replica/sutradhara-key-registry`; deployments should create it
   with service-user ownership and mode `0700`. Root-key files are written
@@ -209,19 +209,19 @@ backend, test fakes — is documented with exact defaults in
 ## Scenario O — sealed REM-OBJECT copies
 
 Scenario O seals per-copy representations before storage instead of storing raw
-bytes. Sutradhara retains `RAO` in module names and stored representation IDs;
-in current Remanence terminology these are REM-OBJECT files. The default copy
-representation remains `raw-bytes`; `o-archive` uses `rao-plain-v1` for copy 1
-and `rao-aead-v1` for copy 2 — see the
+bytes. The default copy representation remains `raw-bytes`; `o-archive` uses
+`rem-object-v1` for its plaintext copy and `rem-encrypt-v1` for its encrypted
+copy. The latter is Sutradhara's pool-policy name for a REM-ENCRYPT envelope;
+the canonical stream inside that envelope remains `rem-object-v1`. See the
 "Configuration" section above for the `REM_BIN` and key-registry
 requirements this depends on.
 
-For RAO copies, `copy.integrity_hash` is the stored RAO object digest; the
-logical asset itself stays keyed by the source plaintext SHA-256. RAO copy
+For REM-OBJECT copies, `copy.integrity_hash` is the stored-object digest; the
+logical asset itself stays keyed by the source plaintext SHA-256. Copy
 rows record non-authoritative `storage_metadata` with the representation and
-chunk size; an encrypted copy's `key_id` is recovered from the stored RAO
-header via keyless inspection (`sutradhara.sealing.inspect_rao`), not stored
-redundantly on the row.
+chunk size; an encrypted copy's recipients are recovered from the REM-ENCRYPT
+header via keyless inspection
+(`sutradhara.sealing.inspect_rem_object`), not stored redundantly on the row.
 
 <!-- code-anchor: none -->
 ## Documentation

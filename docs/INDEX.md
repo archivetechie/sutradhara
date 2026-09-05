@@ -17,7 +17,8 @@
   downgrade export policy.
 - [Retention evidence journal](reference-retention-journal.md) — locked chained
   export, append-only DR shipping, checking, corrections, and ops alarms.
-- [Glossary](reference-glossary.md) — project terminology.
+- [Glossary](reference-glossary.md) — project terminology, including the canonical
+  REM-OBJECT and REM-ENCRYPT representation identifiers.
 - [Arrangement ARC guide](arrangement-arc-guide.md) — arrangement review workflow.
 - [Examples](examples/README.md) — example configuration and agent bundles.
 - [Security policy](../SECURITY.md) — supported versions and private reporting.

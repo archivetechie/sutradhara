@@ -22,11 +22,16 @@ if TYPE_CHECKING:
 
 
 class Representation(StrEnum):
-    """Supported per-copy stored representations."""
+    """Supported per-copy storage-policy representations.
+
+    ``rem-object-v1`` is also the canonical Remanence stream format id.
+    ``rem-encrypt-v1`` is Sutradhara's policy label for a REM-ENCRYPT envelope
+    whose decrypted inner stream is still ``rem-object-v1``.
+    """
 
     RAW_BYTES = "raw-bytes"
-    RAO_PLAIN_V1 = "rao-plain-v1"
-    RAO_AEAD_V1 = "rao-aead-v1"
+    REM_OBJECT_V1 = "rem-object-v1"
+    REM_ENCRYPT_V1 = "rem-encrypt-v1"
     D2TAR_RAW = "d2tar-raw"
 
 
