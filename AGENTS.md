@@ -7,7 +7,7 @@ Read CLAUDE.md. Non-negotiables:
    ~/system consumes this working tree's main as an editable dep — a broken
    main silently breaks the steering harness.
 3. **Update `docs/INDEX.md`** for prompts you implement / docs you add.
-4. Facts that bite: RAO sealing uses the local Remanence `rem-debug` CLI (no
+4. Facts that bite: REM-OBJECT sealing uses the local Remanence `rem-debug` CLI (no
    service); the key registry default is
    `/var/lib/replica/sutradhara-key-registry`; two QuadStor VTLs exist
    (rem=mainlib, d2tape=d2lib) — never assume one library/backend; policy

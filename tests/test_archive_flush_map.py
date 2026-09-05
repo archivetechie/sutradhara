@@ -77,7 +77,7 @@ from sutradhara.catalog.types import (
 )
 from sutradhara.rem_archive_cli import RemArchiveBuildResult
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 from tests.bundle_group_helpers import bundle_kwargs
 
 MAP_HEADER = "archive_path\tsource_path\tsha256\tsize\tingest_item_id"
@@ -196,7 +196,7 @@ def _install_class(
         session,
         artifactclass,
         ArtifactClassPolicy(
-            ruleset=f"rao.{artifactclass}.v1",
+            ruleset=f"rem-object.{artifactclass}.v1",
             placements=tuple(
                 PlacementPolicy(pool_id, role="primary" if index == 0 else "shelf")
                 for index, (pool_id, _) in enumerate(pools)
@@ -567,12 +567,12 @@ def test_repair_path_names_the_unmappable_member_instead_of_failing_opaquely(
 # --- the map-only rem route ------------------------------------------------
 
 
-def _fake_rao_build(
+def _fake_rem_object_build(
     kwargs: dict[str, Any],
 ) -> RemArchiveBuildResult:
-    """Materialise a RAO-plain-shaped object from the map the caller handed in.
+    """Materialise a REM-OBJECT-plain-shaped object from the map the caller handed in.
 
-    Member bytes land at ``first_chunk_lba * RAO_CHUNK_SIZE`` so the flush's
+    Member bytes land at ``first_chunk_lba * REM_OBJECT_CHUNK_SIZE`` so the flush's
     own ranged-read verification passes without a rem subprocess.
     """
     map_rows = [
@@ -583,7 +583,7 @@ def _fake_rao_build(
     files: list[dict[str, Any]] = []
     for index, (archive_path, source_path, sha256, size, _ingest) in enumerate(map_rows):
         first_lba = index + 1
-        start = first_lba * RAO_CHUNK_SIZE
+        start = first_lba * REM_OBJECT_CHUNK_SIZE
         data = Path(source_path).read_bytes()
         if len(payload) < start + len(data):
             payload.extend(b"\0" * (start + len(data) - len(payload)))
@@ -606,7 +606,7 @@ def _fake_rao_build(
     return RemArchiveBuildResult(
         artifact_path=output_path,
         stored_digest=hashlib.sha256(bytes(payload)).digest(),
-        stdout_report={"files": files, "chunk_size": RAO_CHUNK_SIZE},
+        stdout_report={"files": files, "chunk_size": REM_OBJECT_CHUNK_SIZE},
         manifest_path=None if manifest_path is None else Path(manifest_path),
     )
 
@@ -631,7 +631,7 @@ def test_group_flush_builds_by_map_through_rem_builder(
         recorded = dict(kwargs)
         recorded["map_bytes"] = Path(kwargs["map_path"]).read_bytes()
         calls.append(recorded)
-        return _fake_rao_build(kwargs)
+        return _fake_rem_object_build(kwargs)
 
     monkeypatch.setattr("sutradhara.archive_fanout.run_rem_archive_build", fake_build)
 
@@ -642,13 +642,13 @@ def test_group_flush_builds_by_map_through_rem_builder(
 
     backend = _WriteBackend()
     with session_scope(engine) as s:
-        # Two pools, one RAO and one legacy D2TAR_RAW: the RAO leg goes by map,
+        # Two pools, one REM-OBJECT and one legacy D2TAR_RAW: the REM-OBJECT leg goes by map,
         # the D2 leg stays map-blind (_build_d2_tar), per design §4.
         _install_class(
             s,
             "o-archive",
             pools=(
-                ("o-copy-1-pool", Representation.RAO_PLAIN_V1.value),
+                ("o-copy-1-pool", Representation.REM_OBJECT_V1.value),
                 ("d2-shelf-pool", Representation.D2TAR_RAW.value),
             ),
         )
@@ -669,7 +669,7 @@ def test_group_flush_builds_by_map_through_rem_builder(
         assert flushed.status == "sealed"
         map_digest = flushed.scan_summary["map_sha256"]
 
-    # Exactly one rem build: the RAO leg. The D2TAR_RAW leg never reaches rem.
+    # Exactly one rem build: the REM-OBJECT leg. The D2TAR_RAW leg never reaches rem.
     assert len(calls) == 1
     [call] = calls
     assert call["inputs"] is None
@@ -707,7 +707,7 @@ def test_map_route_argv_carries_map_source_root_slash_and_no_inputs_or_rules(
         map_texts.append(Path(cmd[cmd.index("--map") + 1]).read_text(encoding="utf-8"))
         out = Path(cmd[cmd.index("--out") + 1])
         manifest_out = Path(cmd[cmd.index("--manifest-out") + 1])
-        result = _fake_rao_build(
+        result = _fake_rem_object_build(
             {
                 "map_path": Path(cmd[cmd.index("--map") + 1]),
                 "output_path": out,
@@ -730,7 +730,7 @@ def test_map_route_argv_carries_map_source_root_slash_and_no_inputs_or_rules(
         _install_class(
             s,
             "o-archive",
-            pools=(("o-copy-1-pool", Representation.RAO_PLAIN_V1.value),),
+            pools=(("o-copy-1-pool", Representation.REM_OBJECT_V1.value),),
         )
         bundle_id = _enqueue(s, artifactclass="o-archive", source=source, member_path="only.bin").id
 
@@ -767,8 +767,8 @@ def test_rem_builder_refuses_the_retired_inputs_route(tmp_path: Path) -> None:
         builder.build(
             bundle=Bundle(id="bundle-x", **bundle_kwargs(seed="x"), status="open"),
             members=(),
-            representation=Representation.RAO_PLAIN_V1,
-            ruleset="rao.x.v1",
+            representation=Representation.REM_OBJECT_V1,
+            ruleset="rem-object.x.v1",
             key_epoch=None,
             work_dir=tmp_path,
         )
@@ -782,7 +782,7 @@ def test_same_representation_targets_get_separate_work_dirs(
     tmp_path: Path,
 ) -> None:
     """§8: two pool targets of the same representation used to collide on the
-    work-dir artifact filename (``{bundle}-{representation}.rao``), so the
+    work-dir artifact filename (``{bundle}-{representation}.rem-object``), so the
     second build overwrote the first target's artifact while its copy was
     still being verified. Each target must own a directory."""
     work_dirs: list[Path] = []
@@ -800,8 +800,8 @@ def test_same_representation_targets_get_separate_work_dirs(
             s,
             "o-archive",
             pools=(
-                ("rao-pool-a", Representation.RAO_PLAIN_V1.value),
-                ("rao-pool-b", Representation.RAO_PLAIN_V1.value),
+                ("rem-object-pool-a", Representation.REM_OBJECT_V1.value),
+                ("rem-object-pool-b", Representation.REM_OBJECT_V1.value),
             ),
         )
         bundle_id = _enqueue(s, artifactclass="o-archive", source=source, member_path="only.bin").id
@@ -818,8 +818,8 @@ def test_same_representation_targets_get_separate_work_dirs(
     assert len(work_dirs) == 2
     assert work_dirs[0] != work_dirs[1]
     assert {path.name for path in work_dirs} == {
-        "target-00-rao-pool-a",
-        "target-01-rao-pool-b",
+        "target-00-rem-object-pool-a",
+        "target-01-rem-object-pool-b",
     }
 
 
@@ -860,7 +860,7 @@ def _two_member_bundle(engine: Engine, tmp_path: Path) -> tuple[str, _WriteBacke
         _install_class(
             s,
             "o-archive",
-            pools=(("o-copy-1-pool", Representation.RAO_PLAIN_V1.value),),
+            pools=(("o-copy-1-pool", Representation.REM_OBJECT_V1.value),),
         )
         bundle = _enqueue(s, artifactclass="o-archive", source=a, member_path="a.bin")
         _enqueue(s, artifactclass="o-archive", source=b, member_path="nested/b.bin")
@@ -926,7 +926,7 @@ def test_writer_digest_failure_quarantines_by_archive_path(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
-    """The RAO writer's streamed-digest refusal names the ARCHIVE PATH, not a
+    """The REM-OBJECT writer's streamed-digest refusal names the ARCHIVE PATH, not a
     map line (remanence-format writer.rs). Guards a flush that only understands
     the line form and therefore lets a content mismatch propagate as an
     unidentified failure, poisoning the whole multi-class bundle."""
@@ -1004,7 +1004,7 @@ def test_rem_shaped_stderr_through_the_cli_wrapper_quarantines_the_named_member(
             # Really execute the fake rem: real exit code, real stderr bytes.
             return subprocess.run(cmd, capture_output=True, text=True, check=False)
         # The retry succeeds so the flush can finish and be asserted on.
-        result = _fake_rao_build(
+        result = _fake_rem_object_build(
             {
                 "map_path": Path(cmd[cmd.index("--map") + 1]),
                 "output_path": Path(cmd[cmd.index("--out") + 1]),

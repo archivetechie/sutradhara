@@ -64,7 +64,7 @@ from sutradhara.catalog.types import (
     content_hash,
 )
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 
 ARCHIVE_EPOCH = "archive-" + "a" * 32
 RECOVERY_EPOCH = "recovery-" + "b" * 32
@@ -163,19 +163,19 @@ class _MapArchiveBuilder:
         assert map_sha256 is not None
         self.calls.append((representation, map_path, source_root, map_sha256))
         by_path = _source_map_ingest_ids(map_path)
-        ext = ".aead" if representation is Representation.RAO_AEAD_V1 else ".rao"
+        ext = ".aead" if representation is Representation.REM_ENCRYPT_V1 else ".rem-object"
         artifact_path = work_dir / f"{bundle.id}-{representation.value}{ext}"
         size = 0
         payloads: list[tuple[MemberInput, bytes, int]] = []
         for index, member in enumerate(members):
             data = member.source_path.read_bytes()
             first_lba = index + 1
-            size = max(size, first_lba * RAO_CHUNK_SIZE + len(data))
+            size = max(size, first_lba * REM_OBJECT_CHUNK_SIZE + len(data))
             payloads.append((member, data, first_lba))
         object_bytes = bytearray(b"\0" * size)
         built: list[BuiltMember] = []
         for member, data, first_lba in payloads:
-            start = first_lba * RAO_CHUNK_SIZE
+            start = first_lba * REM_OBJECT_CHUNK_SIZE
             object_bytes[start : start + len(data)] = data
             ingest_item_id = by_path[member.member_path]
             if member.member_path == self.bad_ingest_path:
@@ -202,7 +202,7 @@ class _MapArchiveBuilder:
             manifest_path=None,
             recipient_epochs=(
                 (key_epoch or ARCHIVE_EPOCH, RECOVERY_EPOCH)
-                if representation is Representation.RAO_AEAD_V1
+                if representation is Representation.REM_ENCRYPT_V1
                 else ()
             ),
         )
@@ -217,7 +217,7 @@ class _MapArchiveBuilder:
         storage_metadata: Mapping[str, Any],
         work_dir: Path,
     ) -> bytes:
-        start = int(member.native_locator["first_chunk_lba"]) * RAO_CHUNK_SIZE
+        start = int(member.native_locator["first_chunk_lba"]) * REM_OBJECT_CHUNK_SIZE
         return backend.read_range(copy_locator, ByteRange(start, start + member.size_bytes))
 
 
@@ -528,7 +528,7 @@ def test_identity_mismatch_is_caught_before_any_physical_write(
     """P4 gate condition C3, closed.
 
     The old per-submission validator early-returned for representations
-    outside the RAO family, and basis-ordered fan-out sorts the D2 shelf pool
+    outside the REM-OBJECT family, and basis-ordered fan-out sorts the D2 shelf pool
     first — so an identity mismatch was caught only *after* the shelf write and
     left a media-only orphan. The identity gate is now catalog-grain and runs
     once, before any build and before any physical write, for every
@@ -612,7 +612,7 @@ def test_builder_that_echoes_a_wrong_ingest_item_id_is_caught_before_its_write(
     assert builder.calls
     assert rem_backend.writes == []
     # The D2 shelf pool sorts first in basis order and used to be written
-    # before the RAO-family mismatch surfaced. It is not written now.
+    # before the REM-OBJECT-family mismatch surfaced. It is not written now.
     assert d2_backend.writes == []
     with session_scope(engine) as session:
         assert list(session.scalars(select(Copy))) == []
@@ -809,12 +809,12 @@ def _install_policy(session: Session) -> tuple[int, int]:
             Pool(
                 id="working-pool",
                 backend_id=rem.id,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             ),
             Pool(
                 id="offsite-pool",
                 backend_id=rem.id,
-                representation=Representation.RAO_AEAD_V1.value,
+                representation=Representation.REM_ENCRYPT_V1.value,
             ),
             Pool(
                 id="d2-shelf-pool",
@@ -828,7 +828,7 @@ def _install_policy(session: Session) -> tuple[int, int]:
         session,
         "s-masters",
         ArtifactClassPolicy(
-            ruleset="rao.s.v1",
+            ruleset="rem-object.s.v1",
             placements=(
                 PlacementPolicy("working-pool", role="primary"),
                 PlacementPolicy("offsite-pool", role="offsite"),

@@ -83,7 +83,7 @@ class CacheEntry(Base):
             name="ck_cache_entry_state",
         ),
         CheckConstraint(
-            "representation IN ('raw-bytes', 'rao-aead-v1')",
+            "representation IN ('raw-bytes', 'rem-encrypt-v1')",
             name="ck_cache_entry_representation",
         ),
         Index("ix_cache_entry_bundle_key", "bundle_key"),

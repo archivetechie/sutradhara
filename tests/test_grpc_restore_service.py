@@ -78,7 +78,7 @@ from sutradhara.keys import KEY_DOMAIN_HDCACHE
 from sutradhara.keys.remanence import RemRecipientKeyCodec
 from sutradhara.rem_archive_cli import resolve_rem_bin
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliSealer
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE, RemObjectCliSealer
 from tests.bundle_group_helpers import bundle_kwargs
 from tests.key_helpers import registry_with_recovery
 
@@ -165,7 +165,7 @@ class _CacheIdentityProbe:
 
 
 class _CacheTestOpener:
-    """Test RAO opener preserving the private stored/plaintext boundary."""
+    """Test REM-OBJECT opener preserving the private stored/plaintext boundary."""
 
     prefix = b"sealed-aead-test\0"
 
@@ -179,7 +179,7 @@ class _CacheTestOpener:
         key_domain: str | None = None,
         work_dir: Path | str | None = None,
     ) -> Iterator[Path]:
-        assert representation is Representation.RAO_AEAD_V1
+        assert representation is Representation.REM_ENCRYPT_V1
         assert recipient_epochs
         assert key_domain == KEY_DOMAIN_HDCACHE
         root = Path(work_dir) if work_dir is not None else Path(source_path).parent
@@ -399,23 +399,25 @@ def test_open_restore_real_socket_streams_ordered_plaintext_with_bounded_memory(
     assert kinds[-2:] == ["file_end", "job_end"]
     assert set(kinds[4:-2]) == {"chunk"}
     assert digest.digest() == hashlib.sha256(payload).digest()
-    assert max_frame <= RAO_CHUNK_SIZE
-    assert rig.backend.max_chunk_seen <= RAO_CHUNK_SIZE
+    assert max_frame <= REM_OBJECT_CHUNK_SIZE
+    assert rig.backend.max_chunk_seen <= REM_OBJECT_CHUNK_SIZE
     assert rig.backend.whole_reads == 0
     assert peak - baseline < len(payload) // 2
 
 
-def test_open_restore_real_socket_streams_rao_aead_plaintext(rig: _Rig, socket_port: int) -> None:
+def test_open_restore_real_socket_streams_rem_encrypt_plaintext(
+    rig: _Rig, socket_port: int
+) -> None:
     payload = b"authenticated encrypted restore\n" * 20_000
     source = rig.root / "encrypted-source.bin"
     source.write_bytes(payload)
     registry = rig.service_config.cache_config.key_registry
     assert registry is not None
     epoch = registry.create_epoch()
-    stored = rig.root / "encrypted-stored.rao"
-    with RaoCliSealer(registry).seal(
+    stored = rig.root / "encrypted-stored.rem-object"
+    with RemObjectCliSealer(registry).seal(
         source,
-        Representation.RAO_AEAD_V1,
+        Representation.REM_ENCRYPT_V1,
         key_epoch=epoch,
     ) as sealed:
         shutil.copyfile(sealed.sealed_path, stored)
@@ -425,7 +427,7 @@ def test_open_restore_real_socket_streams_rao_aead_plaintext(rig: _Rig, socket_p
         "aead",
         payload,
         receiver="receiver",
-        representation=Representation.RAO_AEAD_V1,
+        representation=Representation.REM_ENCRYPT_V1,
         stored_path=stored,
         recipient_epochs=recipient_epochs,
         member_path=source.name,
@@ -1390,7 +1392,7 @@ def _seed_item(
         }
         if block_range is not None:
             locator_native["block_range"] = block_range
-        if representation is Representation.RAO_AEAD_V1:
+        if representation is Representation.REM_ENCRYPT_V1:
             locator_native["first_chunk_lba"] = 1
         session.add(
             AssetLocator(

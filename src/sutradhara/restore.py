@@ -283,7 +283,7 @@ def _copy_representation(copy: Copy) -> Representation:
 
 
 def _copy_recipient_epochs(copy: Copy, representation: Representation) -> tuple[str, ...] | None:
-    if representation is not Representation.RAO_AEAD_V1:
+    if representation is not Representation.REM_ENCRYPT_V1:
         return None
     value = copy.storage_metadata.get("recipient_epochs")
     if (

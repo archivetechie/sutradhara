@@ -39,8 +39,8 @@ Subpackages:
 | `catalog/` | SQLAlchemy models, enums, session helpers, and the single content-addressed funnel for recording copies (`copies.py`) and facts (`facts.py`). |
 | `jobs/` | Job engine (`engine.py`), worker (`worker.py`), counted leases (`leases.py`), retry policy (`config.py`), attempt log (`attempts.py`), handlers (`handlers/`), and the reconciler spine (`reconcilers/`). |
 | `backend/` | The storage port (`port.py`), the factory, and one adapter per backend kind. |
-| `sealing/` | `Sealer`/`Opener` ports and the RAO codec that shells out to the Remanence `rem` CLI. |
-| `keys/` | The local key registry for RAO-AEAD encryption epochs (`registry.py`), plus the subprocess adapter that delegates X-Wing key derivation and validation to Remanence's `rem` CLI (`remanence.py`). |
+| `sealing/` | `Sealer`/`Opener` ports and the REM-OBJECT codec that shells out to the Remanence `rem` CLI. |
+| `keys/` | The local key registry for REM-ENCRYPT recipient epochs (`registry.py`), plus the subprocess adapter that delegates X-Wing key derivation and validation to Remanence's `rem` CLI (`remanence.py`). |
 | `hdcache/` | The expendable HD cache disk tier: store layout, fills, placement, walker, lifecycle, repopulation, restore manager, alarms. |
 | `api/` | The FastAPI operator console API (`/api/...`), identity/capability parsing, the live operator-capability cache (`live_capabilities.py`), the durable receive-intent/idempotency store (`store.py`), the card-history projection (`receive_history.py`), and the read models the browser console consumes. |
 | `grpc/` | The mTLS gRPC server: streaming intake (`IntakeService`), the device relay (`DeviceService`), and agent-delivered restore streaming (`RestoreService`, `restore_service.py`); an in-memory live-progress registry for active uploads (`progress.py`); plus enrollment admin. |
@@ -491,7 +491,7 @@ Every write also carries a `caller_object_id`, an opaque per-invocation
 identity Remanence uses to detect duplicate or conflicting writes across
 retries. `replication.py` mints it as `<asset-hash-prefix>-<execution_id>`
 rather than reusing a fixed name — earlier code shared one
-`caller_object_id` (the sealed temp filename, always `sealed.rao`) across
+`caller_object_id` (the sealed temp filename, always `sealed.rem-object`) across
 every write of a given copy, so a legitimate re-write (self-heal
 re-encrypting a placement to a new key epoch, for instance) collided with
 Remanence's own conflict check and was wrongly refused.
@@ -500,15 +500,15 @@ Remanence's own conflict check and was wrongly refused.
 ## Sealing and keys
 
 A copy's on-backend form is its **representation**: `raw-bytes`
-(passthrough), `rao-plain-v1` (unencrypted REM-OBJECT), `rao-aead-v1`
-(encrypted REM-OBJECT), or `d2tar-raw` (legacy d2 tar, passthrough at
+(passthrough), `rem-object-v1` (unencrypted REM-OBJECT), `rem-encrypt-v1`
+(REM-ENCRYPT envelope), or `d2tar-raw` (legacy d2 tar, passthrough at
 seal). The `Sealer`/`Opener` ports in `sealing/port.py` convert between
-plaintext and stored form; `RaoCliSealer`/`RaoCliOpener` implement them by
+plaintext and stored form; `RemObjectCliSealer`/`RemObjectCliOpener` implement them by
 shelling out to the Remanence `rem` CLI (`rem archive build/extract`) as
 a stateless local codec — by explicit decision there is no sealing daemon
 or service. Plaintext REM-OBJECT builds are deterministic: fixed chunk size (262144),
 fixed timestamp and UUIDs derived from the plaintext digest for plaintext
-objects. Encrypted REM-OBJECT v2 uses fresh envelope randomness. `inspect_rao` is
+objects. Encrypted REM-OBJECT v2 uses fresh envelope randomness. `inspect_rem_object` is
 keyless and reports format version plus every `{epoch_id, label}` recipient.
 
 Encrypted copies record a **recipient epoch list** from the `KeyRegistry`
@@ -543,7 +543,7 @@ and never joins it — cache disks are not backends, cache entries are not
 copies, and no durability math ever counts them. `cache_disk` rows track
 enrollment and lifecycle (`active`, `absent`, `retiring`, `dead`);
 `cache_entry` rows (`filling`, `present`, `lost`) hold one representation
-per asset, `raw-bytes` or `rao-aead-v1` for private material.
+per asset, `raw-bytes` or `rem-encrypt-v1` for private material.
 
 Fills are jobs on the reconciler spine (domain `hdcache`), bounded by a
 live-job cap and priority-ordered below operator restores and above
@@ -617,9 +617,9 @@ Both converge on the same chain:
    grace, ranged extraction) is already live for the server-local path.
 3. **The verified, streaming read**: reading is chunked all the way
    through rather than buffered whole-object, where the representation
-   allows it — a native ranged read for `rao-plain-v1` (or the backend's
+   allows it — a native ranged read for `rem-object-v1` (or the backend's
    own range primitive), piped decryption via `rem archive extract-stream`
-   for `rao-aead-v1`. Every chunk passes a three-layer, incrementally
+   for `rem-encrypt-v1`. Every chunk passes a three-layer, incrementally
    computed fixity chain: stored/ciphertext bytes against
    `Copy.integrity_hash`, staging-transform reversal (only `zstd` is
    currently reversible), and final plaintext against

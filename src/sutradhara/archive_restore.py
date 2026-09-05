@@ -53,7 +53,7 @@ from sutradhara.restore import (
     atomic_write_verified_chunks,
 )
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 from sutradhara.staging import StagingError
 from sutradhara_receive.member_name import (
     MemberNameError,
@@ -73,9 +73,9 @@ _REM_STREAM_MOUNT_GRACE_SECONDS = float(
 _REM_STREAM_INACTIVITY_TIMEOUT_SECONDS = 120.0
 _REM_STREAM_EXIT_TIMEOUT_SECONDS = 10.0
 _REM_STREAM_STDERR_LIMIT_BYTES = 64 * 1024
-_RAO_HEADER_BYTES = 128
-_RAO_MAX_METADATA_FRAME_BYTES = 16 * 1024 * 1024
-_RAO_MAX_KEY_FRAME_BYTES = 4096
+_REM_OBJECT_HEADER_BYTES = 128
+_REM_OBJECT_MAX_METADATA_FRAME_BYTES = 16 * 1024 * 1024
+_REM_OBJECT_MAX_KEY_FRAME_BYTES = 4096
 
 
 class ArchiveRestoreError(Exception):
@@ -262,9 +262,11 @@ class RestorePlan:
                 with path.open("rb") as handle:
                     yield _file_chunks(handle)
             return
-        if Representation(member.locator.representation) is Representation.RAO_AEAD_V1:
+        if Representation(member.locator.representation) is Representation.REM_ENCRYPT_V1:
             if not isinstance(self._extractor, RemArchiveExtractor):
-                raise ArchiveRestoreError("encrypted restore requires a streaming RAO adapter")
+                raise ArchiveRestoreError(
+                    "encrypted restore requires a streaming REM-OBJECT adapter"
+                )
             with self._extractor.open_aead_member_stream(member) as chunks:
                 yield chunks
             return
@@ -355,7 +357,7 @@ class LocalArchiveExtractor:
 
 
 class RemArchiveExtractor(LocalArchiveExtractor):
-    """Extractor that delegates RAO bundle extraction to the rem CLI."""
+    """Extractor that delegates REM-OBJECT bundle extraction to the rem CLI."""
 
     def __init__(
         self,
@@ -397,8 +399,8 @@ class RemArchiveExtractor(LocalArchiveExtractor):
         if representation is Representation.D2TAR_RAW:
             _extract_d2_bundle_to_paths(locators, copy, backend, destinations)
             return
-        if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
-            _extract_rao_bundle_with_rem_to_paths(
+        if representation in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}:
+            _extract_rem_object_bundle_with_rem_to_paths(
                 backend=backend,
                 copy=copy,
                 locators=locators,
@@ -421,7 +423,7 @@ class RemArchiveExtractor(LocalArchiveExtractor):
         selected = _select_private_epoch(self._keys, member.copy.storage_metadata)
         with (
             self._keys.materialized_private_key(selected) as private_key,
-            _open_rao_aead_plaintext_stream(
+            _open_rem_encrypt_plaintext_stream(
                 backend=member.backend,
                 copy=member.copy,
                 locator=member.locator,
@@ -474,7 +476,7 @@ def read_member_to_path(
         )
         return size
 
-    if representation is Representation.RAO_PLAIN_V1:
+    if representation is Representation.REM_OBJECT_V1:
         start = member_byte_base(native_locator)
         _copy_backend_range_to_path(
             backend,
@@ -485,14 +487,14 @@ def read_member_to_path(
         )
         return size
 
-    if representation is Representation.RAO_AEAD_V1:
+    if representation is Representation.REM_ENCRYPT_V1:
         if rem_bin is None:
             copy_id = getattr(copy, "id", None)
             label = f"copy id={copy_id}" if copy_id is not None else "copy"
             raise ArchiveRestoreError(
-                f"{label} representation {representation.value!r} requires a RAO restore adapter"
+                f"{label} representation {representation.value!r} requires a REM-OBJECT restore adapter"
             )
-        _extract_rao_with_rem_to_path(
+        _extract_rem_object_with_rem_to_path(
             backend=backend,
             copy=copy,
             locator=asset_locator,
@@ -651,7 +653,7 @@ def _planned_member(
     buffered = (
         not trusted_extractor
         or (
-            representation is Representation.RAO_AEAD_V1
+            representation is Representation.REM_ENCRYPT_V1
             and not isinstance(extractor, RemArchiveExtractor)
         )
         or (
@@ -1310,7 +1312,7 @@ def _open_locator_range_chunks(member: PlannedMember) -> Iterator[Iterator[bytes
         start = int(raw_range[0])
     elif "offset" in native:
         start = _local_archive_member_start(member.backend, member.copy, member.locator)
-    elif representation is Representation.RAO_PLAIN_V1:
+    elif representation is Representation.REM_OBJECT_V1:
         start = member_byte_base(native)
     elif representation is Representation.RAW_BYTES and "block_range" in native:
         raw_range = native["block_range"]
@@ -1365,21 +1367,21 @@ def _open_backend_range_chunks(
         with backend.open_range_chunks(
             locator,
             byte_range,
-            chunk_bytes=RAO_CHUNK_SIZE,
+            chunk_bytes=REM_OBJECT_CHUNK_SIZE,
         ) as chunks:
             yield chunks
         return
     materialized = getattr(backend, "open_materialized_range_chunks", None)
     if callable(materialized):
-        with materialized(locator, byte_range, chunk_bytes=RAO_CHUNK_SIZE) as chunks:
+        with materialized(locator, byte_range, chunk_bytes=REM_OBJECT_CHUNK_SIZE) as chunks:
             yield chunks
         return
 
     @contextmanager
     def legacy_range_reader() -> Iterator[Iterator[bytes]]:
         def chunks() -> Iterator[bytes]:
-            for cursor in range(byte_range.start, byte_range.end, RAO_CHUNK_SIZE):
-                end = min(cursor + RAO_CHUNK_SIZE, byte_range.end)
+            for cursor in range(byte_range.start, byte_range.end, REM_OBJECT_CHUNK_SIZE):
+                end = min(cursor + REM_OBJECT_CHUNK_SIZE, byte_range.end)
                 yield backend.read_range(locator, ByteRange(cursor, end))
 
         yield chunks()
@@ -1389,7 +1391,7 @@ def _open_backend_range_chunks(
 
 
 @contextmanager
-def _open_rao_aead_plaintext_stream(
+def _open_rem_encrypt_plaintext_stream(
     *,
     backend: StorageBackend,
     copy: Copy,
@@ -1397,7 +1399,7 @@ def _open_rao_aead_plaintext_stream(
     rem_bin: str,
     private_key: Path,
 ) -> Iterator[Iterator[bytes]]:
-    """Pipe a complete encrypted RAO object through ``extract-stream``.
+    """Pipe a complete encrypted REM-OBJECT object through ``extract-stream``.
 
     Ciphertext is written on its own thread while the caller pulls plaintext
     from stdout.  Publication remains transactional in
@@ -1407,7 +1409,9 @@ def _open_rao_aead_plaintext_stream(
     """
 
     if not isinstance(backend, StreamingStorageBackend):
-        raise ArchiveRestoreError("RAO AEAD streaming restore requires a native streaming backend")
+        raise ArchiveRestoreError(
+            "REM-OBJECT AEAD streaming restore requires a native streaming backend"
+        )
     command = [rem_bin, "archive", "extract-stream", "--private-key", str(private_key)]
     native = dict(locator.native_locator)
     size = _size_bytes(native)
@@ -1577,11 +1581,11 @@ def _query_covering_stored_range(
     """Ask Rust for a member's covering stored range, degrading on absence."""
 
     temporary_directory = tempfile.TemporaryDirectory(prefix="sutradhara-rem-prefix-")
-    prefix_path = Path(temporary_directory.name) / "authenticated-prefix.rao"
+    prefix_path = Path(temporary_directory.name) / "authenticated-prefix.rem-object"
     object_id = str(copy.native_locator.get("object_id", copy.id))
     file_id = locator.member_path
     try:
-        prefix_len = _write_rao_authenticated_prefix(
+        prefix_len = _write_rem_encrypt_authenticated_prefix(
             backend,
             dict(copy.native_locator),
             prefix_path,
@@ -1652,25 +1656,25 @@ def _query_covering_stored_range(
         return None
 
 
-def _write_rao_authenticated_prefix(
+def _write_rem_encrypt_authenticated_prefix(
     backend: StorageBackend,
     locator: dict[str, Any],
     destination: Path,
 ) -> int:
-    """Copy only the bounded RAO header/key/metadata prefix for Rust to authenticate."""
+    """Copy only the bounded REM-OBJECT header/key/metadata prefix for Rust to authenticate."""
 
-    header_range = ByteRange(0, _RAO_HEADER_BYTES)
+    header_range = ByteRange(0, _REM_OBJECT_HEADER_BYTES)
     header = backend.read_range(locator, header_range)
-    if len(header) != _RAO_HEADER_BYTES:
-        raise ArchiveRestoreError("encrypted RAO object has a truncated scalar header")
+    if len(header) != _REM_OBJECT_HEADER_BYTES:
+        raise ArchiveRestoreError("encrypted REM-OBJECT object has a truncated scalar header")
     metadata_len = int.from_bytes(header[0x30:0x38], "big")
     key_frame_len = int.from_bytes(header[0x3C:0x40], "big") if header[6] == 2 else 0
-    if not 17 <= metadata_len <= _RAO_MAX_METADATA_FRAME_BYTES:
-        raise ArchiveRestoreError("encrypted RAO object has invalid metadata framing")
-    if key_frame_len > _RAO_MAX_KEY_FRAME_BYTES:
-        raise ArchiveRestoreError("encrypted RAO object has invalid key framing")
-    prefix_len = _RAO_HEADER_BYTES + key_frame_len + metadata_len
-    remainder_range = ByteRange(_RAO_HEADER_BYTES, prefix_len)
+    if not 17 <= metadata_len <= _REM_OBJECT_MAX_METADATA_FRAME_BYTES:
+        raise ArchiveRestoreError("encrypted REM-OBJECT object has invalid metadata framing")
+    if key_frame_len > _REM_OBJECT_MAX_KEY_FRAME_BYTES:
+        raise ArchiveRestoreError("encrypted REM-OBJECT object has invalid key framing")
+    prefix_len = _REM_OBJECT_HEADER_BYTES + key_frame_len + metadata_len
+    remainder_range = ByteRange(_REM_OBJECT_HEADER_BYTES, prefix_len)
     with destination.open("xb") as output:
         output.write(header)
         with _open_backend_range_chunks(backend, locator, remainder_range) as source_chunks:
@@ -1702,7 +1706,7 @@ def _iter_rem_plaintext(
                 break
             ready = selector.select(timeout=0.25)
             if ready:
-                chunk = process.stdout.read(RAO_CHUNK_SIZE)
+                chunk = process.stdout.read(REM_OBJECT_CHUNK_SIZE)
                 if not chunk:
                     break
                 last_activity[0] = time.monotonic()
@@ -1710,7 +1714,7 @@ def _iter_rem_plaintext(
                 continue
             if process.poll() is not None:
                 # A final select/read observes any bytes buffered before exit.
-                chunk = process.stdout.read(RAO_CHUNK_SIZE)
+                chunk = process.stdout.read(REM_OBJECT_CHUNK_SIZE)
                 if chunk:
                     last_activity[0] = time.monotonic()
                     yield chunk
@@ -1826,7 +1830,7 @@ def _decompress_zstd_chunks(chunks: Iterator[bytes]) -> Iterator[bytes]:
         with zstd.ZstdDecompressor().stream_reader(
             cast(BinaryIO, reader), closefd=False
         ) as decompressed:
-            while chunk := decompressed.read(RAO_CHUNK_SIZE):
+            while chunk := decompressed.read(REM_OBJECT_CHUNK_SIZE):
                 yield chunk
     except zstd.ZstdError as exc:
         raise StagingError("zstd decompression failed during restore") from exc
@@ -1857,7 +1861,7 @@ def _verify_logical_chunks(
 
 
 def _file_chunks(handle: Any) -> Iterator[bytes]:
-    while chunk := handle.read(RAO_CHUNK_SIZE):
+    while chunk := handle.read(REM_OBJECT_CHUNK_SIZE):
         yield chunk
 
 
@@ -1872,8 +1876,8 @@ def _copy_backend_range_to_path(
         raise ArchiveRestoreError(f"invalid backend byte range [{start}, {end})")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("wb") as handle:
-        for cursor in range(start, end, RAO_CHUNK_SIZE):
-            chunk_end = min(cursor + RAO_CHUNK_SIZE, end)
+        for cursor in range(start, end, REM_OBJECT_CHUNK_SIZE):
+            chunk_end = min(cursor + REM_OBJECT_CHUNK_SIZE, end)
             chunk = backend.read_range(locator, ByteRange(cursor, chunk_end))
             expected = chunk_end - cursor
             if len(chunk) != expected:
@@ -1900,7 +1904,7 @@ def _materialize_copy_to_path(
     destination.write_bytes(_read_whole(backend, copy))
 
 
-def _extract_rao_with_rem_to_path(
+def _extract_rem_object_with_rem_to_path(
     *,
     backend: StorageBackend,
     copy: Any,
@@ -1913,9 +1917,9 @@ def _extract_rao_with_rem_to_path(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="sutradhara-restore-", dir=work_dir) as raw:
         temp_dir = Path(raw)
-        object_path = temp_dir / "bundle.rao"
+        object_path = temp_dir / "bundle.rem-object"
         _materialize_copy_to_path(backend, copy, object_path)
-        _extract_rao_materialized_member_to_path(
+        _extract_rem_object_materialized_member_to_path(
             object_path=object_path,
             copy=copy,
             locator=locator,
@@ -1926,7 +1930,7 @@ def _extract_rao_with_rem_to_path(
         )
 
 
-def _extract_rao_bundle_with_rem_to_paths(
+def _extract_rem_object_bundle_with_rem_to_paths(
     *,
     backend: StorageBackend,
     copy: Copy,
@@ -1938,10 +1942,10 @@ def _extract_rao_bundle_with_rem_to_paths(
     if not locators:
         return
     with tempfile.TemporaryDirectory(prefix="sutradhara-bundle-restore-") as raw:
-        object_path = Path(raw) / "bundle.rao"
+        object_path = Path(raw) / "bundle.rem-object"
         _materialize_copy_to_path(backend, copy, object_path)
         for locator in locators:
-            _extract_rao_materialized_member_to_path(
+            _extract_rem_object_materialized_member_to_path(
                 object_path=object_path,
                 copy=copy,
                 locator=locator,
@@ -1952,7 +1956,7 @@ def _extract_rao_bundle_with_rem_to_paths(
             )
 
 
-def _extract_rao_materialized_member_to_path(
+def _extract_rem_object_materialized_member_to_path(
     *,
     object_path: Path,
     copy: Any,
@@ -1988,16 +1992,18 @@ def _extract_rao_materialized_member_to_path(
         format_plugin = _format_plugin(copy.storage_metadata)
         if format_plugin is not None:
             cmd.extend(["--format", format_plugin])
-        if representation is Representation.RAO_PLAIN_V1:
-            cmd.extend(["--chunk-size", str(RAO_CHUNK_SIZE)])
+        if representation is Representation.REM_OBJECT_V1:
+            cmd.extend(["--chunk-size", str(REM_OBJECT_CHUNK_SIZE)])
             _run_rem(cmd)
-        elif representation is Representation.RAO_AEAD_V1:
+        elif representation is Representation.REM_ENCRYPT_V1:
             selected = _select_private_epoch(keys, copy.storage_metadata)
             with keys.materialized_private_key(selected) as private_key:
                 cmd.extend(["--private-key", str(private_key)])
                 _run_rem(cmd)
         else:
-            raise ArchiveRestoreError(f"unsupported RAO representation {representation.value!r}")
+            raise ArchiveRestoreError(
+                f"unsupported REM-OBJECT representation {representation.value!r}"
+            )
         _copy_restored_member(dest_dir, member_path, destination)
 
 
@@ -2009,15 +2015,15 @@ def _member_path(locator: dict[str, Any]) -> str:
 
 
 def member_byte_base(locator: dict[str, Any] | Mapping[str, Any]) -> int:
-    """Return the object-relative byte offset where one RAO member begins."""
+    """Return the object-relative byte offset where one REM-OBJECT member begins."""
 
-    return _first_chunk_lba(locator) * RAO_CHUNK_SIZE
+    return _first_chunk_lba(locator) * REM_OBJECT_CHUNK_SIZE
 
 
 def _first_chunk_lba(locator: dict[str, Any] | Mapping[str, Any]) -> int:
     value = locator.get("first_chunk_lba")
     if value is None:
-        raise ArchiveRestoreError("RAO asset locator is missing first_chunk_lba")
+        raise ArchiveRestoreError("REM-OBJECT asset locator is missing first_chunk_lba")
     result = int(value)
     if result < 0:
         raise ArchiveRestoreError(f"invalid first_chunk_lba {value!r}")

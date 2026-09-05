@@ -26,9 +26,11 @@ from sutradhara.catalog.session import create_all, locator_key, make_engine, ses
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource
 from sutradhara.hdcache.models import CacheDisk, CacheEntry
 from sutradhara.hdcache.store import (
+    AEAD_REPRESENTATION,
     RAW_REPRESENTATION,
     ExpectedDiskIdentity,
     ObservedBlockIdentity,
+    entries_root,
     entry_path,
     tmp_root,
     write_disk_sentinel,
@@ -161,6 +163,43 @@ def test_walker_tripwire_and_identity_mismatch_are_non_destructive(
         assert read_only.destructive is False
         assert unknown.exists()
         assert events[-1].code == "disk-identity-mismatch"
+
+
+def test_walker_cleans_stale_file_for_lost_entry_without_tripping_unknown_limit(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    """A representation rename may invalidate a row before its old file is removed."""
+
+    secret = b"walker-secret"
+    mount = _mount_with_identity(tmp_path, secret=secret)
+    with session_scope(engine) as session:
+        disk = _disk(session, mount)
+        digest = _seed_archived_asset(session, data=b"stale encrypted cache entry")
+        entry = _entry(session, disk, digest, b"stale", state="lost", write_file=False)
+        stale_path = entries_root(mount) / digest.hex()[:2] / f"{digest.hex()}.legacy.epoch"
+        stale_path.parent.mkdir(parents=True, exist_ok=True)
+        stale_path.write_bytes(b"stale")
+        entry.relpath = str(stale_path.relative_to(entries_root(mount)))
+        entry.representation = AEAD_REPRESENTATION
+        entry.key_epoch = "hdcache-epoch"
+        session.flush([entry])
+
+        result = walk_disk(
+            session,
+            disk,
+            config=HdcacheWalkerConfig(
+                hmac_secret=secret,
+                identity_probe=FakeProbe(),
+                unknown_file_tripwire=0,
+                enqueue_repopulation=False,
+            ),
+        )
+
+        assert result.halted is False
+        assert result.unknown_files == 0
+        assert result.unknown_deleted == 1
+        assert not stale_path.exists()
 
 
 def test_rebuild_inserts_untrusted_rows_and_walker_promotes(

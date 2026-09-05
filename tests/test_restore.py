@@ -1,7 +1,7 @@
 """Tests for P2.1 whole-copy restore primitives.
 
 These tests exercise the asset-scoped restore boundary without depending on a
-live Remanence daemon or the RAO CLI. Stored bytes live in a populated
+live Remanence daemon or the REM-OBJECT CLI. Stored bytes live in a populated
 ``MemoryBackend`` instance, while a fake opener models representation reversal
 and encrypted key-epoch selection.
 """
@@ -67,7 +67,7 @@ class _FakeOpener:
             plaintext = temp_dir / "plain.bin"
             prefix, stored_key, payload = source.read_bytes().split(b":", 2)
             assert prefix.decode("ascii") == representation.value
-            if representation is Representation.RAO_AEAD_V1:
+            if representation is Representation.REM_ENCRYPT_V1:
                 assert recipient_epochs is not None
                 assert stored_key.decode("ascii") == recipient_epochs[0]
             plaintext.write_bytes(payload)
@@ -152,9 +152,9 @@ def _stored_bytes(
 
 def _metadata(representation: Representation, *, key_epoch: str | None = None) -> dict[str, object]:
     metadata: dict[str, object] = {"representation": representation.value}
-    if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
+    if representation in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}:
         metadata["chunk_size"] = 262144
-    if representation is Representation.RAO_AEAD_V1 and key_epoch is not None:
+    if representation is Representation.REM_ENCRYPT_V1 and key_epoch is not None:
         metadata["recipient_epochs"] = [key_epoch, "recovery-" + "2" * 32]
     return metadata
 
@@ -228,7 +228,7 @@ def _restore_to_destination(
 
 @pytest.mark.parametrize(
     "representation",
-    [Representation.RAW_BYTES, Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1],
+    [Representation.RAW_BYTES, Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1],
 )
 def test_restore_copy_round_trips_asset_per_representation(
     engine: Engine,
@@ -259,10 +259,10 @@ def test_restore_copy_round_trips_asset_per_representation(
 
     assert dest.read_bytes() == data
     assert result.sha256 == _sha(data)
-    if representation is Representation.RAO_AEAD_V1:
+    if representation is Representation.REM_ENCRYPT_V1:
         expected_recipients = (
             ("archive-" + "1" * 32, "recovery-" + "2" * 32)
-            if representation is Representation.RAO_AEAD_V1
+            if representation is Representation.REM_ENCRYPT_V1
             else None
         )
         assert opener.calls == [(representation, expected_recipients)]
@@ -317,12 +317,12 @@ def test_restore_fails_closed_for_stored_and_content_corruption(
     assert dest.read_bytes() == b"old"
 
     backend2 = MemoryBackend("mem")
-    wrong_stored = _stored_bytes(b"wrong", Representation.RAO_PLAIN_V1)
+    wrong_stored = _stored_bytes(b"wrong", Representation.REM_OBJECT_V1)
     copy_id2 = _add_copy(
         engine,
         backend2,
         data=b"expected",
-        representation=Representation.RAO_PLAIN_V1,
+        representation=Representation.REM_OBJECT_V1,
         stored_bytes=wrong_stored,
     )
     dest2 = tmp_path / "content-corrupt.bin"

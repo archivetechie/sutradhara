@@ -382,7 +382,7 @@ def _install_policy(session: Session, artifactclass: str) -> int:
         Pool(
             id=pool_id,
             backend_id=backend.id,
-            representation=Representation.RAO_PLAIN_V1.value,
+            representation=Representation.REM_OBJECT_V1.value,
         )
     )
     session.flush()

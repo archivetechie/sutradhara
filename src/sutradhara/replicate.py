@@ -18,7 +18,7 @@ from sutradhara.replication import (
 from sutradhara.replication import (
     self_heal as replication_self_heal,
 )
-from sutradhara.sealing.rao import RaoCliOpener, RaoCliSealer
+from sutradhara.sealing.rem_object import RemObjectCliOpener, RemObjectCliSealer
 
 
 def fan_out(
@@ -47,7 +47,7 @@ def fan_out(
         source_path,
         content_type,
         backends=backends,
-        sealer=RaoCliSealer(registry),
+        sealer=RemObjectCliSealer(registry),
         key_epoch=epoch.key_id,
     )
 
@@ -90,8 +90,8 @@ def self_heal(
         asset_hash,
         content_type,
         backends=backends,
-        opener=RaoCliOpener(registry),
-        sealer=RaoCliSealer(registry),
+        opener=RemObjectCliOpener(registry),
+        sealer=RemObjectCliSealer(registry),
         key_epoch=epoch.key_id,
         execution_id=repair_id,
     )
