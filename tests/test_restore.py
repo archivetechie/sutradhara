@@ -357,7 +357,10 @@ def test_restore_rejects_missing_bundle_and_bad_representation(
     bundle_hash = backend.add(bundle_bytes)
     with session_scope(engine) as s:
         backend_row = _add_backend_row(s)
-        bundle = Bundle(id="bundle-1", **bundle_kwargs(seed="o-archive"),)
+        bundle = Bundle(
+            id="bundle-1",
+            **bundle_kwargs(seed="o-archive"),
+        )
         s.add(bundle)
         s.flush()
         locator = {"hash_hex": bundle_hash.hex()}

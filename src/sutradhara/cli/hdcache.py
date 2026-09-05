@@ -308,7 +308,9 @@ def drill_status_cmd(disk_id: str | None, as_json: bool) -> None:
 
 @hdcache_group.command("walk")
 @click.argument("disk_id", required=False)
-@click.option("--read-only", is_flag=True, default=False, help="Do not delete or mark entries lost.")
+@click.option(
+    "--read-only", is_flag=True, default=False, help="Do not delete or mark entries lost."
+)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
 def hdcache_walk_cmd(disk_id: str | None, read_only: bool, as_json: bool) -> None:
     """Run the hdcache disk walker for one disk or all disks."""

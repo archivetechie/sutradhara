@@ -10,7 +10,7 @@ reads use `ReadSessionService.ReadObjectRange`; Catalog metadata is never used
 as a byte source.
 
 Sutradhara's object-level model: one logical asset = one Remanence object
-(content_sha256 == rem-tar manifest_sha256, per spec-v0.1.md §4.1 and
+(content_sha256 == rem-tar manifest_sha256, per the architecture overview and
 remanence/spec-v0.4.md §8.6.5). File-level (per-pax-entry) addressing
 lands in a later slice; for day-1 every copy is whole-object.
 """
@@ -505,10 +505,12 @@ class RemanenceBackend:
         *,
         library_identity: bytes | str | None = None,
     ) -> RemanenceBackend:
-        """Construct a live adapter targeting a Remanence daemon Catalog.
+        """Construct a live adapter targeting a local Remanence daemon.
 
         Prefer `from_grpc(name, endpoint)`. `from_grpc(endpoint)` is accepted for
-        callers that do not have an operator-visible backend name at hand.
+        callers that do not have an operator-visible backend name at hand. Only
+        Unix-domain sockets are accepted until this adapter has an mTLS client
+        credential path for the daemon's TCP listener.
         """
         if endpoint is None:
             endpoint = name
@@ -872,7 +874,9 @@ class RemanenceBackend:
             drive_element_address=int(session.drive_element_address),
         )
 
-    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> RemanenceWriteResult:
+    def write_object_to_pool(
+        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+    ) -> RemanenceWriteResult:
         """Write one local file through the checkpoint batch funnel.
 
         Existing callers retain the synchronous batch-of-one contract: this
@@ -1340,14 +1344,12 @@ class RemanenceReadSession:
                 )
             return obj.content[byte_range.start : byte_range.end]
 
-        assert self._session_id is not None
-        assert self._drive_element_address is not None
-        assert self._object_id is not None
+        session_id, drive_element_address, object_id = self._require_live_state()
         try:
             stream = self._client.ReadObjectRange(
                 layer5_pb2.ReadObjectRangeRequest(
-                    session_id=self._session_id,
-                    object_id=self._object_id,
+                    session_id=session_id,
+                    object_id=object_id,
                     start_byte=byte_range.start,
                     end_byte=byte_range.end,
                 )
@@ -1357,8 +1359,8 @@ class RemanenceReadSession:
             raise _read_object_range_error(
                 self._backend._endpoint,
                 e,
-                session_id=self._session_id,
-                drive_element_address=self._drive_element_address,
+                session_id=session_id,
+                drive_element_address=drive_element_address,
             ) from e
 
     @contextmanager
@@ -1378,14 +1380,12 @@ class RemanenceReadSession:
             yield self._fixture_range_chunks(byte_range, chunk_bytes=chunk_bytes)
             return
 
-        assert self._session_id is not None
-        assert self._drive_element_address is not None
-        assert self._object_id is not None
+        session_id, drive_element_address, object_id = self._require_live_state()
         try:
             call = self._client.ReadObjectRange(
                 layer5_pb2.ReadObjectRangeRequest(
-                    session_id=self._session_id,
-                    object_id=self._object_id,
+                    session_id=session_id,
+                    object_id=object_id,
                     start_byte=byte_range.start,
                     end_byte=byte_range.end,
                 )
@@ -1394,8 +1394,8 @@ class RemanenceReadSession:
             raise _read_object_range_error(
                 self._backend._endpoint,
                 e,
-                session_id=self._session_id,
-                drive_element_address=self._drive_element_address,
+                session_id=session_id,
+                drive_element_address=drive_element_address,
             ) from e
         try:
             yield self._grpc_range_chunks(call)
@@ -1429,8 +1429,7 @@ class RemanenceReadSession:
             position = next_position
 
     def _grpc_range_chunks(self, call: _ReadRangeCall) -> Iterator[bytes]:
-        assert self._session_id is not None
-        assert self._drive_element_address is not None
+        session_id, drive_element_address, _object_id = self._require_live_state()
         try:
             for chunk in call:
                 yield chunk.data
@@ -1438,9 +1437,19 @@ class RemanenceReadSession:
             raise _read_object_range_error(
                 self._backend._endpoint,
                 e,
-                session_id=self._session_id,
-                drive_element_address=self._drive_element_address,
+                session_id=session_id,
+                drive_element_address=drive_element_address,
             ) from e
+
+    def _require_live_state(self) -> tuple[bytes, int, bytes]:
+        """Return complete live-session state or fail without relying on assertions."""
+
+        session_id = self._session_id
+        drive_element_address = self._drive_element_address
+        object_id = self._object_id
+        if session_id is None or drive_element_address is None or object_id is None:
+            raise BackendUnavailableError("Remanence live read session state is incomplete")
+        return session_id, drive_element_address, object_id
 
     def close(self) -> None:
         if self._closed:
@@ -1772,10 +1781,11 @@ def _timestamp_text(message: Any, field: str) -> str:
 
 
 def _grpc_target(endpoint: str) -> str:
-    if endpoint.startswith("http://"):
-        return endpoint.removeprefix("http://")
-    if endpoint.startswith("https://"):
-        return endpoint.removeprefix("https://")
+    if not endpoint.startswith("unix:"):
+        raise ValueError(
+            "Remanence daemon endpoints must use unix: sockets; "
+            "TCP requires mTLS, which this adapter does not configure"
+        )
     return endpoint
 
 

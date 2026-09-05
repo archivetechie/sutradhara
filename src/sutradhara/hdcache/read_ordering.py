@@ -268,7 +268,8 @@ def _predict_tape_items(
             tape_uuid = bytes.fromhex(tape_uuid_hex)
             if len(tape_uuid) != 16:
                 continue
-            assert item.id is not None
+            if item.id is None:
+                raise RuntimeError("persisted restore item has no id")
             predictions.append(
                 _TapePrediction(
                     item=item,
@@ -326,7 +327,8 @@ def _plan_volume_initial(
         for prediction in predictions:
             span = planner.get_copy_read_span(prediction.locator)
             item_id = prediction.item.id
-            assert item_id is not None
+            if item_id is None:
+                raise RuntimeError("persisted restore item has no id")
             if span is None:
                 tail_item_ids.append(item_id)
                 continue
@@ -840,7 +842,8 @@ def _maybe_post_mount_replan(
         for prediction in predictions:
             item_span = planner.get_copy_read_span(prediction.locator)
             item_id = prediction.item.id
-            assert item_id is not None
+            if item_id is None:
+                raise RuntimeError("persisted restore item has no id")
             if item_span is None or item_span[1] <= item_span[0]:
                 tail_item_ids.append(item_id)
                 continue

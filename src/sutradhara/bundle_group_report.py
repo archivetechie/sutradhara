@@ -435,9 +435,9 @@ def _near_miss_cohorts(members: list[ArtifactClassPolicyRecord]) -> tuple[NearMi
     """
     cohorts: dict[tuple[int, int], list[str]] = {}
     for record in members:
-        cohorts.setdefault(
-            (record.target_bytes, record.max_age_seconds), []
-        ).append(record.artifactclass)
+        cohorts.setdefault((record.target_bytes, record.max_age_seconds), []).append(
+            record.artifactclass
+        )
     return tuple(
         NearMissCohort(
             target_bytes=target_bytes,
@@ -596,26 +596,24 @@ def _warnings(
     # name a class whose target was never counted, so the divergence is stated
     # rather than left for the reader to infer.
     live_classes = {record.artifactclass for record in members}
-    stale = sorted(
-        record.artifactclass for record in members if record.bundle_group != fingerprint
-    )
+    stale = sorted(record.artifactclass for record in members if record.bundle_group != fingerprint)
     counted_only = sorted(set(thresholds.declared) - live_classes)
     if stale or counted_only:
-        detail: list[str] = []
+        projection_detail: list[str] = []
         if stale:
-            detail.append(
+            projection_detail.append(
                 f"class(es) {', '.join(stale)} carry a bundle_group projection that "
                 "disagrees with their live-derived fingerprint"
             )
         if counted_only:
-            detail.append(
+            projection_detail.append(
                 f"class(es) {', '.join(counted_only)} project onto this fingerprint but "
                 "no longer derive it live, and are still counted in its thresholds"
             )
         warnings.append(
             GroupWarning(
                 WARNING_STALE_PROJECTION,
-                "; ".join(detail)
+                "; ".join(projection_detail)
                 + ". A fingerprint-input writer was missed. Member classes and near-miss "
                 "cohorts above are live-derived while the effective thresholds are the "
                 "stored declared set the accumulator uses at open, so the two can name "
@@ -683,9 +681,7 @@ def render_policy_apply_report(report: PolicyApplyReport) -> str:
             f"(derived={counts.get(BASIS_SOURCE_DERIVED, 0)} "
             f"backfilled={counts.get(BASIS_SOURCE_BACKFILLED, 0)})"
         )
-        lines.append(
-            f"    open           {', '.join(orphan.open_bundle_ids) or '(none)'}"
-        )
+        lines.append(f"    open           {', '.join(orphan.open_bundle_ids) or '(none)'}")
         for warning in orphan.warnings:
             lines.append(f"    warning        [{warning.kind}] {warning.message}")
     return "\n".join(lines)

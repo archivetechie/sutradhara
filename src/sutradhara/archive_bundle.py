@@ -17,9 +17,10 @@ import os
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.orm import Session
 
@@ -537,10 +538,13 @@ def claim_bundle_for_flush(
     """
     token = worker_id or default_worker_id()
     stamp = now or dt.datetime.now(dt.UTC)
-    result = session.execute(
-        update(Bundle)
-        .where(Bundle.id == bundle.id, Bundle.status == "open")
-        .values(status="flushing", claimed_by=token, flushed_at=stamp)
+    result = cast(
+        CursorResult[Any],
+        session.execute(
+            update(Bundle)
+            .where(Bundle.id == bundle.id, Bundle.status == "open")
+            .values(status="flushing", claimed_by=token, flushed_at=stamp)
+        ),
     )
     if result.rowcount != 1:
         session.expire(bundle, ["status", "claimed_by", "flushed_at"])
@@ -565,14 +569,17 @@ def close_bundle(session: Session, bundle: Bundle, *, claim_token: str) -> Bundl
     evidence of who sealed it, and the reaper only ever looks at ``flushing``.
     """
     sealed_at = dt.datetime.now(dt.UTC)
-    result = session.execute(
-        update(Bundle)
-        .where(
-            Bundle.id == bundle.id,
-            Bundle.status == "flushing",
-            Bundle.claimed_by == claim_token,
-        )
-        .values(status="sealed", sealed_at=sealed_at)
+    result = cast(
+        CursorResult[Any],
+        session.execute(
+            update(Bundle)
+            .where(
+                Bundle.id == bundle.id,
+                Bundle.status == "flushing",
+                Bundle.claimed_by == claim_token,
+            )
+            .values(status="sealed", sealed_at=sealed_at)
+        ),
     )
     if result.rowcount != 1:
         session.expire(bundle, ["status", "claimed_by", "sealed_at"])
@@ -702,10 +709,7 @@ def _resolve_member_name(
         ).one_or_none()
         if row is None:
             return candidate, None, first_occupant
-        if (
-            row.artifactclass == artifactclass
-            and row.logical_asset_hash == logical_asset_hash
-        ):
+        if row.artifactclass == artifactclass and row.logical_asset_hash == logical_asset_hash:
             return candidate, row, first_occupant
         if first_occupant is None:
             first_occupant = row
@@ -1014,9 +1018,7 @@ def bundle_artifactclasses(session: Session, bundle: Bundle) -> list[str]:
     classes = sorted(
         set(
             session.scalars(
-                select(BundleMember.artifactclass).where(
-                    BundleMember.bundle_id == bundle.id
-                )
+                select(BundleMember.artifactclass).where(BundleMember.bundle_id == bundle.id)
             )
         )
     )

@@ -83,9 +83,7 @@ def set_pool_representation(
     member_classes = sorted(
         set(
             session.scalars(
-                select(ArtifactClassPool.artifactclass).where(
-                    ArtifactClassPool.pool_id == pool_id
-                )
+                select(ArtifactClassPool.artifactclass).where(ArtifactClassPool.pool_id == pool_id)
             )
         )
     )
@@ -113,14 +111,12 @@ def set_pool_write_fence(
         if violations and not force:
             raise PoolWriteFenceWouldBreakDurability(
                 f"pool {pool_id!r} cannot be write-fenced; active artifactclass floor "
-                "would be unsatisfied: "
-                + "; ".join(violations)
+                "would be unsatisfied: " + "; ".join(violations)
             )
         if violations:
             message = (
                 f"FORCED write fence for pool {pool_id!r} leaves durability floor "
-                "unsatisfied: "
-                + "; ".join(violations)
+                "unsatisfied: " + "; ".join(violations)
             )
             LOGGER.error(message, extra={"pool_id": pool_id, "violations": violations})
             _record_forced_write_fence_alarm(session, pool_id, message)

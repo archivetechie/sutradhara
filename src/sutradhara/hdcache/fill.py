@@ -902,7 +902,9 @@ def _finalize_filling_entry(
     disk = session.get(CacheDisk, reservation.disk.disk_id)
     if disk is None:
         _delete_written_entry(target, reservation, config=config)
-        raise HdcacheFillBlocked("missing-disk", f"cache disk {reservation.disk.disk_id!r} is missing")
+        raise HdcacheFillBlocked(
+            "missing-disk", f"cache disk {reservation.disk.disk_id!r} is missing"
+        )
     session.refresh(disk)
     if (
         entry.state != "filling"
@@ -911,7 +913,9 @@ def _finalize_filling_entry(
         or entry.key_epoch != reservation.key_epoch
     ):
         _delete_written_entry(target, reservation, config=config)
-        raise HdcacheFillError(f"cache fill reservation changed before finalize for {target.sha_hex}")
+        raise HdcacheFillError(
+            f"cache fill reservation changed before finalize for {target.sha_hex}"
+        )
 
     if current_policy_sha256 != reservation.policy_sha256:
         _delete_written_entry(target, reservation, config=config)
@@ -992,7 +996,11 @@ def _delete_written_entry(
 
 
 def _expected_representation(session: Session, content_sha256: bytes) -> str:
-    return AEAD_REPRESENTATION if effective_privacy_level(session, content_sha256) != "none" else RAW_REPRESENTATION
+    return (
+        AEAD_REPRESENTATION
+        if effective_privacy_level(session, content_sha256) != "none"
+        else RAW_REPRESENTATION
+    )
 
 
 def _artifactclass_policy_sha256(session: Session, artifactclass: str) -> str | None:

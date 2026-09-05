@@ -266,9 +266,7 @@ def _source(tmp_path: Path, name: str, size: int = 64) -> Path:
 # --------------------------------------------------------------------------
 
 
-def test_sweeper_flushes_an_accumulator_that_is_due_by_size(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_sweeper_flushes_an_accumulator_that_is_due_by_size(engine: Engine, tmp_path: Path) -> None:
     """Guards: the size arm firing only as an incidental side effect of an
     enqueue. Nothing appends after the accumulator crosses its target, so
     without a sweeper the bundle sits open until the next member arrives —
@@ -383,9 +381,7 @@ def test_due_scan_covers_open_funnel_bundles_not_only_accumulators(
 # --------------------------------------------------------------------------
 
 
-def test_full_group_move_drains_the_orphaned_accumulator(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_full_group_move_drains_the_orphaned_accumulator(engine: Engine, tmp_path: Path) -> None:
     """Guards: an accumulator whose only class moved to a new pool set sitting
     open until its age arm happens to fire. Nothing will ever be appended to
     it again, so the drain rule seals it now."""
@@ -414,9 +410,7 @@ def test_full_group_move_drains_the_orphaned_accumulator(
         assert session.get(Bundle, bundle_id).status == "sealed"
 
 
-def test_partial_group_move_does_not_drain_the_accumulator(
-    engine: Engine, tmp_path: Path
-) -> None:
+def test_partial_group_move_does_not_drain_the_accumulator(engine: Engine, tmp_path: Path) -> None:
     """Guards: reading "a class left the group" as "the group is dead".
 
     Two classes share a group. One leaves. The fingerprint is still the other
@@ -1047,9 +1041,7 @@ def test_a_reaped_drain_flush_is_still_reachable_without_an_age_arm(
 
         # A drain flush that died after claiming: `flush_bundle` mints
         # `archive_id` right after the claim.
-        claim_bundle_for_flush(
-            session, bundle, worker_id=f"{socket.gethostname()}:{_dead_pid()}"
-        )
+        claim_bundle_for_flush(session, bundle, worker_id=f"{socket.gethostname()}:{_dead_pid()}")
         bundle.archive_id = f"archive-{bundle_id}"
         session.flush()
         assert reap_stuck_flushing(session) == [bundle_id]
@@ -1105,7 +1097,9 @@ def test_reaped_then_returning_flusher_fails_the_close_cas_loudly(
             source=_source(tmp_path, "a.tif"),
             member_path="a.tif",
         )
-        token = claim_bundle_for_flush(session, bundle, worker_id=f"{socket.gethostname()}:{_dead_pid()}")
+        token = claim_bundle_for_flush(
+            session, bundle, worker_id=f"{socket.gethostname()}:{_dead_pid()}"
+        )
         assert reap_stuck_flushing(session) == [bundle.id]
 
         with pytest.raises(BundleClaimLost, match="lost its flush claim"):

@@ -256,7 +256,9 @@ def test_policy_sha_change_between_reservation_and_finalize_refills_under_new_po
         )
 
         entry = session.get(CacheEntry, target.content_sha256)
-        raw_path = entry_path(tmp_path / "d001", target.content_sha256, representation=RAW_REPRESENTATION)
+        raw_path = entry_path(
+            tmp_path / "d001", target.content_sha256, representation=RAW_REPRESENTATION
+        )
         assert raised is True
         assert result.representation == AEAD_REPRESENTATION
         assert entry.representation == AEAD_REPRESENTATION
@@ -525,15 +527,18 @@ def test_hdcache_convergence_marks_privacy_raise_and_retired_epoch_lost(
         assert raw_entry.representation == AEAD_REPRESENTATION
         assert raw_entry.key_epoch is not None
         assert raw_entry.key_epoch.startswith("hdcache-")
-        assert raw_entry.stored_digest == hashlib.sha256(b"sealed:" + raw_source.read_bytes()).digest()
+        assert (
+            raw_entry.stored_digest == hashlib.sha256(b"sealed:" + raw_source.read_bytes()).digest()
+        )
         assert private_entry.state == "present"
         assert private_entry.representation == AEAD_REPRESENTATION
         assert private_entry.key_epoch is not None
         assert private_entry.key_epoch.startswith("hdcache-")
         assert private_entry.key_epoch != retired_epoch
-        assert private_entry.stored_digest == hashlib.sha256(
-            b"sealed:" + private_source.read_bytes()
-        ).digest()
+        assert (
+            private_entry.stored_digest
+            == hashlib.sha256(b"sealed:" + private_source.read_bytes()).digest()
+        )
 
 
 @pytest.mark.parametrize(
@@ -623,7 +628,9 @@ def test_hung_lost_mark_delete_returns_within_deadline_and_preserves_accounting(
             disk_id="d-timeout",
             artifactclass="private-timeout",
         )
-        path = entry_path(tmp_path / "d-timeout", target.content_sha256, representation=RAW_REPRESENTATION)
+        path = entry_path(
+            tmp_path / "d-timeout", target.content_sha256, representation=RAW_REPRESENTATION
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
@@ -676,7 +683,9 @@ def test_present_entry_on_absent_disk_is_not_lost_or_replaced(
     data = b"absent cache bytes"
     with session_scope(engine) as session:
         target = _seed_archived_asset(session, data=data)
-        entry = _seed_present_cache_entry(session, tmp_path / "d001", target.content_sha256, len(data))
+        entry = _seed_present_cache_entry(
+            session, tmp_path / "d001", target.content_sha256, len(data)
+        )
         disk = session.get(CacheDisk, "d001")
         disk.state = "absent"
         session.flush([disk])
@@ -1018,9 +1027,10 @@ def _seed_archived_asset(
             )
         )
     else:
-        session.get(ArtifactClassPolicyRecord, artifactclass).hdcache_config = (
-            hdcache_config or {"enabled": True, "privacy_level": "none"}
-        )
+        session.get(ArtifactClassPolicyRecord, artifactclass).hdcache_config = hdcache_config or {
+            "enabled": True,
+            "privacy_level": "none",
+        }
     if (
         session.scalar(
             select(ArtifactClassPool).where(

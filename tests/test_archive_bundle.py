@@ -77,11 +77,7 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
                 representation=Representation.RAO_PLAIN_V1.value,
             )
         )
-        s.add(
-            ArtifactClassPool(
-                artifactclass="o-archive", pool_id="archive-pool", active=True
-            )
-        )
+        s.add(ArtifactClassPool(artifactclass="o-archive", pool_id="archive-pool", active=True))
         s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=6))
         s.add(policy)
         s.flush()
@@ -216,11 +212,7 @@ def test_enqueue_artifact_escapes_default_member_path_from_raw_filename(
                 representation=Representation.RAO_PLAIN_V1.value,
             )
         )
-        s.add(
-            ArtifactClassPool(
-                artifactclass="o-archive", pool_id="archive-pool", active=True
-            )
-        )
+        s.add(ArtifactClassPool(artifactclass="o-archive", pool_id="archive-pool", active=True))
         s.add_all([policy, LogicalAsset(content_sha256=asset_hash, size_bytes=7)])
         s.flush()
 

@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import tempfile
 from collections.abc import Iterator
 from concurrent import futures
 from contextlib import contextmanager
@@ -15,6 +16,13 @@ from typing import Any
 import grpc
 import pytest
 from click.testing import CliRunner
+
+pytest.importorskip(
+    "pfr_core",
+    reason="optional format-anatomy package is not installed",
+    exc_type=ImportError,
+)
+
 from pfr_core import PFRSidecar
 from pfr_core.cut import CutRefusal
 from pfr_core.failure import ReasonId, ScrapeFailure
@@ -159,12 +167,15 @@ def _serve_remanence(
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
     layer5_pb2_grpc.add_ReadSessionServiceServicer_to_server(read, server)  # type: ignore[no-untyped-call]
     layer5_pb2_grpc.add_CatalogServicer_to_server(catalog, server)  # type: ignore[no-untyped-call]
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    try:
-        yield f"127.0.0.1:{port}"
-    finally:
-        server.stop(grace=None)
+    with tempfile.TemporaryDirectory(prefix="sutradhara-pfr-grpc-") as root:
+        endpoint = f"unix:{Path(root) / 'server.sock'}"
+        if server.add_insecure_port(endpoint) != 1:
+            raise RuntimeError(f"failed to bind test gRPC server at {endpoint}")
+        server.start()
+        try:
+            yield endpoint
+        finally:
+            server.stop(grace=None)
 
 
 class _CutResult:
@@ -360,8 +371,9 @@ def test_remanence_read_range_maps_grpc_codes_to_typed_errors() -> None:
         catalog = _Catalog(object_id=object_id, member_size=1)
         with _serve_remanence(read, catalog) as endpoint:
             backend = RemanenceBackend.from_grpc("primary-tape", endpoint)
-            with backend.open_read_session(_rem_locator(object_id)) as session, pytest.raises(
-                expected
+            with (
+                backend.open_read_session(_rem_locator(object_id)) as session,
+                pytest.raises(expected),
             ):
                 session.read_range(ByteRange(0, 1))
 
@@ -748,7 +760,9 @@ def _failure(
         plugin=plugin,
         stage=stage,
         reason_id=reason,
-        exception_class="MXFParseError" if reason is ReasonId.EXCEPTION and plugin == "mxf" else None,
+        exception_class="MXFParseError"
+        if reason is ReasonId.EXCEPTION and plugin == "mxf"
+        else None,
         source_identity={"kind": "test"},
         message=f"{reason.value} message",
     )

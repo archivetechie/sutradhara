@@ -888,7 +888,8 @@ def _check_segment(
         raise JournalError("footer is missing")
     _validate_footer(footer)
     footer_cursors = footer["cursors"]
-    assert isinstance(footer_cursors, dict)
+    if not isinstance(footer_cursors, dict):
+        raise JournalError("footer cursors must be an object")
     expected_footer = {
         "segment_start_sequence": segment_start,
         "entry_count": entry_count,
@@ -959,7 +960,8 @@ def _checkpoint_ahead_issue(engine: Engine, state: JournalState) -> str | None:
 def _state_from_footer(footer: dict[str, object], path: Path) -> JournalState:
     _validate_footer(footer)
     cursors = footer["cursors"]
-    assert isinstance(cursors, dict)
+    if not isinstance(cursors, dict):
+        raise JournalError("footer cursors must be an object")
     published_at = footer.get("published_at")
     if not isinstance(published_at, str):
         raise JournalError("footer published_at is missing")
@@ -968,7 +970,8 @@ def _state_from_footer(footer: dict[str, object], path: Path) -> JournalState:
     except ValueError as exc:
         raise JournalError(f"footer published_at is invalid: {published_at!r}") from exc
     head = footer["head_hash"]
-    assert isinstance(head, str)
+    if not isinstance(head, str):
+        raise JournalError("footer head_hash must be a string")
     return JournalState(
         global_sequence=_integer(footer["global_sequence"], "global_sequence"),
         head_hash=head,
@@ -1091,7 +1094,8 @@ def _journal_dir(engine: Engine, configured: Path | str | None) -> Path:
         return Path(raw).expanduser().resolve(strict=False)
     database = engine.url.database
     if engine.url.drivername.startswith("sqlite") and database not in {None, "", ":memory:"}:
-        assert isinstance(database, str)
+        if not isinstance(database, str):
+            raise JournalError("file-backed SQLite journal requires a string database path")
         db_path = Path(database).expanduser()
         if not db_path.is_absolute():
             db_path = Path.cwd() / db_path

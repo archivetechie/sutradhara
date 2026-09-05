@@ -82,7 +82,9 @@ class _ArchiveBackend:
         self.objects: dict[str, bytes] = {}
         self._counter = 0
 
-    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
+    def write_object_to_pool(
+        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+    ) -> CopyRecord:
         data = Path(source).read_bytes()
         self._counter += 1
         object_id = f"{self.name}-{self._counter}"

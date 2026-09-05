@@ -92,7 +92,9 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
 
     builder = make_archive_builder(rem_bin=rem_bin)
     errors: list[str] = []
-    for source in select_source_candidates(ctx.session, BundleTarget(bundle.id), purpose="self_heal"):
+    for source in select_source_candidates(
+        ctx.session, BundleTarget(bundle.id), purpose="self_heal"
+    ):
         if source.health != CopyHealth.OK:
             errors.append(f"copy id={source.id}: health={source.health.value}")
             continue
@@ -102,7 +104,9 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
             continue
         touch_copy_tape(ctx, source)
         try:
-            with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-repair-{bundle.id}-") as raw:
+            with tempfile.TemporaryDirectory(
+                prefix=f"sutradhara-bundle-repair-{bundle.id}-"
+            ) as raw:
                 temp_root = Path(raw)
                 member_sources = _extract_member_sources(
                     ctx=ctx,
@@ -325,8 +329,7 @@ def _extract_member_sources(
         actual = hashlib.sha256(dest.read_bytes()).digest()
         if actual != member.file_sha256:
             raise _SourceDigestMismatch(
-                f"member {member.member_path!r} digest {actual.hex()} != "
-                f"{member.file_sha256.hex()}"
+                f"member {member.member_path!r} digest {actual.hex()} != {member.file_sha256.hex()}"
             )
         member_sources.append(
             MemberInput(

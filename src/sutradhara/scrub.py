@@ -1,7 +1,7 @@
 """Reconciliation scrub — the load-bearing demo of the rebuildable index.
 
 The scrub re-enumerates a backend and reconciles its catalog representation
-against what the backend actually holds. See docs/spec-v0.1.md §7
+against what the backend actually holds. See docs/architecture-overview.md
 (reconciliation scrub).
 
 Day-1 reconciliation policy (a subset of the full §7 policy):

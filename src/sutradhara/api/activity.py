@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from pathlib import Path
 
 from sqlalchemy import Engine, select
@@ -23,6 +24,7 @@ MAX_ACTIVITY_DAYS = 30
 BAD_TERMINAL_STATUSES = {"quarantined", "discrepancy"}
 TERMINAL_STATUSES = {"verified", "quarantined", "discrepancy", "aborted"}
 _PATH_SEPARATORS = {"/", "\\"}
+logger = logging.getLogger(__name__)
 
 
 def read_activity(
@@ -59,9 +61,7 @@ def read_activity(
     modeled_rows = [_activity_row(row) for row, _started in ordered_window]
     intakes = modeled_rows[:MAX_ACTIVITY_ROWS]
     verified_today = [
-        _activity_row(row)
-        for row, _started in today_rows
-        if _status_for(row)[0] == "verified"
+        _activity_row(row) for row, _started in today_rows if _status_for(row)[0] == "verified"
     ]
     return {
         "summary": {
@@ -135,6 +135,7 @@ def _receipt_bytes(row: grpc_store.GrpcIntake) -> int | None:
             payload = json.loads(line)
             total += int(payload["bytes"])
     except Exception:
+        logger.debug("failed to read receive receipt bytes from %s", path, exc_info=True)
         return None
     return total
 
@@ -181,6 +182,7 @@ def _marker_timestamp(
         try:
             payload = json.loads(marker.read_text(encoding="utf-8"))
         except Exception:
+            logger.debug("failed to read activity marker %s", marker, exc_info=True)
             payload = None
         if isinstance(payload, dict):
             value = payload.get(payload_key)

@@ -152,9 +152,7 @@ def durable_placements(
     )
     if pool_id is not None:
         asset_query = asset_query.where(Copy.pool_id == pool_id)
-    asset_copies = list(
-        session.scalars(asset_query.order_by(Copy.id))
-    )
+    asset_copies = list(session.scalars(asset_query.order_by(Copy.id)))
     bundle_query = (
         select(Copy)
         .join(AssetLocator, AssetLocator.copy_id == Copy.id)
@@ -303,10 +301,7 @@ def bundle_copy_aggregates_by_bundle(
 ) -> dict[str, BundleCopyAggregate]:
     """Return per-bundle placement counts, families, and media identities."""
 
-    aggregates = {
-        bundle_id: BundleCopyAggregate({}, {}, {}, ())
-        for bundle_id in bundle_ids
-    }
+    aggregates = {bundle_id: BundleCopyAggregate({}, {}, {}, ()) for bundle_id in bundle_ids}
     if not bundle_ids:
         return {}
     mutable_errors: dict[str, list[str]] = {bundle_id: [] for bundle_id in bundle_ids}
@@ -523,7 +518,9 @@ def _bundle_policy_targets(session: Session, bundle: Bundle) -> list[PoolTarget]
     return targets
 
 
-def _policy_targets(session: Session, artifactclass: str) -> list[tuple[StorageBackend, PoolTarget]]:
+def _policy_targets(
+    session: Session, artifactclass: str
+) -> list[tuple[StorageBackend, PoolTarget]]:
     backend_rows: dict[int, StorageBackend] = {}
     for backend_id, backend_name in session.execute(
         select(Backend.id, Backend.name)

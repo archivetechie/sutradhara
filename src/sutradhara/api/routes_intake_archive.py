@@ -224,9 +224,7 @@ def get_archive_bundles(
         if status_filter is not None:
             query = query.where(Bundle.status == status_filter)
         rows = list(session.execute(query))
-        bundles = [
-            _bundle_payload(session, row[0], copy_count=int(row[1] or 0)) for row in rows
-        ]
+        bundles = [_bundle_payload(session, row[0], copy_count=int(row[1] or 0)) for row in rows]
         total = int(rows[0][2]) if rows else 0
     return {"total": total, "truncated": total > len(bundles), "bundles": bundles}
 

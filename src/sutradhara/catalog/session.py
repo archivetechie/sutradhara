@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sutradhara.catalog.models import Base
 
 # Default DB URL: a SQLite file in the current working directory. Override
-# with SUTRADHARA_DB_URL. SQLite is the day-1 default (docs/spec-v0.1.md §11);
+# with SUTRADHARA_DB_URL. SQLite is the initial default (docs/reference-config.md);
 # Postgres lands when concurrency demands.
 DEFAULT_DB_URL = "sqlite:///./sutradhara.db"
 
@@ -84,7 +84,10 @@ def _install_sqlite_pragmas(engine: Engine) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys = ON")
         cursor.execute("PRAGMA journal_mode = WAL")
-        cursor.execute("PRAGMA synchronous = NORMAL")
+        # The catalog can be rebuilt, but retention decisions, enrollment
+        # tokens, and idempotency records cannot. FULL keeps committed WAL
+        # transactions durable across an operating-system or power failure.
+        cursor.execute("PRAGMA synchronous = FULL")
         cursor.close()
 
 

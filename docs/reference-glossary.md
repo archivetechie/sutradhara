@@ -495,5 +495,5 @@ unverified bundle, or a `Submission.status == archived` flag on its own,
 is not evidence. The legacy `archived` boolean on `Intake` is now a
 projection of this same ALL-semantics predicate, not a separate
 any-semantics compatibility value — the rollout gate that once let it lag
-behind (`SUTRADHARA_ARCHIVED_ALL_SEMANTICS`) was deleted outright once
+behind it was deleted outright once
 `sutra archive predicate-audit` came back clean, not merely defaulted off.

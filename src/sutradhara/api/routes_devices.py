@@ -382,7 +382,6 @@ async def post_device_receive(
         card = next((item for item in device.cards if item.card_id == body.card_id), None)
         if card is None:
             raise CardUnavailable("card is not present on the device")
-        assert card is not None
     except DeviceOwnerMismatch as exc:
         _raise(403, "forbidden", str(exc))
     except (DeviceOffline, CardUnavailable) as exc:
@@ -1208,7 +1207,12 @@ async def _current_card_listing(
         _raise_for_directory_status(listing)
         complete = complete and not listing.truncated
         for entry in listing.entries:
-            if not entry.name or entry.name in {".", ".."} or "/" in entry.name or "\\" in entry.name:
+            if (
+                not entry.name
+                or entry.name in {".", ".."}
+                or "/" in entry.name
+                or "\\" in entry.name
+            ):
                 _raise(502, "listing_failed", "device returned an invalid directory entry")
             relative_path = posixpath.join(relative_root, entry.name)
             if entry.is_dir and not entry.is_package:

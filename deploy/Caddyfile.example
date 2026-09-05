@@ -1,0 +1,30 @@
+# Example only: replace the host and Authentik upstream for the deployment.
+system-ui.example.invalid {
+	@enrollment {
+		method POST
+		path /api/enroll/csr
+	}
+	handle @enrollment {
+		route {
+			request_header -X-Authentik-*
+			reverse_proxy unix//run/sutradhara/api.sock {
+				header_up Host {host}
+			}
+		}
+	}
+
+	handle {
+		route {
+			# Security invariant: scrub before forward_auth copies trusted values.
+			request_header -X-Authentik-*
+			forward_auth authentik.example.invalid:9000 {
+				uri /outpost.goauthentik.io/auth/caddy
+				copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name
+			}
+			reverse_proxy /api/* unix//run/sutradhara/api.sock {
+				header_up Host {host}
+			}
+			reverse_proxy 127.0.0.1:5173
+		}
+	}
+}

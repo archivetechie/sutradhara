@@ -376,9 +376,7 @@ def test_live_uncalibrated_volume_is_a_normal_response(backend: RemanenceBackend
             compression=layer5_pb2.COMPRESSION_DISABLED,
             written_extent_lba=WRITTEN_EXTENT,
         ),
-        targets=[
-            layer5_pb2.ReadTarget(partition=0, start_block=10, end_block=20, tag=b"\x00u")
-        ],
+        targets=[layer5_pb2.ReadTarget(partition=0, start_block=10, end_block=20, tag=b"\x00u")],
         objective=layer5_pb2.MIN_TOTAL_TIME,
         tape_uuid=bytes.fromhex(TAPE_UNCAL),
     )

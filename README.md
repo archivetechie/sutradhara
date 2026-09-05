@@ -31,12 +31,13 @@ data-loss event.
 - Not a vendor product like Miria — it is first-party software designed to
   outlive its dependencies.
 
-<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/cli docs/INDEX.md -->
 ## Status
 
-Beyond the v0.1 anchor spec (see [`docs/spec-v0.1.md`](docs/spec-v0.1.md) for
-the original design). The catalog, job engine, and CLI are built and in
-active use, and the ingest → arrange → archive →
+The catalog, job engine, and CLI are built and in active operational use. The
+published package remains `0.0.1` / Pre-Alpha because its public interfaces and
+deployment contract can still change before a stable release. The ingest →
+arrange → archive →
 restore lifecycle is implemented end to end, including:
 
 - Multi-backend copy fan-out with per-placement policy and durability
@@ -58,8 +59,10 @@ restore lifecycle is implemented end to end, including:
 - An expendable HD-cache disk tier in front of tape, including a
   cache-first, bounded, digest-verified byte producer shared by both
   restore delivery modes below (`sutra hdcache`).
-- Partial file restore: container-index sidecars and byte-range clip cuts
-  with a whole-member fallback (`sutra pfr`).
+- Optional partial file restore: container-index sidecars and byte-range clip
+  cuts with a whole-member fallback (`sutra pfr`). This feature requires the
+  separately distributed `format-anatomy` package; the base installation does
+  not.
 - A single-node lease-aware job worker with cgroup-based resource control
   (`sutra worker`).
 - An operator HTTP API + mTLS gRPC relay for browser/agent-driven intake and
@@ -81,10 +84,10 @@ restore lifecycle is implemented end to end, including:
     stream only the covering ciphertext range instead of the whole stored
     object.
 
-`docs/INDEX.md` tracks every design doc's status (current / implemented /
-superseded / historical) and is the authoritative map of what's built versus
-still proposed. `docs/roadmap.md` and
-`docs/implementation-plan-ingest-v2.md` track what's next.
+[`docs/INDEX.md`](docs/INDEX.md) is the authoritative map of the public guides
+and references. The private working design history is deliberately not copied
+into this repository; the architecture overview distills the decisions needed
+to understand and operate the current code.
 
 <!-- code-anchor: pyproject.toml packages @ 5688438 -->
 ## Layout
@@ -99,8 +102,11 @@ sutradhara/
 │   └── sutradhara/            # server/orchestrator package (the `sutra` CLI)
 ├── proto/                     # gRPC contracts (device, intake, restore, Remanence layer5)
 ├── docs/
-│   ├── spec-v0.1.md           # original design — start here for the "why"
-│   └── INDEX.md               # status of every design/contract/prompt doc
+│   ├── architecture-overview.md # current design and invariants — start here
+│   ├── guide-deployment.md    # production service and proxy setup
+│   └── INDEX.md               # public documentation map
+├── systemd/                   # deployment unit templates and tmpfiles policy
+├── deploy/                    # reverse-proxy example with identity-header scrub
 ├── alembic/                   # DB schema migrations
 └── tests/
 ```
@@ -118,6 +124,11 @@ Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/).
 uv sync                 # install dependencies (workspace incl. packages/sutradhara-receive)
 uv run pytest -q        # fast, hermetic test suite
 ```
+
+This base install intentionally excludes partial-file restore. Operators who
+need `sutra pfr` must install a compatible `format-anatomy` distribution into
+the same environment; requesting PFR without it produces a feature-specific
+error and does not prevent any other CLI or worker command from starting.
 
 The CLI is installed as `sutra` inside the project's virtualenv
 (`.venv/bin/sutra`). It talks to a database configured via `SUTRADHARA_DB_URL`
@@ -177,12 +188,13 @@ are reserved names without adapters yet.
 
 Beyond `SUTRADHARA_DB_URL`, the environment variables most operators need:
 
-- `REM_BIN` — path to the Remanence `rem` CLI, used for RAO
+- `REM_BIN` — path to the Remanence `rem` CLI, used for REM-OBJECT
   sealing/opening and archive builds. Resolution falls back to `rem` on
   `PATH`, then `~/remanence/target/release/rem`. Run `sutra admin doctor`
   to check availability.
 - `SUTRADHARA_KEY_REGISTRY_DIR` — root of the local key registry for
-  encrypted (RAO-AEAD) copies. Defaults to
+  encrypted REM-OBJECT copies (`rao-aead-v1` in stored catalog identifiers).
+  Defaults to
   `/var/lib/replica/sutradhara-key-registry`; deployments should create it
   with service-user ownership and mode `0700`. Root-key files are written
   `0600`; retiring an epoch never deletes key material.
@@ -194,11 +206,13 @@ backend, test fakes — is documented with exact defaults in
 [`docs/reference-config.md`](docs/reference-config.md).
 
 <!-- code-anchor: src/sutradhara/sealing @ 072cb02 -->
-## Scenario O — sealed RAO copies
+## Scenario O — sealed REM-OBJECT copies
 
-Scenario O seals per-copy representations before storage instead of storing
-raw bytes. The default copy representation remains `raw-bytes`; `o-archive`
-uses `rao-plain-v1` for copy 1 and `rao-aead-v1` for copy 2 — see the
+Scenario O seals per-copy representations before storage instead of storing raw
+bytes. Sutradhara retains `RAO` in module names and stored representation IDs;
+in current Remanence terminology these are REM-OBJECT files. The default copy
+representation remains `raw-bytes`; `o-archive` uses `rao-plain-v1` for copy 1
+and `rao-aead-v1` for copy 2 — see the
 "Configuration" section above for the `REM_BIN` and key-registry
 requirements this depends on.
 
@@ -218,6 +232,10 @@ redundantly on the row.
 - [`docs/architecture-overview.md`](docs/architecture-overview.md) — how
   the code is actually organized: data model, lifecycle, job engine and
   reconciler spine, backends, sealing, hdcache, operator surface.
+- [`docs/design-decisions.md`](docs/design-decisions.md) — why the
+  load-bearing architecture choices were made and what they require.
+- [`docs/guide-deployment.md`](docs/guide-deployment.md) — production services,
+  schema migration, Remanence, key bootstrap, and the proxy trust boundary.
 - [`docs/reference-cli.md`](docs/reference-cli.md) — every command and
   flag, verified against `--help`.
 - [`docs/reference-config.md`](docs/reference-config.md) — every
@@ -227,10 +245,7 @@ redundantly on the row.
   catalogue's key modelling boundaries.
 - [`docs/reference-glossary.md`](docs/reference-glossary.md) — the
   internal vocabulary, as the code uses it.
-- [`docs/spec-v0.1.md`](docs/spec-v0.1.md) — the original design (why this
-  exists, first principles).
-- [`docs/INDEX.md`](docs/INDEX.md) — status of every design, contract, and
-  prompt doc in `docs/`; the map of what's built vs. proposed.
+- [`docs/INDEX.md`](docs/INDEX.md) — the map of public documentation.
 - [`docs/arrangement-arc-guide.md`](docs/arrangement-arc-guide.md) — a
   plain-language walkthrough of the intake → arrange → archive →
   organize-forever lifecycle, for archivists and operators rather than
@@ -244,4 +259,6 @@ moving parts, and a 30-year horizon.
 
 ## License
 
-AGPL-3.0-or-later. Same as Remanence.
+AGPL-3.0-or-later. Sutradhara is independently licensed under the AGPL so that
+source for modified network-deployed versions remains available under the same
+terms; Remanence has its own Apache-2.0 license.

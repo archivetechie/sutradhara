@@ -256,9 +256,7 @@ def test_sealed_bundle_with_unmeasured_copies_is_not_archive_evidence(tmp_path: 
         _verified_copies(session, bundle, measured=False)
         assert (
             session.scalar(
-                select(intake_archive_state_expr()).where(
-                    Intake.intake_id == "unmeasured-intake"
-                )
+                select(intake_archive_state_expr()).where(Intake.intake_id == "unmeasured-intake")
             )
             == "none"
         )
@@ -269,9 +267,7 @@ def test_sealed_bundle_with_unmeasured_copies_is_not_archive_evidence(tmp_path: 
         session.flush()
         assert (
             session.scalar(
-                select(intake_archive_state_expr()).where(
-                    Intake.intake_id == "unmeasured-intake"
-                )
+                select(intake_archive_state_expr()).where(Intake.intake_id == "unmeasured-intake")
             )
             == "complete"
         )
@@ -296,9 +292,7 @@ def test_evidence_uses_the_member_own_class_min_copies(tmp_path: Path) -> None:
         for digest in (lax, strict):
             session.add(LogicalAsset(content_sha256=digest, size_bytes=10))
         session.flush()
-        bundle = _sealed_bundle(
-            session, "mixed-bundle", artifactclass="lax", digest=lax, now=now
-        )
+        bundle = _sealed_bundle(session, "mixed-bundle", artifactclass="lax", digest=lax, now=now)
         session.add(
             BundleMember(
                 bundle_id=bundle.id,
@@ -321,9 +315,7 @@ def test_evidence_uses_the_member_own_class_min_copies(tmp_path: Path) -> None:
             item.artifactclass = "lax" if item.intake_id == lax_intake.intake_id else "strict"
         session.flush()
 
-        states = dict(
-            session.execute(select(Intake.intake_id, intake_archive_state_expr())).all()
-        )
+        states = dict(session.execute(select(Intake.intake_id, intake_archive_state_expr())).all())
     assert states[lax_intake.intake_id] == "complete"
     assert states[strict_intake.intake_id] == "none"
     engine.dispose()
@@ -387,9 +379,7 @@ def test_stored_submission_archived_flag_is_not_archive_evidence(tmp_path: Path)
 
         assert (
             session.scalar(
-                select(intake_archive_state_expr()).where(
-                    Intake.intake_id == "flagged-intake"
-                )
+                select(intake_archive_state_expr()).where(Intake.intake_id == "flagged-intake")
             )
             == "none"
         )
@@ -417,9 +407,7 @@ def test_submission_is_archived_only_when_every_member_is_evidence(tmp_path: Pat
             session.add(LogicalAsset(content_sha256=digest, size_bytes=10))
         intake = _intake_with_items(session, "split-intake", digests=(first, second), now=now)
         items = list(
-            session.scalars(
-                select(IngestItem).where(IngestItem.intake_id == intake.intake_id)
-            )
+            session.scalars(select(IngestItem).where(IngestItem.intake_id == intake.intake_id))
         )
         arrangement = Arrangement(
             label="split",
@@ -598,9 +586,7 @@ def test_audit_catches_a_partial_intake_sharing_a_hash_with_a_sealed_bundle(
         _policy(session, "s-masters")
         for digest in (shared_hash, missing_hash):
             session.add(LogicalAsset(content_sha256=digest, size_bytes=10))
-        _intake_with_items(
-            session, "victim", digests=(shared_hash, missing_hash), now=now
-        )
+        _intake_with_items(session, "victim", digests=(shared_hash, missing_hash), now=now)
         _intake_with_items(
             session,
             "donor",

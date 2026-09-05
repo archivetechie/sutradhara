@@ -79,9 +79,7 @@ def test_registration_classifies_all_authoritative_dispositions_and_suppression(
 
         with session_scope(engine) as session:
             under = register_intake(session, under_root, artifactclass="masters")
-            item = session.scalars(
-                select(IngestItem).where(IngestItem.intake_id == "under")
-            ).one()
+            item = session.scalars(select(IngestItem).where(IngestItem.intake_id == "under")).one()
             assert item.disposition == IngestDisposition.KNOWN_UNDER_DURABLE
             assert item.prior_intake_id == "first"
             assert item.disposition_evidence["work_suppression_safe"] is False
@@ -167,9 +165,7 @@ def test_estimate_and_nothing_new_handshake_are_content_based(tmp_path: Path) ->
             intake = session.get(Intake, "prior")
             assert intake is not None
             intake.card_id = "card-1"
-            item = session.scalars(
-                select(IngestItem).where(IngestItem.intake_id == "prior")
-            ).one()
+            item = session.scalars(select(IngestItem).where(IngestItem.intake_id == "prior")).one()
             pool = _add_pool(session, "archive", "masters")
             copy, _ = add_copy(
                 session,

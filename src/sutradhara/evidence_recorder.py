@@ -159,9 +159,7 @@ def _enqueue_verify(session: Session, copy: Copy) -> Job:
 
 def _verify_job_for_copy(session: Session, copy: Copy) -> Job | None:
     return session.scalars(
-        select(Job)
-        .where(Job.dedupe_key == f"verify:remeasure:{copy.id}")
-        .order_by(Job.id.desc())
+        select(Job).where(Job.dedupe_key == f"verify:remeasure:{copy.id}").order_by(Job.id.desc())
     ).first()
 
 

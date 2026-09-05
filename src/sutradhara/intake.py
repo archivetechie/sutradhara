@@ -17,7 +17,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -611,11 +611,7 @@ def _enqueue_missing_cloud_job(
 def _intake_is_fully_known_durable(session: Session, intake_id: str) -> bool:
     """Return true only when a nonempty intake needs no new cloud object work."""
 
-    items = list(
-        session.scalars(
-            select(IngestItem).where(IngestItem.intake_id == intake_id)
-        )
-    )
+    items = list(session.scalars(select(IngestItem).where(IngestItem.intake_id == intake_id)))
     return bool(items) and all(work_suppression_safe(session, item) for item in items)
 
 
@@ -900,13 +896,11 @@ def _register_payload_record(
     if record.package_index is not None:
         metadata["package_index_path"] = str(payload_root.parent / record.package_index)
     if item is None:
-        disposition, prior_intake, evidence_at, policy_generation, evidence = (
-            _classify_disposition(
-                session,
-                intake,
-                record.sha256_bytes,
-                inserted=inserted,
-            )
+        disposition, prior_intake, evidence_at, policy_generation, evidence = _classify_disposition(
+            session,
+            intake,
+            record.sha256_bytes,
+            inserted=inserted,
         )
         item = IngestItem(
             intake=intake,
@@ -955,19 +949,23 @@ def _insert_logical_asset_if_absent(
     dialect = session.get_bind().dialect.name
     statement: Any
     if dialect == "sqlite":
-        statement = sqlite_insert(LogicalAsset).values(**values).on_conflict_do_nothing(
-            index_elements=[LogicalAsset.content_sha256]
+        statement = (
+            sqlite_insert(LogicalAsset)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[LogicalAsset.content_sha256])
         )
     elif dialect == "postgresql":
-        statement = postgresql_insert(LogicalAsset).values(**values).on_conflict_do_nothing(
-            index_elements=[LogicalAsset.content_sha256]
+        statement = (
+            postgresql_insert(LogicalAsset)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[LogicalAsset.content_sha256])
         )
     else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL.
-        raise RuntimeError(
-            f"atomic logical-asset registration is unsupported for {dialect!r}"
-        )
-    result = session.execute(statement.execution_options(synchronize_session=False))
-    assert isinstance(result, CursorResult)
+        raise RuntimeError(f"atomic logical-asset registration is unsupported for {dialect!r}")
+    result = cast(
+        CursorResult[Any],
+        session.execute(statement.execution_options(synchronize_session=False)),
+    )
     inserted = result.rowcount == 1
     asset = session.get(LogicalAsset, record.sha256_bytes)
     if asset is None:  # pragma: no cover - database contract violation.
@@ -1021,9 +1019,7 @@ def _classify_disposition(
             status = {"complete": False, "want": set(), "have": set(), "missing": set()}
         safe = policy is not None and status["complete"] and bool(status["want"])
         disposition = (
-            IngestDisposition.KNOWN_DURABLE
-            if safe
-            else IngestDisposition.KNOWN_UNDER_DURABLE
+            IngestDisposition.KNOWN_DURABLE if safe else IngestDisposition.KNOWN_UNDER_DURABLE
         )
     evidence: dict[str, Any] = {
         "server_sha256": asset_hash.hex(),

@@ -123,7 +123,9 @@ def test_set_pool_write_fence_refuses_floor_critical_pool(engine: Engine) -> Non
         s.flush()
         s.add_all(
             [
-                Pool(id="p-rem", backend_id=rem.id, representation=Representation.RAO_PLAIN_V1.value),
+                Pool(
+                    id="p-rem", backend_id=rem.id, representation=Representation.RAO_PLAIN_V1.value
+                ),
                 Pool(id="p-d2", backend_id=d2.id, representation=Representation.D2TAR_RAW.value),
                 ArtifactClassPool(artifactclass="masters", pool_id="p-rem", active=True),
                 ArtifactClassPool(artifactclass="masters", pool_id="p-d2", active=True),

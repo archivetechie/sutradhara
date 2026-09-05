@@ -96,7 +96,8 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                     intake_id=intake_id,
                 )
                 if decision.state == "resume":
-                    assert decision.intake_id is not None
+                    if decision.intake_id is None:
+                        raise RuntimeError("resume decision has no intake id")
                     self._assert_resume_request(
                         decision.intake_id,
                         identity,
@@ -145,7 +146,8 @@ class IntakeServicer(intake_pb2_grpc.IntakeServiceServicer):
                     "no authorized receive intent",
                 )
             if decision.state == "resume":
-                assert decision.intake_id is not None
+                if decision.intake_id is None:
+                    raise RuntimeError("resume decision has no intake id")
                 self.progress_registry.start(
                     decision.intake_id,
                     planned_bytes_total=_planned_bytes_total(request),

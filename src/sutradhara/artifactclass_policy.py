@@ -313,9 +313,7 @@ def apply_artifactclass_policy(
     pools = {
         pool.id: pool
         for pool in session.scalars(
-            select(Pool)
-            .options(joinedload(Pool.backend))
-            .where(Pool.id.in_(referenced_pool_ids))
+            select(Pool).options(joinedload(Pool.backend)).where(Pool.id.in_(referenced_pool_ids))
         )
     }
     missing = sorted(set(pool_ids) - set(pools))
@@ -498,7 +496,9 @@ def _parse_hdcache(raw: object, label: str) -> HdcachePolicy:
     enabled = table.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ArtifactClassPolicyError(f"{label}.enabled must be a boolean")
-    privacy_level = _optional_str(table.get("privacy_level"), f"{label}.privacy_level", default="none")
+    privacy_level = _optional_str(
+        table.get("privacy_level"), f"{label}.privacy_level", default="none"
+    )
     if privacy_level != "none" and re.fullmatch(r"p[1-9][0-9]*", privacy_level) is None:
         raise ArtifactClassPolicyError(f"{label}.privacy_level must be 'none' or a p<N> level")
     return HdcachePolicy(enabled=enabled, privacy_level=privacy_level)

@@ -531,7 +531,7 @@ Serve the operator HTTP API and the mTLS gRPC relay in one process.
 | `--landing-root DIRECTORY` | `/replica/landing` | Landing root for streamed intakes. |
 | `--pki-dir DIRECTORY` | `/etc/sutradhara/pki` | gRPC PKI directory. |
 | `--api-socket PATH` | `$SUTRA_API_SOCKET` or `/run/sutradhara/api.sock` | Unix socket for the HTTP API. |
-| `--api-tcp` | off | Serve loopback TCP for local dev. |
+| `--api-tcp` | off | Serve loopback TCP for local development. Any local process can forge the trusted identity headers; never use this as a production trust boundary. |
 | `--api-host TEXT` | `127.0.0.1` | Loopback TCP host. |
 | `--api-port INTEGER` | `8770` | Loopback TCP port. |
 | `--socket-mode TEXT` | `660` | Octal mode for the API Unix socket. |
@@ -541,7 +541,8 @@ Serve the operator HTTP API and the mTLS gRPC relay in one process.
 
 Serve the operator API alone, on a Unix domain socket by default and never
 on a tailnet/public bind. Flags: `--socket PATH` (default
-`$SUTRA_API_SOCKET` or `/run/sutradhara/api.sock`), `--tcp`, `--host TEXT`
+`$SUTRA_API_SOCKET` or `/run/sutradhara/api.sock`), `--tcp` (local development
+only; local processes can forge trusted identity headers), `--host TEXT`
 (default `127.0.0.1`), `--port INTEGER` (default `8770`),
 `--socket-mode TEXT` (default `660`).
 

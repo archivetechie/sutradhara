@@ -32,14 +32,10 @@ def novelty_summary(session: Session, intake_id: str) -> dict[str, int]:
     return novelty_summaries(session, [intake_id])[intake_id]
 
 
-def novelty_summaries(
-    session: Session, intake_ids: list[str]
-) -> dict[str, dict[str, int]]:
+def novelty_summaries(session: Session, intake_ids: list[str]) -> dict[str, dict[str, int]]:
     """Batch disposition counts without adding an intake-list N+1 query."""
 
-    counts_by_intake: dict[str, Counter[str]] = {
-        intake_id: Counter() for intake_id in intake_ids
-    }
+    counts_by_intake: dict[str, Counter[str]] = {intake_id: Counter() for intake_id in intake_ids}
     if intake_ids:
         for intake_id, disposition in session.execute(
             select(IngestItem.intake_id, IngestItem.disposition).where(
@@ -47,10 +43,7 @@ def novelty_summaries(
             )
         ):
             counts_by_intake[str(intake_id)][str(disposition)] += 1
-    return {
-        intake_id: _novelty_counts(count)
-        for intake_id, count in counts_by_intake.items()
-    }
+    return {intake_id: _novelty_counts(count) for intake_id, count in counts_by_intake.items()}
 
 
 def _novelty_counts(counts: Counter[str]) -> dict[str, int]:
@@ -85,9 +78,8 @@ def asset_policy_qualified_durable(session: Session, item: IngestItem) -> bool:
 def work_suppression_safe(session: Session, item: IngestItem) -> bool:
     """Re-check I2 live durability before suppressing work for an occurrence."""
 
-    return (
-        item.disposition == IngestDisposition.KNOWN_DURABLE
-        and asset_policy_qualified_durable(session, item)
+    return item.disposition == IngestDisposition.KNOWN_DURABLE and asset_policy_qualified_durable(
+        session, item
     )
 
 
@@ -122,18 +114,14 @@ def estimate_listing_novelty(
             and (item.as_received_path, item.size_bytes) in listing_entries
             and asset_policy_qualified_durable(session, item)
         }
-    match_prior = sum(
-        (entry.path, entry.size_bytes) in prior_entries for entry in listing
-    )
+    match_prior = sum((entry.path, entry.size_bytes) in prior_entries for entry in listing)
     likely_new = len(listing) - match_prior
     visible = prior is not None and prior.operator == requester
     estimate: dict[str, object] = {
         "listing_files": len(listing),
         "match_prior": match_prior,
         "likely_new": likely_new,
-        "all_known_estimate": (
-            prior is not None and listing_complete and likely_new == 0
-        ),
+        "all_known_estimate": (prior is not None and listing_complete and likely_new == 0),
         "visible": visible,
     }
     if visible and prior is not None:

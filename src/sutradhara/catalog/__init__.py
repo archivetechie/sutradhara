@@ -1,6 +1,6 @@
 """Catalog — content-addressed logical assets, copies, and backends.
 
-See docs/spec-v0.1.md §4 (data model).
+See docs/architecture-overview.md (data model).
 """
 
 from sutradhara.catalog.copies import (

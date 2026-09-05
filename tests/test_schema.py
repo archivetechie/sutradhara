@@ -81,6 +81,53 @@ def _foreign_key_delete_actions(db_path: Path, table: str) -> dict[tuple[str, st
         }
 
 
+def _schema_signatures(db_path: Path) -> dict[str, dict[str, tuple[tuple[object, ...], ...]]]:
+    """Return exhaustive SQLite column, foreign-key, and index signatures."""
+
+    with sqlite3.connect(db_path) as conn:
+        tables = sorted(
+            name
+            for (name,) in conn.execute(
+                "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+            )
+            if name != "alembic_version"
+        )
+        result: dict[str, dict[str, tuple[tuple[object, ...], ...]]] = {}
+        for table in tables:
+            columns = tuple(
+                sorted(
+                    (str(row[1]), str(row[2]).upper(), bool(row[3]), int(row[5]))
+                    for row in conn.execute(f"PRAGMA table_info({table})")
+                )
+            )
+            foreign_key_rows = list(conn.execute(f"PRAGMA foreign_key_list({table})"))
+            foreign_keys: dict[int, list[tuple[int, str, str]]] = {}
+            foreign_key_meta: dict[int, tuple[str, str, str, str]] = {}
+            for row in foreign_key_rows:
+                key = int(row[0])
+                foreign_keys.setdefault(key, []).append((int(row[1]), str(row[3]), str(row[4])))
+                foreign_key_meta[key] = (str(row[2]), str(row[5]), str(row[6]), str(row[7]))
+            foreign_key_signature = tuple(
+                sorted(
+                    (*foreign_key_meta[key], tuple(sorted(parts)))
+                    for key, parts in foreign_keys.items()
+                )
+            )
+            indexes = []
+            for row in conn.execute(f"PRAGMA index_list({table})"):
+                index_name = str(row[1])
+                index_columns = tuple(
+                    str(part[2]) for part in conn.execute(f"PRAGMA index_info({index_name})")
+                )
+                indexes.append((bool(row[2]), str(row[3]), bool(row[4]), index_columns))
+            result[table] = {
+                "columns": columns,
+                "foreign_keys": foreign_key_signature,
+                "indexes": tuple(sorted(indexes)),
+            }
+        return result
+
+
 def _assert_archive_invariants(db_path: Path) -> None:
     backend_sql = _table_sql(db_path, "backend")
     pool_sql = _table_sql(db_path, "pool")
@@ -452,6 +499,32 @@ def test_alembic_upgrade_head_creates_job_table(tmp_path: Path) -> None:
     _assert_retention_invariants(db_path)
     _assert_grpc_relay_invariants(db_path)
     _assert_hdcache_invariants(db_path)
+
+
+def test_create_all_and_migration_head_have_schema_shape_parity(tmp_path: Path) -> None:
+    """Every modeled table, column, foreign key, and index must also exist after Alembic."""
+
+    create_all_path = tmp_path / "create-all-parity.db"
+    migration_path = tmp_path / "migration-parity.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    code = f"""
+from sutradhara.catalog.session import create_all, make_engine
+
+engine = make_engine("sqlite:///{create_all_path.as_posix()}")
+create_all(engine)
+engine.dispose()
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{migration_path.as_posix()}"
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+
+    assert _schema_signatures(migration_path) == _schema_signatures(create_all_path)
 
 
 def test_deletion_evidence_migration_recreates_raw_sql_health_trigger(
@@ -885,7 +958,7 @@ def test_retention_journal_downgrade_exports_and_removes_used_receipt_correction
             "supersedes_source, supersedes_event_id) VALUES "
             "('receipt', 'verify_receipt:1', 'correction_recorded', "
             "'journal-correction:verify_receipt:1:used', 'ops', ?, "
-            "'{\"kind\":\"receipt-supersession\",\"reason\":\"wrong read\"}', "
+            '\'{"kind":"receipt-supersession","reason":"wrong read"}\', '
             "'verify_receipt', 1)",
             (now,),
         )
@@ -975,7 +1048,7 @@ def test_retention_journal_upgrade_backfills_confirmation_receipts_and_targets(
             "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
             "('media', 'legacy:revoked', 'correction_recorded', "
             "'offsite-revoke:legacy:revoked:prompt-1', 'revoking-operator', ?, "
-            "'{\"kind\":\"offsite-revocation\",\"reason\":\"wrong shipment\"}')",
+            '\'{"kind":"offsite-revocation","reason":"wrong shipment"}\')',
             (revoked_at,),
         )
         conn.commit()
@@ -1422,7 +1495,7 @@ def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
             "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
             "('media', 'legacy:two-cycle', 'correction_recorded', "
             "'offsite-revoke:two-cycle:c1', 'cycle1-revoker', ?, "
-            "'{\"kind\":\"offsite-revocation\",\"reason\":\"wrong tape\"}')",
+            '\'{"kind":"offsite-revocation","reason":"wrong tape"}\')',
             (cycle1_revoked_at,),
         )
         # E2: cycle-2 re-confirmation receipt.
@@ -1431,7 +1504,7 @@ def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
             "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
             "('media', 'legacy:two-cycle', 'offsite_confirmed', "
             "'offsite-confirm:two-cycle:c2', 'cycle2-operator', ?, "
-            "'{\"shipment_id\":\"shipment-2\",\"confirmed_by\":\"cycle2-operator\"}')",
+            '\'{"shipment_id":"shipment-2","confirmed_by":"cycle2-operator"}\')',
             (cycle2_confirmed_at,),
         )
         # E3: cycle-2 revocation correction.
@@ -1440,7 +1513,7 @@ def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
             "(subject_type, subject_id, action, operation_id, actor, at, detail) VALUES "
             "('media', 'legacy:two-cycle', 'correction_recorded', "
             "'offsite-revoke:two-cycle:c2', 'cycle2-revoker', ?, "
-            "'{\"kind\":\"offsite-revocation\",\"reason\":\"failed audit\"}')",
+            '\'{"kind":"offsite-revocation","reason":"failed audit"}\')',
             (cycle2_revoked_at,),
         )
         conn.commit()
@@ -1468,6 +1541,4 @@ def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
     assert set(receipts) == {lead_op, "offsite-confirm:two-cycle:c2"}
     # Each correction targets its OWN cycle's receipt, by correction identity.
     assert corrections["offsite-revoke:two-cycle:c1"] == receipts[lead_op]
-    assert corrections["offsite-revoke:two-cycle:c2"] == (
-        receipts["offsite-confirm:two-cycle:c2"]
-    )
+    assert corrections["offsite-revoke:two-cycle:c2"] == (receipts["offsite-confirm:two-cycle:c2"])

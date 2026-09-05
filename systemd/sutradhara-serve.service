@@ -1,0 +1,21 @@
+[Unit]
+Description=Sutradhara operator API and device gRPC relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=replica
+Group=replica
+WorkingDirectory=/opt/sutradhara
+EnvironmentFile=/etc/sutradhara/sutradhara.env
+Environment=SUTRADHARA_GRPC_BIND=127.0.0.1
+ExecStart=/opt/sutradhara/.venv/bin/sutra serve --grpc-bind ${SUTRADHARA_GRPC_BIND} --grpc-port 50051 --api-socket /run/sutradhara/api.sock --pki-dir /var/lib/sutradhara/pki --landing-root ${SUTRA_RECEIVE_LANDING_ROOT}
+Restart=on-failure
+RestartSec=3
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

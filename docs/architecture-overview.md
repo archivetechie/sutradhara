@@ -3,10 +3,9 @@
 How Sutradhara is actually built, as of the commit in each section's
 anchor. This is the map a newcomer should read after the README and before
 the code. It describes what exists, not what was planned:
-[`spec-v0.1.md`](spec-v0.1.md) holds the original design and its
-first principles, and [`INDEX.md`](INDEX.md) tracks which designs became
-code. Where this page and the code disagree, the code wins; please fix the
-page.
+The private working journal holds the original design and its first principles;
+[`INDEX.md`](INDEX.md) maps the public operational documentation. Where this
+page and the code disagree, the code wins; please fix the page.
 
 <!-- code-anchor: none -->
 ## The one-paragraph version

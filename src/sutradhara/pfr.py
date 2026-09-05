@@ -82,8 +82,7 @@ class PFRCutRefused(PFRUnavailable):
     def __init__(self, refusal: CutRefusal) -> None:
         self.failure = refusal.failure
         super().__init__(
-            f"{refusal.failure.reason_id.value}: "
-            f"{refusal.failure.message or 'cut refused'}"
+            f"{refusal.failure.reason_id.value}: {refusal.failure.message or 'cut refused'}"
         )
 
 
@@ -492,9 +491,7 @@ def enforce_blob_lru(
         return
     protected = _protected_blob_paths(protect_sidecar, blob_dir=blob_dir)
     all_files = [
-        path
-        for path in blob_dir.rglob("*")
-        if path.is_file() and not path.name.endswith(".tmp")
+        path for path in blob_dir.rglob("*") if path.is_file() and not path.name.endswith(".tmp")
     ]
     files = [path for path in all_files if path.resolve() not in protected]
     total = sum(path.stat().st_size for path in all_files)

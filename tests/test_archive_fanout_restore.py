@@ -136,7 +136,9 @@ class _ArchiveWriteBackend:
     def stream_kind(self) -> StreamKind:
         return StreamKind.native_stream
 
-    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
+    def write_object_to_pool(
+        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+    ) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
         self._counter += 1
@@ -200,7 +202,9 @@ class _TransientWriteBackend(_ArchiveWriteBackend):
         super().__init__(name)
         self.failing_pools = failing_pools
 
-    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
+    def write_object_to_pool(
+        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+    ) -> CopyRecord:
         if pool in self.failing_pools:
             raise BackendError(f"transport unavailable for pool {pool}")
         return super().write_object_to_pool(source, pool)
@@ -678,9 +682,7 @@ def test_build_bundle_copy_for_pool_records_copy_locators_blob_roots_but_no_excl
         assert copy.last_checked_at is not None
         assert copy.last_measured_digest == copy.integrity_hash
         assert copy.last_measured_at == copy.last_checked_at
-        receipt = s.scalars(
-            select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)
-        ).one()
+        receipt = s.scalars(select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id)).one()
         assert receipt.source == "fanout"
         assert receipt.measured_digest == copy.integrity_hash
         assert bundle.status == "open"
@@ -830,9 +832,7 @@ def test_member_locator_verification_refuses_its_copy_and_seals_partial(
         bundle = s.get(Bundle, setup.bundle_id)
         assert bundle is not None
         assert bundle.status == "sealed"
-        health = {
-            copy.pool_id: copy.health for copy in s.scalars(select(Copy).order_by(Copy.id))
-        }
+        health = {copy.pool_id: copy.health for copy in s.scalars(select(Copy).order_by(Copy.id))}
         # The good placement survives the bad one...
         assert CopyHealth.OK in health.values()
         # ...and the refused object is still recorded, as SUSPECT: the bytes

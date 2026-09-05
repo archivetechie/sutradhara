@@ -86,7 +86,9 @@ class _Backend:
     def name(self) -> str:
         return "rem"
 
-    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
+    def write_object_to_pool(
+        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+    ) -> CopyRecord:
         self._counter += 1
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
@@ -190,9 +192,10 @@ def test_bundle_repair_rebuilds_missing_pool_after_staging_purge(
         assert len(list(s.scalars(select(BlobRoot).where(BlobRoot.copy_id == repaired.id)))) == 1
         assert len(list(s.scalars(select(ExclusionRecord)))) == old_exclusion_count
         for locator in locators:
-            assert read_member_bytes(backend, repaired, locator, work_dir=tmp_path) == assets[
-                locator.logical_asset_hash
-            ]
+            assert (
+                read_member_bytes(backend, repaired, locator, work_dir=tmp_path)
+                == assets[locator.logical_asset_hash]
+            )
         attempt = s.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
         assert "tape:D2BAR000003" in attempt.detail["components"]
 
@@ -439,7 +442,9 @@ def test_bundle_copy_duplicate_alarm_logs_once(
     bundle_id, backend_id, _assets = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
 
     with session_scope(engine) as s:
-        existing = s.scalars(select(Copy).where(Copy.bundle_id == bundle_id, Copy.pool_id == "p1")).one()
+        existing = s.scalars(
+            select(Copy).where(Copy.bundle_id == bundle_id, Copy.pool_id == "p1")
+        ).one()
         duplicate, _ = add_bundle_copy(
             s,
             bundle_id=bundle_id,
@@ -470,9 +475,10 @@ def test_bundle_copy_duplicate_alarm_logs_once(
         assert first.condition == CONDITION_BLOCKED
         assert second.condition == CONDITION_BLOCKED
         assert second.reason == "duplicate-copy"
-        assert sum(
-            1 for record in caplog.records if record.message == "bundle_copy_condition_blocked"
-        ) == 1
+        assert (
+            sum(1 for record in caplog.records if record.message == "bundle_copy_condition_blocked")
+            == 1
+        )
 
 
 def _flushed_bundle(

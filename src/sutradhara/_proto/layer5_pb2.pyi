@@ -49,6 +49,12 @@ class TapeFinalizationOutcome(int, metaclass=_enum_type_wrapper.EnumTypeWrapper)
     TAPE_FINALIZATION_OUTCOME_FAILED: _ClassVar[TapeFinalizationOutcome]
     TAPE_FINALIZATION_OUTCOME_BUSY: _ClassVar[TapeFinalizationOutcome]
 
+class TapeInventoryBotRecoveryReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    TAPE_INVENTORY_BOT_RECOVERY_REASON_UNSPECIFIED: _ClassVar[TapeInventoryBotRecoveryReason]
+    TAPE_INVENTORY_BOT_RECOVERY_REASON_NO_USABLE_TERMINAL_LAYOUT: _ClassVar[TapeInventoryBotRecoveryReason]
+    TAPE_INVENTORY_BOT_RECOVERY_REASON_ALL_MEMBERS_INVALID: _ClassVar[TapeInventoryBotRecoveryReason]
+
 class TapeInventoryStructuralKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     TAPE_INVENTORY_STRUCTURAL_KIND_UNSPECIFIED: _ClassVar[TapeInventoryStructuralKind]
@@ -212,6 +218,9 @@ TAPE_FINALIZATION_OUTCOME_FINALIZED_DEGRADED: TapeFinalizationOutcome
 TAPE_FINALIZATION_OUTCOME_RECOVERY_REQUIRED: TapeFinalizationOutcome
 TAPE_FINALIZATION_OUTCOME_FAILED: TapeFinalizationOutcome
 TAPE_FINALIZATION_OUTCOME_BUSY: TapeFinalizationOutcome
+TAPE_INVENTORY_BOT_RECOVERY_REASON_UNSPECIFIED: TapeInventoryBotRecoveryReason
+TAPE_INVENTORY_BOT_RECOVERY_REASON_NO_USABLE_TERMINAL_LAYOUT: TapeInventoryBotRecoveryReason
+TAPE_INVENTORY_BOT_RECOVERY_REASON_ALL_MEMBERS_INVALID: TapeInventoryBotRecoveryReason
 TAPE_INVENTORY_STRUCTURAL_KIND_UNSPECIFIED: TapeInventoryStructuralKind
 TAPE_INVENTORY_STRUCTURAL_KIND_OBJECT: TapeInventoryStructuralKind
 TAPE_INVENTORY_STRUCTURAL_KIND_PARITY_SIDECAR: TapeInventoryStructuralKind
@@ -1202,20 +1211,48 @@ class TapeInventoryRequest(_message.Message):
     def __init__(self, tape_uuid: _Optional[bytes] = ...) -> None: ...
 
 class TapeInventoryStreamItem(_message.Message):
-    __slots__ = ("replica_attempt_started", "structural_entry", "object_row", "replica_attempt_rejected", "bot_object", "summary")
+    __slots__ = ("replica_attempt_started", "structural_entry", "object_row", "replica_attempt_rejected", "bot_object", "summary", "bot_recovery_started", "bot_recovery_progress")
     REPLICA_ATTEMPT_STARTED_FIELD_NUMBER: _ClassVar[int]
     STRUCTURAL_ENTRY_FIELD_NUMBER: _ClassVar[int]
     OBJECT_ROW_FIELD_NUMBER: _ClassVar[int]
     REPLICA_ATTEMPT_REJECTED_FIELD_NUMBER: _ClassVar[int]
     BOT_OBJECT_FIELD_NUMBER: _ClassVar[int]
     SUMMARY_FIELD_NUMBER: _ClassVar[int]
+    BOT_RECOVERY_STARTED_FIELD_NUMBER: _ClassVar[int]
+    BOT_RECOVERY_PROGRESS_FIELD_NUMBER: _ClassVar[int]
     replica_attempt_started: TapeInventoryReplicaAttemptStarted
     structural_entry: TapeInventoryStructuralEntry
     object_row: TapeInventoryObjectRow
     replica_attempt_rejected: TapeInventoryReplicaAttemptRejected
     bot_object: TapeInventoryBotObject
     summary: TapeInventory
-    def __init__(self, replica_attempt_started: _Optional[_Union[TapeInventoryReplicaAttemptStarted, _Mapping]] = ..., structural_entry: _Optional[_Union[TapeInventoryStructuralEntry, _Mapping]] = ..., object_row: _Optional[_Union[TapeInventoryObjectRow, _Mapping]] = ..., replica_attempt_rejected: _Optional[_Union[TapeInventoryReplicaAttemptRejected, _Mapping]] = ..., bot_object: _Optional[_Union[TapeInventoryBotObject, _Mapping]] = ..., summary: _Optional[_Union[TapeInventory, _Mapping]] = ...) -> None: ...
+    bot_recovery_started: TapeInventoryBotRecoveryStarted
+    bot_recovery_progress: TapeInventoryBotRecoveryProgress
+    def __init__(self, replica_attempt_started: _Optional[_Union[TapeInventoryReplicaAttemptStarted, _Mapping]] = ..., structural_entry: _Optional[_Union[TapeInventoryStructuralEntry, _Mapping]] = ..., object_row: _Optional[_Union[TapeInventoryObjectRow, _Mapping]] = ..., replica_attempt_rejected: _Optional[_Union[TapeInventoryReplicaAttemptRejected, _Mapping]] = ..., bot_object: _Optional[_Union[TapeInventoryBotObject, _Mapping]] = ..., summary: _Optional[_Union[TapeInventory, _Mapping]] = ..., bot_recovery_started: _Optional[_Union[TapeInventoryBotRecoveryStarted, _Mapping]] = ..., bot_recovery_progress: _Optional[_Union[TapeInventoryBotRecoveryProgress, _Mapping]] = ...) -> None: ...
+
+class TapeInventoryBotRecoveryStarted(_message.Message):
+    __slots__ = ("tape_uuid", "block_size", "reason")
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    BLOCK_SIZE_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    block_size: int
+    reason: TapeInventoryBotRecoveryReason
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., block_size: _Optional[int] = ..., reason: _Optional[_Union[TapeInventoryBotRecoveryReason, str]] = ...) -> None: ...
+
+class TapeInventoryBotRecoveryProgress(_message.Message):
+    __slots__ = ("tape_file_number", "partition", "position_lba", "structural_candidate_count", "elapsed_millis")
+    TAPE_FILE_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    PARTITION_FIELD_NUMBER: _ClassVar[int]
+    POSITION_LBA_FIELD_NUMBER: _ClassVar[int]
+    STRUCTURAL_CANDIDATE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    ELAPSED_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    tape_file_number: int
+    partition: int
+    position_lba: int
+    structural_candidate_count: int
+    elapsed_millis: int
+    def __init__(self, tape_file_number: _Optional[int] = ..., partition: _Optional[int] = ..., position_lba: _Optional[int] = ..., structural_candidate_count: _Optional[int] = ..., elapsed_millis: _Optional[int] = ...) -> None: ...
 
 class TapeInventoryReplicaAttemptStarted(_message.Message):
     __slots__ = ("attempt_id", "replica_ordinal")

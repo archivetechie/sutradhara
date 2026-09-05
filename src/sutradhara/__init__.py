@@ -1,6 +1,6 @@
 """Sutradhara — orchestrator above Remanence.
 
-See docs/spec-v0.1.md for the design.
+See docs/architecture-overview.md for the current design.
 """
 
 __version__ = "0.0.1"

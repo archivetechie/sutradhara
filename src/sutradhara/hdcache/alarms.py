@@ -181,7 +181,9 @@ def evaluate_hdcache_alarm_conditions(
         )
 
     lost_count = int(
-        session.scalar(select(func.count()).select_from(CacheEntry).where(CacheEntry.state == "lost"))
+        session.scalar(
+            select(func.count()).select_from(CacheEntry).where(CacheEntry.state == "lost")
+        )
         or 0
     )
     rows.append(

@@ -442,11 +442,7 @@ def _drive_payload(
     is_admin: bool,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
-        "bay": (
-            str(int(drive.element_address))
-            if drive.HasField("element_address")
-            else None
-        ),
+        "bay": (str(int(drive.element_address)) if drive.HasField("element_address") else None),
         "status": _drive_status(drive.status),
     }
     if is_admin:

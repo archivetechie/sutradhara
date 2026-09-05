@@ -2,7 +2,9 @@
 
 Vendored Layer 5 gRPC contract from [Remanence](https://github.com/archivetechie/remanence).
 
-- **`layer5.proto`** — copied verbatim from `archivetechie/remanence:proto/layer5.proto`. Wire-stability is not promised yet; expect breakage as Remanence Layer 5 implementation begins.
+- **`layer5.proto`** — copied verbatim from `archivetechie/remanence:proto/layer5.proto`.
+  Layer 5 is implemented, but its pre-1.0 wire contract may still evolve; synchronize
+  this copy and regenerate the committed stubs whenever the Remanence contract changes.
 - **`google/rpc/status.proto`**, **`google/rpc/error_details.proto`** — Remanence's vendored subset of googleapis' rich-error detail types, copied verbatim from `archivetechie/remanence:proto/google/rpc/`. They decode the `grpc-status-details-bin` trailer on `INVALID_ARGUMENT` responses (`PlanBatchRead` names offending targets by index through `google.rpc.BadRequest`).
 
 ## Why vendor?

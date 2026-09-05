@@ -70,6 +70,11 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip(
+        "pfr_core",
+        reason="optional format-anatomy package is not installed",
+        exc_type=ImportError,
+    )
     monkeypatch.setenv("SUTRADHARA_FAKE_TRANSCODE", "1")
     monkeypatch.setenv("SUTRADHARA_FAKE_FFPROBE", "1")
     monkeypatch.setenv("SUTRADHARA_FAKE_CLOUD_BLOB", "1")
@@ -337,6 +342,11 @@ def test_pfr_index_fact_is_idempotent_and_preserves_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip(
+        "pfr_core",
+        reason="optional format-anatomy package is not installed",
+        exc_type=ImportError,
+    )
     monkeypatch.setenv("SUTRADHARA_FAKE_FFPROBE", "1")
     landing = tmp_path / "landing"
     _write_intake(landing, "card-111", {"clip.mov": b"valid video payload"})

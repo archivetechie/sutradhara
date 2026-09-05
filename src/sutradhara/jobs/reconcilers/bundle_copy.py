@@ -67,7 +67,9 @@ def enumerate_targets(
     if not rows:
         return []
     bundle_ids = [bundle_id for bundle_id, _classes in rows]
-    classes = {artifactclass for _bundle_id, bundle_classes in rows for artifactclass in bundle_classes}
+    classes = {
+        artifactclass for _bundle_id, bundle_classes in rows for artifactclass in bundle_classes
+    }
     desired_by_class = _desired_targets_by_class(session, classes)
     floors_by_class = _floors_for_classes(session, classes)
     placement_aggregates = _reconciler_aggregates(session, bundle_ids)
@@ -203,9 +205,7 @@ def _sealed_bundle_rows(
     ):
         classes_by_bundle[str(bundle_id)].add(str(artifactclass))
 
-    memberless_groups = {
-        group for bundle_id, group in bundles if not classes_by_bundle[bundle_id]
-    }
+    memberless_groups = {group for bundle_id, group in bundles if not classes_by_bundle[bundle_id]}
     projection_classes: dict[str, set[str]] = {group: set() for group in memberless_groups}
     if memberless_groups:
         for group, artifactclass in session.execute(
@@ -296,9 +296,9 @@ def _desired_targets_by_class(
             tier=pool.tier,
             sort_order=membership.sort_order,
         )
-        result.setdefault(membership.artifactclass, {})[
-            (target.backend_id, target.pool_id)
-        ] = target
+        result.setdefault(membership.artifactclass, {})[(target.backend_id, target.pool_id)] = (
+            target
+        )
     return result
 
 
@@ -307,8 +307,7 @@ def _floors_for_classes(
     artifactclasses: set[str],
 ) -> dict[str, DurabilityFloor]:
     return {
-        artifactclass: _floor_for_class(session, artifactclass)
-        for artifactclass in artifactclasses
+        artifactclass: _floor_for_class(session, artifactclass) for artifactclass in artifactclasses
     }
 
 
@@ -432,7 +431,9 @@ def _reconciler_aggregates(
     pending_ids = pending_verification_copy_ids(session)
     if not pending_ids:
         return aggregates
-    errors = {bundle_id: list(aggregate.media_errors) for bundle_id, aggregate in aggregates.items()}
+    errors = {
+        bundle_id: list(aggregate.media_errors) for bundle_id, aggregate in aggregates.items()
+    }
     pending = session.scalars(
         select(Copy)
         .options(joinedload(Copy.backend))
@@ -485,7 +486,9 @@ def _structural_floor_message(
     desired_families = _desired_families(session, desired_targets)
     defects: list[str] = []
     if len(desired_targets) < floor.min_copies:
-        defects.append(f"write-eligible pools {len(desired_targets)} < min_copies {floor.min_copies}")
+        defects.append(
+            f"write-eligible pools {len(desired_targets)} < min_copies {floor.min_copies}"
+        )
     if len(set(desired_families.values())) < floor.min_impl_families:
         defects.append(
             "implementation families "
@@ -512,10 +515,7 @@ def _desired_families(
         .join(Backend, Pool.backend_id == Backend.id)
         .where(Pool.id.in_(pool_ids))
     )
-    return {
-        (int(backend_id), str(pool_id)): str(family)
-        for backend_id, pool_id, family in rows
-    }
+    return {(int(backend_id), str(pool_id)): str(family) for backend_id, pool_id, family in rows}
 
 
 def _realized_media_conflicts(aggregate: BundleCopyAggregate) -> list[str]:

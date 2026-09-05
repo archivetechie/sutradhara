@@ -6,14 +6,31 @@ Importing this package registers every built-in handler (via the
 
 from __future__ import annotations
 
+import logging
+from importlib import import_module
+
 # Side-effect imports: each module's @register_handler decorator runs.
 from sutradhara.jobs.handlers import bundle_repair as _bundle_repair  # noqa: F401
 from sutradhara.jobs.handlers import bundle_sweep as _bundle_sweep  # noqa: F401
 from sutradhara.jobs.handlers import cloud_blob as _cloud_blob  # noqa: F401
 from sutradhara.jobs.handlers import copy as _copy  # noqa: F401
 from sutradhara.jobs.handlers import hdcache_fill as _hdcache_fill  # noqa: F401
-from sutradhara.jobs.handlers import pfr_index as _pfr_index  # noqa: F401
 from sutradhara.jobs.handlers import restore as _restore  # noqa: F401
 from sutradhara.jobs.handlers import transcode as _transcode  # noqa: F401
 from sutradhara.jobs.handlers import validate as _validate  # noqa: F401
 from sutradhara.jobs.handlers import verify as _verify  # noqa: F401
+from sutradhara.optional import pfr_core_available
+
+LOGGER = logging.getLogger(__name__)
+
+if pfr_core_available():
+    try:
+        _pfr_index = import_module("sutradhara.jobs.handlers.pfr_index")
+    except (ImportError, AttributeError):
+        LOGGER.warning(
+            "optional format-anatomy installation is incompatible; disabling PFR handler",
+            exc_info=True,
+        )
+        _pfr_index = import_module("sutradhara.jobs.handlers.pfr_unavailable")
+else:
+    _pfr_index = import_module("sutradhara.jobs.handlers.pfr_unavailable")

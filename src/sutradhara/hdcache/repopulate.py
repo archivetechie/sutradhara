@@ -186,10 +186,11 @@ def repopulation_config_from_env() -> RepopulationConfig:
     return RepopulationConfig(
         fill_config=fill_config_from_env(),
         scratch_root=Path(
-            os.environ.get("SUTRADHARA_HDCACHE_REPOP_SCRATCH_ROOT")
-            or DEFAULT_REPOP_SCRATCH_ROOT
+            os.environ.get("SUTRADHARA_HDCACHE_REPOP_SCRATCH_ROOT") or DEFAULT_REPOP_SCRATCH_ROOT
         ),
-        batch_seconds=_env_int("SUTRADHARA_HDCACHE_REPOP_BATCH_SECONDS", DEFAULT_REPOP_BATCH_SECONDS),
+        batch_seconds=_env_int(
+            "SUTRADHARA_HDCACHE_REPOP_BATCH_SECONDS", DEFAULT_REPOP_BATCH_SECONDS
+        ),
         tape_bytes_per_second=_env_int(
             "SUTRADHARA_HDCACHE_REPOP_TAPE_BYTES_PER_SECOND",
             DEFAULT_REPOP_TAPE_BYTES_PER_SECOND,
@@ -244,10 +245,7 @@ def execute_repopulation_batch(
 
     final_config = config or repopulation_config_from_env()
     raw_items = _batch_items(params)
-    items_by_sha = {
-        _target_from_item(item).content_sha256: item
-        for item in raw_items
-    }
+    items_by_sha = {_target_from_item(item).content_sha256: item for item in raw_items}
     targets = [
         target
         for item in raw_items
@@ -258,7 +256,9 @@ def execute_repopulation_batch(
     final_config.scratch_root.mkdir(parents=True, exist_ok=True)
     os.chmod(final_config.scratch_root, 0o700)
     results: list[HdcacheFillResult] = []
-    with tempfile.TemporaryDirectory(prefix="hdcache-repop-batch-", dir=final_config.scratch_root) as raw:
+    with tempfile.TemporaryDirectory(
+        prefix="hdcache-repop-batch-", dir=final_config.scratch_root
+    ) as raw:
         root = Path(raw)
         for group in _group_targets_for_restore(targets):
             group = [
@@ -347,10 +347,7 @@ def drain_retiring_disk(
     )
     if limit is not None:
         query = query.limit(limit)
-    entries = [
-        entry.content_sha256
-        for entry in session.scalars(query)
-    ]
+    entries = [entry.content_sha256 for entry in session.scalars(query)]
     moved = 0
     fallback = 0
     failed = 0
@@ -367,12 +364,21 @@ def drain_retiring_disk(
             continue
         old_representation = entry.representation
         old_key_epoch = entry.key_epoch
-        with tempfile.TemporaryDirectory(prefix="hdcache-drain-", dir=final_config.scratch_root) as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="hdcache-drain-", dir=final_config.scratch_root
+        ) as raw:
             plaintext = Path(raw) / "plain"
             try:
                 _read_entry_plaintext(session, disk, entry, plaintext, config=final_config)
                 source_kind = "drain-local"
-            except (StoreContentMismatch, StoreReadTimeout, StoreError, OSError, RuntimeError, ValueError):
+            except (
+                StoreContentMismatch,
+                StoreReadTimeout,
+                StoreError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ):
                 disk = _fresh_retiring_disk(session, disk_id)
                 entry = _fresh_drain_entry(session, digest, disk_id)
                 if entry is None:
@@ -480,11 +486,7 @@ def repopulation_batch_payload(batch: RepopulationBatch) -> dict[str, Any]:
         "batch_id": batch.batch_id,
         "source_tape": batch.source_tape,
         "origin_drill_ids": sorted(
-            {
-                item.lost_drill_id
-                for item in batch.items
-                if item.lost_drill_id is not None
-            }
+            {item.lost_drill_id for item in batch.items if item.lost_drill_id is not None}
         ),
         "items": [_batch_item_payload(item) for item in batch.items],
     }
@@ -887,7 +889,9 @@ def _status_for_drill(
     started_values = [_as_utc(entry.lost_at) for entry in entries if entry.lost_at is not None]
     started_at = min(started_values) if started_values else None
     remaining = [entry for entry in entries if entry.state == "lost"]
-    refilled = [entry for entry in entries if entry.state == "present" and entry.refilled_at is not None]
+    refilled = [
+        entry for entry in entries if entry.state == "present" and entry.refilled_at is not None
+    ]
     remaining_bytes = sum(entry.size_bytes for entry in remaining)
     refilled_bytes = sum(entry.size_bytes for entry in refilled)
     bytes_per_hour: float | None = None
@@ -896,7 +900,9 @@ def _status_for_drill(
         elapsed_hours = max((now - started_at).total_seconds() / 3600, 0.0)
         if elapsed_hours > 0 and refilled_bytes > 0:
             bytes_per_hour = refilled_bytes / elapsed_hours
-            eta_seconds = None if remaining_bytes == 0 else remaining_bytes / (bytes_per_hour / 3600)
+            eta_seconds = (
+                None if remaining_bytes == 0 else remaining_bytes / (bytes_per_hour / 3600)
+            )
     return DrillStatus(
         disk_id=disk_id,
         drill_id=drill_id,

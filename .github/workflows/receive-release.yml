@@ -31,6 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v9
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --extra dev
       - name: Verify package version
         id: version
         run: |
@@ -63,6 +68,12 @@ jobs:
             fi
           fi
           echo "package-version=$cargo_version" >> "$GITHUB_OUTPUT"
+      - name: Test Rust receive core and shared fixtures
+        run: cargo test --locked --manifest-path "$PACKAGE_DIR/Cargo.toml"
+      - name: Verify Python-generated fixture corpus
+        run: |
+          uv run python "$PACKAGE_DIR/scripts/extract_fixtures.py"
+          git diff --exit-code -- "$PACKAGE_DIR/fixtures"
 
   manylinux-wheel:
     name: manylinux wheel

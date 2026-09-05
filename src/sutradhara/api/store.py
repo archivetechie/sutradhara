@@ -539,7 +539,8 @@ def reconcile_device_receive_leases(
                 _release_record_lease(session, record)
                 expired += 1
                 continue
-            assert record.card_identity is not None
+            if record.card_identity is None:
+                raise RuntimeError("device receive intent has no card identity")
             lease_source_id = record.lease_source_id or card_lease_source_id(record.card_identity)
             if _claim_source_in_session(
                 session,
@@ -1050,7 +1051,8 @@ def _authorize_record_lease(
     ttl: dt.timedelta,
     now: dt.datetime,
 ) -> bool:
-    assert record.card_identity is not None
+    if record.card_identity is None:
+        raise RuntimeError("device receive intent has no card identity")
     lease_source_id = card_lease_source_id(record.card_identity)
     if not _claim_source_in_session(
         session,
@@ -1157,10 +1159,7 @@ def _claim_owned_by(
 ) -> bool:
     """Centralize the operator-and-key source-claim ownership predicate."""
 
-    return (
-        claim.operator_username == operator_username
-        and claim.idempotency_key == idempotency_key
-    )
+    return claim.operator_username == operator_username and claim.idempotency_key == idempotency_key
 
 
 def _reconcile_orphaned_grpc_intakes(
@@ -1196,8 +1195,7 @@ def _reconcile_orphaned_grpc_intakes(
             )
             .order_by(GrpcIntake.updated_at, GrpcIntake.intake_id)
             .limit(batch_size)
-        )
-        .unique()
+        ).unique()
     )
     if not rows:
         return 0

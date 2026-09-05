@@ -199,7 +199,13 @@ def test_pfr_sidecar_observation_has_no_derived_item_or_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip(
+        "pfr_core",
+        reason="optional format-anatomy package is not installed",
+        exc_type=ImportError,
+    )
     monkeypatch.setenv("SUTRADHARA_FAKE_FFPROBE", "1")
+    monkeypatch.setenv("SUTRADHARA_CACHE_ROOT", str(tmp_path / "cache"))
     item_id = _register_prepared_video(engine, tmp_path, "card-pfr", profile="hd-review")
 
     with session_scope(engine) as session:

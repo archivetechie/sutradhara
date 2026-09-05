@@ -187,7 +187,9 @@ def test_rebuild_inserts_untrusted_rows_and_walker_promotes(
         )
 
         assert result.entries == 1
-        assert [(failure.relpath, failure.content_sha256, failure.reason) for failure in result.failures] == [
+        assert [
+            (failure.relpath, failure.content_sha256, failure.reason) for failure in result.failures
+        ] == [
             ("aa/not-a-cache-entry", None, "malformed-name"),
             (
                 str(foreign_path.relative_to(mount / "hdcache" / "v1")),

@@ -39,11 +39,15 @@ from sutradhara.grpc.store import issue_enroll_token as issue_enroll_token_row
     show_default=True,
     help="Sutradhara gRPC PKI directory.",
 )
-@click.option("--issue-enroll-token", is_flag=True, default=False, help="Mint a 24h enrollment token.")
+@click.option(
+    "--issue-enroll-token", is_flag=True, default=False, help="Mint a 24h enrollment token."
+)
 @click.option("--device-id", default=None, help="Device id for --issue-enroll-token.")
 @click.option("--revoke-device", default=None, help="Revoke all certificates for DEVICE_ID.")
 @click.option("--sign-csr", type=click.Path(path_type=Path, dir_okay=False), default=None)
-@click.option("--operator", "operator_name", default=None, help="Operator for --issue-enroll-token.")
+@click.option(
+    "--operator", "operator_name", default=None, help="Operator for --issue-enroll-token."
+)
 @click.option("--cert-out", type=click.Path(path_type=Path, dir_okay=False), default=None)
 @click.option("--token", default=None, help="Enrollment token for --sign-csr.")
 @click.option(

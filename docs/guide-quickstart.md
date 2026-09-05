@@ -15,8 +15,12 @@ Requires Python ≥ 3.11 and [`uv`](https://docs.astral.sh/uv/).
 ```sh
 git clone <repo> sutradhara && cd sutradhara
 uv sync            # installs the workspace, incl. packages/sutradhara-receive
-uv run pytest -q   # hermetic test suite; one optional live-MinIO test may skip
+uv run pytest -q   # hermetic base suite; external-integration tests may skip
 ```
+
+Partial-file restore is optional and needs a separately distributed compatible
+`format-anatomy` package. Its absence does not affect this tour, the base CLI,
+or the worker.
 
 The CLI lands in the virtualenv as `.venv/bin/sutra`. The examples below
 assume `.venv/bin` is on your `PATH` or you prefix each command with
@@ -104,11 +108,10 @@ accumulate` and `sutra archive bundle sweep`, restore, retention — is
 wired end to end but needs the
 Remanence `rem` CLI (set `REM_BIN`), registered pools with an applied
 artifactclass policy, and for encrypted placements a key registry
-directory. See [`reference-config.md`](reference-config.md) for those
-knobs and [`architecture-overview.md`](architecture-overview.md) for the
-flow. The maintainer's end-to-end truth lives in the separate `~/system`
-scenario harness (per `CLAUDE.md`), which drives this repo as an editable
-dependency.
+directory. See [`reference-config.md`](reference-config.md) for those knobs,
+[`architecture-overview.md`](architecture-overview.md) for the flow, and
+[`guide-deployment.md`](guide-deployment.md) for production service and proxy
+templates.
 
 <!-- code-anchor: src/sutradhara/cli/admin.py src/sutradhara/jobs/worker_lock.py src/sutradhara/resource_control.py src/sutradhara/jobs/reconcilers/conditions.py @ 072cb02 -->
 ## Troubleshooting

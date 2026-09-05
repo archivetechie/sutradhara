@@ -75,7 +75,9 @@ class S3Backend:
                     metadata=metadata,
                 )
 
-    def write_object_to_pool(self, source: Path | str, pool: str, *, caller_object_id: str | None = None) -> CopyRecord:
+    def write_object_to_pool(
+        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+    ) -> CopyRecord:
         source_path = Path(source)
         key = self._join_key(pool.strip("/"), source_path.name)
         return self.write_object(source_path, key=key, pool=pool)

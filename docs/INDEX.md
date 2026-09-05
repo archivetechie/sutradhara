@@ -2,7 +2,11 @@
 
 - [Architecture overview](architecture-overview.md) — system boundaries, durability,
   deletion-evidence gates, and operational data flow.
+- [Design decision register](design-decisions.md) — public rationale and consequences
+  for the architecture's load-bearing choices.
 - [Quickstart](guide-quickstart.md) — local setup and first catalog workflow.
+- [Deployment guide](guide-deployment.md) — production services, Remanence,
+  key bootstrap, and reverse-proxy trust boundary.
 - [Data-model walkthrough](guide-data-model-walkthrough.md) — catalog concepts and
   relationships.
 - [CLI reference](reference-cli.md) — operator commands, including retention,
@@ -16,6 +20,9 @@
 - [Glossary](reference-glossary.md) — project terminology.
 - [Arrangement ARC guide](arrangement-arc-guide.md) — arrangement review workflow.
 - [Examples](examples/README.md) — example configuration and agent bundles.
+- [Security policy](../SECURITY.md) — supported versions and private reporting.
+- [Contributing](../CONTRIBUTING.md) — development, quality gates, and review workflow.
+- [Changelog](../CHANGELOG.md) — release-visible changes.
 
 The deletion-evidence prompt-1 gate and prompt-2 journal implementations are
 documented in the architecture, CLI, database-schema, configuration, and journal

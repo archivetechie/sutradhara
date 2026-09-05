@@ -523,9 +523,7 @@ def test_non_utf8_source_path_is_quarantined_and_the_rest_of_the_bundle_builds(
             "nested/b.bin",
         ]
         [quarantine] = list(s.scalars(select(Bundle).where(Bundle.status == "held")))
-        assert [row.member_path for row in _member_rows_for_flush(s, quarantine)] == [
-            "cafe.mov"
-        ]
+        assert [row.member_path for row in _member_rows_for_flush(s, quarantine)] == ["cafe.mov"]
         reason = quarantine.review_summary["quarantined_members"][0]["reason"]
         assert "not UTF-8" in reason
 
@@ -706,9 +704,7 @@ def test_map_route_argv_carries_map_source_root_slash_and_no_inputs_or_rules(
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         captured.append(cmd)
         # Snapshot the map before the flush's TemporaryDirectory disappears.
-        map_texts.append(
-            Path(cmd[cmd.index("--map") + 1]).read_text(encoding="utf-8")
-        )
+        map_texts.append(Path(cmd[cmd.index("--map") + 1]).read_text(encoding="utf-8"))
         out = Path(cmd[cmd.index("--out") + 1])
         manifest_out = Path(cmd[cmd.index("--manifest-out") + 1])
         result = _fake_rao_build(
@@ -736,9 +732,7 @@ def test_map_route_argv_carries_map_source_root_slash_and_no_inputs_or_rules(
             "o-archive",
             pools=(("o-copy-1-pool", Representation.RAO_PLAIN_V1.value),),
         )
-        bundle_id = _enqueue(
-            s, artifactclass="o-archive", source=source, member_path="only.bin"
-        ).id
+        bundle_id = _enqueue(s, artifactclass="o-archive", source=source, member_path="only.bin").id
 
     with session_scope(engine) as s:
         flush_bundle(
@@ -810,9 +804,7 @@ def test_same_representation_targets_get_separate_work_dirs(
                 ("rao-pool-b", Representation.RAO_PLAIN_V1.value),
             ),
         )
-        bundle_id = _enqueue(
-            s, artifactclass="o-archive", source=source, member_path="only.bin"
-        ).id
+        bundle_id = _enqueue(s, artifactclass="o-archive", source=source, member_path="only.bin").id
 
     with session_scope(engine) as s:
         result = flush_bundle(
@@ -940,7 +932,7 @@ def test_writer_digest_failure_quarantines_by_archive_path(
     unidentified failure, poisoning the whole multi-class bundle."""
     bundle_id, backend = _two_member_bundle(engine, tmp_path)
     builder = _FailingBuilder(
-        ['rem archive build failed: streamed data hash for a.bin does not match spec']
+        ["rem archive build failed: streamed data hash for a.bin does not match spec"]
     )
 
     with session_scope(engine) as s:
@@ -955,9 +947,7 @@ def test_writer_digest_failure_quarantines_by_archive_path(
     with session_scope(engine) as s:
         sealed = s.get(Bundle, bundle_id)
         assert sealed is not None
-        assert [row.member_path for row in _member_rows_for_flush(s, sealed)] == [
-            "nested/b.bin"
-        ]
+        assert [row.member_path for row in _member_rows_for_flush(s, sealed)] == ["nested/b.bin"]
         [quarantine] = list(s.scalars(select(Bundle).where(Bundle.status == "held")))
         assert [row.member_path for row in _member_rows_for_flush(s, quarantine)] == ["a.bin"]
     assert _map_archive_paths(builder.maps[0]) == ["a.bin", "nested/b.bin"]
@@ -975,8 +965,7 @@ _REM_SHAPED_STDERR = {
         "nested/b.bin",
     ),
     "archive-path": (
-        "error: invalid REM-OBJECT input: streamed data hash for a.bin "
-        "does not match spec",
+        "error: invalid REM-OBJECT input: streamed data hash for a.bin does not match spec",
         "a.bin",
     ),
 }
@@ -1071,9 +1060,7 @@ def test_quarantine_moves_staging_transform_rows_with_the_member(
     with session_scope(engine) as s:
         bundle = s.get(Bundle, bundle_id)
         assert bundle is not None
-        [target] = [
-            row for row in _member_rows_for_flush(s, bundle) if row.member_path == "a.bin"
-        ]
+        [target] = [row for row in _member_rows_for_flush(s, bundle) if row.member_path == "a.bin"]
         s.add(
             StagingTransform(
                 bundle_id=bundle_id,
@@ -1141,9 +1128,7 @@ def test_quarantine_loop_is_bounded_by_the_member_count(
     member_count attempts. Guards an unbounded retry against a rem that always
     blames the first map line."""
     bundle_id, backend = _two_member_bundle(engine, tmp_path)
-    builder = _FailingBuilder(
-        ["rem archive build failed: source map line 2 missing source"] * 8
-    )
+    builder = _FailingBuilder(["rem archive build failed: source map line 2 missing source"] * 8)
 
     with session_scope(engine) as s, pytest.raises(ArchiveFanoutError, match="no members left"):
         flush_bundle(

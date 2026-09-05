@@ -28,7 +28,7 @@ def scrub_cmd(backend_name: str) -> None:
     """Re-enumerate a backend and reconcile against the catalog.
 
     The load-bearing demo of the rebuildable-index principle
-    (docs/spec-v0.1.md §2 principle 1 + §7).
+    (the rebuildable-catalog principle in docs/architecture-overview.md).
     """
     engine = make_engine()
     with session_scope(engine) as s:

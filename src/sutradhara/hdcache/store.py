@@ -349,7 +349,9 @@ def verify_disk_identity(
     try:
         sentinel = json.loads(sentinel_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        return DiskIdentityResult(False, "bad_sentinel", f"disk sentinel is unreadable: {exc}", observed)
+        return DiskIdentityResult(
+            False, "bad_sentinel", f"disk sentinel is unreadable: {exc}", observed
+        )
     if not isinstance(sentinel, dict):
         return DiskIdentityResult(False, "bad_sentinel", "disk sentinel is not an object", observed)
     hmac_value = sentinel.get("hmac")
@@ -366,7 +368,9 @@ def verify_disk_identity(
         ("layout", LAYOUT_VERSION),
     ):
         if sentinel.get(key) != value:
-            return DiskIdentityResult(False, "sentinel_mismatch", f"sentinel {key} mismatch", observed)
+            return DiskIdentityResult(
+                False, "sentinel_mismatch", f"sentinel {key} mismatch", observed
+            )
     return DiskIdentityResult(True, "ok", "disk identity verified", observed)
 
 
@@ -555,7 +559,8 @@ def _read_entry_verified_direct(
             if output is not None:
                 output.write(chunk)
             else:
-                assert chunks is not None
+                if chunks is None:
+                    raise RuntimeError("stream collector is missing its chunk buffer")
                 chunks.append(chunk)
     stream_digest = digest.digest()
     if stream_digest != expected:

@@ -85,7 +85,9 @@ def test_assembly_writes_single_package_index_with_null_non_file_members(tmp_pat
 
     index = read_package_index(intake_dir / PACKAGE_INDEX_NAME)
     assert len(index["packages"]) == 1
-    directory = next(member for member in index["packages"][0]["members"] if member["type"] == "directory")
+    directory = next(
+        member for member in index["packages"][0]["members"] if member["type"] == "directory"
+    )
     assert directory["sha256"] is None
     assert directory["data_offset"] is None
     assert validate_bag(intake_dir).valid

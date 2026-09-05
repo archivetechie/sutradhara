@@ -172,9 +172,7 @@ class ConformanceScan:
         # compliant informational clusters, not deviations — only reasons
         # outside that set hold a compliant-expect bundle.
         compliant = {"native", "exclude-rule", "blob-rule"}
-        return any(c.reason not in compliant for c in self.clusters) or bool(
-            self.exclusions
-        )
+        return any(c.reason not in compliant for c in self.clusters) or bool(self.exclusions)
 
     def to_summary(self) -> dict[str, Any]:
         return {
@@ -311,7 +309,6 @@ class FanoutResult:
     failed_pools: tuple[str, ...] = ()
     condition_reason: str | None = None
     condition_message: str | None = None
-
 
 
 class LocalArchiveBuilder:
@@ -651,8 +648,7 @@ def flush_bundle(
             member_rows = _member_rows_for_flush(session, bundle)
             if not member_rows:
                 raise ArchiveFanoutError(
-                    f"bundle {bundle.id!r} has no members left to flush; "
-                    f"all were quarantined"
+                    f"bundle {bundle.id!r} has no members left to flush; all were quarantined"
                 )
             if max_attempts is None:
                 # Each retry quarantines exactly one member, so the loop is
@@ -761,9 +757,7 @@ def flush_bundle(
         tuple(copy_ids),
         manifest_receipt,
         partial=bool(transient_failures or write_failures),
-        failed_pools=tuple(
-            failure.pool_id for failure in (*transient_failures, *write_failures)
-        ),
+        failed_pools=tuple(failure.pool_id for failure in (*transient_failures, *write_failures)),
         condition_reason=condition_reason,
         condition_message=condition_message,
     )
@@ -802,9 +796,7 @@ def _member_rows_for_flush(session: Session, bundle: Bundle) -> list[BundleMembe
     the same catalog could then lay members down in one order on SQLite and
     another on Postgres. Python compares by codepoint, everywhere.
     """
-    rows = list(
-        session.scalars(select(BundleMember).where(BundleMember.bundle_id == bundle.id))
-    )
+    rows = list(session.scalars(select(BundleMember).where(BundleMember.bundle_id == bundle.id)))
     return sorted(rows, key=lambda row: row.member_path)
 
 
@@ -1284,9 +1276,7 @@ def _quarantine_member(
         session.add(quarantine)
         session.flush()
     session.execute(
-        update(BundleMember)
-        .where(BundleMember.id == member_row.id)
-        .values(bundle_id=quarantine.id)
+        update(BundleMember).where(BundleMember.id == member_row.id).values(bundle_id=quarantine.id)
     )
     session.execute(
         update(StagingTransform)
@@ -1392,9 +1382,7 @@ def _record_bundle_copy_write_failure(
     human decides whether to re-place, re-verify, or condemn the media.
     """
     detail = "; ".join(f"pool {failure.pool_id}: {failure.cause}" for failure in failures)
-    message = (
-        f"bundle {bundle_id} sealed with partial fan-out; post-write failure for {detail}"
-    )
+    message = f"bundle {bundle_id} sealed with partial fan-out; post-write failure for {detail}"
     record_observation(
         session,
         domain="bundle_copy",
@@ -1753,9 +1741,7 @@ def _build_d2_tar(
                     # Carried through so the built-member check reads the same
                     # lineage column on every representation, not just RAO.
                     ingest_item_id=(
-                        None
-                        if member.ingest_item_id is None
-                        else str(member.ingest_item_id)
+                        None if member.ingest_item_id is None else str(member.ingest_item_id)
                     ),
                 )
             )
@@ -1849,9 +1835,7 @@ def _record_build_exclusions(
         return rulesets[artifactclass]
 
     for exclusion in artifact.exclusions:
-        member = (
-            members_by_path.get(exclusion.path) if exclusion.count <= 1 else None
-        )
+        member = members_by_path.get(exclusion.path) if exclusion.count <= 1 else None
         artifactclass = member.artifactclass if member is not None else sole_class
         record_exclusion(
             session,
@@ -2119,8 +2103,7 @@ def _members_from_manifest(
         reported_size = item.get("size_bytes")
         if reported_size != source.size_bytes:
             raise ArchiveFanoutError(
-                f"rem manifest resized member {path!r}: "
-                f"{reported_size!r} != {source.size_bytes}"
+                f"rem manifest resized member {path!r}: {reported_size!r} != {source.size_bytes}"
             )
         reported_sha256 = item.get("sha256")
         try:
