@@ -25,16 +25,16 @@ from sutradhara.catalog.types import BackendKind, BackendTier, content_hash
 def test_ssh_disk_backend_write_range_verify_enumerate_and_delete(tmp_path: Path) -> None:
     transport = _LocalDirTransport(tmp_path / "remote")
     backend = SshDiskBackend("lan", host="ignored", root="/ignored", transport=transport)
-    source = tmp_path / "object.rao"
+    source = tmp_path / "object.rem-object"
     source.write_bytes(b"abcdef")
 
-    record = backend.write_object(source, key="intakes/card-1.rao", pool="cloud-temp")
+    record = backend.write_object(source, key="intakes/card-1.rem-object", pool="cloud-temp")
 
     digest = content_hash(hashlib.sha256(b"abcdef").digest())
     assert record.logical_id == digest
     assert record.integrity_hash == digest
     assert record.native_locator == {
-        "key": "intakes/card-1.rao",
+        "key": "intakes/card-1.rem-object",
         "sha256": digest.hex(),
         "size_bytes": 6,
     }
@@ -49,13 +49,13 @@ def test_ssh_disk_backend_write_range_verify_enumerate_and_delete(tmp_path: Path
         assert list(chunks) == [b"bc", b"de", b"f"]
     assert backend.verify(record.native_locator).ok
 
-    backend.write_object(source, key="intakes/card-1.rao", pool="cloud-temp")
+    backend.write_object(source, key="intakes/card-1.rem-object", pool="cloud-temp")
     rows = list(backend.enumerate())
     assert len(rows) == 1
     assert rows[0].native_locator == record.native_locator
     assert rows[0].integrity_hash == digest
 
-    (tmp_path / "remote" / "intakes" / "card-1.rao").write_bytes(b"corrupt")
+    (tmp_path / "remote" / "intakes" / "card-1.rem-object").write_bytes(b"corrupt")
     mismatch = backend.verify(record.native_locator)
     assert not mismatch.ok
     assert mismatch.actual_hash == content_hash(hashlib.sha256(b"corrupt").digest())
@@ -70,7 +70,7 @@ def test_ssh_disk_backend_write_range_verify_enumerate_and_delete(tmp_path: Path
 def test_ssh_disk_backend_rejects_unsafe_keys_before_transport(tmp_path: Path) -> None:
     transport = _LocalDirTransport(tmp_path / "remote")
     backend = SshDiskBackend("lan", host="ignored", root="/ignored", transport=transport)
-    source = tmp_path / "object.rao"
+    source = tmp_path / "object.rem-object"
     source.write_bytes(b"payload")
     unsafe_keys = [
         "../x",
@@ -103,26 +103,26 @@ def test_ssh_disk_backend_rejects_unsafe_keys_before_transport(tmp_path: Path) -
 def test_ssh_disk_verify_and_enumerate_are_defensive(tmp_path: Path) -> None:
     transport = _LocalDirTransport(tmp_path / "remote")
     backend = SshDiskBackend("lan", host="ignored", root="/ignored", transport=transport)
-    source = tmp_path / "object.rao"
+    source = tmp_path / "object.rem-object"
     source.write_bytes(b"payload")
-    record = backend.write_object(source, key="intakes/card-1.rao")
+    record = backend.write_object(source, key="intakes/card-1.rem-object")
 
-    assert not backend.verify({"key": "intakes/card-1.rao"}).ok
-    assert not backend.verify({"key": "intakes/card-1.rao", "sha256": "00"}).ok
+    assert not backend.verify({"key": "intakes/card-1.rem-object"}).ok
+    assert not backend.verify({"key": "intakes/card-1.rem-object", "sha256": "00"}).ok
 
-    transport.hash_overrides["intakes/card-1.rao"] = "not-hex"
+    transport.hash_overrides["intakes/card-1.rem-object"] = "not-hex"
     assert not backend.verify(record.native_locator).ok
-    transport.hash_overrides["intakes/card-1.rao"] = "00"
+    transport.hash_overrides["intakes/card-1.rem-object"] = "00"
     assert not backend.verify(record.native_locator).ok
 
-    transport.hash_overrides.pop("intakes/card-1.rao")
-    (tmp_path / "remote" / "bad-hash.rao").write_bytes(b"bad")
-    transport.hash_overrides["bad-hash.rao"] = "00"
-    transport.extra_list_entries.extend(["a/../bad.rao", "missing.rao"])
-    transport.missing_hashes.add("missing.rao")
+    transport.hash_overrides.pop("intakes/card-1.rem-object")
+    (tmp_path / "remote" / "bad-hash.rem-object").write_bytes(b"bad")
+    transport.hash_overrides["bad-hash.rem-object"] = "00"
+    transport.extra_list_entries.extend(["a/../bad.rem-object", "missing.rem-object"])
+    transport.missing_hashes.add("missing.rem-object")
 
     rows = list(backend.enumerate())
-    assert [row.native_locator["key"] for row in rows] == ["intakes/card-1.rao"]
+    assert [row.native_locator["key"] for row in rows] == ["intakes/card-1.rem-object"]
 
 
 def test_backend_factory_builds_ssh_disk_and_validates_config() -> None:
@@ -169,10 +169,12 @@ def test_rsync_ssh_transport_constructs_safe_commands(tmp_path: Path) -> None:
         assert timeout > 0
         assert shell is False
         calls.append(list(argv))
-        stdout = "intakes/card 'one.rao\n" if argv[0] == "ssh" and "find " in argv[-1] else ""
+        stdout = (
+            "intakes/card 'one.rem-object\n" if argv[0] == "ssh" and "find " in argv[-1] else ""
+        )
         return _completed(argv, stdout=stdout)
 
-    source = tmp_path / "clip 'one.rao"
+    source = tmp_path / "clip 'one.rem-object"
     source.write_bytes(b"payload")
     transport = RsyncSshTransport(
         "backup.example",
@@ -183,20 +185,20 @@ def test_rsync_ssh_transport_constructs_safe_commands(tmp_path: Path) -> None:
         runner=runner,
     )
 
-    transport.put(source, "intakes/card 'one.rao")
+    transport.put(source, "intakes/card 'one.rem-object")
     assert [call[0] for call in calls] == ["ssh", "rsync", "ssh"]
     assert "mkdir -p" in calls[0][-1]
     assert calls[1][:4] == ["rsync", "-a", "--partial", "--protect-args"]
     assert calls[1][4] == "-e"
     assert "BatchMode=yes" in calls[1][5]
     assert "ConnectTimeout=" in calls[1][5]
-    assert calls[1][-1].endswith("/remote root/quote'root/intakes/card 'one.rao.partial")
+    assert calls[1][-1].endswith("/remote root/quote'root/intakes/card 'one.rem-object.partial")
     assert "mv -f" in calls[2][-1]
     assert "quote'\"'\"'root" in calls[0][-1]
-    assert "card '\"'\"'one.rao" in calls[2][-1]
+    assert "card '\"'\"'one.rem-object" in calls[2][-1]
 
     calls.clear()
-    assert list(transport.list_files()) == ["intakes/card 'one.rao"]
+    assert list(transport.list_files()) == ["intakes/card 'one.rem-object"]
     assert calls[0][0] == "ssh"
     assert "! -name '*.partial'" in calls[0][-1]
     assert "-printf '%P\\n'" in calls[0][-1]
@@ -229,22 +231,22 @@ def test_rsync_ssh_transport_append_only_publication_uses_atomic_link(
 
 
 def test_rsync_ssh_transport_classifies_failures(tmp_path: Path) -> None:
-    source = tmp_path / "object.rao"
+    source = tmp_path / "object.rem-object"
     source.write_bytes(b"payload")
 
     absent = RsyncSshTransport("backup.example", "/root", runner=_runner_returning(42))
-    assert absent.sha256("intakes/missing.rao") is None
-    assert absent.size("intakes/missing.rao") is None
+    assert absent.sha256("intakes/missing.rem-object") is None
+    assert absent.size("intakes/missing.rem-object") is None
     with pytest.raises(BackendNotFoundError):
-        absent.get("intakes/missing.rao", tmp_path / "out.rao")
+        absent.get("intakes/missing.rem-object", tmp_path / "out.rem-object")
 
     unavailable = RsyncSshTransport("backup.example", "/root", runner=_runner_returning(255))
     with pytest.raises(BackendUnavailableError):
-        unavailable.sha256("intakes/object.rao")
+        unavailable.sha256("intakes/object.rem-object")
 
     failed = RsyncSshTransport("backup.example", "/root", runner=_runner_returning(13))
     with pytest.raises(BackendError, match="permission denied"):
-        failed.size("intakes/object.rao")
+        failed.size("intakes/object.rem-object")
 
 
 class _LocalDirTransport:

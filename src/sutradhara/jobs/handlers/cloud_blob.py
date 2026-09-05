@@ -1,4 +1,4 @@
-"""`cloud-blob` job: write one encrypted RAO object for an intake."""
+"""`cloud-blob` job: write one encrypted REM-OBJECT object for an intake."""
 
 from __future__ import annotations
 
@@ -100,7 +100,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
     cache_root = Path(str(params.get("cache_root") or ".sutradhara-cache")).resolve()
     blob_dir = cache_root / "intakes" / intake.intake_id / "cloud"
     blob_dir.mkdir(parents=True, exist_ok=True)
-    blob_path = blob_dir / f"{intake.intake_id}.rao"
+    blob_path = blob_dir / f"{intake.intake_id}.rem-object"
     registry = KeyRegistry()
     key_epoch = _cloud_key_epoch(params.get("key_epoch"), registry=registry)
 
@@ -125,7 +125,7 @@ def handle_cloud_blob(ctx: JobContext) -> JobResult:
     )
 
     backend = factory.backend_from_row(backend_row)
-    key = f"intakes/{intake.intake_id}.rao"
+    key = f"intakes/{intake.intake_id}.rem-object"
     if hasattr(backend, "write_object"):
         committed_record = cast(KeyedObjectWriter, backend).write_object(
             blob_path,
@@ -248,10 +248,10 @@ def _cloud_blob_representation(pool: Pool) -> Representation:
         raise ValueError(
             f"pool {pool.id!r} has unsupported representation {pool.representation!r}"
         ) from exc
-    if representation is not Representation.RAO_AEAD_V1:
+    if representation is not Representation.REM_ENCRYPT_V1:
         raise ValueError(
             f"cloud-blob pool {pool.id!r} has representation {representation.value!r}; "
-            f"cloud-blob can only produce {Representation.RAO_AEAD_V1.value!r}"
+            f"cloud-blob can only produce {Representation.REM_ENCRYPT_V1.value!r}"
         )
     return representation
 

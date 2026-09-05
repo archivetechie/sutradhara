@@ -206,20 +206,24 @@ retention release after their tape's media id has an operator-recorded
 `OffsiteConfirmation` (`sutra offsite confirm`).
 
 **cloud-temp / cloud blob** — the per-intake disaster-recovery blob
-uploaded at registration to the `cloud-temp` backend/pool (an encrypted
-RAO of the whole intake). Temporary by design: the retention gate deletes
+uploaded at registration to the `cloud-temp` backend/pool (a REM-ENCRYPT
+envelope of the whole intake). Temporary by design: the retention gate deletes
 it once durable copies are proven.
 
 <!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 8ecf3c8 -->
 ## Sealing
 
 **representation** — the stored form of a copy: `raw-bytes`,
-`rao-plain-v1`, `rao-aead-v1`, or `d2tar-raw` (`Representation` in
+`rem-object-v1`, `rem-encrypt-v1`, or `d2tar-raw` (`Representation` in
 `sealing/port.py`).
 
-**RAO** — Sutradhara's retained internal name for a stored REM-OBJECT
-representation. "The RAO codec" means `RaoCliSealer`/`RaoCliOpener`: a
-stateless local wrapper around `rem archive build/extract`, never a daemon.
+**REM-OBJECT / REM-ENCRYPT** — REM-OBJECT is the canonical plaintext archive
+stream; REM-ENCRYPT is its optional encrypted envelope profile. Sutradhara's
+`rem-object-v1` policy label selects the plaintext stream, while
+`rem-encrypt-v1` selects the envelope. The latter is a pool-policy identifier,
+not a second stream-format identifier: after opening the envelope, its inner
+stream is still `rem-object-v1`. `RemObjectCliSealer`/`RemObjectCliOpener` are
+the stateless local wrappers around `rem archive build/extract`, never a daemon.
 
 **sealer / opener** — the ports that convert plaintext to stored form and
 back (`sealing/port.py`). Every restore and self-heal goes through an

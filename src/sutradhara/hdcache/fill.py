@@ -63,7 +63,7 @@ from sutradhara.jobs.reconcilers.conditions import (
 )
 from sutradhara.keys import KEY_DOMAIN_HDCACHE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.sealing.port import Representation
-from sutradhara.sealing.rao import RaoCliSealer
+from sutradhara.sealing.rem_object import RemObjectCliSealer
 
 DOMAIN = "hdcache"
 JOB_KIND = "hdcache_fill"
@@ -587,7 +587,7 @@ def fill_target(
     *,
     config: HdcacheFillConfig | None = None,
     key_registry: KeyRegistry | None = None,
-    sealer: RaoCliSealer | None = None,
+    sealer: RemObjectCliSealer | None = None,
     key_epoch: KeyEpoch | None = None,
     restore_backends: dict[int, StorageBackend] | None = None,
     restore_backend_resolver: RestoreBackendResolver | None = None,
@@ -708,7 +708,7 @@ def fill_target_from_plaintext(
     source_kind: str,
     config: HdcacheFillConfig | None = None,
     key_registry: KeyRegistry | None = None,
-    sealer: RaoCliSealer | None = None,
+    sealer: RemObjectCliSealer | None = None,
     key_epoch: KeyEpoch | None = None,
 ) -> HdcacheFillResult:
     """Fill one hdcache entry from a caller-supplied verified plaintext file.
@@ -1351,7 +1351,7 @@ def _write_source_to_disk(
     key_epoch: KeyEpoch | None,
     config: HdcacheFillConfig,
     registry: KeyRegistry,
-    sealer: RaoCliSealer | None,
+    sealer: RemObjectCliSealer | None,
 ) -> Any:
     if representation == RAW_REPRESENTATION:
         with source_path.open("rb") as handle:
@@ -1366,10 +1366,10 @@ def _write_source_to_disk(
     if key_epoch is None:
         raise HdcacheFillError("AEAD hdcache fill requires a key epoch")
     assert_key_epoch_domain(key_epoch, KEY_DOMAIN_HDCACHE, context="hdcache fill")
-    final_sealer = sealer or RaoCliSealer(registry, work_dir=config.scratch_root)
+    final_sealer = sealer or RemObjectCliSealer(registry, work_dir=config.scratch_root)
     with final_sealer.seal(
         source_path,
-        Representation.RAO_AEAD_V1,
+        Representation.REM_ENCRYPT_V1,
         key_epoch=key_epoch,
         work_dir=config.scratch_root,
     ) as sealed:

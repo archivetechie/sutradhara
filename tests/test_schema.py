@@ -527,6 +527,205 @@ engine.dispose()
     assert _schema_signatures(migration_path) == _schema_signatures(create_all_path)
 
 
+def test_rem_object_representation_migration_rewrites_catalog_and_fingerprints(
+    tmp_path: Path,
+) -> None:
+    """The clean-break rename must update every authoritative catalog surface."""
+
+    import hashlib
+
+    db_path = tmp_path / "rem-object-rename.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+
+    def migrate(revision: str, *, downgrade: bool = False) -> None:
+        command = "downgrade" if downgrade else "upgrade"
+        subprocess.run(
+            [sys.executable, "-m", "alembic", command, revision],
+            cwd=repo_root,
+            env=env,
+            check=True,
+        )
+
+    migrate("c2d3e4f5a6b7")
+    old_basis = [{"pool": "plain", "representation": "rao-plain-v1"}]
+    old_document = {
+        "basis": old_basis,
+        "basis_source": "derived",
+        "writer_version": 1,
+        "effective": {"target_bytes": 1024, "max_age_seconds": 60},
+    }
+    old_fingerprint = hashlib.sha256(
+        json.dumps(old_basis, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    digest = b"r" * 32
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(
+            "INSERT INTO backend "
+            "(id, name, kind, implementation_family, config, tier, added_at) "
+            "VALUES (1, 'rem', 'rem_tape', 'tape', '{}', 'self_describing', "
+            "'2026-09-05')"
+        )
+        conn.execute(
+            "INSERT INTO pool "
+            "(id, backend_id, representation, location, offsite_gate, tier, "
+            "accepts_writes, retired, created_at) "
+            "VALUES ('plain', 1, 'rao-plain-v1', '', 0, '', 1, 0, '2026-09-05')"
+        )
+        conn.execute(
+            "INSERT INTO artifactclass_pool "
+            "(artifactclass, pool_id, active, sort_order, created_at) "
+            "VALUES ('photo', 'plain', 1, 0, '2026-09-05')"
+        )
+        conn.execute(
+            "INSERT INTO artifactclass_policy "
+            "(artifactclass, ruleset, expect, target_bytes, max_age_seconds, "
+            "restore_preference, min_copies, min_impl_families, staging_config, "
+            "hdcache_config, updated_at, bundle_group) "
+            "VALUES ('photo', 'rules', 'messy', 1024, 60, '[]', 1, 1, '{}', "
+            "'{}', '2026-09-05', ?)",
+            (old_fingerprint,),
+        )
+        conn.execute(
+            "INSERT INTO bundle "
+            "(id, status, total_bytes, member_count, target_bytes, max_age_seconds, "
+            "opened_at, bundle_group, group_basis) "
+            "VALUES ('bundle', 'sealed', 1, 1, 1024, 60, '2026-09-05', ?, ?)",
+            (old_fingerprint, json.dumps(old_document)),
+        )
+        conn.execute(
+            "INSERT INTO logical_asset "
+            "(content_sha256, size_bytes, first_seen_at, validity) "
+            "VALUES (?, 1, '2026-09-05', 'unvalidated')",
+            (digest,),
+        )
+        conn.execute(
+            "INSERT INTO copy "
+            "(logical_asset_hash, backend_id, native_locator, native_locator_key, "
+            "integrity_hash, health, first_observed_at, source, storage_metadata, "
+            "pool_id) VALUES (?, 1, '{}', 'object', ?, 'ok', '2026-09-05', "
+            "'local_write', ?, 'plain')",
+            (
+                digest,
+                digest,
+                json.dumps(
+                    {
+                        "representation": "rao-aead-v1",
+                        "nested": {"representation": "rao-plain-v1"},
+                    }
+                ),
+            ),
+        )
+        copy_id = conn.execute("SELECT id FROM copy").fetchone()[0]
+        conn.execute(
+            "INSERT INTO asset_locator "
+            "(logical_asset_hash, pool_id, copy_id, native_locator, member_path, "
+            "representation, created_at) VALUES (?, 'plain', ?, '{}', 'asset.bin', "
+            "'rao-plain-v1', '2026-09-05')",
+            (digest, copy_id),
+        )
+        conn.execute(
+            "INSERT INTO cache_disk "
+            "(disk_id, serial, fs_uuid, mount, state, capacity_bytes, filled_bytes, "
+            "capacity_state, enrolled_at) VALUES "
+            "('disk', 'serial', 'fs', '/cache', 'active', 10, 1, 'ok', '2026-09-05')"
+        )
+        conn.execute(
+            "INSERT INTO cache_entry "
+            "(content_sha256, artifactclass, disk_id, relpath, size_bytes, state, "
+            "representation, key_epoch, trusted, placed_at, lost_drill_id) VALUES "
+            "(?, 'photo', 'disk', 'entry', 1, 'present', 'rao-aead-v1', "
+            "'archive-epoch', 1, '2026-09-05', 'old-drill')",
+            (digest,),
+        )
+        lost_digest = hashlib.sha256(b"already-lost-cache-entry").digest()
+        conn.execute(
+            "INSERT INTO logical_asset "
+            "(content_sha256, size_bytes, first_seen_at, validity) "
+            "VALUES (?, 1, '2026-09-05', 'unvalidated')",
+            (lost_digest,),
+        )
+        conn.execute(
+            "INSERT INTO cache_entry "
+            "(content_sha256, artifactclass, disk_id, relpath, size_bytes, state, "
+            "representation, key_epoch, trusted, placed_at, lost_origin_disk_id, "
+            "lost_drill_id, lost_at) VALUES "
+            "(?, 'photo', 'disk', 'lost-entry', 1, 'lost', 'rao-aead-v1', "
+            "'archive-epoch', 0, '2026-09-04', 'original-disk', 'old-drill', "
+            "'2026-09-04')",
+            (lost_digest,),
+        )
+
+    migrate("head")
+    new_basis = [{"pool": "plain", "representation": "rem-object-v1"}]
+    new_fingerprint = hashlib.sha256(
+        json.dumps(new_basis, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT representation FROM pool").fetchone()[0] == "rem-object-v1"
+        assert (
+            conn.execute("SELECT representation FROM asset_locator").fetchone()[0]
+            == "rem-object-v1"
+        )
+        metadata = json.loads(conn.execute("SELECT storage_metadata FROM copy").fetchone()[0])
+        assert metadata["representation"] == "rem-encrypt-v1"
+        assert metadata["nested"]["representation"] == "rem-object-v1"
+        cache_row = conn.execute(
+            "SELECT representation, state, trusted, lost_origin_disk_id, lost_drill_id, lost_at "
+            "FROM cache_entry WHERE content_sha256 = ?",
+            (digest,),
+        ).fetchone()
+        assert cache_row[:5] == ("rem-encrypt-v1", "lost", 0, "disk", None)
+        assert cache_row[5] is not None
+        already_lost = conn.execute(
+            "SELECT representation, state, trusted, lost_origin_disk_id, lost_drill_id, lost_at "
+            "FROM cache_entry WHERE content_sha256 = ?",
+            (lost_digest,),
+        ).fetchone()
+        assert already_lost == (
+            "rem-encrypt-v1",
+            "lost",
+            0,
+            "original-disk",
+            "old-drill",
+            "2026-09-04",
+        )
+        assert conn.execute("SELECT filled_bytes FROM cache_disk").fetchone()[0] == 1
+        bundle_group, document_raw = conn.execute(
+            "SELECT bundle_group, group_basis FROM bundle"
+        ).fetchone()
+        assert bundle_group == new_fingerprint
+        assert json.loads(document_raw)["basis"] == new_basis
+        assert (
+            conn.execute("SELECT bundle_group FROM artifactclass_policy").fetchone()[0]
+            == new_fingerprint
+        )
+        cache_sql = _table_sql(db_path, "cache_entry")
+        assert "rem-encrypt-v1" in cache_sql
+        assert "rao-aead-v1" not in cache_sql
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    migrate("c2d3e4f5a6b7", downgrade=True)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT representation FROM pool").fetchone()[0] == "rao-plain-v1"
+        assert (
+            conn.execute("SELECT representation FROM asset_locator").fetchone()[0] == "rao-plain-v1"
+        )
+        metadata = json.loads(conn.execute("SELECT storage_metadata FROM copy").fetchone()[0])
+        assert metadata["representation"] == "rao-aead-v1"
+        assert metadata["nested"]["representation"] == "rao-plain-v1"
+        cache_row = conn.execute(
+            "SELECT representation, state, trusted, lost_origin_disk_id FROM cache_entry"
+            " WHERE content_sha256 = ?",
+            (digest,),
+        ).fetchone()
+        assert cache_row == ("rao-aead-v1", "lost", 0, "disk")
+        assert conn.execute("SELECT filled_bytes FROM cache_disk").fetchone()[0] == 1
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_deletion_evidence_migration_recreates_raw_sql_health_trigger(
     tmp_path: Path,
 ) -> None:

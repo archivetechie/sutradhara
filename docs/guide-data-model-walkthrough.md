@@ -394,7 +394,7 @@ Before a byte is written, policy decides *where copies may go and how many*:
   `catalog_authoritative` (its database backup matters more).
 - **`pool`** — the policy-facing write target *inside* a backend, with an
   `accepts_writes` fence, a `retired` flag, an `offsite_gate`, and a stored
-  `representation` (raw bytes, or our RAO object format).
+  `representation` (raw bytes, or our REM-OBJECT object format).
 - The **durability floor**, carried by the class policy: `min_copies` and
   `min_impl_families`, defaulting to **3 copies across 2 implementation families.**
 
@@ -590,7 +590,7 @@ The model solves this with two durable homes for exactly the non-derivable facts
 - the **self-describing bundle manifest** embedded in every bundle
   (`_sutradhara/bundle-manifest.cbor`), naming the artifacts, members, submissions,
   and hashes inside it — so the object on the shelf carries its own meaning, in a
-  format that works for RAO, plain tar/object storage, and the D2 tape adapter alike.
+  format that works for REM-OBJECT, plain tar/object storage, and the D2 tape adapter alike.
 
 A disaster rebuild then reads like a recipe: enumerate every backend, open each
 bundle's manifest, verify the hashes, recreate the policy versions, then the

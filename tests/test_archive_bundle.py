@@ -57,7 +57,7 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
     with session_scope(engine) as s:
         policy = ArtifactClassPolicyRecord(
             artifactclass="o-archive",
-            ruleset="rao.o.v1",
+            ruleset="rem-object.o.v1",
             expect="messy",
             target_bytes=1024,
             max_age_seconds=3600,
@@ -74,7 +74,7 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
             Pool(
                 id="archive-pool",
                 backend_id=backend.id,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         s.add(ArtifactClassPool(artifactclass="o-archive", pool_id="archive-pool", active=True))
@@ -110,7 +110,7 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
             native_locator={"pool_id": "archive-pool", "object_id": "bundle-test"},
             integrity_hash=_hash(b"stored-bundle"),
             source=CopySource.INGEST,
-            storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
+            storage_metadata={"representation": Representation.REM_OBJECT_V1.value},
         )
         locator = record_asset_locator(
             s,
@@ -121,7 +121,7 @@ def test_bundle_helpers_record_members_locators_roots_and_exclusions(
                 "object_id": "bundle-test",
                 "member_path": "member.bin",
             },
-            representation=Representation.RAO_PLAIN_V1.value,
+            representation=Representation.REM_OBJECT_V1.value,
             copy_id=copy.id,
             bundle_id=bundle.id,
         )
@@ -192,7 +192,7 @@ def test_enqueue_artifact_escapes_default_member_path_from_raw_filename(
     with session_scope(engine) as s:
         policy = ArtifactClassPolicyRecord(
             artifactclass="o-archive",
-            ruleset="rao.o.v1",
+            ruleset="rem-object.o.v1",
             expect="messy",
             target_bytes=1024,
             max_age_seconds=3600,
@@ -209,7 +209,7 @@ def test_enqueue_artifact_escapes_default_member_path_from_raw_filename(
             Pool(
                 id="archive-pool",
                 backend_id=backend.id,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         s.add(ArtifactClassPool(artifactclass="o-archive", pool_id="archive-pool", active=True))

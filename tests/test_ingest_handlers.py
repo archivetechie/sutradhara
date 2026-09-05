@@ -126,9 +126,9 @@ def test_dispatch_runs_proxies_pfr_and_cloud_copy(
         copy = session.scalars(select(Copy).where(Copy.bundle_id == bundle.id)).one()
         pool = session.get(Pool, "cloud-temp")
         assert pool is not None
-        assert copy.native_locator["key"] == "intakes/card-100.rao"
+        assert copy.native_locator["key"] == "intakes/card-100.rem-object"
         assert copy.storage_metadata["representation"] == pool.representation
-        assert fake_backend.objects["intakes/card-100.rao"]
+        assert fake_backend.objects["intakes/card-100.rem-object"]
 
 
 def test_cloud_blob_handler_uses_ssh_disk_backend_row(
@@ -159,11 +159,11 @@ def test_cloud_blob_handler_uses_ssh_disk_backend_row(
         result = run_one(session, job.id)
         assert result.ok
 
-    stored = remote_root / "intakes" / "card-ssh.rao"
+    stored = remote_root / "intakes" / "card-ssh.rem-object"
     assert stored.exists()
     with session_scope(engine) as session:
         copy = session.scalars(select(Copy)).one()
-        assert copy.native_locator["key"] == "intakes/card-ssh.rao"
+        assert copy.native_locator["key"] == "intakes/card-ssh.rem-object"
         assert copy.native_locator["sha256"] == hashlib.sha256(stored.read_bytes()).hexdigest()
 
 
@@ -188,7 +188,9 @@ def test_cloud_blob_fake_build_unlinks_stale_cache_artifact(
             artifactclass="s-masters",
             cache_root=cache_root,
         )
-        blob_path = cache_root / "intakes" / "card-retry-fake" / "cloud" / "card-retry-fake.rao"
+        blob_path = (
+            cache_root / "intakes" / "card-retry-fake" / "cloud" / "card-retry-fake.rem-object"
+        )
         blob_path.parent.mkdir(parents=True, exist_ok=True)
         blob_path.write_text("stale", encoding="utf-8")
         job = session.scalars(select(Job).where(Job.kind == "cloud-blob")).one()
@@ -197,8 +199,8 @@ def test_cloud_blob_fake_build_unlinks_stale_cache_artifact(
 
     payload = json.loads(blob_path.read_text(encoding="utf-8"))
     assert payload["intake_bundle_id"] == "cloud-blob:card-retry-fake"
-    assert payload["representation"] == Representation.RAO_AEAD_V1.value
-    assert fake_backend.objects["intakes/card-retry-fake.rao"] == blob_path.read_bytes()
+    assert payload["representation"] == Representation.REM_ENCRYPT_V1.value
+    assert fake_backend.objects["intakes/card-retry-fake.rem-object"] == blob_path.read_bytes()
 
 
 def test_cloud_blob_refuses_pool_representation_it_cannot_produce(
@@ -286,7 +288,9 @@ def test_cloud_blob_real_build_unlinks_stale_cache_artifact(
             artifactclass="s-masters",
             cache_root=cache_root,
         )
-        blob_path = cache_root / "intakes" / "card-retry-real" / "cloud" / "card-retry-real.rao"
+        blob_path = (
+            cache_root / "intakes" / "card-retry-real" / "cloud" / "card-retry-real.rem-object"
+        )
         blob_path.parent.mkdir(parents=True, exist_ok=True)
         blob_path.write_text("stale", encoding="utf-8")
         job = session.scalars(select(Job).where(Job.kind == "cloud-blob")).one()
@@ -294,7 +298,7 @@ def test_cloud_blob_real_build_unlinks_stale_cache_artifact(
         assert result.ok
 
     assert blob_path.read_bytes() == build_payload
-    assert fake_backend.objects["intakes/card-retry-real.rao"] == build_payload
+    assert fake_backend.objects["intakes/card-retry-real.rem-object"] == build_payload
 
 
 def test_transcode_derivation_facts_are_idempotent(
@@ -601,7 +605,7 @@ def _add_cloud_backend(session: Any) -> None:
         Pool(
             id="cloud-temp",
             backend_id=backend.id,
-            representation="rao-aead-v1",
+            representation="rem-encrypt-v1",
             location="s3://test-bucket",
             tier="cloud",
         )
@@ -621,7 +625,7 @@ def _add_ssh_cloud_backend(session: Any) -> None:
         Pool(
             id="cloud-temp",
             backend_id=backend.id,
-            representation="rao-aead-v1",
+            representation="rem-encrypt-v1",
             location="ssh://backup.example/remote-root",
             tier="lan",
         )

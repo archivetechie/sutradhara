@@ -23,14 +23,15 @@ def test_s3_backend_write_range_verify_and_enumerate(tmp_path: Path) -> None:
         storage_class="STANDARD_IA",
         client=client,
     )
-    source = tmp_path / "object.rao"
+    source = tmp_path / "object.rem-object"
     source.write_bytes(b"abcdef")
 
-    record = backend.write_object(source, key="intakes/card-1.rao", pool="cloud-temp")
+    record = backend.write_object(source, key="intakes/card-1.rem-object", pool="cloud-temp")
 
-    assert record.native_locator["key"] == "sutra/intakes/card-1.rao"
+    assert record.native_locator["key"] == "sutra/intakes/card-1.rem-object"
     assert (
-        client.extra_args[("bucket", "sutra/intakes/card-1.rao")]["StorageClass"] == "STANDARD_IA"
+        client.extra_args[("bucket", "sutra/intakes/card-1.rem-object")]["StorageClass"]
+        == "STANDARD_IA"
     )
     assert backend.read_range(record.native_locator, ByteRange(1, 4)) == b"bcd"
     assert backend.verify(record.native_locator).ok
@@ -39,7 +40,7 @@ def test_s3_backend_write_range_verify_and_enumerate(tmp_path: Path) -> None:
     assert rows[0].integrity_hash == hashlib.sha256(b"abcdef").digest()
 
     backend.delete_object(record.native_locator)
-    assert ("bucket", "sutra/intakes/card-1.rao") not in client.objects
+    assert ("bucket", "sutra/intakes/card-1.rem-object") not in client.objects
     backend.delete_object(record.native_locator)
 
 

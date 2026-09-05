@@ -16,7 +16,7 @@ source for each current contract.
 | Restore is verified before publication | A readable source or successful subprocess exit does not establish integrity. | Restore checks stored and plaintext digests, then atomically renames and fsyncs the result. | [Architecture: restore](architecture-overview.md) |
 | Operator HTTP identity terminates at a local proxy boundary | Sutradhara consumes Authentik identity headers rather than implementing another login system. | Production HTTP uses a protected Unix socket; the proxy must scrub client-supplied identity headers before authentication. | [Deployment guide](guide-deployment.md) |
 | Partial-file restore is optional | The core archive must remain installable without the separately distributed format-analysis implementation. | PFR imports are lazy; unavailable PFR work becomes a visible blocked condition rather than breaking the CLI or worker. | [Quickstart](guide-quickstart.md) |
-| Historical `rao-*` identifiers remain stable | Remanence renamed the object format after persisted representation names already existed. | Public prose says REM-OBJECT; database and compatibility identifiers retain their `rao-*` spelling. | [Glossary](reference-glossary.md) |
+| REM-* vocabulary is canonical end to end | The Remanence rename was an explicit pre-production clean break and avoids collision with the tape-drive term Recommended Access Order. | Code, pool policy, catalog metadata, cache paths, and operator prose use `rem-object-v1` for plaintext objects and `rem-encrypt-v1` for encrypted envelopes. | [Glossary](reference-glossary.md) |
 
 Changes that reverse one of these decisions should update this register, the
 linked reference, migration notes where applicable, and `docs/INDEX.md` in the

@@ -330,7 +330,17 @@ def test_scrub_discovery_is_satisfied_pending_until_verify_runs(
         assert verify_job.status == JobStatus.SUCCEEDED
 
 
-def test_scrub_quarantines_recognizable_bundle_container_unknown(engine: Engine) -> None:
+@pytest.mark.parametrize(
+    "caller_object_id",
+    [
+        "bundle-a-rem-object-v1.rem-object",
+        "bundle-a-rao-plain-v1.rao",
+    ],
+)
+def test_scrub_quarantines_recognizable_bundle_container_unknown(
+    engine: Engine,
+    caller_object_id: str,
+) -> None:
     stored_digest = _hash(b"bundle container")
     now = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
 
@@ -343,12 +353,12 @@ def test_scrub_quarantines_recognizable_bundle_container_unknown(engine: Engine)
             yield CopyRecord(
                 logical_id=stored_digest,
                 native_locator={
-                    "caller_object_id": "bundle-a-rao-plain-v1.rao",
+                    "caller_object_id": caller_object_id,
                     "content_sha256": stored_digest.hex(),
                 },
                 integrity_hash=stored_digest,
                 size_bytes=99,
-                metadata={"body_format": "rem-archive-v1"},
+                metadata={},
             )
 
         def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
@@ -410,18 +420,18 @@ def test_scrub_still_adopts_unknown_non_container_object(engine: Engine) -> None
         assert s.get(LogicalAsset, logical_id) is not None
 
 
-def test_scrub_existing_rao_copy_does_not_create_stored_digest_asset(
+def test_scrub_existing_rem_object_copy_does_not_create_stored_digest_asset(
     engine: Engine,
 ) -> None:
     asset_hash = _hash(b"plaintext asset")
-    stored_digest = _hash(b"stored rao bytes")
-    locator = {"pool_id": "o-copy-1-pool", "object_id": "stored-rao"}
+    stored_digest = _hash(b"stored rem-object bytes")
+    locator = {"pool_id": "o-copy-1-pool", "object_id": "stored-rem-object"}
     now = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
 
     class _ExistingRaoBackend:
         @property
         def name(self) -> str:
-            return "rao-backend"
+            return "rem-object-backend"
 
         def enumerate(self) -> Iterator[CopyRecord]:
             yield CopyRecord(
@@ -439,7 +449,7 @@ def test_scrub_existing_rao_copy_does_not_create_stored_digest_asset(
 
     with session_scope(engine) as s:
         row = Backend(
-            name="rao-backend",
+            name="rem-object-backend",
             kind=BackendKind.REM_TAPE,
             tier=BackendTier.SELF_DESCRIBING,
         )
@@ -449,7 +459,7 @@ def test_scrub_existing_rao_copy_does_not_create_stored_digest_asset(
             Pool(
                 id="o-copy-1-pool",
                 backend_id=row.id,
-                representation=Representation.RAO_PLAIN_V1.value,
+                representation=Representation.REM_OBJECT_V1.value,
             )
         )
         s.add(LogicalAsset(content_sha256=asset_hash, size_bytes=15))
@@ -462,7 +472,7 @@ def test_scrub_existing_rao_copy_does_not_create_stored_digest_asset(
             native_locator=locator,
             integrity_hash=stored_digest,
             source=CopySource.INGEST,
-            storage_metadata={"representation": Representation.RAO_PLAIN_V1.value},
+            storage_metadata={"representation": Representation.REM_OBJECT_V1.value},
         )
 
         report = scrub_backend(s, row, _ExistingRaoBackend(), now=now)

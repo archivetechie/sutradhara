@@ -53,7 +53,7 @@ from sutradhara.replication import (
     target_pools,
 )
 from sutradhara.sealing.port import Representation, SealResult
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE
+from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 
 ARCHIVE_EPOCH = "archive-" + "1" * 32
 RECOVERY_EPOCH = "recovery-" + "2" * 32
@@ -211,7 +211,7 @@ class _FakeSealer:
             plaintext_digest=self._plaintext_digest_override or plaintext,
             representation=representation,
             recipient_epochs=(key_id, RECOVERY_EPOCH)
-            if representation is Representation.RAO_AEAD_V1 and key_id is not None
+            if representation is Representation.REM_ENCRYPT_V1 and key_id is not None
             else (),
         )
         self.results.append(result)
@@ -276,8 +276,8 @@ def _add_asset(engine: Engine, data: bytes) -> bytes:
 
 def _metadata(representation: Representation) -> dict[str, object]:
     metadata: dict[str, object] = {"representation": representation.value}
-    if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
-        metadata["chunk_size"] = RAO_CHUNK_SIZE
+    if representation in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}:
+        metadata["chunk_size"] = REM_OBJECT_CHUNK_SIZE
     return metadata
 
 
@@ -309,7 +309,7 @@ def test_target_pools_reads_active_memberships_and_representations(
         backend_id=backend_id,
         pool_id="o-copy-1-pool",
         artifactclass="o-archive",
-        representation=Representation.RAO_PLAIN_V1,
+        representation=Representation.REM_OBJECT_V1,
         sort_order=1,
     )
     _add_pool(
@@ -317,7 +317,7 @@ def test_target_pools_reads_active_memberships_and_representations(
         backend_id=backend_id,
         pool_id="o-copy-2-pool",
         artifactclass="o-archive",
-        representation=Representation.RAO_AEAD_V1,
+        representation=Representation.REM_ENCRYPT_V1,
         sort_order=2,
     )
     backend = _PoolWriteBackend("rem")
@@ -335,8 +335,8 @@ def test_target_pools_reads_active_memberships_and_representations(
         "o-copy-2-pool",
     ]
     assert [target.representation for _, target in targets] == [
-        Representation.RAO_PLAIN_V1.value,
-        Representation.RAO_AEAD_V1.value,
+        Representation.REM_OBJECT_V1.value,
+        Representation.REM_ENCRYPT_V1.value,
     ]
     assert [target.key_epoch for _, target in targets] == [None, ARCHIVE_EPOCH]
 
@@ -401,7 +401,7 @@ def test_pool_sealing_rejects_hdcache_key_epoch(
         backend_id=backend_id,
         pool_id="private-pool",
         artifactclass="video-priv",
-        representation=Representation.RAO_AEAD_V1,
+        representation=Representation.REM_ENCRYPT_V1,
     )
     backend = _PoolWriteBackend("rem")
 
@@ -492,7 +492,7 @@ def test_replicate_asset_fans_out_and_records_each_pool_copy(
         assert list(s.scalars(select(ArtifactClassPool))).pop().artifactclass == "video-priv"
 
 
-def test_replicate_asset_records_stored_digest_for_rao_pool_copies(
+def test_replicate_asset_records_stored_digest_for_rem_object_pool_copies(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -506,7 +506,7 @@ def test_replicate_asset_records_stored_digest_for_rao_pool_copies(
         backend_id=backend_id,
         pool_id="o-copy-1-pool",
         artifactclass="o-archive",
-        representation=Representation.RAO_PLAIN_V1,
+        representation=Representation.REM_OBJECT_V1,
         sort_order=1,
     )
     _add_pool(
@@ -514,7 +514,7 @@ def test_replicate_asset_records_stored_digest_for_rao_pool_copies(
         backend_id=backend_id,
         pool_id="o-copy-2-pool",
         artifactclass="o-archive",
-        representation=Representation.RAO_AEAD_V1,
+        representation=Representation.REM_ENCRYPT_V1,
         sort_order=2,
     )
     backend = _PoolWriteBackend(
@@ -539,8 +539,8 @@ def test_replicate_asset_records_stored_digest_for_rao_pool_copies(
 
     assert backend.writes == ["o-copy-1-pool", "o-copy-2-pool"]
     assert sealer.calls == [
-        (Representation.RAO_PLAIN_V1, None),
-        (Representation.RAO_AEAD_V1, ARCHIVE_EPOCH),
+        (Representation.REM_OBJECT_V1, None),
+        (Representation.REM_ENCRYPT_V1, ARCHIVE_EPOCH),
     ]
     assert len(copies) == 2
     with session_scope(engine) as s:
@@ -548,12 +548,12 @@ def test_replicate_asset_records_stored_digest_for_rao_pool_copies(
         assert rows["o-copy-1-pool"].integrity_hash == sealer.results[0].stored_digest
         assert rows["o-copy-2-pool"].integrity_hash == sealer.results[1].stored_digest
         assert rows["o-copy-1-pool"].storage_metadata == {
-            "representation": Representation.RAO_PLAIN_V1.value,
-            "chunk_size": RAO_CHUNK_SIZE,
+            "representation": Representation.REM_OBJECT_V1.value,
+            "chunk_size": REM_OBJECT_CHUNK_SIZE,
         }
         assert rows["o-copy-2-pool"].storage_metadata == {
-            "representation": Representation.RAO_AEAD_V1.value,
-            "chunk_size": RAO_CHUNK_SIZE,
+            "representation": Representation.REM_ENCRYPT_V1.value,
+            "chunk_size": REM_OBJECT_CHUNK_SIZE,
             "recipient_epochs": [ARCHIVE_EPOCH, RECOVERY_EPOCH],
         }
 
@@ -573,7 +573,7 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
         backend_id=rem_backend_id,
         pool_id="n-copy-1",
         artifactclass="n-archive",
-        representation=Representation.RAO_PLAIN_V1,
+        representation=Representation.REM_OBJECT_V1,
         sort_order=1,
     )
     _add_pool(
@@ -581,7 +581,7 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
         backend_id=rem_backend_id,
         pool_id="n-copy-2",
         artifactclass="n-archive",
-        representation=Representation.RAO_AEAD_V1,
+        representation=Representation.REM_ENCRYPT_V1,
         sort_order=2,
     )
     _add_pool(
@@ -627,8 +627,8 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
         "n-copy-3",
     }
     assert sealer.calls == [
-        (Representation.RAO_PLAIN_V1, None),
-        (Representation.RAO_AEAD_V1, ARCHIVE_EPOCH),
+        (Representation.REM_OBJECT_V1, None),
+        (Representation.REM_ENCRYPT_V1, ARCHIVE_EPOCH),
         (Representation.D2TAR_RAW, None),
     ]
 
@@ -640,7 +640,7 @@ def test_replicate_asset_n_archive_writes_three_copies_across_two_backends(
         assert d2_copy.integrity_hash == asset_hash
 
 
-def test_replicate_asset_rejects_rao_plaintext_digest_mismatch(
+def test_replicate_asset_rejects_rem_objecttext_digest_mismatch(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -654,7 +654,7 @@ def test_replicate_asset_rejects_rao_plaintext_digest_mismatch(
         backend_id=backend_id,
         pool_id="o-copy-1-pool",
         artifactclass="o-archive",
-        representation=Representation.RAO_PLAIN_V1,
+        representation=Representation.REM_OBJECT_V1,
     )
     backend = _PoolWriteBackend("rem")
     sealer = _FakeSealer(
@@ -679,7 +679,7 @@ def test_replicate_asset_rejects_rao_plaintext_digest_mismatch(
         )
 
 
-def test_replicate_asset_rejects_rao_stored_digest_mismatch(
+def test_replicate_asset_rejects_rem_object_stored_digest_mismatch(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
@@ -693,7 +693,7 @@ def test_replicate_asset_rejects_rao_stored_digest_mismatch(
         backend_id=backend_id,
         pool_id="o-copy-1-pool",
         artifactclass="o-archive",
-        representation=Representation.RAO_PLAIN_V1,
+        representation=Representation.REM_OBJECT_V1,
     )
     backend = _PoolWriteBackend("rem")
     sealer = _FakeSealer(
@@ -801,7 +801,7 @@ def test_replication_status_rejects_copy_representation_mismatch(
         backend_id=backend_id,
         pool_id="o-copy-1-pool",
         artifactclass="o-archive",
-        representation=Representation.RAO_PLAIN_V1,
+        representation=Representation.REM_OBJECT_V1,
     )
 
     with session_scope(engine) as s:
@@ -1116,13 +1116,13 @@ def test_select_source_self_heal_prefers_fresh_aead_over_stale_plain(
                 Pool(
                     id="plain-pool",
                     backend_id=backend_id,
-                    representation=Representation.RAO_PLAIN_V1.value,
+                    representation=Representation.REM_OBJECT_V1.value,
                     offsite_gate=False,
                 ),
                 Pool(
                     id="aead-pool",
                     backend_id=backend_id,
-                    representation=Representation.RAO_AEAD_V1.value,
+                    representation=Representation.REM_ENCRYPT_V1.value,
                     offsite_gate=False,
                 ),
             ]
@@ -1136,7 +1136,7 @@ def test_select_source_self_heal_prefers_fresh_aead_over_stale_plain(
             native_locator={"pool_id": "plain-pool", "tape_uuid": "1" * 32},
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
-            storage_metadata=_metadata(Representation.RAO_PLAIN_V1),
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
         )
         _qualify_fixture_copy(
             stale_plain,
@@ -1150,7 +1150,7 @@ def test_select_source_self_heal_prefers_fresh_aead_over_stale_plain(
             native_locator={"pool_id": "aead-pool", "tape_uuid": "2" * 32},
             integrity_hash=asset_hash,
             source=CopySource.INGEST,
-            storage_metadata=_metadata(Representation.RAO_AEAD_V1),
+            storage_metadata=_metadata(Representation.REM_ENCRYPT_V1),
         )
         _qualify_fixture_copy(
             fresh_aead,

@@ -257,7 +257,7 @@ tape is spending the whole group's tape efficiency to do it.
 |---|---|---|
 | `--deliverables-dir DIRECTORY` | | Directory for customer manifest receipts. |
 | `--rem-bin TEXT` | `rem` | rem CLI binary. |
-| `--key-epoch TEXT` | | Key epoch for rao-aead-v1 pools. |
+| `--key-epoch TEXT` | | Key epoch for rem-encrypt-v1 pools. |
 | `--manifest-signing-key-file FILE` | | Raw HMAC key file for customer manifest receipts. |
 
 ### sutra archive bundle sweep
@@ -285,7 +285,7 @@ write appends a second object rather than replacing the first.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--rem-bin TEXT` | `rem` | rem CLI binary. |
-| `--key-epoch TEXT` | | Key epoch for rao-aead-v1 pools. |
+| `--key-epoch TEXT` | | Key epoch for rem-encrypt-v1 pools. |
 | `--no-reap` | off | Skip the stuck-claim reaper (diagnosis only). |
 
 ### sutra archive submission accumulate SUBMISSION_ID

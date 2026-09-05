@@ -29,7 +29,11 @@ from sutradhara.jobs.engine import submit
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyEpoch, KeyRegistry, assert_key_epoch_domain
 from sutradhara.restore import RestoreError, RestoreIntegrityError, restore_copy
 from sutradhara.sealing.port import Opener, Representation, Sealer, SealResult
-from sutradhara.sealing.rao import RAO_CHUNK_SIZE, RaoCliOpener, RaoCliSealer
+from sutradhara.sealing.rem_object import (
+    REM_OBJECT_CHUNK_SIZE,
+    RemObjectCliOpener,
+    RemObjectCliSealer,
+)
 
 
 class ReplicationError(Exception):
@@ -238,7 +242,7 @@ def _pool_target_entry(
             backend_name=pool.backend.name,
             representation=pool.representation,
             key_epoch=(
-                key_epoch if pool.representation == Representation.RAO_AEAD_V1.value else None
+                key_epoch if pool.representation == Representation.REM_ENCRYPT_V1.value else None
             ),
             location=pool.location,
             offsite_gate=pool.offsite_gate,
@@ -263,7 +267,7 @@ def replicate_asset(
     execution_id = execution_id or f"exec-{uuid4().hex[:12]}"
     targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
     existing = _healthy_copies_by_pool(session, asset_hash, targets)
-    sealer = sealer or RaoCliSealer(KeyRegistry())
+    sealer = sealer or RemObjectCliSealer(KeyRegistry())
 
     copies: list[Copy] = []
     for backend, target in targets:
@@ -332,7 +336,7 @@ def repair(
 
     targets = target_pools(session, artifactclass, backends, key_epoch=key_epoch)
     missing = status["missing"]
-    sealer = sealer or RaoCliSealer(KeyRegistry())
+    sealer = sealer or RemObjectCliSealer(KeyRegistry())
 
     repaired: list[Copy] = []
     for backend, target in targets:
@@ -413,7 +417,7 @@ def self_heal(
     if not candidates:
         raise SelfHealUnavailable(f"cannot self-heal {asset_hash.hex()}: no healthy source copy")
 
-    opener = opener or RaoCliOpener(KeyRegistry())
+    opener = opener or RemObjectCliOpener(KeyRegistry())
     errors: list[str] = []
     for source in candidates:
         if source.health != CopyHealth.OK:
@@ -705,9 +709,9 @@ def _timestamp_sort_value(value: Any) -> float:
 
 def _representation_cost(copy: Copy) -> int:
     representation = copy.storage_metadata.get("representation")
-    if representation == Representation.RAO_PLAIN_V1.value:
+    if representation == Representation.REM_OBJECT_V1.value:
         return 0
-    if representation == Representation.RAO_AEAD_V1.value:
+    if representation == Representation.REM_ENCRYPT_V1.value:
         return 1
     return 2
 
@@ -782,7 +786,7 @@ def _epoch_for(
     target: PoolTarget,
     representation: Representation,
 ) -> KeyEpoch | None:
-    if representation is not Representation.RAO_AEAD_V1:
+    if representation is not Representation.REM_ENCRYPT_V1:
         return None
     if target.key_epoch is None:
         raise ReplicationInvariantError(
@@ -805,9 +809,9 @@ def _copy_storage_metadata(
     recipient_epochs: Sequence[str] = (),
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {"representation": representation.value}
-    if representation in {Representation.RAO_PLAIN_V1, Representation.RAO_AEAD_V1}:
-        metadata["chunk_size"] = RAO_CHUNK_SIZE
-    if representation is Representation.RAO_AEAD_V1:
+    if representation in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}:
+        metadata["chunk_size"] = REM_OBJECT_CHUNK_SIZE
+    if representation is Representation.REM_ENCRYPT_V1:
         if not recipient_epochs:
             raise ReplicationInvariantError("encrypted copy is missing recipient epochs")
         metadata["recipient_epochs"] = list(recipient_epochs)
