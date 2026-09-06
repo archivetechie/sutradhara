@@ -1285,7 +1285,7 @@ class CatalogStub:
 
     This is the orchestrator's primary read surface. It powers the rebuildable-
     index discipline: every query here can be answered from on-tape state alone
-    (the SQLite index is a cache; see layer4 addendum §6).
+    (the SQLite index is a rebuildable cache, not the durable authority).
     =============================================================================
 
     """
@@ -1394,7 +1394,7 @@ class CatalogServicer:
 
     This is the orchestrator's primary read surface. It powers the rebuildable-
     index discipline: every query here can be answered from on-tape state alone
-    (the SQLite index is a cache; see layer4 addendum §6).
+    (the SQLite index is a rebuildable cache, not the durable authority).
     =============================================================================
 
     """
@@ -1451,7 +1451,7 @@ class CatalogServicer:
         """Stream every object on a tape, in order. This is the core enumeration RPC
         the orchestrator calls to (re)build its catalog. Each item carries the
         logical identity (content_sha256) plus the on-tape locator (tape + file +
-        BodyLba per rem-tar-v1 §2.1).
+        object-local body LBA for `rem-object-v1`).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -1499,7 +1499,7 @@ class CatalogServicer:
 
     def ListFilesInObject(self, request, context):
         """Body-format-aware queries. The daemon delegates to the registered
-        format adapter (rem-tar-v1, rem-tar-legacy, rem-bru, future).
+        format adapter (`rem-object-v1` or a separately distributed foreign adapter).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -1639,7 +1639,7 @@ class Catalog:
 
     This is the orchestrator's primary read surface. It powers the rebuildable-
     index discipline: every query here can be answered from on-tape state alone
-    (the SQLite index is a cache; see layer4 addendum §6).
+    (the SQLite index is a rebuildable cache, not the durable authority).
     =============================================================================
 
     """
@@ -2733,7 +2733,6 @@ class ReadPlanServiceStub:
     """=============================================================================
     READ PLAN SERVICE — batch read ordering over one volume.
 
-    Contract of record: design-read-ordering.md §§9 and 11 (private journal).
     The RPC accepts targets to *reason about*: it requires no read session,
     performs no tape motion, and returns an ordering with per-hop positioning
     estimates. The read surface (ReadSessionService) is unchanged — callers
@@ -2767,7 +2766,6 @@ class ReadPlanServiceServicer:
     """=============================================================================
     READ PLAN SERVICE — batch read ordering over one volume.
 
-    Contract of record: design-read-ordering.md §§9 and 11 (private journal).
     The RPC accepts targets to *reason about*: it requires no read session,
     performs no tape motion, and returns an ordering with per-hop positioning
     estimates. The read surface (ReadSessionService) is unchanged — callers
@@ -2810,7 +2808,6 @@ class ReadPlanService:
     """=============================================================================
     READ PLAN SERVICE — batch read ordering over one volume.
 
-    Contract of record: design-read-ordering.md §§9 and 11 (private journal).
     The RPC accepts targets to *reason about*: it requires no read session,
     performs no tape motion, and returns an ordering with per-hop positioning
     estimates. The read surface (ReadSessionService) is unchanged — callers
@@ -2859,7 +2856,7 @@ class AuditStub:
     """=============================================================================
     AUDIT SERVICE — read-only audit log queries.
 
-    The append-only audit log is daemon-authoritative (layer4 addendum §5).
+    The append-only audit log is daemon-authoritative.
     Layer 5 exposes query-only surface; mutations only happen through the
     other services.
     =============================================================================
@@ -2883,7 +2880,7 @@ class AuditServicer:
     """=============================================================================
     AUDIT SERVICE — read-only audit log queries.
 
-    The append-only audit log is daemon-authoritative (layer4 addendum §5).
+    The append-only audit log is daemon-authoritative.
     Layer 5 exposes query-only surface; mutations only happen through the
     other services.
     =============================================================================
@@ -2916,7 +2913,7 @@ class Audit:
     """=============================================================================
     AUDIT SERVICE — read-only audit log queries.
 
-    The append-only audit log is daemon-authoritative (layer4 addendum §5).
+    The append-only audit log is daemon-authoritative.
     Layer 5 exposes query-only surface; mutations only happen through the
     other services.
     =============================================================================
