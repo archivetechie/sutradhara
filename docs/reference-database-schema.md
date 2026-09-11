@@ -15,7 +15,7 @@ production database: use the CLI/API and Alembic migrations. When this
 reference and the models disagree, the models and migrations win; please fix
 this page.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 747b3c2 -->
 ## Reading this reference
 
 - `PK` means primary key. `FK -> table.column` means a foreign key. Fields not
@@ -28,7 +28,7 @@ this page.
   a bundle copy, never both. `asset_locator` is the bridge that lets a member
   of a stored bundle count as coverage for one logical asset.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 747b3c2 -->
 ## Why these boundaries exist
 
 The most important modelling choice is to keep *content identity* separate
@@ -47,7 +47,7 @@ catalog-authoritative ones are explicitly marked so their database backup
 requirements are visible. That trade-off is described in more depth in
 [`architecture-overview.md`](architecture-overview.md).
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 747b3c2 -->
 ## Relationship map
 
 `logical_asset` is the content identity. `ingest_item` records each appearance
@@ -67,7 +67,7 @@ those writes.
 The job, reconciliation, cache, and restore tables share the same database so
 operators can explain a decision without joining separate operational stores.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 747b3c2 -->
 ## Content and intake
 
 ### `logical_asset`
@@ -153,7 +153,7 @@ the same kind of edge being recorded twice for one source/derived pair.
 | `kind` | text | Derivation kind, such as a transcode profile. |
 | `created_at` | time | When the provenance edge was recorded. |
 
-<!-- code-anchor: src/sutradhara/api/store.py src/sutradhara/grpc/store.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/api/store.py src/sutradhara/grpc/store.py @ 747b3c2 -->
 ## Receive API and device relay
 
 These tables make duplicate-receive decisions, live source ownership, and
@@ -269,7 +269,7 @@ by the agent restore-delivery path.
 | `dest_root` | text | Destination root path for delivered restores. |
 | `created_at` | time | Grant time. |
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 747b3c2 -->
 ## Arrangement and submission
 
 ### `arrangement`
@@ -338,7 +338,7 @@ The immutable member rows represented by a submission's source map.
 | `size_bytes` | bigint | Member byte length. |
 | `ord` | integer | Stable source-map order. |
 
-<!-- code-anchor: src/sutradhara/catalog/models.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py @ 747b3c2 -->
 ## Storage policy and archive objects
 
 ### `backend`
@@ -537,7 +537,7 @@ Root-level metadata for blob-style bundle storage, separate from member-level
 | `archive_id` | text, optional | Backend archive identifier. |
 | `created_at` | time | Creation time. |
 
-<!-- code-anchor: src/sutradhara/catalog/models.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 747b3c2 -->
 ## Organization, retention, and review
 
 ### `virtual_arrangement`
@@ -702,7 +702,7 @@ applies only to this ingest or becomes a persisted rule.
 | `persisted_rule` | json, optional | Rule created for future matching input. |
 | `decided_at` | time | Decision time. |
 
-<!-- code-anchor: src/sutradhara/jobs/models.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/jobs/models.py @ 747b3c2 -->
 ## Jobs and reconciliation
 
 ### `job`
@@ -773,7 +773,7 @@ null `reconciliation_condition.last_attempt_id` without removing this lookup.
 | `condition_id` | integer, FK -> `reconciliation_condition.id` | Parked condition; cascades on condition deletion. |
 | `component` | text, indexed | Exact component string used by `record-fix`; unique per condition. |
 
-<!-- code-anchor: src/sutradhara/hdcache/models.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/hdcache/models.py @ 747b3c2 -->
 ## HD cache and restore
 
 The HD cache is expendable operational state. These tables intentionally do
@@ -931,7 +931,7 @@ that a restore ran unordered, and the reason.
 | `calibration_generation` | bigint, optional | Remanence calibration generation the decision was made against. |
 | `created_at` | time | Decision time. |
 
-<!-- code-anchor: src/sutradhara/api/live_capabilities.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/api/live_capabilities.py @ 747b3c2 -->
 ## Operator capability cache
 
 Restore admission trusts an HTTP session's capability headers as a snapshot,
@@ -961,7 +961,7 @@ capability)` is unique.
 | `operator` | text, FK -> `operator_capability_sync.operator`, unique with `capability` | Granted operator. |
 | `capability` | enum, unique with `operator` | One of `can_view`, `can_receive`, `can_restore`, `can_logs`, `can_admin`, `can_restore_p2`, `can_restore_p3`. |
 
-<!-- code-anchor: src/sutradhara/catalog/models.py alembic @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py alembic @ 747b3c2 -->
 ## Integrity constraints and migration practice
 
 Besides the primary and foreign keys shown above, the implementation enforces

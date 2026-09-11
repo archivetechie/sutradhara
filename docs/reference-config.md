@@ -15,7 +15,7 @@ Types: "bool" variables accept `1`, `true`, `yes`, `on` and `0`, `false`,
 raise on non-numeric values. An empty string is treated the same as unset
 in the hdcache/placement helpers.
 
-<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/jobs/config.py src/sutradhara/jobs/worker_lock.py src/sutradhara/logs_store.py src/sutradhara/retention.py @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/catalog/session.py src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/jobs/config.py src/sutradhara/jobs/worker_lock.py src/sutradhara/logs_store.py src/sutradhara/retention.py @ 747b3c2 -->
 ## Core
 
 | Variable | Default | Purpose |
@@ -42,7 +42,7 @@ older RAOR/RAOP registry cannot be relabelled: move it intact to a protected
 backup and initialize new epochs, or perform a separately designed migration
 when old encrypted objects must remain readable.
 
-<!-- code-anchor: src/sutradhara/cli/api.py src/sutradhara/api/app.py src/sutradhara/api/sources.py @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/cli/api.py src/sutradhara/api/app.py src/sutradhara/api/sources.py @ 747b3c2 -->
 ## Operator API and servers
 
 | Variable | Default | Purpose |
@@ -52,7 +52,7 @@ when old encrypted objects must remain readable.
 | `SUTRA_RECEIVE_SOURCE_ROOT` | `/replica/sources` | Root under which the API's server-side receive resolves operator-selected source ids. (`api/sources.py`) |
 | `SUTRA_RECEIVE_LANDING_ROOT` | `/replica/landing` | Landing root the API's server-side receive writes bags into. (`api/sources.py`) |
 
-<!-- code-anchor: src/sutradhara/resource_control.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/resource_control.py @ 747b3c2 -->
 ## Resource control
 
 Sutradhara runs CPU-heavy subprocesses (`ffmpeg`, `rem`, `ffprobe`, the PFR
@@ -66,7 +66,7 @@ CPU sharing. These variables control that wrapper.
 | `SUTRADHARA_RESOURCE_CONTROL_REQUIRE` | unset (off) | When truthy (`1`, `on`, `true`, `yes`, `require`, `required`), a failed capability probe raises `ResourceControlUnavailable` instead of degrading to plain execution. Degradation is otherwise logged once per process. |
 | `SUTRADHARA_RESOURCE_CONTROL_PROBE_TIMEOUT` | `2.0` | Seconds allowed for the `systemd-run` capability probe, clamped to at least `0.1`. Non-numeric values silently fall back to `2.0`. |
 
-<!-- code-anchor: src/sutradhara/hdcache/fill.py src/sutradhara/hdcache/manager.py src/sutradhara/hdcache/placement.py src/sutradhara/hdcache/repopulate.py src/sutradhara/hdcache/lifecycle.py src/sutradhara/hdcache/store.py src/sutradhara/artifactclass_policy.py @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/hdcache/fill.py src/sutradhara/hdcache/manager.py src/sutradhara/hdcache/placement.py src/sutradhara/hdcache/repopulate.py src/sutradhara/hdcache/lifecycle.py src/sutradhara/hdcache/store.py src/sutradhara/artifactclass_policy.py @ 747b3c2 -->
 ## HD cache tier
 
 The hdcache subsystem reads its knobs at call time through
@@ -138,7 +138,7 @@ prove it is looking at the disk the catalog thinks it is.
 | `SUTRADHARA_HDCACHE_HMAC_SECRET` | unset | Inline sentinel secret (UTF-8). When unset, the secret is read from the key file `/var/lib/replica/hdcache-disk-hmac.key`; an empty key file raises. (`hdcache/lifecycle.py`, `hdcache/store.py`) |
 | `SUTRADHARA_HDCACHE_HMAC_SECRET_HEX` | unset | Hex-encoded sentinel secret for the fill config path; same fallback to the key file when unset. (`hdcache/fill.py`) |
 
-<!-- code-anchor: src/sutradhara/pfr.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/pfr.py @ 747b3c2 -->
 ## Partial file restore
 
 | Variable | Default | Purpose |
@@ -146,7 +146,7 @@ prove it is looking at the disk the catalog thinks it is.
 | `SUTRADHARA_PFR_BLOB_CACHE_BYTES` | `21474836480` (20 GiB) | Size of the local LRU cache of fetched archive blobs that serves partial reads. Must be non-negative; `0` disables caching. |
 | `SUTRADHARA_PFR_SCRATCH_ROOT` | `/var/lib/replica/pfr-scratch` | Scratch directory for PFR cuts and the blob cache. |
 
-<!-- code-anchor: src/sutradhara/jobs/handlers/cloud_blob.py src/sutradhara/jobs/handlers/transcode.py @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/jobs/handlers/cloud_blob.py src/sutradhara/jobs/handlers/transcode.py @ 747b3c2 -->
 ## Test and harness knobs
 
 Set only in tests and CI; never in production.
@@ -160,7 +160,7 @@ Additionally, `tests/test_s3_backend.py` runs its live-MinIO test only when
 both `SUTRADHARA_MINIO_ENDPOINT` and `SUTRADHARA_MINIO_BUCKET` are set;
 otherwise it skips.
 
-<!-- code-anchor: src/sutradhara/backend/d2tape.py @ 5688438 -->
+<!-- code-anchor: src/sutradhara/backend/d2tape.py @ 747b3c2 -->
 ## d2tape backend
 
 The `d2_tape` backend bridges the legacy d2 tape library through a Java
@@ -178,7 +178,7 @@ the path is configurable via the backend row's `device_env_path`).
 | `D2TAPE_STINIT_SCRIPT` | unset | Optional stinit script passed to the CLI. |
 | `D2TAPE_JAR` | newest `~/d2tape/d2tape-cli/target/d2tape-cli-*-jar-with-dependencies.jar` | Path to the d2tape CLI fat jar. Env-only (not read from `device.env`). |
 
-<!-- code-anchor: src/sutradhara/jobs/worker_lock.py src/sutradhara/keys/registry.py @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/jobs/worker_lock.py src/sutradhara/keys/registry.py @ 747b3c2 -->
 ## Standard variables Sutradhara also honors
 
 | Variable | Used for |
@@ -186,4 +186,4 @@ the path is configurable via the backend row's `device_env_path`).
 | `XDG_STATE_HOME` | Worker lock directory when `SUTRADHARA_STATE_DIR` is unset. |
 | `XDG_RUNTIME_DIR` | First candidate for the private `0700` temp directory where short-lived `0600` REMP private-key files are materialized (then `/run/user/<uid>`, `/dev/shm`, and the platform temp directory). |
 | `USER` | Default operator attribution on receives, submissions, retention actions, tags, and virtual-arrangement edits. |
-| `JAVA_HOME` | Passed through to the d2tape CLI subprocess when the backend row configures `java_home`. |
+| `JAVA_HOME` | Inherited unconditionally by the d2tape CLI subprocess from Sutradhara's own environment, and overridden only when the backend row configures `java_home`. |

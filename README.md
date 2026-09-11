@@ -31,7 +31,7 @@ data-loss event.
 - Not a vendor product like Miria — it is first-party software designed to
   outlive its dependencies.
 
-<!-- code-anchor: src/sutradhara/cli docs/INDEX.md -->
+<!-- code-anchor: src/sutradhara/cli docs/INDEX.md @ 747b3c2 -->
 ## Status
 
 The catalog, job engine, and CLI are built and in active operational use. The
@@ -89,7 +89,7 @@ and references. The private working design history is deliberately not copied
 into this repository; the architecture overview distills the decisions needed
 to understand and operate the current code.
 
-<!-- code-anchor: pyproject.toml packages @ 5688438 -->
+<!-- code-anchor: pyproject.toml packages @ 747b3c2 -->
 ## Layout
 
 ```
@@ -115,7 +115,7 @@ The Rust workstation helper (`sutra-agent`, tray + headless binaries) lives
 in its own repository and links `packages/sutradhara-receive` as a crate;
 an earlier in-tree `packages/sutra-agent` was removed when it moved.
 
-<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ 072cb02 -->
+<!-- code-anchor: pyproject.toml src/sutradhara/cli/db.py src/sutradhara/catalog/session.py alembic @ 747b3c2 -->
 ## Install & verify
 
 Requires Python ≥3.11 and [`uv`](https://docs.astral.sh/uv/).
@@ -147,7 +147,7 @@ init`. [`docs/guide-quickstart.md`](docs/guide-quickstart.md) walks a full
 local tour, including a catalog rebuild from a fixture backend and one
 receive → register pass, plus troubleshooting.
 
-<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/cli src/sutradhara/backend/factory.py @ 747b3c2 -->
 ## CLI overview
 
 `sutra --help` lists every command group; each group has its own `--help`,
@@ -183,7 +183,7 @@ CLI adapter for the legacy d2 tape library), `s3` (cloud), `ssh_disk`
 accepted by `backends add` (`rem_disk`, `plain_disk`, `gcs`, `azure_blob`)
 are reserved names without adapters yet.
 
-<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/rem_archive_cli.py src/sutradhara/keys/registry.py src/sutradhara/cli/serve.py @ 747b3c2 -->
 ## Configuration
 
 Beyond `SUTRADHARA_DB_URL`, the environment variables most operators need:
@@ -205,7 +205,7 @@ Every other knob — hdcache tuning, resource control, PFR, the d2tape
 backend, test fakes — is documented with exact defaults in
 [`docs/reference-config.md`](docs/reference-config.md).
 
-<!-- code-anchor: src/sutradhara/sealing @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/sealing @ 747b3c2 -->
 ## Scenario O — sealed REM-OBJECT copies
 
 Scenario O seals per-copy representations before storage instead of storing raw
