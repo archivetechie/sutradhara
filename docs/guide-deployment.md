@@ -6,6 +6,7 @@ passes. The retention-journal timer is shipped beside them. Adapt paths, users,
 network addresses, and storage policy to the site; do not copy example identity
 or network values unchanged.
 
+<!-- code-anchor: alembic alembic.ini src/sutradhara/catalog/session.py src/sutradhara/cli/backends.py src/sutradhara/backend/factory.py src/sutradhara/backend/remanence.py @ 747b3c2 -->
 ## Install and migrate
 
 Install a pinned checkout in a path readable by the service account. The unit
@@ -32,6 +33,14 @@ SUTRADHARA_CACHE_ROOT=/var/cache/sutradhara
 SUTRADHARA_GRPC_BIND=127.0.0.1
 ```
 
+`SUTRADHARA_GRPC_BIND` is not read by Sutradhara itself — `sutra serve`'s
+`--grpc-bind` flag defaults to `127.0.0.1` in code. The shipped
+`sutradhara-serve.service` substitutes this variable into that flag at
+launch (`ExecStart=... --grpc-bind ${SUTRADHARA_GRPC_BIND} ...`), which is
+why setting it here works for the unit below. Running `sutra serve`
+under a different supervisor requires passing `--grpc-bind` directly;
+setting only the environment variable has no effect there.
+
 Remanence daemon endpoints are persisted per backend, not read from an
 environment variable. Register each library after the migration, using its
 actual Remanence library UUID:
@@ -56,6 +65,7 @@ deployment uses Linux `CAP_SYS_RAWIO`, apply `setcap cap_sys_rawio+ep` to the
 installed binary after every replacement and verify it with `getcap`; do not run
 Sutradhara as root to compensate.
 
+<!-- code-anchor: src/sutradhara/keys/registry.py src/sutradhara/keys/remanence.py src/sutradhara/cli/admin.py src/sutradhara/api/app.py src/sutradhara/api/routes_devices.py docs/examples/agent-bundle.dev.json @ 747b3c2 -->
 ## Recovery and hot keys
 
 Create a recovery pair on an offline operator machine and keep the private half
@@ -86,6 +96,7 @@ make the referenced enrollment CA readable by the service user, and add
 file. Without it the server remains usable, but `/api/enroll/bundle` returns
 `bundle_not_configured`.
 
+<!-- code-anchor: systemd src/sutradhara/cli/serve.py src/sutradhara/cli/reconcile.py src/sutradhara/jobs/reconcilers src/sutradhara/jobs/worker_lock.py src/sutradhara/grpc/ca.py src/sutradhara/grpc/server.py @ 747b3c2 -->
 ## Services
 
 Templates live in [`systemd/`](../systemd/). Review every `User`, `Group`, path,
@@ -116,6 +127,7 @@ assert desired state periodically; they are safe to rerun. On first start, the
 server creates its CA and server key below the configured PKI directory. Back up
 that directory as sensitive state and restrict it to the service account.
 
+<!-- code-anchor: deploy/Caddyfile.example src/sutradhara/api/identity.py src/sutradhara/api/app.py src/sutradhara/cli/api.py @ 747b3c2 -->
 ## Reverse proxy and identity boundary
 
 The HTTP API trusts `X-Authentik-*` identity headers. That trust is safe only
@@ -135,6 +147,7 @@ must have execute permission on `/run/sutradhara` and group access to the `0660`
 socket. Do not expose `sutra serve-api --tcp`: loopback TCP is a development mode
 where any local process can forge an operator identity.
 
+<!-- code-anchor: src/sutradhara/cli/admin.py src/sutradhara/cli/reconcile.py systemd/sutradhara-retention-journal-export.service systemd/sutradhara-retention-journal-export.timer src/sutradhara/api/routes_session.py @ 747b3c2 -->
 ## Verify
 
 After startup, check the migration, processes, socket ownership, and denial path:

@@ -4,7 +4,7 @@ The internal vocabulary of Sutradhara, as the code actually uses it. Each
 entry names the defining module so you can check the source. Terms that
 appear in older design docs but not in the code are flagged as such.
 
-<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ 8ecf3c8 -->
+<!-- code-anchor: packages/sutradhara-receive/src/sutradhara_receive src/sutradhara/intake.py src/sutradhara/catalog/types.py @ 747b3c2 -->
 ## Receive and intake
 
 **bag / BagIt** — the on-disk form of a received intake: a BagIt 1.0 bag
@@ -65,7 +65,7 @@ check — see "duplicate warning" under
 [Relay and enrollment](#relay-and-enrollment) for the live, pre-registration
 half computed by `receive_novelty.py`.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py src/sutradhara/bundle_group.py src/sutradhara/archive_bundle.py src/sutradhara/archive_sweeper.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/durability.py src/sutradhara/bundle_group.py src/sutradhara/archive_bundle.py src/sutradhara/archive_sweeper.py @ 747b3c2 -->
 ## Catalog identities
 
 **logical asset** — content identity. One row per distinct SHA-256; the
@@ -170,7 +170,7 @@ to override), never deletion or preservation. `sutra unreject` clears it.
 **tag** — a soft-deleted governance label on an asset (`AssetTag`);
 removal tombstones the row for audit.
 
-<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/artifactclass_policy.py src/sutradhara/catalog/models.py @ 747b3c2 -->
 ## Policy and placement
 
 **artifactclass** — the policy class of a piece of content (e.g. masters
@@ -210,7 +210,7 @@ uploaded at registration to the `cloud-temp` backend/pool (a REM-ENCRYPT
 envelope of the whole intake). Temporary by design: the retention gate deletes
 it once durable copies are proven.
 
-<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 747b3c2 -->
 ## Sealing
 
 **representation** — the stored form of a copy: `raw-bytes`,
@@ -248,7 +248,7 @@ and best-effort zeroized before removal. Recovery private material stays
 offline. Retiring an epoch stops new seals but preserves its retained
 material.
 
-<!-- code-anchor: src/sutradhara/arrangement.py src/sutradhara/virtual_arrangement.py src/sutradhara/archive_submission.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/arrangement.py src/sutradhara/virtual_arrangement.py src/sutradhara/archive_submission.py @ 747b3c2 -->
 ## Arrangement
 
 **arrangement** — the mutable pre-archive workspace: registered masters
@@ -281,7 +281,7 @@ organizational view (`VirtualArrangement`). Members key on
 catalog-only. Older docs call this "virtual segregation" or "VS" — same
 thing, renamed 2026-06-27.
 
-<!-- code-anchor: src/sutradhara/jobs @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/jobs @ 747b3c2 -->
 ## Jobs and reconciliation
 
 **job / job attempt** — a `Job` row is one unit of work dispatched by
@@ -331,7 +331,7 @@ substitute it (e.g. "the `rem.tape.write_object` seam", "the hdcache read
 seam" around `resolve_read_source`). An architecture term, not a data
 model term.
 
-<!-- code-anchor: src/sutradhara/scrub.py src/sutradhara/replication.py src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/scrub.py src/sutradhara/replication.py src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py @ 747b3c2 -->
 ## Verification and lifecycle
 
 **scrub** — re-enumerating a backend and reconciling it against the
@@ -391,7 +391,7 @@ reading the whole stored object: a `pfr-index-v1` container-index sidecar
 plus Remanence byte-range reads, with a fallback ladder to whole-member
 restore (`pfr.py`, `sutra pfr`).
 
-<!-- code-anchor: src/sutradhara/hdcache @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/hdcache @ 747b3c2 -->
 ## HD cache
 
 **hdcache** — the expendable disk cache tier: independent JBOD disks in
@@ -442,13 +442,13 @@ a planned slot only once every earlier same-volume slot has settled.
 **ordering outcome** — an append-only, never-updated ledger row
 (`restore_ordering_outcome`) recording one ordering decision — phase
 `initial`, `post_mount`, or `read_failure`, and a closed status vocabulary
-(e.g. `ordered`, `unavailable_uncalibrated`, `tag_collision`,
+(e.g. `ok`, `unavailable_uncalibrated`, `tag_collision`,
 `rpc_unimplemented`) — for one volume of one restore request. There is no
 stored "was this restore ordered" flag anywhere; it's derived by asking
 whether planned slots or a favorable-status outcome exist for the phase
 you're asking about.
 
-<!-- code-anchor: src/sutradhara/grpc src/sutradhara/api/routes_devices.py src/sutradhara/api/routes_intake_archive.py src/sutradhara/archive_predicate.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/grpc src/sutradhara/api/routes_devices.py src/sutradhara/api/routes_intake_archive.py src/sutradhara/archive_predicate.py @ 747b3c2 -->
 ## Relay and enrollment
 
 **agent / helper** — the Rust `sutra-agent` workstation program (separate

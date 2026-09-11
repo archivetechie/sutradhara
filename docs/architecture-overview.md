@@ -25,7 +25,7 @@ not a data-loss event.
 
 *Fig. 1 — What talks to what: three entry surfaces over one catalog database, the reconciler enqueuing what the job engine runs, and storage below. The tape-side path is where durable copies are written.*
 
-<!-- code-anchor: src/sutradhara pyproject.toml @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara pyproject.toml @ 747b3c2 -->
 ## The shape of the code
 
 One Python package, `src/sutradhara/`, plus one workspace package. The
@@ -83,7 +83,7 @@ canonical implementation is Python (`core.py`), with a Rust crate under
 (a separate repository) links the same crate. The server imports the
 package as `sutradhara_receive` via the uv workspace.
 
-<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/catalog/types.py src/sutradhara/bundle_group.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/catalog/types.py src/sutradhara/bundle_group.py @ 747b3c2 -->
 ## Data model
 
 Two identities anchor everything:
@@ -316,7 +316,7 @@ insert unknown objects, mark absentees `missing`, flag hash conflicts
 `suspect` — never delete), and **self-heal** (`replication.py`) re-seals
 missing placements from a healthy copy.
 
-<!-- code-anchor: src/sutradhara/jobs @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/jobs @ 747b3c2 -->
 ## Job engine and reconciler spine
 
 Intent lives in the catalog; jobs are ephemeral attempts. That is the
@@ -404,7 +404,7 @@ a batch of targets, process due conditions, and enqueue at most one live
 job per target. Level-triggered and idempotent: running it twice is safe,
 and crashed state converges on the next cycle.
 
-<!-- code-anchor: src/sutradhara/backend src/sutradhara/replication.py src/sutradhara/jobs/registry.py src/sutradhara/hdcache/read_ordering.py @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/backend src/sutradhara/replication.py src/sutradhara/jobs/registry.py src/sutradhara/hdcache/read_ordering.py @ 747b3c2 -->
 ## Storage backends
 
 The port (`backend/port.py`) is deliberately small: `enumerate()` yields
@@ -496,7 +496,7 @@ every write of a given copy, so a legitimate re-write (self-heal
 re-encrypting a placement to a new key epoch, for instance) collided with
 Remanence's own conflict check and was wrongly refused.
 
-<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/sealing src/sutradhara/keys @ 747b3c2 -->
 ## Sealing and keys
 
 A copy's on-backend form is its **representation**: `raw-bytes`
@@ -534,7 +534,7 @@ trust boundary: the codec accepts only exactly one JSON object on the
 garbage — and raises rather than tolerate anything looser. Epoch IDs are
 explicitly domain-tagged and all seal/open sites assert their domain.
 
-<!-- code-anchor: src/sutradhara/hdcache @ 8ecf3c8 -->
+<!-- code-anchor: src/sutradhara/hdcache @ 747b3c2 -->
 ## The HD cache tier
 
 `hdcache/` is a speed layer of independent JBOD disks in front of tape.
@@ -579,7 +579,7 @@ today — a cache miss there defers to disk-only archive candidates and
 explicitly refuses tape (see below). One producer, two callers, so a cache
 read is never less verified for one delivery mode than the other.
 
-<!-- code-anchor: src/sutradhara/restore.py src/sutradhara/archive_restore.py src/sutradhara/hdcache/manager.py src/sutradhara/hdcache/read_ordering.py src/sutradhara/grpc/restore_service.py proto/restore.proto proto/layer5.proto @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/restore.py src/sutradhara/archive_restore.py src/sutradhara/hdcache/manager.py src/sutradhara/hdcache/read_ordering.py src/sutradhara/grpc/restore_service.py proto/restore.proto proto/layer5.proto @ 747b3c2 -->
 ## The restore path
 
 Bytes reach a requester in one of two ways, sharing the same gates,
@@ -710,7 +710,7 @@ ranges let ffmpeg cut a clip without reading the whole object, through a
 bounded local blob cache, with a fallback ladder down to whole-member
 restore.
 
-<!-- code-anchor: src/sutradhara/api src/sutradhara/grpc proto @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/api src/sutradhara/grpc proto @ 747b3c2 -->
 ## Operator surface
 
 The HTTP API (`api/app.py`, FastAPI) binds to a Unix socket behind a
@@ -804,7 +804,7 @@ projection of this predicate — and neither is a sealed bundle whose copies
 were never measured. `sutra archive predicate-audit` reports the intakes
 that sit only partially covered.
 
-<!-- code-anchor: src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 072cb02 -->
+<!-- code-anchor: src/sutradhara/retention.py src/sutradhara/evidence_recorder.py src/sutradhara/backend/port.py src/sutradhara/backend/remanence.py alembic/versions/e1f2a3b4c5d6_add_deletion_evidence_gate.py alembic/versions/f2a3b4c5d6e7_add_retention_journal.py @ 747b3c2 -->
 ## Deletion evidence and the retention witness gate
 
 Retention already refused to delete anything until every recipe copy was
@@ -857,14 +857,22 @@ history into a tamper-evident evidence journal are in
 `sutra retention journal export|check|correct` /
 `sutra retention sitrep` in [`reference-cli.md`](reference-cli.md).
 
-<!-- code-anchor: alembic @ 072cb02 -->
+<!-- code-anchor: alembic @ 747b3c2 -->
 ## Migrations
 
-Schema history is alembic, in `alembic/`: 38 migrations in a single
+Schema history is alembic, in `alembic/`: 39 migrations in a single
 linear chain from `ea7254a77d7a` (the initial logical-asset/backend/copy
-tables) to head `c2d3e4f5a6b7` (`bundle.claimed_by`, the flush
-compare-and-set/reaper identity column). The three revisions immediately
-before head layer in the bundle-groups and restore-read-ordering work:
+tables) to head `d3e4f5a6b7c8` (`rename_rem_object_representations`:
+rewrites `pool.representation`, `asset_locator.representation`,
+`copy.storage_metadata`, and `cache_entry.representation` from the
+pre-production `rao-plain-v1`/`rao-aead-v1` names to
+`rem-object-v1`/`rem-encrypt-v1`, invalidates live/filling cache rows for
+refill since their stored representation label changed, and recomputes
+every `bundle.bundle_group`/`group_basis` fingerprint and
+`artifactclass_policy.bundle_group` that embeds those labels). The four
+revisions immediately before head layer in the representation rename,
+bundle-groups, and restore-read-ordering work: `c2d3e4f5a6b7`
+(`bundle.claimed_by`, the flush compare-and-set/reaper identity column),
 `a4b5c6d7e8f9` (restore read ordering: `restore_read_plan_slot`, the
 persisted per-volume release-order whiteboard, and
 `restore_ordering_outcome`, the append-only ordering-outcome ledger),
@@ -874,8 +882,8 @@ backfilled from the bundle's own former class column,
 frozen open-time witness — `artifactclass_policy.bundle_group`,
 `pool.min_object_bytes`, dropping the now-obsolete
 `bundle.artifactclass`/`ruleset`/`expect` columns, and admitting
-`accumulated` to submission status), and `c2d3e4f5a6b7` itself. Before
-that, the deletion-evidence work: `c8d2e4f6a1b3` (indexed component
+`accumulated` to submission status). Before that, the deletion-evidence
+work: `c8d2e4f6a1b3` (indexed component
 snapshots for parked reconciliation conditions — the state `sutra
 reconcile record-fix` matches against), `e1f2a3b4c5d6` (deletion
 evidence: the `verify_receipt` table, `integrity_hash_provenance` and
@@ -894,8 +902,9 @@ job table, pools, staging transforms, leases, the reconciler spine,
 arrangements and submissions, virtual arrangements, retention, gRPC
 intake and relay state, the hdcache tier, restore admission and
 progress, copy-grain durability, the agent-delivery restore protocol,
-the deletion-evidence witness gate and retention evidence journal, and
-now restore read ordering and bundle-group accumulation. Migration
+the deletion-evidence witness gate and retention evidence journal,
+restore read ordering and bundle-group accumulation, and now the
+REM-OBJECT representation rename. Migration
 `b9c8d7e6f5a4` also runs a hard pre-flight gate — it aborts with an
 actionable error, rather than transforming data, if two currently-open
 per-class accumulators already share a bundle-group fingerprint, since
