@@ -11,6 +11,7 @@
 
 ---
 
+<!-- code-anchor: none -->
 ## The one big idea
 
 A preservation archive has to do two jobs that pull in opposite directions.
@@ -29,6 +30,7 @@ Everything that follows is a consequence of taking that idea seriously.
 
 ---
 
+<!-- code-anchor: src/sutradhara/cli/intake.py src/sutradhara/cli/arrangement.py src/sutradhara/cli/archive.py src/sutradhara/cli/virtual.py @ b6c1b9f -->
 ## A story: a morning shoot, from card to catalogue
 
 Before the concepts, here's the whole journey concretely. Imagine an operator comes back from a morning shoot with a camera card holding a few clips: `A001.MOV`, `A002.MOV`, and so on.
@@ -55,6 +57,7 @@ That's the whole arc. The rest of this guide explains *why* each part is shaped 
 
 ---
 
+<!-- code-anchor: src/sutradhara/catalog/models.py packages/sutradhara-receive/src/sutradhara_receive/core.py src/sutradhara/jobs/reconcilers/spine.py src/sutradhara/pfr.py @ b6c1b9f -->
 ## The ideas underneath
 
 ### 1. The evidence is sacred — you organize a *layer over* it, never the thing itself
@@ -172,6 +175,7 @@ The principle: *walk once, then one object forever.* (And because sealing must b
 
 ---
 
+<!-- code-anchor: none -->
 ## The principles that tie it all together
 
 If you remember nothing else, remember these:
@@ -187,6 +191,7 @@ If you remember nothing else, remember these:
 
 ---
 
+<!-- code-anchor: src/sutradhara/catalog/models.py src/sutradhara/jobs/reconcilers/spine.py packages/sutradhara-receive/src/sutradhara_receive/core.py @ b6c1b9f -->
 ## A short glossary
 
 - **Intake / the bag** — one received batch of material, copied to the landing area with a checksum manifest. Immutable evidence.
