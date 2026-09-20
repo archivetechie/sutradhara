@@ -1,3 +1,4 @@
+<!-- code-anchor: docs/examples/agent-bundle.dev.json @ b6c1b9f -->
 # Sutradhara deployment examples
 
 ## Agent bundle dev config

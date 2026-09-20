@@ -1,3 +1,4 @@
+<!-- code-anchor: src/sutradhara/sealing/port.py src/sutradhara/sealing/rem_object.py src/sutradhara/retention.py src/sutradhara/pfr.py src/sutradhara/api/identity.py src/sutradhara/backend/remanence.py @ b6c1b9f -->
 # Design decision register
 
 The private working journal contains exploratory drafts and operational detail
