@@ -17,22 +17,31 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   PACKAGE_DIR: packages/sutradhara-receive
   BIN_NAME: sutra-receive
 
 jobs:
+  full-ci:
+    uses: ./.github/workflows/ci.yml
   version:
     name: version guard
+    needs: full-ci
     runs-on: ubuntu-latest
     outputs:
       package-version: ${{ steps.version.outputs.package-version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v9
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95.0"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.16"
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --locked --extra dev
@@ -68,6 +77,15 @@ jobs:
             fi
           fi
           echo "package-version=$cargo_version" >> "$GITHUB_OUTPUT"
+      - name: Verify release source and main CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/release_evidence.py gate --output eligibility/eligibility.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receive-eligibility
+          path: eligibility/eligibility.json
+          if-no-files-found: error
       - name: Test Rust receive core and shared fixtures
         run: cargo test --locked --manifest-path "$PACKAGE_DIR/Cargo.toml"
       - name: Verify Python-generated fixture corpus
@@ -80,18 +98,26 @@ jobs:
     runs-on: ubuntu-latest
     needs: version
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build manylinux wheel
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           working-directory: ${{ env.PACKAGE_DIR }}
           command: build
-          args: --release --out dist --find-interpreter
-          manylinux: auto
+          args: --release --locked --out dist --find-interpreter
+          maturin-version: "1.12.6"
+          rust-toolchain: "1.95.0"
+          container: quay.io/pypa/manylinux_2_28_x86_64@sha256:ae21cd1c8220f773f9b5934f3b845d677494d4cd4b8981c1e416f654e8afa74e
+          manylinux: "2_28"
+          before-script-linux: |
+            rustc -vV > rust-toolchain.txt
+            cargo -V > cargo-toolchain.txt
           target: x86_64
           sccache: true
+      - name: Record wheel build
+        run: python scripts/release_evidence.py record --name manylinux --dist "$PACKAGE_DIR/dist" --lock uv.lock --lock "$PACKAGE_DIR/Cargo.lock" --rust-version-file "$PACKAGE_DIR/rust-toolchain.txt" --cargo-version-file "$PACKAGE_DIR/cargo-toolchain.txt"
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: receive-wheel-manylinux-x86_64
           path: ${{ env.PACKAGE_DIR }}/dist/*
@@ -110,9 +136,10 @@ jobs:
           - target: x86_64-unknown-linux-musl
             artifact: sutra-receive-x86_64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: "1.95.0"
           targets: ${{ matrix.target }}
       - name: Install musl linker
         if: contains(matrix.target, 'musl')
@@ -121,7 +148,7 @@ jobs:
           sudo apt-get install -y musl-tools
       - name: Build binary
         run: |
-          cargo build \
+          cargo build --locked \
             --manifest-path "$PACKAGE_DIR/Cargo.toml" \
             --release \
             --bin "$BIN_NAME" \
@@ -133,11 +160,15 @@ jobs:
           cp "$PACKAGE_DIR/target/${{ matrix.target }}/release/$BIN_NAME" \
             "dist/${{ matrix.artifact }}/$BIN_NAME"
           tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+      - name: Record build inputs
+        run: python scripts/release_evidence.py record --name ${{ matrix.target }} --dist dist --lock uv.lock --lock "$PACKAGE_DIR/Cargo.lock"
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: receive-binary-${{ matrix.target }}
-          path: dist/${{ matrix.artifact }}.tar.gz
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/build-*.json
           if-no-files-found: error
 
   macos-universal-binary:
@@ -145,18 +176,19 @@ jobs:
     runs-on: macos-latest
     needs: version
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: "1.95.0"
           targets: x86_64-apple-darwin,aarch64-apple-darwin
       - name: Build binary slices
         run: |
-          cargo build \
+          cargo build --locked \
             --manifest-path "$PACKAGE_DIR/Cargo.toml" \
             --release \
             --bin "$BIN_NAME" \
             --target x86_64-apple-darwin
-          cargo build \
+          cargo build --locked \
             --manifest-path "$PACKAGE_DIR/Cargo.toml" \
             --release \
             --bin "$BIN_NAME" \
@@ -240,11 +272,15 @@ jobs:
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --wait
+      - name: Record build inputs
+        run: python scripts/release_evidence.py record --name universal2-apple-darwin --dist dist --lock uv.lock --lock "$PACKAGE_DIR/Cargo.lock"
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: receive-binary-universal2-apple-darwin
-          path: dist/sutra-receive-universal2-apple-darwin.zip
+          path: |
+            dist/sutra-receive-universal2-apple-darwin.zip
+            dist/build-*.json
           if-no-files-found: error
 
   windows-binary:
@@ -252,12 +288,14 @@ jobs:
     runs-on: windows-latest
     needs: version
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95.0"
       - name: Build binary
         shell: pwsh
         run: |
-          cargo build `
+          cargo build --locked `
             --manifest-path "$env:PACKAGE_DIR/Cargo.toml" `
             --release `
             --bin "$env:BIN_NAME"
@@ -269,11 +307,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/$artifact"
           Copy-Item "$env:PACKAGE_DIR/target/release/$env:BIN_NAME.exe" "dist/$artifact/$env:BIN_NAME.exe"
           Compress-Archive -Path "dist/$artifact" -DestinationPath "dist/$artifact.zip" -Force
+      - name: Record build inputs
+        shell: bash
+        run: python scripts/release_evidence.py record --name x86_64-pc-windows-msvc --dist dist --lock uv.lock --lock "$PACKAGE_DIR/Cargo.lock"
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: receive-binary-x86_64-pc-windows-msvc
-          path: dist/sutra-receive-x86_64-pc-windows-msvc.zip
+          path: |
+            dist/sutra-receive-x86_64-pc-windows-msvc.zip
+            dist/build-*.json
           if-no-files-found: error
 
   checksums:
@@ -286,28 +329,36 @@ jobs:
       - windows-binary
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
+          pattern: receive-*
           merge-multiple: true
-      - name: Generate SHA256SUMS
-        run: |
-          set -euo pipefail
-          cd dist
-          find . -type f ! -name SHA256SUMS -printf '%P\n' \
-            | LC_ALL=C sort \
-            | xargs sha256sum > SHA256SUMS
-          cat SHA256SUMS
+      - name: Validate builds and generate release manifest
+        run: >-
+          python scripts/release_evidence.py manifest --dist dist --lock uv.lock --lock "$PACKAGE_DIR/Cargo.lock"
+          --require-build manylinux --require-build x86_64-unknown-linux-gnu
+          --require-build x86_64-unknown-linux-musl --require-build universal2-apple-darwin
+          --require-build x86_64-pc-windows-msvc
+      - name: Attest release payload and manifest
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
       - name: Upload checksummed release files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: receive-release-files
           path: dist/*
           if-no-files-found: error
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
