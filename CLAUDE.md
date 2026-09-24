@@ -22,8 +22,10 @@ pytest before every commit. Policy compat (o/n archive shims) must keep
 Scenario J/N/O/Q green.
 
 ## Pattern + hygiene
-The maintainer brainstorms with Claude → design/prompt docs in `docs/` → codex (or
-Claude) implements → harness scenarios verify. Background `gardener` auto-
-commits idle work, pushes, prunes merged branches — never ask the maintainer to do
-repo hygiene. Docs lifecycle: `docs/INDEX.md` + `docs/historical/`
-(finished designs and implemented prompts; formerly `docs/archive/`).
+Designs, prompts, reviews and journals live in the supervising private repository;
+this public repository carries distilled architecture, guides and specifications.
+Implementation is independently reviewed and verified by the harness scenarios.
+Gardener creates isolated recovery checkpoints and reviewed documentation candidates.
+It does not automatically commit the active branch, push it, or delete remote branches.
+Track working-document lifecycle in the private repository's documentation registry.
+Keep the public navigation index `docs/INDEX.md` current when public guides change.
