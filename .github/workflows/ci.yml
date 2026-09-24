@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -19,21 +20,24 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v9
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          version: "0.11.16"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - run: uv sync --locked --extra dev
       - run: uv run pytest -q
+      - run: python -m unittest discover -s scripts -p 'test_release_evidence.py'
 
   quality:
     name: lint, format, types, generated contracts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v9
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          version: "0.11.16"
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --locked --extra dev
@@ -49,15 +53,18 @@ jobs:
     name: pinned rem-daemon wire proof
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: archivetechie/remanence
           ref: 1ca0a9e6098b9000695752fb19b2bf07403a7c7c
           path: .ci/remanence
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v9
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: "1.95.0"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.16"
           python-version: "3.12"
           enable-cache: true
       - name: Install protobuf compiler
