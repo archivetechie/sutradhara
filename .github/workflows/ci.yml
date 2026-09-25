@@ -12,9 +12,35 @@ permissions:
   contents: read
 
 jobs:
+  remanence-binaries:
+    name: pinned Remanence binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: archivetechie/remanence
+          # pin: remanence main after wire presence
+          ref: 15e573094dc1d46b61cc6520844a563d3a8d2c5b
+          path: .ci/remanence
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95.0"
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - run: cargo build --manifest-path .ci/remanence/Cargo.toml --bin rem --bin rem-daemon
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: remanence-binaries
+          path: |
+            .ci/remanence/target/debug/rem
+            .ci/remanence/target/debug/rem-daemon
+          retention-days: 1
+
   test:
     name: pytest (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    needs: remanence-binaries
     strategy:
       fail-fast: false
       matrix:
@@ -27,7 +53,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - run: uv sync --locked --extra dev
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: remanence-binaries
+          path: ${{ runner.temp }}/rem-bin
+      - run: chmod +x "${{ runner.temp }}/rem-bin/rem" "${{ runner.temp }}/rem-bin/rem-daemon"
       - run: uv run pytest -q
+        env:
+          REM_BIN: ${{ runner.temp }}/rem-bin/rem
+          REM_DAEMON_BIN: ${{ runner.temp }}/rem-bin/rem-daemon
       - run: python -m unittest discover -s scripts -p 'test_release_evidence.py'
 
   quality:
@@ -52,26 +86,21 @@ jobs:
   remanence-wire:
     name: pinned rem-daemon wire proof
     runs-on: ubuntu-latest
+    needs: remanence-binaries
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: archivetechie/remanence
-          ref: 1ca0a9e6098b9000695752fb19b2bf07403a7c7c
-          path: .ci/remanence
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: "1.95.0"
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.11.16"
           python-version: "3.12"
           enable-cache: true
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - run: uv sync --locked --extra dev
-      - run: cargo build --manifest-path .ci/remanence/Cargo.toml --bin rem-daemon
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: remanence-binaries
+          path: ${{ runner.temp }}/rem-bin
+      - run: chmod +x "${{ runner.temp }}/rem-bin/rem-daemon"
       - name: Run real-daemon read/planning contract
         env:
-          REM_DAEMON_BIN: ${{ github.workspace }}/.ci/remanence/target/debug/rem-daemon
+          REM_DAEMON_BIN: ${{ runner.temp }}/rem-bin/rem-daemon
         run: uv run pytest -q tests/test_read_ordering_live.py

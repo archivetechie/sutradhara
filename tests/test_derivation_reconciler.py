@@ -70,7 +70,10 @@ def test_proxy_lands_as_output_class_and_copy_policy_uses_proxy_class(
         profile="proxy-review",
     )
 
-    with session_scope(engine) as session:
+    with (
+        override_derivation_cache_root(tmp_path / "cache"),
+        session_scope(engine) as session,
+    ):
         _add_pool(session, "master-pool", "s-masters")
         _add_pool(session, "proxy-pool", "s-proxy")
         reconcile(session, "derivation")

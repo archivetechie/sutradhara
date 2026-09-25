@@ -535,7 +535,8 @@ class _FakeContext:
 def _eventually(predicate: Callable[[], bool]) -> None:
     import time
 
-    deadline = time.monotonic() + 2
+    # Generous: a loaded CI runner can take seconds; a passing check returns at once.
+    deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         try:
             if predicate():

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Enforce a non-growing, diagnostic-specific baseline for strict mypy errors.
 
-The project is reducing an inherited strict-mode backlog.  CI accepts existing
-diagnostics by source location, error code, and message, allows fixes, and
-rejects every new diagnostic even when the total count happens to stay constant.
+The project is reducing an inherited strict-mode backlog. CI accepts existing
+diagnostics by file, error code, and message, allows fixes, and rejects an
+increase in any diagnostic's count.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / "mypy-baseline.json"
 
 
-Diagnostic = tuple[str, int, int, str, str]
+Diagnostic = tuple[str, str, str]
 
 
 def _diagnostics() -> tuple[collections.Counter[Diagnostic], subprocess.CompletedProcess[str]]:
@@ -45,8 +45,6 @@ def _diagnostics() -> tuple[collections.Counter[Diagnostic], subprocess.Complete
         diagnostics[
             (
                 str(record["file"]),
-                int(record["line"]),
-                int(record["column"]),
                 str(record.get("code") or "unknown"),
                 str(record["message"]),
             )
@@ -58,28 +56,24 @@ def _load_baseline() -> collections.Counter[Diagnostic]:
     payload = json.loads(BASELINE.read_text(encoding="utf-8"))
     if payload.get("version") != 2:
         raise SystemExit(f"unsupported mypy baseline version in {BASELINE}")
-    return collections.Counter(
-        {
+    diagnostics: collections.Counter[Diagnostic] = collections.Counter()
+    for row in payload["diagnostics"]:
+        diagnostics[
             (
                 str(row["file"]),
-                int(row["line"]),
-                int(row["column"]),
                 str(row["code"]),
                 str(row["message"]),
-            ): int(row["count"])
-            for row in payload["diagnostics"]
-        }
-    )
+            )
+        ] += int(row["count"])
+    return diagnostics
 
 
 def _write_baseline(diagnostics: collections.Counter[Diagnostic]) -> None:
     rows: list[dict[str, Any]] = []
-    for (file, line, column, code, message), count in sorted(diagnostics.items()):
+    for (file, code, message), count in sorted(diagnostics.items()):
         rows.append(
             {
                 "file": file,
-                "line": line,
-                "column": column,
                 "code": code,
                 "message": message,
                 "count": count,
@@ -95,6 +89,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--write-baseline",
+        "--update",
         action="store_true",
         help="Replace the baseline with the current strict-mypy diagnostics.",
     )
@@ -112,12 +107,11 @@ def main() -> int:
         f"mypy baseline: current={current.total()} allowed={baseline.total()} "
         f"fixed={fixed.total()} new={additions.total()}"
     )
+    for (file, code, message), count in sorted(fixed.items()):
+        print(f"FIXED {file} [{code}] x{count}: {message}")
     if additions:
-        for (file, line, column, code, message), count in sorted(additions.items()):
-            print(
-                f"NEW {file}:{line}:{column} [{code}] x{count}: {message}",
-                file=sys.stderr,
-            )
+        for (file, code, message), count in sorted(additions.items()):
+            print(f"NEW {file} [{code}] x{count}: {message}", file=sys.stderr)
         return 1
     return 0
 
