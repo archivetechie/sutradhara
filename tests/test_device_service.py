@@ -426,7 +426,11 @@ def test_device_service_ack_does_not_complete_when_card_correlation_fails(
         )
     )
     assert pending.future.result(timeout=2).intake_id == "missing-intake"
-    _eventually(lambda: _idempotency_status(engine) == "started")
+    # A failed correlation abandons the intent (abandon_on_reject defaults to true,
+    # DeviceService._complete_receive): it ends "failed" with no stored response, never
+    # "completed". The old expectation "started" held only when this check ran before the
+    # ack handler, which a loaded CI runner does not guarantee.
+    _eventually(lambda: _idempotency_status(engine) == "failed")
     assert _idempotency_response(engine) is None
     messages.close()
     responses.close()
