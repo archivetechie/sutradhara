@@ -88,6 +88,16 @@ class TapeIndexVerificationState(int, metaclass=_enum_type_wrapper.EnumTypeWrapp
     TAPE_INDEX_VERIFICATION_STATE_VERIFIED_DEGRADED: _ClassVar[TapeIndexVerificationState]
     TAPE_INDEX_VERIFICATION_STATE_RECOVERY_REQUIRED: _ClassVar[TapeIndexVerificationState]
 
+class ProtectedContentFindingKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    PROTECTED_CONTENT_FINDING_KIND_UNSPECIFIED: _ClassVar[ProtectedContentFindingKind]
+    PROTECTED_CONTENT_FINDING_KIND_DATA_BLOCK: _ClassVar[ProtectedContentFindingKind]
+    PROTECTED_CONTENT_FINDING_KIND_PARITY_SHARD: _ClassVar[ProtectedContentFindingKind]
+    PROTECTED_CONTENT_FINDING_KIND_SIDECAR: _ClassVar[ProtectedContentFindingKind]
+    PROTECTED_CONTENT_FINDING_KIND_PREFIX_DAMAGE: _ClassVar[ProtectedContentFindingKind]
+    PROTECTED_CONTENT_FINDING_KIND_NOT_PERFORMED: _ClassVar[ProtectedContentFindingKind]
+    PROTECTED_CONTENT_FINDING_KIND_PARITY_MAP: _ClassVar[ProtectedContentFindingKind]
+
 class AppendMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     APPEND_MODE_UNSPECIFIED: _ClassVar[AppendMode]
@@ -242,6 +252,13 @@ TAPE_INDEX_VERIFICATION_STATE_DEFERRED_FULL_PHYSICAL_VERIFY: TapeIndexVerificati
 TAPE_INDEX_VERIFICATION_STATE_VERIFIED_COMPLETE: TapeIndexVerificationState
 TAPE_INDEX_VERIFICATION_STATE_VERIFIED_DEGRADED: TapeIndexVerificationState
 TAPE_INDEX_VERIFICATION_STATE_RECOVERY_REQUIRED: TapeIndexVerificationState
+PROTECTED_CONTENT_FINDING_KIND_UNSPECIFIED: ProtectedContentFindingKind
+PROTECTED_CONTENT_FINDING_KIND_DATA_BLOCK: ProtectedContentFindingKind
+PROTECTED_CONTENT_FINDING_KIND_PARITY_SHARD: ProtectedContentFindingKind
+PROTECTED_CONTENT_FINDING_KIND_SIDECAR: ProtectedContentFindingKind
+PROTECTED_CONTENT_FINDING_KIND_PREFIX_DAMAGE: ProtectedContentFindingKind
+PROTECTED_CONTENT_FINDING_KIND_NOT_PERFORMED: ProtectedContentFindingKind
+PROTECTED_CONTENT_FINDING_KIND_PARITY_MAP: ProtectedContentFindingKind
 APPEND_MODE_UNSPECIFIED: AppendMode
 APPEND_MODE_FRESH: AppendMode
 APPEND_MODE_APPEND: AppendMode
@@ -1415,7 +1432,7 @@ class TapeIndexSeparationHealth(_message.Message):
     def __init__(self, separation_ordinal: _Optional[int] = ..., state: _Optional[_Union[TapeIndexSeparationHealth.State, str]] = ..., verified_interior_record_count: _Optional[int] = ..., detail: _Optional[str] = ...) -> None: ...
 
 class TapeIndexVerification(_message.Message):
-    __slots__ = ("tape_uuid", "state", "fast_inventory", "detail", "replica_health", "separation_health", "measured_eod_lba", "verified_prefix_tape_file_count", "verified_prefix_record_count", "measured_tape_file_count", "edition_digest", "layout_digest", "payload_digest", "canonical_map_digest", "verification_basis", "recovery_inventory")
+    __slots__ = ("tape_uuid", "state", "fast_inventory", "detail", "replica_health", "separation_health", "measured_eod_lba", "verified_prefix_tape_file_count", "verified_prefix_record_count", "measured_tape_file_count", "edition_digest", "layout_digest", "payload_digest", "canonical_map_digest", "verification_basis", "recovery_inventory", "protected_content_findings")
     TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
     STATE_FIELD_NUMBER: _ClassVar[int]
     FAST_INVENTORY_FIELD_NUMBER: _ClassVar[int]
@@ -1432,6 +1449,7 @@ class TapeIndexVerification(_message.Message):
     CANONICAL_MAP_DIGEST_FIELD_NUMBER: _ClassVar[int]
     VERIFICATION_BASIS_FIELD_NUMBER: _ClassVar[int]
     RECOVERY_INVENTORY_FIELD_NUMBER: _ClassVar[int]
+    PROTECTED_CONTENT_FINDINGS_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     state: TapeIndexVerificationState
     fast_inventory: TapeInventory
@@ -1448,7 +1466,18 @@ class TapeIndexVerification(_message.Message):
     canonical_map_digest: bytes
     verification_basis: str
     recovery_inventory: TapeInventory
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., state: _Optional[_Union[TapeIndexVerificationState, str]] = ..., fast_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., detail: _Optional[str] = ..., replica_health: _Optional[_Iterable[_Union[TapeIndexReplicaHealth, _Mapping]]] = ..., separation_health: _Optional[_Iterable[_Union[TapeIndexSeparationHealth, _Mapping]]] = ..., measured_eod_lba: _Optional[int] = ..., verified_prefix_tape_file_count: _Optional[int] = ..., verified_prefix_record_count: _Optional[int] = ..., measured_tape_file_count: _Optional[int] = ..., edition_digest: _Optional[bytes] = ..., layout_digest: _Optional[bytes] = ..., payload_digest: _Optional[bytes] = ..., canonical_map_digest: _Optional[bytes] = ..., verification_basis: _Optional[str] = ..., recovery_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ...) -> None: ...
+    protected_content_findings: _containers.RepeatedCompositeFieldContainer[ProtectedContentFinding]
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., state: _Optional[_Union[TapeIndexVerificationState, str]] = ..., fast_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., detail: _Optional[str] = ..., replica_health: _Optional[_Iterable[_Union[TapeIndexReplicaHealth, _Mapping]]] = ..., separation_health: _Optional[_Iterable[_Union[TapeIndexSeparationHealth, _Mapping]]] = ..., measured_eod_lba: _Optional[int] = ..., verified_prefix_tape_file_count: _Optional[int] = ..., verified_prefix_record_count: _Optional[int] = ..., measured_tape_file_count: _Optional[int] = ..., edition_digest: _Optional[bytes] = ..., layout_digest: _Optional[bytes] = ..., payload_digest: _Optional[bytes] = ..., canonical_map_digest: _Optional[bytes] = ..., verification_basis: _Optional[str] = ..., recovery_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., protected_content_findings: _Optional[_Iterable[_Union[ProtectedContentFinding, _Mapping]]] = ...) -> None: ...
+
+class ProtectedContentFinding(_message.Message):
+    __slots__ = ("kind", "address", "detail")
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    kind: ProtectedContentFindingKind
+    address: str
+    detail: str
+    def __init__(self, kind: _Optional[_Union[ProtectedContentFindingKind, str]] = ..., address: _Optional[str] = ..., detail: _Optional[str] = ...) -> None: ...
 
 class TapeFinalization(_message.Message):
     __slots__ = ("tape_uuid", "operation_id", "progress", "completed_replicas", "replica_health", "edition_digest", "layout_digest", "outcome", "trigger", "detail", "replica_progress")

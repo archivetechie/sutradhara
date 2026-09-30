@@ -20,14 +20,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: archivetechie/remanence
-          # pin: remanence main after wire presence
-          ref: 15e573094dc1d46b61cc6520844a563d3a8d2c5b
+          # pin: remanence main after the RustCrypto generation and the aead review
+          ref: 124d18763aec323635d5c08a2308c1e66b292e85
           path: .ci/remanence
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - run: cargo build --manifest-path .ci/remanence/Cargo.toml --bin rem --bin rem-daemon
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
