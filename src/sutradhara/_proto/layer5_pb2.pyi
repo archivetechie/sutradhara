@@ -1432,7 +1432,7 @@ class TapeIndexSeparationHealth(_message.Message):
     def __init__(self, separation_ordinal: _Optional[int] = ..., state: _Optional[_Union[TapeIndexSeparationHealth.State, str]] = ..., verified_interior_record_count: _Optional[int] = ..., detail: _Optional[str] = ...) -> None: ...
 
 class TapeIndexVerification(_message.Message):
-    __slots__ = ("tape_uuid", "state", "fast_inventory", "detail", "replica_health", "separation_health", "measured_eod_lba", "verified_prefix_tape_file_count", "verified_prefix_record_count", "measured_tape_file_count", "edition_digest", "layout_digest", "payload_digest", "canonical_map_digest", "verification_basis", "recovery_inventory", "protected_content_findings")
+    __slots__ = ("tape_uuid", "state", "fast_inventory", "detail", "replica_health", "separation_health", "measured_eod_lba", "verified_prefix_tape_file_count", "verified_prefix_record_count", "measured_tape_file_count", "edition_digest", "layout_digest", "payload_digest", "canonical_map_digest", "verification_basis", "recovery_inventory", "protected_content_findings", "io")
     TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
     STATE_FIELD_NUMBER: _ClassVar[int]
     FAST_INVENTORY_FIELD_NUMBER: _ClassVar[int]
@@ -1450,6 +1450,7 @@ class TapeIndexVerification(_message.Message):
     VERIFICATION_BASIS_FIELD_NUMBER: _ClassVar[int]
     RECOVERY_INVENTORY_FIELD_NUMBER: _ClassVar[int]
     PROTECTED_CONTENT_FINDINGS_FIELD_NUMBER: _ClassVar[int]
+    IO_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     state: TapeIndexVerificationState
     fast_inventory: TapeInventory
@@ -1467,7 +1468,72 @@ class TapeIndexVerification(_message.Message):
     verification_basis: str
     recovery_inventory: TapeInventory
     protected_content_findings: _containers.RepeatedCompositeFieldContainer[ProtectedContentFinding]
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., state: _Optional[_Union[TapeIndexVerificationState, str]] = ..., fast_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., detail: _Optional[str] = ..., replica_health: _Optional[_Iterable[_Union[TapeIndexReplicaHealth, _Mapping]]] = ..., separation_health: _Optional[_Iterable[_Union[TapeIndexSeparationHealth, _Mapping]]] = ..., measured_eod_lba: _Optional[int] = ..., verified_prefix_tape_file_count: _Optional[int] = ..., verified_prefix_record_count: _Optional[int] = ..., measured_tape_file_count: _Optional[int] = ..., edition_digest: _Optional[bytes] = ..., layout_digest: _Optional[bytes] = ..., payload_digest: _Optional[bytes] = ..., canonical_map_digest: _Optional[bytes] = ..., verification_basis: _Optional[str] = ..., recovery_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., protected_content_findings: _Optional[_Iterable[_Union[ProtectedContentFinding, _Mapping]]] = ...) -> None: ...
+    io: VerificationIo
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., state: _Optional[_Union[TapeIndexVerificationState, str]] = ..., fast_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., detail: _Optional[str] = ..., replica_health: _Optional[_Iterable[_Union[TapeIndexReplicaHealth, _Mapping]]] = ..., separation_health: _Optional[_Iterable[_Union[TapeIndexSeparationHealth, _Mapping]]] = ..., measured_eod_lba: _Optional[int] = ..., verified_prefix_tape_file_count: _Optional[int] = ..., verified_prefix_record_count: _Optional[int] = ..., measured_tape_file_count: _Optional[int] = ..., edition_digest: _Optional[bytes] = ..., layout_digest: _Optional[bytes] = ..., payload_digest: _Optional[bytes] = ..., canonical_map_digest: _Optional[bytes] = ..., verification_basis: _Optional[str] = ..., recovery_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., protected_content_findings: _Optional[_Iterable[_Union[ProtectedContentFinding, _Mapping]]] = ..., io: _Optional[_Union[VerificationIo, _Mapping]] = ...) -> None: ...
+
+class VerificationIoCounts(_message.Message):
+    __slots__ = ("locate", "space", "read_position", "single_read", "batch_read", "other", "records_requested", "records_confirmed", "bytes", "hardware_batch_fallbacks", "recovered_reads", "algorithmic_fallback_epochs")
+    LOCATE_FIELD_NUMBER: _ClassVar[int]
+    SPACE_FIELD_NUMBER: _ClassVar[int]
+    READ_POSITION_FIELD_NUMBER: _ClassVar[int]
+    SINGLE_READ_FIELD_NUMBER: _ClassVar[int]
+    BATCH_READ_FIELD_NUMBER: _ClassVar[int]
+    OTHER_FIELD_NUMBER: _ClassVar[int]
+    RECORDS_REQUESTED_FIELD_NUMBER: _ClassVar[int]
+    RECORDS_CONFIRMED_FIELD_NUMBER: _ClassVar[int]
+    BYTES_FIELD_NUMBER: _ClassVar[int]
+    HARDWARE_BATCH_FALLBACKS_FIELD_NUMBER: _ClassVar[int]
+    RECOVERED_READS_FIELD_NUMBER: _ClassVar[int]
+    ALGORITHMIC_FALLBACK_EPOCHS_FIELD_NUMBER: _ClassVar[int]
+    locate: int
+    space: int
+    read_position: int
+    single_read: int
+    batch_read: int
+    other: int
+    records_requested: int
+    records_confirmed: int
+    bytes: int
+    hardware_batch_fallbacks: int
+    recovered_reads: int
+    algorithmic_fallback_epochs: int
+    def __init__(self, locate: _Optional[int] = ..., space: _Optional[int] = ..., read_position: _Optional[int] = ..., single_read: _Optional[int] = ..., batch_read: _Optional[int] = ..., other: _Optional[int] = ..., records_requested: _Optional[int] = ..., records_confirmed: _Optional[int] = ..., bytes: _Optional[int] = ..., hardware_batch_fallbacks: _Optional[int] = ..., recovered_reads: _Optional[int] = ..., algorithmic_fallback_epochs: _Optional[int] = ...) -> None: ...
+
+class VerificationIoPhase(_message.Message):
+    __slots__ = ("phase", "counts")
+    PHASE_FIELD_NUMBER: _ClassVar[int]
+    COUNTS_FIELD_NUMBER: _ClassVar[int]
+    phase: str
+    counts: VerificationIoCounts
+    def __init__(self, phase: _Optional[str] = ..., counts: _Optional[_Union[VerificationIoCounts, _Mapping]] = ...) -> None: ...
+
+class VerificationIoRange(_message.Message):
+    __slots__ = ("start_lba", "end_lba")
+    START_LBA_FIELD_NUMBER: _ClassVar[int]
+    END_LBA_FIELD_NUMBER: _ClassVar[int]
+    start_lba: int
+    end_lba: int
+    def __init__(self, start_lba: _Optional[int] = ..., end_lba: _Optional[int] = ...) -> None: ...
+
+class VerificationIo(_message.Message):
+    __slots__ = ("total", "phases", "elapsed_ms", "backward_data_seeks", "protected_bytes", "protected_ranges", "recovered_lbas", "recovered_unknown_addresses")
+    TOTAL_FIELD_NUMBER: _ClassVar[int]
+    PHASES_FIELD_NUMBER: _ClassVar[int]
+    ELAPSED_MS_FIELD_NUMBER: _ClassVar[int]
+    BACKWARD_DATA_SEEKS_FIELD_NUMBER: _ClassVar[int]
+    PROTECTED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PROTECTED_RANGES_FIELD_NUMBER: _ClassVar[int]
+    RECOVERED_LBAS_FIELD_NUMBER: _ClassVar[int]
+    RECOVERED_UNKNOWN_ADDRESSES_FIELD_NUMBER: _ClassVar[int]
+    total: VerificationIoCounts
+    phases: _containers.RepeatedCompositeFieldContainer[VerificationIoPhase]
+    elapsed_ms: int
+    backward_data_seeks: int
+    protected_bytes: int
+    protected_ranges: _containers.RepeatedCompositeFieldContainer[VerificationIoRange]
+    recovered_lbas: _containers.RepeatedScalarFieldContainer[int]
+    recovered_unknown_addresses: int
+    def __init__(self, total: _Optional[_Union[VerificationIoCounts, _Mapping]] = ..., phases: _Optional[_Iterable[_Union[VerificationIoPhase, _Mapping]]] = ..., elapsed_ms: _Optional[int] = ..., backward_data_seeks: _Optional[int] = ..., protected_bytes: _Optional[int] = ..., protected_ranges: _Optional[_Iterable[_Union[VerificationIoRange, _Mapping]]] = ..., recovered_lbas: _Optional[_Iterable[int]] = ..., recovered_unknown_addresses: _Optional[int] = ...) -> None: ...
 
 class ProtectedContentFinding(_message.Message):
     __slots__ = ("kind", "address", "detail")

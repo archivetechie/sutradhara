@@ -20,8 +20,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: archivetechie/remanence
-          # pin: remanence main after the RustCrypto generation and the aead review
-          ref: 124d18763aec323635d5c08a2308c1e66b292e85
+          # pin: remanence main after full-verification streaming and its io report
+          ref: 15013672a02283d0ccc9eea9be26ce5a4e9e88d8
           path: .ci/remanence
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
