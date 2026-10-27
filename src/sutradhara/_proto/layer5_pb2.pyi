@@ -375,7 +375,7 @@ class PageToken(_message.Message):
     def __init__(self, value: _Optional[bytes] = ...) -> None: ...
 
 class HealthResponse(_message.Message):
-    __slots__ = ("status", "components", "detail", "component_health")
+    __slots__ = ("status", "components", "detail", "component_health", "supported_endpoint_kinds", "daemon_capabilities", "observed_endpoints")
     class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         STATUS_UNSPECIFIED: _ClassVar[HealthResponse.Status]
@@ -399,11 +399,17 @@ class HealthResponse(_message.Message):
     COMPONENTS_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
     COMPONENT_HEALTH_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTED_ENDPOINT_KINDS_FIELD_NUMBER: _ClassVar[int]
+    DAEMON_CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
+    OBSERVED_ENDPOINTS_FIELD_NUMBER: _ClassVar[int]
     status: HealthResponse.Status
     components: _containers.ScalarMap[str, str]
     detail: str
     component_health: _containers.RepeatedCompositeFieldContainer[ComponentHealth]
-    def __init__(self, status: _Optional[_Union[HealthResponse.Status, str]] = ..., components: _Optional[_Mapping[str, str]] = ..., detail: _Optional[str] = ..., component_health: _Optional[_Iterable[_Union[ComponentHealth, _Mapping]]] = ...) -> None: ...
+    supported_endpoint_kinds: _containers.RepeatedScalarFieldContainer[str]
+    daemon_capabilities: _containers.RepeatedScalarFieldContainer[str]
+    observed_endpoints: _containers.RepeatedCompositeFieldContainer[ObservedEndpoint]
+    def __init__(self, status: _Optional[_Union[HealthResponse.Status, str]] = ..., components: _Optional[_Mapping[str, str]] = ..., detail: _Optional[str] = ..., component_health: _Optional[_Iterable[_Union[ComponentHealth, _Mapping]]] = ..., supported_endpoint_kinds: _Optional[_Iterable[str]] = ..., daemon_capabilities: _Optional[_Iterable[str]] = ..., observed_endpoints: _Optional[_Iterable[_Union[ObservedEndpoint, _Mapping]]] = ...) -> None: ...
 
 class ComponentHealth(_message.Message):
     __slots__ = ("component", "status", "other_status")
@@ -429,15 +435,37 @@ class ComponentHealth(_message.Message):
     other_status: str
     def __init__(self, component: _Optional[str] = ..., status: _Optional[_Union[ComponentHealth.Status, str]] = ..., other_status: _Optional[str] = ...) -> None: ...
 
+class ObservedEndpoint(_message.Message):
+    __slots__ = ("kind", "serial", "path", "ownership", "bay", "library_serial")
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    SERIAL_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    OWNERSHIP_FIELD_NUMBER: _ClassVar[int]
+    BAY_FIELD_NUMBER: _ClassVar[int]
+    LIBRARY_SERIAL_FIELD_NUMBER: _ClassVar[int]
+    kind: str
+    serial: str
+    path: str
+    ownership: str
+    bay: int
+    library_serial: str
+    def __init__(self, kind: _Optional[str] = ..., serial: _Optional[str] = ..., path: _Optional[str] = ..., ownership: _Optional[str] = ..., bay: _Optional[int] = ..., library_serial: _Optional[str] = ...) -> None: ...
+
 class VersionResponse(_message.Message):
-    __slots__ = ("daemon_version", "api_version", "rust_target")
+    __slots__ = ("daemon_version", "api_version", "rust_target", "supported_endpoint_kinds", "daemon_capabilities", "observed_endpoints")
     DAEMON_VERSION_FIELD_NUMBER: _ClassVar[int]
     API_VERSION_FIELD_NUMBER: _ClassVar[int]
     RUST_TARGET_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTED_ENDPOINT_KINDS_FIELD_NUMBER: _ClassVar[int]
+    DAEMON_CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
+    OBSERVED_ENDPOINTS_FIELD_NUMBER: _ClassVar[int]
     daemon_version: str
     api_version: str
     rust_target: str
-    def __init__(self, daemon_version: _Optional[str] = ..., api_version: _Optional[str] = ..., rust_target: _Optional[str] = ...) -> None: ...
+    supported_endpoint_kinds: _containers.RepeatedScalarFieldContainer[str]
+    daemon_capabilities: _containers.RepeatedScalarFieldContainer[str]
+    observed_endpoints: _containers.RepeatedCompositeFieldContainer[ObservedEndpoint]
+    def __init__(self, daemon_version: _Optional[str] = ..., api_version: _Optional[str] = ..., rust_target: _Optional[str] = ..., supported_endpoint_kinds: _Optional[_Iterable[str]] = ..., daemon_capabilities: _Optional[_Iterable[str]] = ..., observed_endpoints: _Optional[_Iterable[_Union[ObservedEndpoint, _Mapping]]] = ...) -> None: ...
 
 class GetOperationRequest(_message.Message):
     __slots__ = ("operation_id",)
@@ -1100,7 +1128,7 @@ class LibraryEvent(_message.Message):
     def __init__(self, at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., kind: _Optional[_Union[LibraryEvent.Kind, str]] = ..., detail: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class Tape(_message.Message):
-    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id", "correlation_rollups", "written_extent_lba", "kind", "scheme_id", "assignment_generation")
+    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id", "correlation_rollups", "written_extent_lba", "kind", "scheme_id", "assignment_generation", "last_verified_at", "last_verification_state", "last_verified_edition_digest")
     class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         TAPE_STATE_UNSPECIFIED: _ClassVar[Tape.State]
@@ -1141,6 +1169,9 @@ class Tape(_message.Message):
     KIND_FIELD_NUMBER: _ClassVar[int]
     SCHEME_ID_FIELD_NUMBER: _ClassVar[int]
     ASSIGNMENT_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    LAST_VERIFIED_AT_FIELD_NUMBER: _ClassVar[int]
+    LAST_VERIFICATION_STATE_FIELD_NUMBER: _ClassVar[int]
+    LAST_VERIFIED_EDITION_DIGEST_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     voltag: str
     body_format: str
@@ -1157,7 +1188,10 @@ class Tape(_message.Message):
     kind: str
     scheme_id: str
     assignment_generation: int
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ..., written_extent_lba: _Optional[int] = ..., kind: _Optional[str] = ..., scheme_id: _Optional[str] = ..., assignment_generation: _Optional[int] = ...) -> None: ...
+    last_verified_at: _timestamp_pb2.Timestamp
+    last_verification_state: TapeIndexVerificationState
+    last_verified_edition_digest: bytes
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ..., written_extent_lba: _Optional[int] = ..., kind: _Optional[str] = ..., scheme_id: _Optional[str] = ..., assignment_generation: _Optional[int] = ..., last_verified_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., last_verification_state: _Optional[_Union[TapeIndexVerificationState, str]] = ..., last_verified_edition_digest: _Optional[bytes] = ...) -> None: ...
 
 class FinalizeTapeRequest(_message.Message):
     __slots__ = ("tape_uuid", "expected_pool_id", "reason", "idempotency_key")
@@ -1403,6 +1437,12 @@ class TapeInventory(_message.Message):
     selected_attempt_id: int
     def __init__(self, tape_uuid: _Optional[bytes] = ..., outcome: _Optional[_Union[TapeInventoryOutcome, str]] = ..., selected_replica_ordinal: _Optional[int] = ..., replica_health: _Optional[_Iterable[_Union[TapeIndexReplicaHealth, _Mapping]]] = ..., structural_entry_count: _Optional[int] = ..., object_row_count: _Optional[int] = ..., edition_digest: _Optional[bytes] = ..., layout_digest: _Optional[bytes] = ..., payload_digest: _Optional[bytes] = ..., canonical_map_digest: _Optional[bytes] = ..., inventory_basis: _Optional[str] = ..., detail: _Optional[str] = ..., recovered_object_count: _Optional[int] = ..., unknown_object_count: _Optional[int] = ..., incomplete_object_count: _Optional[int] = ..., damaged_region_count: _Optional[int] = ..., selected_attempt_id: _Optional[int] = ...) -> None: ...
 
+class StartTapeVerificationRequest(_message.Message):
+    __slots__ = ("tape_uuid",)
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    def __init__(self, tape_uuid: _Optional[bytes] = ...) -> None: ...
+
 class VerifyTapeIndexRequest(_message.Message):
     __slots__ = ("tape_uuid",)
     TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
@@ -1472,7 +1512,7 @@ class TapeIndexVerification(_message.Message):
     def __init__(self, tape_uuid: _Optional[bytes] = ..., state: _Optional[_Union[TapeIndexVerificationState, str]] = ..., fast_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., detail: _Optional[str] = ..., replica_health: _Optional[_Iterable[_Union[TapeIndexReplicaHealth, _Mapping]]] = ..., separation_health: _Optional[_Iterable[_Union[TapeIndexSeparationHealth, _Mapping]]] = ..., measured_eod_lba: _Optional[int] = ..., verified_prefix_tape_file_count: _Optional[int] = ..., verified_prefix_record_count: _Optional[int] = ..., measured_tape_file_count: _Optional[int] = ..., edition_digest: _Optional[bytes] = ..., layout_digest: _Optional[bytes] = ..., payload_digest: _Optional[bytes] = ..., canonical_map_digest: _Optional[bytes] = ..., verification_basis: _Optional[str] = ..., recovery_inventory: _Optional[_Union[TapeInventory, _Mapping]] = ..., protected_content_findings: _Optional[_Iterable[_Union[ProtectedContentFinding, _Mapping]]] = ..., io: _Optional[_Union[VerificationIo, _Mapping]] = ...) -> None: ...
 
 class VerificationIoCounts(_message.Message):
-    __slots__ = ("locate", "space", "read_position", "single_read", "batch_read", "other", "records_requested", "records_confirmed", "bytes", "hardware_batch_fallbacks", "recovered_reads", "algorithmic_fallback_epochs")
+    __slots__ = ("locate", "space", "read_position", "single_read", "batch_read", "other", "records_requested", "records_confirmed", "bytes", "hardware_batch_fallbacks", "recovered_reads", "algorithmic_fallback_epochs", "elapsed_ms", "command_ms", "max_command_ms", "command_latency_buckets")
     LOCATE_FIELD_NUMBER: _ClassVar[int]
     SPACE_FIELD_NUMBER: _ClassVar[int]
     READ_POSITION_FIELD_NUMBER: _ClassVar[int]
@@ -1485,6 +1525,10 @@ class VerificationIoCounts(_message.Message):
     HARDWARE_BATCH_FALLBACKS_FIELD_NUMBER: _ClassVar[int]
     RECOVERED_READS_FIELD_NUMBER: _ClassVar[int]
     ALGORITHMIC_FALLBACK_EPOCHS_FIELD_NUMBER: _ClassVar[int]
+    ELAPSED_MS_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_MS_FIELD_NUMBER: _ClassVar[int]
+    MAX_COMMAND_MS_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_LATENCY_BUCKETS_FIELD_NUMBER: _ClassVar[int]
     locate: int
     space: int
     read_position: int
@@ -1497,7 +1541,11 @@ class VerificationIoCounts(_message.Message):
     hardware_batch_fallbacks: int
     recovered_reads: int
     algorithmic_fallback_epochs: int
-    def __init__(self, locate: _Optional[int] = ..., space: _Optional[int] = ..., read_position: _Optional[int] = ..., single_read: _Optional[int] = ..., batch_read: _Optional[int] = ..., other: _Optional[int] = ..., records_requested: _Optional[int] = ..., records_confirmed: _Optional[int] = ..., bytes: _Optional[int] = ..., hardware_batch_fallbacks: _Optional[int] = ..., recovered_reads: _Optional[int] = ..., algorithmic_fallback_epochs: _Optional[int] = ...) -> None: ...
+    elapsed_ms: int
+    command_ms: int
+    max_command_ms: int
+    command_latency_buckets: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, locate: _Optional[int] = ..., space: _Optional[int] = ..., read_position: _Optional[int] = ..., single_read: _Optional[int] = ..., batch_read: _Optional[int] = ..., other: _Optional[int] = ..., records_requested: _Optional[int] = ..., records_confirmed: _Optional[int] = ..., bytes: _Optional[int] = ..., hardware_batch_fallbacks: _Optional[int] = ..., recovered_reads: _Optional[int] = ..., algorithmic_fallback_epochs: _Optional[int] = ..., elapsed_ms: _Optional[int] = ..., command_ms: _Optional[int] = ..., max_command_ms: _Optional[int] = ..., command_latency_buckets: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class VerificationIoPhase(_message.Message):
     __slots__ = ("phase", "counts")
@@ -1699,7 +1747,7 @@ class ObjectCopy(_message.Message):
     def __init__(self, tape_uuid: _Optional[bytes] = ..., tape_file_number: _Optional[int] = ..., first_body_lba: _Optional[int] = ..., last_verified_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., health: _Optional[_Union[ObjectCopy.Health, str]] = ..., pool_id: _Optional[str] = ..., plaintext_digest: _Optional[_Union[Digest, _Mapping]] = ..., stored_digest: _Optional[_Union[Digest, _Mapping]] = ..., global_start_block: _Optional[int] = ..., global_end_block: _Optional[int] = ...) -> None: ...
 
 class FileRecord(_message.Message):
-    __slots__ = ("object_id", "file_id", "path", "size_bytes", "file_sha256", "first_chunk_body_lba", "chunk_count", "file_digest")
+    __slots__ = ("object_id", "file_id", "path", "size_bytes", "file_sha256", "first_chunk_body_lba", "chunk_count", "file_digest", "mtime")
     OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
     FILE_ID_FIELD_NUMBER: _ClassVar[int]
     PATH_FIELD_NUMBER: _ClassVar[int]
@@ -1708,6 +1756,7 @@ class FileRecord(_message.Message):
     FIRST_CHUNK_BODY_LBA_FIELD_NUMBER: _ClassVar[int]
     CHUNK_COUNT_FIELD_NUMBER: _ClassVar[int]
     FILE_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    MTIME_FIELD_NUMBER: _ClassVar[int]
     object_id: bytes
     file_id: bytes
     path: str
@@ -1716,7 +1765,8 @@ class FileRecord(_message.Message):
     first_chunk_body_lba: int
     chunk_count: int
     file_digest: Digest
-    def __init__(self, object_id: _Optional[bytes] = ..., file_id: _Optional[bytes] = ..., path: _Optional[str] = ..., size_bytes: _Optional[int] = ..., file_sha256: _Optional[bytes] = ..., first_chunk_body_lba: _Optional[int] = ..., chunk_count: _Optional[int] = ..., file_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
+    mtime: str
+    def __init__(self, object_id: _Optional[bytes] = ..., file_id: _Optional[bytes] = ..., path: _Optional[str] = ..., size_bytes: _Optional[int] = ..., file_sha256: _Optional[bytes] = ..., first_chunk_body_lba: _Optional[int] = ..., chunk_count: _Optional[int] = ..., file_digest: _Optional[_Union[Digest, _Mapping]] = ..., mtime: _Optional[str] = ...) -> None: ...
 
 class ListTapesRequest(_message.Message):
     __slots__ = ("library_uuid", "page_token", "page_size", "pool_id", "kind")
@@ -2107,7 +2157,7 @@ class AppendObjectMessage(_message.Message):
     def __init__(self, start: _Optional[_Union[AppendObjectStart, _Mapping]] = ..., chunk: _Optional[_Union[AppendObjectChunk, _Mapping]] = ..., finish: _Optional[_Union[AppendObjectFinish, _Mapping]] = ..., canonical_start: _Optional[_Union[AppendCanonicalPlaintextObjectStart, _Mapping]] = ...) -> None: ...
 
 class AppendObjectStart(_message.Message):
-    __slots__ = ("session_id", "caller_object_id", "caller_metadata", "declared_size_bytes", "body_format_manifest", "expected_content_sha256", "source_replay_capability", "expected_content_digest")
+    __slots__ = ("session_id", "caller_object_id", "caller_metadata", "declared_size_bytes", "body_format_manifest", "expected_content_sha256", "source_replay_capability", "expected_content_digest", "mtime")
     class CallerMetadataEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -2123,6 +2173,7 @@ class AppendObjectStart(_message.Message):
     EXPECTED_CONTENT_SHA256_FIELD_NUMBER: _ClassVar[int]
     SOURCE_REPLAY_CAPABILITY_FIELD_NUMBER: _ClassVar[int]
     EXPECTED_CONTENT_DIGEST_FIELD_NUMBER: _ClassVar[int]
+    MTIME_FIELD_NUMBER: _ClassVar[int]
     session_id: bytes
     caller_object_id: str
     caller_metadata: _containers.ScalarMap[str, str]
@@ -2131,7 +2182,8 @@ class AppendObjectStart(_message.Message):
     expected_content_sha256: bytes
     source_replay_capability: SourceReplayCapability
     expected_content_digest: Digest
-    def __init__(self, session_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., declared_size_bytes: _Optional[int] = ..., body_format_manifest: _Optional[bytes] = ..., expected_content_sha256: _Optional[bytes] = ..., source_replay_capability: _Optional[_Union[SourceReplayCapability, str]] = ..., expected_content_digest: _Optional[_Union[Digest, _Mapping]] = ...) -> None: ...
+    mtime: str
+    def __init__(self, session_id: _Optional[bytes] = ..., caller_object_id: _Optional[str] = ..., caller_metadata: _Optional[_Mapping[str, str]] = ..., declared_size_bytes: _Optional[int] = ..., body_format_manifest: _Optional[bytes] = ..., expected_content_sha256: _Optional[bytes] = ..., source_replay_capability: _Optional[_Union[SourceReplayCapability, str]] = ..., expected_content_digest: _Optional[_Union[Digest, _Mapping]] = ..., mtime: _Optional[str] = ...) -> None: ...
 
 class AppendCanonicalPlaintextObjectStart(_message.Message):
     __slots__ = ("session_id", "declared_size_bytes", "expected_plaintext_digest", "source_replay_capability", "expected_object_id", "expected_caller_object_id")
@@ -2334,20 +2386,22 @@ class ReadTarget(_message.Message):
     def __init__(self, partition: _Optional[int] = ..., start_block: _Optional[int] = ..., end_block: _Optional[int] = ..., tag: _Optional[bytes] = ...) -> None: ...
 
 class CartridgeFacts(_message.Message):
-    __slots__ = ("cartridge_generation", "recording_format", "voltag", "block_size_bytes", "compression", "written_extent_lba")
+    __slots__ = ("cartridge_generation", "recording_format", "voltag", "block_size_bytes", "compression", "written_extent_lba", "generation_source")
     CARTRIDGE_GENERATION_FIELD_NUMBER: _ClassVar[int]
     RECORDING_FORMAT_FIELD_NUMBER: _ClassVar[int]
     VOLTAG_FIELD_NUMBER: _ClassVar[int]
     BLOCK_SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
     COMPRESSION_FIELD_NUMBER: _ClassVar[int]
     WRITTEN_EXTENT_LBA_FIELD_NUMBER: _ClassVar[int]
+    GENERATION_SOURCE_FIELD_NUMBER: _ClassVar[int]
     cartridge_generation: str
     recording_format: str
     voltag: str
     block_size_bytes: int
     compression: CompressionState
     written_extent_lba: int
-    def __init__(self, cartridge_generation: _Optional[str] = ..., recording_format: _Optional[str] = ..., voltag: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., compression: _Optional[_Union[CompressionState, str]] = ..., written_extent_lba: _Optional[int] = ...) -> None: ...
+    generation_source: str
+    def __init__(self, cartridge_generation: _Optional[str] = ..., recording_format: _Optional[str] = ..., voltag: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., compression: _Optional[_Union[CompressionState, str]] = ..., written_extent_lba: _Optional[int] = ..., generation_source: _Optional[str] = ...) -> None: ...
 
 class StartPosition(_message.Message):
     __slots__ = ("partition", "block")
@@ -2451,3 +2505,25 @@ class AuditEntry(_message.Message):
     detail_json: str
     software_build: str
     def __init__(self, sequence: _Optional[int] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., actor: _Optional[str] = ..., source_layer: _Optional[str] = ..., operation_id: _Optional[bytes] = ..., session_id: _Optional[bytes] = ..., event_kind: _Optional[str] = ..., detail_json: _Optional[str] = ..., software_build: _Optional[str] = ...) -> None: ...
+
+class SupersedeTailRequest(_message.Message):
+    __slots__ = ("tape_uuid", "ack_tape_uuid", "confirm_supersede", "expected_found")
+    TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    ACK_TAPE_UUID_FIELD_NUMBER: _ClassVar[int]
+    CONFIRM_SUPERSEDE_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_FOUND_FIELD_NUMBER: _ClassVar[int]
+    tape_uuid: bytes
+    ack_tape_uuid: bytes
+    confirm_supersede: str
+    expected_found: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., ack_tape_uuid: _Optional[bytes] = ..., confirm_supersede: _Optional[str] = ..., expected_found: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class SupersedeTailResponse(_message.Message):
+    __slots__ = ("found", "required_confirmation", "completed")
+    FOUND_FIELD_NUMBER: _ClassVar[int]
+    REQUIRED_CONFIRMATION_FIELD_NUMBER: _ClassVar[int]
+    COMPLETED_FIELD_NUMBER: _ClassVar[int]
+    found: _containers.RepeatedScalarFieldContainer[str]
+    required_confirmation: str
+    completed: bool
+    def __init__(self, found: _Optional[_Iterable[str]] = ..., required_confirmation: _Optional[str] = ..., completed: _Optional[bool] = ...) -> None: ...

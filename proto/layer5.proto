@@ -82,7 +82,10 @@ message OperationStatus {
   google.protobuf.Timestamp created_at = 4;
   google.protobuf.Timestamp updated_at = 5;
   // Free-form progress payload (e.g., bytes_written, current_lba, etc.).
-  // Keys are operation-kind-specific.
+  // Keys are operation-kind-specific. tape_verification publishes tape_uuid,
+  // drive_serial, bay, phase, tape_file, bytes_read, and elapsed_ms.
+  // Unknown locations use "unknown". Phase changes
+  // publish immediately; other progress publishes at most once per five seconds.
   map<string, string> progress = 6;
   // On failure, a human-readable summary; structured detail in audit log.
   string error_summary         = 7;
@@ -126,6 +129,9 @@ message HealthResponse {
   map<string, string> components = 2;
   string detail            = 3;
   repeated ComponentHealth component_health = 4;
+  repeated string supported_endpoint_kinds = 5;
+  repeated string daemon_capabilities = 6;
+  repeated ObservedEndpoint observed_endpoints = 7;
 }
 
 message ComponentHealth {
@@ -143,10 +149,23 @@ message ComponentHealth {
   string other_status = 3;
 }
 
+// A discovered endpoint, not a claim about this daemon's hosting capability.
+message ObservedEndpoint {
+  string kind = 1;
+  optional string serial = 2;
+  optional string path = 3;
+  string ownership = 4;
+  optional uint32 bay = 5;
+  optional string library_serial = 6;
+}
+
 message VersionResponse {
   string daemon_version    = 1; // e.g., "0.4.1+abc1234"
   string api_version       = 2; // e.g., "v1"
   string rust_target       = 3; // e.g., "x86_64-unknown-linux-gnu"
+  repeated string supported_endpoint_kinds = 4;
+  repeated string daemon_capabilities = 5;
+  repeated ObservedEndpoint observed_endpoints = 6;
 }
 
 message GetOperationRequest    { bytes operation_id = 1; }
@@ -195,6 +214,12 @@ service LibraryService {
   rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
   // Resume an existing durable media-readiness fence in place. Progress is
   // observed through Daemon.WatchOperation using the returned operation id.
+  // The wait holds the fenced drive until it ends, so one caller at a time
+  // waits on a drive. A call while another caller holds that drive is
+  // refused with FAILED_PRECONDITION ("... is busy: another caller holds
+  // this drive while media-readiness operation ... is unresolved"), and the
+  // caller retries after the operation finishes. Any caller can follow a
+  // wait started through this RPC with Daemon.WatchOperation on the same id.
   rpc ResumeMediaReadiness (ResumeMediaReadinessRequest) returns (OperationRef);
   rpc ListAlarms        (ListAlarmsRequest)           returns (ListAlarmsResponse);
   rpc AckAlarm          (AckAlarmRequest)             returns (Alarm);
@@ -669,6 +694,10 @@ service Catalog {
   // prefix, compare its canonical map, and read all three replicas and both
   // typed separation extents. This is distinct from GetTapeInventory.
   rpc VerifyTapeIndex  (VerifyTapeIndexRequest)  returns (TapeIndexVerification);
+  // Full verification retained by this daemon process; watch and cancel via Daemon.
+  rpc StartTapeVerification (StartTapeVerificationRequest) returns (OperationRef);
+  // NOT_FOUND for unknown/pruned ids; FAILED_PRECONDITION without a completed verdict.
+  rpc GetTapeVerification (GetOperationRequest) returns (TapeIndexVerification);
   rpc ListTapeFiles    (ListTapeFilesRequest)    returns (ListTapeFilesResponse);
   rpc ListTapePools    (ListTapePoolsRequest)    returns (ListTapePoolsResponse);
   rpc GetTapePool      (GetTapePoolRequest)      returns (TapePool);
@@ -696,6 +725,7 @@ service Catalog {
   // that automatic trigger; all fit, fence, ownership, and format checks stay
   // mandatory. An accepted request can never reopen the tape for Objects.
   rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
+  rpc SupersedeTail    (SupersedeTailRequest)     returns (SupersedeTailResponse);
   rpc GetTapeFinalization (GetTapeFinalizationRequest) returns (TapeFinalization);
 
   // Body-format-aware queries. The daemon delegates to the registered
@@ -770,6 +800,10 @@ message Tape {
   optional string scheme_id = 15;
   // Monotonic exact pool-assignment generation from the catalog row.
   uint64 assignment_generation = 16;
+  // Completion time of the most recent full verification verdict.
+  optional google.protobuf.Timestamp last_verified_at = 17;
+  optional TapeIndexVerificationState last_verification_state = 18;
+  optional bytes last_verified_edition_digest = 19;
 }
 
 message FinalizeTapeRequest {
@@ -1018,6 +1052,11 @@ message TapeInventory {
   optional uint64 selected_attempt_id = 17;
 }
 
+message StartTapeVerificationRequest {
+  // Exact 16-byte Remanence tape UUID. Voltags are refused.
+  bytes tape_uuid = 1;
+}
+
 message VerifyTapeIndexRequest {
   // Exact 16-byte Remanence tape UUID. Voltags are deliberately not accepted.
   bytes tape_uuid = 1;
@@ -1107,6 +1146,12 @@ message VerificationIoCounts {
   uint64 hardware_batch_fallbacks = 10;
   uint64 recovered_reads = 11;
   uint64 algorithmic_fallback_epochs = 12;
+  // Exclusive wall time in the phase; total covers the collection lifetime.
+  uint64 elapsed_ms = 13;
+  uint64 command_ms = 14;
+  uint64 max_command_ms = 15;
+  // Command durations in ms: <5, [5,20), [20,100), [100,1000), [1000,10000), >=10000.
+  repeated uint64 command_latency_buckets = 16;
 }
 message VerificationIoPhase {
   string phase = 1;
@@ -1314,6 +1359,8 @@ message FileRecord {
   // Algorithm-aware mirror of file_sha256. During the compatibility window
   // servers populate both fields with the same SHA-256 value.
   Digest file_digest           = 8;
+  // Recorded decimal PAX seconds, including fractional precision.
+  optional string mtime        = 9;
 }
 
 message ListTapesRequest {
@@ -1565,6 +1612,24 @@ enum ArchiveGapCause {
 // =============================================================================
 
 service WriteSessionService {
+  // Open a write session. A target that needs a mount reserves a drive bay
+  // before any robot motion: the bay that already holds the selected tape,
+  // otherwise the first idle empty bay, otherwise an idle bay whose cartridge
+  // can return to an empty home slot. A bay that another session or wait
+  // holds is never chosen, so concurrent opens on different pools take
+  // different bays. When the selected tape sits in a bay that another caller
+  // holds, the open is refused with FAILED_PRECONDITION ("drive bay ... is
+  // busy").
+  //
+  // Robot moves in one library are serialized behind media readiness. While
+  // any drive in a library has an active media-readiness fence (for example
+  // a load that has not yet reached READY, recorded under an operation id),
+  // an open in that library that needs the robot is refused with
+  // FAILED_PRECONDITION naming that operation, even when other bays are
+  // idle. The open probes readiness only briefly, so on real drives a cold
+  // load commonly leaves such a fence. The caller retries the open once the
+  // operation finishes; LibraryService.ResumeMediaReadiness drives a fence to
+  // completion, one caller per drive at a time.
   rpc OpenWriteSession   (OpenWriteSessionRequest)   returns (WriteSession);
 
   // Stream one object into the session. The first message in each call must
@@ -1723,6 +1788,8 @@ message AppendObjectStart {
   SourceReplayCapability source_replay_capability = 7;
   // Algorithm-aware mirror of expected_content_sha256.
   Digest expected_content_digest = 8;
+  // Non-negative decimal PAX seconds, optionally with fractional digits.
+  optional string mtime = 9;
 }
 
 // Start a verbatim plaintext REM-OBJECT append. This is a distinct oneof arm,
@@ -1939,12 +2006,13 @@ enum CompressionState {
 }
 
 message CartridgeFacts {
-  string           cartridge_generation = 1;  // e.g. "LTO-7"; empty = derive from voltag
+  optional string  cartridge_generation = 1;  // e.g. "LTO-7"; absent = unknown
   string           recording_format     = 2;  // e.g. "L7", "M8"
   string           voltag               = 3;  // barcode; resolve by the canonical §6.3 table
   uint64           block_size_bytes     = 4;
   CompressionState compression          = 5;
   uint64           written_extent_lba   = 6;  // exclusive; last written block + 1
+  optional string  generation_source = 7; // measured, label, or operator
 }
 // Note: no capacity field. Wrap boundaries come from the cached REOWP map
 // (§6.5), not from arithmetic over a published capacity. Generation and
@@ -2041,4 +2109,18 @@ message AuditEntry {
   // Producing crate version plus build-time git description. Absent only for
   // audit records written before this field was introduced.
   optional string software_build = 9;
+}
+
+// Explicit recovery of an acknowledged, physically enumerated uncheckpointed tail.
+// Without confirmation this is a read-only preview. Mutation rechecks the preview.
+message SupersedeTailRequest {
+  bytes tape_uuid = 1;
+  bytes ack_tape_uuid = 2;
+  optional string confirm_supersede = 3;
+  repeated string expected_found = 4;
+}
+message SupersedeTailResponse {
+  repeated string found = 1;
+  string required_confirmation = 2;
+  bool completed = 3;
 }
