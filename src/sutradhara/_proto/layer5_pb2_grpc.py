@@ -525,6 +525,12 @@ class LibraryServiceServicer:
     def ResumeMediaReadiness(self, request, context):
         """Resume an existing durable media-readiness fence in place. Progress is
         observed through Daemon.WatchOperation using the returned operation id.
+        The wait holds the fenced drive until it ends, so one caller at a time
+        waits on a drive. A call while another caller holds that drive is
+        refused with FAILED_PRECONDITION ("... is busy: another caller holds
+        this drive while media-readiness operation ... is unresolved"), and the
+        caller retries after the operation finishes. Any caller can follow a
+        wait started through this RPC with Daemon.WatchOperation on the same id.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -1316,6 +1322,16 @@ class CatalogStub:
                 request_serializer=layer5__pb2.VerifyTapeIndexRequest.SerializeToString,
                 response_deserializer=layer5__pb2.TapeIndexVerification.FromString,
                 _registered_method=True)
+        self.StartTapeVerification = channel.unary_unary(
+                '/remanence.api.v1.Catalog/StartTapeVerification',
+                request_serializer=layer5__pb2.StartTapeVerificationRequest.SerializeToString,
+                response_deserializer=layer5__pb2.OperationRef.FromString,
+                _registered_method=True)
+        self.GetTapeVerification = channel.unary_unary(
+                '/remanence.api.v1.Catalog/GetTapeVerification',
+                request_serializer=layer5__pb2.GetOperationRequest.SerializeToString,
+                response_deserializer=layer5__pb2.TapeIndexVerification.FromString,
+                _registered_method=True)
         self.ListTapeFiles = channel.unary_unary(
                 '/remanence.api.v1.Catalog/ListTapeFiles',
                 request_serializer=layer5__pb2.ListTapeFilesRequest.SerializeToString,
@@ -1355,6 +1371,11 @@ class CatalogStub:
                 '/remanence.api.v1.Catalog/FinalizeTape',
                 request_serializer=layer5__pb2.FinalizeTapeRequest.SerializeToString,
                 response_deserializer=layer5__pb2.TapeFinalization.FromString,
+                _registered_method=True)
+        self.SupersedeTail = channel.unary_unary(
+                '/remanence.api.v1.Catalog/SupersedeTail',
+                request_serializer=layer5__pb2.SupersedeTailRequest.SerializeToString,
+                response_deserializer=layer5__pb2.SupersedeTailResponse.FromString,
                 _registered_method=True)
         self.GetTapeFinalization = channel.unary_unary(
                 '/remanence.api.v1.Catalog/GetTapeFinalization',
@@ -1429,6 +1450,20 @@ class CatalogServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StartTapeVerification(self, request, context):
+        """Full verification retained by this daemon process; watch and cancel via Daemon.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetTapeVerification(self, request, context):
+        """NOT_FOUND for unknown/pruned ids; FAILED_PRECONDITION without a completed verdict.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListTapeFiles(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -1487,6 +1522,12 @@ class CatalogServicer:
         that automatic trigger; all fit, fence, ownership, and format checks stay
         mandatory. An accepted request can never reopen the tape for Objects.
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SupersedeTail(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -1555,6 +1596,16 @@ def add_CatalogServicer_to_server(servicer, server):
                     request_deserializer=layer5__pb2.VerifyTapeIndexRequest.FromString,
                     response_serializer=layer5__pb2.TapeIndexVerification.SerializeToString,
             ),
+            'StartTapeVerification': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartTapeVerification,
+                    request_deserializer=layer5__pb2.StartTapeVerificationRequest.FromString,
+                    response_serializer=layer5__pb2.OperationRef.SerializeToString,
+            ),
+            'GetTapeVerification': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTapeVerification,
+                    request_deserializer=layer5__pb2.GetOperationRequest.FromString,
+                    response_serializer=layer5__pb2.TapeIndexVerification.SerializeToString,
+            ),
             'ListTapeFiles': grpc.unary_unary_rpc_method_handler(
                     servicer.ListTapeFiles,
                     request_deserializer=layer5__pb2.ListTapeFilesRequest.FromString,
@@ -1594,6 +1645,11 @@ def add_CatalogServicer_to_server(servicer, server):
                     servicer.FinalizeTape,
                     request_deserializer=layer5__pb2.FinalizeTapeRequest.FromString,
                     response_serializer=layer5__pb2.TapeFinalization.SerializeToString,
+            ),
+            'SupersedeTail': grpc.unary_unary_rpc_method_handler(
+                    servicer.SupersedeTail,
+                    request_deserializer=layer5__pb2.SupersedeTailRequest.FromString,
+                    response_serializer=layer5__pb2.SupersedeTailResponse.SerializeToString,
             ),
             'GetTapeFinalization': grpc.unary_unary_rpc_method_handler(
                     servicer.GetTapeFinalization,
@@ -1741,6 +1797,60 @@ class Catalog:
             target,
             '/remanence.api.v1.Catalog/VerifyTapeIndex',
             layer5__pb2.VerifyTapeIndexRequest.SerializeToString,
+            layer5__pb2.TapeIndexVerification.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StartTapeVerification(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.Catalog/StartTapeVerification',
+            layer5__pb2.StartTapeVerificationRequest.SerializeToString,
+            layer5__pb2.OperationRef.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetTapeVerification(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.Catalog/GetTapeVerification',
+            layer5__pb2.GetOperationRequest.SerializeToString,
             layer5__pb2.TapeIndexVerification.FromString,
             options,
             channel_credentials,
@@ -1958,6 +2068,33 @@ class Catalog:
             '/remanence.api.v1.Catalog/FinalizeTape',
             layer5__pb2.FinalizeTapeRequest.SerializeToString,
             layer5__pb2.TapeFinalization.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SupersedeTail(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.Catalog/SupersedeTail',
+            layer5__pb2.SupersedeTailRequest.SerializeToString,
+            layer5__pb2.SupersedeTailResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -2196,7 +2333,25 @@ class WriteSessionServiceServicer:
     """
 
     def OpenWriteSession(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Open a write session. A target that needs a mount reserves a drive bay
+        before any robot motion: the bay that already holds the selected tape,
+        otherwise the first idle empty bay, otherwise an idle bay whose cartridge
+        can return to an empty home slot. A bay that another session or wait
+        holds is never chosen, so concurrent opens on different pools take
+        different bays. When the selected tape sits in a bay that another caller
+        holds, the open is refused with FAILED_PRECONDITION ("drive bay ... is
+        busy").
+
+        Robot moves in one library are serialized behind media readiness. While
+        any drive in a library has an active media-readiness fence (for example
+        a load that has not yet reached READY, recorded under an operation id),
+        an open in that library that needs the robot is refused with
+        FAILED_PRECONDITION naming that operation, even when other bays are
+        idle. The open probes readiness only briefly, so on real drives a cold
+        load commonly leaves such a fence. The caller retries the open once the
+        operation finishes; LibraryService.ResumeMediaReadiness drives a fence to
+        completion, one caller per drive at a time.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
