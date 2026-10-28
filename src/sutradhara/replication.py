@@ -64,12 +64,20 @@ class WritableStorageBackend(StorageBackend, Protocol):
     """Storage backend surface needed by the fan-out writer."""
 
     def write_object_to_pool(
-        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+        self,
+        source: Path | str,
+        pool: str,
+        *,
+        caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
         """Return only after `source` is durable and copy-accountable.
 
         Checkpoint-capable implementations must return the copy selected from
         the checkpoint/close committed-copy set, never from a WRITTEN append.
+        ``content_sha256`` optionally supplies the stored bytes' digest; the
+        caller keeps the source unchanged until the write returns. Backends
+        without start-digest support accept and ignore it.
         """
         ...
 
@@ -288,6 +296,7 @@ def replicate_asset(
                 sealed.sealed_path,
                 target.pool_id,
                 caller_object_id=f"{asset_hash.hex()[:32]}-{execution_id}",
+                content_sha256=sealed.stored_digest,
             )
             _assert_copy_integrity(asset_hash, committed_record, sealed, target)
         copy, created = add_copy(
@@ -353,6 +362,7 @@ def repair(
                 sealed.sealed_path,
                 target.pool_id,
                 caller_object_id=f"{asset_hash.hex()[:32]}-{execution_id}",
+                content_sha256=sealed.stored_digest,
             )
             _assert_copy_integrity(asset_hash, committed_record, sealed, target)
         copy, created = add_copy(

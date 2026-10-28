@@ -30,6 +30,7 @@ from sutradhara.backend.port import (
 from sutradhara.backend.remanence import (
     CommittedCopy,
     RemanenceBackend,
+    RemanenceDigestMismatchError,
     RemanenceWriteResult,
     RemanenceWriteSessionError,
     WrittenReceipt,
@@ -921,10 +922,15 @@ class _WriteSession(layer5_pb2_grpc.WriteSessionServiceServicer):
         context: grpc.ServicerContext,
     ) -> layer5_pb2.ObjectRecord:
         caller_object_id = ""
+        finished = False
         for msg in request_iterator:
             self.appended.append(msg)
             if msg.HasField("start"):
                 caller_object_id = msg.start.caller_object_id
+            elif msg.HasField("finish"):
+                finished = True
+        if not finished:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "missing Finish")
         if self.append_error is not None:
             context.abort(self.append_error, "append failed")
             raise AssertionError("unreachable after context.abort")
@@ -978,6 +984,7 @@ class _DirectWriteClient:
         self.session_id = b"direct-write-session"
         self.drive_element_address = 0x102
         self.aborted = False
+        self.appended: list[layer5_pb2.AppendObjectMessage] = []
         self.pending: list[layer5_pb2.ObjectRecord] = []
 
     def OpenWriteSession(
@@ -992,7 +999,10 @@ class _DirectWriteClient:
     def AppendObject(
         self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
     ) -> layer5_pb2.ObjectRecord:
-        messages = list(request_iterator)
+        messages = []
+        for message in request_iterator:
+            messages.append(message)
+            self.appended.append(message)
         if self.raise_on_append:
             raise _DirectWriteError()
         caller_object_id = messages[0].start.caller_object_id
@@ -1373,6 +1383,84 @@ def test_write_object_to_pool_success(
     assert servicer.open_request.pool_target.mount_if_needed is True
 
 
+@pytest.mark.parametrize("with_digest", [False, True])
+@pytest.mark.parametrize(
+    "data", [b"", b"a" * (2 * 1024 * 1024 + 512 * 1024)], ids=["empty", "multichunk"]
+)
+def test_append_start_digest_fields(
+    proto_object: layer5_pb2.ObjectRecord,
+    tmp_path: Path,
+    with_digest: bool,
+    data: bytes,
+) -> None:
+    """Both write modes preserve the wire fields, including a declared empty file."""
+
+    client = _DirectWriteClient(proto_object)
+    src = tmp_path / "big.bin"
+    src.write_bytes(data)
+    digest = hashlib.sha256(data).digest()
+
+    RemanenceBackend("primary-tape", write_session=client).write_object_to_pool(
+        src, "scenario-a", content_sha256=digest if with_digest else None
+    )
+
+    msgs = client.appended
+    start = layer5_pb2.AppendObjectStart(
+        session_id=client.session_id,
+        caller_object_id=src.name,
+        declared_size_bytes=len(data),
+    )
+    if with_digest:
+        start.expected_content_sha256 = digest
+        start.expected_content_digest.CopyFrom(layer5_pb2.Digest(algorithm="sha256", value=digest))
+        start.source_replay_capability = layer5_pb2.SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START
+    assert msgs[0] == layer5_pb2.AppendObjectMessage(start=start)
+    assert msgs[-1] == layer5_pb2.AppendObjectMessage(
+        finish=layer5_pb2.AppendObjectFinish(
+            session_id=client.session_id,
+            expected_content_sha256=digest,
+            expected_content_digest=layer5_pb2.Digest(algorithm="sha256", value=digest),
+        )
+    )
+    assert sum(1 for msg in msgs if msg.HasField("chunk")) == (3 if data else 0)
+    assert b"".join(msg.chunk.data for msg in msgs[1:-1]) == data
+
+
+@pytest.mark.parametrize("length", [0, 1, 31, 33, 64])
+@pytest.mark.parametrize("entrypoint", ["write", "batch", "messages"])
+def test_malformed_digest_is_refused_before_any_message(
+    proto_object: layer5_pb2.ObjectRecord,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    length: int,
+    entrypoint: str,
+) -> None:
+    """Digest validation precedes session creation, append RPCs and source access."""
+
+    client = _DirectWriteClient(proto_object)
+    backend = RemanenceBackend("primary-tape", write_session=client)
+    source = tmp_path / "missing.bin"
+    digest = b"x" * length
+    monkeypatch.setattr(client, "AppendObject", lambda _: pytest.fail("AppendObject is called"))
+    if entrypoint == "write":
+        monkeypatch.setattr(backend, "open_batch", lambda _: pytest.fail("open_batch is called"))
+        with pytest.raises(ValueError, match="content_sha256 must be exactly 32 bytes"):
+            backend.write_object_to_pool(source, "scenario-a", content_sha256=digest)
+    elif entrypoint == "batch":
+        batch = backend.open_batch("scenario-a")
+        try:
+            with pytest.raises(ValueError, match="content_sha256 must be exactly 32 bytes"):
+                batch.append(source, source.name, content_sha256=digest)
+        finally:
+            batch.abort("validation complete")
+    else:
+        messages = backend._append_messages(
+            client.session_id, source, source.name, content_sha256=digest
+        )
+        with pytest.raises(ValueError, match="content_sha256 must be exactly 32 bytes"):
+            next(messages)
+
+
 def test_write_streams_start_chunks_finish(
     write_server: tuple[str, _WriteSession],
     tmp_path: Path,
@@ -1390,6 +1478,145 @@ def test_write_streams_start_chunks_finish(
     assert sum(1 for msg in msgs if msg.HasField("chunk")) == 3
     assert msgs[0].start.declared_size_bytes == len(data)
     assert msgs[-1].finish.expected_content_sha256 == hashlib.sha256(data).digest()
+
+
+@pytest.mark.parametrize("rpc_error", [False, True])
+def test_write_digest_mismatch_ends_request_iterator_cleanly(
+    proto_object: layer5_pb2.ObjectRecord, tmp_path: Path, rpc_error: bool
+) -> None:
+    """The iterator ends normally; either RPC outcome exposes the local mismatch."""
+
+    class ExhaustingWriteClient(_DirectWriteClient):
+        """Consume the requests and optionally reject the missing Finish."""
+
+        def AppendObject(
+            self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+        ) -> layer5_pb2.ObjectRecord:
+            with futures.ThreadPoolExecutor(max_workers=1) as executor:
+                self.appended.extend(executor.submit(list, request_iterator).result())
+            if rpc_error:
+                raise _DirectWriteError()
+            return _written_ack(
+                self.appended[0].start.caller_object_id, object_id=self.obj.object_id
+            )
+
+    client = ExhaustingWriteClient(proto_object)
+    backend = RemanenceBackend("primary-tape", write_session=client)
+    source = tmp_path / "changed.bin"
+    source.write_bytes(b"changed bytes")
+    supplied = hashlib.sha256(b"original bytes").digest()
+    streamed = hashlib.sha256(source.read_bytes()).digest()
+
+    with pytest.raises(RemanenceDigestMismatchError) as raised:
+        backend.write_object_to_pool(source, "scenario-a", content_sha256=supplied)
+
+    assert not isinstance(raised.value, BackendUnavailableError)
+    assert supplied.hex() in str(raised.value)
+    assert streamed.hex() in str(raised.value)
+    assert client.aborted
+    assert client.pending == []
+    assert [msg.WhichOneof("payload") for msg in client.appended] == ["start", "chunk"]
+
+
+def test_append_digest_mismatch_omits_finish(tmp_path: Path) -> None:
+    """A changed file ends the iterator with both hashes and no Finish."""
+
+    source = tmp_path / "changed.bin"
+    supplied = hashlib.sha256(b"original bytes").digest()
+    source.write_bytes(b"changed bytes")
+    streamed = hashlib.sha256(source.read_bytes()).digest()
+    messages = RemanenceBackend("rem")._append_messages(
+        b"session", source, source.name, content_sha256=supplied
+    )
+    seen = []
+    with pytest.raises(RemanenceDigestMismatchError) as raised:
+        seen.extend(messages)
+
+    assert [msg.WhichOneof("payload") for msg in seen] == ["start", "chunk"]
+    assert supplied.hex() in str(raised.value)
+    assert streamed.hex() in str(raised.value)
+
+
+def test_write_digest_mismatch_aborts_over_grpc(
+    write_server: tuple[str, _WriteSession], tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The gRPC boundary preserves mismatch details and never checkpoints."""
+
+    endpoint, servicer = write_server
+    source = tmp_path / "changed.bin"
+    supplied = hashlib.sha256(b"original bytes").digest()
+    source.write_bytes(b"changed bytes")
+    streamed = hashlib.sha256(source.read_bytes()).digest()
+    backend = RemanenceBackend.from_grpc("primary-tape", endpoint)
+
+    with pytest.raises(RemanenceDigestMismatchError) as raised:
+        backend.write_object_to_pool(source, "scenario-a", content_sha256=supplied)
+
+    assert not isinstance(raised.value, BackendUnavailableError)
+    assert "Exception iterating requests!" not in caplog.text
+    assert [msg.WhichOneof("payload") for msg in servicer.appended] == ["start", "chunk"]
+    assert supplied.hex() in str(raised.value)
+    assert streamed.hex() in str(raised.value)
+    assert servicer.aborted
+    assert servicer.abort_reason is not None
+    assert supplied.hex() in servicer.abort_reason
+    assert streamed.hex() in servicer.abort_reason
+    assert not any(msg.HasField("finish") for msg in servicer.appended)
+    assert not servicer.checkpointed
+    assert not servicer.closed
+    assert servicer.pending == []
+    assert source.read_bytes() == b"changed bytes"
+
+
+def test_interrupted_append_replays_same_file_from_zero(
+    proto_object: layer5_pb2.ObjectRecord, tmp_path: Path
+) -> None:
+    """A requeued source opens afresh and sends every byte on a new append."""
+
+    class InterruptedWriteClient(_DirectWriteClient):
+        """Interrupt the first append after one chunk and accept the replay."""
+
+        def __init__(self) -> None:
+            super().__init__(proto_object)
+            self.attempts: list[list[layer5_pb2.AppendObjectMessage]] = []
+
+        def AppendObject(
+            self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+        ) -> layer5_pb2.ObjectRecord:
+            messages: list[layer5_pb2.AppendObjectMessage] = []
+            self.attempts.append(messages)
+            for message in request_iterator:
+                messages.append(message)
+                if len(self.attempts) == 1 and message.HasField("chunk"):
+                    raise _DirectWriteError()
+            return super().AppendObject(iter(messages))
+
+    client = InterruptedWriteClient()
+    backend = RemanenceBackend("primary-tape", write_session=client)
+    source = tmp_path / "replay.bin"
+    data = b"a" * (1024 * 1024) + b"tail"
+    source.write_bytes(data)
+    digest = hashlib.sha256(data).digest()
+    with pytest.raises(RemanenceWriteSessionError) as raised:
+        backend.write_object_to_pool(source, "scenario-a", content_sha256=digest)
+
+    assert client.aborted
+    assert source.read_bytes() == data
+    [requeued] = raised.value.requeue_objects
+    assert requeued.source == source
+    backend.write_object_to_pool(
+        requeued.source,
+        "scenario-a",
+        caller_object_id=requeued.caller_object_id,
+        content_sha256=digest,
+    )
+
+    first, replay = client.attempts
+    assert [message.WhichOneof("payload") for message in first] == ["start", "chunk"]
+    assert replay[0] == first[0]
+    assert b"".join(message.chunk.data for message in replay[1:-1]) == data
+    assert replay[-1].finish.expected_content_sha256 == digest
+    assert source.read_bytes() == data
 
 
 def test_write_aborts_on_stream_error(

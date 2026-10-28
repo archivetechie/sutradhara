@@ -83,7 +83,12 @@ class _ArchiveBackend:
         self._counter = 0
 
     def write_object_to_pool(
-        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+        self,
+        source: Path | str,
+        pool: str,
+        *,
+        caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
         data = Path(source).read_bytes()
         self._counter += 1

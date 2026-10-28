@@ -183,6 +183,10 @@ class RequeueObject:
     provisional_ordinal: int | None
 
 
+class RemanenceDigestMismatchError(BackendError):
+    """The source changes or its supplied digest disagrees with the streamed bytes."""
+
+
 class RemanenceWriteSessionError(BackendUnavailableError):
     """A write failed after Remanence returned an opened session identity."""
 
@@ -875,20 +879,29 @@ class RemanenceBackend:
         )
 
     def write_object_to_pool(
-        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+        self,
+        source: Path | str,
+        pool: str,
+        *,
+        caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> RemanenceWriteResult:
         """Write one local file through the checkpoint batch funnel.
 
         Existing callers retain the synchronous batch-of-one contract: this
         method opens, appends, checkpoints, and closes before returning the
-        checkpoint-returned copy.
+        checkpoint-returned copy. The source stays unchanged while it streams.
+        A failed append is never resent within the session; a later attempt
+        rebuilds or reseals the artifact and sends a new object.
         """
 
+        if content_sha256 is not None and len(content_sha256) != 32:
+            raise ValueError("content_sha256 must be exactly 32 bytes")
         source = Path(source)
         caller_id = caller_object_id or source.name
         batch = self.open_batch(pool)
         try:
-            batch.append(source, caller_id)
+            batch.append(source, caller_id, content_sha256=content_sha256)
             committed = [*batch.checkpoint(), *batch.close()]
         except Exception:
             batch.abort("batch-of-one write failed")
@@ -947,15 +960,33 @@ class RemanenceBackend:
         session_id: bytes,
         source: Path,
         caller_object_id: str,
+        *,
+        content_sha256: bytes | None = None,
     ) -> Iterator[layer5_pb2.AppendObjectMessage]:
+        """Stream a file and refuse Finish if its supplied digest differs.
+
+        The replay promise means the file stays unchanged while it streams.
+        Sutradhara never resends a failed append from the same file within the
+        session; a later attempt rebuilds or reseals and sends a new object.
+        For raw representations, the sealed path is the intake file itself,
+        so the mismatch check also covers a change to that file.
+        """
+
+        if content_sha256 is not None and len(content_sha256) != 32:
+            raise ValueError("content_sha256 must be exactly 32 bytes")
         digest = hashlib.sha256()
-        yield layer5_pb2.AppendObjectMessage(
-            start=layer5_pb2.AppendObjectStart(
-                session_id=session_id,
-                caller_object_id=caller_object_id,
-                declared_size_bytes=source.stat().st_size,
-            )
+        start = layer5_pb2.AppendObjectStart(
+            session_id=session_id,
+            caller_object_id=caller_object_id,
+            declared_size_bytes=source.stat().st_size,
         )
+        if content_sha256 is not None:
+            start.expected_content_sha256 = content_sha256
+            start.expected_content_digest.CopyFrom(
+                layer5_pb2.Digest(algorithm="sha256", value=content_sha256)
+            )
+            start.source_replay_capability = layer5_pb2.SOURCE_REPLAY_CAPABILITY_REPLAY_FROM_START
+        yield layer5_pb2.AppendObjectMessage(start=start)
         with source.open("rb") as f:
             while True:
                 chunk = f.read(_WRITE_CHUNK_BYTES)
@@ -968,10 +999,18 @@ class RemanenceBackend:
                         data=chunk,
                     )
                 )
+        streamed_digest = digest.digest()
+        if content_sha256 is not None and streamed_digest != content_sha256:
+            raise RemanenceDigestMismatchError(
+                f"Remanence content SHA-256 mismatch: supplied={content_sha256.hex()} "
+                f"streamed={streamed_digest.hex()}"
+            )
+        finish_digest = content_sha256 if content_sha256 is not None else streamed_digest
         yield layer5_pb2.AppendObjectMessage(
             finish=layer5_pb2.AppendObjectFinish(
                 session_id=session_id,
-                expected_content_sha256=digest.digest(),
+                expected_content_sha256=finish_digest,
+                expected_content_digest=layer5_pb2.Digest(algorithm="sha256", value=finish_digest),
             )
         )
 
@@ -1059,19 +1098,47 @@ class BatchWriter:
         else:
             self.abort(str(exc or exc_type.__name__))
 
-    def append(self, source: Path | str, caller_object_id: str) -> WrittenReceipt:
-        """Stream one object and return only its advisory WRITTEN identity."""
+    def append(
+        self,
+        source: Path | str,
+        caller_object_id: str,
+        *,
+        content_sha256: bytes | None = None,
+    ) -> WrittenReceipt:
+        """Stream one object and return only its advisory WRITTEN identity.
+
+        The replay promise means the file stays unchanged while it streams.
+        Sutradhara never resends a failed append from the same file within the
+        session; a later attempt rebuilds or reseals and sends a new object.
+        For raw representations, the sealed path is the intake file itself,
+        so the mismatch check also covers a change to that file.
+        """
 
         self._require_open()
+        if content_sha256 is not None and len(content_sha256) != 32:
+            raise ValueError("content_sha256 must be exactly 32 bytes")
         source = Path(source)
         if not caller_object_id:
             raise ValueError("caller_object_id must be non-empty")
         if any(item.caller_object_id == caller_object_id for item in self._pending):
             raise ValueError(f"caller_object_id {caller_object_id!r} is already pending")
+        stream_error: RemanenceDigestMismatchError | None = None
+
+        def messages() -> Iterator[layer5_pb2.AppendObjectMessage]:
+            """End a mismatched stream cleanly and raise in the caller's thread."""
+
+            nonlocal stream_error
+            try:
+                yield from self._backend._append_messages(
+                    self.session_id, source, caller_object_id, content_sha256=content_sha256
+                )
+            except RemanenceDigestMismatchError as exc:
+                stream_error = exc
+
         try:
-            response = self._client.AppendObject(
-                self._backend._append_messages(self.session_id, source, caller_object_id)
-            )
+            response = self._client.AppendObject(messages())
+            if stream_error is not None:
+                raise stream_error
             receipt, durability = _written_receipt_from_response(
                 response,
                 fallback_batch_id=self._batch_id or self.session_id.hex(),
@@ -1109,7 +1176,10 @@ class BatchWriter:
                         provisional_ordinal=None,
                     )
                 )
-            raise self._fail(exc, tuple(requeue)) from exc
+            error = self._fail(stream_error or exc, tuple(requeue))
+            if error is exc:
+                raise
+            raise error from exc
 
     def checkpoint(self) -> list[CommittedCopy]:
         """Barrier the current batch and return exactly its committed copies."""
@@ -1235,10 +1305,12 @@ class BatchWriter:
         self,
         exc: BaseException,
         requeue_objects: tuple[RequeueObject, ...],
-    ) -> RemanenceWriteSessionError:
+    ) -> BackendError:
         detail = _rpc_error_text(exc) if isinstance(exc, grpc.RpcError) else str(exc)
         self._backend._safe_abort(self._client, self.session_id, detail)
         self._closed = True
+        if isinstance(exc, RemanenceDigestMismatchError):
+            return exc
         return RemanenceWriteSessionError(
             f"Remanence write session at {self._backend._endpoint!r} failed: {detail}",
             session_id=self.session_id,

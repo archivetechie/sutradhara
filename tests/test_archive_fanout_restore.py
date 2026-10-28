@@ -62,6 +62,7 @@ from sutradhara.backend.port import (
     StreamKind,
     VerifyResult,
 )
+from sutradhara.backend.remanence import RemanenceDigestMismatchError
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import (
     ArtifactClassPool,
@@ -126,6 +127,7 @@ class _ArchiveWriteBackend:
         self._objects: dict[str, bytes] = {}
         self._counter = 0
         self.writes: list[str] = []
+        self.supplied_digests: list[bytes | None] = []
         self.reads: list[ByteRange] = []
 
     @property
@@ -137,10 +139,16 @@ class _ArchiveWriteBackend:
         return StreamKind.native_stream
 
     def write_object_to_pool(
-        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+        self,
+        source: Path | str,
+        pool: str,
+        *,
+        caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
+        self.supplied_digests.append(content_sha256)
         self._counter += 1
         object_id = f"{self._name}-{self._counter}"
         self._objects[object_id] = data
@@ -198,16 +206,29 @@ class _ArchiveWriteBackend:
 
 
 class _TransientWriteBackend(_ArchiveWriteBackend):
-    def __init__(self, name: str, failing_pools: set[str]) -> None:
+    def __init__(
+        self,
+        name: str,
+        failing_pools: set[str],
+        error_type: type[BackendError] = BackendError,
+    ) -> None:
         super().__init__(name)
         self.failing_pools = failing_pools
+        self.error_type = error_type
 
     def write_object_to_pool(
-        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+        self,
+        source: Path | str,
+        pool: str,
+        *,
+        caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
         if pool in self.failing_pools:
-            raise BackendError(f"transport unavailable for pool {pool}")
-        return super().write_object_to_pool(source, pool)
+            raise self.error_type(f"write fails for pool {pool}")
+        return super().write_object_to_pool(
+            source, pool, caller_object_id=caller_object_id, content_sha256=content_sha256
+        )
 
 
 class _BadLocatorBuilder(LocalArchiveBuilder):
@@ -539,16 +560,21 @@ def test_enqueue_due_and_flush_fans_out_bundle_copies(
         assert len(list(s.scalars(select(AssetLocator)))) == 4
         assert rem_backend.writes == ["o-copy-1-pool"]
         assert d2_backend.writes == ["d2-shelf-pool"]
+        by_pool = {copy.pool_id: copy for copy in copies}
+        assert rem_backend.supplied_digests == [by_pool["o-copy-1-pool"].integrity_hash]
+        assert d2_backend.supplied_digests == [by_pool["d2-shelf-pool"].integrity_hash]
 
 
+@pytest.mark.parametrize("error_type", [BackendError, RemanenceDigestMismatchError])
 def test_flush_bundle_transient_partial_seals_and_repair_heals(
     engine: Engine,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[BackendError],
 ) -> None:
     setup = _create_bundle(engine, tmp_path, target_gb=0.000000014)
     rem_backend = _ArchiveWriteBackend("rem")
-    d2_backend = _TransientWriteBackend("d2", {"d2-shelf-pool"})
+    d2_backend = _TransientWriteBackend("d2", {"d2-shelf-pool"}, error_type)
 
     with session_scope(engine) as s:
         result = flush_bundle(

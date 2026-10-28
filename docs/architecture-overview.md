@@ -487,6 +487,26 @@ structural-fallback parsing discarded the real committed-copy set — an
 archive write could report zero durable copies while tape held the data
 fine.
 
+Remanence writes accept an optional `content_sha256` for the stored bytes.
+Archive fan-out and replication pass the digest they already compute when
+building or sealing the artifact. With this digest, the start message carries
+the declared size, matching SHA-256 digest fields, and replay capability.
+These fields let Remanence write to tape while bytes arrive. The replay promise
+means the file stays unchanged while it streams. Sutradhara never resends a
+failed append from the same file within the session; a later attempt rebuilds
+or reseals and sends a new object. For raw representations, the sealed path is
+the intake file itself, so the mismatch check also covers a change to that file.
+The backend hashes the stream and aborts without a Finish message if the
+supplied and streamed digests differ. The request stream ends normally and the
+caller receives an integrity error that names both digests, rather than a
+backend-unavailable error. Archive fan-out schedules repair through its existing
+backend-error handling; replication propagates the error and worker retries
+follow the configured attempt limit. Each later attempt rebuilds or reseals.
+Finish carries both SHA-256 digest fields. A supplied digest of any length other
+than 32 bytes is refused before any message is sent. Without a supplied
+digest, the start message omits these claims and Remanence spools and hashes
+the whole object before writing it to tape.
+
 Every write also carries a `caller_object_id`, an opaque per-invocation
 identity Remanence uses to detect duplicate or conflicting writes across
 retries. `replication.py` mints it as `<asset-hash-prefix>-<execution_id>`

@@ -1522,6 +1522,7 @@ def write_bundle_copy_for_pool(
         committed_record = backend.write_object_to_pool(
             artifact.artifact_path,
             target.pool_id,
+            content_sha256=artifact.stored_digest,
         )
     except (BackendError, OSError) as exc:
         raise TransientPoolFanoutError(target.pool_id, target.backend_name, exc) from exc
