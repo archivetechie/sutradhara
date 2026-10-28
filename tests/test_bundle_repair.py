@@ -87,7 +87,12 @@ class _Backend:
         return "rem"
 
     def write_object_to_pool(
-        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+        self,
+        source: Path | str,
+        pool: str,
+        *,
+        caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
         self._counter += 1
         data = Path(source).read_bytes()

@@ -19,6 +19,7 @@ from sutradhara.backend.port import (
     CopyRecord,
     VerifyResult,
 )
+from sutradhara.backend.remanence import RemanenceDigestMismatchError
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import (
     ArtifactClassPool,
@@ -77,6 +78,7 @@ class _PoolWriteBackend:
         self._name = name
         self._tape_by_pool = tape_by_pool or {}
         self.writes: list[str] = []
+        self.supplied_digests: list[bytes | None] = []
         self._payload_by_object_id: dict[str, bytes] = {}
 
     @property
@@ -84,10 +86,16 @@ class _PoolWriteBackend:
         return self._name
 
     def write_object_to_pool(
-        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+        self,
+        source: Path | str,
+        pool: str,
+        *,
+        caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
+        self.supplied_digests.append(content_sha256)
         self.writes.append(pool)
         tape_uuid = self._tape_by_pool.get(pool, f"{len(self.writes):032x}")
         object_id = f"{len(self.writes):032x}"
@@ -126,9 +134,16 @@ class _PoolWriteBackend:
 
 class _WrongHashBackend(_PoolWriteBackend):
     def write_object_to_pool(
-        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+        self,
+        source: Path | str,
+        pool: str,
+        *,
+        caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
-        record = super().write_object_to_pool(source, pool)
+        record = super().write_object_to_pool(
+            source, pool, caller_object_id=caller_object_id, content_sha256=content_sha256
+        )
         wrong = content_hash(hashlib.sha256(b"different").digest())
         return CopyRecord(
             logical_id=wrong,
@@ -140,7 +155,12 @@ class _WrongHashBackend(_PoolWriteBackend):
 
 class _D2TapeFakeBackend(_PoolWriteBackend):
     def write_object_to_pool(
-        self, source: Path | str, pool: str, *, caller_object_id: str | None = None
+        self,
+        source: Path | str,
+        pool: str,
+        *,
+        caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
@@ -492,6 +512,60 @@ def test_replicate_asset_fans_out_and_records_each_pool_copy(
         assert list(s.scalars(select(ArtifactClassPool))).pop().artifactclass == "video-priv"
 
 
+def test_replication_digest_mismatch_propagates_and_next_attempt_reseals(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mismatch records no copy and a later attempt seals a new artifact."""
+
+    data = b"asset bytes"
+    source = tmp_path / "asset.bin"
+    source.write_bytes(data)
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_pool(
+        engine,
+        backend_id=backend_id,
+        pool_id="archive-pool",
+        artifactclass="o-archive",
+        representation=Representation.REM_OBJECT_V1,
+        sort_order=1,
+    )
+    backend = _PoolWriteBackend("rem")
+    sealer = _FakeSealer(tmp_path)
+
+    def mismatch(*args: object, **kwargs: object) -> CopyRecord:
+        """Report a local integrity failure before a copy commits."""
+
+        raise RemanenceDigestMismatchError("supplied digest differs from streamed digest")
+
+    with session_scope(engine) as s:
+        with monkeypatch.context() as patch:
+            patch.setattr(backend, "write_object_to_pool", mismatch)
+            with pytest.raises(RemanenceDigestMismatchError):
+                replicate_asset(
+                    s,
+                    asset_hash,
+                    source,
+                    "o-archive",
+                    backends={backend_id: backend},
+                    sealer=sealer,
+                )
+        assert list(s.scalars(select(Copy))) == []
+        copies = replicate_asset(
+            s,
+            asset_hash,
+            source,
+            "o-archive",
+            backends={backend_id: backend},
+            sealer=sealer,
+        )
+
+    assert len(copies) == 1
+    assert len(sealer.calls) == 2
+    assert sealer.results[0].sealed_path != sealer.results[1].sealed_path
+    assert backend.supplied_digests == [sealer.results[1].stored_digest]
+
+
 def test_replicate_asset_records_stored_digest_for_rem_object_pool_copies(
     engine: Engine,
     tmp_path: Path,
@@ -538,6 +612,8 @@ def test_replicate_asset_records_stored_digest_for_rem_object_pool_copies(
         )
 
     assert backend.writes == ["o-copy-1-pool", "o-copy-2-pool"]
+    assert backend.supplied_digests == [result.stored_digest for result in sealer.results]
+    assert all(digest != asset_hash for digest in backend.supplied_digests)
     assert sealer.calls == [
         (Representation.REM_OBJECT_V1, None),
         (Representation.REM_ENCRYPT_V1, ARCHIVE_EPOCH),
@@ -876,6 +952,7 @@ def test_repair_writes_only_missing_pools(
         assert verify_job.status == JobStatus.SUCCEEDED
 
     assert backend.writes == ["private-copy-2"]
+    assert backend.supplied_digests == [hashlib.sha256(data).digest()]
     assert len(repaired) == 1
     assert repaired[0].pool_id == "private-copy-2"
     assert repaired[0].last_measured_digest == repaired[0].integrity_hash

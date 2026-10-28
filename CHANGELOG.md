@@ -18,6 +18,9 @@ contracts; migration notes accompany incompatible changes.
 
 ### Changed
 
+- Remanence writes send the optional stored SHA-256 at append start so tape
+  writing can overlap transfer. Archive fan-out and replication supply the
+  digest they already hold; a streamed digest mismatch aborts before Finish.
 - Adopted REM-OBJECT and REM-ENCRYPT terminology throughout the code, catalog,
   new cache paths, CLI, and documentation. The database migration rewrites the
   obsolete pre-production catalog labels and dependent bundle-group

@@ -44,6 +44,23 @@ def test_s3_backend_write_range_verify_and_enumerate(tmp_path: Path) -> None:
     backend.delete_object(record.native_locator)
 
 
+def test_s3_pool_write_ignores_content_sha256(tmp_path: Path) -> None:
+    """The optional start digest leaves S3 uploads and measured metadata unchanged."""
+
+    client = _FakeS3Client()
+    backend = S3Backend("cloud-temp", bucket="bucket", client=client)
+    source = tmp_path / "object.bin"
+    source.write_bytes(b"stored bytes")
+
+    record = backend.write_object_to_pool(
+        source, "pool", content_sha256=hashlib.sha256(b"ignored digest").digest()
+    )
+
+    assert client.objects[("bucket", "pool/object.bin")] == b"stored bytes"
+    assert record.integrity_hash == hashlib.sha256(b"stored bytes").digest()
+    assert client.metadata[("bucket", "pool/object.bin")]["sha256"] == record.integrity_hash.hex()
+
+
 def test_s3_minio_live_round_trip_skips_without_env(tmp_path: Path) -> None:
     endpoint = os.environ.get("SUTRADHARA_MINIO_ENDPOINT")
     bucket = os.environ.get("SUTRADHARA_MINIO_BUCKET")

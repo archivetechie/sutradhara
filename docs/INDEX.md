@@ -1,7 +1,8 @@
 # Documentation index
 
 - [Architecture overview](architecture-overview.md) — system boundaries, durability,
-  deletion-evidence gates, and operational data flow.
+  deletion-evidence gates, append digest validation and retry behavior, and
+  operational data flow.
 - [Design decision register](design-decisions.md) — public rationale and consequences
   for the architecture's load-bearing choices.
 - [Quickstart](guide-quickstart.md) — local setup and first catalog workflow.

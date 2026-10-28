@@ -116,6 +116,7 @@ class _WriteBackend:
         pool: str,
         *,
         caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
         if pool in self.fail_pools:
             raise OSError(f"configured write failure for {pool}")

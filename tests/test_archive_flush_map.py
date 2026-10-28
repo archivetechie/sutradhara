@@ -117,6 +117,7 @@ class _WriteBackend:
         pool: str,
         *,
         caller_object_id: str | None = None,
+        content_sha256: bytes | None = None,
     ) -> CopyRecord:
         data = Path(source).read_bytes()
         digest = content_hash(hashlib.sha256(data).digest())
