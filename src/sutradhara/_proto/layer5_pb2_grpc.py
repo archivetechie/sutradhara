@@ -342,6 +342,11 @@ class LibraryServiceStub:
         Args:
             channel: A grpc.Channel.
         """
+        self.ReleaseTapeIoFence = channel.unary_unary(
+                '/remanence.api.v1.LibraryService/ReleaseTapeIoFence',
+                request_serializer=layer5__pb2.ReleaseTapeIoFenceRequest.SerializeToString,
+                response_deserializer=layer5__pb2.TapeIoFence.FromString,
+                _registered_method=True)
         self.ListLibraries = channel.unary_unary(
                 '/remanence.api.v1.LibraryService/ListLibraries',
                 request_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
@@ -456,6 +461,13 @@ class LibraryServiceServicer:
 
     """
 
+    def ReleaseTapeIoFence(self, request, context):
+        """Administrative release: durable evidence precedes clearing the fence.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListLibraries(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -523,14 +535,13 @@ class LibraryServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ResumeMediaReadiness(self, request, context):
-        """Resume an existing durable media-readiness fence in place. Progress is
-        observed through Daemon.WatchOperation using the returned operation id.
-        The wait holds the fenced drive until it ends, so one caller at a time
-        waits on a drive. A call while another caller holds that drive is
-        refused with FAILED_PRECONDITION ("... is busy: another caller holds
-        this drive while media-readiness operation ... is unresolved"), and the
-        caller retries after the operation finishes. Any caller can follow a
-        wait started through this RPC with Daemon.WatchOperation on the same id.
+        """Resume a durable media-readiness fence in place. A running wait for the
+        same operation attaches and returns the same OperationRef, whether the
+        daemon or a client starts it. WatchOperation reports started_by=daemon|client.
+        The daemon starts resumable fences with a 9000 s timeout and 30 s steady
+        polls. Release-only states and operator-cancelled waits need operator action.
+        A different drive holder still returns FAILED_PRECONDITION with
+        "another caller holds this drive while media-readiness operation ... is unresolved".
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -597,6 +608,11 @@ class LibraryServiceServicer:
 
 def add_LibraryServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'ReleaseTapeIoFence': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseTapeIoFence,
+                    request_deserializer=layer5__pb2.ReleaseTapeIoFenceRequest.FromString,
+                    response_serializer=layer5__pb2.TapeIoFence.SerializeToString,
+            ),
             'ListLibraries': grpc.unary_unary_rpc_method_handler(
                     servicer.ListLibraries,
                     request_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
@@ -716,6 +732,33 @@ class LibraryService:
     =============================================================================
 
     """
+
+    @staticmethod
+    def ReleaseTapeIoFence(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.LibraryService/ReleaseTapeIoFence',
+            layer5__pb2.ReleaseTapeIoFenceRequest.SerializeToString,
+            layer5__pb2.TapeIoFence.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def ListLibraries(request,
@@ -1372,6 +1415,11 @@ class CatalogStub:
                 request_serializer=layer5__pb2.FinalizeTapeRequest.SerializeToString,
                 response_deserializer=layer5__pb2.TapeFinalization.FromString,
                 _registered_method=True)
+        self.CloseoutTape = channel.unary_unary(
+                '/remanence.api.v1.Catalog/CloseoutTape',
+                request_serializer=layer5__pb2.CloseoutTapeRequest.SerializeToString,
+                response_deserializer=layer5__pb2.OperationRef.FromString,
+                _registered_method=True)
         self.SupersedeTail = channel.unary_unary(
                 '/remanence.api.v1.Catalog/SupersedeTail',
                 request_serializer=layer5__pb2.SupersedeTailRequest.SerializeToString,
@@ -1521,7 +1569,17 @@ class CatalogServicer:
         boundary. This is valid below the pool low watermark and bypasses only
         that automatic trigger; all fit, fence, ownership, and format checks stay
         mandatory. An accepted request can never reopen the tape for Objects.
+        The operation describes one attempt; TapeFinalization describes durable intent.
+        A stopped worker publishes FAILED with a retry summary while intent remains
+        FINALIZING and detail carries that summary. The same idempotency key resumes
+        under the same operation id; retry and startup recovery publish RUNNING.
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CloseoutTape(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -1645,6 +1703,11 @@ def add_CatalogServicer_to_server(servicer, server):
                     servicer.FinalizeTape,
                     request_deserializer=layer5__pb2.FinalizeTapeRequest.FromString,
                     response_serializer=layer5__pb2.TapeFinalization.SerializeToString,
+            ),
+            'CloseoutTape': grpc.unary_unary_rpc_method_handler(
+                    servicer.CloseoutTape,
+                    request_deserializer=layer5__pb2.CloseoutTapeRequest.FromString,
+                    response_serializer=layer5__pb2.OperationRef.SerializeToString,
             ),
             'SupersedeTail': grpc.unary_unary_rpc_method_handler(
                     servicer.SupersedeTail,
@@ -2079,6 +2142,33 @@ class Catalog:
             _registered_method=True)
 
     @staticmethod
+    def CloseoutTape(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/remanence.api.v1.Catalog/CloseoutTape',
+            layer5__pb2.CloseoutTapeRequest.SerializeToString,
+            layer5__pb2.OperationRef.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def SupersedeTail(request,
             target,
             options=(),
@@ -2349,8 +2439,13 @@ class WriteSessionServiceServicer:
         FAILED_PRECONDITION naming that operation, even when other bays are
         idle. The open probes readiness only briefly, so on real drives a cold
         load commonly leaves such a fence. The caller retries the open once the
-        operation finishes; LibraryService.ResumeMediaReadiness drives a fence to
-        completion, one caller per drive at a time.
+        operation finishes; the daemon resumes resumable fences, and
+        LibraryService.ResumeMediaReadiness attaches to the same wait until
+        completion with one drive wait shared by attached callers.
+
+        An open that completes a due automatic seal returns FAILED_PRECONDITION
+        naming the seal. The client retries OpenWriteSession against the pool to
+        select another tape; the sealed tape cannot accept more Objects.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
