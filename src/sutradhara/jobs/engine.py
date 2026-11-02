@@ -17,7 +17,7 @@ from typing import Any, cast
 
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from sutradhara.jobs.attempts import record_attempt
@@ -51,6 +51,13 @@ from sutradhara.jobs.runtime_observations import (
     bind_session_open_observer,
     bind_tape_locator_observer,
 )
+
+
+def is_sqlite_lock_error(error: BaseException) -> bool:
+    """Recognize only SQLite contention errors, leaving other failures unchanged."""
+    return isinstance(error, OperationalError) and str(error.orig).lower().startswith(
+        ("database is locked", "database table is locked")
+    )
 
 
 def _utcnow() -> dt.datetime:
@@ -198,6 +205,14 @@ def run_one(
         )
         return JobResult(ok=False, detail=str(e))
     except Exception as e:
+        if is_sqlite_lock_error(e):
+            session.rollback()
+            raise
+        if not session.is_active:
+            session.rollback()
+            job = session.get(Job, job_id)
+            if job is None:
+                raise
         job.status = JobStatus.FAILED
         job.finished_at = _utcnow()
         job.last_error = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
@@ -282,7 +297,7 @@ def _invoke_handler_in_savepoint(
     except BaseException:
         batch_state_touched = bool(handler_session.info.get("checkpoint_batch_state_touched"))
         failed_batch_state = deepcopy(
-            dict(handler_job.step_state or {}).get(CHECKPOINT_BATCH_STATE_KEY)
+            dict(handler_job.__dict__.get("step_state") or {}).get(CHECKPOINT_BATCH_STATE_KEY)
         )
         handler_session.rollback()
         if connection_savepoint.is_active:

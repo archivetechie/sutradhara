@@ -9,10 +9,13 @@ dispatching other lease-fitting work.
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from sutradhara.catalog.session import session_scope
@@ -24,6 +27,7 @@ from sutradhara.jobs.engine import (
     apply_retry_policy,
     attempt_detail,
     claim_job_by_id,
+    is_sqlite_lock_error,
     job_context,
     pending_candidates,
     reset_orphaned_running_jobs,
@@ -35,6 +39,9 @@ from sutradhara.jobs.reconcilers.conditions import CONDITION_BACKOFF
 from sutradhara.jobs.registry import JobResult
 from sutradhara.structured_logs import emit_structured_event
 
+_LOCK_BACKOFF = (0.1, 0.5, 2.0, 5.0)
+_LOG = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class WorkerJobOutcome:
@@ -43,6 +50,7 @@ class WorkerJobOutcome:
     job_id: int
     result: JobResult
     granted_leases: dict[str, int]
+    failure_record_pending: bool = False
 
 
 class JobWorker:
@@ -53,15 +61,31 @@ class JobWorker:
         self.config = config or WorkerConfig.defaults()
         self.leases = LeaseManager(self.config.capacities)
         self._blocked_scans: dict[int, int] = {}
+        self._pending_failures: dict[int, WorkerJobOutcome] = {}
+        self._recovery_pending = False
 
     def recover_orphans(self) -> int:
-        with session_scope(self.engine) as session:
-            return reset_orphaned_running_jobs(session)
+        try:
+            with session_scope(self.engine) as session:
+                recovered = reset_orphaned_running_jobs(session)
+        except OperationalError as error:
+            if not is_sqlite_lock_error(error):
+                raise
+            self._recovery_pending = True
+            return 0
+        self._recovery_pending = False
+        return recovered
 
     def drain(self, *, recover_orphans: bool = True) -> list[WorkerJobOutcome]:
         """Run pending work until no eligible dispatchable jobs remain."""
-        if recover_orphans:
+        for job_id, outcome in list(self._pending_failures.items()):
+            if _persist_lock_failure(self.engine, outcome):
+                del self._pending_failures[job_id]
+        # Do not reset a job whose failed attempt is still awaiting persistence.
+        if (recover_orphans or self._recovery_pending) and not self._pending_failures:
             self.recover_orphans()
+        if self._recovery_pending:
+            return []
         outcomes: list[WorkerJobOutcome] = []
         max_workers = max(self.config.executor_workers or 1, 1)
         futures: dict[Future[WorkerJobOutcome], dict[str, int]] = {}
@@ -84,7 +108,10 @@ class JobWorker:
                 for future in done:
                     granted = futures.pop(future)
                     try:
-                        outcomes.append(future.result())
+                        outcome = future.result()
+                        outcomes.append(outcome)
+                        if outcome.failure_record_pending:
+                            self._pending_failures[outcome.job_id] = outcome
                     finally:
                         self.leases.release(granted)
         return outcomes
@@ -92,9 +119,21 @@ class JobWorker:
     def _claim_available(self, *, max_new: int) -> list[tuple[int, dict[str, int]]]:
         if max_new <= 0:
             return []
-        return self._claim_available_bounded(max_new=max_new)
+        # Claims have no attempt yet. Roll back contention and retry on the next
+        # scheduler poll, releasing reservations made by the aborted transaction.
+        reserved_before = []
+        try:
+            return self._claim_available_bounded(max_new=max_new, reserved=reserved_before)
+        except Exception as error:
+            for granted in reserved_before:
+                self.leases.release(granted)
+            if is_sqlite_lock_error(error):
+                return []
+            raise
 
-    def _claim_available_bounded(self, *, max_new: int) -> list[tuple[int, dict[str, int]]]:
+    def _claim_available_bounded(
+        self, *, max_new: int, reserved: list[dict[str, int]]
+    ) -> list[tuple[int, dict[str, int]]]:
         claimed: list[tuple[int, dict[str, int]]] = []
         with session_scope(self.engine) as session:
             while len(claimed) < max_new:
@@ -122,6 +161,7 @@ class JobWorker:
                     if job is None:
                         continue
                     granted = self.leases.reserve(required)
+                    reserved.append(granted)
                     self._blocked_scans.pop(candidate.id, None)
                     break
                 if job is None or granted is None:
@@ -154,13 +194,20 @@ def _mark_never_fits(
     )
 
 
-def _execute_job(
+def _execute_job_once(
     engine: Engine,
     job_id: int,
     granted: dict[str, int],
     config: WorkerConfig,
 ) -> WorkerJobOutcome:
     with session_scope(engine) as session:
+        if engine.dialect.name == "sqlite":
+            # sqlite3's legacy transaction mode does not BEGIN for SELECT or
+            # SAVEPOINT. Without this, releasing the handler savepoint commits
+            # its writes before the attempt transaction can roll them back.
+            connection = session.connection()
+            if not connection.connection.dbapi_connection.in_transaction:
+                connection.exec_driver_sql("BEGIN")
         job = session.get(Job, job_id)
         emit_structured_event(
             "sutradhara.job.started",
@@ -187,3 +234,64 @@ def _execute_job(
             result=result,
             granted_leases=dict(granted),
         )
+
+
+def _execute_job(
+    engine: Engine,
+    job_id: int,
+    granted: dict[str, int],
+    config: WorkerConfig,
+) -> WorkerJobOutcome:
+    """Retry the entire attempt transaction, including its flushes and commit.
+
+    The claim is already committed, so rollback/replay retains one attempt
+    number and writes only one audit row. Handlers must tolerate replay of
+    external effects, as they already must for worker crash recovery.
+    """
+    for retry in range(len(_LOCK_BACKOFF) + 1):
+        try:
+            return _execute_job_once(engine, job_id, granted, config)
+        except OperationalError as error:
+            if not is_sqlite_lock_error(error):
+                raise
+            detail = str(error)
+            if retry < len(_LOCK_BACKOFF):
+                time.sleep(_LOCK_BACKOFF[retry])
+    outcome = WorkerJobOutcome(job_id, JobResult(ok=False, detail=detail), dict(granted))
+    if _persist_lock_failure(engine, outcome):
+        return outcome
+    return WorkerJobOutcome(job_id, outcome.result, dict(granted), failure_record_pending=True)
+
+
+def _persist_lock_failure(engine: Engine, outcome: WorkerJobOutcome) -> bool:
+    """Record exhaustion without replaying the handler; defer if SQLite is locked.
+
+    An indefinitely locked database cannot accept even a failure record. Keep
+    the claimed job RUNNING and let the live worker retry this write next poll.
+    """
+    try:
+        with session_scope(engine) as session:
+            job = session.get(Job, outcome.job_id)
+            if job is None:
+                return True
+            job.status = JobStatus.FAILED
+            job.finished_at = dt.datetime.now(dt.UTC)
+            job.last_error = outcome.result.detail
+            ctx = job_context(session, job, granted_leases=outcome.granted_leases)
+            attempt = record_attempt(
+                session, job, granted_leases=outcome.granted_leases, detail=attempt_detail(ctx)
+            )
+            _record_reconciler_condition(
+                session,
+                job,
+                attempt,
+                condition=CONDITION_BACKOFF,
+                reason="sqlite-lock-exhausted",
+                message=job.last_error,
+            )
+    except OperationalError as error:
+        if not is_sqlite_lock_error(error):
+            raise
+        _LOG.warning("Deferring locked SQLite failure record for job %s: %s", outcome.job_id, error)
+        return False
+    return True

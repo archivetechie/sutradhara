@@ -959,3 +959,23 @@ Honest notes a newcomer would otherwise trip on:
 - `IngestDisposition.LEGACY_UNKNOWN` is a declared content-novelty
   disposition with no code path that currently assigns it — it's reserved
   for pre-existing rows that predate disposition classification.
+
+## Worker SQLite contention
+
+The catalog writer engine uses a 30-second SQLite connection timeout and sets
+`PRAGMA busy_timeout = 30000` on each connection. The worker retries a locked
+attempt transaction up to five times, with delays of 0.1, 0.5, 2, and 5 seconds.
+Both `database is locked` and `database table is locked` trigger rollback and
+replay through the common attempt runner. The committed claim retains one
+attempt number; rolled-back audit inserts do not create extra attempts.
+An explicit SQLite outer transaction keeps handler savepoints inside that
+rollback boundary. External handler effects still require replay tolerance,
+as with worker crash recovery.
+
+Exhaustion records a failed attempt and allows the worker to continue. If the
+failure record itself cannot be written, the live worker retains it in memory
+and retries persistence on subsequent polls, leaving the claimed job RUNNING
+until then. A process restart loses this deferred error detail; normal orphan
+recovery makes the job eligible again. Claim and startup-recovery contention
+also defer to subsequent polls without terminating the worker. Other database
+errors retain their existing propagation or handler-failure behavior.
