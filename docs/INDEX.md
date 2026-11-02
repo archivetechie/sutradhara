@@ -13,6 +13,9 @@
 - [CLI reference](reference-cli.md) — operator commands, including retention,
   offsite confirmation, revocation, and correction surfaces.
 - [Configuration reference](reference-config.md) — environment and backend settings.
+- [Remanence proto contract](../proto/README.md) — vendored RPC contract, including
+  B9 closeout obligation surfaces; GetTape failures are reported per tape during
+  restore read planning so other tapes can still be planned.
 - [Database schema reference](reference-database-schema.md) — authoritative tables,
   constraints, evidence projections, retention receipts, and compatibility
   downgrade export policy.

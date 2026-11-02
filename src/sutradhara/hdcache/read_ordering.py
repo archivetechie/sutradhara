@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 
 from sutradhara._proto import layer5_pb2
 from sutradhara._proto.google.rpc import error_details_pb2, status_pb2
+from sutradhara.backend.remanence import TapeReadFactsError
 from sutradhara.hdcache.models import (
     RestoreOrderingOutcome,
     RestoreReadPlanSlot,
@@ -81,8 +82,9 @@ class ReadOrderingPlanner(Protocol):
     """The three metadata-only calls the planning pass consumes.
 
     `RemanenceBackend` implements this for live daemons via
-    `read_ordering_planner()`; tests substitute fakes. gRPC errors
-    propagate out of all three — this module owns the §5 mapping.
+    `read_ordering_planner()`; tests substitute fakes. GetTape failures
+    raise TapeReadFactsError; other gRPC errors propagate unchanged.
+    This module records failures per volume and owns the §5 mapping.
     """
 
     def get_tape_facts(self, tape_uuid: bytes) -> Any: ...
@@ -425,6 +427,17 @@ def _plan_volume(
             wire_request.start_position.partition = 0
             wire_request.start_position.block = start_block
         response = planner.plan_batch_read(wire_request)
+    except TapeReadFactsError as error:
+        _rewrite_volume_slots(session, request.id, tape_uuid, [], [])
+        _record_outcome(
+            session,
+            request.id,
+            tape_uuid,
+            phase=phase,
+            status="rpc_transport_error",
+            detail=str(error),
+        )
+        return
     except grpc.RpcError as error:
         _rewrite_volume_slots(session, request.id, tape_uuid, [], [])
         _record_rpc_failure(session, request.id, tape_uuid, phase, error)

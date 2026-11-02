@@ -24,7 +24,7 @@ from sutradhara._proto import layer5_pb2
 from sutradhara._proto.google.rpc import error_details_pb2, status_pb2
 from sutradhara.api.identity import parse_identity
 from sutradhara.backend.memory import MemoryBackend
-from sutradhara.backend.remanence import TapeReadFacts
+from sutradhara.backend.remanence import RemanenceBackend, TapeReadFacts, TapeReadFactsError
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
     ArtifactClassPool,
@@ -874,6 +874,53 @@ def test_gettape_transport_failure_reads_unordered_and_records(
         rows = _outcomes(session, request.id)
         assert [(row.phase, row.status) for row in rows] == [("initial", "rpc_transport_error")]
         assert _slots(session, request.id) == []
+
+
+def test_gettape_unreadable_log_is_typed_and_only_degrades_affected_tape(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the real adapter: failed tape A must not suppress tape B's plan."""
+
+    failure = FakeRpcError(grpc.StatusCode.INTERNAL, "native tape log is unreadable")
+
+    class Catalog:
+        def GetTape(self, request, timeout=None):
+            if request.tape_uuid == TAPE_A:
+                raise failure
+            return layer5_pb2.Tape(
+                voltag="RO0002L8", block_size_bytes=BLOCK_SIZE,
+                written_extent_lba=WRITTEN_EXTENT,
+            )
+
+    adapter = RemanenceBackend("rem", catalog=Catalog())
+    with pytest.raises(TapeReadFactsError) as raised:
+        adapter.get_tape_facts(TAPE_A)
+    assert raised.value.tape_uuid == TAPE_A
+    assert raised.value.rpc_error is failure
+    assert raised.value.__cause__ is failure
+
+    planner = FakePlanner()
+    monkeypatch.setattr(planner, "get_tape_facts", adapter.get_tape_facts)
+    with session_scope(engine) as session:
+        backend_obj, digests, _copies = _seed_world(session, planner, count=1)
+        digest, _, _ = _seed_tape_asset(
+            session, backend_obj, data=b"healthy-tape", tape_uuid=TAPE_B,
+            tape_file_number=1,
+        )
+        planner.spans[(TAPE_B.hex(), 1)] = _span_for(1)
+        config = _config(tmp_path, _backend_map(session, backend_obj))
+        request = _admit(session, config, [*digests, digest])
+
+        rows = _outcomes(session, request.id)
+        assert [(row.tape_uuid, row.status) for row in rows] == [
+            (TAPE_A, "rpc_transport_error"), (TAPE_B, "ok"),
+        ]
+        assert "GetTape" in rows[0].detail
+        assert "INTERNAL: native tape log is unreadable" in rows[0].detail
+        assert _slots(session, request.id, TAPE_A) == []
+        assert len(_slots(session, request.id, TAPE_B)) == 1
+        assert [bytes(req.tape_uuid) for req in planner.plan_requests] == [TAPE_B]
+        assert all(item.state == "queued" for item in request.items)
 
 
 def test_invalid_argument_logs_loudly_with_violations_and_proceeds(

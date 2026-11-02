@@ -284,6 +284,17 @@ class _ReadPlanClient(Protocol):
     ) -> layer5_pb2.PlanBatchReadResponse: ...
 
 
+class TapeReadFactsError(BackendError):
+    """A single tape's catalog facts are unavailable for restore planning."""
+
+    def __init__(self, tape_uuid: bytes, error: grpc.RpcError) -> None:
+        self.tape_uuid = tape_uuid
+        self.rpc_error = error
+        super().__init__(
+            f"Remanence GetTape for {tape_uuid.hex()} failed: {_rpc_error_text(error)}"
+        )
+
+
 @dataclass(frozen=True)
 class TapeReadFacts:
     """The `GetTape` facts the read-ordering planning pass consumes.
@@ -716,7 +727,8 @@ class RemanenceBackend:
     #
     # These three calls are the whole surface the restore planning pass
     # consumes (hdcache/read_ordering.py). They are metadata-only: no read
-    # session, no mount, no tape motion. gRPC errors propagate — the
+    # session, no mount, no tape motion. GetTape errors are typed per tape;
+    # other gRPC errors propagate — the
     # ordering module owns the §5 degradation mapping, and a restore must
     # never fail because ordering could not be computed.
 
@@ -728,13 +740,16 @@ class RemanenceBackend:
         return None
 
     def get_tape_facts(self, tape_uuid: bytes) -> TapeReadFacts:
-        """Fetch the `GetTape` facts feeding `CartridgeFacts`."""
+        """Fetch `CartridgeFacts` inputs, or raise a per-tape facts error."""
 
         catalog = self._require_catalog()
-        tape = catalog.GetTape(
-            layer5_pb2.GetTapeRequest(tape_uuid=tape_uuid),
-            timeout=_PLAN_METADATA_TIMEOUT_SECONDS,
-        )
+        try:
+            tape = catalog.GetTape(
+                layer5_pb2.GetTapeRequest(tape_uuid=tape_uuid),
+                timeout=_PLAN_METADATA_TIMEOUT_SECONDS,
+            )
+        except grpc.RpcError as error:
+            raise TapeReadFactsError(tape_uuid, error) from error
         return TapeReadFacts(
             voltag=tape.voltag,
             block_size_bytes=int(tape.block_size_bytes),

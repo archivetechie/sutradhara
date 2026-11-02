@@ -587,7 +587,7 @@ class LibraryState(_message.Message):
     def __init__(self, library: _Optional[_Union[Library, _Mapping]] = ..., drives: _Optional[_Iterable[_Union[Drive, _Mapping]]] = ..., slots: _Optional[_Iterable[_Union[Slot, _Mapping]]] = ..., import_export_ports: _Optional[_Iterable[_Union[PortalSlot, _Mapping]]] = ..., last_inventory_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., managed: _Optional[str] = ..., changer_wait: _Optional[str] = ...) -> None: ...
 
 class Drive(_message.Message):
-    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status", "drive_uuid", "cleaning_due", "fenced", "lifetime_read_bytes", "lifetime_write_bytes", "counter_epoch", "session_id", "active_alert_names", "tape_io_staging_ring_buffers", "tape_io_effective_batch_blocks", "tape_io_gap_p50_us", "tape_io_gap_p95_us", "tape_io_gap_max_us", "tape_io_ioctl_p50_us", "tape_io_ioctl_p95_us", "tape_io_ioctl_max_us", "tape_io_cadence_us", "tape_io_effective_feed_bytes_per_second", "loaded_tape_barcode", "mount_age_seconds", "tape_io_window_feed_bytes_per_second", "catalog_state", "open_epoch_start", "open_epoch_end")
+    __slots__ = ("element_address", "drive_serial", "host_device_path", "vendor", "product", "loaded_tape_uuid", "status", "drive_uuid", "cleaning_due", "fenced", "lifetime_read_bytes", "lifetime_write_bytes", "counter_epoch", "session_id", "active_alert_names", "tape_io_staging_ring_buffers", "tape_io_effective_batch_blocks", "tape_io_gap_p50_us", "tape_io_gap_p95_us", "tape_io_gap_max_us", "tape_io_ioctl_p50_us", "tape_io_ioctl_p95_us", "tape_io_ioctl_max_us", "tape_io_cadence_us", "tape_io_effective_feed_bytes_per_second", "loaded_tape_barcode", "mount_age_seconds", "tape_io_window_feed_bytes_per_second", "catalog_state", "open_epoch_start", "open_epoch_end", "unprotected_bytes", "unprotected_since", "closeout_due", "closeout_overdue", "closeout_authority_error", "closeout_retry_reason")
     class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         DRIVE_STATUS_UNSPECIFIED: _ClassVar[Drive.Status]
@@ -635,6 +635,12 @@ class Drive(_message.Message):
     CATALOG_STATE_FIELD_NUMBER: _ClassVar[int]
     OPEN_EPOCH_START_FIELD_NUMBER: _ClassVar[int]
     OPEN_EPOCH_END_FIELD_NUMBER: _ClassVar[int]
+    UNPROTECTED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    UNPROTECTED_SINCE_FIELD_NUMBER: _ClassVar[int]
+    CLOSEOUT_DUE_FIELD_NUMBER: _ClassVar[int]
+    CLOSEOUT_OVERDUE_FIELD_NUMBER: _ClassVar[int]
+    CLOSEOUT_AUTHORITY_ERROR_FIELD_NUMBER: _ClassVar[int]
+    CLOSEOUT_RETRY_REASON_FIELD_NUMBER: _ClassVar[int]
     element_address: int
     drive_serial: str
     host_device_path: str
@@ -666,7 +672,13 @@ class Drive(_message.Message):
     catalog_state: DriveCatalogState
     open_epoch_start: int
     open_epoch_end: int
-    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ..., drive_uuid: _Optional[bytes] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., lifetime_read_bytes: _Optional[int] = ..., lifetime_write_bytes: _Optional[int] = ..., counter_epoch: _Optional[int] = ..., session_id: _Optional[bytes] = ..., active_alert_names: _Optional[_Iterable[str]] = ..., tape_io_staging_ring_buffers: _Optional[int] = ..., tape_io_effective_batch_blocks: _Optional[int] = ..., tape_io_gap_p50_us: _Optional[int] = ..., tape_io_gap_p95_us: _Optional[int] = ..., tape_io_gap_max_us: _Optional[int] = ..., tape_io_ioctl_p50_us: _Optional[int] = ..., tape_io_ioctl_p95_us: _Optional[int] = ..., tape_io_ioctl_max_us: _Optional[int] = ..., tape_io_cadence_us: _Optional[int] = ..., tape_io_effective_feed_bytes_per_second: _Optional[int] = ..., loaded_tape_barcode: _Optional[str] = ..., mount_age_seconds: _Optional[int] = ..., tape_io_window_feed_bytes_per_second: _Optional[int] = ..., catalog_state: _Optional[_Union[DriveCatalogState, str]] = ..., open_epoch_start: _Optional[int] = ..., open_epoch_end: _Optional[int] = ...) -> None: ...
+    unprotected_bytes: int
+    unprotected_since: _timestamp_pb2.Timestamp
+    closeout_due: bool
+    closeout_overdue: bool
+    closeout_authority_error: str
+    closeout_retry_reason: str
+    def __init__(self, element_address: _Optional[int] = ..., drive_serial: _Optional[str] = ..., host_device_path: _Optional[str] = ..., vendor: _Optional[str] = ..., product: _Optional[str] = ..., loaded_tape_uuid: _Optional[bytes] = ..., status: _Optional[_Union[Drive.Status, str]] = ..., drive_uuid: _Optional[bytes] = ..., cleaning_due: _Optional[str] = ..., fenced: _Optional[bool] = ..., lifetime_read_bytes: _Optional[int] = ..., lifetime_write_bytes: _Optional[int] = ..., counter_epoch: _Optional[int] = ..., session_id: _Optional[bytes] = ..., active_alert_names: _Optional[_Iterable[str]] = ..., tape_io_staging_ring_buffers: _Optional[int] = ..., tape_io_effective_batch_blocks: _Optional[int] = ..., tape_io_gap_p50_us: _Optional[int] = ..., tape_io_gap_p95_us: _Optional[int] = ..., tape_io_gap_max_us: _Optional[int] = ..., tape_io_ioctl_p50_us: _Optional[int] = ..., tape_io_ioctl_p95_us: _Optional[int] = ..., tape_io_ioctl_max_us: _Optional[int] = ..., tape_io_cadence_us: _Optional[int] = ..., tape_io_effective_feed_bytes_per_second: _Optional[int] = ..., loaded_tape_barcode: _Optional[str] = ..., mount_age_seconds: _Optional[int] = ..., tape_io_window_feed_bytes_per_second: _Optional[int] = ..., catalog_state: _Optional[_Union[DriveCatalogState, str]] = ..., open_epoch_start: _Optional[int] = ..., open_epoch_end: _Optional[int] = ..., unprotected_bytes: _Optional[int] = ..., unprotected_since: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., closeout_due: _Optional[bool] = ..., closeout_overdue: _Optional[bool] = ..., closeout_authority_error: _Optional[str] = ..., closeout_retry_reason: _Optional[str] = ...) -> None: ...
 
 class DriveCatalogEntry(_message.Message):
     __slots__ = ("drive_uuid", "serial", "identity_source", "actionable", "vendor", "product", "firmware_rev", "managed", "state", "cleaning_due", "fenced", "first_seen_utc", "last_seen_utc", "last_library_serial", "last_element_address", "purchase_date", "warranty_until", "cost", "notes", "retired_at_utc", "retire_reason", "correlation_rollups")
@@ -995,7 +1007,7 @@ class DriveAssignment(_message.Message):
     def __init__(self, library_serial: _Optional[str] = ..., bay: _Optional[int] = ..., drive_uuid: _Optional[bytes] = ..., state: _Optional[_Union[DriveAssignment.State, str]] = ..., current_session_id: _Optional[bytes] = ..., loaded_tape_uuid: _Optional[bytes] = ...) -> None: ...
 
 class GetLiveStatusResponse(_message.Message):
-    __slots__ = ("libraries", "operations", "alarms", "snapshot_at_utc", "daemon_epoch", "drive_assignments", "active_tape_io_fence_count", "active_tape_io_fences")
+    __slots__ = ("libraries", "operations", "alarms", "snapshot_at_utc", "daemon_epoch", "drive_assignments", "active_tape_io_fence_count", "active_tape_io_fences", "closeout_debt")
     LIBRARIES_FIELD_NUMBER: _ClassVar[int]
     OPERATIONS_FIELD_NUMBER: _ClassVar[int]
     ALARMS_FIELD_NUMBER: _ClassVar[int]
@@ -1004,6 +1016,7 @@ class GetLiveStatusResponse(_message.Message):
     DRIVE_ASSIGNMENTS_FIELD_NUMBER: _ClassVar[int]
     ACTIVE_TAPE_IO_FENCE_COUNT_FIELD_NUMBER: _ClassVar[int]
     ACTIVE_TAPE_IO_FENCES_FIELD_NUMBER: _ClassVar[int]
+    CLOSEOUT_DEBT_FIELD_NUMBER: _ClassVar[int]
     libraries: _containers.RepeatedCompositeFieldContainer[LibraryState]
     operations: _containers.RepeatedCompositeFieldContainer[OperationRef]
     alarms: _containers.RepeatedCompositeFieldContainer[Alarm]
@@ -1012,7 +1025,8 @@ class GetLiveStatusResponse(_message.Message):
     drive_assignments: _containers.RepeatedCompositeFieldContainer[DriveAssignment]
     active_tape_io_fence_count: int
     active_tape_io_fences: _containers.RepeatedCompositeFieldContainer[TapeIoFence]
-    def __init__(self, libraries: _Optional[_Iterable[_Union[LibraryState, _Mapping]]] = ..., operations: _Optional[_Iterable[_Union[OperationRef, _Mapping]]] = ..., alarms: _Optional[_Iterable[_Union[Alarm, _Mapping]]] = ..., snapshot_at_utc: _Optional[str] = ..., daemon_epoch: _Optional[int] = ..., drive_assignments: _Optional[_Iterable[_Union[DriveAssignment, _Mapping]]] = ..., active_tape_io_fence_count: _Optional[int] = ..., active_tape_io_fences: _Optional[_Iterable[_Union[TapeIoFence, _Mapping]]] = ...) -> None: ...
+    closeout_debt: _containers.RepeatedCompositeFieldContainer[Tape]
+    def __init__(self, libraries: _Optional[_Iterable[_Union[LibraryState, _Mapping]]] = ..., operations: _Optional[_Iterable[_Union[OperationRef, _Mapping]]] = ..., alarms: _Optional[_Iterable[_Union[Alarm, _Mapping]]] = ..., snapshot_at_utc: _Optional[str] = ..., daemon_epoch: _Optional[int] = ..., drive_assignments: _Optional[_Iterable[_Union[DriveAssignment, _Mapping]]] = ..., active_tape_io_fence_count: _Optional[int] = ..., active_tape_io_fences: _Optional[_Iterable[_Union[TapeIoFence, _Mapping]]] = ..., closeout_debt: _Optional[_Iterable[_Union[Tape, _Mapping]]] = ...) -> None: ...
 
 class Slot(_message.Message):
     __slots__ = ("element_address", "voltag", "tape_uuid")
@@ -1176,7 +1190,7 @@ class LibraryEvent(_message.Message):
     def __init__(self, at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., kind: _Optional[_Union[LibraryEvent.Kind, str]] = ..., detail: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class Tape(_message.Message):
-    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id", "correlation_rollups", "written_extent_lba", "kind", "scheme_id", "assignment_generation", "last_verified_at", "last_verification_state", "last_verified_edition_digest", "open_epoch_start", "open_epoch_end", "seal_due")
+    __slots__ = ("tape_uuid", "voltag", "body_format", "block_size_bytes", "data_blocks_per_stripe", "parity_blocks_per_stripe", "stripes_per_neighborhood", "last_committed_tape_file", "state", "updated_at", "pool_id", "correlation_rollups", "written_extent_lba", "kind", "scheme_id", "assignment_generation", "last_verified_at", "last_verification_state", "last_verified_edition_digest", "open_epoch_start", "open_epoch_end", "seal_due", "unprotected_bytes", "unprotected_since", "closeout_due", "closeout_overdue", "closeout_authority_error", "closeout_retry_reason")
     class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         TAPE_STATE_UNSPECIFIED: _ClassVar[Tape.State]
@@ -1223,6 +1237,12 @@ class Tape(_message.Message):
     OPEN_EPOCH_START_FIELD_NUMBER: _ClassVar[int]
     OPEN_EPOCH_END_FIELD_NUMBER: _ClassVar[int]
     SEAL_DUE_FIELD_NUMBER: _ClassVar[int]
+    UNPROTECTED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    UNPROTECTED_SINCE_FIELD_NUMBER: _ClassVar[int]
+    CLOSEOUT_DUE_FIELD_NUMBER: _ClassVar[int]
+    CLOSEOUT_OVERDUE_FIELD_NUMBER: _ClassVar[int]
+    CLOSEOUT_AUTHORITY_ERROR_FIELD_NUMBER: _ClassVar[int]
+    CLOSEOUT_RETRY_REASON_FIELD_NUMBER: _ClassVar[int]
     tape_uuid: bytes
     voltag: str
     body_format: str
@@ -1245,7 +1265,13 @@ class Tape(_message.Message):
     open_epoch_start: int
     open_epoch_end: int
     seal_due: str
-    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ..., written_extent_lba: _Optional[int] = ..., kind: _Optional[str] = ..., scheme_id: _Optional[str] = ..., assignment_generation: _Optional[int] = ..., last_verified_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., last_verification_state: _Optional[_Union[TapeIndexVerificationState, str]] = ..., last_verified_edition_digest: _Optional[bytes] = ..., open_epoch_start: _Optional[int] = ..., open_epoch_end: _Optional[int] = ..., seal_due: _Optional[str] = ...) -> None: ...
+    unprotected_bytes: int
+    unprotected_since: _timestamp_pb2.Timestamp
+    closeout_due: bool
+    closeout_overdue: bool
+    closeout_authority_error: str
+    closeout_retry_reason: str
+    def __init__(self, tape_uuid: _Optional[bytes] = ..., voltag: _Optional[str] = ..., body_format: _Optional[str] = ..., block_size_bytes: _Optional[int] = ..., data_blocks_per_stripe: _Optional[int] = ..., parity_blocks_per_stripe: _Optional[int] = ..., stripes_per_neighborhood: _Optional[int] = ..., last_committed_tape_file: _Optional[int] = ..., state: _Optional[_Union[Tape.State, str]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., pool_id: _Optional[str] = ..., correlation_rollups: _Optional[_Iterable[_Union[DriveCorrelationRollup, _Mapping]]] = ..., written_extent_lba: _Optional[int] = ..., kind: _Optional[str] = ..., scheme_id: _Optional[str] = ..., assignment_generation: _Optional[int] = ..., last_verified_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., last_verification_state: _Optional[_Union[TapeIndexVerificationState, str]] = ..., last_verified_edition_digest: _Optional[bytes] = ..., open_epoch_start: _Optional[int] = ..., open_epoch_end: _Optional[int] = ..., seal_due: _Optional[str] = ..., unprotected_bytes: _Optional[int] = ..., unprotected_since: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., closeout_due: _Optional[bool] = ..., closeout_overdue: _Optional[bool] = ..., closeout_authority_error: _Optional[str] = ..., closeout_retry_reason: _Optional[str] = ...) -> None: ...
 
 class FinalizeTapeRequest(_message.Message):
     __slots__ = ("tape_uuid", "expected_pool_id", "reason", "idempotency_key")
