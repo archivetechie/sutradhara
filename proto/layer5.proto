@@ -16,9 +16,10 @@
 //   - "Object" identity is by Remanence-assigned object UUID. The orchestrator's
 //     own identifier rides as `caller_object_id` (an opaque string) and is
 //     stored with the REM-OBJECT identity metadata.
-//   - Idempotency: fields are reserved on state-changing RPCs. Until per-RPC
-//     replay is implemented, non-empty keys fail fast with UNIMPLEMENTED rather
-//     than being silently accepted.
+//   - Idempotency: Catalog.CloseoutTape and Catalog.FinalizeTape implement
+//     required idempotency keys and request replay. Other RPC key fields remain
+//     reserved: non-empty keys fail fast with UNIMPLEMENTED until implemented.
+//     Endpoint-specific key requirements below are normative.
 //   - Pagination: list RPCs return a `next_page_token`; opaque to clients.
 //   - Cancellation: long-running operations return an `operation_id`; cancel
 //     via Daemon.CancelOperation.
@@ -380,6 +381,15 @@ message Drive {
   // Committed ordinals [W,T) awaiting parity on the seated cartridge.
   optional uint64 open_epoch_start = 31;
   optional uint64 open_epoch_end = 32;
+  // Native parity debt. Absent fields with closeout_authority_error mean unknown.
+  // Vacant drives have absent debt; a known protected tape has present zero/false.
+  optional uint64 unprotected_bytes = 33;
+  optional google.protobuf.Timestamp unprotected_since = 34;
+  optional bool closeout_due = 35;
+  optional bool closeout_overdue = 36;
+  optional string closeout_authority_error = 37;
+  // Last worker refusal; operator-required failures wait for an explicit wake.
+  optional string closeout_retry_reason = 38;
 }
 
 // A row of the drive catalog. Field presence here MIRRORS the nullability of
@@ -606,6 +616,8 @@ message GetLiveStatusResponse {
   repeated DriveAssignment drive_assignments = 6;
   uint64 active_tape_io_fence_count = 7;
   repeated TapeIoFence active_tape_io_fences = 8;
+  // All due tapes, including unavailable and unseated cartridges.
+  repeated Tape closeout_debt = 9;
 }
 
 message Slot {
@@ -849,8 +861,17 @@ message Tape {
   // Committed ordinals [W,T) awaiting an on-tape sidecar; both absent when protected.
   optional uint64 open_epoch_start = 20;
   optional uint64 open_epoch_end = 21;
-  // Deferred automatic seal trigger; persists until terminal completion.
+  // Automatic barrier seal trigger; not a removal deferral.
   optional string seal_due = 22;
+  // Native parity debt. Absent fields with closeout_authority_error mean unknown.
+  // Vacant drives have absent debt; a known protected tape has present zero/false.
+  optional uint64 unprotected_bytes = 23;
+  optional google.protobuf.Timestamp unprotected_since = 24;
+  optional bool closeout_due = 25;
+  optional bool closeout_overdue = 26;
+  optional string closeout_authority_error = 27;
+  // Last worker refusal; operator-required failures wait for an explicit wake.
+  optional string closeout_retry_reason = 28;
 }
 
 message FinalizeTapeRequest {
