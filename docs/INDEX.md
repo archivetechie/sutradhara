@@ -2,7 +2,7 @@
 
 - [Architecture overview](architecture-overview.md) — system boundaries, durability,
   deletion-evidence gates, append digest validation and retry behavior, and
-  operational data flow.
+  operational data flow, including worker SQLite lock retries and deferred failure records.
 - [Design decision register](design-decisions.md) — public rationale and consequences
   for the architecture's load-bearing choices.
 - [Quickstart](guide-quickstart.md) — local setup and first catalog workflow.

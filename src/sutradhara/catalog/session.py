@@ -82,6 +82,7 @@ def _install_sqlite_pragmas(engine: Engine) -> None:
     @event.listens_for(engine, "connect")
     def _set_pragmas(dbapi_connection: Any, _conn_record: Any) -> None:
         cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA busy_timeout = 30000")
         cursor.execute("PRAGMA foreign_keys = ON")
         cursor.execute("PRAGMA journal_mode = WAL")
         # The catalog can be rebuilt, but retention decisions, enrollment
