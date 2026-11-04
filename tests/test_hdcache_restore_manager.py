@@ -1255,6 +1255,7 @@ def test_hung_identity_check_falls_back_with_breaker_without_lost_marking(
     events: list[RestoreEvent] = []
     identity_read_started = threading.Event()
     unblock_identity_read = threading.Event()
+    identity_read_finished = threading.Event()
     disk_id = "didenthung"
 
     with session_scope(engine) as session:
@@ -1275,34 +1276,38 @@ def test_hung_identity_check_falls_back_with_breaker_without_lost_marking(
             if path == sentinel_path:
                 identity_read_started.set()
                 unblock_identity_read.wait()
+                identity_read_finished.set()
             return original_read_text(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "read_text", read_text_maybe_blocking)
         _request, item = _request_item(session, digest, root)
-        started = time.monotonic()
-        result = serve_restore_item(
-            session,
-            item,
-            identity_or_override=_identity("sutradhara-ingest"),
-            config=_config(
-                root,
-                restore_backends={backend_id: memory},
-                events=events,
-                liveness_probe_deadline_seconds=0.05,
-                breaker=DiskCircuitBreaker(failure_threshold=1, window_seconds=60),
-                identity_probe=FakeDiskIdentityProbe(serial="SERIDENT", fs_uuid="fs-ident"),
-            ),
-        )
-        elapsed = time.monotonic() - started
+        try:
+            result = serve_restore_item(
+                session,
+                item,
+                identity_or_override=_identity("sutradhara-ingest"),
+                config=_config(
+                    root,
+                    restore_backends={backend_id: memory},
+                    events=events,
+                    liveness_probe_deadline_seconds=0.05,
+                    breaker=DiskCircuitBreaker(failure_threshold=1, window_seconds=60),
+                    identity_probe=FakeDiskIdentityProbe(serial="SERIDENT", fs_uuid="fs-ident"),
+                ),
+            )
 
-        assert result.source == "tape"
-        assert item.state == ITEM_DONE
-        assert (root / digest.hex()).read_bytes() == b"tape truth"
-        assert session.get(CacheEntry, digest).state == "present"
-        assert session.get(CacheDisk, disk_id).state == "absent"
-        assert identity_read_started.is_set()
-        assert elapsed < 0.5
-    unblock_identity_read.set()
+            assert result.source == "tape"
+            assert item.state == ITEM_DONE
+            assert (root / digest.hex()).read_bytes() == b"tape truth"
+            assert session.get(CacheEntry, digest).state == "present"
+            assert session.get(CacheDisk, disk_id).state == "absent"
+            assert identity_read_started.is_set()
+            # Restore must complete while the identity read is still blocked,
+            # regardless of how long CI takes to schedule the fallback.
+            assert not unblock_identity_read.is_set()
+            assert not identity_read_finished.is_set()
+        finally:
+            unblock_identity_read.set()
 
     assert [event.code for event in events] == [
         "cache-fallback:disk-identity-timeout",
