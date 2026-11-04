@@ -121,7 +121,7 @@ class JobWorker:
             return []
         # Claims have no attempt yet. Roll back contention and retry on the next
         # scheduler poll, releasing reservations made by the aborted transaction.
-        reserved_before = []
+        reserved_before: list[dict[str, int]] = []
         try:
             return self._claim_available_bounded(max_new=max_new, reserved=reserved_before)
         except Exception as error:
@@ -206,7 +206,12 @@ def _execute_job_once(
             # SAVEPOINT. Without this, releasing the handler savepoint commits
             # its writes before the attempt transaction can roll them back.
             connection = session.connection()
-            if not connection.connection.dbapi_connection.in_transaction:
+            dbapi_connection = connection.connection.dbapi_connection
+            # session.connection() has just checked out a live connection; no
+            # close or invalidation can have occurred before this access.
+            if dbapi_connection is None:
+                raise RuntimeError("active session must have a DBAPI connection")
+            if not dbapi_connection.in_transaction:
                 connection.exec_driver_sql("BEGIN")
         job = session.get(Job, job_id)
         emit_structured_event(

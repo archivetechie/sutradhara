@@ -888,7 +888,8 @@ def test_gettape_unreadable_log_is_typed_and_only_degrades_affected_tape(
             if request.tape_uuid == TAPE_A:
                 raise failure
             return layer5_pb2.Tape(
-                voltag="RO0002L8", block_size_bytes=BLOCK_SIZE,
+                voltag="RO0002L8",
+                block_size_bytes=BLOCK_SIZE,
                 written_extent_lba=WRITTEN_EXTENT,
             )
 
@@ -904,7 +905,10 @@ def test_gettape_unreadable_log_is_typed_and_only_degrades_affected_tape(
     with session_scope(engine) as session:
         backend_obj, digests, _copies = _seed_world(session, planner, count=1)
         digest, _, _ = _seed_tape_asset(
-            session, backend_obj, data=b"healthy-tape", tape_uuid=TAPE_B,
+            session,
+            backend_obj,
+            data=b"healthy-tape",
+            tape_uuid=TAPE_B,
             tape_file_number=1,
         )
         planner.spans[(TAPE_B.hex(), 1)] = _span_for(1)
@@ -913,7 +917,8 @@ def test_gettape_unreadable_log_is_typed_and_only_degrades_affected_tape(
 
         rows = _outcomes(session, request.id)
         assert [(row.tape_uuid, row.status) for row in rows] == [
-            (TAPE_A, "rpc_transport_error"), (TAPE_B, "ok"),
+            (TAPE_A, "rpc_transport_error"),
+            (TAPE_B, "ok"),
         ]
         assert "GetTape" in rows[0].detail
         assert "INTERNAL: native tape log is unreadable" in rows[0].detail
