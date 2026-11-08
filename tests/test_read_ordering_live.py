@@ -132,8 +132,14 @@ tape_catalog_dir = "{self.state}/cache/tapes"
             )
         finally:
             stderr.close()
-        self._wait_for_socket()
-        self._seed_index_rows()
+        try:
+            self._wait_for_socket()
+            self._seed_index_rows()
+        except BaseException:
+            # A failed start must not leave the daemon running: the module
+            # fixture never reaches its yield, so stop() would not be called.
+            self.stop()
+            raise
 
     def _seed_calibration_journal(self) -> None:
         calibration_dir = self.state / "calibration"
@@ -414,3 +420,51 @@ def test_live_invalid_argument_carries_decodable_bad_request(
     assert any("0" in violation["field"] for violation in violations), (
         "the offending target must be named by index (tags may be unprintable)"
     )
+
+
+def test_fixture_start_failure_stops_the_daemon(tmp_path, monkeypatch):
+    """A seeding failure inside start() stops the launched daemon and cleans up."""
+
+    fake = tmp_path / "fake-rem-daemon"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "# ReadPlanService\n"
+        'while [ "$#" -gt 0 ]; do\n'
+        '  if [ "$1" = "--socket" ]; then : > "$2"; fi\n'
+        "  shift\n"
+        "done\n"
+        "exec sleep 60\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("REM_DAEMON_BIN", str(fake))
+
+    def failing_seed(self) -> None:
+        raise RuntimeError("seed failed")
+
+    monkeypatch.setattr(FixtureDaemon, "_seed_index_rows", failing_seed)
+
+    launched: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        launched.append(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+
+    fixture = FixtureDaemon()
+    try:
+        with pytest.raises(RuntimeError, match="seed failed"):
+            fixture.start()
+        assert len(launched) == 1
+        launched[0].wait(timeout=10)
+        assert launched[0].poll() is not None
+        assert fixture._proc is None
+        assert not fixture.root.exists()
+    finally:
+        for proc in launched:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+        shutil.rmtree(fixture.root, ignore_errors=True)
