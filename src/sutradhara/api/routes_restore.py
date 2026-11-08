@@ -25,7 +25,6 @@ from sutradhara.catalog.types import is_content_hash
 from sutradhara.hdcache.alarms import (
     ALARM_DOMAIN,
     ALARM_OWNER,
-    RestoreEventAlarmSink,
     evaluate_hdcache_alarm_conditions,
     restore_event_alarm_sink,
 )
@@ -43,6 +42,7 @@ from sutradhara.hdcache.manager import (
     RestoreManagerError,
     UnknownRestoreDestination,
     admit_restore_request,
+    bind_restore_event_sink_to_engine,
     configured_destinations,
     restore_config_from_env,
 )
@@ -232,9 +232,7 @@ def _with_app_alarm_sink(config: RestoreConfig, engine: Engine) -> RestoreConfig
     sink = config.event_sink
     if sink is None:
         return replace(config, event_sink=restore_event_alarm_sink(engine=engine))
-    if isinstance(sink, RestoreEventAlarmSink) and sink.engine is None and sink.session is None:
-        return replace(config, event_sink=restore_event_alarm_sink(engine=engine))
-    return config
+    return bind_restore_event_sink_to_engine(config, engine)
 
 
 def _require_view(identity: Identity) -> Identity:

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PureWindowsPath
 from typing import Literal
 
-from sqlalchemy import select
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from sutradhara.api.identity import Identity
@@ -418,6 +418,17 @@ def bind_restore_event_sink_to_session(config: RestoreConfig, session: Session) 
     sink = config.event_sink
     if isinstance(sink, RestoreEventAlarmSink) and sink.session is None:
         return replace(config, event_sink=sink.bind(session))
+    return config
+
+
+def bind_restore_event_sink_to_engine(config: RestoreConfig, engine: Engine) -> RestoreConfig:
+    """Point the default DB-backed restore alarm sink at the caller's own engine."""
+
+    from sutradhara.hdcache.alarms import RestoreEventAlarmSink, restore_event_alarm_sink
+
+    sink = config.event_sink
+    if isinstance(sink, RestoreEventAlarmSink) and sink.engine is None and sink.session is None:
+        return replace(config, event_sink=restore_event_alarm_sink(engine=engine))
     return config
 
 

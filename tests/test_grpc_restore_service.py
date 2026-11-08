@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 import shutil
 import socket
 import struct
@@ -53,7 +54,17 @@ from sutradhara.grpc.restore_service import (
     _ManifestFile,
 )
 from sutradhara.grpc.server import GrpcServerConfig, make_server
-from sutradhara.hdcache.manager import RestoreConfig
+from sutradhara.hdcache.alarms import (
+    ALARM_DOMAIN,
+    RestoreEventAlarmSink,
+    restore_event_alarm_sink,
+)
+from sutradhara.hdcache.manager import (
+    RestoreConfig,
+    RestoreEvent,
+    _emit,
+    bind_restore_event_sink_to_engine,
+)
 from sutradhara.hdcache.models import (
     CacheDisk,
     CacheEntry,
@@ -71,8 +82,9 @@ from sutradhara.hdcache.store import (
     write_disk_sentinel,
     write_entry,
 )
-from sutradhara.jobs.models import Job
+from sutradhara.jobs.models import Job, ReconciliationCondition
 from sutradhara.jobs.reconcilers import restore_open as restore_open_reconciler
+from sutradhara.jobs.reconcilers.conditions import CONDITION_OPEN
 from sutradhara.jobs.reconcilers.spine import reconcile
 from sutradhara.keys import KEY_DOMAIN_HDCACHE
 from sutradhara.keys.remanence import RemRecipientKeyCodec
@@ -1680,3 +1692,72 @@ def _unused_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         return int(probe.getsockname()[1])
+
+
+def test_default_service_alarm_sink_writes_to_the_service_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A service built without a cache_config (as make_server does) must not leak to make_engine()."""
+
+    for name in [key for key in os.environ if key.startswith("SUTRADHARA_HDCACHE_")]:
+        monkeypatch.delenv(name)
+    engine = make_engine(f"sqlite:///{tmp_path / 'svc.db'}")
+    create_all(engine)
+
+    def leaked() -> Engine:
+        raise AssertionError("alarm sink opened make_engine() instead of the service engine")
+
+    monkeypatch.setattr("sutradhara.hdcache.alarms.make_engine", leaked)
+    try:
+        service = RestoreService(RestoreServiceConfig(engine=engine))
+        _emit(
+            service._cache,
+            RestoreEvent(
+                code="disk-circuit-open",
+                severity="alarm",
+                detail="cache disk d001 exceeded failure threshold",
+            ),
+        )
+        with engine.connect() as conn:
+            rows = {
+                target_key: reason
+                for target_key, reason in conn.execute(
+                    select(
+                        ReconciliationCondition.target_key, ReconciliationCondition.reason
+                    ).where(
+                        ReconciliationCondition.domain == ALARM_DOMAIN,
+                        ReconciliationCondition.condition == CONDITION_OPEN,
+                    )
+                )
+            }
+    finally:
+        engine.dispose()
+    assert rows == {"disk-unreachable:restore": "disk-unreachable"}
+
+
+def test_bind_restore_event_sink_to_engine_only_rebinds_unbound_alarm_sink(
+    tmp_path: Path,
+) -> None:
+    engine = make_engine(f"sqlite:///{tmp_path / 'a.db'}")
+    other = make_engine(f"sqlite:///{tmp_path / 'b.db'}")
+    try:
+        unbound = RestoreConfig(event_sink=RestoreEventAlarmSink())
+        bound = bind_restore_event_sink_to_engine(unbound, engine)
+        assert bound is not unbound
+        assert bound.event_sink == restore_event_alarm_sink(engine=engine)
+
+        none_cfg = RestoreConfig(event_sink=None)
+        assert bind_restore_event_sink_to_engine(none_cfg, engine) is none_cfg
+
+        with session_scope(other) as session:
+            session_cfg = RestoreConfig(event_sink=restore_event_alarm_sink(session=session))
+            assert bind_restore_event_sink_to_engine(session_cfg, engine) is session_cfg
+
+        other_cfg = RestoreConfig(event_sink=restore_event_alarm_sink(engine=other))
+        assert bind_restore_event_sink_to_engine(other_cfg, engine) is other_cfg
+
+        callable_cfg = RestoreConfig(event_sink=lambda event: None)
+        assert bind_restore_event_sink_to_engine(callable_cfg, engine) is callable_cfg
+    finally:
+        engine.dispose()
+        other.dispose()

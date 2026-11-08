@@ -55,6 +55,7 @@ from sutradhara.hdcache.manager import (
     _select_cache_entry,
     _update_request_state,
     authorize_agent_restore_destination,
+    bind_restore_event_sink_to_engine,
     open_cache_plaintext_chunks,
     restore_backends_for_artifactclass,
     restore_config_from_env,
@@ -158,7 +159,9 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         self.config = config
         self._factory = make_session_factory(config.engine)
         self._live = config.live_capabilities or LiveCapabilityResolver.from_database(config.engine)
-        self._cache = config.cache_config or restore_config_from_env()
+        self._cache = bind_restore_event_sink_to_engine(
+            config.cache_config or restore_config_from_env(), config.engine
+        )
         self._slots = threading.BoundedSemaphore(config.max_concurrent_streams)
 
     def OpenRestore(self, request: Any, context: Any) -> Iterator[Any]:
