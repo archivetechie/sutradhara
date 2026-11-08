@@ -1,6 +1,7 @@
 """Own the current read-back measurement projection and its atomic receipts.
 
-Only ``record_measured`` and ``record_unmeasured_promotion`` may mutate a
+Only ``record_measured``, ``record_unmeasured_promotion`` and
+``record_backend_attested_corrupt`` may mutate a
 copy's ``last_measured_digest``/``last_measured_at`` pair.  Callers own the
 transaction, so the projection, receipt, and any verification enqueue commit
 or roll back together.
@@ -144,6 +145,51 @@ def record_unmeasured_promotion(
     job = _enqueue_verify(session, copy)
     session.flush()
     return receipt, job
+
+
+def record_backend_attested_corrupt(
+    session: Session,
+    copy: Copy,
+    *,
+    detail: str,
+    source: str,
+    execution_id: str,
+    actor: str | None = None,
+    checked_at: dt.datetime | None = None,
+) -> VerifyReceipt:
+    """Record a backend's refusal of the stored bytes: corrupt, with no digest of ours."""
+
+    if source not in MEASUREMENT_SOURCES:
+        raise ValueError(f"measurement source must be one of {sorted(MEASUREMENT_SOURCES)}")
+    if not execution_id:
+        raise ValueError("execution_id must be non-empty")
+
+    receipt = _receipt_for_execution(session, copy, source, execution_id)
+    if receipt is not None:
+        return receipt
+
+    at = checked_at or _utcnow()
+    copy.last_checked_at = at
+    copy.last_measured_digest = None
+    copy.last_measured_at = None
+    copy.health = CopyHealth.CORRUPT
+    receipt = VerifyReceipt(
+        copy_id=copy.id,
+        backend_id=copy.backend_id,
+        expected_digest=copy.integrity_hash,
+        measured_digest=None,
+        backend_ok=False,
+        failure_kind="backend-digest-mismatch",
+        failure_detail=detail,
+        source=source,
+        execution_id=execution_id,
+        producer_process=_producer_process(),
+        actor=actor,
+        at=at,
+    )
+    session.add(receipt)
+    session.flush()
+    return receipt
 
 
 def _enqueue_verify(session: Session, copy: Copy) -> Job:

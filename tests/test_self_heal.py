@@ -24,6 +24,7 @@ import sutradhara.replicate as replicate_wrapper
 from sutradhara.backend.port import (
     BackendError,
     BackendLocator,
+    BackendStoredCorruptError,
     ByteRange,
     CopyRecord,
     VerifyResult,
@@ -84,6 +85,7 @@ class _ReadableTaggedWriteBackend:
         self._records: list[CopyRecord] = []
         self.writes: list[str] = []
         self.read_failures: set[str] = set()
+        self.stored_corrupt: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -128,6 +130,8 @@ class _ReadableTaggedWriteBackend:
         object_id = str(locator["object_id"])
         if object_id in self.read_failures:
             raise BackendError(f"transport unavailable for {object_id}")
+        if object_id in self.stored_corrupt:
+            raise BackendStoredCorruptError(f"stored bytes refused for {object_id}")
         data = self._objects[object_id]
         if byte_range.is_whole_object:
             return data
@@ -731,6 +735,86 @@ def test_self_heal_falls_back_after_proven_bad_source(
         assert bad_copy.health == CopyHealth.SUSPECT
         assert good_copy.health == CopyHealth.OK
         assert {copy.pool_id for copy in repaired} == {"o-copy-1-pool", "o-copy-3-pool"}
+
+
+def test_self_heal_records_backend_attested_corrupt_source_and_repairs_from_next(
+    engine: Engine,
+) -> None:
+    data = b"original attested"
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
+    backend = _backend()
+    bad_record = backend.put_object("o-copy-1-pool", b"rem-object-v1::stored")
+    good_record = backend.put_object(
+        "o-copy-2-pool", b"rem-encrypt-v1:" + ARCHIVE_EPOCH.encode() + b":" + data
+    )
+
+    with session_scope(engine) as s:
+        s.add(
+            Pool(
+                id="o-copy-3-pool",
+                backend_id=backend_id,
+                representation=Representation.REM_OBJECT_V1.value,
+            )
+        )
+        s.add(ArtifactClassPool(artifactclass="o-archive", pool_id="o-copy-3-pool", sort_order=3))
+        s.flush()
+        bad_copy, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=bad_record.native_locator,
+            integrity_hash=bad_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-1-pool",
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
+        )
+        _record_fixture_measurement(
+            s, bad_copy, backend, measured_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+        )
+        good_copy, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=good_record.native_locator,
+            integrity_hash=good_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-2-pool",
+            storage_metadata=_metadata(Representation.REM_ENCRYPT_V1, key_epoch=ARCHIVE_EPOCH),
+        )
+        _record_fixture_measurement(
+            s, good_copy, backend, measured_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        )
+        bad_object_id = str(bad_record.native_locator["object_id"])
+        bad_copy_id = bad_copy.id
+        backend.stored_corrupt.add(bad_object_id)
+
+        repaired = self_heal(
+            s,
+            asset_hash,
+            "o-archive",
+            backends={backend_id: backend},
+            key_epoch=ARCHIVE_EPOCH,
+            opener=_FakeOpener(),
+            sealer=_FakeSealer(),
+            execution_id="self-heal:attested-corrupt",
+        )
+        assert {copy.pool_id for copy in repaired} == {"o-copy-1-pool", "o-copy-3-pool"}
+
+    with session_scope(engine) as s:
+        refreshed = s.get(Copy, bad_copy_id)
+        assert refreshed is not None
+        assert refreshed.health == CopyHealth.CORRUPT
+        assert refreshed.last_measured_digest is None
+        receipt = s.scalars(
+            select(VerifyReceipt).where(
+                VerifyReceipt.copy_id == bad_copy_id,
+                VerifyReceipt.source == "restore",
+            )
+        ).one()
+        assert receipt.failure_kind == "backend-digest-mismatch"
+        assert receipt.measured_digest is None
 
 
 def test_self_heal_transport_error_falls_back_without_suspect_latch(

@@ -40,6 +40,7 @@ from sutradhara.backend.port import (
     BackendLocator,
     BackendNotFoundError,
     BackendSessionInvalidatedError,
+    BackendStoredCorruptError,
     BackendTransientError,
     BackendUnavailableError,
     ByteRange,
@@ -1896,9 +1897,10 @@ def _read_object_range_error(
     if code in {
         grpc.StatusCode.UNAVAILABLE,
         grpc.StatusCode.DEADLINE_EXCEEDED,
-        grpc.StatusCode.DATA_LOSS,
     }:
         result: BackendError = BackendTransientError(text)
+    elif code == grpc.StatusCode.DATA_LOSS:
+        result = BackendStoredCorruptError(text)
     elif code in {
         grpc.StatusCode.NOT_FOUND,
         grpc.StatusCode.FAILED_PRECONDITION,

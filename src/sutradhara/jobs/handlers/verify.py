@@ -25,9 +25,14 @@ from typing import cast
 # can monkeypatch `factory.backend_from_row` and have the override take
 # effect here.
 from sutradhara.backend import factory
+from sutradhara.backend.port import BackendStoredCorruptError
 from sutradhara.catalog.models import Copy
 from sutradhara.catalog.types import CopyHealth
-from sutradhara.evidence_recorder import record_measured, record_unmeasured_promotion
+from sutradhara.evidence_recorder import (
+    record_backend_attested_corrupt,
+    record_measured,
+    record_unmeasured_promotion,
+)
 from sutradhara.jobs.components import touch_asset, touch_copy_tape
 from sutradhara.jobs.registry import JobContext, JobResult, register_handler
 
@@ -50,7 +55,32 @@ def handle_verify(ctx: JobContext) -> JobResult:
     ctx.touch(f"backend:{copy.backend.name}")
     touch_copy_tape(ctx, copy)
     backend = factory.backend_from_row(copy.backend)
-    result = backend.verify(copy.native_locator)
+    try:
+        result = backend.verify(copy.native_locator)
+    except BackendStoredCorruptError as exc:
+        record_backend_attested_corrupt(
+            ctx.session,
+            copy,
+            detail=str(exc),
+            source="verify-job",
+            execution_id=str(ctx.job.id),
+        )
+        ctx.observe(
+            {"verify_ok": False, "measured": False, "actual_hash": None, "detail": str(exc)}
+        )
+        return JobResult(
+            ok=True,
+            detail=f"integrity mismatch: {exc}",
+            step_state={
+                "verify_result": {
+                    "ok": False,
+                    "measured": False,
+                    "actual_hash": None,
+                    "detail": str(exc),
+                },
+                "copy_health_after": copy.health.value,
+            },
+        )
     ctx.observe(
         {
             "verify_ok": result.ok,

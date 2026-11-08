@@ -216,3 +216,7 @@ class BackendTransientError(BackendUnavailableError):
 
 class BackendSessionInvalidatedError(BackendError):
     """A session-scoped backend read was invalidated before bytes were returned."""
+
+
+class BackendStoredCorruptError(BackendError):
+    """The backend read the stored bytes back and they do not match what it recorded at write time."""

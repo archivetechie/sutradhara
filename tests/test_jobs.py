@@ -1061,6 +1061,85 @@ def test_verify_detects_corruption_marks_corrupt_and_succeeds(
             assert job.step_state["copy_health_after"] == "corrupt"
 
 
+def test_verify_backend_attested_corruption_marks_corrupt_and_succeeds(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backend refusal of the stored bytes is a successful job and a corrupt copy."""
+    from sutradhara.backend.port import (
+        BackendLocator,
+        BackendStoredCorruptError,
+        ByteRange,
+        VerifyResult,
+    )
+    from sutradhara.catalog.types import content_hash
+
+    h = content_hash(hashlib.sha256(b"original").digest())
+
+    class _RefusingBackend:
+        @property
+        def name(self) -> str:
+            return "refusing"
+
+        def enumerate(self) -> Iterator[object]:  # pragma: no cover
+            return iter([])
+
+        def read_range(self, _l: BackendLocator, _r: ByteRange) -> bytes:  # pragma: no cover
+            raise NotImplementedError
+
+        def verify(self, _l: BackendLocator) -> VerifyResult:
+            raise BackendStoredCorruptError("daemon: stored bytes failed digest check")
+
+    monkeypatch.setattr(
+        backend_factory,
+        "backend_from_row",
+        lambda row: _RefusingBackend() if row.name == "refusing-backend" else None,
+    )
+    with session_scope(engine) as s:
+        backend_row = Backend(
+            name="refusing-backend",
+            kind=BackendKind.MEMORY,
+            tier=BackendTier.SELF_DESCRIBING,
+        )
+        s.add(backend_row)
+        s.add(LogicalAsset(content_sha256=h, size_bytes=8))
+        s.flush()
+        locator = {"hash_hex": h.hex()}
+        copy = Copy(
+            logical_asset_hash=h,
+            backend_id=backend_row.id,
+            native_locator=locator,
+            native_locator_key=locator_key(locator),
+            integrity_hash=h,
+            health=CopyHealth.OK,
+            source=CopySource.INGEST,
+        )
+        s.add(copy)
+        s.flush()
+        copy_id = copy.id
+
+    with session_scope(engine) as s:
+        job = submit(s, "verify", {"copy_id": copy_id})
+        job_id = job.id
+        result = run_one(s, job_id)
+        assert result.ok
+        assert "integrity mismatch" in result.detail
+        assert job.status == JobStatus.SUCCEEDED
+        assert job.step_state["verify_result"]["ok"] is False
+        assert job.step_state["verify_result"]["measured"] is False
+        assert job.step_state["copy_health_after"] == "corrupt"
+
+    with session_scope(engine) as s:
+        refreshed = s.get(Copy, copy_id)
+        assert refreshed is not None
+        assert refreshed.health == CopyHealth.CORRUPT
+        assert refreshed.last_measured_digest is None
+        assert refreshed.last_measured_at is None
+        receipt = s.scalars(select(VerifyReceipt).where(VerifyReceipt.copy_id == copy_id)).one()
+        assert receipt.source == "verify-job"
+        assert receipt.execution_id == str(job_id)
+        assert receipt.failure_kind == "backend-digest-mismatch"
+
+
 def test_verify_with_missing_copy_id_marks_failed(engine: Engine) -> None:
     with session_scope(engine) as s:
         job = submit(s, "verify", {"copy_id": 99999})

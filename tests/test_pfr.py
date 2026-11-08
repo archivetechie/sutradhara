@@ -34,7 +34,9 @@ import sutradhara.jobs.handlers  # noqa: F401 -- register built-in handlers
 from sutradhara._proto import layer5_pb2, layer5_pb2_grpc
 from sutradhara.backend.port import (
     BackendSessionInvalidatedError,
+    BackendStoredCorruptError,
     BackendTransientError,
+    BackendUnavailableError,
     ByteRange,
 )
 from sutradhara.backend.remanence import RemanenceBackend
@@ -362,7 +364,7 @@ def test_remanence_read_range_maps_grpc_codes_to_typed_errors() -> None:
     for code, expected in [
         (grpc.StatusCode.UNAVAILABLE, BackendTransientError),
         (grpc.StatusCode.DEADLINE_EXCEEDED, BackendTransientError),
-        (grpc.StatusCode.DATA_LOSS, BackendTransientError),
+        (grpc.StatusCode.DATA_LOSS, BackendStoredCorruptError),
         (grpc.StatusCode.FAILED_PRECONDITION, BackendSessionInvalidatedError),
         (grpc.StatusCode.ABORTED, BackendSessionInvalidatedError),
     ]:
@@ -376,6 +378,24 @@ def test_remanence_read_range_maps_grpc_codes_to_typed_errors() -> None:
                 pytest.raises(expected),
             ):
                 session.read_range(ByteRange(0, 1))
+
+
+def test_remanence_data_loss_is_stored_corruption_not_unavailable() -> None:
+    read = _ReadSession(b"x", read_error=grpc.StatusCode.DATA_LOSS)
+    object_id = bytes.fromhex("1cd8ebd3d70a4998a02ab868b8aafbf3")
+    catalog = _Catalog(object_id=object_id, member_size=1)
+    with _serve_remanence(read, catalog) as endpoint:
+        backend = RemanenceBackend.from_grpc("primary-tape", endpoint)
+        with (
+            backend.open_read_session(_rem_locator(object_id)) as session,
+            pytest.raises(BackendStoredCorruptError) as caught,
+        ):
+            session.read_range(ByteRange(0, 0))
+    exc = caught.value
+    assert "read failed" in str(exc)
+    assert exc.session_id is not None  # type: ignore[attr-defined]
+    assert isinstance(exc.drive_element_address, int)  # type: ignore[attr-defined]
+    assert not isinstance(exc, BackendUnavailableError)
 
 
 def test_pfr_retryables_never_auto_promote_but_parse_determination_blocks_after_restart(

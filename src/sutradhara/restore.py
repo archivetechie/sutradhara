@@ -20,10 +20,15 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from sutradhara.backend.port import ByteRange, StorageBackend, VerifyResult
+from sutradhara.backend.port import (
+    BackendStoredCorruptError,
+    ByteRange,
+    StorageBackend,
+    VerifyResult,
+)
 from sutradhara.catalog.models import Copy, LogicalAsset
 from sutradhara.catalog.types import CopyHealth, content_hash
-from sutradhara.evidence_recorder import record_measured
+from sutradhara.evidence_recorder import record_backend_attested_corrupt, record_measured
 from sutradhara.sealing.port import Opener, Representation
 
 _PROGRESS_CALLBACK: contextvars.ContextVar[Callable[[int], None] | None] = contextvars.ContextVar(
@@ -80,7 +85,21 @@ def restore_copy(
     with tempfile.TemporaryDirectory(prefix="sutradhara-restore-copy-") as temp_dir_raw:
         temp_dir = Path(temp_dir_raw)
         stored_path = temp_dir / "stored-copy.bin"
-        stored_path.write_bytes(backend.read_range(copy.native_locator, ByteRange(0, 0)))
+        try:
+            stored_bytes = backend.read_range(copy.native_locator, ByteRange(0, 0))
+        except BackendStoredCorruptError as exc:
+            record_backend_attested_corrupt(
+                session,
+                copy,
+                detail=str(exc),
+                source="restore",
+                execution_id=execution_id,
+                actor=actor,
+            )
+            raise RestoreIntegrityError(
+                f"stored-corrupt: backend refused the stored bytes for copy id={copy.id}: {exc}"
+            ) from exc
+        stored_path.write_bytes(stored_bytes)
 
         stored_digest = sha256_file(stored_path)
         measured = content_hash(stored_digest)

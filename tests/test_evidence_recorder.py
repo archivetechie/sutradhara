@@ -146,6 +146,97 @@ def test_record_measured_retry_deduplicates_without_rewriting_projection(
         assert session.scalar(select(func.count()).select_from(VerifyReceipt)) == 1
 
 
+def test_record_backend_attested_corrupt_clears_pair_and_is_idempotent(
+    engine: Engine,
+) -> None:
+    from sutradhara.evidence_recorder import record_backend_attested_corrupt
+    from sutradhara.retention_journal import _projection_mismatches
+
+    copy_id = _seed_copy(engine)
+    good_at = dt.datetime(2026, 7, 19, 12, 0, tzinfo=dt.UTC)
+    bad_at = good_at + dt.timedelta(days=1)
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        assert copy is not None
+        record_measured(
+            session,
+            copy,
+            VerifyResult(ok=True, measured=True, actual_hash=copy.integrity_hash),
+            source="fanout",
+            execution_id="fanout-ok",
+            measured_at=good_at,
+        )
+        assert copy.health == CopyHealth.OK
+
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        assert copy is not None
+        receipt = record_backend_attested_corrupt(
+            session,
+            copy,
+            detail="daemon refused the stored bytes",
+            source="verify-job",
+            execution_id="verify-7",
+            actor="tester",
+            checked_at=bad_at,
+        )
+        assert receipt.failure_kind == "backend-digest-mismatch"
+        event_id = receipt.event_id
+
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        assert copy is not None
+        assert copy.health == CopyHealth.CORRUPT
+        assert copy.last_measured_digest is None
+        assert copy.last_measured_at is None
+        assert copy.last_checked_at is not None
+        assert copy.last_checked_at.replace(tzinfo=dt.UTC) == bad_at
+        receipts = list(
+            session.scalars(select(VerifyReceipt).where(VerifyReceipt.execution_id == "verify-7"))
+        )
+        assert len(receipts) == 1
+        r = receipts[0]
+        assert r.copy_id == copy_id
+        assert r.backend_id == copy.backend_id
+        assert r.expected_digest == copy.integrity_hash
+        assert r.measured_digest is None
+        assert r.backend_ok is False
+        assert r.failure_kind == "backend-digest-mismatch"
+        assert r.failure_detail == "daemon refused the stored bytes"
+        assert r.source == "verify-job"
+        assert r.actor == "tester"
+        assert session.scalar(select(func.count()).select_from(VerifyReceipt)) == 2
+        assert list(_projection_mismatches(engine)) == []
+
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        assert copy is not None
+        again = record_backend_attested_corrupt(
+            session,
+            copy,
+            detail="a different detail",
+            source="verify-job",
+            execution_id="verify-7",
+            checked_at=bad_at + dt.timedelta(days=1),
+        )
+        assert again.event_id == event_id
+        assert session.scalar(select(func.count()).select_from(VerifyReceipt)) == 2
+        assert copy.last_checked_at is not None
+        assert copy.last_checked_at.replace(tzinfo=dt.UTC) == bad_at
+
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        assert copy is not None
+        with pytest.raises(ValueError, match="measurement source"):
+            record_backend_attested_corrupt(
+                session, copy, detail="x", source="scrub", execution_id="e"
+            )
+        with pytest.raises(ValueError, match="execution_id"):
+            record_backend_attested_corrupt(
+                session, copy, detail="x", source="restore", execution_id=""
+            )
+
+
 def test_backend_discovered_identity_conflict_cannot_reach_ok_via_readback(
     engine: Engine,
 ) -> None:

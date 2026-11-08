@@ -19,6 +19,7 @@ from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from sutradhara.backend.memory import MemoryBackend
+from sutradhara.backend.port import BackendLocator, BackendStoredCorruptError, ByteRange
 from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset, VerifyReceipt
 from sutradhara.catalog.session import create_all, locator_key, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
@@ -333,6 +334,46 @@ def test_restore_fails_closed_for_stored_and_content_corruption(
             _restore_to_destination(s, copy, backend=backend2, opener=opener, destination=dest2)
 
     assert not dest2.exists()
+
+
+class _StoredCorruptBackend(MemoryBackend):
+    def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+        raise BackendStoredCorruptError("daemon: stored bytes failed digest check")
+
+
+def test_restore_records_backend_attested_stored_corruption(engine: Engine) -> None:
+    backend = _StoredCorruptBackend("mem")
+    copy_id = _add_copy(engine, backend, data=b"good")
+    with session_scope(engine) as s:
+        copy = s.get(Copy, copy_id)
+        assert copy is not None
+        with (
+            pytest.raises(
+                RestoreIntegrityError, match=r"^stored-corrupt: backend refused"
+            ) as caught,
+            restore_copy(
+                s,
+                copy,
+                backend=backend,
+                opener=_FakeOpener(),
+                execution_id="restore-attested",
+                actor="tester",
+            ),
+        ):
+            pass  # pragma: no cover
+        assert isinstance(caught.value.__cause__, BackendStoredCorruptError)
+
+    with session_scope(engine) as s:
+        copy = s.get(Copy, copy_id)
+        assert copy is not None
+        assert copy.health == CopyHealth.CORRUPT
+        assert copy.last_measured_digest is None
+        receipt = s.scalars(select(VerifyReceipt).where(VerifyReceipt.copy_id == copy_id)).one()
+        assert receipt.source == "restore"
+        assert receipt.execution_id == "restore-attested"
+        assert receipt.actor == "tester"
+        assert receipt.failure_kind == "backend-digest-mismatch"
+        assert "stored bytes failed digest check" in (receipt.failure_detail or "")
 
 
 def test_restore_rejects_missing_bundle_and_bad_representation(
