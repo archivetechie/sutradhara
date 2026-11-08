@@ -422,26 +422,26 @@ def test_live_invalid_argument_carries_decodable_bad_request(
     )
 
 
-def test_fixture_start_failure_stops_the_daemon(tmp_path, monkeypatch):
-    """A seeding failure inside start() stops the launched daemon and cleans up."""
+_FAKE_BINDS_AND_SLEEPS = (
+    "#!/bin/sh\n"
+    "# ReadPlanService\n"
+    'while [ "$#" -gt 0 ]; do\n'
+    '  if [ "$1" = "--socket" ]; then : > "$2"; fi\n'
+    "  shift\n"
+    "done\n"
+    "exec sleep 60\n"
+)
+_FAKE_EXITS_AT_ONCE = "#!/bin/sh\n# ReadPlanService\nexit 3\n"
+_FAKE_NEVER_BINDS = "#!/bin/sh\n# ReadPlanService\nexec sleep 60\n"
+
+
+def _install_fake_daemon(tmp_path, monkeypatch, script: str) -> list[subprocess.Popen]:
+    """Point the fixture at a fake daemon script; return the list of launched processes."""
 
     fake = tmp_path / "fake-rem-daemon"
-    fake.write_text(
-        "#!/bin/sh\n"
-        "# ReadPlanService\n"
-        'while [ "$#" -gt 0 ]; do\n'
-        '  if [ "$1" = "--socket" ]; then : > "$2"; fi\n'
-        "  shift\n"
-        "done\n"
-        "exec sleep 60\n"
-    )
+    fake.write_text(script)
     fake.chmod(0o755)
     monkeypatch.setenv("REM_DAEMON_BIN", str(fake))
-
-    def failing_seed(self) -> None:
-        raise RuntimeError("seed failed")
-
-    monkeypatch.setattr(FixtureDaemon, "_seed_index_rows", failing_seed)
 
     launched: list[subprocess.Popen] = []
     real_popen = subprocess.Popen
@@ -452,19 +452,92 @@ def test_fixture_start_failure_stops_the_daemon(tmp_path, monkeypatch):
         return proc
 
     monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    return launched
+
+
+def _assert_launched_daemon_stopped(launched: list[subprocess.Popen]) -> None:
+    assert len(launched) == 1
+    try:
+        launched[0].wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the launched daemon was left running after a failed start")
+
+
+def _kill_leftovers(launched: list[subprocess.Popen], fixture: FixtureDaemon) -> None:
+    for proc in launched:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+    shutil.rmtree(fixture.root, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [RuntimeError("seed failed"), KeyboardInterrupt()],
+    ids=["runtime_error", "keyboard_interrupt"],
+)
+def test_fixture_start_failure_stops_the_daemon(tmp_path, monkeypatch, exc):
+    """A seeding failure inside start() stops the daemon, cleans up and re-raises the original."""
+
+    launched = _install_fake_daemon(tmp_path, monkeypatch, _FAKE_BINDS_AND_SLEEPS)
+
+    def failing_seed(self) -> None:
+        raise exc
+
+    monkeypatch.setattr(FixtureDaemon, "_seed_index_rows", failing_seed)
 
     fixture = FixtureDaemon()
     try:
-        with pytest.raises(RuntimeError, match="seed failed"):
+        with pytest.raises(type(exc)) as excinfo:
             fixture.start()
-        assert len(launched) == 1
-        launched[0].wait(timeout=10)
-        assert launched[0].poll() is not None
+        assert excinfo.value is exc
+        _assert_launched_daemon_stopped(launched)
         assert fixture._proc is None
         assert not fixture.root.exists()
     finally:
-        for proc in launched:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait(timeout=10)
-        shutil.rmtree(fixture.root, ignore_errors=True)
+        _kill_leftovers(launched, fixture)
+
+
+def test_fixture_start_early_daemon_exit_cleans_up(tmp_path, monkeypatch):
+    """A daemon that exits before binding fails start() and leaves no temp root."""
+
+    launched = _install_fake_daemon(tmp_path, monkeypatch, _FAKE_EXITS_AT_ONCE)
+
+    fixture = FixtureDaemon()
+    try:
+        with pytest.raises(RuntimeError, match="before binding"):
+            fixture.start()
+        _assert_launched_daemon_stopped(launched)
+        assert fixture._proc is None
+        assert not fixture.root.exists()
+    finally:
+        _kill_leftovers(launched, fixture)
+
+
+def test_fixture_start_interrupted_socket_wait_stops_the_daemon(tmp_path, monkeypatch):
+    """An interrupt while waiting for the socket stops the daemon and cleans up."""
+
+    launched = _install_fake_daemon(tmp_path, monkeypatch, _FAKE_NEVER_BINDS)
+
+    real_sleep = time.sleep
+    calls: list[float] = []
+
+    def interrupted_sleep(seconds: float) -> None:
+        # Only the first call (the socket wait) is interrupted: subprocess's
+        # timed wait polls through time.sleep too, and must keep working.
+        calls.append(seconds)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        real_sleep(seconds)
+
+    monkeypatch.setattr(time, "sleep", interrupted_sleep)
+
+    fixture = FixtureDaemon()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            fixture.start()
+        _assert_launched_daemon_stopped(launched)
+        assert fixture._proc is None
+        assert not fixture.root.exists()
+    finally:
+        _kill_leftovers(launched, fixture)
