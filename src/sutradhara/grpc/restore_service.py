@@ -56,6 +56,7 @@ from sutradhara.hdcache.manager import (
     _update_request_state,
     authorize_agent_restore_destination,
     bind_restore_event_sink_to_engine,
+    bind_restore_event_sink_to_session,
     open_cache_plaintext_chunks,
     restore_backends_for_artifactclass,
     restore_config_from_env,
@@ -552,7 +553,11 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             member: PlannedMember | None = None
             cache_entry_hash: bytes | None = None
             source = "cache"
-            entry = _select_cache_entry(session, item.content_sha256, config=self._cache)
+            cache = bind_restore_event_sink_to_session(self._cache, session)
+            entry = _select_cache_entry(session, item.content_sha256, config=cache)
+            # A recovered cache disk is a fact about the disk; commit it (and its
+            # alarm) now. Nothing else is pending here (the commit above).
+            session.commit()
             if entry is not None and self._probe_cache_entry(session, entry, item):
                 cache_entry_hash = entry.content_sha256
             else:
@@ -607,7 +612,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 expected_content_sha256=item.content_sha256,
                 expected_size_bytes=item.size_bytes,
                 artifactclass=item.artifactclass,
-                config=self._cache,
+                config=bind_restore_event_sink_to_session(self._cache, session),
             ) as chunks:
                 _drain_chunks(chunks)
         except CacheServeFailed:
@@ -783,7 +788,14 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
 
         if prepared.cache_entry_hash is not None:
             with self._factory() as session:
-                entry = _select_cache_entry(session, prepared.cache_entry_hash, config=self._cache)
+                cache = bind_restore_event_sink_to_session(self._cache, session)
+                # The open streams the source prepare just verified; it stays read-only.
+                entry = _select_cache_entry(
+                    session,
+                    prepared.cache_entry_hash,
+                    config=cache,
+                    allow_recovery_probe=False,
+                )
                 if entry is None:
                     raise RestoreSourceUnavailable("verified cache source became unavailable")
                 with open_cache_plaintext_chunks(
@@ -792,7 +804,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     expected_content_sha256=prepared.manifest.content_sha256,
                     expected_size_bytes=prepared.manifest.size,
                     artifactclass=prepared.artifactclass,
-                    config=self._cache,
+                    config=cache,
                 ) as chunks:
                     yield chunks
             return

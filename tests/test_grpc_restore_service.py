@@ -8,6 +8,7 @@ import os
 import shutil
 import socket
 import struct
+import time
 import tracemalloc
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -1761,3 +1762,94 @@ def test_bind_restore_event_sink_to_engine_only_rebinds_unbound_alarm_sink(
     finally:
         engine.dispose()
         other.dispose()
+
+
+def _set_cache_disk_state(rig: _Rig, state: str) -> None:
+    with session_scope(rig.engine) as session:
+        disk = session.get(CacheDisk, "d-cache")
+        assert disk is not None
+        disk.state = state
+
+
+def test_cache_recovery_on_absent_disk_commits_without_alarm_lock_stall(rig: _Rig) -> None:
+    payload = b"recovered cache disk serves\n" * 1000
+    item_id = _seed_item(rig, "cache-recover", payload, receiver="receiver")
+    _seed_cache_entry(rig, item_id, payload)
+    archive_opens = rig.backend.open_calls
+    # The rig's cache config has no event sink (events only log); production wires
+    # the DB-backed alarm sink, so this test does too.
+    assert rig.service_config.cache_config is not None
+    service = RestoreService(
+        replace(
+            rig.service_config,
+            cache_config=replace(
+                rig.service_config.cache_config, event_sink=restore_event_alarm_sink()
+            ),
+        )
+    )
+    _set_cache_disk_state(rig, "absent")
+    try:
+        started = time.monotonic()
+        frames = list(
+            service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 10
+        assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+        assert rig.backend.open_calls == archive_opens
+        with session_scope(rig.engine) as session:
+            disk = session.get(CacheDisk, "d-cache")
+            assert disk is not None
+            assert disk.state == "active"
+            # _set_alarm(active=False) records an observation: an inactive row
+            # (observed present, not open) is created when none existed.
+            row = session.scalars(
+                select(ReconciliationCondition).where(
+                    ReconciliationCondition.domain == ALARM_DOMAIN,
+                    ReconciliationCondition.target_key == "disk-unreachable:restore",
+                )
+            ).one()
+            assert row.condition != CONDITION_OPEN
+    finally:
+        _set_cache_disk_state(rig, "active")
+
+
+class _AbsentAfterPrepareService(RestoreService):
+    """Turn the cache disk absent after prepare verified it, before the open."""
+
+    def _mark_streaming(self, prepared: Any) -> None:
+        super()._mark_streaming(prepared)
+        with session_scope(self.config.engine) as session:
+            disk = session.get(CacheDisk, "d-cache")
+            assert disk is not None
+            disk.state = "absent"
+
+
+def test_open_prepared_cache_source_never_probes_recovery(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"prepared cache source goes absent\n" * 100
+    item_id = _seed_item(rig, "cache-no-open-probe", payload, receiver="receiver")
+    _seed_cache_entry(rig, item_id, payload)
+
+    def _boom(*_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("the open must not run a recovery probe")
+
+    monkeypatch.setattr("sutradhara.hdcache.manager._probe_cache_disk_recovery", _boom)
+    try:
+        frames = list(
+            _AbsentAfterPrepareService(rig.service_config).OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+        )
+    finally:
+        _set_cache_disk_state(rig, "active")
+
+    errors = [frame.error for frame in frames if frame.HasField("error")]
+    assert [e.code for e in errors] == ["ARCHIVE_RESTORE_FAILED"]
+    assert "verified cache source became unavailable" in errors[0].message
