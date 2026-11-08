@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from concurrent import futures
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import grpc
 import pytest
@@ -568,6 +569,16 @@ class _LostRaceError(grpc.RpcError):  # type: ignore[misc]
         return "read session already active"
 
 
+class _TapeMountedError(_LostRaceError):
+    def details(self) -> str:
+        return "tape is already mounted"
+
+
+class _OtherPreconditionError(_LostRaceError):
+    def details(self) -> str:
+        return "tape is quarantined"
+
+
 class _LostRaceReadClient(_QueueReadClient):
     def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
         self.open_count += 1
@@ -580,6 +591,20 @@ class _LostRaceReadClient(_QueueReadClient):
             tape_uuid=tape_uuid,
             drive_element_address=0x101,
         )
+
+
+class _TapeMountedReadClient(_LostRaceReadClient):
+    def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+        if self.open_count == 0:
+            self.open_count += 1
+            raise _TapeMountedError()
+        return super().OpenReadSession(request)
+
+
+class _OtherPreconditionReadClient(_QueueReadClient):
+    def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+        self.open_count += 1
+        raise _OtherPreconditionError()
 
 
 class _RangeFailureReadClient(_QueueReadClient):
@@ -664,6 +689,41 @@ def test_lost_open_read_session_race_requeues_instead_of_failing() -> None:
         assert session.drive_element_address == 0x101
 
     assert client.open_count == 2
+
+
+def test_tape_already_mounted_by_another_session_requeues_and_releases_lease() -> None:
+    library = _QueueLibrary()
+    client = _TapeMountedReadClient(library)
+    backend = _queue_backend(library, client)
+    assert backend._drive_queue is not None
+    real_acquire = backend._drive_queue.acquire
+    leases: list[Any] = []
+
+    def recording_acquire(tape_uuid: bytes) -> Any:
+        lease = real_acquire(tape_uuid)
+        leases.append(lease)
+        return lease
+
+    backend._drive_queue.acquire = recording_acquire  # type: ignore[method-assign]
+
+    with backend.open_read_session(_read_locator(hashlib.sha256(b"payload").hexdigest())) as s:
+        assert s.session_id == b"won-after-requeue"
+        # The first attempt's lease was released before the second attempt began.
+        assert len(leases) == 2
+        assert leases[0]._released is True
+
+    assert client.open_count == 2
+
+
+def test_other_failed_precondition_on_open_still_fails_on_first_attempt() -> None:
+    library = _QueueLibrary()
+    client = _OtherPreconditionReadClient(library)
+    backend = _queue_backend(library, client)
+
+    with pytest.raises(BackendUnavailableError):
+        backend.open_read_session(_read_locator("11" * 32))
+
+    assert client.open_count == 1
 
 
 def test_drive_uuid_float_does_not_change_library_bay_queue_key() -> None:

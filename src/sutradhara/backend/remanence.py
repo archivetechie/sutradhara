@@ -1914,12 +1914,17 @@ def _read_object_range_error(
 
 
 def _is_active_read_session_race(error: grpc.RpcError) -> bool:
-    """Recognize the atomic bay-reservation race that must return to the queue."""
+    """Recognize a lost open race that must return to the queue.
 
-    details = error.details()
-    return error.code() == grpc.StatusCode.FAILED_PRECONDITION and bool(
-        details and "read session already active" in str(details).lower()
-    )
+    Both refusals mean another session holds the bay or the tape: the bay-level
+    "read session already active" and the tape-level "tape is already mounted"
+    (another process, such as a worker verify job, won the reservation).
+    """
+
+    if error.code() != grpc.StatusCode.FAILED_PRECONDITION:
+        return False
+    details = str(error.details() or "").lower()
+    return "read session already active" in details or "tape is already mounted" in details
 
 
 def _rpc_error_text(error: grpc.RpcError) -> str:
