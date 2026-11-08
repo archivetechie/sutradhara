@@ -393,8 +393,8 @@ def test_remanence_data_loss_is_stored_corruption_not_unavailable() -> None:
             session.read_range(ByteRange(0, 0))
     exc = caught.value
     assert "read failed" in str(exc)
-    assert exc.session_id is not None  # type: ignore[attr-defined]
-    assert isinstance(exc.drive_element_address, int)  # type: ignore[attr-defined]
+    assert exc.session_id == b"pfr-read-session"  # type: ignore[attr-defined]
+    assert exc.drive_element_address == 0  # type: ignore[attr-defined]
     assert not isinstance(exc, BackendUnavailableError)
 
 

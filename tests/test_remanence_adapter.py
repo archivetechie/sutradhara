@@ -23,6 +23,7 @@ from sutradhara.backend import remanence as remanence_module
 from sutradhara.backend.port import (
     BackendError,
     BackendNotFoundError,
+    BackendStoredCorruptError,
     BackendUnavailableError,
     ByteRange,
     CopyRecord,
@@ -891,6 +892,22 @@ def test_read_range_grpc_error_raises_unavailable() -> None:
                 _read_locator(hashlib.sha256(b"x").hexdigest()),
                 ByteRange(0, 0),
             )
+    assert servicer.closed
+
+
+def test_read_range_data_loss_raises_stored_corrupt_with_session_identity() -> None:
+    servicer = _ReadSession(b"x", read_error=grpc.StatusCode.DATA_LOSS)
+    with _serve_read(servicer) as endpoint:
+        backend = RemanenceBackend.from_grpc("primary-tape", endpoint)
+        with pytest.raises(BackendStoredCorruptError) as caught:
+            backend.read_range(
+                _read_locator(hashlib.sha256(b"x").hexdigest()),
+                ByteRange(0, 0),
+            )
+    exc = caught.value
+    assert not isinstance(exc, BackendUnavailableError)
+    assert exc.session_id == servicer.session_id  # type: ignore[attr-defined]
+    assert exc.drive_element_address == 0  # type: ignore[attr-defined]
     assert servicer.closed
 
 
