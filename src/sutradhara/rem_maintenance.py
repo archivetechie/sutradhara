@@ -1,7 +1,9 @@
 """Explicit Remanence maintenance requests over caller-owned RPC clients.
 
-The caller owns operator confirmation and persists the closeout idempotency key
-for retries. These helpers neither select media nor create network channels.
+The caller owns operator confirmation and the closeout idempotency key. It reuses
+a key only to re-attach to an operation that has not ended, and uses a new key for
+any attempt after one has ended. These helpers neither select media nor create
+network channels.
 """
 
 from __future__ import annotations
@@ -13,6 +15,14 @@ import grpc
 
 from ._proto import layer5_pb2 as pb
 from ._proto.layer5_pb2_grpc import CatalogStub, DaemonStub
+
+
+class CloseoutEnded(RuntimeError):
+    """The closeout operation ended without a confirmed success; ``state`` is its terminal state."""
+
+    def __init__(self, message: str, state: int) -> None:
+        super().__init__(message)
+        self.state = state
 
 
 def supersede_tail(
@@ -63,7 +73,15 @@ def closeout_tape(
     expected_pool_id: str | None = None,
     timeout: float = 900,
 ) -> pb.OperationStatus:
-    """Wait for checked closeout, reusing the caller's key for any later retry."""
+    """Wait for checked closeout under the caller's idempotency key.
+
+    Reuse the key after a timeout, a broken watch or a caller crash: a live operation
+    re-attaches, and a succeeded one replays its success. If the operation ended
+    otherwise in the meantime (a daemon restart marks every open operation failed),
+    Remanence refuses the re-attach with ``FAILED_PRECONDITION``; use a new key. After
+    ``CloseoutEnded`` the same key is refused the same way, so any further attempt
+    needs a new key.
+    """
     if idempotency_key.int == 0:
         raise ValueError("CloseoutTape idempotency_key must not be the nil UUID")
     request = pb.CloseoutTapeRequest(
@@ -88,5 +106,7 @@ def closeout_tape(
             pb.OPERATION_STATE_CANCELLED,
             pb.OPERATION_STATE_COMPLETION_UNKNOWN,
         ):
-            raise RuntimeError(status.error_summary or "closeout operation did not succeed")
+            raise CloseoutEnded(
+                status.error_summary or "closeout operation did not succeed", status.state
+            )
     raise RuntimeError("closeout operation watch ended without a terminal status")

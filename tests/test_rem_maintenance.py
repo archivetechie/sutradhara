@@ -6,7 +6,7 @@ import grpc
 import pytest
 
 from sutradhara._proto import layer5_pb2 as pb
-from sutradhara.rem_maintenance import closeout_tape, supersede_tail
+from sutradhara.rem_maintenance import CloseoutEnded, closeout_tape, supersede_tail
 
 TAPE, KEY, OP = uuid.UUID(int=1), uuid.UUID(int=2), uuid.UUID(int=3)
 
@@ -157,5 +157,81 @@ def test_closeout_failure_and_unknown_completion_preserve_diagnostic(state):
                 error_summary="CloseoutCheckMismatch",
             )
 
-    with pytest.raises(RuntimeError, match="CloseoutCheckMismatch"):
+    with pytest.raises(RuntimeError, match="CloseoutCheckMismatch") as raised:
         closeout_tape(Catalog(), Daemon(), TAPE, idempotency_key=KEY)
+    assert isinstance(raised.value, CloseoutEnded)
+    assert raised.value.state == state
+
+
+def test_failed_closeout_requires_a_new_key():
+    keys, watches = [], []
+    new_key = uuid.UUID(int=4)
+    refusal = (
+        "this closeout operation has ended; a new operation is required for further physical work"
+    )
+
+    class Catalog:
+        def CloseoutTape(self, request, **kwargs):
+            keys.append(uuid.UUID(bytes=request.idempotency_key.value))
+            if len(keys) == 2:
+                raise Refusal(refusal)
+            return pb.OperationRef(operation_id=OP.bytes)
+
+    class Daemon:
+        def WatchOperation(self, request, **kwargs):
+            watches.append(request.operation_id)
+            failed = len(watches) == 1
+            yield pb.OperationStatus(
+                operation_id=OP.bytes,
+                operation_kind="tape_closeout",
+                state=pb.OPERATION_STATE_FAILED if failed else pb.OPERATION_STATE_SUCCEEDED,
+                error_summary="CloseoutCheckMismatch" if failed else "",
+            )
+
+    with pytest.raises(CloseoutEnded, match="CloseoutCheckMismatch") as ended:
+        closeout_tape(Catalog(), Daemon(), TAPE, idempotency_key=KEY)
+    assert isinstance(ended.value, RuntimeError)
+    assert ended.value.state == pb.OPERATION_STATE_FAILED
+    with pytest.raises(Refusal) as refused:
+        closeout_tape(Catalog(), Daemon(), TAPE, idempotency_key=KEY)
+    assert refused.value.details() == refusal
+    assert len(watches) == 1
+    result = closeout_tape(Catalog(), Daemon(), TAPE, idempotency_key=new_key)
+    assert result.state == pb.OPERATION_STATE_SUCCEEDED
+    assert keys == [KEY, KEY, new_key]
+
+
+def test_watch_ended_without_terminal_status_is_not_an_end():
+    class Catalog:
+        def CloseoutTape(self, *a, **kw):
+            return pb.OperationRef(operation_id=OP.bytes)
+
+    class Daemon:
+        def WatchOperation(self, *a, **kw):
+            yield pb.OperationStatus(
+                operation_id=OP.bytes,
+                operation_kind="tape_closeout",
+                state=pb.OPERATION_STATE_RUNNING,
+            )
+
+    with pytest.raises(RuntimeError, match="without a terminal status") as raised:
+        closeout_tape(Catalog(), Daemon(), TAPE, idempotency_key=KEY)
+    assert not isinstance(raised.value, CloseoutEnded)
+
+
+def test_identity_mismatch_is_not_an_end():
+    class Catalog:
+        def CloseoutTape(self, *a, **kw):
+            return pb.OperationRef(operation_id=OP.bytes)
+
+    class Daemon:
+        def WatchOperation(self, *a, **kw):
+            yield pb.OperationStatus(
+                operation_id=uuid.UUID(int=9).bytes,
+                operation_kind="tape_closeout",
+                state=pb.OPERATION_STATE_RUNNING,
+            )
+
+    with pytest.raises(RuntimeError, match="identity mismatch") as raised:
+        closeout_tape(Catalog(), Daemon(), TAPE, idempotency_key=KEY)
+    assert not isinstance(raised.value, CloseoutEnded)
