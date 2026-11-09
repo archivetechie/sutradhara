@@ -70,6 +70,7 @@ from sutradhara.hdcache.alarms import (
 )
 from sutradhara.hdcache.manager import (
     CacheServeFailed,
+    DiskCircuitBreaker,
     RestoreConfig,
     RestoreEvent,
     _emit,
@@ -93,6 +94,7 @@ from sutradhara.hdcache.store import (
     RAW_REPRESENTATION,
     ExpectedDiskIdentity,
     ObservedBlockIdentity,
+    StoreReadTimeout,
     entry_path,
     write_disk_sentinel,
     write_entry,
@@ -266,11 +268,11 @@ def _started(service: RestoreService) -> RestoreService:
 class _HookService(RestoreService):
     """Hooks at the seams the exit-table tests need (RSR-1b E1, E8).
 
-    ``before_lease`` runs before the lease transaction; ``lease_row`` rewrites
-    the row the lease CAS re-reads (the race inside one call); ``before_streaming``
-    runs between the lease and ``_mark_streaming``; ``chunks`` wraps the source
-    iterator the stream reads; ``before_insert`` runs between D5's pre-check and
-    the attempt insert.
+    ``before_lease`` runs before the lease transaction (between ``_prepare_open``
+    and ``_acquire_lease``); ``lease_row`` rewrites the row the lease CAS
+    re-reads (the race inside one call); ``chunks`` wraps the source iterator
+    the stream reads; ``before_insert`` runs between D5's pre-check and the
+    attempt insert.
     """
 
     def __init__(
@@ -279,14 +281,12 @@ class _HookService(RestoreService):
         *,
         before_lease: Any = None,
         lease_row: Any = None,
-        before_streaming: Any = None,
         chunks: Any = None,
         before_insert: Any = None,
     ) -> None:
         super().__init__(config)
         self.before_lease = before_lease
         self.lease_row = lease_row
-        self.before_streaming = before_streaming
         self.chunks = chunks
         self.before_insert = before_insert
 
@@ -305,11 +305,6 @@ class _HookService(RestoreService):
         if self.lease_row is not None and row is not None:
             return self.lease_row(row)  # type: ignore[no-any-return]
         return row
-
-    def _mark_streaming(self, prepared: Any) -> None:
-        if self.before_streaming is not None:
-            self.before_streaming(prepared.item_id)
-        super()._mark_streaming(prepared)
 
     @contextmanager
     def _open_prepared_chunks(self, prepared: Any) -> Iterator[Iterator[bytes]]:
@@ -1311,6 +1306,9 @@ def test_resume_redrives_in_progress_file_from_start_and_reveals(rig: _Rig) -> N
 
 
 def test_resume_skips_committed_file_and_revealed_resume_is_already_done(rig: _Rig) -> None:
+    """Re-pinned by RSR-1c (D10): the resume claims the file it holds (1); a
+    claim of 0 against a stored 1 is the lost-acknowledgement case (K1)."""
+
     item_id = _seed_item(rig, "resume-skip", b"already staged", receiver="receiver")
     initial = list(
         rig.service.OpenRestore(
@@ -1337,7 +1335,7 @@ def test_resume_skips_committed_file_and_revealed_resume_is_already_done(rig: _R
                 resume_token=restore_pb2.ResumeToken(
                     restore_request_item_id=item_id,
                     manifest_sha256=head.manifest_sha256,
-                    committed_index=0,
+                    committed_index=1,
                 ),
             ),
             rig.context("receiver"),
@@ -2141,12 +2139,13 @@ def test_cache_recovery_on_absent_disk_commits_without_alarm_lock_stall(rig: _Ri
 class _AbsentAfterPrepareService(RestoreService):
     """Turn the cache disk absent after prepare verified it, before the open."""
 
-    def _mark_streaming(self, prepared: Any) -> None:
-        super()._mark_streaming(prepared)
+    def _acquire_lease(self, prepared: Any, context: Any, entry: Any) -> Any:
+        lease = super()._acquire_lease(prepared, context, entry)
         with session_scope(self.config.engine) as session:
             disk = session.get(CacheDisk, "d-cache")
             assert disk is not None
             disk.state = "absent"
+        return lease
 
 
 def test_open_prepared_cache_source_never_probes_recovery(
@@ -2581,9 +2580,11 @@ def _d_lease_live_698(rig: _Rig, _mp: Any, ctx: _Context_factory, tag: str) -> A
 
 
 def _d_item_withdrawn(rig: _Rig, _mp: Any, ctx: _Context_factory, tag: str) -> Any:
+    # K6's driver: the item leaves the openable states between ``_prepare_open``
+    # and the lease transaction, whose item update then matches no row.
     item_id = _seed_item(rig, f"{tag}-withdrawn", _pl(f"{tag}-withdrawn"), receiver="receiver")
     service = _with_hooks(
-        rig, before_streaming=lambda withdrawn_id: _set_item(rig, withdrawn_id, state="denied")
+        rig, before_lease=lambda withdrawn_id: _set_item(rig, withdrawn_id, state="failed")
     )
     try:
         return item_id, *_open_collect(service, item_id, ctx("receiver"))
@@ -2765,7 +2766,7 @@ _EXIT_CASES: dict[str, _ExitCase] = {
         opened_from="sent",
         prior_rows=1,
     ),
-    "item_withdrawn_mark_streaming": _ExitCase(
+    "item_withdrawn_lease_item_update": _ExitCase(
         drive=_d_item_withdrawn,
         end_kind="error",
         cause="item_withdrawn",
@@ -3336,3 +3337,477 @@ def test_pre_admission_refusals_for_item_id_missing_and_not_started_write_no_row
         assert (exc.code, exc.details) == (code, details)
     assert _attempt_count(rig) == rows_before
     assert _attempt_rows(rig, item_id) == []
+
+
+# ---- RSR-1c: the receiver's claim, one lease transaction, the shared funnel ------
+
+
+def _checkpoint_of(rig: _Rig, item_id: int) -> tuple[int, bool]:
+    with session_scope(rig.engine) as session:
+        checkpoint = session.get(RestoreItemCheckpoint, item_id)
+        assert checkpoint is not None
+        return checkpoint.committed_index, checkpoint.revealed
+
+
+def _lease_of(rig: _Rig, item_id: int) -> tuple[int, dt.datetime] | None:
+    with session_scope(rig.engine) as session:
+        lease = session.get(RestoreOpenSession, item_id)
+        if lease is None:
+            return None
+        return lease.generation, lease.expires_at
+
+
+def _request_state(rig: _Rig, item_id: int) -> str:
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        return str(item.request.state)
+
+
+def _resume_fields(item_id: int, head: Any, claim: int) -> dict[str, Any]:
+    """A resume under the prior lease generation, claiming ``claim`` files held."""
+
+    return {
+        "lease_token": head.lease_token,
+        "resume_token": restore_pb2.ResumeToken(
+            restore_request_item_id=item_id,
+            manifest_sha256=head.manifest_sha256,
+            committed_index=claim,
+        ),
+    }
+
+
+def _acknowledged(rig: _Rig, suffix: str) -> tuple[int, bytes, Any]:
+    """Deliver an item and record the receiver's STAGED acknowledgement of its one file."""
+
+    payload = _pl(suffix)
+    item_id = _seed_item(rig, suffix, payload, receiver="receiver")
+    head = _deliver(rig, item_id)
+    staged = rig.service.CommitRestore(
+        _commit_request(item_id, head.manifest_sha256, head.lease_token, 1),
+        rig.context("receiver"),
+    )
+    assert (staged.status, staged.committed_index) == ("advanced", 1)
+    assert _checkpoint_of(rig, item_id) == (1, False)
+    return item_id, payload, head
+
+
+def _kinds(frames: list[Any]) -> list[str]:
+    return [frame.WhichOneof("payload") for frame in frames]
+
+
+def _funnel_service(
+    rig: _Rig, events: list[RestoreEvent], **cache_overrides: Any
+) -> RestoreService:
+    """A started service whose cache config records events and has its own breaker."""
+
+    assert rig.service_config.cache_config is not None
+    cache_config = replace(
+        rig.service_config.cache_config, event_sink=events.append, **cache_overrides
+    )
+    return _started(RestoreService(replace(rig.service_config, cache_config=cache_config)))
+
+
+def test_k1_a_lost_acknowledgement_resume_claiming_zero_streams_the_file_and_lowers(
+    rig: _Rig,
+) -> None:
+    item_id, payload, head = _acknowledged(rig, "k1-lost-ack")
+    _expire_lease(rig, item_id)
+
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(
+                restore_request_item_id=item_id, **_resume_fields(item_id, head, 0)
+            ),
+            rig.context("receiver"),
+        )
+    )
+
+    assert _kinds(frames)[:4] == ["manifest_head", "manifest_entry", "manifest_end", "file_header"]
+    assert frames[-1].job_end.files == 1
+    assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+    assert frames[0].manifest_head.lease_token.generation == head.lease_token.generation + 1
+    # The stored value is the receiver's claim once the open won its lease.
+    assert _checkpoint_of(rig, item_id) == (0, False)
+    _delivered, resumed = _attempt_rows(rig, item_id)
+    assert (resumed.end_kind, resumed.cause, resumed.lease_generation) == ("job_end", None, 2)
+
+
+def test_k2_a_fresh_open_after_discarded_staging_streams_the_file_and_lowers(rig: _Rig) -> None:
+    item_id, payload, head = _acknowledged(rig, "k2-discarded")
+    _expire_lease(rig, item_id)
+
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+
+    assert "file_header" in _kinds(frames)
+    assert frames[-1].job_end.files == 1
+    assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+    assert frames[0].manifest_head.lease_token.generation == head.lease_token.generation + 1
+    assert _checkpoint_of(rig, item_id) == (0, False)
+
+
+def test_k3_a_claim_equal_to_the_stored_value_takes_the_committed_path_without_a_read(
+    rig: _Rig,
+) -> None:
+    item_id, _payload, head = _acknowledged(rig, "k3-equal")
+    rig.backend.paths["object-k3-equal"].unlink()  # no source read may happen
+    _expire_lease(rig, item_id)
+    archive_opens = rig.backend.open_calls
+
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(
+                restore_request_item_id=item_id, **_resume_fields(item_id, head, 1)
+            ),
+            rig.context("receiver"),
+        )
+    )
+
+    assert _kinds(frames) == ["manifest_head", "manifest_entry", "manifest_end", "job_end"]
+    assert frames[-1].job_end.files == 0
+    assert rig.backend.open_calls == archive_opens
+    assert _checkpoint_of(rig, item_id) == (1, False)
+    _delivered, resumed = _attempt_rows(rig, item_id)
+    # K8: the committed path runs no probe.
+    assert (resumed.probe_source, resumed.probe_candidates_tried, resumed.probe_ended_at) == (
+        None,
+        None,
+        None,
+    )
+
+
+def test_k3_a_claim_above_the_stored_value_is_not_adopted(rig: _Rig) -> None:
+    item_id, _payload, head = _acknowledged(rig, "k3-above")
+    rig.backend.paths["object-k3-above"].unlink()
+    _expire_lease(rig, item_id)
+
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(
+                restore_request_item_id=item_id, **_resume_fields(item_id, head, 5)
+            ),
+            rig.context("receiver"),
+        )
+    )
+
+    assert _kinds(frames) == ["manifest_head", "manifest_entry", "manifest_end", "job_end"]
+    assert frames[-1].job_end.files == 0
+    assert _checkpoint_of(rig, item_id) == (1, False)
+
+
+def test_k3_an_open_refused_for_a_live_lease_leaves_the_stored_value_unchanged(
+    rig: _Rig,
+) -> None:
+    item_id, _payload, _head = _acknowledged(rig, "k3-live")  # the lease is live
+
+    frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+
+    assert frames == []
+    assert isinstance(exc, _Abort)
+    assert exc.code == grpc.StatusCode.ALREADY_EXISTS
+    assert _checkpoint_of(rig, item_id) == (1, False)
+
+
+def test_k3_a_revealed_checkpoint_replays_unchanged_and_is_never_lowered(rig: _Rig) -> None:
+    item_id, _payload, head = _acknowledged(rig, "k3-revealed")
+    revealed = rig.service.CommitRestore(
+        _commit_request(item_id, head.manifest_sha256, head.lease_token, 1, revealed=True),
+        rig.context("receiver"),
+    )
+    assert revealed.revealed
+
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(
+                restore_request_item_id=item_id, **_resume_fields(item_id, head, 0)
+            ),
+            rig.context("receiver"),
+        )
+    )
+
+    assert _kinds(frames) == ["job_end"]
+    assert frames[0].job_end.files == 0
+    assert _checkpoint_of(rig, item_id) == (1, True)
+    lease = _lease_of(rig, item_id)
+    assert lease is not None
+    assert lease[0] == head.lease_token.generation  # the replay takes no lease
+
+
+def test_the_698_insert_race_reads_the_live_lease_in_the_same_transaction(rig: _Rig) -> None:
+    """C3: a lease that went live between the pre-probe check (C4) and the
+    insert makes the insert fail inside its savepoint; the live expiry is read
+    in the same transaction and recorded as ``blocked_until``."""
+
+    item_id = _seed_item(rig, "c3-698-race", _pl("c3-698-race"), receiver="receiver")
+    live_until = dt.datetime.now(dt.UTC) + dt.timedelta(minutes=3)
+
+    def another_open_leased(raced_id: int) -> None:
+        with session_scope(rig.engine) as session:
+            session.add(
+                RestoreOpenSession(
+                    restore_request_item_id=raced_id,
+                    receiver_device_id="receiver",
+                    manifest_sha256=b"\x02" * 32,
+                    generation=1,
+                    expires_at=live_until,
+                )
+            )
+
+    service = _with_hooks(rig, before_lease=another_open_leased)
+    try:
+        frames, exc, _ = _open_collect(service, item_id, rig.context("receiver"))
+    finally:
+        service.stop()
+
+    assert frames == []
+    assert isinstance(exc, _Abort)
+    assert (exc.code, exc.details) == (
+        grpc.StatusCode.ALREADY_EXISTS,
+        "restore item has a live open",
+    )
+    (row,) = _attempt_rows(rig, item_id)
+    assert (row.end_kind, row.cause) == ("error", "lease_live")
+    assert row.blocked_until == live_until.replace(tzinfo=None)
+    assert row.lease_generation is None
+    assert _lease_of(rig, item_id) == (1, live_until.replace(tzinfo=None))
+
+
+def test_k6_the_lease_transaction_is_one_when_the_item_is_withdrawn(rig: _Rig) -> None:
+    """The item update matches no row: the lease CAS, the fence's generation and
+    D10's lowering all roll back; the request state is re-derived, not ``active``."""
+
+    item_id, _payload, head = _acknowledged(rig, "k6-withdrawn")
+    _expire_lease(rig, item_id)
+    lease_before = _lease_of(rig, item_id)
+    assert lease_before is not None
+    service = _with_hooks(
+        rig, before_lease=lambda withdrawn_id: _set_item(rig, withdrawn_id, state="failed")
+    )
+    try:
+        frames, exc, _ = _open_collect(
+            service, item_id, rig.context("receiver"), **_resume_fields(item_id, head, 0)
+        )
+    finally:
+        service.stop()
+
+    assert frames == []
+    assert isinstance(exc, RuntimeError)
+    _delivered, withdrawn = _attempt_rows(rig, item_id)
+    assert (withdrawn.end_kind, withdrawn.cause) == ("error", "item_withdrawn")
+    assert withdrawn.lease_generation is None
+    assert withdrawn.ended_at is not None
+    assert withdrawn.id not in service._registry
+    # As before the call: the lease row (generation, expiry) and the checkpoint
+    # (the lowering to 0 rolled back with the rest).
+    assert _lease_of(rig, item_id) == lease_before
+    assert _checkpoint_of(rig, item_id) == (1, False)
+    assert _request_state(rig, item_id) == "completed_with_errors"
+
+
+def test_k7_a_token_less_open_against_a_live_lease_is_refused_before_any_source_read(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = _pl("k7-live")
+    item_id = _seed_item(rig, "k7-live", payload, receiver="receiver")
+    _seed_cache_entry(rig, item_id, payload)
+    _deliver(rig, item_id)  # served from the cache; the lease is live
+    lease = _lease_of(rig, item_id)
+    assert lease is not None
+    probes: list[int] = []
+    original_probe = RestoreService._probe_cache_entry
+
+    def counting_probe(self: RestoreService, *args: Any, **kwargs: Any) -> bool:
+        probes.append(1)
+        return original_probe(self, *args, **kwargs)
+
+    monkeypatch.setattr(RestoreService, "_probe_cache_entry", counting_probe)
+    archive_opens = rig.backend.open_calls
+
+    frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+
+    assert frames == []
+    assert isinstance(exc, _Abort)
+    assert (exc.code, exc.details) == (
+        grpc.StatusCode.ALREADY_EXISTS,
+        "restore item has a live open",
+    )
+    assert probes == []
+    assert rig.backend.open_calls == archive_opens
+    _delivered, refused = _attempt_rows(rig, item_id)
+    assert (refused.end_kind, refused.cause) == ("error", "lease_live")
+    assert refused.blocked_until == lease[1]
+    assert (refused.probe_source, refused.probe_candidates_tried, refused.probe_ended_at) == (
+        None,
+        None,
+        None,
+    )
+
+
+def test_k4_a_corrupt_cache_entry_goes_through_the_funnel_once_and_falls_back_to_disk(
+    rig: _Rig,
+) -> None:
+    payload = _pl("k4-corrupt-disk")
+    item_id = _seed_item(rig, "k4-corrupt-disk", payload, receiver="receiver")
+    cache_path = _seed_cache_entry(rig, item_id, payload)
+    cache_path.write_bytes(b"corrupt cache bytes")
+    events: list[RestoreEvent] = []
+    breaker = DiskCircuitBreaker(failure_threshold=1, window_seconds=60)
+    service = _funnel_service(rig, events, breaker=breaker)
+    archive_opens = rig.backend.open_calls
+    try:
+        frames = list(
+            service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+        )
+    finally:
+        service.stop()
+
+    assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+    assert rig.backend.open_calls > archive_opens
+    assert [event.code for event in events] == ["cache-fallback:read-failed"]
+    assert not breaker.is_open("d-cache")  # a content mismatch is not a breaker failure
+    assert not cache_path.exists()
+    with session_scope(rig.engine) as session:
+        entry = session.get(CacheEntry, hashlib.sha256(payload).digest())
+        assert entry is not None
+        assert entry.state == "lost"
+        disk = session.get(CacheDisk, "d-cache")
+        assert disk is not None
+        assert disk.state == "active"
+    (row,) = _attempt_rows(rig, item_id)
+    assert (row.end_kind, row.cause) == ("job_end", None)
+    # K8: the cache entry read counts one, the disk copy one; the open streams from disk.
+    assert (row.probe_source, row.probe_candidates_tried) == ("disk", 2)
+    assert row.probe_ended_at is not None
+
+
+def test_k4_a_corrupt_cache_entry_on_a_tape_only_item_ends_tape_only_with_the_entry_lost(
+    rig: _Rig,
+) -> None:
+    payload = _pl("k4-corrupt-tape")
+    item_id = _seed_item(rig, "k4-corrupt-tape", payload, receiver="receiver")
+    cache_path = _seed_cache_entry(rig, item_id, payload)
+    cache_path.write_bytes(b"corrupt cache bytes")
+    _make_tape_only(rig, "k4-corrupt-tape")
+    events: list[RestoreEvent] = []
+    service = _funnel_service(rig, events)
+    try:
+        frames, exc, _ = _open_collect(service, item_id, rig.context("receiver"))
+    finally:
+        service.stop()
+
+    assert frames == []
+    assert isinstance(exc, _Abort)
+    assert exc.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert "RM3" in exc.details
+    assert [event.code for event in events] == ["cache-fallback:read-failed"]
+    # Committed with the funnel: the file is gone and the row is lost, so the
+    # fresh read gives tape_only (terminal), not cache_disk_unavailable.
+    assert not cache_path.exists()
+    with session_scope(rig.engine) as session:
+        entry = session.get(CacheEntry, hashlib.sha256(payload).digest())
+        assert entry is not None
+        assert entry.state == "lost"
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        assert item.state == "failed"
+        assert item.detail == _TAPE_ONLY_SENTENCE
+    (row,) = _attempt_rows(rig, item_id)
+    assert (row.end_kind, row.cause) == ("error", "tape_only")
+    assert (row.probe_source, row.probe_candidates_tried) == (None, 1)
+    assert row.probe_ended_at is not None
+
+
+def test_k4_a_cache_read_deadline_counts_one_breaker_failure_and_leaves_the_entry_present(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = _pl("k4-deadline")
+    item_id = _seed_item(rig, "k4-deadline", payload, receiver="receiver")
+    cache_path = _seed_cache_entry(rig, item_id, payload)
+
+    def timing_out(*_args: Any, **_kwargs: Any) -> Any:
+        raise StoreReadTimeout("cache read deadline exceeded")
+
+    monkeypatch.setattr("sutradhara.hdcache.manager.read_entry_verified", timing_out)
+    events: list[RestoreEvent] = []
+    # One failure trips this breaker: the trip is the proof the failure was recorded.
+    breaker = DiskCircuitBreaker(failure_threshold=1, window_seconds=60)
+    service = _funnel_service(rig, events, breaker=breaker)
+    try:
+        frames = list(
+            service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+        )
+    finally:
+        service.stop()
+        _set_cache_disk_state(rig, "active")
+
+    assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+    assert [event.code for event in events] == ["cache-fallback:read-deadline", "disk-circuit-open"]
+    assert breaker.is_open("d-cache")
+    assert cache_path.exists()
+    with session_scope(rig.engine) as session:
+        entry = session.get(CacheEntry, hashlib.sha256(payload).digest())
+        assert entry is not None
+        assert entry.state == "present"
+    (row,) = _attempt_rows(rig, item_id)
+    assert (row.end_kind, row.cause) == ("job_end", None)
+    assert (row.probe_source, row.probe_candidates_tried) == ("disk", 2)
+
+
+def test_k8_probe_evidence_records_the_source_and_the_candidates_read(rig: _Rig) -> None:
+    # A cache pass: cache, 1.
+    payload = _pl("k8-cache")
+    cache_id = _seed_item(rig, "k8-cache", payload, receiver="receiver")
+    _seed_cache_entry(rig, cache_id, payload)
+    _deliver(rig, cache_id)
+    (row,) = _attempt_rows(rig, cache_id)
+    assert (row.probe_source, row.probe_candidates_tried) == ("cache", 1)
+    assert row.probe_ended_at is not None
+
+    # A plain disk pass: disk, 1.
+    disk_id = _seed_item(rig, "k8-disk", _pl("k8-disk"), receiver="receiver")
+    _deliver(rig, disk_id)
+    (row,) = _attempt_rows(rig, disk_id)
+    assert (row.probe_source, row.probe_candidates_tried) == ("disk", 1)
+
+    # Every disk candidate failing after a corrupt cache entry: null, 2, source_integrity.
+    payload = _pl("k8-all-fail")
+    failing_id = _seed_item(rig, "k8-all-fail", payload, receiver="receiver")
+    cache_path = _seed_cache_entry(rig, failing_id, payload)
+    cache_path.write_bytes(b"corrupt cache bytes")
+    _corrupt_archive(rig, "k8-all-fail")
+    frames, exc, _ = _open_collect(rig.service, failing_id, rig.context("receiver"))
+    assert frames == []
+    assert isinstance(exc, _Abort)
+    (row,) = _attempt_rows(rig, failing_id)
+    assert (row.end_kind, row.cause) == ("error", "source_integrity")
+    assert (row.probe_source, row.probe_candidates_tried) == (None, 2)
+    assert row.probe_ended_at is not None
+
+    # The revealed replay runs no probe.
+    replay_id = _seed_item(rig, "k8-replay", _pl("k8-replay"), receiver="receiver")
+    head = _deliver(rig, replay_id)
+    rig.service.CommitRestore(
+        _commit_request(replay_id, head.manifest_sha256, head.lease_token, 1, revealed=True),
+        rig.context("receiver"),
+    )
+    frames, exc, _ = _open_collect(
+        rig.service, replay_id, rig.context("receiver"), lease_token=head.lease_token
+    )
+    assert exc is None
+    _delivered, replay = _attempt_rows(rig, replay_id)
+    assert (replay.probe_source, replay.probe_candidates_tried, replay.probe_ended_at) == (
+        None,
+        None,
+        None,
+    )

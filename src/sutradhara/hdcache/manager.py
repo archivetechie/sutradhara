@@ -834,20 +834,7 @@ def serve_restore_item(
             _finish_item_progress(item, result.size_bytes, source="cache")
             return ServeResult(item.id, "cache", plan.destination, result.size_bytes)
         except CacheServeFailed as exc:
-            _emit(
-                final_config,
-                RestoreEvent(
-                    code=f"cache-fallback:{exc.reason}",
-                    severity="warning",
-                    content_sha256=item.content_sha256.hex(),
-                    artifactclass=item.artifactclass,
-                    detail=_sanitize_detail(exc.detail),
-                    request_id=item.request_id,
-                    item_id=item.id,
-                    destination_id=item.request.destination_id,
-                ),
-            )
-            breaker_open = _record_cache_failure(
+            record_cache_serve_failure(
                 session,
                 plan.cache_entry,
                 exc,
@@ -858,18 +845,6 @@ def serve_restore_item(
                 item_id=item.id,
                 destination_id=item.request.destination_id,
             )
-            if exc.mark_lost and plan.cache_entry is not None:
-                _try_mark_entry_lost_for_cache_fallback(
-                    session,
-                    plan.cache_entry,
-                    final_config,
-                    content_sha256=item.content_sha256,
-                    artifactclass=item.artifactclass,
-                    request_id=item.request_id,
-                    item_id=item.id,
-                    destination_id=item.request.destination_id,
-                    breaker_already_open=breaker_open,
-                )
             _set_item_state(item, ITEM_FELL_BACK_TO_TAPE, "tape mount pending")
             item.source = "tape"
             item.bytes_restored = 0
@@ -987,17 +962,7 @@ def restore_to_path(
             )
             return ServeResult(None, "cache", plan.destination, cache_result.size_bytes)
         except CacheServeFailed as exc:
-            _emit(
-                final_config,
-                RestoreEvent(
-                    code=f"cache-fallback:{exc.reason}",
-                    severity="warning",
-                    content_sha256=asset_hash.hex(),
-                    artifactclass=artifactclass,
-                    detail=_sanitize_detail(exc.detail),
-                ),
-            )
-            breaker_open = _record_cache_failure(
+            record_cache_serve_failure(
                 session,
                 plan.cache_entry,
                 exc,
@@ -1005,15 +970,6 @@ def restore_to_path(
                 content_sha256=asset_hash,
                 artifactclass=artifactclass,
             )
-            if exc.mark_lost and plan.cache_entry is not None:
-                _try_mark_entry_lost_for_cache_fallback(
-                    session,
-                    plan.cache_entry,
-                    final_config,
-                    content_sha256=asset_hash,
-                    artifactclass=artifactclass,
-                    breaker_already_open=breaker_open,
-                )
     tape_result = _serve_from_tape(
         session,
         asset_hash,
@@ -1601,6 +1557,64 @@ def _record_cache_failure(
             ),
         )
     return breaker_open
+
+
+def record_cache_serve_failure(
+    session: Session,
+    entry: CacheEntry | None,
+    exc: CacheServeFailed,
+    config: RestoreConfig,
+    *,
+    content_sha256: bytes,
+    artifactclass: str,
+    request_id: str | None = None,
+    item_id: int | None = None,
+    destination_id: str | None = None,
+) -> None:
+    """The cache failure funnel (design RSR, D3 "Cache probe"), shared by every reader.
+
+    In order: the ``cache-fallback:<reason>`` event, the breaker's failure
+    record (a content mismatch does not count), and, when the failure says
+    so, the lost mark that deletes the file. It only flushes: the caller's
+    session owns the commit, and ``config`` must be bound to that session.
+    """
+
+    _emit(
+        config,
+        RestoreEvent(
+            code=f"cache-fallback:{exc.reason}",
+            severity="warning",
+            content_sha256=content_sha256.hex(),
+            artifactclass=artifactclass,
+            detail=_sanitize_detail(exc.detail),
+            request_id=request_id,
+            item_id=item_id,
+            destination_id=destination_id,
+        ),
+    )
+    breaker_open = _record_cache_failure(
+        session,
+        entry,
+        exc,
+        config,
+        content_sha256=content_sha256,
+        artifactclass=artifactclass,
+        request_id=request_id,
+        item_id=item_id,
+        destination_id=destination_id,
+    )
+    if exc.mark_lost and entry is not None:
+        _try_mark_entry_lost_for_cache_fallback(
+            session,
+            entry,
+            config,
+            content_sha256=content_sha256,
+            artifactclass=artifactclass,
+            request_id=request_id,
+            item_id=item_id,
+            destination_id=destination_id,
+            breaker_already_open=breaker_open,
+        )
 
 
 def _admission_inputs_for_item(item: RestoreRequestItem) -> RestoreAdmissionInputs:

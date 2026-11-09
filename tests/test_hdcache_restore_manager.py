@@ -2227,3 +2227,68 @@ def _request_item(
 
 def _reader_thread_count(disk_id: str) -> int:
     return sum(1 for thread in threading.enumerate() if thread.name == f"hdcache-reader-{disk_id}")
+
+
+def test_both_server_local_sites_call_the_shared_cache_failure_funnel_with_their_identifiers(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RSR-1c K5: ``serve_restore_item`` and ``restore_to_path`` share
+    ``record_cache_serve_failure``; the request-bound site passes its ids."""
+
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    calls: list[tuple[str, dict[str, object]]] = []
+    original = restore_manager.record_cache_serve_failure
+
+    def spy(session, entry, exc, config, **identifiers):
+        calls.append((exc.reason, identifiers))
+        return original(session, entry, exc, config, **identifiers)
+
+    monkeypatch.setattr(restore_manager, "record_cache_serve_failure", spy)
+
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=b"tape truth")
+        _seed_cache_entry(session, tmp_path / "d001", digest, b"tape truth")
+        path = entry_path(tmp_path / "d001", digest, representation=RAW_REPRESENTATION)
+        path.write_bytes(b"corrupt")
+        request, item = _request_item(session, digest, root)
+
+        result = serve_restore_item(
+            session,
+            item,
+            identity_or_override=_identity("sutradhara-ingest"),
+            config=_config(root, restore_backends={backend_id: memory}),
+        )
+        assert result.source == "tape"
+        assert session.get(CacheEntry, digest).state == "lost"
+
+        # The request-less site: a fresh corrupt entry for the same asset.
+        _seed_cache_entry(session, tmp_path / "d001", digest, b"tape truth")
+        path.write_bytes(b"corrupt")
+        restored = restore_to_path(
+            session,
+            asset_hash=digest,
+            artifactclass="s-masters",
+            destination=tmp_path / "cli.bin",
+            identity_or_override=_identity("sutradhara-ingest"),
+            backends={backend_id: memory},
+            config=_config(root),
+        )
+        assert restored.source == "tape"
+        assert (tmp_path / "cli.bin").read_bytes() == b"tape truth"
+
+        assert calls == [
+            (
+                "read-failed",
+                {
+                    "content_sha256": digest,
+                    "artifactclass": "s-masters",
+                    "request_id": request.id,
+                    "item_id": item.id,
+                    "destination_id": "media-server",
+                },
+            ),
+            ("read-failed", {"content_sha256": digest, "artifactclass": "s-masters"}),
+        ]

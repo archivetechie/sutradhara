@@ -55,7 +55,6 @@ from sutradhara.hdcache.manager import (
     ITEM_QUEUED,
     ITEM_SENT,
     ITEM_STREAMING,
-    REQUEST_ACTIVE,
     CacheServeFailed,
     InvalidRestoreDestination,
     RestoreConfig,
@@ -65,6 +64,7 @@ from sutradhara.hdcache.manager import (
     bind_restore_event_sink_to_engine,
     bind_restore_event_sink_to_session,
     open_cache_plaintext_chunks,
+    record_cache_serve_failure,
     rederive_request_state,
     restore_backends_for_artifactclass,
     restore_config_from_env,
@@ -189,6 +189,11 @@ class _Outcome:
     bytes_sent: int = 0
     slot_taken: bool = False
     fenced: bool = False
+    # The probe's evidence (D2): the source the open streams from, the sources
+    # read, and the reason the cache entry failed (no end: the open goes on).
+    probe_source: str | None = None
+    probe_candidates: int = 0
+    probe_failure: str | None = None
 
     @property
     def decided(self) -> bool:
@@ -262,7 +267,10 @@ class _PreparedOpen:
     member: PlannedMember | None
     cache_entry_hash: bytes | None
     source: str
+    # The planned index: ``min(claim, stored)`` for an unrevealed checkpoint (D10).
     committed_index: int
+    # The receiver's claim: the resume token's ``committed_index``, or 0 (D10).
+    claim: int
     revealed: bool
     expected_generation: int | None
     # The call's outcome cell (mutable; this record stays frozen), so ``_stream``
@@ -451,7 +459,6 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 cell.set("job_end", None)
                 return
             entry.lease = self._acquire_lease(prepared, context, entry)
-            self._mark_streaming(prepared)
             try:
                 emitted = yield from self._stream(prepared, entry.lease, context)
             except (BackendError, StagingError, OSError) as exc:
@@ -1020,6 +1027,9 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                         cause="protocol",
                     )
 
+            # The receiver's claim (D10): what it says it holds durably.
+            claim = request.resume_token.committed_index if request.HasField("resume_token") else 0
+
             session.commit()
             if checkpoint.revealed:
                 return _PreparedOpen(
@@ -1033,11 +1043,28 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     cache_entry_hash=None,
                     source=item.source or "cache",
                     committed_index=checkpoint.committed_index,
+                    claim=claim,
                     revealed=True,
                     expected_generation=expected_generation,
                     outcome=cell,
                 )
-            if checkpoint.committed_index > manifest.index:
+            if not request.HasField("lease_token"):
+                # D3 "Before the probe": a token-less open against a live lease
+                # is refused now, read only, instead of after the probe (`:698`).
+                current = self._lease_row(session, item.id)
+                if current is not None and current[1] > dt.datetime.now(dt.UTC):
+                    _refuse(
+                        context,
+                        cell,
+                        grpc.StatusCode.ALREADY_EXISTS,
+                        "restore item has a live open",
+                        cause="lease_live",
+                        blocked_until=current[1],
+                    )
+            # The plan starts from the lower of the claim and the stored value;
+            # a claim above the stored value is never adopted (D10).
+            planned = min(claim, checkpoint.committed_index)
+            if planned > manifest.index:
                 return _PreparedOpen(
                     item_id=item.id,
                     device_id=identity.device_id,
@@ -1048,7 +1075,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     member=None,
                     cache_entry_hash=None,
                     source=item.source or "cache",
-                    committed_index=checkpoint.committed_index,
+                    committed_index=planned,
+                    claim=claim,
                     revealed=False,
                     expected_generation=expected_generation,
                     outcome=cell,
@@ -1062,8 +1090,12 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             # A recovered cache disk is a fact about the disk; commit it (and its
             # alarm) now. Nothing else is pending here (the commit above).
             session.commit()
-            if cache_entry is not None and self._probe_cache_entry(session, cache_entry, item):
+            if cache_entry is not None and self._probe_cache_entry(
+                session, cache_entry, item, cell
+            ):
                 cache_entry_hash = cache_entry.content_sha256
+                cell.probe_source = "cache"
+                self._record_probe_evidence(entry)
             else:
                 backends = self.config.backend_resolver(session, item.artifactclass)
                 plan = build_restore_plan(
@@ -1074,40 +1106,57 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     extractor=self.config.extractor_factory(),
                 )
                 try:
-                    member = _select_verified_disk_member(plan, manifest)
-                    session.commit()
-                except TapeSourceDeferred as exc:
-                    plan.close()
-                    # A fresh Core read, not session.get: a present cache entry
-                    # means the cache disk, not the item, is the fault (B3).
-                    entry_state = session.execute(
-                        select(CacheEntry.state).where(
-                            CacheEntry.content_sha256 == item.content_sha256
+                    try:
+                        member = _select_verified_disk_member(plan, manifest, cell)
+                        cell.probe_source = "disk"
+                        session.commit()  # the SUSPECT marks, before the evidence
+                        self._record_probe_evidence(entry)
+                    except TapeSourceDeferred as exc:
+                        plan.close()
+                        # A fresh Core read, not session.get: a present cache entry
+                        # means the cache disk, not the item, is the fault (B3).
+                        entry_state = session.execute(
+                            select(CacheEntry.state).where(
+                                CacheEntry.content_sha256 == item.content_sha256
+                            )
+                        ).scalar()
+                        cause = (
+                            "cache_disk_unavailable" if entry_state == "present" else "tape_only"
                         )
-                    ).scalar()
-                    cause = "cache_disk_unavailable" if entry_state == "present" else "tape_only"
-                    _refuse(
-                        context, cell, grpc.StatusCode.FAILED_PRECONDITION, str(exc), cause=cause
-                    )
-                except RestoreIntegrityError as exc:
-                    session.commit()
+                        self._record_probe_evidence(entry)
+                        _refuse(
+                            context,
+                            cell,
+                            grpc.StatusCode.FAILED_PRECONDITION,
+                            str(exc),
+                            cause=cause,
+                        )
+                    except RestoreIntegrityError as exc:
+                        session.commit()  # the SUSPECT marks, before the evidence
+                        self._record_probe_evidence(entry)
+                        plan.close()
+                        _refuse(
+                            context,
+                            cell,
+                            grpc.StatusCode.FAILED_PRECONDITION,
+                            str(exc),
+                            cause="source_integrity",
+                        )
+                    except RestoreSourceUnavailable as exc:
+                        plan.close()
+                        self._record_probe_evidence(entry)
+                        _refuse(
+                            context,
+                            cell,
+                            grpc.StatusCode.FAILED_PRECONDITION,
+                            str(exc),
+                            cause="source_unavailable",
+                        )
+                except BaseException:
+                    # C5: nothing raised after the plan was built may leak it
+                    # (``close`` is idempotent, so the refusals above stay right).
                     plan.close()
-                    _refuse(
-                        context,
-                        cell,
-                        grpc.StatusCode.FAILED_PRECONDITION,
-                        str(exc),
-                        cause="source_integrity",
-                    )
-                except RestoreSourceUnavailable as exc:
-                    plan.close()
-                    _refuse(
-                        context,
-                        cell,
-                        grpc.StatusCode.FAILED_PRECONDITION,
-                        str(exc),
-                        cause="source_unavailable",
-                    )
+                    raise
             return _PreparedOpen(
                 item_id=item.id,
                 device_id=identity.device_id,
@@ -1118,19 +1167,51 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 member=member,
                 cache_entry_hash=cache_entry_hash,
                 source=source,
-                committed_index=checkpoint.committed_index,
+                committed_index=planned,
+                claim=claim,
                 revealed=False,
                 expected_generation=expected_generation,
                 outcome=cell,
             )
 
+    def _record_probe_evidence(self, entry: _AttemptEntry) -> None:
+        """C5: the probe's three columns, a short transaction of their own, on the open attempt.
+
+        Callers commit ``_prepare_open``'s own session first: on SQLite a
+        pending write there would hold this transaction for the busy timeout.
+        """
+
+        cell = entry.outcome
+        with self._factory.begin() as session:
+            session.connection().execute(
+                update(RestoreItemAttempt)
+                .where(
+                    RestoreItemAttempt.id == entry.attempt_id,
+                    RestoreItemAttempt.ended_at.is_(None),
+                    RestoreItemAttempt.closed_at.is_(None),
+                )
+                .values(
+                    probe_source=cell.probe_source,
+                    probe_candidates_tried=cell.probe_candidates,
+                    probe_ended_at=func.now(),
+                )
+            )
+
     def _probe_cache_entry(
-        self, session: Session, entry: CacheEntry, item: RestoreRequestItem
+        self, session: Session, entry: CacheEntry, item: RestoreRequestItem, cell: _Outcome
     ) -> bool:
-        """Verify a cache hit to EOF before any restore frame can be emitted."""
+        """Verify a cache hit to EOF before any restore frame can be emitted.
+
+        A failure goes through the cache failure funnel with this session's
+        bound config and is committed at once (the funnel deletes the file and
+        only flushes its rows; the refusals after this close the session
+        without a commit). The cell keeps the reason; the open goes on.
+        """
 
         if item.size_bytes is None:
             raise RuntimeError("cache probe requires a restore item size")
+        cache = bind_restore_event_sink_to_session(self._cache, session)
+        cell.probe_candidates += 1
         try:
             with open_cache_plaintext_chunks(
                 session,
@@ -1138,10 +1219,28 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 expected_content_sha256=item.content_sha256,
                 expected_size_bytes=item.size_bytes,
                 artifactclass=item.artifactclass,
-                config=bind_restore_event_sink_to_session(self._cache, session),
+                config=cache,
             ) as chunks:
                 _drain_chunks(chunks)
-        except CacheServeFailed:
+        except CacheServeFailed as exc:
+            record_cache_serve_failure(
+                session,
+                entry,
+                exc,
+                cache,
+                content_sha256=item.content_sha256,
+                artifactclass=item.artifactclass,
+                request_id=item.request_id,
+                item_id=item.id,
+                destination_id=None if item.request is None else item.request.destination_id,
+            )
+            session.commit()
+            cell.probe_failure = exc.reason
+            LOG.warning(
+                "restore item %s: cache probe failed (%s); falling back to the archive",
+                item.id,
+                exc.reason,
+            )
             return False
         return True
 
@@ -1259,25 +1358,26 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     cell.set("error", "lease_live", detail, blocked_until=current[1])
                 _abort(context, grpc.StatusCode.FAILED_PRECONDITION, detail)
             else:
-                session.add(
-                    RestoreOpenSession(
-                        restore_request_item_id=prepared.item_id,
-                        receiver_device_id=prepared.device_id,
-                        manifest_sha256=prepared.manifest_sha256,
-                        generation=1,
-                        expires_at=expires,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
                 try:
-                    session.flush()
+                    # The insert inside a savepoint: on PostgreSQL the
+                    # transaction survives the IntegrityError, so the live
+                    # lease's expiry is read in this same transaction (C3).
+                    with session.begin_nested():
+                        session.add(
+                            RestoreOpenSession(
+                                restore_request_item_id=prepared.item_id,
+                                receiver_device_id=prepared.device_id,
+                                manifest_sha256=prepared.manifest_sha256,
+                                generation=1,
+                                expires_at=expires,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                        )
+                        session.flush()
                 except IntegrityError:
                     # `:698`: a live lease with no supplied generation (P51).
-                    # The failed insert left this session unusable; read the
-                    # expiry in a fresh one.
-                    with self._factory() as fresh:
-                        current = self._lease_row(fresh, prepared.item_id)
+                    current = self._lease_row(session, prepared.item_id)
                     cell.set(
                         "error",
                         "lease_live",
@@ -1305,6 +1405,35 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             if fenced.rowcount != 1:
                 cell.fenced = True
                 _abort(context, grpc.StatusCode.UNAVAILABLE, _CLOSED_BY_RECOVERY)
+            # D10: the stored checkpoint never claims more than the receiver
+            # holds. Only an open that won the lease gets here; a revealed
+            # checkpoint is never lowered; lowering only ever re-sends bytes.
+            session.connection().execute(
+                update(RestoreItemCheckpoint)
+                .where(
+                    RestoreItemCheckpoint.restore_request_item_id == prepared.item_id,
+                    RestoreItemCheckpoint.committed_index > prepared.claim,
+                    RestoreItemCheckpoint.revealed.is_(False),
+                )
+                .values(committed_index=prepared.claim, updated_at=now)
+            )
+            # The item's move to ``streaming``, conditioned on it still being
+            # openable; the request state is re-derived, never set (D6).
+            moved = session.connection().execute(
+                update(RestoreRequestItem)
+                .where(
+                    RestoreRequestItem.id == prepared.item_id,
+                    RestoreRequestItem.state.in_([ITEM_QUEUED, ITEM_SENT, ITEM_STREAMING]),
+                )
+                .values(state=ITEM_STREAMING, detail=None, bytes_restored=0, updated_at=now)
+            )
+            if moved.rowcount != 1:
+                # The whole transaction rolls back: the lease, the fence's
+                # generation and the lowering are as before the call.
+                detail = "leased restore item ceased to be streamable"
+                cell.set("error", "item_withdrawn", detail)
+                raise RuntimeError(detail)
+            rederive_request_state(session, entry.request_id)
         return _Lease(
             item_id=prepared.item_id,
             device_id=prepared.device_id,
@@ -1424,20 +1553,6 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             raise RestoreSourceUnavailable("prepared restore source is incomplete")
         with prepared.plan.open_member_stream(prepared.member) as chunks:
             yield chunks
-
-    def _mark_streaming(self, prepared: _PreparedOpen) -> None:
-        with self._factory.begin() as session:
-            item = session.get(RestoreRequestItem, prepared.item_id)
-            if item is None or item.state not in {ITEM_QUEUED, ITEM_SENT, ITEM_STREAMING}:
-                detail = "leased restore item ceased to be streamable"
-                prepared.outcome.set("error", "item_withdrawn", detail)
-                raise RuntimeError(detail)
-            item.state = ITEM_STREAMING
-            item.detail = None
-            item.bytes_restored = 0
-            item.updated_at = dt.datetime.now(dt.UTC)
-            if item.request is not None:
-                item.request.state = REQUEST_ACTIVE
 
     # ---- the end (design RSR, D6; order RSR-1b B5) -----------------------------------
 
@@ -1654,8 +1769,14 @@ class TapeSourceDeferred(RestoreSourceUnavailable):
     """The frozen item has only tape-backed sources, deferred until RM3."""
 
 
-def _select_verified_disk_member(plan: RestorePlan, manifest: _ManifestFile) -> PlannedMember:
-    """Probe ordered archive candidates, persisting restore_asset's SUSPECT rule."""
+def _select_verified_disk_member(
+    plan: RestorePlan, manifest: _ManifestFile, cell: _Outcome
+) -> PlannedMember:
+    """Probe ordered archive candidates, persisting restore_asset's SUSPECT rule.
+
+    Every disk candidate opened counts one on the cell (C5); tape and
+    non-matching members are skipped unread.
+    """
 
     errors: list[str] = []
     saw_tape = False
@@ -1669,6 +1790,7 @@ def _select_verified_disk_member(plan: RestorePlan, manifest: _ManifestFile) -> 
             saw_tape = True
             continue
         saw_disk = True
+        cell.probe_candidates += 1
         try:
             with plan.open_member_stream(member) as chunks:
                 _drain_chunks(chunks)
