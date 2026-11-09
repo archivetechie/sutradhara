@@ -2097,6 +2097,29 @@ def _update_request_state(request: RestoreRequest) -> None:
     request.state = REQUEST_COMPLETED_WITH_ERRORS
 
 
+def rederive_request_state(session: Session, request_id: str) -> None:
+    """Re-derive one request's state from its items, under the request row's lock.
+
+    Design RSR, D6 step 4: every agent-path derivation goes through here so two
+    derivations for sibling items cannot leave the request ``active`` with every
+    item terminal. The row is locked with ``FOR UPDATE`` (a no-op on SQLite,
+    where the caller's write lock is already held); the request and its items
+    are reloaded from the database (``populate_existing``) so Core writes made
+    earlier in the same transaction are seen; then ``_update_request_state``
+    sets the state, which the session flushes with the rest of the transaction.
+    """
+
+    request = session.scalars(
+        select(RestoreRequest)
+        .where(RestoreRequest.id == request_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).one_or_none()
+    if request is None:
+        return
+    _update_request_state(request)
+
+
 def _set_item_state(item: RestoreRequestItem, state: str, detail: str | None) -> None:
     item.state = state
     item.detail = detail

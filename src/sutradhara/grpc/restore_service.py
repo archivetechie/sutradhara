@@ -1,9 +1,11 @@
 """Authorized restore-agent streaming over the catalog-backed RestorePlan.
 
 Each OpenRestore owns its backend instances and mutable ``RestorePlan``. SQL
-transactions are kept outside the data loop: one validates and leases the open,
-one records ``sent``, and a final conditional transaction releases the lease.
-The agent path never resolves or writes an archive-server destination path.
+transactions are kept outside the data loop: admission writes the attempt row
+(design RSR, D2), one transaction validates and leases the open, and one end
+transaction (``_end_attempt``, D6) records what happened, releases the lease
+or records ``sent``, and applies the retry policy's give-up. The agent path
+never resolves or writes an archive-server destination path.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from pathlib import PurePosixPath
 from typing import Any, NoReturn
 
 import grpc
-from sqlalchemy import Engine, and_, func, select, update
+from sqlalchemy import Engine, and_, case, exists, func, insert, literal, null, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -49,6 +51,7 @@ from sutradhara.grpc import store as grpc_store
 from sutradhara.hdcache.fill import effective_privacy_level
 from sutradhara.hdcache.manager import (
     ITEM_DONE,
+    ITEM_FAILED,
     ITEM_QUEUED,
     ITEM_SENT,
     ITEM_STREAMING,
@@ -62,18 +65,32 @@ from sutradhara.hdcache.manager import (
     bind_restore_event_sink_to_engine,
     bind_restore_event_sink_to_session,
     open_cache_plaintext_chunks,
+    rederive_request_state,
     restore_backends_for_artifactclass,
     restore_config_from_env,
     validate_restore_relative_path,
 )
 from sutradhara.hdcache.models import (
     CacheEntry,
+    RestoreItemAttempt,
     RestoreItemCheckpoint,
+    RestoreItemGiveup,
     RestoreOpenSession,
     RestoreRequestItem,
     RestoreServerInstance,
 )
-from sutradhara.hdcache.restore_retry import RetryPolicy, retry_policy_from_env
+from sutradhara.hdcache.restore_retry import (
+    OFFER_AT,
+    OFFER_GIVE_UP,
+    OFFER_OPEN,
+    RetryPolicy,
+    attempt_summaries,
+    bound_message,
+    classify,
+    compose_detail,
+    plan_next_offer,
+    retry_policy_from_env,
+)
 from sutradhara.jobs.attempts import default_code_version
 from sutradhara.restore import RestoreIntegrityError as ChunkRestoreIntegrityError
 from sutradhara.staging import StagingError
@@ -89,6 +106,14 @@ _SYNTHETIC_UID = 0
 _SYNTHETIC_GID = 0
 _SYNTHETIC_MTIME = 0
 _NOT_STARTED = "restore service is not started"
+# Design RSR, D5's re-check at admission (B2): refusals before any row is written.
+_OPEN_IN_PROGRESS = "another open of this item is in progress"
+_WAITING_BEFORE_RETRY = "restore item is waiting before its next try"
+_WILL_NOT_RETRY = "restore item will not be retried"
+_CLOSED_BY_RECOVERY = "restore attempt was closed by recovery"
+_DELIVERY_NOT_RECORDED = "the delivery was not recorded"
+END_ENDED = "ended"
+END_ALREADY_CLOSED = "already_closed"
 
 LOG = logging.getLogger(__name__)
 
@@ -146,6 +171,84 @@ class _ManifestFile:
     mtime: int = _SYNTHETIC_MTIME
 
 
+@dataclass
+class _Outcome:
+    """The per-call outcome cell (design RSR, D3).
+
+    Set at the site that raises or catches, before any ``_abort`` or ``yield``;
+    the end transaction writes it. Nothing classifies by exception type:
+    production ``abort`` raises a bare ``Exception()`` and the test fake raises
+    its own class (P16). ``fenced`` marks the one end with no write: recovery
+    closed the attempt before the lease was granted.
+    """
+
+    end_kind: str | None = None
+    cause: str | None = None
+    message: str | None = None
+    blocked_until: dt.datetime | None = None
+    bytes_sent: int = 0
+    slot_taken: bool = False
+    fenced: bool = False
+
+    @property
+    def decided(self) -> bool:
+        return self.end_kind is not None or self.fenced
+
+    def set(
+        self,
+        end_kind: str,
+        cause: str | None,
+        message: str | None = None,
+        *,
+        blocked_until: dt.datetime | None = None,
+    ) -> None:
+        self.end_kind = end_kind
+        self.cause = cause
+        self.message = message
+        self.blocked_until = blocked_until
+
+
+@dataclass
+class _AttemptEntry:
+    """What the process remembers of one admitted attempt (``RestoreService._registry``).
+
+    Removed when its end is written or found already closed; kept, marked
+    ``ended`` with the cell's outcome and class, when the end write raised, so
+    recovery (design RSR, D7) can retry the end with that outcome.
+    """
+
+    attempt_id: int
+    item_id: int
+    request_id: str
+    opened_from_state: str
+    outcome: _Outcome
+    lease: _Lease | None = None
+    source: str | None = None
+    cache_entry_hash: bytes | None = None
+    ended: bool = False
+    klass: str | None = None
+
+
+@dataclass(frozen=True)
+class _Admission:
+    """An admitted open: its registry entry and whether it is the revealed replay."""
+
+    entry: _AttemptEntry
+    revealed: bool
+
+
+@dataclass(frozen=True)
+class _EndResult:
+    """``_end_attempt``'s answer: ``ended`` or ``already_closed``, and whether ``sent`` was recorded."""
+
+    status: str
+    sent: bool = False
+
+
+class _AlreadyClosed(Exception):
+    """The end update matched no row: recovery or the fence closed the attempt first."""
+
+
 @dataclass(frozen=True)
 class _PreparedOpen:
     """Detached stream inputs built during the short authorization transaction."""
@@ -163,6 +266,9 @@ class _PreparedOpen:
     committed_index: int
     revealed: bool
     expected_generation: int | None
+    # The call's outcome cell (mutable; this record stays frozen), so ``_stream``
+    # keeps its signature for the subclasses that wrap it.
+    outcome: _Outcome
 
 
 @dataclass(frozen=True)
@@ -188,6 +294,11 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         )
         self._slots = threading.BoundedSemaphore(config.max_concurrent_streams)
         self._retry_policy = config.retry_policy or retry_policy_from_env()
+        # The attempts this process admitted (design RSR, D2/D7): attempt id ->
+        # entry. The lock covers the admission insert and the registration;
+        # an end never takes it while it holds the database write lock.
+        self._registry_lock = threading.Lock()
+        self._registry: dict[int, _AttemptEntry] = {}
         # Lifecycle (design RSR, D7): ``start()`` writes the instance row and
         # runs the heartbeat; nothing is served before it.
         self._lifecycle_lock = threading.Lock()
@@ -306,14 +417,29 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         """Authorize, exclusively lease, and frame one archive-backed restore item."""
 
         self._require_started(context)
-        if not self._slots.acquire(blocking=False):
-            _abort(context, grpc.StatusCode.RESOURCE_EXHAUSTED, "restore stream capacity is full")
+        cell = _Outcome()
+        entry: _AttemptEntry | None = None
         prepared: _PreparedOpen | None = None
-        lease: _Lease | None = None
-        completed = False
+        ended_in_body = False
         try:
             identity = self._identity(context)
-            prepared = self._prepare_open(request, identity, context)
+            admission = self._admit(request, identity, context, cell)
+            entry = admission.entry
+            if not admission.revealed:
+                # Capacity is checked after admission so the refusal leaves a
+                # row (design RSR, D2); the revealed replay takes no slot.
+                if not self._slots.acquire(blocking=False):
+                    _refuse(
+                        context,
+                        cell,
+                        grpc.StatusCode.RESOURCE_EXHAUSTED,
+                        "restore stream capacity is full",
+                        cause="capacity",
+                    )
+                cell.slot_taken = True
+            prepared = self._prepare_open(request, identity, context, entry)
+            entry.source = prepared.source
+            entry.cache_entry_hash = prepared.cache_entry_hash
             if prepared.revealed:
                 yield restore_pb2.RestoreFrame(
                     job_end=restore_pb2.JobEnd(
@@ -322,19 +448,81 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                         manifest_sha256=prepared.manifest_sha256,
                     )
                 )
+                # Set only once the generator resumed past its last yield (D3).
+                cell.set("job_end", None)
                 return
-            lease = self._acquire_lease(prepared, context)
+            entry.lease = self._acquire_lease(prepared, context, entry)
             self._mark_streaming(prepared)
-            emitted = yield from self._stream(prepared, lease, context)
+            try:
+                emitted = yield from self._stream(prepared, entry.lease, context)
+            except (BackendError, StagingError, OSError) as exc:
+                cell.set("error", "source_unavailable", str(exc))
+                raise
+            except ChunkRestoreIntegrityError as exc:
+                cell.set("error", "source_integrity", str(exc))
+                raise
             if emitted is not None:
-                completed = self._mark_sent(prepared, lease, emitted)
+                # The generator resumed past job_end: the delivery is ended in
+                # the body, never inside a GeneratorExit close (B4). Step 1 of
+                # the end transaction decides its cause.
+                cell.set("job_end", None)
+                ended_in_body = True
+                sent = False
+                try:
+                    sent = self._end_attempt(entry, deliver=True).sent
+                except Exception:
+                    LOG.exception(
+                        "restore attempt %s: the end write failed after job_end; "
+                        "recovery retries it",
+                        entry.attempt_id,
+                    )
+                if not sent:
+                    _abort(context, grpc.StatusCode.ABORTED, _DELIVERY_NOT_RECORDED)
+        except BaseException as exc:
+            if not cell.decided:
+                # D3 / D-RSRP-7: a closed generator always means the call ended;
+                # otherwise the client's liveness decides.
+                if isinstance(exc, GeneratorExit) or not context.is_active():
+                    cell.set("cancelled", None)
+                else:
+                    cell.set("error", "server_error", str(exc) or type(exc).__name__)
+            raise
         finally:
-            if prepared is not None and prepared.plan is not None:
+            self._finish_open(entry, prepared, cell, ended_in_body=ended_in_body)
+
+    def _finish_open(
+        self,
+        entry: _AttemptEntry | None,
+        prepared: _PreparedOpen | None,
+        cell: _Outcome,
+        *,
+        ended_in_body: bool,
+    ) -> None:
+        """B4: three guarded steps; one failure never skips the others."""
+
+        if entry is not None and not ended_in_body:
+            if cell.fenced:
+                self._forget(entry)
+            else:
+                if not cell.decided:
+                    cell.set("error", "server_error", "the call ended without an outcome")
+                try:
+                    self._end_attempt(entry, deliver=False)
+                except Exception:
+                    LOG.exception(
+                        "restore attempt %s: the end write failed; recovery retries it",
+                        entry.attempt_id,
+                    )
+        if prepared is not None and prepared.plan is not None:
+            try:
                 prepared.plan.close()
-            if lease is not None and not completed and prepared is not None:
-                self._restore_interrupted_state(prepared, lease)
-                self._release_lease(lease)
-            self._slots.release()
+            except Exception:
+                LOG.exception("restore plan close failed for item %s", prepared.item_id)
+        if cell.slot_taken:
+            try:
+                self._slots.release()
+            except Exception:
+                LOG.exception("restore stream slot release failed")
 
     def CommitRestore(self, request: Any, context: Any) -> Any:
         """Durably advance staged progress or terminally reveal one restore item."""
@@ -537,12 +725,21 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             session.expunge(device)
             return device
 
-    def _prepare_open(
+    def _admit(
         self,
         request: Any,
         identity: grpc_store.DeviceIdentity,
         context: Any,
-    ) -> _PreparedOpen:
+        cell: _Outcome,
+    ) -> _Admission:
+        """B2: the refusals that write no row, D5's re-check, then the attempt row.
+
+        A refusal here belongs to the device or the caller, not the item, so no
+        row is written. Then, under ``_registry_lock``, the attempt row is
+        inserted and committed and its entry registered; only after that does
+        the caller take a capacity slot.
+        """
+
         if request.restore_request_item_id <= 0:
             _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "restore item id must be positive")
         self._require_restore_device(identity, context)
@@ -573,6 +770,140 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 and (item.state != ITEM_STREAMING or item.open_session is None)
             ):
                 _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "item is not streamable")
+            # D5's re-check: one open attempt per item; a queued or sent item
+            # still backing off, or given up, is refused without a row. A
+            # streaming item and the revealed replay meet only the first rule.
+            open_attempt = session.scalar(
+                select(RestoreItemAttempt.id)
+                .where(
+                    RestoreItemAttempt.restore_request_item_id == item.id,
+                    RestoreItemAttempt.ended_at.is_(None),
+                    RestoreItemAttempt.closed_at.is_(None),
+                )
+                .limit(1)
+            )
+            if open_attempt is not None:
+                _abort(context, grpc.StatusCode.ALREADY_EXISTS, _OPEN_IN_PROGRESS)
+            if item.state in {ITEM_QUEUED, ITEM_SENT}:
+                summary = attempt_summaries(session, [item.id])[item.id]
+                now = session.scalar(select(func.now()))
+                assert now is not None
+                offer = plan_next_offer(summary, now, self._retry_policy)
+                if offer.kind == OFFER_OPEN:
+                    _abort(context, grpc.StatusCode.ALREADY_EXISTS, _OPEN_IN_PROGRESS)
+                if offer.kind == OFFER_AT:
+                    _abort(context, grpc.StatusCode.FAILED_PRECONDITION, _WAITING_BEFORE_RETRY)
+                if offer.kind == OFFER_GIVE_UP:
+                    _abort(context, grpc.StatusCode.FAILED_PRECONDITION, _WILL_NOT_RETRY)
+            item_id = item.id
+            request_id = item.request_id
+            opened_from_state = item.state
+        entry = self._insert_attempt(
+            context,
+            cell,
+            item_id=item_id,
+            request_id=request_id,
+            device_id=identity.device_id,
+            opened_from_state=opened_from_state,
+        )
+        return _Admission(entry=entry, revealed=revealed_done)
+
+    def _insert_attempt(
+        self,
+        context: Any,
+        cell: _Outcome,
+        *,
+        item_id: int,
+        request_id: str,
+        device_id: str,
+        opened_from_state: str,
+    ) -> _AttemptEntry:
+        """Insert the attempt row (``attempt_no`` = max + 1 in the INSERT … SELECT) and register it."""
+
+        instance_id = self._instance_id
+        if instance_id is None:
+            _abort(context, grpc.StatusCode.UNAVAILABLE, _NOT_STARTED)
+        attempt = RestoreItemAttempt
+        next_row = select(
+            literal(item_id),
+            func.coalesce(func.max(attempt.attempt_no), 0) + 1,
+            literal(device_id),
+            literal(instance_id),
+            literal(opened_from_state),
+            func.now(),
+            literal(default_code_version()),
+        ).where(attempt.restore_request_item_id == item_id)
+        statement = insert(attempt).from_select(
+            [
+                "restore_request_item_id",
+                "attempt_no",
+                "receiver_device_id",
+                "server_instance_id",
+                "opened_from_state",
+                "opened_at",
+                "code_version",
+            ],
+            next_row,
+        )
+        with self._registry_lock:
+            try:
+                with self._factory.begin() as session:
+                    session.connection().execute(statement)
+                    attempt_id = session.scalar(
+                        select(attempt.id)
+                        .where(attempt.restore_request_item_id == item_id)
+                        .order_by(attempt.attempt_no.desc())
+                        .limit(1)
+                    )
+            except IntegrityError:
+                # Either unique index (one open attempt per item; attempt_no)
+                # fired: a concurrent admission won.
+                _abort(context, grpc.StatusCode.ALREADY_EXISTS, _OPEN_IN_PROGRESS)
+            assert attempt_id is not None
+            entry = _AttemptEntry(
+                attempt_id=attempt_id,
+                item_id=item_id,
+                request_id=request_id,
+                opened_from_state=opened_from_state,
+                outcome=cell,
+            )
+            self._registry[attempt_id] = entry
+        return entry
+
+    def _forget(self, entry: _AttemptEntry) -> None:
+        with self._registry_lock:
+            self._registry.pop(entry.attempt_id, None)
+
+    def _keep_ended(self, entry: _AttemptEntry) -> None:
+        """Mark an entry whose end write failed: ended, with the outcome's class (A2)."""
+
+        outcome = entry.outcome
+        with self._registry_lock:
+            entry.ended = True
+            entry.klass = classify(
+                outcome.end_kind, outcome.cause, entry.opened_from_state == ITEM_DONE
+            )
+
+    def _prepare_open(
+        self,
+        request: Any,
+        identity: grpc_store.DeviceIdentity,
+        context: Any,
+        entry: _AttemptEntry,
+    ) -> _PreparedOpen:
+        """Authorize and freeze one admitted open; every refusal sets the cell first (B3)."""
+
+        cell = entry.outcome
+        with self._factory() as session:
+            item = session.scalar(
+                select(RestoreRequestItem)
+                .options(selectinload(RestoreRequestItem.request))
+                .where(RestoreRequestItem.id == entry.item_id)
+            )
+            if item is None or item.request is None:
+                # Admission saw it moments ago; the ledger's RESTRICT key keeps it.
+                _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "restore item is unavailable")
+            restore_request = item.request
             try:
                 authorize_agent_restore_destination(
                     session,
@@ -580,14 +911,32 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     destination_id=restore_request.destination_id,
                 )
             except Exception as exc:
-                _abort(context, grpc.StatusCode.PERMISSION_DENIED, str(exc))
-            self._require_live_capabilities(session, item, identity, context)
+                _refuse(
+                    context,
+                    cell,
+                    grpc.StatusCode.PERMISSION_DENIED,
+                    str(exc),
+                    cause="not_authorized",
+                )
+            self._require_live_capabilities(session, item, identity, context, cell)
             if item.final_rel_path is None or item.size_bytes is None:
-                _abort(context, grpc.StatusCode.FAILED_PRECONDITION, "item manifest is incomplete")
+                _refuse(
+                    context,
+                    cell,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "item manifest is incomplete",
+                    cause="manifest_invalid",
+                )
             try:
                 final_rel_path = validate_restore_relative_path(item.final_rel_path)
             except InvalidRestoreDestination as exc:
-                _abort(context, grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+                _refuse(
+                    context,
+                    cell,
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    str(exc),
+                    cause="manifest_invalid",
+                )
             manifest = _ManifestFile(
                 index=0,
                 final_rel_path=final_rel_path,
@@ -610,16 +959,20 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 except IntegrityError:
                     checkpoint = session.get(RestoreItemCheckpoint, item.id)
                     if checkpoint is None:
-                        _abort(
+                        _refuse(
                             context,
+                            cell,
                             grpc.StatusCode.ALREADY_EXISTS,
                             "restore checkpoint is being frozen by another open",
+                            cause="open_conflict",
                         )
             if checkpoint.manifest_sha256 != digest:
-                _abort(
+                _refuse(
                     context,
+                    cell,
                     grpc.StatusCode.FAILED_PRECONDITION,
                     "server-frozen restore manifest changed",
+                    cause="manifest_invalid",
                 )
 
             expected_generation: int | None = None
@@ -630,29 +983,39 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     or supplied.receiver_device_id != identity.device_id
                     or supplied.manifest_sha256 != digest
                 ):
-                    _abort(
-                        context, grpc.StatusCode.FAILED_PRECONDITION, "lease token does not match"
+                    _refuse(
+                        context,
+                        cell,
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        "lease token does not match",
+                        cause="stale_lease",
                     )
                 expected_generation = supplied.generation
                 if item.open_session is None or item.open_session.generation != expected_generation:
-                    _abort(
+                    _refuse(
                         context,
+                        cell,
                         grpc.StatusCode.FAILED_PRECONDITION,
                         "lease generation is stale or superseded",
+                        cause="stale_lease",
                     )
             if request.HasField("resume_token"):
                 resume = request.resume_token
                 if resume.restore_request_item_id != item.id or resume.manifest_sha256 != digest:
-                    _abort(
+                    _refuse(
                         context,
+                        cell,
                         grpc.StatusCode.FAILED_PRECONDITION,
                         "resume token manifest does not match the frozen plan",
+                        cause="resume_mismatch",
                     )
                 if not request.HasField("lease_token"):
-                    _abort(
+                    _refuse(
                         context,
+                        cell,
                         grpc.StatusCode.FAILED_PRECONDITION,
                         "resume requires the prior lease generation",
+                        cause="protocol",
                     )
 
             session.commit()
@@ -671,6 +1034,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     committed_index=checkpoint.committed_index,
                     revealed=True,
                     expected_generation=expected_generation,
+                    outcome=cell,
                 )
             if checkpoint.committed_index > manifest.index:
                 return _PreparedOpen(
@@ -687,18 +1051,19 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     committed_index=checkpoint.committed_index,
                     revealed=False,
                     expected_generation=expected_generation,
+                    outcome=cell,
                 )
             plan: RestorePlan | None = None
             member: PlannedMember | None = None
             cache_entry_hash: bytes | None = None
             source = "cache"
             cache = bind_restore_event_sink_to_session(self._cache, session)
-            entry = _select_cache_entry(session, item.content_sha256, config=cache)
+            cache_entry = _select_cache_entry(session, item.content_sha256, config=cache)
             # A recovered cache disk is a fact about the disk; commit it (and its
             # alarm) now. Nothing else is pending here (the commit above).
             session.commit()
-            if entry is not None and self._probe_cache_entry(session, entry, item):
-                cache_entry_hash = entry.content_sha256
+            if cache_entry is not None and self._probe_cache_entry(session, cache_entry, item):
+                cache_entry_hash = cache_entry.content_sha256
             else:
                 backends = self.config.backend_resolver(session, item.artifactclass)
                 plan = build_restore_plan(
@@ -713,14 +1078,36 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     session.commit()
                 except TapeSourceDeferred as exc:
                     plan.close()
-                    _abort(context, grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+                    # A fresh Core read, not session.get: a present cache entry
+                    # means the cache disk, not the item, is the fault (B3).
+                    entry_state = session.execute(
+                        select(CacheEntry.state).where(
+                            CacheEntry.content_sha256 == item.content_sha256
+                        )
+                    ).scalar()
+                    cause = "cache_disk_unavailable" if entry_state == "present" else "tape_only"
+                    _refuse(
+                        context, cell, grpc.StatusCode.FAILED_PRECONDITION, str(exc), cause=cause
+                    )
                 except RestoreIntegrityError as exc:
                     session.commit()
                     plan.close()
-                    _abort(context, grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+                    _refuse(
+                        context,
+                        cell,
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        str(exc),
+                        cause="source_integrity",
+                    )
                 except RestoreSourceUnavailable as exc:
                     plan.close()
-                    _abort(context, grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+                    _refuse(
+                        context,
+                        cell,
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        str(exc),
+                        cause="source_unavailable",
+                    )
             return _PreparedOpen(
                 item_id=item.id,
                 device_id=identity.device_id,
@@ -735,6 +1122,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 committed_index=checkpoint.committed_index,
                 revealed=False,
                 expected_generation=expected_generation,
+                outcome=cell,
             )
 
     def _probe_cache_entry(
@@ -764,24 +1152,71 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         item: RestoreRequestItem,
         identity: grpc_store.DeviceIdentity,
         context: Any,
+        cell: _Outcome,
     ) -> None:
-        capabilities = self._live.capabilities_for(identity.operator)
+        try:
+            capabilities = self._live.capabilities_for(identity.operator)
+        except Exception as exc:
+            _refuse(
+                context,
+                cell,
+                grpc.StatusCode.FAILED_PRECONDITION,
+                str(exc) or type(exc).__name__,
+                cause="configuration",
+            )
         if "can_restore" not in capabilities:
-            _abort(context, grpc.StatusCode.PERMISSION_DENIED, "operator lacks live can_restore")
+            _refuse(
+                context,
+                cell,
+                grpc.StatusCode.PERMISSION_DENIED,
+                "operator lacks live can_restore",
+                cause="not_authorized",
+            )
         privacy_level = effective_privacy_level(session, item.content_sha256)
         if privacy_level == "none":
             return
-        required = hdcache_privacy_capability_map_from_env().get(privacy_level)
-        if required is None:
-            _abort(
+        try:
+            mapping = hdcache_privacy_capability_map_from_env()
+        except Exception as exc:
+            _refuse(
                 context,
+                cell,
+                grpc.StatusCode.FAILED_PRECONDITION,
+                str(exc) or type(exc).__name__,
+                cause="configuration",
+            )
+        required = mapping.get(privacy_level)
+        if required is None:
+            _refuse(
+                context,
+                cell,
                 grpc.StatusCode.FAILED_PRECONDITION,
                 f"privacy level {privacy_level} has no restore capability mapping",
+                cause="configuration",
             )
         if required not in capabilities:
-            _abort(context, grpc.StatusCode.PERMISSION_DENIED, f"operator lacks live {required}")
+            _refuse(
+                context,
+                cell,
+                grpc.StatusCode.PERMISSION_DENIED,
+                f"operator lacks live {required}",
+                cause="not_authorized",
+            )
 
-    def _acquire_lease(self, prepared: _PreparedOpen, context: Any) -> _Lease:
+    def _lease_row(self, session: Session, item_id: int) -> tuple[int, dt.datetime] | None:
+        """Re-read the lease row the CAS refused: ``(generation, expires_at)``."""
+
+        row = session.execute(
+            select(RestoreOpenSession.generation, RestoreOpenSession.expires_at).where(
+                RestoreOpenSession.restore_request_item_id == item_id
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return int(row[0]), _as_utc(row[1])
+
+    def _acquire_lease(self, prepared: _PreparedOpen, context: Any, entry: _AttemptEntry) -> _Lease:
+        cell = prepared.outcome
         now = dt.datetime.now(dt.UTC)
         expires = now + self.config.lease_duration
         generation: int | None = None
@@ -814,11 +1249,16 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     )
                 )
             elif prepared.expected_generation is not None:
-                _abort(
-                    context,
-                    grpc.StatusCode.FAILED_PRECONDITION,
-                    "lease generation is stale, live, or superseded",
-                )
+                # B3's three `:678` rows: re-read the lease the CAS refused.
+                detail = "lease generation is stale, live, or superseded"
+                current = self._lease_row(session, prepared.item_id)
+                if current is None or current[0] != prepared.expected_generation:
+                    cell.set("error", "stale_lease", detail)
+                else:
+                    # Still live, or expired between the CAS and this read: the
+                    # expiry read is blocked_until either way (D-RSRP-4).
+                    cell.set("error", "lease_live", detail, blocked_until=current[1])
+                _abort(context, grpc.StatusCode.FAILED_PRECONDITION, detail)
             else:
                 session.add(
                     RestoreOpenSession(
@@ -834,10 +1274,38 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 try:
                     session.flush()
                 except IntegrityError:
+                    # `:698`: a live lease with no supplied generation (P51).
+                    # The failed insert left this session unusable; read the
+                    # expiry in a fresh one.
+                    with self._factory() as fresh:
+                        current = self._lease_row(fresh, prepared.item_id)
+                    cell.set(
+                        "error",
+                        "lease_live",
+                        "restore item has a live open",
+                        blocked_until=None if current is None else current[1],
+                    )
                     _abort(context, grpc.StatusCode.ALREADY_EXISTS, "restore item has a live open")
                 generation = 1
-        if generation is None:
-            _abort(context, grpc.StatusCode.ALREADY_EXISTS, "restore item has a live open")
+            if generation is None:
+                # `:701`, defensive: no expiry to record; the policy waits 30 s.
+                cell.set("error", "lease_live", "restore item has a live open")
+                _abort(context, grpc.StatusCode.ALREADY_EXISTS, "restore item has a live open")
+            # The fence (D6): the attempt still open takes the generation. No
+            # row means recovery closed it while the call was probing: the
+            # lease write rolls back and no end is written.
+            fenced = session.connection().execute(
+                update(RestoreItemAttempt)
+                .where(
+                    RestoreItemAttempt.id == entry.attempt_id,
+                    RestoreItemAttempt.ended_at.is_(None),
+                    RestoreItemAttempt.closed_at.is_(None),
+                )
+                .values(lease_generation=generation)
+            )
+            if fenced.rowcount != 1:
+                cell.fenced = True
+                _abort(context, grpc.StatusCode.UNAVAILABLE, _CLOSED_BY_RECOVERY)
         return _Lease(
             item_id=prepared.item_id,
             device_id=prepared.device_id,
@@ -891,19 +1359,25 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     for start in range(0, len(view), _WIRE_CHUNK_BYTES):
                         _require_active(context)
                         piece = bytes(view[start : start + _WIRE_CHUNK_BYTES])
+                        prepared.outcome.bytes_sent += len(piece)
                         yield restore_pb2.RestoreFrame(
                             chunk=restore_pb2.Chunk(data=piece, offset=offset)
                         )
                         offset += len(piece)
         except (ArchiveRestoreError, CacheServeFailed) as exc:
+            # B3: the cell is set at the catch, before the error frame is yielded.
+            integrity = isinstance(exc, RestoreIntegrityError | LogicalMemberIntegrityError)
+            prepared.outcome.set(
+                "error", "source_integrity" if integrity else "source_unavailable", str(exc)
+            )
             yield restore_pb2.RestoreFrame(
                 error=restore_pb2.RestoreError(code="ARCHIVE_RESTORE_FAILED", message=str(exc))
             )
             return None
         if offset != manifest.size:
-            raise RestoreSourceUnavailable(
-                f"restore plan emitted {offset} bytes, expected {manifest.size}"
-            )
+            detail = f"restore plan emitted {offset} bytes, expected {manifest.size}"
+            prepared.outcome.set("error", "source_integrity", detail)
+            raise RestoreSourceUnavailable(detail)
         yield restore_pb2.RestoreFrame(
             file_end=restore_pb2.FileEnd(
                 index=manifest.index,
@@ -956,7 +1430,9 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         with self._factory.begin() as session:
             item = session.get(RestoreRequestItem, prepared.item_id)
             if item is None or item.state not in {ITEM_QUEUED, ITEM_SENT, ITEM_STREAMING}:
-                raise RuntimeError("leased restore item ceased to be streamable")
+                detail = "leased restore item ceased to be streamable"
+                prepared.outcome.set("error", "item_withdrawn", detail)
+                raise RuntimeError(detail)
             item.state = ITEM_STREAMING
             item.detail = None
             item.bytes_restored = 0
@@ -964,78 +1440,177 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             if item.request is not None:
                 item.request.state = REQUEST_ACTIVE
 
-    def _mark_sent(self, prepared: _PreparedOpen, lease: _Lease, emitted_bytes: int) -> bool:
-        now = dt.datetime.now(dt.UTC)
-        with self._factory.begin() as session:
-            result = session.connection().execute(
-                update(RestoreRequestItem)
-                .where(
-                    RestoreRequestItem.id == prepared.item_id,
-                    RestoreRequestItem.state == ITEM_STREAMING,
-                    RestoreRequestItem.open_session.has(
-                        and_(
-                            RestoreOpenSession.receiver_device_id == lease.device_id,
-                            RestoreOpenSession.manifest_sha256 == lease.manifest_sha256,
-                            RestoreOpenSession.generation == lease.generation,
-                            RestoreOpenSession.expires_at > now,
-                        )
-                    ),
-                )
-                .values(
-                    state=ITEM_SENT,
-                    detail=None,
-                    source=prepared.source,
-                    bytes_restored=emitted_bytes,
-                    updated_at=now,
-                )
-            )
-            if result.rowcount != 1:
-                return False
-            item = session.get(RestoreRequestItem, prepared.item_id)
-            if item is not None and item.request is not None:
-                item.request.state = REQUEST_ACTIVE
-            if prepared.cache_entry_hash is not None:
-                entry = session.get(CacheEntry, prepared.cache_entry_hash)
-                if entry is not None:
-                    entry.last_read_at = now
-                    entry.trusted = True
-            return True
+    # ---- the end (design RSR, D6; order RSR-1b B5) -----------------------------------
 
-    def _restore_interrupted_state(self, prepared: _PreparedOpen, lease: _Lease) -> None:
-        with self._factory.begin() as session:
-            session.connection().execute(
-                update(RestoreRequestItem)
-                .where(
-                    RestoreRequestItem.id == prepared.item_id,
-                    RestoreRequestItem.state == ITEM_STREAMING,
-                    RestoreRequestItem.open_session.has(
-                        and_(
-                            RestoreOpenSession.receiver_device_id == lease.device_id,
-                            RestoreOpenSession.manifest_sha256 == lease.manifest_sha256,
-                            RestoreOpenSession.generation == lease.generation,
-                        )
-                    ),
-                )
-                .values(
-                    state=prepared.original_state,
-                    bytes_restored=0,
-                    updated_at=dt.datetime.now(dt.UTC),
-                )
-            )
+    def _end_attempt(self, entry: _AttemptEntry, *, deliver: bool) -> _EndResult:
+        """End one attempt: one transaction, then the registry, outside it.
 
-    def _release_lease(self, lease: _Lease) -> None:
-        now = dt.datetime.now(dt.UTC)
-        with self._factory.begin() as session:
-            session.execute(
-                update(RestoreOpenSession)
-                .where(
-                    RestoreOpenSession.restore_request_item_id == lease.item_id,
-                    RestoreOpenSession.receiver_device_id == lease.device_id,
-                    RestoreOpenSession.manifest_sha256 == lease.manifest_sha256,
-                    RestoreOpenSession.generation == lease.generation,
+        ``deliver`` is true only for a stream that went through ``_stream`` and
+        returned past ``job_end``. ``ended`` or ``already_closed`` removes the
+        registry entry; a raise keeps it, marked ended with the cell's outcome,
+        for recovery to retry.
+        """
+
+        try:
+            result = self._end_transaction(entry, deliver=deliver)
+        except BaseException:
+            self._keep_ended(entry)
+            raise
+        self._forget(entry)
+        return result
+
+    def _end_transaction(self, entry: _AttemptEntry, *, deliver: bool) -> _EndResult:
+        outcome = entry.outcome
+        lease = entry.lease
+        now = dt.datetime.now(dt.UTC)  # the lease clock (D-RSRP-5)
+        try:
+            with self._factory.begin() as session:
+                conn = session.connection()
+                sent = False
+                cause: Any = outcome.cause
+                if deliver:
+                    # Step 1: the sent CAS is the first statement, so the write
+                    # lock is held from here on SQLite (P50).
+                    sent = self._record_sent(conn, entry, now)
+                    if sent:
+                        cause = None
+                    elif (
+                        lease is None
+                        or not conn.execute(select(_lease_live_clause(lease, now))).scalar()
+                    ):
+                        cause = "lease_expired"
+                    else:
+                        cause = "item_withdrawn"
+                elif outcome.end_kind == "cancelled" and lease is not None:
+                    # A cancelled end whose lease has expired by now is terminal;
+                    # decided inside the write so no read precedes it (P50).
+                    cause = case(
+                        (_lease_live_clause(lease, now), null()), else_=literal("lease_expired")
+                    )
+                message = None if outcome.message is None else bound_message(outcome.message)
+                # Step 2: the end, conditioned on the attempt still being open.
+                end = conn.execute(
+                    update(RestoreItemAttempt)
+                    .where(
+                        RestoreItemAttempt.id == entry.attempt_id,
+                        RestoreItemAttempt.ended_at.is_(None),
+                        RestoreItemAttempt.closed_at.is_(None),
+                    )
+                    .values(
+                        ended_at=func.now(),
+                        end_kind=outcome.end_kind,
+                        cause=cause,
+                        message=message,
+                        blocked_until=outcome.blocked_until,
+                        bytes_sent=outcome.bytes_sent,
+                    )
                 )
-                .values(expires_at=now, updated_at=now)
+                if end.rowcount != 1:
+                    raise _AlreadyClosed
+                # Step 3: an undelivered lease returns the item and expires.
+                if lease is not None and not sent:
+                    return_state = (
+                        ITEM_QUEUED
+                        if entry.opened_from_state == ITEM_STREAMING
+                        else entry.opened_from_state
+                    )
+                    conn.execute(
+                        update(RestoreRequestItem)
+                        .where(
+                            RestoreRequestItem.id == entry.item_id,
+                            RestoreRequestItem.state == ITEM_STREAMING,
+                            RestoreRequestItem.open_session.has(_lease_matches(lease)),
+                        )
+                        .values(state=return_state, bytes_restored=0, updated_at=now)
+                    )
+                    conn.execute(
+                        update(RestoreOpenSession)
+                        .where(
+                            RestoreOpenSession.restore_request_item_id == lease.item_id,
+                            _lease_matches(lease),
+                        )
+                        .values(expires_at=now, updated_at=now)
+                    )
+                # Step 4: the request state, under the request row's lock.
+                rederive_request_state(session, entry.request_id)
+                # Step 5: the policy; give-up is an event, failed its projection.
+                self._apply_give_up(session, entry, now)
+        except _AlreadyClosed:
+            return _EndResult(END_ALREADY_CLOSED)
+        return _EndResult(END_ENDED, sent=sent)
+
+    def _record_sent(self, conn: Any, entry: _AttemptEntry, now: dt.datetime) -> bool:
+        """The ``sent`` CAS and its side writes; true when the delivery was recorded."""
+
+        lease = entry.lease
+        if lease is None:
+            return False
+        result = conn.execute(
+            update(RestoreRequestItem)
+            .where(
+                RestoreRequestItem.id == entry.item_id,
+                RestoreRequestItem.state == ITEM_STREAMING,
+                RestoreRequestItem.open_session.has(
+                    and_(_lease_matches(lease), RestoreOpenSession.expires_at > now)
+                ),
             )
+            .values(
+                state=ITEM_SENT,
+                detail=None,
+                source=entry.source,
+                bytes_restored=entry.outcome.bytes_sent,
+                updated_at=now,
+            )
+        )
+        if result.rowcount != 1:
+            return False
+        if entry.cache_entry_hash is not None:
+            conn.execute(
+                update(CacheEntry)
+                .where(CacheEntry.content_sha256 == entry.cache_entry_hash)
+                .values(last_read_at=now, trusted=True)
+            )
+        return True
+
+    def _apply_give_up(self, session: Session, entry: _AttemptEntry, now: dt.datetime) -> None:
+        summary = attempt_summaries(session, [entry.item_id])[entry.item_id]
+        db_now = session.scalar(select(func.now()))
+        assert db_now is not None
+        offer = plan_next_offer(summary, db_now, self._retry_policy)
+        if offer.kind != OFFER_GIVE_UP:
+            return
+        decisive = summary.latest_non_wait
+        if decisive is None or offer.rule is None:
+            return
+        detail = compose_detail(offer.rule, offer.counted, decisive)
+        failed = session.connection().execute(
+            update(RestoreRequestItem)
+            .where(
+                RestoreRequestItem.id == entry.item_id,
+                or_(
+                    RestoreRequestItem.state.in_([ITEM_QUEUED, ITEM_SENT]),
+                    and_(
+                        RestoreRequestItem.state == ITEM_STREAMING,
+                        ~RestoreRequestItem.open_session.has(RestoreOpenSession.expires_at > now),
+                    ),
+                ),
+            )
+            .values(state=ITEM_FAILED, detail=detail, updated_at=now)
+        )
+        if failed.rowcount != 1:
+            return
+        session.connection().execute(
+            insert(RestoreItemGiveup).values(
+                restore_request_item_id=entry.item_id,
+                decisive_attempt_id=decisive.id,
+                rule=offer.rule,
+                counted=offer.counted,
+                threshold=offer.threshold,
+                decided_at=func.now(),
+                code_version=default_code_version(),
+            )
+        )
+        rederive_request_state(session, entry.request_id)
 
     def _assignments(self, device_id: str) -> list[Any]:
         with self._factory() as session:
@@ -1190,6 +1765,26 @@ def _assignment_proto(item: RestoreRequestItem) -> Any:
     )
 
 
+def _lease_matches(lease: _Lease) -> Any:
+    """The lease row's identity: receiver, manifest and generation."""
+
+    return and_(
+        RestoreOpenSession.receiver_device_id == lease.device_id,
+        RestoreOpenSession.manifest_sha256 == lease.manifest_sha256,
+        RestoreOpenSession.generation == lease.generation,
+    )
+
+
+def _lease_live_clause(lease: _Lease, now: dt.datetime) -> Any:
+    """SQL: the attempt's lease generation still exists and has not expired at ``now``."""
+
+    return exists().where(
+        RestoreOpenSession.restore_request_item_id == lease.item_id,
+        RestoreOpenSession.generation == lease.generation,
+        RestoreOpenSession.expires_at > now,
+    )
+
+
 def _require_active(context: Any) -> None:
     if not context.is_active():
         raise grpc.RpcError("restore stream cancelled")
@@ -1206,3 +1801,18 @@ def _as_utc(value: dt.datetime) -> dt.datetime:
 def _abort(context: Any, code: grpc.StatusCode, detail: str) -> NoReturn:
     context.abort(code, detail)
     raise RuntimeError(detail)
+
+
+def _refuse(
+    context: Any,
+    cell: _Outcome,
+    code: grpc.StatusCode,
+    detail: str,
+    *,
+    cause: str,
+    blocked_until: dt.datetime | None = None,
+) -> NoReturn:
+    """Record an ``error`` outcome in the cell, then abort (B3: the cell before the abort)."""
+
+    cell.set("error", cause, detail, blocked_until=blocked_until)
+    _abort(context, code, detail)

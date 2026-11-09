@@ -23,7 +23,12 @@ from typing import Any, Final
 from sqlalchemy import ColumnElement, and_, case, func, null, select
 from sqlalchemy.orm import Session
 
-from sutradhara.hdcache.models import RestoreItemAttempt
+from sutradhara.hdcache.models import (
+    RestoreItemAttempt,
+    RestoreItemGiveup,
+    RestoreRequest,
+    RestoreRequestItem,
+)
 
 # ---- A2: the class table ----------------------------------------------------
 
@@ -556,3 +561,64 @@ def compose_detail(rule: str, counted: int | None, decisive: SummaryRow) -> str:
     if rule == RULE_MAX_INTERRUPTIONS:
         return f"gave up after {counted} interrupted transfers in a row"
     raise ValueError(f"unknown give-up rule {rule!r}")
+
+
+# ---- D6: the agreement between give-up rows and failed items ---------------------
+
+
+def giveup_agreement_violations(session: Session) -> list[str]:
+    """D6's two checks as queries over the data; empty when the ledger and the items agree.
+
+    Every agent item in ``failed`` has a give-up row whose decisive attempt is the
+    item's latest non-wait row up to that attempt, and the item's ``detail`` equals
+    the text :func:`compose_detail` composes from it; every give-up row's item is
+    ``failed``. The decisive row is rebuilt through :func:`summarize_rows` over the
+    item's rows, so the check uses the same classification as the policy. Tests
+    run it on a fresh database; the harness scenario runs it after each leg.
+    """
+
+    violations: list[str] = []
+    giveups = {
+        giveup.restore_request_item_id: giveup
+        for giveup in session.scalars(select(RestoreItemGiveup).order_by(RestoreItemGiveup.id))
+    }
+    failed_items = session.scalars(
+        select(RestoreRequestItem)
+        .join(RestoreRequestItem.request)
+        .where(RestoreRequest.delivery_mode == "agent", RestoreRequestItem.state == "failed")
+        .order_by(RestoreRequestItem.id)
+    ).all()
+    for item in failed_items:
+        giveup = giveups.get(item.id)
+        if giveup is None:
+            violations.append(f"item {item.id} is failed without a give-up row")
+            continue
+        rows = session.scalars(
+            select(RestoreItemAttempt).where(RestoreItemAttempt.restore_request_item_id == item.id)
+        ).all()
+        decisive_rows = [row for row in rows if row.id == giveup.decisive_attempt_id]
+        if not decisive_rows:
+            violations.append(
+                f"item {item.id}: decisive attempt {giveup.decisive_attempt_id} is not one of its rows"
+            )
+            continue
+        upto = decisive_rows[0].attempt_no
+        decisive = summarize_rows(row for row in rows if row.attempt_no <= upto).latest_non_wait
+        if decisive is None or decisive.id != giveup.decisive_attempt_id:
+            violations.append(
+                f"item {item.id}: decisive attempt {giveup.decisive_attempt_id} is not a non-wait row"
+            )
+            continue
+        expected = compose_detail(giveup.rule, giveup.counted, decisive)
+        if item.detail != expected:
+            violations.append(
+                f"item {item.id}: detail {item.detail!r} is not the composed text {expected!r}"
+            )
+    for giveup in giveups.values():
+        giveup_item = session.get(RestoreRequestItem, giveup.restore_request_item_id)
+        state = None if giveup_item is None else giveup_item.state
+        if state != "failed":
+            violations.append(
+                f"give-up {giveup.id}: item {giveup.restore_request_item_id} is {state!r}, not failed"
+            )
+    return violations
