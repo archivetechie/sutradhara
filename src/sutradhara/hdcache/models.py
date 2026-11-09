@@ -577,7 +577,7 @@ class RestoreItemAttempt(Base):
             name="ck_restore_item_attempt_cause_by_kind",
         ),
         CheckConstraint(
-            "blocked_until IS NULL OR cause = 'lease_live'",
+            "blocked_until IS NULL OR coalesce(cause, '') = 'lease_live'",
             name="ck_restore_item_attempt_blocked_until",
         ),
         Index("ix_restore_item_attempt_server_instance", "server_instance_id"),

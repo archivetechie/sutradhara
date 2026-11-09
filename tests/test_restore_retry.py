@@ -150,7 +150,8 @@ _VIOLATIONS: list[tuple[str, dict[str, Any]]] = [
     ("message_length", _ended("error", "server_error", message="x" * 2001)),
     ("end_kind_without_time", {"end_kind": "job_end"}),
     ("time_without_end_kind", {"ended_at": T0}),
-    ("both_end_times", {"end_kind": "job_end", "ended_at": T0, "closed_at": T0}),
+    # Only ck_restore_item_attempt_one_end_time rejects this one.
+    ("lost_both_end_times", {"end_kind": "lost", "ended_at": T0, "closed_at": T0}),
     ("lost_with_ended_at", {"end_kind": "lost", "ended_at": T0}),
     ("job_end_with_closed_at", {"end_kind": "job_end", "closed_at": T0}),
     ("open_with_cause", {"cause": "capacity"}),
@@ -160,6 +161,9 @@ _VIOLATIONS: list[tuple[str, dict[str, Any]]] = [
     ("cancelled_counted_cause", _ended("cancelled", "server_error")),
     ("job_end_counted_cause", _ended("job_end", "server_error")),
     ("blocked_until_without_lease_live", _ended("error", "capacity", blocked_until=T0)),
+    # A NULL cause must not slip through the blocked_until rule (SQL three-valued logic).
+    ("blocked_until_on_open_row", {"blocked_until": T0}),
+    ("blocked_until_on_cancelled_null_cause", _ended("cancelled", None, blocked_until=T0)),
 ]
 
 
@@ -223,12 +227,42 @@ def test_attempt_constraint_blocks_item_delete_and_giveup_shape(
         conn.execute(insert(RestoreItemGiveup).values(**{**giveup, "rule": "max_failures"}))
     with engine.begin() as conn:
         conn.execute(insert(RestoreItemGiveup).values(**giveup))
+    # A second give-up for the same item is refused (one decision per item).
     with pytest.raises(IntegrityError), engine.begin() as conn:
         conn.execute(
             insert(RestoreItemGiveup).values(
                 **{**giveup, "rule": "max_failures", "counted": 8, "threshold": 8}
             )
         )
+
+
+def test_attempt_constraint_giveup_rule_legal_numbers_and_duplicate_attempt_no(
+    engine: Engine, instance_id: int
+) -> None:
+    item_id = _seed_item(engine, "giveup-legal")
+    attempt_id = _insert_attempt(
+        engine, _attempt_values(item_id, instance_id, 1, **_ended("error", "server_error"))
+    )
+    legal = {
+        "restore_request_item_id": item_id,
+        "decisive_attempt_id": attempt_id,
+        "rule": "max_failures",
+        "counted": 8,
+        "threshold": 8,
+        "decided_at": T0,
+        "code_version": "test",
+    }
+    # Only ck_restore_item_giveup_rule rejects an unknown rule with both numbers set.
+    with pytest.raises(IntegrityError), engine.begin() as conn:
+        conn.execute(insert(RestoreItemGiveup).values(**{**legal, "rule": "other"}))
+    with engine.begin() as conn:
+        conn.execute(insert(RestoreItemGiveup).values(**legal))
+    # uq_restore_item_attempt_item_no: a second row with the same attempt_no is refused.
+    with pytest.raises(IntegrityError):
+        _insert_attempt(
+            engine, _attempt_values(item_id, instance_id, 1, **_ended("cancelled", None))
+        )
+    _insert_attempt(engine, _attempt_values(item_id, instance_id, 2, **_ended("cancelled", None)))
 
 
 # ---- T3: one open attempt per item -------------------------------------------
@@ -409,11 +443,18 @@ def test_policy_gives_up_at_once_on_a_terminal_row(terminal: tuple[str, str]) ->
     assert offer.rule == "terminal_cause"
     assert (offer.counted, offer.threshold) == (None, None)
     assert offer.decisive_attempt_id == rows[-1].id
-    # Even after a delivery, and the decisive row is the latest ended row.
+    # Even after a delivery and with a later wait row: the decisive row is the
+    # latest ended non-wait row (D-RSRP-9), so the detail carries the terminal cause.
     rows = _history(DELIVERED, terminal, WAIT)
     offer = _offer(rows)
     assert offer.kind == "give_up"
-    assert offer.decisive_attempt_id == rows[-1].id
+    assert offer.decisive_attempt_id == rows[1].id
+    decisive = summarize_rows(rows).latest_non_wait
+    assert decisive is not None
+    assert decisive.id == rows[1].id
+    assert compose_detail("terminal_cause", None, decisive) == compose_last_error(
+        terminal[0], terminal[1], None
+    )
 
 
 def test_policy_first_interruption_reoffers_now_and_later_ones_back_off() -> None:
@@ -740,3 +781,40 @@ def test_summary_statement_agrees_with_python_twin_on_random_histories(
     )
     assert "WITH classified AS" in compiled
     assert "GROUP BY" in compiled
+
+
+# ---- FR1 additions: large limits (T5) and non-finite configuration (T7) ---------------
+
+
+def test_policy_large_limits_walk_to_one_hundred_without_overflow() -> None:
+    policy = RetryPolicy(max_failures=100, max_interruptions=100)
+    ceiling = dt.timedelta(seconds=1800)
+    for n in range(1, 100):
+        rows = _history(*([COUNTED] * n))
+        offer = _offer(rows, policy=policy)
+        assert offer.kind == "at", n
+        assert offer.not_before is not None
+        if n >= 7:
+            assert offer.not_before - rows[-1].ended_at == ceiling
+    assert _offer(_history(*([COUNTED] * 100)), policy=policy).kind == "give_up"
+    assert _offer(_history(INTERRUPTED), policy=policy).kind == "now"
+    for r in range(2, 100):
+        rows = _history(*([INTERRUPTED] * r))
+        offer = _offer(rows, policy=policy)
+        assert offer.kind == "at", r
+        assert offer.not_before is not None
+        if r >= 8:
+            assert offer.not_before - rows[-1].ended_at == ceiling
+    offer = _offer(_history(*([INTERRUPTED] * 100)), policy=policy)
+    assert (offer.kind, offer.rule, offer.counted) == ("give_up", "max_interruptions", 100)
+
+
+@pytest.mark.parametrize("value", ["inf", "-inf", "nan", "1e400"])
+def test_text_retry_policy_from_env_refuses_non_finite_seconds(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    for name in ("BASE_SECONDS", "MAX_SECONDS", "WAIT_SECONDS"):
+        with monkeypatch.context() as context:
+            context.setenv(f"SUTRADHARA_RESTORE_RETRY_{name}", value)
+            with pytest.raises(ValueError, match=r"finite|too large|positive|not be below"):
+                retry_policy_from_env()

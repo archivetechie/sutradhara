@@ -126,6 +126,10 @@ class RestoreServiceConfig:
             raise ValueError("heartbeat interval must be positive")
         if self.staleness_threshold <= dt.timedelta(0):
             raise ValueError("staleness threshold must be positive")
+        # D-RSRP-11: a gap longer than half the threshold is a break, so a
+        # heartbeat that slow would never build an unbroken run.
+        if self.heartbeat_seconds >= self.staleness_threshold.total_seconds() / 2:
+            raise ValueError("heartbeat interval must be below half the staleness threshold")
 
 
 @dataclass(frozen=True)

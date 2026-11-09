@@ -14,6 +14,7 @@ sanitize it.
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -162,7 +163,13 @@ def _env_seconds(name: str, default: dt.timedelta) -> dt.timedelta:
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
-    return dt.timedelta(seconds=float(raw))
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number of seconds, got {raw!r}")
+    try:
+        return dt.timedelta(seconds=value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} is too large: {raw!r}") from exc
 
 
 def _env_count(name: str, default: int) -> int:
@@ -421,7 +428,14 @@ class NextOffer:
 
 
 def _backoff(policy: RetryPolicy, exponent: int) -> dt.timedelta:
-    return min(policy.base_delay * (1 << exponent), policy.max_delay)
+    """``base * 2**exponent`` capped at ``max_delay``; the doubling stops at the ceiling."""
+
+    delay = policy.base_delay
+    for _ in range(exponent):
+        if delay >= policy.max_delay:
+            break
+        delay = delay * 2
+    return min(delay, policy.max_delay)
 
 
 def plan_next_offer(summary: AttemptSummary, now: dt.datetime, policy: RetryPolicy) -> NextOffer:
@@ -430,16 +444,20 @@ def plan_next_offer(summary: AttemptSummary, now: dt.datetime, policy: RetryPoli
     if summary.open:
         return NextOffer(OFFER_OPEN)
     latest = summary.latest
-    if latest is not None:
+    # The decisive row of a give-up is the latest ended non-wait row (D-RSRP-9):
+    # the terminal, counted or interrupted row that triggered the rule, never a
+    # later wait row, so compose_detail renders the cause that ended the item.
+    row = summary.latest_non_wait
+    if row is not None:
         if summary.terminal:
-            return NextOffer(OFFER_GIVE_UP, rule=RULE_TERMINAL_CAUSE, decisive_attempt_id=latest.id)
+            return NextOffer(OFFER_GIVE_UP, rule=RULE_TERMINAL_CAUSE, decisive_attempt_id=row.id)
         if summary.counted >= policy.max_failures:
             return NextOffer(
                 OFFER_GIVE_UP,
                 rule=RULE_MAX_FAILURES,
                 counted=summary.counted,
                 threshold=policy.max_failures,
-                decisive_attempt_id=latest.id,
+                decisive_attempt_id=row.id,
             )
         if summary.interruptions >= policy.max_interruptions:
             return NextOffer(
@@ -447,11 +465,10 @@ def plan_next_offer(summary: AttemptSummary, now: dt.datetime, policy: RetryPoli
                 rule=RULE_MAX_INTERRUPTIONS,
                 counted=summary.interruptions,
                 threshold=policy.max_interruptions,
-                decisive_attempt_id=latest.id,
+                decisive_attempt_id=row.id,
             )
 
     not_before: dt.datetime | None = None
-    row = summary.latest_non_wait
     if row is not None:
         if row.klass == CLASS_COUNTED:
             not_before = row.end_time + _backoff(policy, summary.counted - 1)

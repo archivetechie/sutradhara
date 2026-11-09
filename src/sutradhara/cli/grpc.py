@@ -131,8 +131,11 @@ def serve_grpc_cmd(
     try:
         server.wait_for_termination()
     except KeyboardInterrupt:
-        server.stop(grace=None)
+        pass
     finally:
+        # Idempotent on a terminated server; blocks until every handler has
+        # ended, so the restore service is stopped only after its last caller.
+        server.stop(grace=None).wait()
         parts.restore_service.stop()
         sweep_stop.set()
         registry_stop.set()

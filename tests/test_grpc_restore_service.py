@@ -1784,6 +1784,9 @@ def test_background_heartbeat_advances_and_stop_joins(rig: _Rig) -> None:
         )
     )
     service.start(background=True)
+    thread = service._heartbeat_thread
+    assert thread is not None
+    assert thread.is_alive()
     try:
         with session_scope(rig.engine) as session:
             row = session.get(RestoreServerInstance, service.instance_id)
@@ -1806,25 +1809,42 @@ def test_background_heartbeat_advances_and_stop_joins(rig: _Rig) -> None:
         assert service.heartbeat_unbroken_seconds() > unbroken
     finally:
         service.stop()
-    thread = service._heartbeat_thread
-    assert thread is None or not thread.is_alive()
+    # stop() joined the thread it captured above.
+    assert not thread.is_alive()
 
 
 def test_heartbeat_once_records_a_break_after_half_the_threshold(rig: _Rig) -> None:
+    # A 2 s break window (half of 4 s); every sleep sits well inside or beyond it,
+    # so an oversleep of tens of milliseconds on a loaded host cannot fail it.
     service = RestoreService(
-        replace(rig.service_config, staleness_threshold=dt.timedelta(seconds=0.2))
+        replace(
+            rig.service_config, heartbeat_seconds=0.5, staleness_threshold=dt.timedelta(seconds=4)
+        )
     )
     service.start(background=False)
     try:
         service.heartbeat_once()
-        assert service.heartbeat_unbroken_seconds() >= 0.0
-        time.sleep(0.15)  # longer than half the threshold: the run is broken
+        time.sleep(0.3)
+        assert 0.2 <= service.heartbeat_unbroken_seconds() < 1.5
+        time.sleep(2.2)  # the gap since the last success now exceeds 2 s: broken
         assert service.heartbeat_unbroken_seconds() == 0.0
         service.heartbeat_once()  # a new run starts at this success
-        time.sleep(0.02)
-        assert 0.0 < service.heartbeat_unbroken_seconds() < 0.1
+        time.sleep(0.3)
+        assert 0.2 <= service.heartbeat_unbroken_seconds() < 1.5
     finally:
         service.stop()
+
+
+def test_config_refuses_a_heartbeat_at_or_above_half_the_staleness_threshold(rig: _Rig) -> None:
+    with pytest.raises(ValueError, match="half the staleness threshold"):
+        replace(
+            rig.service_config, heartbeat_seconds=60.0, staleness_threshold=dt.timedelta(minutes=2)
+        )
+    replace(rig.service_config, heartbeat_seconds=59.0, staleness_threshold=dt.timedelta(minutes=2))
+    with pytest.raises(ValueError, match="half the staleness threshold"):
+        replace(
+            rig.service_config, heartbeat_seconds=10.0, staleness_threshold=dt.timedelta(seconds=20)
+        )
 
 
 def test_default_service_alarm_sink_writes_to_the_service_engine(

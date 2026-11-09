@@ -127,7 +127,9 @@ def serve_cmd(
             if api_socket.exists():
                 api_socket.unlink()
     finally:
-        grpc_server.stop(grace=5)
+        # stop() returns an Event at once; wait for the handlers to end before
+        # the restore service, which they may still be using.
+        grpc_server.stop(grace=5).wait()
         parts.restore_service.stop()
         sweep_stop.set()
         registry_stop.set()
