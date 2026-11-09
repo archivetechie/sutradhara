@@ -456,3 +456,218 @@ class RestoreOpenSession(Base):
     )
 
     item: Mapped[RestoreRequestItem] = relationship(back_populates="open_session")
+
+
+#: The closed cause vocabulary of a restore attempt's end (design RSR, D2). The
+#: retry policy's class table in ``hdcache/restore_retry.py`` is keyed on it.
+RESTORE_ATTEMPT_CAUSES = (
+    "not_authorized",
+    "configuration",
+    "capacity",
+    "manifest_invalid",
+    "resume_mismatch",
+    "open_conflict",
+    "stale_lease",
+    "protocol",
+    "cache_disk_unavailable",
+    "tape_only",
+    "source_integrity",
+    "source_unavailable",
+    "server_error",
+    "lease_live",
+    "item_withdrawn",
+    "lease_expired",
+)
+
+RESTORE_ATTEMPT_END_KINDS = ("job_end", "error", "cancelled", "lost")
+
+RESTORE_GIVEUP_RULES = ("terminal_cause", "max_failures", "max_interruptions")
+
+
+def _sql_list(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{value}'" for value in values)
+
+
+class RestoreServerInstance(Base):
+    """One start of a process hosting ``RestoreService``.
+
+    Ledger: rows are never deleted. ``heartbeat_at`` is the one whiteboard
+    column, refreshed by the process on the database clock (design RSR, D7).
+    """
+
+    __tablename__ = "restore_server_instance"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    host: Mapped[str] = mapped_column(String(255), nullable=False)
+    pid: Mapped[int] = mapped_column(Integer, nullable=False)
+    code_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    heartbeat_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RestoreItemAttempt(Base):
+    """One ``OpenRestore`` call the server admitted for one agent restore item.
+
+    Ledger: rows are never deleted. An attempt is open while ``end_kind`` is
+    null; it ends with ``ended_at`` (``job_end``, ``error``, ``cancelled``) or
+    is closed by recovery with ``closed_at`` (``lost``). The CHECKs below are
+    the D2 shape rules; ``restore_retry.py`` classifies rows for the policy.
+    """
+
+    __tablename__ = "restore_item_attempt"
+    __table_args__ = (
+        CheckConstraint("attempt_no >= 1", name="ck_restore_item_attempt_no"),
+        UniqueConstraint(
+            "restore_request_item_id", "attempt_no", name="uq_restore_item_attempt_item_no"
+        ),
+        CheckConstraint(
+            "opened_from_state IN ('queued', 'sent', 'streaming', 'done')",
+            name="ck_restore_item_attempt_opened_from_state",
+        ),
+        CheckConstraint(
+            "probe_source IS NULL OR probe_source IN ('cache', 'disk')",
+            name="ck_restore_item_attempt_probe_source",
+        ),
+        CheckConstraint(
+            "probe_candidates_tried IS NULL OR probe_candidates_tried >= 0",
+            name="ck_restore_item_attempt_probe_candidates",
+        ),
+        CheckConstraint(
+            "lease_generation IS NULL OR lease_generation >= 1",
+            name="ck_restore_item_attempt_lease_generation",
+        ),
+        CheckConstraint(
+            "bytes_sent IS NULL OR bytes_sent >= 0", name="ck_restore_item_attempt_bytes_sent"
+        ),
+        CheckConstraint(
+            f"end_kind IS NULL OR end_kind IN ({_sql_list(RESTORE_ATTEMPT_END_KINDS)})",
+            name="ck_restore_item_attempt_end_kind",
+        ),
+        CheckConstraint(
+            f"cause IS NULL OR cause IN ({_sql_list(RESTORE_ATTEMPT_CAUSES)})",
+            name="ck_restore_item_attempt_cause",
+        ),
+        CheckConstraint(
+            "message IS NULL OR length(message) <= 2000",
+            name="ck_restore_item_attempt_message_length",
+        ),
+        # end_kind is null exactly when neither end time is set.
+        CheckConstraint(
+            "(end_kind IS NULL) = (ended_at IS NULL AND closed_at IS NULL)",
+            name="ck_restore_item_attempt_end_kind_times",
+        ),
+        # At most one of the two end times is set.
+        CheckConstraint(
+            "ended_at IS NULL OR closed_at IS NULL",
+            name="ck_restore_item_attempt_one_end_time",
+        ),
+        # 'lost' is the one kind written with closed_at (recovery), never ended_at.
+        CheckConstraint(
+            "CASE WHEN end_kind = 'lost' THEN closed_at IS NOT NULL ELSE closed_at IS NULL END",
+            name="ck_restore_item_attempt_lost_closed",
+        ),
+        # The cause a kind may carry (D2).
+        CheckConstraint(
+            "CASE end_kind "
+            "WHEN 'error' THEN cause IS NOT NULL AND cause <> 'lease_expired' "
+            "WHEN 'lost' THEN cause IS NULL "
+            "WHEN 'cancelled' THEN cause IS NULL OR cause = 'lease_expired' "
+            "WHEN 'job_end' THEN cause IS NULL OR cause IN ('lease_expired', 'item_withdrawn') "
+            "ELSE cause IS NULL END",
+            name="ck_restore_item_attempt_cause_by_kind",
+        ),
+        CheckConstraint(
+            "blocked_until IS NULL OR cause = 'lease_live'",
+            name="ck_restore_item_attempt_blocked_until",
+        ),
+        Index("ix_restore_item_attempt_server_instance", "server_instance_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    restore_request_item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("restore_request_item.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Evidence, not a reference: a ledger must not cascade from the device table.
+    receiver_device_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    server_instance_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("restore_server_instance.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    opened_from_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    opened_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    probe_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    probe_candidates_tried: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    probe_ended_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    blocked_until: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    bytes_sent: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    ended_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    cause: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    closed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    code_version: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    item: Mapped[RestoreRequestItem] = relationship()
+    server_instance: Mapped[RestoreServerInstance] = relationship()
+
+
+# At most one open attempt per item (declared for both dialects, D-RSRP-2).
+Index(
+    "uq_restore_item_attempt_open",
+    RestoreItemAttempt.restore_request_item_id,
+    unique=True,
+    sqlite_where=RestoreItemAttempt.ended_at.is_(None) & RestoreItemAttempt.closed_at.is_(None),
+    postgresql_where=RestoreItemAttempt.ended_at.is_(None) & RestoreItemAttempt.closed_at.is_(None),
+)
+
+
+class RestoreItemGiveup(Base):
+    """The one decision that an agent restore item will not be retried.
+
+    Ledger: one row per item, never deleted. ``counted`` and ``threshold`` are
+    the numbers the rule compared; both are null only for ``terminal_cause``.
+    """
+
+    __tablename__ = "restore_item_giveup"
+    __table_args__ = (
+        UniqueConstraint("restore_request_item_id", name="uq_restore_item_giveup_item"),
+        UniqueConstraint("decisive_attempt_id", name="uq_restore_item_giveup_attempt"),
+        CheckConstraint(
+            f"rule IN ({_sql_list(RESTORE_GIVEUP_RULES)})",
+            name="ck_restore_item_giveup_rule",
+        ),
+        CheckConstraint(
+            "(rule = 'terminal_cause' AND counted IS NULL AND threshold IS NULL) OR "
+            "(rule <> 'terminal_cause' AND counted IS NOT NULL AND threshold IS NOT NULL)",
+            name="ck_restore_item_giveup_numbers",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    restore_request_item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("restore_request_item.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    decisive_attempt_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("restore_item_attempt.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    rule: Mapped[str] = mapped_column(String(32), nullable=False)
+    counted: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    threshold: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    decided_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    code_version: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    item: Mapped[RestoreRequestItem] = relationship()
+    decisive_attempt: Mapped[RestoreItemAttempt] = relationship()

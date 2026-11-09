@@ -1475,6 +1475,9 @@ def test_restore_agent_foundation_migration_backfills_constraints_and_downgrades
             "grpc_device_destination_grant",
             "restore_item_checkpoint",
             "restore_open_session",
+            "restore_item_attempt",
+            "restore_item_giveup",
+            "restore_server_instance",
             "operator_capability_sync",
             "operator_live_capability",
         }.issubset(tables)
@@ -1518,6 +1521,53 @@ def test_restore_agent_foundation_migration_backfills_constraints_and_downgrades
         assert "delivery_mode" not in {
             row[1] for row in conn.execute("PRAGMA table_info(restore_request)")
         }
+
+
+def test_restore_attempt_ledger_migration_schema_round_trips(tmp_path: Path) -> None:
+    """The ledger revision adds its three tables and its downgrade leaves the rest unchanged."""
+
+    db_path = tmp_path / "restore-attempt-ledger.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["SUTRADHARA_DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    ledger_tables = {"restore_item_attempt", "restore_item_giveup", "restore_server_instance"}
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "d3e4f5a6b7c8"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    before = _schema_signatures(db_path)
+    assert not ledger_tables & set(before)
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "e7a1c3b5d9f2"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    after = _schema_signatures(db_path)
+    assert ledger_tables <= set(after)
+    assert {name: after[name] for name in before} == before
+    attempt_sql = _table_sql(db_path, "restore_item_attempt")
+    assert "ck_restore_item_attempt_blocked_until" in attempt_sql
+    assert "ON DELETE RESTRICT" in attempt_sql
+    assert "WHERE ended_at IS NULL AND closed_at IS NULL" in _index_sql(
+        db_path, "uq_restore_item_attempt_open"
+    )
+    assert _foreign_key_delete_actions(db_path, "restore_item_giveup") == {
+        ("restore_request_item_id", "restore_request_item"): "RESTRICT",
+        ("decisive_attempt_id", "restore_item_attempt"): "RESTRICT",
+    }
+
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "d3e4f5a6b7c8"],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    assert _schema_signatures(db_path) == before
 
 
 def test_receive_dedup_migration_preserves_dead_intent_heartbeat_and_downgrades(

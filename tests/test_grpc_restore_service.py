@@ -73,6 +73,7 @@ from sutradhara.hdcache.models import (
     RestoreOpenSession,
     RestoreRequest,
     RestoreRequestItem,
+    RestoreServerInstance,
 )
 from sutradhara.hdcache.store import (
     AEAD_REPRESENTATION,
@@ -233,6 +234,13 @@ class _Context:
         return True
 
 
+def _started(service: RestoreService) -> RestoreService:
+    """Start a test service without its heartbeat thread (RSR A7); callers stop it."""
+
+    service.start(background=False)
+    return service
+
+
 @dataclass
 class _Rig:
     root: Path
@@ -336,6 +344,8 @@ def rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Rig]:
         lease_duration=dt.timedelta(minutes=5),
         assignment_poll_seconds=0.01,
     )
+    service = RestoreService(config)
+    service.start(background=False)
     test_rig = _Rig(
         root=root,
         engine=engine,
@@ -345,7 +355,7 @@ def rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Rig]:
         capabilities=capabilities,
         unavailable_operators=unavailable_operators,
         service_config=config,
-        service=RestoreService(config),
+        service=service,
         receiver_material=receiver_material,
         receiver_cert=receiver_cert,
         fingerprints=fingerprints,
@@ -353,6 +363,7 @@ def rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Rig]:
     try:
         yield test_rig
     finally:
+        service.stop()
         engine.dispose()
 
 
@@ -361,7 +372,7 @@ def socket_port(rig: _Rig) -> Iterator[int]:
     """Run the production shared mTLS server on a real loopback socket."""
 
     port = _unused_port()
-    server = make_server(
+    parts = make_server(
         GrpcServerConfig(
             engine=rig.engine,
             landing_root=rig.root / "landing",
@@ -372,11 +383,13 @@ def socket_port(rig: _Rig) -> Iterator[int]:
             restore=rig.service_config,
         )
     )
-    server.start()
+    parts.restore_service.start(background=False)
+    parts.server.start()
     try:
         yield port
     finally:
-        server.stop(grace=0).wait()
+        parts.server.stop(grace=0).wait()
+        parts.restore_service.stop()
 
 
 def test_open_restore_real_socket_streams_ordered_plaintext_with_bounded_memory(
@@ -811,25 +824,28 @@ def test_duplicate_open_rejected_then_expired_generation_reopens(rig: _Rig) -> N
 def test_restore_capacity_fails_fast_and_cancellation_releases_state(rig: _Rig) -> None:
     first_id = _seed_item(rig, "capacity-first", b"first", receiver="receiver")
     second_id = _seed_item(rig, "capacity-second", b"second", receiver="receiver")
-    service = RestoreService(replace(rig.service_config, max_concurrent_streams=1))
+    service = _started(RestoreService(replace(rig.service_config, max_concurrent_streams=1)))
     first_context = rig.context("receiver")
-    first = service.OpenRestore(
-        restore_pb2.OpenRestoreRequest(restore_request_item_id=first_id), first_context
-    )
-    assert next(first).HasField("manifest_head")
-
-    with pytest.raises(_Abort) as saturated:
-        list(
-            service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=second_id),
-                rig.context("receiver"),
-            )
+    try:
+        first = service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=first_id), first_context
         )
-    assert saturated.value.code == grpc.StatusCode.RESOURCE_EXHAUSTED
+        assert next(first).HasField("manifest_head")
 
-    first_context.active = False
-    with pytest.raises(grpc.RpcError):
-        list(first)
+        with pytest.raises(_Abort) as saturated:
+            list(
+                service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=second_id),
+                    rig.context("receiver"),
+                )
+            )
+        assert saturated.value.code == grpc.StatusCode.RESOURCE_EXHAUSTED
+
+        first_context.active = False
+        with pytest.raises(grpc.RpcError):
+            list(first)
+    finally:
+        service.stop()
     with session_scope(rig.engine) as session:
         first_item = session.get(RestoreRequestItem, first_id)
         assert first_item is not None
@@ -1695,6 +1711,122 @@ def _unused_port() -> int:
         return int(probe.getsockname()[1])
 
 
+def test_unstarted_service_refuses_open_and_watch_and_writes_nothing(rig: _Rig) -> None:
+    item_id = _seed_item(rig, "unstarted", b"unstarted", receiver="receiver")
+    with session_scope(rig.engine) as session:
+        instances_before = session.scalar(select(func.count(RestoreServerInstance.id)))
+    service = RestoreService(rig.service_config)
+    with pytest.raises(_Abort) as refused_open:
+        next(
+            service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+        )
+    assert refused_open.value.code == grpc.StatusCode.UNAVAILABLE
+    assert refused_open.value.details == "restore service is not started"
+    with pytest.raises(_Abort) as refused_watch:
+        next(
+            service.WatchAssignments(
+                restore_pb2.WatchRequest(device_id="receiver"), rig.context("receiver")
+            )
+        )
+    assert refused_watch.value.code == grpc.StatusCode.UNAVAILABLE
+    assert refused_watch.value.details == "restore service is not started"
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        assert item.state == "queued"
+        assert session.get(RestoreOpenSession, item_id) is None
+        assert session.scalar(select(func.count(RestoreServerInstance.id))) == instances_before
+    # The started rig service still serves the same item.
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+            rig.context("receiver"),
+        )
+    )
+    assert frames[-1].HasField("job_end")
+
+
+def test_start_writes_one_instance_row_and_a_second_start_raises(rig: _Rig) -> None:
+    with session_scope(rig.engine) as session:
+        ids_before = set(session.scalars(select(RestoreServerInstance.id)))
+    service = RestoreService(rig.service_config)
+    service.start(background=False)
+    try:
+        with pytest.raises(RuntimeError):
+            service.start(background=False)
+        with session_scope(rig.engine) as session:
+            new_rows = [
+                row
+                for row in session.scalars(select(RestoreServerInstance))
+                if row.id not in ids_before
+            ]
+        assert len(new_rows) == 1
+        row = new_rows[0]
+        assert row.id == service.instance_id
+        assert row.host == socket.gethostname()
+        assert row.pid == os.getpid()
+        assert row.code_version
+        assert row.started_at == row.heartbeat_at
+        assert service.heartbeat_unbroken_seconds() >= 0.0
+    finally:
+        service.stop()
+    with pytest.raises(RuntimeError):
+        service.start(background=False)
+
+
+def test_background_heartbeat_advances_and_stop_joins(rig: _Rig) -> None:
+    service = RestoreService(
+        replace(
+            rig.service_config, heartbeat_seconds=0.05, staleness_threshold=dt.timedelta(seconds=4)
+        )
+    )
+    service.start(background=True)
+    try:
+        with session_scope(rig.engine) as session:
+            row = session.get(RestoreServerInstance, service.instance_id)
+            assert row is not None
+            first_heartbeat = row.heartbeat_at
+        deadline = time.monotonic() + 3.0
+        advanced = False
+        while time.monotonic() < deadline:
+            with session_scope(rig.engine) as session:
+                row = session.get(RestoreServerInstance, service.instance_id)
+                assert row is not None
+                if row.heartbeat_at > first_heartbeat:
+                    advanced = True
+                    break
+            time.sleep(0.05)
+        assert advanced, "heartbeat_at did not advance within 3 s"
+        unbroken = service.heartbeat_unbroken_seconds()
+        assert unbroken > 0.0
+        time.sleep(0.2)
+        assert service.heartbeat_unbroken_seconds() > unbroken
+    finally:
+        service.stop()
+    thread = service._heartbeat_thread
+    assert thread is None or not thread.is_alive()
+
+
+def test_heartbeat_once_records_a_break_after_half_the_threshold(rig: _Rig) -> None:
+    service = RestoreService(
+        replace(rig.service_config, staleness_threshold=dt.timedelta(seconds=0.2))
+    )
+    service.start(background=False)
+    try:
+        service.heartbeat_once()
+        assert service.heartbeat_unbroken_seconds() >= 0.0
+        time.sleep(0.15)  # longer than half the threshold: the run is broken
+        assert service.heartbeat_unbroken_seconds() == 0.0
+        service.heartbeat_once()  # a new run starts at this success
+        time.sleep(0.02)
+        assert 0.0 < service.heartbeat_unbroken_seconds() < 0.1
+    finally:
+        service.stop()
+
+
 def test_default_service_alarm_sink_writes_to_the_service_engine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1709,8 +1841,9 @@ def test_default_service_alarm_sink_writes_to_the_service_engine(
         raise AssertionError("alarm sink opened make_engine() instead of the service engine")
 
     monkeypatch.setattr("sutradhara.hdcache.alarms.make_engine", leaked)
+    service: RestoreService | None = None
     try:
-        service = RestoreService(RestoreServiceConfig(engine=engine))
+        service = _started(RestoreService(RestoreServiceConfig(engine=engine)))
         _emit(
             service._cache,
             RestoreEvent(
@@ -1732,6 +1865,8 @@ def test_default_service_alarm_sink_writes_to_the_service_engine(
                 )
             }
     finally:
+        if service is not None:
+            service.stop()
         engine.dispose()
     assert rows == {"disk-unreachable:restore": "disk-unreachable"}
 
@@ -1779,12 +1914,14 @@ def test_cache_recovery_on_absent_disk_commits_without_alarm_lock_stall(rig: _Ri
     # The rig's cache config has no event sink (events only log); production wires
     # the DB-backed alarm sink, so this test does too.
     assert rig.service_config.cache_config is not None
-    service = RestoreService(
-        replace(
-            rig.service_config,
-            cache_config=replace(
-                rig.service_config.cache_config, event_sink=restore_event_alarm_sink()
-            ),
+    service = _started(
+        RestoreService(
+            replace(
+                rig.service_config,
+                cache_config=replace(
+                    rig.service_config.cache_config, event_sink=restore_event_alarm_sink()
+                ),
+            )
         )
     )
     _set_cache_disk_state(rig, "absent")
@@ -1797,6 +1934,7 @@ def test_cache_recovery_on_absent_disk_commits_without_alarm_lock_stall(rig: _Ri
             )
         )
         elapsed = time.monotonic() - started
+        service.stop()
 
         assert elapsed < 10
         assert _payload_digest(frames) == hashlib.sha256(payload).digest()
@@ -1840,14 +1978,16 @@ def test_open_prepared_cache_source_never_probes_recovery(
         raise AssertionError("the open must not run a recovery probe")
 
     monkeypatch.setattr("sutradhara.hdcache.manager._probe_cache_disk_recovery", _boom)
+    service = _started(_AbsentAfterPrepareService(rig.service_config))
     try:
         frames = list(
-            _AbsentAfterPrepareService(rig.service_config).OpenRestore(
+            service.OpenRestore(
                 restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
                 rig.context("receiver"),
             )
         )
     finally:
+        service.stop()
         _set_cache_disk_state(rig, "active")
 
     errors = [frame.error for frame in frames if frame.HasField("error")]

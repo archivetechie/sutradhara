@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import logging
+import os
+import socket
 import struct
 import threading
+import time
 from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,7 +23,7 @@ from pathlib import PurePosixPath
 from typing import Any, NoReturn
 
 import grpc
-from sqlalchemy import Engine, and_, select, update
+from sqlalchemy import Engine, and_, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -67,7 +71,10 @@ from sutradhara.hdcache.models import (
     RestoreItemCheckpoint,
     RestoreOpenSession,
     RestoreRequestItem,
+    RestoreServerInstance,
 )
+from sutradhara.hdcache.restore_retry import RetryPolicy, retry_policy_from_env
+from sutradhara.jobs.attempts import default_code_version
 from sutradhara.restore import RestoreIntegrityError as ChunkRestoreIntegrityError
 from sutradhara.staging import StagingError
 
@@ -81,6 +88,9 @@ _SYNTHETIC_MODE = 0o644
 _SYNTHETIC_UID = 0
 _SYNTHETIC_GID = 0
 _SYNTHETIC_MTIME = 0
+_NOT_STARTED = "restore service is not started"
+
+LOG = logging.getLogger(__name__)
 
 BackendResolver = Callable[[Session, str], dict[int, StorageBackend]]
 ExtractorFactory = Callable[[], ArchiveExtractor]
@@ -99,6 +109,11 @@ class RestoreServiceConfig:
     # Mid-stream lease renewal lands in RM1.3; this default only raises the ceiling.
     lease_duration: dt.timedelta = dt.timedelta(minutes=30)
     assignment_poll_seconds: float = 0.5
+    # Design RSR, D7: the instance heartbeat and the staleness rule recovery applies.
+    heartbeat_seconds: float = 10.0
+    staleness_threshold: dt.timedelta = dt.timedelta(minutes=2)
+    # None: ``retry_policy_from_env()`` when the service is constructed.
+    retry_policy: RetryPolicy | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.max_concurrent_streams < 16:
@@ -107,6 +122,10 @@ class RestoreServiceConfig:
             raise ValueError("restore lease duration must be positive")
         if self.assignment_poll_seconds <= 0:
             raise ValueError("assignment poll interval must be positive")
+        if self.heartbeat_seconds <= 0:
+            raise ValueError("heartbeat interval must be positive")
+        if self.staleness_threshold <= dt.timedelta(0):
+            raise ValueError("staleness threshold must be positive")
 
 
 @dataclass(frozen=True)
@@ -164,10 +183,125 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             config.cache_config or restore_config_from_env(), config.engine
         )
         self._slots = threading.BoundedSemaphore(config.max_concurrent_streams)
+        self._retry_policy = config.retry_policy or retry_policy_from_env()
+        # Lifecycle (design RSR, D7): ``start()`` writes the instance row and
+        # runs the heartbeat; nothing is served before it.
+        self._lifecycle_lock = threading.Lock()
+        self._started = False
+        self._instance_id: int | None = None
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        # Monotonic bookkeeping of heartbeat successes: when the current
+        # unbroken run began, and the last success.
+        self._heartbeat_run_since: float | None = None
+        self._heartbeat_last_success: float | None = None
+
+    # ---- lifecycle ---------------------------------------------------------------
+
+    @property
+    def instance_id(self) -> int | None:
+        """This process's ``restore_server_instance`` row, once started."""
+
+        return self._instance_id
+
+    def start(self, *, background: bool = True) -> None:
+        """Write the instance row; with ``background``, run the heartbeat thread.
+
+        A second ``start()`` raises ``RuntimeError``. Tests start without the
+        thread and drive ``heartbeat_once()`` themselves.
+        """
+
+        with self._lifecycle_lock:
+            if self._started:
+                raise RuntimeError("restore service is already started")
+            with self._factory.begin() as session:
+                row = RestoreServerInstance(
+                    host=socket.gethostname(),
+                    pid=os.getpid(),
+                    code_version=default_code_version(),
+                    started_at=func.now(),
+                    heartbeat_at=func.now(),
+                )
+                session.add(row)
+                session.flush()
+                instance_id = row.id
+            self._instance_id = instance_id
+            self._started = True
+            # The row's own heartbeat_at is the first success of the run.
+            self._record_heartbeat_success(time.monotonic())
+            if background:
+                self._heartbeat_stop.clear()
+                self._heartbeat_thread = threading.Thread(
+                    target=self._heartbeat_loop, name="sutra-restore-heartbeat", daemon=True
+                )
+                self._heartbeat_thread.start()
+
+    def stop(self) -> None:
+        """End and join the heartbeat thread. Idempotent."""
+
+        self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        self._heartbeat_thread = None
+
+    def heartbeat_once(self) -> None:
+        """Set this instance's ``heartbeat_at`` to the database clock (one step)."""
+
+        if self._instance_id is None:
+            raise RuntimeError(_NOT_STARTED)
+        with self._factory.begin() as session:
+            result = session.connection().execute(
+                update(RestoreServerInstance)
+                .where(RestoreServerInstance.id == self._instance_id)
+                .values(heartbeat_at=func.now())
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(f"restore server instance {self._instance_id} row is missing")
+        self._record_heartbeat_success(time.monotonic())
+
+    def heartbeat_unbroken_seconds(self) -> float:
+        """How long heartbeats have succeeded without a break, on the monotonic clock.
+
+        A gap between successes longer than half ``staleness_threshold`` is a
+        break; while the current gap already exceeds that, the answer is 0.
+        """
+
+        last = self._heartbeat_last_success
+        since = self._heartbeat_run_since
+        if last is None or since is None:
+            return 0.0
+        now = time.monotonic()
+        if now - last > self._break_seconds():
+            return 0.0
+        return now - since
+
+    def _break_seconds(self) -> float:
+        return self.config.staleness_threshold.total_seconds() / 2
+
+    def _record_heartbeat_success(self, at: float) -> None:
+        last = self._heartbeat_last_success
+        if last is None or at - last > self._break_seconds():
+            self._heartbeat_run_since = at
+        self._heartbeat_last_success = at
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(self.config.heartbeat_seconds):
+            try:
+                self.heartbeat_once()
+            except Exception:
+                LOG.exception("restore service heartbeat failed (instance %s)", self._instance_id)
+
+    def _require_started(self, context: Any) -> None:
+        if not self._started:
+            _abort(context, grpc.StatusCode.UNAVAILABLE, _NOT_STARTED)
+
+    # ---- RPCs ----------------------------------------------------------------------
 
     def OpenRestore(self, request: Any, context: Any) -> Iterator[Any]:
         """Authorize, exclusively lease, and frame one archive-backed restore item."""
 
+        self._require_started(context)
         if not self._slots.acquire(blocking=False):
             _abort(context, grpc.StatusCode.RESOURCE_EXHAUSTED, "restore stream capacity is full")
         prepared: _PreparedOpen | None = None
@@ -348,6 +482,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
     def WatchAssignments(self, request: Any, context: Any) -> Iterator[Any]:
         """Emit device-scoped metadata; OpenRestore separately gates object bytes."""
 
+        self._require_started(context)
         identity = self._identity(context)
         if request.device_id != identity.device_id:
             _abort(

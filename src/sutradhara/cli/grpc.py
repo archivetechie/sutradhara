@@ -109,7 +109,7 @@ def serve_grpc_cmd(
     registry = ConnectedDeviceRegistry()
     progress_registry = ReceiveProgressRegistry()
     landing_root.mkdir(parents=True, exist_ok=True)
-    server = make_server(
+    parts = make_server(
         GrpcServerConfig(
             engine=engine,
             landing_root=landing_root,
@@ -121,6 +121,9 @@ def serve_grpc_cmd(
             progress_registry=progress_registry,
         )
     )
+    # The restore service must be started before any call can reach it (RSR D7).
+    parts.restore_service.start()
+    server = parts.server
     server.start()
     sweep_stop, sweep_thread = start_sweep_loop(landing_root)
     registry_stop, registry_thread = start_registry_sweep_loop(registry)
@@ -130,6 +133,7 @@ def serve_grpc_cmd(
     except KeyboardInterrupt:
         server.stop(grace=None)
     finally:
+        parts.restore_service.stop()
         sweep_stop.set()
         registry_stop.set()
         sweep_thread.join(timeout=5)

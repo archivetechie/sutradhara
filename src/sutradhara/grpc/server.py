@@ -43,8 +43,21 @@ class GrpcServerConfig:
     restore: RestoreServiceConfig | None = None
 
 
-def make_server(config: GrpcServerConfig) -> grpc.Server:
-    """Create a configured mTLS gRPC server."""
+@dataclass(frozen=True)
+class GrpcServerParts:
+    """What ``make_server`` builds: the server and the restore service it hosts.
+
+    The caller starts ``restore_service`` before ``server`` and stops it after
+    the server has stopped (design RSR, D7; D-RSRP-3). A ``RestoreService``
+    refuses calls until it is started.
+    """
+
+    server: grpc.Server
+    restore_service: RestoreService
+
+
+def make_server(config: GrpcServerConfig) -> GrpcServerParts:
+    """Create a configured mTLS gRPC server and the restore service it hosts."""
 
     validate_bind_address(config.bind)
     ca_cert, server_cert, server_key = load_server_credentials(config.pki_dir)
@@ -78,8 +91,9 @@ def make_server(config: GrpcServerConfig) -> grpc.Server:
     restore_config = config.restore or RestoreServiceConfig(engine=config.engine)
     if restore_config.engine is not config.engine:
         raise ValueError("restore service must use the shared server database engine")
+    restore_service = RestoreService(restore_config)
     restore_pb2_grpc.add_RestoreServiceServicer_to_server(  # type: ignore[no-untyped-call]
-        RestoreService(restore_config),
+        restore_service,
         server,
     )
     creds = grpc.ssl_server_credentials(
@@ -88,7 +102,7 @@ def make_server(config: GrpcServerConfig) -> grpc.Server:
         require_client_auth=True,
     )
     server.add_secure_port(f"{config.bind}:{config.port}", creds)
-    return server
+    return GrpcServerParts(server=server, restore_service=restore_service)
 
 
 def validate_bind_address(bind: str) -> None:

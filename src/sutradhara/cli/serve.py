@@ -85,7 +85,7 @@ def serve_cmd(
     progress_registry = ReceiveProgressRegistry()
     landing_root.mkdir(parents=True, exist_ok=True)
 
-    grpc_server = make_server(
+    parts = make_server(
         GrpcServerConfig(
             engine=engine,
             landing_root=landing_root,
@@ -104,6 +104,9 @@ def serve_cmd(
         grpc_pki_dir=pki_dir,
         grpc_progress_registry=progress_registry,
     )
+    # The restore service must be started before any call can reach it (RSR D7).
+    parts.restore_service.start()
+    grpc_server = parts.server
     grpc_server.start()
     sweep_stop, sweep_thread = start_sweep_loop(landing_root)
     registry_stop, registry_thread = start_registry_sweep_loop(registry)
@@ -125,6 +128,7 @@ def serve_cmd(
                 api_socket.unlink()
     finally:
         grpc_server.stop(grace=5)
+        parts.restore_service.stop()
         sweep_stop.set()
         registry_stop.set()
         sweep_thread.join(timeout=5)
