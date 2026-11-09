@@ -256,7 +256,6 @@ class _PreparedOpen:
     item_id: int
     device_id: str
     artifactclass: str
-    original_state: str
     manifest: _ManifestFile
     manifest_sha256: bytes
     plan: RestorePlan | None
@@ -855,9 +854,12 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                         .order_by(attempt.attempt_no.desc())
                         .limit(1)
                     )
-            except IntegrityError:
-                # Either unique index (one open attempt per item; attempt_no)
-                # fired: a concurrent admission won.
+            except IntegrityError as exc:
+                # Only the two unique constraints (one open attempt per item;
+                # attempt_no) mean a concurrent admission won; anything else
+                # is a fault and propagates.
+                if not _is_open_attempt_conflict(exc):
+                    raise
                 _abort(context, grpc.StatusCode.ALREADY_EXISTS, _OPEN_IN_PROGRESS)
             assert attempt_id is not None
             entry = _AttemptEntry(
@@ -1024,7 +1026,6 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     item_id=item.id,
                     device_id=identity.device_id,
                     artifactclass=item.artifactclass,
-                    original_state=item.state,
                     manifest=manifest,
                     manifest_sha256=digest,
                     plan=None,
@@ -1041,7 +1042,6 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     item_id=item.id,
                     device_id=identity.device_id,
                     artifactclass=item.artifactclass,
-                    original_state=ITEM_QUEUED if item.state == ITEM_STREAMING else item.state,
                     manifest=manifest,
                     manifest_sha256=digest,
                     plan=None,
@@ -1112,7 +1112,6 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 item_id=item.id,
                 device_id=identity.device_id,
                 artifactclass=item.artifactclass,
-                original_state=ITEM_QUEUED if item.state == ITEM_STREAMING else item.state,
                 manifest=manifest,
                 manifest_sha256=digest,
                 plan=plan,
@@ -1763,6 +1762,22 @@ def _assignment_proto(item: RestoreRequestItem) -> Any:
         destination_id=item.request.destination_id,
         state=item.state,
     )
+
+
+# What the two dialects say when the attempt insert hits D2's unique constraints:
+# PostgreSQL names the constraint, SQLite the columns (both start with the item).
+_ATTEMPT_UNIQUE_MARKERS = (
+    "uq_restore_item_attempt_open",
+    "uq_restore_item_attempt_item_no",
+    "restore_item_attempt.restore_request_item_id",
+)
+
+
+def _is_open_attempt_conflict(exc: IntegrityError) -> bool:
+    """True when the attempt insert failed on the open-attempt index or ``(item, attempt_no)``."""
+
+    text = str(exc.orig) if exc.orig is not None else str(exc)
+    return any(marker in text for marker in _ATTEMPT_UNIQUE_MARKERS)
 
 
 def _lease_matches(lease: _Lease) -> Any:

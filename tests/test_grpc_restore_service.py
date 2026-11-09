@@ -20,6 +20,7 @@ from typing import Any
 import grpc
 import pytest
 from sqlalchemy import Engine, func, select
+from sqlalchemy import update as sql_update
 
 from sutradhara._proto import restore_pb2, restore_pb2_grpc
 from sutradhara.api.live_capabilities import LiveCapabilityResolver
@@ -68,10 +69,12 @@ from sutradhara.hdcache.alarms import (
     restore_event_alarm_sink,
 )
 from sutradhara.hdcache.manager import (
+    CacheServeFailed,
     RestoreConfig,
     RestoreEvent,
     _emit,
     bind_restore_event_sink_to_engine,
+    rederive_request_state,
 )
 from sutradhara.hdcache.models import (
     CacheDisk,
@@ -84,7 +87,7 @@ from sutradhara.hdcache.models import (
     RestoreRequestItem,
     RestoreServerInstance,
 )
-from sutradhara.hdcache.restore_retry import giveup_agreement_violations
+from sutradhara.hdcache.restore_retry import compose_last_error, giveup_agreement_violations
 from sutradhara.hdcache.store import (
     AEAD_REPRESENTATION,
     RAW_REPRESENTATION,
@@ -266,7 +269,8 @@ class _HookService(RestoreService):
     ``before_lease`` runs before the lease transaction; ``lease_row`` rewrites
     the row the lease CAS re-reads (the race inside one call); ``before_streaming``
     runs between the lease and ``_mark_streaming``; ``chunks`` wraps the source
-    iterator the stream reads.
+    iterator the stream reads; ``before_insert`` runs between D5's pre-check and
+    the attempt insert.
     """
 
     def __init__(
@@ -277,12 +281,19 @@ class _HookService(RestoreService):
         lease_row: Any = None,
         before_streaming: Any = None,
         chunks: Any = None,
+        before_insert: Any = None,
     ) -> None:
         super().__init__(config)
         self.before_lease = before_lease
         self.lease_row = lease_row
         self.before_streaming = before_streaming
         self.chunks = chunks
+        self.before_insert = before_insert
+
+    def _insert_attempt(self, context: Any, cell: Any, **fields: Any) -> Any:
+        if self.before_insert is not None:
+            self.before_insert(fields["item_id"])
+        return super()._insert_attempt(context, cell, **fields)
 
     def _acquire_lease(self, prepared: Any, context: Any, entry: Any) -> Any:
         if self.before_lease is not None:
@@ -2171,15 +2182,9 @@ def test_open_prepared_cache_source_never_probes_recovery(
 
 # ---- RSR-1b: the attempt ledger's writer (design RSR D2, D3, D6) ------------------
 
-# The owner's two terminal sentences, verbatim (D-RSRP-6).
-_TAPE_ONLY_SENTENCE = (
-    "this item's usable copies are on tape, which agent delivery cannot read yet; "
-    "request server-local delivery"
-)
-_LEASE_EXPIRED_SENTENCE = (
-    "the transfer took longer than the 30-minute delivery lease, which is not renewed "
-    "yet; request server-local delivery"
-)
+# The owner's two terminal sentences (D-RSRP-6), composed by the one composer, not copied.
+_TAPE_ONLY_SENTENCE = compose_last_error("error", "tape_only", None)
+_LEASE_EXPIRED_SENTENCE = compose_last_error("error", "lease_expired", None)
 
 
 def _pl(suffix: str) -> bytes:
@@ -2246,16 +2251,16 @@ def _giveup_of(session: Any, item_id: int) -> RestoreItemGiveup | None:
 
 def _open_collect(
     service: RestoreService, item_id: int, context: _Context, **fields: Any
-) -> tuple[list[Any], BaseException | None]:
-    """Drive one open to its end; return the frames and the exception that ended it, if any."""
+) -> tuple[list[Any], BaseException | None, RestoreService]:
+    """Drive one open to its end; return the frames, the exception that ended it (if any), and the service."""
 
     frames: list[Any] = []
     request = restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id, **fields)
     try:
         frames.extend(service.OpenRestore(request, context))
     except BaseException as exc:
-        return frames, exc
-    return frames, None
+        return frames, exc, service
+    return frames, None, service
 
 
 def _pull_until_job_end(stream: Iterator[Any]) -> list[Any]:
@@ -2310,7 +2315,9 @@ def _raising_chunks(
 
 
 _Context_factory = Callable[[str], _Context]
-_Driver = Callable[[_Rig, pytest.MonkeyPatch, _Context_factory, str], tuple[int, list[Any], Any]]
+_Driver = Callable[
+    [_Rig, pytest.MonkeyPatch, _Context_factory, str], tuple[int, list[Any], Any, RestoreService]
+]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2325,6 +2332,7 @@ class _ExitCase:
     blocked: str = "none"  # none | future | past
     opened_from: str = "queued"
     prior_rows: int = 0
+    message_length: int | None = None  # the stored message's exact length, when pinned
 
 
 def _with_hooks(rig: _Rig, **hooks: Any) -> _HookService:
@@ -2345,13 +2353,13 @@ def _d_capacity(rig: _Rig, _mp: Any, ctx: _Context_factory, tag: str) -> Any:
             restore_pb2.OpenRestoreRequest(restore_request_item_id=first_id), holder_context
         )
         assert next(holder).HasField("manifest_head")
-        frames, exc = _open_collect(service, second_id, ctx("receiver"))
+        frames, exc, _ = _open_collect(service, second_id, ctx("receiver"))
         holder_context.active = False
         with pytest.raises(grpc.RpcError):
             list(holder)
     finally:
         service.stop()
-    return second_id, frames, exc
+    return second_id, frames, exc, service
 
 
 def _d_destination(rig: _Rig, _mp: Any, ctx: _Context_factory, tag: str) -> Any:
@@ -2621,14 +2629,14 @@ def _d_revealed_replay(rig: _Rig, _mp: Any, ctx: _Context_factory, tag: str) -> 
             restore_pb2.OpenRestoreRequest(restore_request_item_id=holder_id), holder_context
         )
         assert next(holder).HasField("manifest_head")
-        frames, exc = _open_collect(service, item_id, ctx("receiver"))
+        frames, exc, _ = _open_collect(service, item_id, ctx("receiver"))
         assert [frame.WhichOneof("payload") for frame in frames] == ["job_end"]
         holder_context.active = False
         with pytest.raises(grpc.RpcError):
             list(holder)
     finally:
         service.stop()
-    return item_id, frames, exc
+    return item_id, frames, exc, service
 
 
 def _d_cancelled_inactive(rig: _Rig, _mp: Any, ctx: _Context_factory, tag: str) -> Any:
@@ -2642,12 +2650,30 @@ def _d_cancelled_inactive(rig: _Rig, _mp: Any, ctx: _Context_factory, tag: str) 
     try:
         frames.extend(stream)
     except BaseException as exc:
-        return item_id, frames, exc
-    return item_id, frames, None
+        return item_id, frames, exc, rig.service
+    return item_id, frames, None, rig.service
 
 
 _DENIED = grpc.StatusCode.PERMISSION_DENIED
+_LONG_TEXT = "x" * 3000
 _EXIT_CASES: dict[str, _ExitCase] = {
+    "server_error_in_stream_value_error": _ExitCase(
+        drive=_d_in_stream(lambda: ValueError(_LONG_TEXT), "valueerror"),
+        end_kind="error",
+        cause="server_error",
+        raises=ValueError,
+        code=None,
+        message_length=2000,
+    ),
+    "source_unavailable_in_stream_cache_serve_failed": _ExitCase(
+        drive=_d_in_stream(
+            lambda: CacheServeFailed("io", "cache read failed mid-stream", mark_lost=False), "csf"
+        ),
+        end_kind="error",
+        cause="source_unavailable",
+        raises=None,
+        code=None,
+    ),
     "capacity": _ExitCase(
         drive=_d_capacity,
         end_kind="error",
@@ -2807,11 +2833,17 @@ def _check_exit_case(
     rig: _Rig, monkeypatch: pytest.MonkeyPatch, name: str, ctx: _Context_factory, *, tag: str
 ) -> None:
     case = _EXIT_CASES[name]
-    item_id, _frames, exc = case.drive(rig, monkeypatch, ctx, tag)
+    item_id, _frames, exc, service = case.drive(rig, monkeypatch, ctx, tag)
     rows = _attempt_rows(rig, item_id)
     assert len(rows) == case.prior_rows + 1, [(r.end_kind, r.cause) for r in rows]
     row = rows[-1]
     assert (row.end_kind, row.cause) == (case.end_kind, case.cause)
+    # An attempt that ended normally has left the registry (B4).
+    assert row.id not in service._registry
+    assert row.message is None or len(row.message) <= 2000
+    if case.message_length is not None:
+        assert row.message is not None
+        assert len(row.message) == case.message_length
     assert row.opened_from_state == case.opened_from
     assert row.ended_at is not None
     assert row.closed_at is None
@@ -2862,7 +2894,7 @@ def test_e3_tape_only_item_fails_at_once_with_the_owners_sentence(fresh_rig: _Ri
     rig = fresh_rig
     item_id = _seed_item(rig, "e3-tape", _pl("e3-tape"), receiver="receiver")
     _make_tape_only(rig, "e3-tape")
-    _frames, exc = _open_collect(rig.service, item_id, rig.context("receiver"))
+    _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
     assert isinstance(exc, _Abort)
     assert exc.code == grpc.StatusCode.FAILED_PRECONDITION
     (row,) = _attempt_rows(rig, item_id)
@@ -2887,13 +2919,12 @@ def test_e3_eight_counted_failures_give_up_and_seven_do_not(fresh_rig: _Rig) -> 
     for attempt in range(1, 9):
         if attempt > 1:
             _age_history(rig, item_id)
-        _frames, exc = _open_collect(rig.service, item_id, rig.context("receiver"))
+        _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
         assert isinstance(exc, _Abort)
         assert exc.code == grpc.StatusCode.FAILED_PRECONDITION
         rows = _attempt_rows(rig, item_id)
         assert len(rows) == attempt
-        assert rows[-1].end_kind == "error"
-        assert rows[-1].cause in {"source_integrity", "source_unavailable"}
+        assert (rows[-1].end_kind, rows[-1].cause) == ("error", "source_integrity")
         with session_scope(rig.engine) as session:
             item = session.get(RestoreRequestItem, item_id)
             assert item is not None
@@ -2911,7 +2942,7 @@ def test_e3_eight_counted_failures_give_up_and_seven_do_not(fresh_rig: _Rig) -> 
                 assert item.detail.startswith("gave up after 8 failed tries: ")
                 assert item.request.state == "completed_with_errors"
     # A ninth open meets the failed state before admission: no row.
-    _frames, exc = _open_collect(rig.service, item_id, rig.context("receiver"))
+    _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
     assert isinstance(exc, _Abort)
     assert exc.details == "item is not streamable"
     assert len(_attempt_rows(rig, item_id)) == 8
@@ -2934,19 +2965,19 @@ def test_e4_admission_backs_off_after_a_counted_failure_and_not_after_an_interru
 ) -> None:
     item_id = _seed_item(rig, "e4-backoff", _pl("e4-backoff"), receiver="receiver")
     _corrupt_archive(rig, "e4-backoff")
-    _frames, exc = _open_collect(rig.service, item_id, rig.context("receiver"))
+    _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
     assert isinstance(exc, _Abort)
     assert exc.code == grpc.StatusCode.FAILED_PRECONDITION
     assert len(_attempt_rows(rig, item_id)) == 1
     # The second open is refused before admission: no row.
-    _frames, exc = _open_collect(rig.service, item_id, rig.context("receiver"))
+    _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
     assert isinstance(exc, _Abort)
     assert exc.code == grpc.StatusCode.FAILED_PRECONDITION
     assert exc.details == "restore item is waiting before its next try"
     assert len(_attempt_rows(rig, item_id)) == 1
     # Aged, it is admitted again.
     _age_history(rig, item_id)
-    _frames, exc = _open_collect(rig.service, item_id, rig.context("receiver"))
+    _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
     assert isinstance(exc, _Abort)
     assert exc.details != "restore item is waiting before its next try"
     assert len(_attempt_rows(rig, item_id)) == 2
@@ -2970,7 +3001,7 @@ def test_e4_admission_backs_off_after_a_counted_failure_and_not_after_an_interru
                 code_version="test",
             )
         )
-    _frames, exc = _open_collect(rig.service, pending_id, rig.context("receiver"))
+    _frames, exc, _ = _open_collect(rig.service, pending_id, rig.context("receiver"))
     assert isinstance(exc, _Abort)
     assert exc.code == grpc.StatusCode.FAILED_PRECONDITION
     assert exc.details == "restore item will not be retried"
@@ -2985,7 +3016,7 @@ def test_e4_admission_backs_off_after_a_counted_failure_and_not_after_an_interru
     stream.close()  # type: ignore[attr-defined]
     (interrupted,) = _attempt_rows(rig, quick_id)
     assert (interrupted.end_kind, interrupted.cause) == ("cancelled", None)
-    frames, exc = _open_collect(rig.service, quick_id, rig.context("receiver"))
+    frames, exc, _ = _open_collect(rig.service, quick_id, rig.context("receiver"))
     assert exc is None
     assert frames[-1].HasField("job_end")
     assert len(_attempt_rows(rig, quick_id)) == 2
@@ -3103,7 +3134,7 @@ def test_e8_the_fence_refuses_a_call_whose_attempt_recovery_closed(rig: _Rig) ->
 
     service = _with_hooks(rig, before_lease=close_the_attempt)
     try:
-        _frames, exc = _open_collect(service, item_id, rig.context("receiver"))
+        _frames, exc, _ = _open_collect(service, item_id, rig.context("receiver"))
     finally:
         service.stop()
     assert isinstance(exc, _Abort)
@@ -3132,6 +3163,7 @@ def test_e10_closing_the_generator_on_an_active_context_records_cancelled(rig: _
     stream.close()  # type: ignore[attr-defined]
     (row,) = _attempt_rows(rig, item_id)
     assert (row.end_kind, row.cause) == ("cancelled", None)
+    assert row.id not in rig.service._registry
     with session_scope(rig.engine) as session:
         item = session.get(RestoreRequestItem, item_id)
         assert item is not None
@@ -3139,3 +3171,168 @@ def test_e10_closing_the_generator_on_an_active_context_records_cancelled(rig: _
         lease = session.get(RestoreOpenSession, item_id)
         assert lease is not None
         assert lease.expires_at <= dt.datetime.now(dt.UTC).replace(tzinfo=None)
+
+
+def test_rederive_request_state_sees_a_core_write_to_an_item_held_in_the_session(
+    tmp_path: Path,
+) -> None:
+    """D6 step 4: the request is derived from the rows as written, not from stale held objects."""
+
+    engine = make_engine(f"sqlite:///{tmp_path / 'rederive.db'}")
+    create_all(engine)
+    try:
+        with session_scope(engine) as session:
+            request = RestoreRequest(
+                id="held",
+                identity="ada",
+                destination_id="d",
+                delivery_mode="server_local",
+                state="active",
+            )
+            for n in (1, 2):
+                session.add(LogicalAsset(content_sha256=bytes([n]) * 32, size_bytes=1))
+                request.items.append(
+                    RestoreRequestItem(
+                        content_sha256=bytes([n]) * 32, artifactclass="x", state="sent"
+                    )
+                )
+            session.add(request)
+        with session_scope(engine) as session:
+            held = session.scalars(select(RestoreRequestItem)).first()
+            assert held is not None
+            assert len(held.request.items) == 2  # the request and both items are held
+            session.connection().execute(
+                sql_update(RestoreRequestItem).values(state="done", detail=None)
+            )
+            rederive_request_state(session, "held")
+            assert held.request.state == "completed"
+            assert [item.state for item in held.request.items] == ["done", "done"]
+        with session_scope(engine) as session:
+            stored = session.get(RestoreRequest, "held")
+            assert stored is not None
+            assert stored.state == "completed"
+    finally:
+        engine.dispose()
+
+
+def _fail_tape_only(rig: _Rig, suffix: str) -> int:
+    item_id = _seed_item(rig, suffix, _pl(suffix), receiver="receiver")
+    _make_tape_only(rig, suffix)
+    _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+    assert isinstance(exc, _Abort)
+    return item_id
+
+
+def test_giveup_agreement_check_reports_a_detail_that_is_not_the_composed_text(
+    fresh_rig: _Rig,
+) -> None:
+    rig = fresh_rig
+    item_id = _fail_tape_only(rig, "agreement-detail")
+    with session_scope(rig.engine) as session:
+        assert giveup_agreement_violations(session) == []
+    _set_item(rig, item_id, detail="edited by hand")
+    with session_scope(rig.engine) as session:
+        assert giveup_agreement_violations(session) == [
+            f"item {item_id}: detail 'edited by hand' is not the composed text "
+            f"{_TAPE_ONLY_SENTENCE!r}"
+        ]
+
+
+def test_giveup_agreement_check_reports_a_give_up_whose_item_is_not_failed(
+    fresh_rig: _Rig,
+) -> None:
+    rig = fresh_rig
+    item_id = _fail_tape_only(rig, "agreement-state")
+    _set_item(rig, item_id, state="queued")
+    with session_scope(rig.engine) as session:
+        giveup = _giveup_of(session, item_id)
+        assert giveup is not None
+        assert giveup_agreement_violations(session) == [
+            f"give-up {giveup.id}: item {item_id} is 'queued', not failed"
+        ]
+
+
+def test_e7_a_failing_delivery_end_aborts_and_keeps_the_entry_marked_delivered(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item_id = _seed_item(rig, "e7-delivery", _pl("e7-delivery"), receiver="receiver")
+    real_end = rig.service._end_transaction
+
+    def boom(entry: Any, *, deliver: bool) -> Any:
+        if deliver:
+            raise RuntimeError("the database went away at the delivery")
+        return real_end(entry, deliver=deliver)
+
+    monkeypatch.setattr(rig.service, "_end_transaction", boom)
+    slots_before = rig.service._slots._value
+    frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+    assert frames[-1].HasField("job_end")
+    assert isinstance(exc, _Abort)
+    assert exc.code == grpc.StatusCode.ABORTED
+    assert exc.details == "the delivery was not recorded"
+    assert rig.service._slots._value == slots_before
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        assert item.state == "streaming"
+    (row,) = _attempt_rows(rig, item_id)
+    assert row.end_kind is None
+    entry = rig.service._registry[row.id]
+    assert entry.ended is True
+    assert (entry.outcome.end_kind, entry.outcome.cause, entry.klass) == (
+        "job_end",
+        None,
+        "delivered",
+    )
+    # Recovery (RSR-1e) owns this entry; drop it so the module rig stays clean.
+    rig.service._registry.pop(row.id)
+
+
+def test_a_concurrent_admission_between_the_pre_check_and_the_insert_is_refused_without_a_row(
+    rig: _Rig,
+) -> None:
+    item_id = _seed_item(rig, "race-insert", _pl("race-insert"), receiver="receiver")
+
+    def another_open_wins(raced_id: int) -> None:
+        with session_scope(rig.engine) as session:
+            session.add(
+                RestoreItemAttempt(
+                    restore_request_item_id=raced_id,
+                    attempt_no=1,
+                    receiver_device_id="receiver",
+                    server_instance_id=rig.service.instance_id,
+                    opened_from_state="queued",
+                    opened_at=dt.datetime.now(dt.UTC),
+                    code_version="test",
+                )
+            )
+
+    service = _with_hooks(rig, before_insert=another_open_wins)
+    try:
+        _frames, exc, _ = _open_collect(service, item_id, rig.context("receiver"))
+    finally:
+        service.stop()
+    assert isinstance(exc, _Abort)
+    assert exc.code == grpc.StatusCode.ALREADY_EXISTS
+    assert exc.details == "another open of this item is in progress"
+    (row,) = _attempt_rows(rig, item_id)  # only the other open's row
+    assert row.end_kind is None
+    assert row.code_version == "test"
+    assert service._registry == {}
+
+
+def test_pre_admission_refusals_for_item_id_missing_and_not_started_write_no_row(rig: _Rig) -> None:
+    item_id = _seed_item(rig, "pre-admission", _pl("pre-admission"), receiver="receiver")
+    rows_before = _attempt_count(rig)
+    unstarted = RestoreService(rig.service_config)
+    for service, requested_id, code, details in (
+        (rig.service, 0, grpc.StatusCode.FAILED_PRECONDITION, "restore item id must be positive"),
+        (rig.service, -1, grpc.StatusCode.FAILED_PRECONDITION, "restore item id must be positive"),
+        (rig.service, 10**9, grpc.StatusCode.FAILED_PRECONDITION, "restore item is unavailable"),
+        (unstarted, item_id, grpc.StatusCode.UNAVAILABLE, "restore service is not started"),
+    ):
+        _frames, exc, _ = _open_collect(service, requested_id, rig.context("receiver"))
+        assert isinstance(exc, _Abort)
+        assert (exc.code, exc.details) == (code, details)
+    assert _attempt_count(rig) == rows_before
+    assert _attempt_rows(rig, item_id) == []
