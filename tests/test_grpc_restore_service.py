@@ -3500,6 +3500,123 @@ def test_k3_a_claim_above_the_stored_value_is_not_adopted(rig: _Rig) -> None:
     assert _checkpoint_of(rig, item_id) == (1, False)
 
 
+def test_k3_a_claim_above_a_stored_zero_streams_the_file_and_stores_zero(rig: _Rig) -> None:
+    """A claim of 1 against a stored 0 is not adopted: the plan starts from the
+    server's lower value, the file is sent, and the stored value stays 0."""
+
+    payload = _pl("k3-claim-one")
+    item_id = _seed_item(rig, "k3-claim-one", payload, receiver="receiver")
+    context = rig.context("receiver")
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), context
+    )
+    head = next(stream).manifest_head  # the lease is granted; nothing acknowledged
+    # Closed while the lease is live: an interruption (``cancelled``), the item
+    # returned to ``queued`` and the lease expired by the end, so it reopens at once.
+    stream.close()  # type: ignore[attr-defined]
+    assert _checkpoint_of(rig, item_id) == (0, False)
+
+    frames = list(
+        rig.service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(
+                restore_request_item_id=item_id, **_resume_fields(item_id, head, 1)
+            ),
+            rig.context("receiver"),
+        )
+    )
+
+    assert "file_header" in _kinds(frames)
+    assert frames[-1].job_end.files == 1
+    assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+    assert _checkpoint_of(rig, item_id) == (0, False)
+
+
+class _CountingFactory:
+    """Counts the sessions a service opens; delegates to the real factory."""
+
+    def __init__(self, real: Any) -> None:
+        self.real = real
+        self.calls = 0
+        self.begins = 0
+
+    def __call__(self) -> Any:
+        self.calls += 1
+        return self.real()
+
+    def begin(self) -> Any:
+        self.begins += 1
+        return self.real.begin()
+
+
+class _PrepareCountingService(RestoreService):
+    """Count the sessions ``_prepare_open`` opens (its own one, and no other)."""
+
+    def __init__(self, config: RestoreServiceConfig) -> None:
+        super().__init__(config)
+        self.prepare_sessions: list[tuple[int, int]] = []
+
+    def _prepare_open(self, request: Any, identity: Any, context: Any, entry: Any) -> Any:
+        counting = _CountingFactory(self._factory)
+        self._factory = counting  # type: ignore[assignment]
+        try:
+            return super()._prepare_open(request, identity, context, entry)
+        finally:
+            self._factory = counting.real
+            self.prepare_sessions.append((counting.calls, counting.begins))
+
+
+def test_the_probe_path_opens_no_second_session_during_preparation(rig: _Rig) -> None:
+    """D-RSRP-14: a cache pass, a corrupt cache entry through the funnel with
+    the disk fallback, and a tape-only refusal each use ``_prepare_open``'s one
+    session (``_factory()`` once, ``_factory.begin()`` never)."""
+
+    service = _started(_PrepareCountingService(rig.service_config))
+    try:
+        payload = _pl("no2s-cache")
+        cache_id = _seed_item(rig, "no2s-cache", payload, receiver="receiver")
+        _seed_cache_entry(rig, cache_id, payload)
+        frames = list(
+            service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=cache_id),
+                rig.context("receiver"),
+            )
+        )
+        assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+
+        payload = _pl("no2s-corrupt")
+        corrupt_id = _seed_item(rig, "no2s-corrupt", payload, receiver="receiver")
+        _seed_cache_entry(rig, corrupt_id, payload).write_bytes(b"corrupt cache bytes")
+        frames = list(
+            service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=corrupt_id),
+                rig.context("receiver"),
+            )
+        )
+        assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+
+        payload = _pl("no2s-tape")
+        tape_id = _seed_item(rig, "no2s-tape", payload, receiver="receiver")
+        _seed_cache_entry(rig, tape_id, payload).write_bytes(b"corrupt cache bytes")
+        _make_tape_only(rig, "no2s-tape")
+        _frames, exc, _ = _open_collect(service, tape_id, rig.context("receiver"))
+        assert isinstance(exc, _Abort)
+        (row,) = _attempt_rows(rig, tape_id)
+        assert (row.end_kind, row.cause) == ("error", "tape_only")
+    finally:
+        service.stop()
+
+    assert service.prepare_sessions == [(1, 0), (1, 0), (1, 0)]
+    with session_scope(rig.engine) as session:
+        for item_id in (cache_id, corrupt_id):
+            row = session.scalar(
+                select(RestoreItemAttempt).where(
+                    RestoreItemAttempt.restore_request_item_id == item_id
+                )
+            )
+            assert row is not None
+            assert row.probe_ended_at is not None  # the evidence was committed
+
+
 def test_k3_an_open_refused_for_a_live_lease_leaves_the_stored_value_unchanged(
     rig: _Rig,
 ) -> None:

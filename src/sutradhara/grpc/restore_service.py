@@ -189,11 +189,10 @@ class _Outcome:
     bytes_sent: int = 0
     slot_taken: bool = False
     fenced: bool = False
-    # The probe's evidence (D2): the source the open streams from, the sources
-    # read, and the reason the cache entry failed (no end: the open goes on).
+    # The probe's evidence (D2): the source the open streams from and the
+    # sources read. A failed cache probe sets no end: the open goes on.
     probe_source: str | None = None
     probe_candidates: int = 0
-    probe_failure: str | None = None
 
     @property
     def decided(self) -> bool:
@@ -1095,7 +1094,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             ):
                 cache_entry_hash = cache_entry.content_sha256
                 cell.probe_source = "cache"
-                self._record_probe_evidence(entry)
+                self._record_probe_evidence(session, entry)
             else:
                 backends = self.config.backend_resolver(session, item.artifactclass)
                 plan = build_restore_plan(
@@ -1109,8 +1108,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     try:
                         member = _select_verified_disk_member(plan, manifest, cell)
                         cell.probe_source = "disk"
-                        session.commit()  # the SUSPECT marks, before the evidence
-                        self._record_probe_evidence(entry)
+                        # One commit: the SUSPECT marks and the probe's evidence.
+                        self._record_probe_evidence(session, entry)
                     except TapeSourceDeferred as exc:
                         plan.close()
                         # A fresh Core read, not session.get: a present cache entry
@@ -1123,7 +1122,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                         cause = (
                             "cache_disk_unavailable" if entry_state == "present" else "tape_only"
                         )
-                        self._record_probe_evidence(entry)
+                        self._record_probe_evidence(session, entry)
                         _refuse(
                             context,
                             cell,
@@ -1132,8 +1131,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                             cause=cause,
                         )
                     except RestoreIntegrityError as exc:
-                        session.commit()  # the SUSPECT marks, before the evidence
-                        self._record_probe_evidence(entry)
+                        # One commit: the SUSPECT marks and the probe's evidence.
+                        self._record_probe_evidence(session, entry)
                         plan.close()
                         _refuse(
                             context,
@@ -1144,7 +1143,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                         )
                     except RestoreSourceUnavailable as exc:
                         plan.close()
-                        self._record_probe_evidence(entry)
+                        self._record_probe_evidence(session, entry)
                         _refuse(
                             context,
                             cell,
@@ -1174,28 +1173,28 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 outcome=cell,
             )
 
-    def _record_probe_evidence(self, entry: _AttemptEntry) -> None:
-        """C5: the probe's three columns, a short transaction of their own, on the open attempt.
+    def _record_probe_evidence(self, session: Session, entry: _AttemptEntry) -> None:
+        """C5: the probe's three columns on the open attempt, committed on their own.
 
-        Callers commit ``_prepare_open``'s own session first: on SQLite a
-        pending write there would hold this transaction for the busy timeout.
+        Written in ``_prepare_open``'s own session and committed there
+        (D-RSRP-14): no second session is opened while an open is prepared.
         """
 
         cell = entry.outcome
-        with self._factory.begin() as session:
-            session.connection().execute(
-                update(RestoreItemAttempt)
-                .where(
-                    RestoreItemAttempt.id == entry.attempt_id,
-                    RestoreItemAttempt.ended_at.is_(None),
-                    RestoreItemAttempt.closed_at.is_(None),
-                )
-                .values(
-                    probe_source=cell.probe_source,
-                    probe_candidates_tried=cell.probe_candidates,
-                    probe_ended_at=func.now(),
-                )
+        session.connection().execute(
+            update(RestoreItemAttempt)
+            .where(
+                RestoreItemAttempt.id == entry.attempt_id,
+                RestoreItemAttempt.ended_at.is_(None),
+                RestoreItemAttempt.closed_at.is_(None),
             )
+            .values(
+                probe_source=cell.probe_source,
+                probe_candidates_tried=cell.probe_candidates,
+                probe_ended_at=func.now(),
+            )
+        )
+        session.commit()
 
     def _probe_cache_entry(
         self, session: Session, entry: CacheEntry, item: RestoreRequestItem, cell: _Outcome
@@ -1205,7 +1204,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         A failure goes through the cache failure funnel with this session's
         bound config and is committed at once (the funnel deletes the file and
         only flushes its rows; the refusals after this close the session
-        without a commit). The cell keeps the reason; the open goes on.
+        without a commit). The reason is in the funnel's event; the open goes on.
         """
 
         if item.size_bytes is None:
@@ -1235,7 +1234,6 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 destination_id=None if item.request is None else item.request.destination_id,
             )
             session.commit()
-            cell.probe_failure = exc.reason
             LOG.warning(
                 "restore item %s: cache probe failed (%s); falling back to the archive",
                 item.id,
@@ -1621,12 +1619,23 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 )
                 if end.rowcount != 1:
                     raise _AlreadyClosed
-                # Step 3: an undelivered lease returns the item and expires.
+                # Step 3: an undelivered lease expires and returns the item:
+                # the lease row first, then the item, the one lock order every
+                # transaction writing both rows keeps (D-RSRP-13). The item's
+                # condition matches on the generation, not the expiry.
                 if lease is not None and not sent:
                     return_state = (
                         ITEM_QUEUED
                         if entry.opened_from_state == ITEM_STREAMING
                         else entry.opened_from_state
+                    )
+                    conn.execute(
+                        update(RestoreOpenSession)
+                        .where(
+                            RestoreOpenSession.restore_request_item_id == lease.item_id,
+                            _lease_matches(lease),
+                        )
+                        .values(expires_at=now, updated_at=now)
                     )
                     conn.execute(
                         update(RestoreRequestItem)
@@ -1636,14 +1645,6 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                             RestoreRequestItem.open_session.has(_lease_matches(lease)),
                         )
                         .values(state=return_state, bytes_restored=0, updated_at=now)
-                    )
-                    conn.execute(
-                        update(RestoreOpenSession)
-                        .where(
-                            RestoreOpenSession.restore_request_item_id == lease.item_id,
-                            _lease_matches(lease),
-                        )
-                        .values(expires_at=now, updated_at=now)
                     )
                 # Step 4: the request state, under the request row's lock.
                 rederive_request_state(session, entry.request_id)
