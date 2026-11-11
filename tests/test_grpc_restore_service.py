@@ -2054,12 +2054,16 @@ def test_d_c_commit_executor_matches_stream_limit_and_stops_with_service(rig: _R
         service._commit_executor.submit(lambda: None)
 
 
-def test_background_heartbeat_advances_and_stop_joins(rig: _Rig) -> None:
+def test_background_heartbeat_advances_and_stop_joins(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = RestoreService(
         replace(
             rig.service_config, heartbeat_seconds=0.05, staleness_threshold=dt.timedelta(seconds=4)
         )
     )
+    recovery_calls: list[None] = []
+    monkeypatch.setattr(service, "recover_once", lambda: recovery_calls.append(None))
     service.start(background=True)
     thread = service._heartbeat_thread
     assert thread is not None
@@ -2084,6 +2088,7 @@ def test_background_heartbeat_advances_and_stop_joins(rig: _Rig) -> None:
         assert unbroken > 0.0
         time.sleep(0.2)
         assert service.heartbeat_unbroken_seconds() > unbroken
+        assert recovery_calls
     finally:
         service.stop()
     # stop() joined the thread it captured above.
@@ -3262,7 +3267,7 @@ def test_e7_a_failing_end_transaction_still_releases_the_slot_and_closes_the_pla
 
     monkeypatch.setattr(RestorePlan, "close", counting_close)
 
-    def boom(_entry: Any, *, deliver: bool) -> Any:
+    def boom(_entry: Any, *, deliver: bool, margin: Any = None) -> Any:
         raise RuntimeError("the database went away")
 
     monkeypatch.setattr(rig.service, "_end_transaction", boom)
@@ -3422,10 +3427,10 @@ def test_e7_a_failing_delivery_end_aborts_and_keeps_the_entry_marked_delivered(
     item_id = _seed_item(rig, "e7-delivery", _pl("e7-delivery"), receiver="receiver")
     real_end = rig.service._end_transaction
 
-    def boom(entry: Any, *, deliver: bool) -> Any:
+    def boom(entry: Any, *, deliver: bool, margin: Any = None) -> Any:
         if deliver:
             raise RuntimeError("the database went away at the delivery")
-        return real_end(entry, deliver=deliver)
+        return real_end(entry, deliver=deliver, margin=margin)
 
     monkeypatch.setattr(rig.service, "_end_transaction", boom)
     slots_before = rig.service._slots._value

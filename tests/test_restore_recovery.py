@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import time
 from collections.abc import Iterator
 from dataclasses import replace
@@ -72,10 +73,11 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 
 def _healthy(service: RestoreService, clock: list[float]) -> None:
+    threshold = service.config.staleness_threshold.total_seconds()
     for _ in range(5):
-        clock[0] += 3
+        clock[0] += threshold * 0.3
         service.heartbeat_once()
-    assert service.heartbeat_unbroken_seconds() > 10
+    assert service.heartbeat_unbroken_seconds() > threshold
 
 
 def _item(rig: _Rig, name: str) -> int:
@@ -176,6 +178,32 @@ def test_r1_dead_instances_require_unbroken_heartbeat_and_stop_after_a_break(
     _assert_lost(rig, third)
 
 
+def test_r1_fresh_other_instance_is_not_closed_despite_expired_lease(
+    rig: _Rig, clock: list[float]
+) -> None:
+    """A long-expired lease alone does not make another live instance recoverable."""
+
+    item_id = _item(rig, "r1-fresh")
+    attempt_id = _abandoned(
+        rig,
+        item_id,
+        expiry=dt.datetime.now(dt.UTC)
+        - rig.service.config.staleness_threshold
+        - dt.timedelta(minutes=1),
+    )
+    with session_scope(rig.engine) as session:
+        owner_id = session.get(RestoreItemAttempt, attempt_id).server_instance_id
+        assert owner_id != rig.service.instance_id
+        session.get(RestoreServerInstance, owner_id).heartbeat_at = dt.datetime.now(dt.UTC)
+    _healthy(rig.service, clock)
+    rig.service.recover_once()
+    row = _attempt_rows(rig, item_id)[0]
+    assert (row.end_kind, row.ended_at, row.closed_at) == (None, None, None)
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreRequestItem, item_id).state == "streaming"
+        assert giveup_agreement_violations(session) == []
+
+
 def test_r1_eight_lost_closes_give_up(rig: _Rig, clock: list[float]) -> None:
     item_id = _item(rig, "r1-eight")
     _healthy(rig.service, clock)
@@ -272,7 +300,7 @@ def test_r3_failed_counted_end_retries_outside_registry_lock(
     entry.outcome.set("error", "source_integrity", "bad archive")
     real_end = rig.service._end_transaction
 
-    def fail(_entry: Any, *, deliver: bool) -> Any:
+    def fail(_entry: Any, *, deliver: bool, margin: Any = None) -> Any:
         raise RuntimeError("end write failed")
 
     with monkeypatch.context() as patch:
@@ -281,10 +309,10 @@ def test_r3_failed_counted_end_retries_outside_registry_lock(
             rig.service._end_attempt(entry, deliver=False)
     assert entry.ended
 
-    def checked(entry: Any, *, deliver: bool) -> Any:
+    def checked(entry: Any, *, deliver: bool, margin: Any = None) -> Any:
         assert rig.service._registry_lock.acquire(blocking=False)
         rig.service._registry_lock.release()
-        return real_end(entry, deliver=deliver)
+        return real_end(entry, deliver=deliver, margin=margin)
 
     monkeypatch.setattr(rig.service, "_end_transaction", checked)
     rig.service.recover_once()
@@ -295,16 +323,136 @@ def test_r3_failed_counted_end_retries_outside_registry_lock(
         assert summary.latest.cause == "source_integrity"
 
 
+def _cancelled_attempt(rig: _Rig, name: str, *, seconds: float = 1) -> service_module._AttemptEntry:
+    """Seed a leased cancellation whose first end can fail independently of the stream."""
+
+    item_id = _item(rig, name)
+    entry = rig.service._insert_attempt(
+        rig.context("receiver"),
+        _Outcome(end_kind="cancelled"),
+        item_id=item_id,
+        request_id=f"request-{name}",
+        device_id="receiver",
+        opened_from_state="queued",
+    )
+    expiry = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)
+    entry.lease = service_module._Lease(item_id, "receiver", b"c" * 32, 1, expiry)
+    with session_scope(rig.engine) as session:
+        session.add(
+            RestoreOpenSession(
+                restore_request_item_id=item_id,
+                receiver_device_id="receiver",
+                manifest_sha256=b"c" * 32,
+                generation=1,
+                expires_at=expiry,
+            )
+        )
+        session.get(RestoreItemAttempt, entry.attempt_id).lease_generation = 1
+        session.get(RestoreRequestItem, item_id).state = "streaming"
+    return entry
+
+
+def _assert_cancelled_interruption(rig: _Rig, item_id: int) -> None:
+    """Pin the persisted cancellation, retry counts, and give-up agreement together."""
+
+    row = _attempt_rows(rig, item_id)[0]
+    assert (row.end_kind, row.cause) == ("cancelled", None)
+    with session_scope(rig.engine) as session:
+        summary = attempt_summaries(session, [item_id])[item_id]
+        assert (summary.counted, summary.interruptions) == (0, 1)
+        assert session.get(RestoreRequestItem, item_id).state == "queued"
+        assert (
+            session.scalar(
+                select(RestoreItemGiveup).where(
+                    RestoreItemGiveup.restore_request_item_id == item_id
+                )
+            )
+            is None
+        )
+        assert giveup_agreement_violations(session) == []
+
+
+def test_r3_cancelled_end_retried_after_its_lease_lapsed_is_an_interruption(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An outage outlasting the lease must preserve the first cancellation's class."""
+
+    entry = _cancelled_attempt(rig, "r3-cancel-lapsed")
+    assert entry.lease is not None
+
+    def fail(_entry: Any, *, deliver: bool, margin: Any = None) -> Any:
+        raise RuntimeError("end write failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.service, "_end_transaction", fail)
+        with pytest.raises(RuntimeError, match="end write failed"):
+            rig.service._end_attempt(entry, deliver=False)
+    assert entry.first_end_at is not None
+    assert entry.first_end_at < entry.lease.expires_at
+    time.sleep(max(0, (entry.lease.expires_at - dt.datetime.now(dt.UTC)).total_seconds()) + 0.05)
+    rig.service.recover_once()
+    _assert_cancelled_interruption(rig, entry.item_id)
+
+
+def test_r3_cancelled_end_whose_lease_had_expired_at_the_first_try_stays_lease_expired(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retrying a genuinely expired cancellation must retain its terminal cause."""
+
+    entry = _cancelled_attempt(rig, "r3-cancel-expired", seconds=-1)
+
+    def fail(_entry: Any, *, deliver: bool, margin: Any = None) -> Any:
+        raise RuntimeError("end write failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.service, "_end_transaction", fail)
+        with pytest.raises(RuntimeError, match="end write failed"):
+            rig.service._end_attempt(entry, deliver=False)
+    rig.service.recover_once()
+    row = _attempt_rows(rig, entry.item_id)[0]
+    assert (row.end_kind, row.cause) == ("cancelled", "lease_expired")
+    with session_scope(rig.engine) as session:
+        assert giveup_agreement_violations(session) == []
+
+
+def test_r3_first_end_instant_is_kept_across_failed_retries(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second failed end after expiry must not advance the cancellation clock."""
+
+    entry = _cancelled_attempt(rig, "r3-cancel-twice")
+    assert entry.lease is not None
+
+    def fail(_entry: Any, *, deliver: bool, margin: Any = None) -> Any:
+        raise RuntimeError("end write failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.service, "_end_transaction", fail)
+        with pytest.raises(RuntimeError, match="end write failed"):
+            rig.service._end_attempt(entry, deliver=False)
+        first_end_at = entry.first_end_at
+        assert first_end_at is not None
+        assert first_end_at < entry.lease.expires_at
+        time.sleep(
+            max(0, (entry.lease.expires_at - dt.datetime.now(dt.UTC)).total_seconds()) + 0.05
+        )
+        with pytest.raises(RuntimeError, match="end write failed"):
+            rig.service._end_attempt(entry, deliver=False)
+        assert entry.first_end_at == first_end_at
+    rig.service.recover_once()
+    _assert_cancelled_interruption(rig, entry.item_id)
+
+
 def test_r3_failed_delivery_retries_as_server_error(
     rig: _Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     item_id = _item(rig, "r3-delivery")
     real_end = rig.service._end_transaction
 
-    def fail(entry: Any, *, deliver: bool) -> Any:
+    def fail(entry: Any, *, deliver: bool, margin: Any = None) -> Any:
         if deliver:
             raise RuntimeError("delivery write failed")
-        return real_end(entry, deliver=deliver)
+        return real_end(entry, deliver=deliver, margin=margin)
 
     with monkeypatch.context() as patch:
         patch.setattr(rig.service, "_end_transaction", fail)
@@ -357,9 +505,9 @@ def test_r3_already_closed_registry_entry_is_dropped(rig: _Rig) -> None:
     assert _attempt_rows(rig, item_id)[0].end_kind == "lost"
 
 
-@pytest.mark.parametrize("seconds", [0, -1, float("nan")])
+@pytest.mark.parametrize("seconds", [0, -1, float("nan"), math.inf, 1e12])
 def test_recovery_interval_is_positive(rig: _Rig, seconds: float) -> None:
-    with pytest.raises(ValueError, match="recovery interval"):
+    with pytest.raises(ValueError, match="recovery interval must be positive and finite"):
         replace(rig.service_config, recovery_seconds=seconds)
 
 
@@ -464,6 +612,13 @@ def test_r4_stranded_items_recover_only_when_heartbeat_is_healthy(
 def test_r4_stranding_rereads_after_lock(rig: _Rig, changed: str) -> None:
     item_id = _stranded(rig, "r4-reread")
     locked: list[str] = []
+    item_updates: list[str] = []
+
+    def count_item_updates(
+        _conn: Any, _cursor: Any, statement: str, _parameters: Any, _context: Any, _many: bool
+    ) -> None:
+        if locked and statement.lstrip().upper().startswith("UPDATE RESTORE_REQUEST_ITEM "):
+            item_updates.append(statement)
 
     def race(conn: Any, clause: Any, *_args: Any) -> None:
         if (
@@ -494,12 +649,15 @@ def test_r4_stranding_rereads_after_lock(rig: _Rig, changed: str) -> None:
                 )
 
     event.listen(rig.engine, "before_execute", race)
+    event.listen(rig.engine, "before_cursor_execute", count_item_updates)
     try:
         rig.service.recover_once()
     finally:
         event.remove(rig.engine, "before_execute", race)
+        event.remove(rig.engine, "before_cursor_execute", count_item_updates)
     assert len(locked) == 1
     assert "FOR UPDATE" in locked[0]
+    assert item_updates == []
     with session_scope(rig.engine) as session:
         item = session.get(RestoreRequestItem, item_id)
         assert (item.state, item.bytes_restored) == ("streaming", 9)
@@ -534,6 +692,7 @@ def test_r4_lowered_policy_applies_pending_giveup_with_non_wait_decisive_row(
     rig.service.recover_once()
     with session_scope(rig.engine) as session:
         assert session.get(RestoreRequestItem, item_id).state == state
+        assert giveup_agreement_violations(session) == []
     rig.service.heartbeat_once()
     rig.service.recover_once()
     with session_scope(rig.engine) as session:
@@ -547,6 +706,71 @@ def test_r4_lowered_policy_applies_pending_giveup_with_non_wait_decisive_row(
     with session_scope(rig.engine) as session:
         assert len(list(session.scalars(select(RestoreItemGiveup)))) == 1
         assert giveup_agreement_violations(session) == []
+
+
+def test_r3_one_failing_end_does_not_starve_the_pass(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A retained bad end must not prevent other ends or stranded-item recovery."""
+
+    entries = []
+    for name in ("r3-failing", "r3-succeeding"):
+        item_id = _item(rig, name)
+        entry = rig.service._insert_attempt(
+            rig.context("receiver"),
+            _Outcome(end_kind="error", cause="source_integrity"),
+            item_id=item_id,
+            request_id=f"request-{name}",
+            device_id="receiver",
+            opened_from_state="queued",
+        )
+        rig.service._keep_ended(entry)
+        entries.append(entry)
+    first, second = entries
+    stranded = _stranded(rig, "r3-beside-ends")
+    real_end = rig.service._end_transaction
+
+    def fail_first(entry: Any, *, deliver: bool, margin: Any = None) -> Any:
+        if entry.attempt_id == first.attempt_id:
+            raise RuntimeError("persistent end failure")
+        return real_end(entry, deliver=deliver, margin=margin)
+
+    monkeypatch.setattr(rig.service, "_end_transaction", fail_first)
+    rig.service.recover_once()
+    assert second.attempt_id not in rig.service._registry
+    row = _attempt_rows(rig, second.item_id)[0]
+    assert (row.end_kind, row.cause) == ("error", "source_integrity")
+    assert row.ended_at is not None
+    assert rig.service._registry[first.attempt_id] is first
+    assert first.ended
+    assert _attempt_rows(rig, first.item_id)[0].ended_at is None
+    assert f"attempt {first.attempt_id} (instance {rig.service.instance_id})" in caplog.text
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, stranded)
+        assert (item.state, item.bytes_restored) == ("queued", 0)
+        assert giveup_agreement_violations(session) == []
+
+
+def test_r5_recovery_pass_runs_at_start(rig: _Rig) -> None:
+    """A stranded item must recover before the first 60-second periodic interval."""
+
+    item_id = _stranded(rig, "r5-start")
+    service = RestoreService(replace(rig.service_config, recovery_seconds=60))
+    service.start(background=True)
+    try:
+        deadline = time.monotonic() + 2
+        recovered = False
+        while time.monotonic() < deadline:
+            with session_scope(rig.engine) as session:
+                recovered = session.get(RestoreRequestItem, item_id).state == "queued"
+            if recovered:
+                break
+            time.sleep(0.02)
+        assert recovered, "start did not recover the stranded item within 2 s"
+        with session_scope(rig.engine) as session:
+            assert giveup_agreement_violations(session) == []
+    finally:
+        service.stop()
 
 
 def test_r5_slow_recovery_does_not_age_heartbeat(

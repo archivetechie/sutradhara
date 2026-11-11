@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import logging
+import math
 import os
 import socket
 import struct
@@ -154,8 +155,11 @@ class RestoreServiceConfig:
             raise ValueError("acknowledgement poll interval must be positive")
         if self.heartbeat_seconds <= 0:
             raise ValueError("heartbeat interval must be positive")
-        if not self.recovery_seconds > 0:
-            raise ValueError("recovery interval must be positive")
+        if not (
+            math.isfinite(self.recovery_seconds)
+            and 0 < self.recovery_seconds <= threading.TIMEOUT_MAX
+        ):
+            raise ValueError("recovery interval must be positive and finite")
         if self.staleness_threshold <= dt.timedelta(0):
             raise ValueError("staleness threshold must be positive")
         # D-RSRP-11: a gap longer than half the threshold is a break, so a
@@ -238,6 +242,8 @@ class _AttemptEntry:
     cache_entry_hash: bytes | None = None
     ended: bool = False
     klass: str | None = None
+    # Instant of the first end try that raised (D-RSRP-15).
+    first_end_at: dt.datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -479,10 +485,24 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         for entry in ended:
             if entry.klass == CLASS_DELIVERED:
                 entry.outcome.set("error", "server_error", _DELIVERY_NOT_RECORDED)
-            self._end_attempt(entry, deliver=False)
+            try:
+                self._end_attempt(entry, deliver=False)
+            except Exception:
+                LOG.exception(
+                    "restore service recovery failed ending attempt %s (instance %s)",
+                    entry.attempt_id,
+                    self._instance_id,
+                )
         for entry in own:
             if entry.attempt_id not in registered:
-                self._end_attempt(entry, deliver=False)
+                try:
+                    self._end_attempt(entry, deliver=False)
+                except Exception:
+                    LOG.exception(
+                        "restore service recovery failed ending attempt %s (instance %s)",
+                        entry.attempt_id,
+                        self._instance_id,
+                    )
         if not healthy:
             return
         margin = self.config.staleness_threshold
@@ -500,7 +520,14 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     ),
                 )
             for entry in stale:
-                self._end_attempt(entry, deliver=False, margin=margin)
+                try:
+                    self._end_attempt(entry, deliver=False, margin=margin)
+                except Exception:
+                    LOG.exception(
+                        "restore service recovery failed ending attempt %s (instance %s)",
+                        entry.attempt_id,
+                        self._instance_id,
+                    )
         self._recover_stranded_items()
         self._recover_pending_giveups()
 
@@ -1099,11 +1126,13 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         with self._registry_lock:
             self._registry.pop(entry.attempt_id, None)
 
-    def _keep_ended(self, entry: _AttemptEntry) -> None:
+    def _keep_ended(self, entry: _AttemptEntry, at: dt.datetime | None = None) -> None:
         """Mark an entry whose end write failed: ended, with the outcome's class (A2)."""
 
         outcome = entry.outcome
         with self._registry_lock:
+            if entry.first_end_at is None:
+                entry.first_end_at = at if at is not None else dt.datetime.now(dt.UTC)
             entry.ended = True
             entry.klass = classify(
                 outcome.end_kind, outcome.cause, entry.opened_from_state == ITEM_DONE
@@ -1823,14 +1852,11 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         for recovery to retry.
         """
 
+        at = dt.datetime.now(dt.UTC)
         try:
-            result = (
-                self._end_transaction(entry, deliver=deliver)
-                if margin is None
-                else self._end_transaction(entry, deliver=deliver, margin=margin)
-            )
+            result = self._end_transaction(entry, deliver=deliver, margin=margin)
         except BaseException:
-            self._keep_ended(entry)
+            self._keep_ended(entry, at)
             raise
         self._forget(entry)
         return result
@@ -1861,10 +1887,15 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     else:
                         cause = "item_withdrawn"
                 elif outcome.end_kind == "cancelled" and lease is not None:
-                    # A cancelled end whose lease has expired by now is terminal;
-                    # decided inside the write so no read precedes it (P50).
+                    # Retries judge cancellation at the first end try (D-RSRP-15).
+                    # Keep the decision inside the write so no read precedes it (P50).
+                    judged = (
+                        entry.first_end_at
+                        if entry.ended and entry.first_end_at is not None
+                        else now
+                    )
                     cause = case(
-                        (_lease_live_clause(lease, now), null()), else_=literal("lease_expired")
+                        (_lease_live_clause(lease, judged), null()), else_=literal("lease_expired")
                     )
                 message = None if outcome.message is None else bound_message(outcome.message)
                 # Step 2: the end, conditioned on the attempt still being open.
