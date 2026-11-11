@@ -21,6 +21,7 @@ import grpc
 import pytest
 from sqlalchemy import Engine, event, func, select
 from sqlalchemy import update as sql_update
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session
 
 from sutradhara._proto import restore_pb2, restore_pb2_grpc
@@ -2013,6 +2014,20 @@ def test_start_writes_one_instance_row_and_a_second_start_raises(rig: _Rig) -> N
         service.stop()
     with pytest.raises(RuntimeError):
         service.start(background=False)
+
+
+def test_d_c_commit_executor_matches_stream_limit_and_stops_with_service(rig: _Rig) -> None:
+    """The service's commit executor follows its stream limit and stops with it."""
+
+    config = replace(rig.service_config, max_concurrent_streams=3)
+    service = RestoreService(config)
+    try:
+        service.start(background=False)
+        assert service._commit_executor._max_workers == config.max_concurrent_streams
+    finally:
+        service.stop()
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+        service._commit_executor.submit(lambda: None)
 
 
 def test_background_heartbeat_advances_and_stop_joins(rig: _Rig) -> None:
@@ -4471,17 +4486,15 @@ def test_d5_sibling_reveals_rederive_under_the_request_lock(rig: _Rig, reverse: 
     locked_reads: list[Any] = []
 
     def observe_request_lock(state: Any) -> None:
-        # SQLite serializes writes, so also pin the ORM's FOR UPDATE intent for
-        # PostgreSQL; sequential completion alone would not exercise that lock.
-        if (
-            state.is_select
-            and state.statement._for_update_arg is not None
-            and any(
-                description.get("entity") is RestoreRequest
-                for description in state.statement.column_descriptions
-            )
+        # On SQLite the sibling outcome is right even without the lock; pin the
+        # request statement's FOR UPDATE when compiled for PostgreSQL.
+        if state.is_select and any(
+            description.get("entity") is RestoreRequest
+            for description in state.statement.column_descriptions
         ):
-            locked_reads.append(state.statement)
+            compiled = str(state.statement.compile(dialect=postgresql.dialect()))
+            if "FOR UPDATE" in compiled:
+                locked_reads.append(state.statement)
 
     event.listen(Session, "do_orm_execute", observe_request_lock)
     try:
@@ -4571,8 +4584,8 @@ def test_real_socket_d4_commits_progress_when_all_shared_workers_are_occupied(
 
     Collect both RPC outcomes before asserting, so dropping the commit executor
     attribute exposes the streams' lease_expired rows rather than cancelling them
-    early during test cleanup. The supervisor runs this and its red proof outside
-    the sandbox through make_server's production registration.
+    early during test cleanup. It needs loopback sockets and uses make_server's
+    production registration.
     """
 
     rig, port = worker_limit_socket
@@ -4611,8 +4624,8 @@ def test_real_socket_d4_commits_progress_when_all_shared_workers_are_occupied(
         replies: list[Any] = []
         for commit in commits:
             try:
-                # Under the red mutation these expire while queued. Continue
-                # reading the opens so every lease expiry is recorded as well.
+                # Commits that queue behind the streams expire here; keep reading
+                # the opens so each expiry is recorded.
                 replies.append(commit.result(timeout=4))
             except grpc.RpcError as exc:
                 replies.append(exc)

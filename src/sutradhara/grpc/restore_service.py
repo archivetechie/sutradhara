@@ -80,6 +80,7 @@ from sutradhara.hdcache.models import (
     RestoreServerInstance,
 )
 from sutradhara.hdcache.restore_retry import (
+    CLASS_DELIVERED,
     OFFER_AT,
     OFFER_GIVE_UP,
     OFFER_OPEN,
@@ -328,7 +329,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         def commit_restore(request: Any, context: Any) -> Any:
             """Expose grpc's per-handler executor on an instance-local plain function."""
 
-            return RestoreService.CommitRestore(self, request, context)
+            return type(self).CommitRestore(self, request, context)
 
         commit_restore.experimental_thread_pool = self._commit_executor  # type: ignore[attr-defined]
         self.CommitRestore = commit_restore  # type: ignore[method-assign]
@@ -1564,7 +1565,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     )
                     .where(
                         RestoreItemCheckpoint.restore_request_item_id == prepared.item_id,
-                        RestoreItemCheckpoint.committed_index >= 1,
+                        RestoreItemCheckpoint.committed_index >= prepared.manifest.index + 1,
                         RestoreOpenSession.generation == lease.generation,
                     )
                 )
@@ -1817,7 +1818,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 latest = summary.latest
                 marker: int | str = (
                     "delivered"
-                    if latest is not None and latest.klass == "delivered"
+                    if latest is not None and latest.klass == CLASS_DELIVERED
                     else latest.id
                     if latest is not None
                     else 0
