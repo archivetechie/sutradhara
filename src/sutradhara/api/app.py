@@ -26,6 +26,7 @@ from sutradhara.api.routes_receive import router as receive_router
 from sutradhara.api.routes_restore import router as restore_router
 from sutradhara.api.routes_session import router as session_router
 from sutradhara.catalog.session import create_all, make_engine
+from sutradhara.hdcache.restore_retry import retry_policy_from_env
 
 AGENT_BUNDLE_CONFIG_ENV = "SUTRA_AGENT_BUNDLE_CONFIG"
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
@@ -48,6 +49,7 @@ def create_app(
         create_all(final_engine)
     app = FastAPI(title="sutradhara API")
     app.state.engine = final_engine
+    app.state.restore_retry_policy = retry_policy_from_env()
     if registry is not None:
         app.state.registry = registry
     if grpc_pki_dir is not None:

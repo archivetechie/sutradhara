@@ -178,6 +178,26 @@ def test_r1_dead_instances_require_unbroken_heartbeat_and_stop_after_a_break(
     _assert_lost(rig, third)
 
 
+def test_r1_dead_instance_lost_close_has_unknown_bytes_sent(rig: _Rig, clock: list[float]) -> None:
+    """Recovery cannot reconstruct a stopped server's transmitted byte count."""
+
+    item_id = _item(rig, "r1-unknown-bytes")
+    _abandoned(rig, item_id)
+    _healthy(rig.service, clock)
+    rig.service.recover_once()
+    _assert_lost(rig, item_id)
+    with session_scope(rig.engine) as session:
+        row = session.scalar(
+            select(RestoreItemAttempt).where(
+                RestoreItemAttempt.restore_request_item_id == item_id,
+                RestoreItemAttempt.end_kind == "lost",
+                RestoreItemAttempt.bytes_sent.is_(None),
+            )
+        )
+        assert row is not None
+        assert row.bytes_sent is None
+
+
 def test_r1_fresh_other_instance_is_not_closed_despite_expired_lease(
     rig: _Rig, clock: list[float]
 ) -> None:
@@ -390,6 +410,29 @@ def test_r3_cancelled_end_retried_after_its_lease_lapsed_is_an_interruption(
     assert entry.first_end_at is not None
     assert entry.first_end_at < entry.lease.expires_at
     time.sleep(max(0, (entry.lease.expires_at - dt.datetime.now(dt.UTC)).total_seconds()) + 0.05)
+    rig.service.recover_once()
+    _assert_cancelled_interruption(rig, entry.item_id)
+
+
+def test_r3_cancelled_end_whose_first_try_outlasted_its_lease_is_an_interruption(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow failing transaction must retain the cancellation instant before expiry."""
+
+    entry = _cancelled_attempt(rig, "r3-cancel-slow-end")
+    assert entry.lease is not None
+    expires = entry.lease.expires_at
+
+    def fail(_entry: Any, *, deliver: bool, margin: Any = None) -> Any:
+        time.sleep(max(0, (expires - dt.datetime.now(dt.UTC)).total_seconds()) + 0.05)
+        raise RuntimeError("slow end write failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.service, "_end_transaction", fail)
+        with pytest.raises(RuntimeError, match="slow end write failed"):
+            rig.service._end_attempt(entry, deliver=False)
+    assert entry.first_end_at is not None
+    assert entry.first_end_at < expires
     rig.service.recover_once()
     _assert_cancelled_interruption(rig, entry.item_id)
 
@@ -708,43 +751,67 @@ def test_r4_lowered_policy_applies_pending_giveup_with_non_wait_decisive_row(
         assert giveup_agreement_violations(session) == []
 
 
+@pytest.mark.parametrize("leg", ["registry", "own", "stale"])
 def test_r3_one_failing_end_does_not_starve_the_pass(
-    rig: _Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    rig: _Rig,
+    clock: list[float],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    leg: str,
 ) -> None:
-    """A retained bad end must not prevent other ends or stranded-item recovery."""
+    """Each recovery loop contains a bad end and still reaches stranded-item recovery."""
 
+    if leg == "stale":
+        _healthy(rig.service, clock)
     entries = []
+    attempts = []
     for name in ("r3-failing", "r3-succeeding"):
         item_id = _item(rig, name)
-        entry = rig.service._insert_attempt(
-            rig.context("receiver"),
-            _Outcome(end_kind="error", cause="source_integrity"),
-            item_id=item_id,
-            request_id=f"request-{name}",
-            device_id="receiver",
-            opened_from_state="queued",
-        )
-        rig.service._keep_ended(entry)
-        entries.append(entry)
-    first, second = entries
+        if leg == "registry":
+            entry = rig.service._insert_attempt(
+                rig.context("receiver"),
+                _Outcome(end_kind="error", cause="source_integrity"),
+                item_id=item_id,
+                request_id=f"request-{name}",
+                device_id="receiver",
+                opened_from_state="queued",
+            )
+            rig.service._keep_ended(entry)
+            entries.append(entry)
+            attempt_id = entry.attempt_id
+        else:
+            attempt_id = _abandoned(
+                rig,
+                item_id,
+                instance_id=rig.service.instance_id if leg == "own" else None,
+            )
+        attempts.append((attempt_id, item_id))
+    (first_id, first_item), (second_id, second_item) = attempts
     stranded = _stranded(rig, "r3-beside-ends")
     real_end = rig.service._end_transaction
 
     def fail_first(entry: Any, *, deliver: bool, margin: Any = None) -> Any:
-        if entry.attempt_id == first.attempt_id:
+        if entry.attempt_id == first_id:
             raise RuntimeError("persistent end failure")
         return real_end(entry, deliver=deliver, margin=margin)
 
     monkeypatch.setattr(rig.service, "_end_transaction", fail_first)
     rig.service.recover_once()
-    assert second.attempt_id not in rig.service._registry
-    row = _attempt_rows(rig, second.item_id)[0]
-    assert (row.end_kind, row.cause) == ("error", "source_integrity")
-    assert row.ended_at is not None
-    assert rig.service._registry[first.attempt_id] is first
-    assert first.ended
-    assert _attempt_rows(rig, first.item_id)[0].ended_at is None
-    assert f"attempt {first.attempt_id} (instance {rig.service.instance_id})" in caplog.text
+    assert second_id not in rig.service._registry
+    row = _attempt_rows(rig, second_item)[0]
+    if leg == "registry":
+        first, second = entries
+        assert second.attempt_id not in rig.service._registry
+        assert (row.end_kind, row.cause) == ("error", "source_integrity")
+        assert row.ended_at is not None
+        assert rig.service._registry[first.attempt_id] is first
+        assert first.ended
+    else:
+        assert (row.end_kind, row.cause, row.ended_at) == ("lost", None, None)
+        assert row.closed_at is not None
+    first_row = _attempt_rows(rig, first_item)[0]
+    assert (first_row.end_kind, first_row.ended_at, first_row.closed_at) == (None, None, None)
+    assert f"attempt {first_id} (instance {rig.service.instance_id})" in caplog.text
     with session_scope(rig.engine) as session:
         item = session.get(RestoreRequestItem, stranded)
         assert (item.state, item.bytes_restored) == ("queued", 0)
@@ -831,9 +898,9 @@ def test_r5_recovery_fault_is_logged_and_next_pass_can_run(
         def fail(*_args: Any, **_kwargs: Any) -> Any:
             raise RuntimeError("temporary recovery fault")
 
-        patch.setattr(rig.service, "_end_attempt", fail)
+        patch.setattr(rig.service, "_recovery_entries", fail)
         rig.service.recover_once()
-    assert "restore service recovery failed" in caplog.text
+    assert f"restore service recovery failed (instance {rig.service.instance_id})" in caplog.text
     assert "temporary recovery fault" in caplog.text
     assert _attempt_rows(rig, item_id)[0].closed_at is None
     rig.service.recover_once()

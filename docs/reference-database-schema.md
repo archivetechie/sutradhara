@@ -66,6 +66,9 @@ those writes.
 
 The job, reconciliation, cache, and restore tables share the same database so
 operators can explain a decision without joining separate operational stores.
+Each `restore_item_attempt` links a `restore_request_item` to the
+`restore_server_instance` that admits its open; `restore_item_giveup` links a
+failed item to its decisive attempt.
 
 <!-- code-anchor: src/sutradhara/catalog/models.py @ 747b3c2 -->
 ## Content and intake
@@ -885,6 +888,93 @@ a stale or duplicate agent session cannot race a live one.
 | `generation` | integer | Monotonically increasing lease generation, starting at 1. |
 | `expires_at` | time | Lease expiry. |
 | `created_at`, `updated_at` | time | Lease creation and last renewal time. |
+
+### `restore_server_instance`
+
+One retained row per start of a restore-serving process. Recovery uses its
+heartbeat to distinguish an active server from one that leaves attempts open;
+`heartbeat_at` is refreshed on the database clock.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Server-instance identifier. |
+| `host` | varchar(255) | Host running the process. |
+| `pid` | integer | Process identifier. |
+| `code_version` | varchar(128) | Code version running in this instance. |
+| `started_at` | time | Instance start time. |
+| `heartbeat_at` | time | Most recent successful heartbeat. |
+
+### `restore_item_attempt`
+
+One retained row per admitted open of an agent restore item, recording its
+source probes, lease generation and outcome. Recovery closes an abandoned open
+as `lost`; a byte count it cannot reconstruct remains null.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Attempt identifier. |
+| `restore_request_item_id` | integer, FK -> `restore_request_item.id` | Item being opened; deletion is restricted. |
+| `attempt_no` | integer, unique with `restore_request_item_id` | Per-item sequence number, at least 1. |
+| `receiver_device_id` | varchar(256) | Recorded receiver identity; evidence, with no device FK. |
+| `server_instance_id` | integer, FK -> `restore_server_instance.id`, indexed | Instance admitting the open; deletion is restricted. |
+| `opened_from_state` | varchar(16) | `queued`, `sent`, `streaming`, or `done`. |
+| `opened_at` | time | Admission time. |
+| `probe_source` | varchar(16), optional | `cache` or `disk`. |
+| `probe_candidates_tried` | integer, optional | Number of candidates probed; non-negative when known. |
+| `probe_ended_at` | time, optional | Source-probe completion time. |
+| `lease_generation` | integer, optional | Granted lease generation, at least 1 when present. |
+| `blocked_until` | time, optional | Earlier lease's expiry; permitted only with cause `lease_live`. |
+| `bytes_sent` | bigint, optional | Bytes transmitted; non-negative when known, null when unknown. |
+| `ended_at` | time, optional | End time for `job_end`, `error`, or `cancelled`. |
+| `end_kind` | varchar(16), optional | `job_end`, `error`, `cancelled`, or `lost`; null while open. |
+| `cause` | varchar(32), optional | Closed outcome vocabulary listed below. |
+| `message` | text, optional | Raw outcome message, at most 2000 characters. |
+| `closed_at` | time, optional | Recovery close time for `lost`. |
+| `code_version` | varchar(128) | Code version admitting the attempt. |
+
+CHECK constraints enforce the state, probe-source, count, generation, byte-count,
+end-kind, cause and message limits above. The allowed causes are
+`not_authorized`, `configuration`, `capacity`, `manifest_invalid`,
+`resume_mismatch`, `open_conflict`, `stale_lease`, `protocol`,
+`cache_disk_unavailable`, `tape_only`, `source_integrity`, `source_unavailable`,
+`server_error`, `lease_live`, `item_withdrawn`, and `lease_expired`.
+An `error` requires a cause other than `lease_expired`; `cancelled` permits
+only null or `lease_expired`; `job_end` permits only null, `lease_expired`, or
+`item_withdrawn`; `lost` and an open attempt require a null cause.
+
+`end_kind` is null exactly when both end times are null. At most one end time
+is set: `lost` requires `closed_at`, and every other ended kind requires
+`ended_at`. The `blocked_until` CHECK permits a value only for `lease_live`.
+Both foreign keys use `ON DELETE RESTRICT`.
+The unique constraint `uq_restore_item_attempt_item_no` covers
+`(restore_request_item_id, attempt_no)`; `ix_restore_item_attempt_server_instance`
+indexes `server_instance_id`. The partial unique index
+`uq_restore_item_attempt_open` permits at most one open attempt per item,
+where `ended_at IS NULL AND closed_at IS NULL`, on SQLite and PostgreSQL.
+
+### `restore_item_giveup`
+
+One retained decision per agent restore item that the retry policy gives up,
+linked to the decisive attempt. The row records the rule and the numbers it
+compares, so the item's failure can be explained from its attempts.
+
+| Field | Type / key | Meaning |
+|---|---|---|
+| `id` | integer, PK | Give-up identifier. |
+| `restore_request_item_id` | integer, unique FK -> `restore_request_item.id` | Failed item; deletion is restricted. |
+| `decisive_attempt_id` | integer, unique FK -> `restore_item_attempt.id` | Attempt that triggers the decision; deletion is restricted. |
+| `rule` | varchar(32) | `terminal_cause`, `max_failures`, or `max_interruptions`. |
+| `counted` | integer, optional | Count compared with the threshold. |
+| `threshold` | integer, optional | Configured limit used for the decision. |
+| `decided_at` | time | Decision time. |
+| `code_version` | varchar(128) | Code version recording the decision. |
+
+CHECK constraints restrict `rule` to the three values above and require
+`counted` and `threshold` to be both null for `terminal_cause` and both
+non-null for either count-based rule. Unique constraints
+`uq_restore_item_giveup_item` and `uq_restore_item_giveup_attempt` prevent a
+second decision for an item or a decisive attempt. Both foreign keys use
+`ON DELETE RESTRICT`.
 
 ### `restore_read_plan_slot`
 

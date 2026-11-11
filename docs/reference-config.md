@@ -108,6 +108,14 @@ never tape — see "The restore path" in `architecture-overview.md`).
 | `SUTRADHARA_HDCACHE_LIVENESS_PROBE_DEADLINE_SECONDS` | `2.0` | Deadline for the disk liveness probe used by the serve-side circuit breaker. |
 | `SUTRADHARA_HDCACHE_RESTORE_DESTINATIONS` | unset (`{}`) | JSON object mapping destination id to either a root path string or `{"root": ..., "label": ..., "writable": ...}`. Destination ids must not look like paths, and labels must not be raw paths; violations raise at parse time. This is what `/api/ui/restore-destinations` serves. |
 | `SUTRADHARA_HDCACHE_PRIVACY_CAPABILITIES` | `{"p2": "can_restore_p2", "p3": "can_restore_p3"}` | JSON object mapping an artifactclass `privacy_level` to the API capability required to restore it. Fail-closed: an asset whose privacy level has no mapping is denied (`privacy_unmapped`). |
+| `SUTRADHARA_RESTORE_RETRY_BASE_SECONDS` | `30` | Initial delay after a counted failure; subsequent delays double up to the maximum. |
+| `SUTRADHARA_RESTORE_RETRY_MAX_SECONDS` | `1800` | Maximum retry delay in seconds. |
+| `SUTRADHARA_RESTORE_RETRY_MAX_FAILURES` | `8` | Counted failures before an agent restore item is given up. |
+| `SUTRADHARA_RESTORE_RETRY_MAX_INTERRUPTIONS` | `8` | Consecutive interrupted transfers before an agent restore item is given up. |
+| `SUTRADHARA_RESTORE_RETRY_WAIT_SECONDS` | `30` | Delay for temporary admission refusals without a known lease expiry and for withdrawn items. |
+
+A malformed or non-positive restore retry value stops the server and the API
+from starting; the maximum delay must also be at least the base delay.
 
 ### Placement
 

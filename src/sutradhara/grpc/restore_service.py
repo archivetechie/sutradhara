@@ -197,7 +197,7 @@ class _Outcome:
     cause: str | None = None
     message: str | None = None
     blocked_until: dt.datetime | None = None
-    bytes_sent: int = 0
+    bytes_sent: int | None = 0
     slot_taken: bool = False
     fenced: bool = False
     # The probe's evidence (D2): the source the open streams from and the
@@ -647,7 +647,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 item_id=row.restore_request_item_id,
                 request_id=request_id,
                 opened_from_state=row.opened_from_state,
-                outcome=_Outcome(end_kind="lost"),
+                outcome=_Outcome(end_kind="lost", bytes_sent=None),
                 lease=(
                     None
                     if row.lease_generation is None
@@ -1731,6 +1731,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     for start in range(0, len(view), _WIRE_CHUNK_BYTES):
                         _require_active(context)
                         piece = bytes(view[start : start + _WIRE_CHUNK_BYTES])
+                        assert prepared.outcome.bytes_sent is not None
                         prepared.outcome.bytes_sent += len(piece)
                         yield restore_pb2.RestoreFrame(
                             chunk=restore_pb2.Chunk(data=piece, offset=offset)
@@ -1969,6 +1970,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         lease = entry.lease
         if lease is None:
             return False
+        assert entry.outcome.bytes_sent is not None
         result = conn.execute(
             update(RestoreRequestItem)
             .where(

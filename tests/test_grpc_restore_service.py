@@ -4611,9 +4611,9 @@ def test_real_socket_d4_commits_progress_when_all_shared_workers_are_occupied(
 ) -> None:
     """Twelve watches plus four unacknowledged opens cannot starve their STAGED RPCs.
 
-    Collect both RPC outcomes before asserting, so dropping the commit executor
-    attribute exposes the streams' lease_expired rows rather than cancelling them
-    early during test cleanup. It needs loopback sockets and uses make_server's
+    If CommitRestore shared the stream workers, the opens would end lease_expired;
+    both outcomes are collected first so cleanup cannot hide that. It needs
+    loopback sockets and uses make_server's
     production registration.
     """
 

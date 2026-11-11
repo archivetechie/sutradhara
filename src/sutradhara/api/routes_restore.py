@@ -49,7 +49,7 @@ from sutradhara.hdcache.manager import (
     restore_config_from_env,
 )
 from sutradhara.hdcache.models import RestoreRequest, RestoreRequestItem
-from sutradhara.hdcache.restore_retry import attempt_summaries, retry_payload, retry_policy_from_env
+from sutradhara.hdcache.restore_retry import RetryPolicy, attempt_summaries, retry_payload
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_SATISFIED
@@ -190,7 +190,7 @@ def get_restore_requests(
         if state is not None:
             query = query.where(RestoreRequest.state == state)
         rows = list(session.scalars(query.limit(limit)))
-        retry_by_item = _page_retry_payloads(session, rows)
+        retry_by_item = _page_retry_payloads(session, rows, request.app.state.restore_retry_policy)
         return {"requests": [_request_payload(row, retry_by_item) for row in rows]}
 
 
@@ -203,7 +203,9 @@ def get_restore_request(request: Request, request_id: str) -> dict[str, object]:
         row = session.get(RestoreRequest, request_id)
         if row is None:
             _raise(404, "not_found", f"unknown restore request {request_id!r}")
-        return _request_payload(row, _page_retry_payloads(session, [row]))
+        return _request_payload(
+            row, _page_retry_payloads(session, [row], request.app.state.restore_retry_policy)
+        )
 
 
 @router.get("/api/ui/reconciliation")
@@ -334,7 +336,7 @@ def _restore_request_for_idempotency(session: Any, key: str) -> RestoreRequest |
 
 
 def _page_retry_payloads(
-    session: Session, rows: list[RestoreRequest]
+    session: Session, rows: list[RestoreRequest], policy: RetryPolicy
 ) -> dict[int, dict[str, object]]:
     """Read all agent histories on the page once, using the database clock and shared policy."""
 
@@ -342,7 +344,6 @@ def _page_retry_payloads(
     summaries = attempt_summaries(session, [item.id for item in items])
     now = session.scalar(select(func.now()))
     assert now is not None
-    policy = retry_policy_from_env()
     return {item.id: retry_payload(item.state, summaries[item.id], policy, now) for item in items}
 
 

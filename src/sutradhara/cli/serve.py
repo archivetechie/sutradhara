@@ -127,8 +127,10 @@ def serve_cmd(
             if api_socket.exists():
                 api_socket.unlink()
     finally:
-        # stop() returns an Event at once; wait for the handlers to end before
-        # the restore service, which they may still be using.
+        # Wait for the server to stop before the restore service. The event fires
+        # once no call is in flight in gRPC's core, which can be before a handler's
+        # own clean-up has returned; an end that fails after that point is closed
+        # `lost` by the next instance's recovery.
         grpc_server.stop(grace=5).wait()
         parts.restore_service.stop()
         sweep_stop.set()

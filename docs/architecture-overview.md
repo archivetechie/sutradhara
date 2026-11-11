@@ -200,11 +200,14 @@ The job tables (`job`, `job_attempt`, `reconciliation_condition`) live in
 `jobs/models.py`. The hdcache tables — `cache_disk`, `cache_entry`, and
 the restore-request pipeline `restore_request` + `restore_request_item`
 (one row per requested asset, tracking `state`, `denial_kind`, and
-`source`), plus two tables added for agent-delivered restore streaming:
+`source`), plus the agent-delivery tables:
 `restore_item_checkpoint` (durable per-item delivery progress —
-`committed_index`, `revealed`) and `restore_open_session` (an exclusive,
+`committed_index`, `revealed`), `restore_open_session` (an exclusive,
 generation-numbered lease on one restore item while a device stream has
-it open) — live in `hdcache/models.py`. The gRPC relay's own durable
+it open), `restore_server_instance` (process identity and heartbeat),
+`restore_item_attempt` (each admitted open and its outcome), and
+`restore_item_giveup` (the retry policy's final decision for an item) —
+live in `hdcache/models.py`. The gRPC relay's own durable
 state lives in `grpc/store.py`: `grpc_intake` (streaming-intake
 owner/state), `grpc_logical_device` (a device identity stable across
 certificate rotations, carrying `ingest`/`restore` scopes),
@@ -723,6 +726,12 @@ reconciler (see "Job engine and reconciler spine") marks it reopenable
 so the device's next `OpenRestore` call is admitted again. Protocol
 version 1 carries exactly one regular file per restore item — no
 xattrs, no multi-file manifests yet.
+
+Each admitted open is recorded as an attempt with how it ends; failed tries
+are retried with a growing delay, and an item is given up after the configured
+number of failures or consecutive interruptions. A delivered item waits for
+the receiver to confirm it. A recovery pass at startup and at intervals closes
+attempts that a stopped server leaves open.
 
 Partial file restore (`pfr.py`, `sutra pfr cut`) shortcuts step 3 for
 indexed members: a `pfr-index-v1` sidecar plus `ReadObjectRange` byte

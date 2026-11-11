@@ -133,8 +133,10 @@ def serve_grpc_cmd(
     except KeyboardInterrupt:
         pass
     finally:
-        # Idempotent on a terminated server; blocks until every handler has
-        # ended, so the restore service is stopped only after its last caller.
+        # Wait for the server to stop before the restore service. The event fires
+        # once no call is in flight in gRPC's core, which can be before a handler's
+        # own clean-up has returned; an end that fails after that point is closed
+        # `lost` by the next instance's recovery.
         server.stop(grace=None).wait()
         parts.restore_service.stop()
         sweep_stop.set()
