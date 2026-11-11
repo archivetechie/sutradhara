@@ -509,7 +509,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         if self.heartbeat_unbroken_seconds() > margin.total_seconds():
             with self._factory() as session:
                 db_now = session.scalar(select(func.now()))
-                assert db_now is not None
+                if db_now is None:
+                    raise RuntimeError("the database returned no current time")
                 stale = self._recovery_entries(
                     session,
                     and_(
@@ -612,7 +613,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             )
             summaries = attempt_summaries(session, [item_id for item_id, _ in candidates])
             db_now = session.scalar(select(func.now()))
-            assert db_now is not None
+            if db_now is None:
+                raise RuntimeError("the database returned no current time")
         for item_id, request_id in candidates:
             if (
                 plan_next_offer(summaries[item_id], db_now, self._retry_policy).kind
@@ -1036,7 +1038,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             if item.state in {ITEM_QUEUED, ITEM_SENT}:
                 summary = attempt_summaries(session, [item.id])[item.id]
                 now = session.scalar(select(func.now()))
-                assert now is not None
+                if now is None:
+                    raise RuntimeError("the database returned no current time")
                 offer = plan_next_offer(summary, now, self._retry_policy)
                 if offer.kind == OFFER_OPEN:
                     _abort(context, grpc.StatusCode.ALREADY_EXISTS, _OPEN_IN_PROGRESS)
@@ -1111,7 +1114,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 if not _is_open_attempt_conflict(exc):
                     raise
                 _abort(context, grpc.StatusCode.ALREADY_EXISTS, _OPEN_IN_PROGRESS)
-            assert attempt_id is not None
+            if attempt_id is None:
+                raise RuntimeError("the restore attempt was not recorded")
             entry = _AttemptEntry(
                 attempt_id=attempt_id,
                 item_id=item_id,
@@ -1731,7 +1735,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     for start in range(0, len(view), _WIRE_CHUNK_BYTES):
                         _require_active(context)
                         piece = bytes(view[start : start + _WIRE_CHUNK_BYTES])
-                        assert prepared.outcome.bytes_sent is not None
+                        if prepared.outcome.bytes_sent is None:
+                            raise RuntimeError("the restore attempt has no sent-bytes counter")
                         prepared.outcome.bytes_sent += len(piece)
                         yield restore_pb2.RestoreFrame(
                             chunk=restore_pb2.Chunk(data=piece, offset=offset)
@@ -1970,7 +1975,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         lease = entry.lease
         if lease is None:
             return False
-        assert entry.outcome.bytes_sent is not None
+        if entry.outcome.bytes_sent is None:
+            raise RuntimeError("the restore attempt has no sent-bytes counter")
         result = conn.execute(
             update(RestoreRequestItem)
             .where(
@@ -2005,7 +2011,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
 
         summary = attempt_summaries(session, [item_id])[item_id]
         db_now = session.scalar(select(func.now()))
-        assert db_now is not None
+        if db_now is None:
+            raise RuntimeError("the database returned no current time")
         offer = plan_next_offer(summary, db_now, self._retry_policy)
         if offer.kind != OFFER_GIVE_UP:
             return
@@ -2061,7 +2068,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 )
             )
             now = session.scalar(select(func.now()))
-            assert now is not None
+            if now is None:
+                raise RuntimeError("the database returned no current time")
             summaries = attempt_summaries(session, [item.id for item in items])
             assignments: list[tuple[tuple[int, int | str], Any]] = []
             for item in items:

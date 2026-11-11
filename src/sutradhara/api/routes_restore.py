@@ -343,7 +343,8 @@ def _page_retry_payloads(
     items = [item for row in rows if row.delivery_mode == "agent" for item in row.items]
     summaries = attempt_summaries(session, [item.id for item in items])
     now = session.scalar(select(func.now()))
-    assert now is not None
+    if now is None:
+        raise RuntimeError("the database returned no current time")
     return {item.id: retry_payload(item.state, summaries[item.id], policy, now) for item in items}
 
 
