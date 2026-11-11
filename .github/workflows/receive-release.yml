@@ -114,6 +114,8 @@ jobs:
             cargo -V > cargo-toolchain.txt
           target: x86_64
           sccache: true
+      - name: Own the wheel output
+        run: sudo chown -R "$(id -u):$(id -g)" "$PACKAGE_DIR/dist"
       - name: Record wheel build
         run: python scripts/release_evidence.py record --name manylinux --dist "$PACKAGE_DIR/dist" --lock uv.lock --lock "$PACKAGE_DIR/Cargo.lock" --rust-version-file "$PACKAGE_DIR/rust-toolchain.txt" --cargo-version-file "$PACKAGE_DIR/cargo-toolchain.txt"
       - name: Upload wheel
@@ -202,7 +204,7 @@ jobs:
             "$PACKAGE_DIR/target/x86_64-apple-darwin/release/$BIN_NAME" \
             "$PACKAGE_DIR/target/aarch64-apple-darwin/release/$BIN_NAME" \
             -output "dist/$artifact/$BIN_NAME"
-          lipo -verify_arch x86_64 arm64 "dist/$artifact/$BIN_NAME"
+          lipo "dist/$artifact/$BIN_NAME" -verify_arch x86_64 arm64
       - name: Sign and notarize
         env:
           APPLE_DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 }}
