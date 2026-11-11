@@ -1,0 +1,616 @@
+"""RSR-1e recovery against a function-scoped catalog, with no other test's leftovers."""
+
+from __future__ import annotations
+
+import datetime as dt
+import time
+from collections.abc import Iterator
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import grpc
+import pytest
+from sqlalchemy import event, select, update
+from sqlalchemy.dialects import postgresql
+
+from sutradhara.catalog.session import session_scope
+from sutradhara.grpc import restore_service as service_module
+from sutradhara.grpc.restore_service import RestoreService, _Outcome
+from sutradhara.hdcache.models import (
+    RestoreItemAttempt,
+    RestoreItemGiveup,
+    RestoreOpenSession,
+    RestoreRequestItem,
+    RestoreServerInstance,
+)
+from sutradhara.hdcache.restore_retry import attempt_summaries, giveup_agreement_violations
+from tests.test_grpc_restore_service import (
+    _Abort,
+    _attempt_rows,
+    _build_rig,
+    _close_attempt,
+    _open_collect,
+    _pl,
+    _Rig,
+    _seed_item,
+    _with_hooks,
+)
+
+
+@pytest.fixture
+def rig(tmp_path: Path) -> Iterator[_Rig]:
+    """Own the whole recovery database; reuse only the stream fixture's construction."""
+
+    result = _build_rig(tmp_path / "recovery")
+    result.service.stop()
+    result.service_config = replace(
+        result.service_config,
+        heartbeat_seconds=1,
+        staleness_threshold=dt.timedelta(seconds=10),
+        recovery_seconds=0.02,
+    )
+    result.service = RestoreService(result.service_config)
+    result.service.start(background=False)
+    try:
+        yield result
+    finally:
+        result.service.stop()
+        result.engine.dispose()
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Advance only the service's monotonic clock; database and lease clocks stay real."""
+
+    value = [time.monotonic()]
+    monkeypatch.setattr(
+        service_module, "time", SimpleNamespace(monotonic=lambda: value[0], sleep=time.sleep)
+    )
+    return value
+
+
+def _healthy(service: RestoreService, clock: list[float]) -> None:
+    for _ in range(5):
+        clock[0] += 3
+        service.heartbeat_once()
+    assert service.heartbeat_unbroken_seconds() > 10
+
+
+def _item(rig: _Rig, name: str) -> int:
+    return _seed_item(rig, name, _pl(name), receiver="receiver")
+
+
+def _abandoned(
+    rig: _Rig,
+    item_id: int,
+    *,
+    attempt_no: int = 1,
+    instance_id: int | None = None,
+    generation: int | None = 1,
+    expiry: dt.datetime | None = None,
+) -> int:
+    """Seed a crashed process's ledger and (when granted) its lease generation."""
+
+    now = dt.datetime.now(dt.UTC)
+    with session_scope(rig.engine) as session:
+        if instance_id is None:
+            owner = RestoreServerInstance(
+                host="dead",
+                pid=1,
+                code_version="test",
+                started_at=now - dt.timedelta(hours=2),
+                heartbeat_at=now - dt.timedelta(hours=1),
+            )
+            session.add(owner)
+            session.flush()
+            instance_id = owner.id
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        if generation is not None:
+            session.merge(
+                RestoreOpenSession(
+                    restore_request_item_id=item_id,
+                    receiver_device_id="receiver",
+                    manifest_sha256=b"m" * 32,
+                    generation=generation,
+                    expires_at=expiry or now - dt.timedelta(minutes=5),
+                )
+            )
+            item.state = "streaming"
+            item.bytes_restored = 7
+        row = RestoreItemAttempt(
+            restore_request_item_id=item_id,
+            attempt_no=attempt_no,
+            receiver_device_id="receiver",
+            server_instance_id=instance_id,
+            opened_from_state="queued",
+            opened_at=now - dt.timedelta(minutes=10),
+            lease_generation=generation,
+            code_version="test",
+        )
+        session.add(row)
+        session.flush()
+        return row.id
+
+
+def _assert_lost(rig: _Rig, item_id: int, *, state: str = "queued") -> None:
+    row = _attempt_rows(rig, item_id)[-1]
+    assert (row.end_kind, row.cause, row.ended_at) == ("lost", None, None)
+    assert row.closed_at is not None
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        assert item.state == state
+        assert item.bytes_restored == 0
+        assert item.request.state == ("pending" if state == "queued" else "completed_with_errors")
+        if item.open_session is not None:
+            assert item.open_session.expires_at.replace(tzinfo=dt.UTC) <= dt.datetime.now(dt.UTC)
+        assert giveup_agreement_violations(session) == []
+
+
+def test_r1_dead_instances_require_unbroken_heartbeat_and_stop_after_a_break(
+    rig: _Rig, clock: list[float]
+) -> None:
+    first = _item(rig, "r1-first")
+    second = _item(rig, "r1-second")
+    _abandoned(rig, first)
+    _abandoned(rig, second)
+    rig.service.recover_once()
+    assert _attempt_rows(rig, first)[0].closed_at is None
+    _healthy(rig.service, clock)
+    rig.service.recover_once()
+    _assert_lost(rig, first)
+    _assert_lost(rig, second)
+    third = _item(rig, "r1-break")
+    _abandoned(rig, third)
+    clock[0] += 6
+    rig.service.recover_once()
+    assert _attempt_rows(rig, third)[0].closed_at is None
+    rig.service.heartbeat_once()
+    rig.service.recover_once()
+    assert _attempt_rows(rig, third)[0].closed_at is None
+    _healthy(rig.service, clock)
+    rig.service.recover_once()
+    _assert_lost(rig, third)
+
+
+def test_r1_eight_lost_closes_give_up(rig: _Rig, clock: list[float]) -> None:
+    item_id = _item(rig, "r1-eight")
+    _healthy(rig.service, clock)
+    for number in range(1, 9):
+        _abandoned(rig, item_id, attempt_no=number, generation=number)
+        rig.service.recover_once()
+        _assert_lost(rig, item_id, state="failed" if number == 8 else "queued")
+    with session_scope(rig.engine) as session:
+        giveup = session.scalar(select(RestoreItemGiveup))
+        assert giveup is not None
+        assert (giveup.rule, giveup.counted, giveup.threshold) == ("max_interruptions", 8, 8)
+        assert giveup.decisive_attempt_id == _attempt_rows(rig, item_id)[-1].id
+
+
+@pytest.mark.parametrize("seconds", [60, -5])
+def test_r2_live_or_recently_expired_lease_is_not_closed(
+    rig: _Rig, clock: list[float], seconds: int
+) -> None:
+    item_id = _item(rig, "r2-margin")
+    _abandoned(rig, item_id, expiry=dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds))
+    _healthy(rig.service, clock)
+    rig.service.recover_once()
+    assert _attempt_rows(rig, item_id)[0].closed_at is None
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreRequestItem, item_id).state == "streaming"
+
+
+def test_r2_null_generation_closes_and_fences_the_pending_acquisition(
+    rig: _Rig, clock: list[float]
+) -> None:
+    item_id = _item(rig, "r2-fence")
+    _healthy(rig.service, clock)
+
+    def recover(_item_id: int) -> None:
+        with session_scope(rig.engine) as session:
+            session.execute(
+                update(RestoreServerInstance)
+                .where(RestoreServerInstance.id == caller.instance_id)
+                .values(heartbeat_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=1))
+            )
+        rig.service.recover_once()
+
+    caller = _with_hooks(rig, before_lease=recover)
+    try:
+        frames, exc, _ = _open_collect(caller, item_id, rig.context("receiver"))
+    finally:
+        caller.stop()
+    assert frames == []
+    assert isinstance(exc, _Abort)
+    assert exc.code == grpc.StatusCode.UNAVAILABLE
+    _assert_lost(rig, item_id)
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreOpenSession, item_id) is None
+
+
+def test_r2_conditional_end_compiles_positive_lease_rule(rig: _Rig, clock: list[float]) -> None:
+    item_id = _item(rig, "r2-sql")
+    _abandoned(rig, item_id)
+    _healthy(rig.service, clock)
+    statements: list[Any] = []
+
+    def capture(_conn: Any, clause: Any, *_args: Any) -> None:
+        if getattr(clause, "is_update", False) and clause.table.name == "restore_item_attempt":
+            statements.append(clause)
+
+    event.listen(rig.engine, "before_execute", capture)
+    try:
+        rig.service.recover_once()
+    finally:
+        event.remove(rig.engine, "before_execute", capture)
+    assert len(statements) == 1
+    compiled = statements[0].compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "OR (EXISTS (" in sql or "OR EXISTS (" in sql
+    assert "NOT (EXISTS" not in sql
+    assert "restore_open_session.expires_at <" in sql.split("EXISTS (", 1)[1]
+    assert "restore_open_session.generation = restore_item_attempt.lease_generation" in sql
+    assert any(isinstance(value, dt.datetime) for value in compiled.params.values())
+    _assert_lost(rig, item_id)
+
+
+def test_r3_failed_counted_end_retries_outside_registry_lock(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item_id = _item(rig, "r3-counted")
+    entry = rig.service._insert_attempt(
+        rig.context("receiver"),
+        _Outcome(),
+        item_id=item_id,
+        request_id="request-r3-counted",
+        device_id="receiver",
+        opened_from_state="queued",
+    )
+    entry.outcome.set("error", "source_integrity", "bad archive")
+    real_end = rig.service._end_transaction
+
+    def fail(_entry: Any, *, deliver: bool) -> Any:
+        raise RuntimeError("end write failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.service, "_end_transaction", fail)
+        with pytest.raises(RuntimeError, match="end write failed"):
+            rig.service._end_attempt(entry, deliver=False)
+    assert entry.ended
+
+    def checked(entry: Any, *, deliver: bool) -> Any:
+        assert rig.service._registry_lock.acquire(blocking=False)
+        rig.service._registry_lock.release()
+        return real_end(entry, deliver=deliver)
+
+    monkeypatch.setattr(rig.service, "_end_transaction", checked)
+    rig.service.recover_once()
+    assert entry.attempt_id not in rig.service._registry
+    with session_scope(rig.engine) as session:
+        summary = attempt_summaries(session, [item_id])[item_id]
+        assert (summary.counted, summary.interruptions, summary.open) == (1, 0, False)
+        assert summary.latest.cause == "source_integrity"
+
+
+def test_r3_failed_delivery_retries_as_server_error(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item_id = _item(rig, "r3-delivery")
+    real_end = rig.service._end_transaction
+
+    def fail(entry: Any, *, deliver: bool) -> Any:
+        if deliver:
+            raise RuntimeError("delivery write failed")
+        return real_end(entry, deliver=deliver)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.service, "_end_transaction", fail)
+        frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+    assert frames[-1].HasField("job_end")  # _open_collect acknowledges STAGED at file_end.
+    assert isinstance(exc, _Abort)
+    assert exc.code == grpc.StatusCode.ABORTED
+    entry = next(iter(rig.service._registry.values()))
+    assert entry.klass == "delivered"
+    rig.service.recover_once()
+    row = _attempt_rows(rig, item_id)[0]
+    assert (row.end_kind, row.cause) == ("error", "server_error")
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item.state == "queued"
+        assert item.checkpoint.committed_index == 1
+        assert attempt_summaries(session, [item_id])[item_id].counted == 1
+    assert entry.attempt_id not in rig.service._registry
+
+
+def test_r3_own_orphan_closes_even_with_a_live_lease_and_broken_heartbeat(
+    rig: _Rig, clock: list[float]
+) -> None:
+    item_id = _item(rig, "r3-orphan")
+    _abandoned(
+        rig,
+        item_id,
+        instance_id=rig.service.instance_id,
+        expiry=dt.datetime.now(dt.UTC) + dt.timedelta(hours=1),
+    )
+    clock[0] += 6
+    rig.service.recover_once()
+    _assert_lost(rig, item_id)
+
+
+def test_r3_already_closed_registry_entry_is_dropped(rig: _Rig) -> None:
+    item_id = _item(rig, "r3-closed")
+    entry = rig.service._insert_attempt(
+        rig.context("receiver"),
+        _Outcome(end_kind="error", cause="source_integrity"),
+        item_id=item_id,
+        request_id="request-r3-closed",
+        device_id="receiver",
+        opened_from_state="queued",
+    )
+    rig.service._keep_ended(entry)
+    _close_attempt(rig, entry.attempt_id)
+    rig.service.recover_once()
+    assert entry.attempt_id not in rig.service._registry
+    assert _attempt_rows(rig, item_id)[0].end_kind == "lost"
+
+
+@pytest.mark.parametrize("seconds", [0, -1, float("nan")])
+def test_recovery_interval_is_positive(rig: _Rig, seconds: float) -> None:
+    with pytest.raises(ValueError, match="recovery interval"):
+        replace(rig.service_config, recovery_seconds=seconds)
+
+
+def test_r3_active_registry_and_revealed_replay_keep_their_meaning(rig: _Rig) -> None:
+    item_id = _item(rig, "r3-replay")
+    with session_scope(rig.engine) as session:
+        session.get(RestoreRequestItem, item_id).state = "done"
+    entry = rig.service._insert_attempt(
+        rig.context("receiver"),
+        _Outcome(),
+        item_id=item_id,
+        request_id="request-r3-replay",
+        device_id="receiver",
+        opened_from_state="done",
+    )
+    rig.service.recover_once()
+    assert _attempt_rows(rig, item_id)[0].closed_at is None
+    entry.outcome.set("job_end", None)
+    rig.service._keep_ended(entry)
+    assert entry.klass == "none"
+    rig.service.recover_once()
+    row = _attempt_rows(rig, item_id)[0]
+    assert (row.end_kind, row.cause, row.closed_at) == ("job_end", None, None)
+    assert row.ended_at is not None
+    with session_scope(rig.engine) as session:
+        summary = attempt_summaries(session, [item_id])[item_id]
+        assert (summary.counted, summary.delivered) == (0, 0)
+        assert session.get(RestoreRequestItem, item_id).state == "done"
+
+
+@pytest.mark.parametrize("generation", [None, 1])
+def test_r3_lost_end_never_uses_the_items_newer_lease(rig: _Rig, generation: int | None) -> None:
+    item_id = _item(rig, "r3-newer")
+    _abandoned(rig, item_id, instance_id=rig.service.instance_id, generation=generation)
+    expiry = dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)
+    with session_scope(rig.engine) as session:
+        session.merge(
+            RestoreOpenSession(
+                restore_request_item_id=item_id,
+                receiver_device_id="receiver",
+                manifest_sha256=b"n" * 32,
+                generation=2,
+                expires_at=expiry,
+            )
+        )
+        item = session.get(RestoreRequestItem, item_id)
+        item.state = "streaming"
+        item.bytes_restored = 7
+    rig.service.recover_once()
+    assert _attempt_rows(rig, item_id)[0].end_kind == "lost"
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert (item.state, item.bytes_restored) == ("streaming", 7)
+        assert item.open_session.generation == 2
+        assert item.open_session.expires_at.replace(tzinfo=dt.UTC) == expiry
+
+
+def _stranded(rig: _Rig, name: str, *, local: bool = False) -> int:
+    """A legacy streaming item with an expired lease and no ledger history."""
+
+    item_id = _item(rig, name)
+    with session_scope(rig.engine) as session:
+        session.add(
+            RestoreOpenSession(
+                restore_request_item_id=item_id,
+                receiver_device_id="receiver",
+                manifest_sha256=b"s" * 32,
+                generation=1,
+                expires_at=dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1),
+            )
+        )
+        item = session.get(RestoreRequestItem, item_id)
+        item.state = "streaming"
+        item.bytes_restored = 9
+        if local:
+            item.request.delivery_mode = "server_local"
+            item.request.receiver_device_id = None
+    return item_id
+
+
+def test_r4_stranded_items_recover_only_when_heartbeat_is_healthy(
+    rig: _Rig, clock: list[float]
+) -> None:
+    item_id = _stranded(rig, "r4-stranded")
+    local_id = _stranded(rig, "r4-local", local=True)
+    clock[0] += 6
+    rig.service.recover_once()
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreRequestItem, item_id).state == "streaming"
+        assert giveup_agreement_violations(session) == []
+    rig.service.heartbeat_once()
+    rig.service.recover_once()  # Step 4 needs health, not a full threshold of successes.
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert (item.state, item.bytes_restored, item.request.state) == ("queued", 0, "pending")
+        assert session.get(RestoreRequestItem, local_id).state == "streaming"
+        assert attempt_summaries(session, [item_id])[item_id].attempts == 0
+        assert giveup_agreement_violations(session) == []
+
+
+@pytest.mark.parametrize("changed", ["lease", "attempt"])
+def test_r4_stranding_rereads_after_lock(rig: _Rig, changed: str) -> None:
+    item_id = _stranded(rig, "r4-reread")
+    locked: list[str] = []
+
+    def race(conn: Any, clause: Any, *_args: Any) -> None:
+        if (
+            not locked
+            and getattr(clause, "_for_update_arg", None) is not None
+            and "restore_open_session" in str(clause)
+        ):
+            locked.append(str(clause.compile(dialect=postgresql.dialect())))
+            if changed == "lease":
+                conn.execute(
+                    update(RestoreOpenSession)
+                    .where(RestoreOpenSession.restore_request_item_id == item_id)
+                    .values(
+                        generation=2, expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)
+                    )
+                )
+            else:
+                conn.execute(
+                    service_module.insert(RestoreItemAttempt).values(
+                        restore_request_item_id=item_id,
+                        attempt_no=1,
+                        receiver_device_id="receiver",
+                        server_instance_id=rig.service.instance_id,
+                        opened_from_state="queued",
+                        opened_at=service_module.func.now(),
+                        code_version="race",
+                    )
+                )
+
+    event.listen(rig.engine, "before_execute", race)
+    try:
+        rig.service.recover_once()
+    finally:
+        event.remove(rig.engine, "before_execute", race)
+    assert len(locked) == 1
+    assert "FOR UPDATE" in locked[0]
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert (item.state, item.bytes_restored) == ("streaming", 9)
+        assert giveup_agreement_violations(session) == []
+
+
+@pytest.mark.parametrize("state", ["queued", "sent"])
+def test_r4_lowered_policy_applies_pending_giveup_with_non_wait_decisive_row(
+    rig: _Rig, state: str, clock: list[float]
+) -> None:
+    item_id = _item(rig, "r4-pending")
+    rows = []
+    for cause in ("source_integrity", "source_unavailable", "capacity"):
+        entry = rig.service._insert_attempt(
+            rig.context("receiver"),
+            _Outcome(end_kind="error", cause=cause),
+            item_id=item_id,
+            request_id="request-r4-pending",
+            device_id="receiver",
+            opened_from_state="queued",
+        )
+        rig.service._end_attempt(entry, deliver=False)
+        rows.append(entry.attempt_id)
+    with session_scope(rig.engine) as session:
+        session.get(RestoreRequestItem, item_id).state = state
+    rig.service.recover_once()
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreRequestItem, item_id).state == state
+        assert giveup_agreement_violations(session) == []
+    rig.service._retry_policy = replace(rig.service._retry_policy, max_failures=2)
+    clock[0] += 6
+    rig.service.recover_once()
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreRequestItem, item_id).state == state
+    rig.service.heartbeat_once()
+    rig.service.recover_once()
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert (item.state, item.request.state) == ("failed", "completed_with_errors")
+        giveup = session.scalar(select(RestoreItemGiveup))
+        assert giveup.decisive_attempt_id == rows[1]
+        assert (giveup.rule, giveup.counted, giveup.threshold) == ("max_failures", 2, 2)
+        assert giveup_agreement_violations(session) == []
+    rig.service.recover_once()
+    with session_scope(rig.engine) as session:
+        assert len(list(session.scalars(select(RestoreItemGiveup)))) == 1
+        assert giveup_agreement_violations(session) == []
+
+
+def test_r5_slow_recovery_does_not_age_heartbeat(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    service = RestoreService(replace(rig.service_config, heartbeat_seconds=0.03))
+    real_end = service._end_attempt
+    item_id = _item(rig, "r5-slow")
+
+    def slow(entry: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(4), "test did not release its recovery end"
+        return real_end(entry, **kwargs)
+
+    monkeypatch.setattr(service, "_end_attempt", slow)
+    service.start(background=True)
+    heartbeat_thread = service._heartbeat_thread
+    recovery_thread = service._recovery_thread
+    try:
+        _abandoned(rig, item_id, instance_id=service.instance_id)
+        assert entered.wait(2), "background recovery never reached the end"
+        assert recovery_thread is not None
+        assert recovery_thread.daemon
+        with session_scope(rig.engine) as session:
+            first = session.get(RestoreServerInstance, service.instance_id).heartbeat_at
+        before = service.heartbeat_unbroken_seconds()
+        deadline = time.monotonic() + 3
+        advanced = False
+        while time.monotonic() < deadline:
+            with session_scope(rig.engine) as session:
+                advanced = (
+                    session.get(RestoreServerInstance, service.instance_id).heartbeat_at > first
+                )
+            if advanced:
+                break
+            time.sleep(0.03)
+        assert advanced, "heartbeat_at did not advance while recovery was blocked"
+        assert service.heartbeat_unbroken_seconds() > before
+    finally:
+        release.set()
+        service.stop()
+    assert not heartbeat_thread.is_alive()
+    assert not recovery_thread.is_alive()
+    _assert_lost(rig, item_id)
+
+
+def test_r5_recovery_fault_is_logged_and_next_pass_can_run(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    item_id = _item(rig, "r5-fault")
+    _abandoned(rig, item_id, instance_id=rig.service.instance_id)
+    with monkeypatch.context() as patch:
+
+        def fail(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("temporary recovery fault")
+
+        patch.setattr(rig.service, "_end_attempt", fail)
+        rig.service.recover_once()
+    assert "restore service recovery failed" in caplog.text
+    assert "temporary recovery fault" in caplog.text
+    assert _attempt_rows(rig, item_id)[0].closed_at is None
+    rig.service.recover_once()
+    _assert_lost(rig, item_id)

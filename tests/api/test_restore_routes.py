@@ -6,13 +6,15 @@ import datetime as dt
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, event, func, select
 from starlette.requests import Request
 
 from sutradhara.api import routes_restore
+from sutradhara.catalog.models import LogicalAsset
 from sutradhara.catalog.session import session_scope
 from sutradhara.grpc.store import GrpcDeviceDestinationGrant, GrpcLogicalDevice
 from sutradhara.hdcache.alarms import (
@@ -26,7 +28,13 @@ from sutradhara.hdcache.manager import (
     RestoreDestination,
     RestoreEvent,
 )
-from sutradhara.hdcache.models import RestoreRequest, RestoreRequestItem
+from sutradhara.hdcache.models import (
+    RestoreItemAttempt,
+    RestoreItemGiveup,
+    RestoreRequest,
+    RestoreRequestItem,
+    RestoreServerInstance,
+)
 from sutradhara.hdcache.walker import HdcacheWalkerEvent
 from sutradhara.jobs.models import Job, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_BLOCKED, CONDITION_OPEN
@@ -243,6 +251,7 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
             "source": None,
             "updated_at": body["items"][0]["updated_at"],
             "checkpoint": None,
+            "retry": None,
         },
         {
             "content_sha256": denied,
@@ -256,6 +265,7 @@ def test_restore_post_mixed_cart_and_request_status_shapes(
             "source": None,
             "updated_at": body["items"][1]["updated_at"],
             "checkpoint": None,
+            "retry": None,
         },
     ]
     listed = client.get(
@@ -655,3 +665,210 @@ def _seed_asset(engine: Engine, digest: bytes, *, privacy: str) -> None:
                     file_sha256=digest,
                 )
             )
+
+
+def _seed_retry_page(engine: Engine) -> dt.datetime:
+    """A mixed page with histories that distinguish each of D8's retry fields."""
+
+    cases = {
+        "counted": ("queued", [("error", "source_integrity"), ("error", "source_unavailable")]),
+        "interrupted": ("queued", [("cancelled", None), ("lost", None)]),
+        "delivered": ("sent", [("job_end", None)]),
+        "done": ("done", [("job_end", None)]),
+        "running": ("streaming", [("error", "server_error"), (None, None)]),
+        "given-up": ("failed", [("error", "source_integrity")] * 3),
+        "empty": ("queued", []),
+        "replay": ("done", [("job_end", None)]),
+        "local": ("queued", []),
+    }
+    with session_scope(engine) as session:
+        now = session.scalar(select(func.now()))
+        assert now is not None
+        session.add(GrpcLogicalDevice(device_id="retry-receiver", scopes=["restore"]))
+        owner = RestoreServerInstance(
+            host="retry-test",
+            pid=1,
+            code_version="test",
+            started_at=now,
+            heartbeat_at=now,
+        )
+        session.add(owner)
+        session.flush()
+        for name, (state, history) in cases.items():
+            digest = hashlib.sha256(name.encode()).digest()
+            session.add(LogicalAsset(content_sha256=digest, size_bytes=1))
+            session.flush()
+            request = RestoreRequest(
+                id=f"retry-{name}",
+                identity="ada",
+                destination_id="media-server",
+                delivery_mode="server_local" if name == "local" else "agent",
+                receiver_device_id=None if name == "local" else "retry-receiver",
+                state="completed" if state == "done" else "active",
+            )
+            item = RestoreRequestItem(
+                request=request,
+                content_sha256=digest,
+                artifactclass="s-masters",
+                final_rel_path=f"{name}.bin",
+                state=state,
+                size_bytes=1,
+            )
+            session.add(item)
+            session.flush()
+            for number, (kind, cause) in enumerate(history, 1):
+                row = RestoreItemAttempt(
+                    restore_request_item_id=item.id,
+                    attempt_no=number,
+                    receiver_device_id="retry-receiver",
+                    server_instance_id=owner.id,
+                    opened_from_state="done" if name == "replay" else "queued",
+                    opened_at=now,
+                    end_kind=kind,
+                    cause=cause,
+                    ended_at=now if kind is not None and kind != "lost" else None,
+                    closed_at=now if kind == "lost" else None,
+                    message="/srv/private/archive.bin" if cause is not None else None,
+                    code_version="test",
+                )
+                session.add(row)
+                session.flush()
+                if name == "given-up" and number == 3:
+                    session.add(
+                        RestoreItemGiveup(
+                            restore_request_item_id=item.id,
+                            decisive_attempt_id=row.id,
+                            rule="max_failures",
+                            counted=3,
+                            threshold=3,
+                            decided_at=now,
+                            code_version="test",
+                        )
+                    )
+                    item.detail = "gave up after 3 failed tries: the archive copies failed their integrity check: /srv/private/archive.bin"
+    return now.replace(tzinfo=dt.UTC)
+
+
+def _retry_policy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in {
+        "BASE_SECONDS": "90",
+        "MAX_SECONDS": "900",
+        "MAX_FAILURES": "3",
+        "MAX_INTERRUPTIONS": "4",
+        "WAIT_SECONDS": "45",
+    }.items():
+        monkeypatch.setenv(f"SUTRADHARA_RESTORE_RETRY_{name}", value)
+
+
+def test_r6_retry_page_and_detail_share_one_summary_query(
+    api_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _retry_policy_env(monkeypatch)
+    now = _seed_retry_page(api_engine)
+    client = TestClient(make_api_app(api_engine))
+    summaries: list[str] = []
+
+    def count_summary(
+        _conn: Any, _cursor: Any, statement: str, _parameters: Any, _context: Any, _many: bool
+    ) -> None:
+        if statement.lstrip().startswith("WITH classified AS"):
+            summaries.append(statement)
+
+    event.listen(api_engine, "before_cursor_execute", count_summary)
+    try:
+        response = client.get("/api/ui/restore-requests", headers=auth_headers("viewer"))
+        assert response.status_code == 200
+        assert len(summaries) == 1
+        rows = {
+            row["id"].removeprefix("retry-"): row["items"][0] for row in response.json()["requests"]
+        }
+        assert set(rows) == {
+            "counted",
+            "interrupted",
+            "delivered",
+            "done",
+            "running",
+            "given-up",
+            "empty",
+            "replay",
+            "local",
+        }
+        assert rows["local"]["retry"] is None
+        empty = {
+            "attempts": 0,
+            "counted_failures": 0,
+            "max_failures": 3,
+            "interrupted_run": 0,
+            "max_interruptions": 4,
+            "deliveries": 0,
+            "running": False,
+            "next_offer_not_before": None,
+            "awaiting_confirmation": False,
+            "last_cause": None,
+            "last_error": None,
+        }
+        expected = {
+            "empty": empty,
+            "counted": {
+                **empty,
+                "attempts": 2,
+                "counted_failures": 2,
+                "next_offer_not_before": (now + dt.timedelta(seconds=180)).isoformat(),
+                "last_cause": "source_unavailable",
+                "last_error": "no readable source copy: <path>",
+            },
+            "interrupted": {
+                **empty,
+                "attempts": 2,
+                "interrupted_run": 2,
+                "next_offer_not_before": (now + dt.timedelta(seconds=90)).isoformat(),
+                "last_error": "the transfer was interrupted",
+            },
+            "delivered": {**empty, "attempts": 1, "deliveries": 1, "awaiting_confirmation": True},
+            "done": {**empty, "attempts": 1, "deliveries": 1},
+            "replay": {**empty, "attempts": 1},
+            "running": {
+                **empty,
+                "attempts": 2,
+                "counted_failures": 1,
+                "running": True,
+                "last_cause": "server_error",
+                "last_error": "server error: <path>",
+            },
+            "given-up": {
+                **empty,
+                "attempts": 3,
+                "counted_failures": 3,
+                "last_cause": "source_integrity",
+                "last_error": "the archive copies failed their integrity check: <path>",
+            },
+        }
+        for name, retry in expected.items():
+            assert rows[name]["retry"] == retry, name
+            summaries.clear()
+            detail = client.get(
+                f"/api/ui/restore-requests/retry-{name}", headers=auth_headers("viewer")
+            )
+            assert detail.status_code == 200
+            assert detail.json()["items"][0]["retry"] == retry
+            assert len(summaries) == 1
+        assert (
+            rows["given-up"]["detail"]
+            == "gave up after 3 failed tries: the archive copies failed their integrity check: <path>"
+        )
+    finally:
+        event.remove(api_engine, "before_cursor_execute", count_summary)
+
+
+def test_r6_done_delivery_is_not_awaiting_confirmation(
+    api_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _retry_policy_env(monkeypatch)
+    _seed_retry_page(api_engine)
+    client = TestClient(make_api_app(api_engine))
+    response = client.get("/api/ui/restore-requests/retry-done", headers=auth_headers("viewer"))
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["state"] == "done"
+    assert item["retry"]["deliveries"] == 1
+    assert item["retry"]["awaiting_confirmation"] is False

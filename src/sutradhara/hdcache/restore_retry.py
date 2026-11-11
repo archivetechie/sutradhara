@@ -497,6 +497,38 @@ def plan_next_offer(summary: AttemptSummary, now: dt.datetime, policy: RetryPoli
     return NextOffer(OFFER_AT, not_before=not_before)
 
 
+def retry_payload(
+    state: str, summary: AttemptSummary, policy: RetryPolicy, now: dt.datetime
+) -> dict[str, object]:
+    """Pure agent-item retry view (D8), sharing the watch's policy and text composer."""
+
+    offer = plan_next_offer(summary, now, policy)
+    latest = summary.latest
+    return {
+        "attempts": summary.attempts,
+        "counted_failures": summary.counted,
+        "max_failures": policy.max_failures,
+        "interrupted_run": summary.interruptions,
+        "max_interruptions": policy.max_interruptions,
+        "deliveries": summary.delivered,
+        "running": summary.open,
+        "next_offer_not_before": (
+            offer.not_before.isoformat()
+            if offer.kind == OFFER_AT and offer.not_before is not None
+            else None
+        ),
+        "awaiting_confirmation": (
+            state == "sent" and latest is not None and latest.klass == CLASS_DELIVERED
+        ),
+        "last_cause": None if latest is None else latest.cause,
+        "last_error": (
+            None
+            if latest is None
+            else compose_last_error(latest.end_kind, latest.cause, latest.message)
+        ),
+    }
+
+
 # ---- A6: the text composer (D-RSRP-6) --------------------------------------------
 
 MESSAGE_LIMIT: Final = 2000

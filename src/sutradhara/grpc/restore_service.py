@@ -138,6 +138,7 @@ class RestoreServiceConfig:
     acknowledgement_poll_seconds: float = 0.25
     # Design RSR, D7: the instance heartbeat and the staleness rule recovery applies.
     heartbeat_seconds: float = 10.0
+    recovery_seconds: float = 30.0
     staleness_threshold: dt.timedelta = dt.timedelta(minutes=2)
     # None: ``retry_policy_from_env()`` when the service is constructed.
     retry_policy: RetryPolicy | None = None
@@ -153,6 +154,8 @@ class RestoreServiceConfig:
             raise ValueError("acknowledgement poll interval must be positive")
         if self.heartbeat_seconds <= 0:
             raise ValueError("heartbeat interval must be positive")
+        if not self.recovery_seconds > 0:
+            raise ValueError("recovery interval must be positive")
         if self.staleness_threshold <= dt.timedelta(0):
             raise ValueError("staleness threshold must be positive")
         # D-RSRP-11: a gap longer than half the threshold is a break, so a
@@ -316,6 +319,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         self._instance_id: int | None = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
+        self._recovery_thread: threading.Thread | None = None
         # Monotonic bookkeeping of heartbeat successes: when the current
         # unbroken run began, and the last success.
         self._heartbeat_run_since: float | None = None
@@ -343,7 +347,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         return self._instance_id
 
     def start(self, *, background: bool = True) -> None:
-        """Write the instance row; with ``background``, run the heartbeat thread.
+        """Write the instance row; with ``background``, run heartbeat and recovery.
 
         A second ``start()`` raises ``RuntimeError``. Tests start without the
         thread and drive ``heartbeat_once()`` themselves.
@@ -373,15 +377,23 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     target=self._heartbeat_loop, name="sutra-restore-heartbeat", daemon=True
                 )
                 self._heartbeat_thread.start()
+                self._recovery_thread = threading.Thread(
+                    target=self._recovery_loop, name="sutra-restore-recovery", daemon=True
+                )
+                self._recovery_thread.start()
 
     def stop(self) -> None:
-        """End the heartbeat and shut down the commit executor. Idempotent."""
+        """Join heartbeat and recovery and shut down the commit executor. Idempotent."""
 
         self._heartbeat_stop.set()
         thread = self._heartbeat_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join()
         self._heartbeat_thread = None
+        thread = self._recovery_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        self._recovery_thread = None
         self._commit_executor.shutdown(wait=False)
 
     def heartbeat_once(self) -> None:
@@ -434,6 +446,195 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
     def _require_started(self, context: Any) -> None:
         if not self._started:
             _abort(context, grpc.StatusCode.UNAVAILABLE, _NOT_STARTED)
+
+    # ---- recovery (design RSR, D7) ------------------------------------------------
+
+    def _recovery_loop(self) -> None:
+        self.recover_once()
+        while not self._heartbeat_stop.wait(self.config.recovery_seconds):
+            self.recover_once()
+
+    def recover_once(self) -> None:
+        """Recover failed ends and abandoned attempts, containing faults to this pass."""
+
+        if self._instance_id is None:
+            raise RuntimeError(_NOT_STARTED)
+        try:
+            self._recover_pass()
+        except Exception:
+            LOG.exception("restore service recovery failed (instance %s)", self._instance_id)
+
+    def _recover_pass(self) -> None:
+        """Snapshot admission state under its lock; run all ends after releasing it."""
+
+        last = self._heartbeat_last_success
+        healthy = last is not None and time.monotonic() - last <= self._break_seconds()
+        with self._registry_lock:
+            registered = set(self._registry)
+            ended = [entry for entry in self._registry.values() if entry.ended]
+            with self._factory() as session:
+                own = self._recovery_entries(
+                    session, RestoreItemAttempt.server_instance_id == self._instance_id
+                )
+        for entry in ended:
+            if entry.klass == CLASS_DELIVERED:
+                entry.outcome.set("error", "server_error", _DELIVERY_NOT_RECORDED)
+            self._end_attempt(entry, deliver=False)
+        for entry in own:
+            if entry.attempt_id not in registered:
+                self._end_attempt(entry, deliver=False)
+        if not healthy:
+            return
+        margin = self.config.staleness_threshold
+        if self.heartbeat_unbroken_seconds() > margin.total_seconds():
+            with self._factory() as session:
+                db_now = session.scalar(select(func.now()))
+                assert db_now is not None
+                stale = self._recovery_entries(
+                    session,
+                    and_(
+                        RestoreItemAttempt.server_instance_id != self._instance_id,
+                        RestoreItemAttempt.server_instance.has(
+                            RestoreServerInstance.heartbeat_at < db_now - margin
+                        ),
+                    ),
+                )
+            for entry in stale:
+                self._end_attempt(entry, deliver=False, margin=margin)
+        self._recover_stranded_items()
+        self._recover_pending_giveups()
+
+    def _recover_stranded_items(self) -> None:
+        """Return expired, attempt-free agent streams, locking the lease before the item."""
+
+        now = dt.datetime.now(dt.UTC)
+        with self._factory() as session:
+            candidates = list(
+                session.scalars(
+                    select(RestoreRequestItem.id)
+                    .join(RestoreOpenSession)
+                    .where(
+                        RestoreRequestItem.request.has(delivery_mode="agent"),
+                        RestoreRequestItem.state == ITEM_STREAMING,
+                        RestoreOpenSession.expires_at < now,
+                        ~_item_has_open_attempt(),
+                    )
+                )
+            )
+        for item_id in candidates:
+            with self._factory.begin() as session:
+                locked = session.scalar(
+                    select(RestoreOpenSession.restore_request_item_id)
+                    .where(RestoreOpenSession.restore_request_item_id == item_id)
+                    .with_for_update()
+                )
+                if locked is None:
+                    continue
+                # A concurrent acquisition may have committed while the lock
+                # was awaited. Read generation, expiry and open attempts anew.
+                lease = session.execute(
+                    select(RestoreOpenSession.generation, RestoreOpenSession.expires_at).where(
+                        RestoreOpenSession.restore_request_item_id == item_id
+                    )
+                ).one()
+                now = dt.datetime.now(dt.UTC)
+                if _as_utc(lease.expires_at) >= now:
+                    continue
+                request_id = session.scalar(
+                    select(RestoreRequestItem.request_id).where(
+                        RestoreRequestItem.id == item_id,
+                        RestoreRequestItem.request.has(delivery_mode="agent"),
+                        RestoreRequestItem.state == ITEM_STREAMING,
+                        ~_item_has_open_attempt(),
+                    )
+                )
+                if request_id is None:
+                    continue
+                returned = session.connection().execute(
+                    update(RestoreRequestItem)
+                    .where(
+                        RestoreRequestItem.id == item_id,
+                        RestoreRequestItem.state == ITEM_STREAMING,
+                        RestoreRequestItem.open_session.has(
+                            and_(
+                                RestoreOpenSession.generation == lease.generation,
+                                RestoreOpenSession.expires_at < now,
+                            )
+                        ),
+                        ~_item_has_open_attempt(),
+                    )
+                    .values(state=ITEM_QUEUED, bytes_restored=0, updated_at=now)
+                )
+                if returned.rowcount == 1:
+                    rederive_request_state(session, request_id)
+
+    def _recover_pending_giveups(self) -> None:
+        """Reapply D6's decision when a write failed or the owner's limits decreased."""
+
+        with self._factory() as session:
+            candidates = list(
+                session.execute(
+                    select(RestoreRequestItem.id, RestoreRequestItem.request_id).where(
+                        RestoreRequestItem.request.has(delivery_mode="agent"),
+                        RestoreRequestItem.state.in_([ITEM_QUEUED, ITEM_SENT]),
+                        ~exists().where(
+                            RestoreItemGiveup.restore_request_item_id == RestoreRequestItem.id
+                        ),
+                    )
+                )
+            )
+            summaries = attempt_summaries(session, [item_id for item_id, _ in candidates])
+            db_now = session.scalar(select(func.now()))
+            assert db_now is not None
+        for item_id, request_id in candidates:
+            if (
+                plan_next_offer(summaries[item_id], db_now, self._retry_policy).kind
+                == OFFER_GIVE_UP
+            ):
+                with self._factory.begin() as session:
+                    self._apply_give_up(session, item_id, request_id, dt.datetime.now(dt.UTC))
+
+    def _recovery_entries(self, session: Session, owner: Any) -> list[_AttemptEntry]:
+        """Build lost ends from the attempt's generation, never the current lease.
+
+        Lost ends use only the lease's item and generation. The token fields
+        are unused: recovery neither issues a token nor records a delivery.
+        A null generation must stay null so an uncommitted acquisition is fenced.
+        """
+
+        rows = session.execute(
+            select(RestoreItemAttempt, RestoreRequestItem.request_id)
+            .join(
+                RestoreRequestItem,
+                RestoreRequestItem.id == RestoreItemAttempt.restore_request_item_id,
+            )
+            .where(
+                owner,
+                RestoreItemAttempt.ended_at.is_(None),
+                RestoreItemAttempt.closed_at.is_(None),
+            )
+        )
+        return [
+            _AttemptEntry(
+                attempt_id=row.id,
+                item_id=row.restore_request_item_id,
+                request_id=request_id,
+                opened_from_state=row.opened_from_state,
+                outcome=_Outcome(end_kind="lost"),
+                lease=(
+                    None
+                    if row.lease_generation is None
+                    else _Lease(
+                        item_id=row.restore_request_item_id,
+                        device_id=row.receiver_device_id,
+                        manifest_sha256=b"",
+                        generation=row.lease_generation,
+                        expires_at=dt.datetime.now(dt.UTC),
+                    )
+                ),
+            )
+            for row, request_id in rows
+        ]
 
     # ---- RPCs ----------------------------------------------------------------------
 
@@ -1611,7 +1812,9 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
 
     # ---- the end (design RSR, D6; order RSR-1b B5) -----------------------------------
 
-    def _end_attempt(self, entry: _AttemptEntry, *, deliver: bool) -> _EndResult:
+    def _end_attempt(
+        self, entry: _AttemptEntry, *, deliver: bool, margin: dt.timedelta | None = None
+    ) -> _EndResult:
         """End one attempt: one transaction, then the registry, outside it.
 
         ``deliver`` is true only for a stream that went through ``_stream`` and
@@ -1621,16 +1824,23 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         """
 
         try:
-            result = self._end_transaction(entry, deliver=deliver)
+            result = (
+                self._end_transaction(entry, deliver=deliver)
+                if margin is None
+                else self._end_transaction(entry, deliver=deliver, margin=margin)
+            )
         except BaseException:
             self._keep_ended(entry)
             raise
         self._forget(entry)
         return result
 
-    def _end_transaction(self, entry: _AttemptEntry, *, deliver: bool) -> _EndResult:
+    def _end_transaction(
+        self, entry: _AttemptEntry, *, deliver: bool, margin: dt.timedelta | None = None
+    ) -> _EndResult:
         outcome = entry.outcome
         lease = entry.lease
+        lost = outcome.end_kind == "lost"
         now = dt.datetime.now(dt.UTC)  # the lease clock (D-RSRP-5)
         try:
             with self._factory.begin() as session:
@@ -1664,9 +1874,15 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                         RestoreItemAttempt.id == entry.attempt_id,
                         RestoreItemAttempt.ended_at.is_(None),
                         RestoreItemAttempt.closed_at.is_(None),
+                        *(
+                            (_recovery_lease_rule(now - margin),)
+                            if lost and margin is not None
+                            else ()
+                        ),
                     )
                     .values(
-                        ended_at=func.now(),
+                        ended_at=None if lost else func.now(),
+                        closed_at=func.now() if lost else None,
                         end_kind=outcome.end_kind,
                         cause=cause,
                         message=message,
@@ -1681,6 +1897,11 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 # transaction writing both rows keeps (D-RSRP-13). The item's
                 # condition matches on the generation, not the expiry.
                 if lease is not None and not sent:
+                    lease_matches = (
+                        RestoreOpenSession.generation == lease.generation
+                        if lost
+                        else _lease_matches(lease)
+                    )
                     return_state = (
                         ITEM_QUEUED
                         if entry.opened_from_state == ITEM_STREAMING
@@ -1690,7 +1911,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                         update(RestoreOpenSession)
                         .where(
                             RestoreOpenSession.restore_request_item_id == lease.item_id,
-                            _lease_matches(lease),
+                            lease_matches,
                         )
                         .values(expires_at=now, updated_at=now)
                     )
@@ -1699,14 +1920,14 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                         .where(
                             RestoreRequestItem.id == entry.item_id,
                             RestoreRequestItem.state == ITEM_STREAMING,
-                            RestoreRequestItem.open_session.has(_lease_matches(lease)),
+                            RestoreRequestItem.open_session.has(lease_matches),
                         )
                         .values(state=return_state, bytes_restored=0, updated_at=now)
                     )
                 # Step 4: the request state, under the request row's lock.
                 rederive_request_state(session, entry.request_id)
                 # Step 5: the policy; give-up is an event, failed its projection.
-                self._apply_give_up(session, entry, now)
+                self._apply_give_up(session, entry.item_id, entry.request_id, now)
         except _AlreadyClosed:
             return _EndResult(END_ALREADY_CLOSED)
         return _EndResult(END_ENDED, sent=sent)
@@ -1744,8 +1965,12 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             )
         return True
 
-    def _apply_give_up(self, session: Session, entry: _AttemptEntry, now: dt.datetime) -> None:
-        summary = attempt_summaries(session, [entry.item_id])[entry.item_id]
+    def _apply_give_up(
+        self, session: Session, item_id: int, request_id: str, now: dt.datetime
+    ) -> None:
+        """The shared D6 step 5: recheck policy, project failure and record its decisive row."""
+
+        summary = attempt_summaries(session, [item_id])[item_id]
         db_now = session.scalar(select(func.now()))
         assert db_now is not None
         offer = plan_next_offer(summary, db_now, self._retry_policy)
@@ -1758,7 +1983,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         failed = session.connection().execute(
             update(RestoreRequestItem)
             .where(
-                RestoreRequestItem.id == entry.item_id,
+                RestoreRequestItem.id == item_id,
                 or_(
                     RestoreRequestItem.state.in_([ITEM_QUEUED, ITEM_SENT]),
                     and_(
@@ -1773,7 +1998,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             return
         session.connection().execute(
             insert(RestoreItemGiveup).values(
-                restore_request_item_id=entry.item_id,
+                restore_request_item_id=item_id,
                 decisive_attempt_id=decisive.id,
                 rule=offer.rule,
                 counted=offer.counted,
@@ -1782,7 +2007,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 code_version=default_code_version(),
             )
         )
-        rederive_request_state(session, entry.request_id)
+        rederive_request_state(session, request_id)
 
     def _assignments(self, device_id: str) -> list[tuple[tuple[int, int | str], Any]]:
         """Read eligible items and their attempt keys on one database-clock poll."""
@@ -1983,6 +2208,34 @@ def _is_open_attempt_conflict(exc: IntegrityError) -> bool:
 
     text = str(exc.orig) if exc.orig is not None else str(exc)
     return any(marker in text for marker in _ATTEMPT_UNIQUE_MARKERS)
+
+
+def _item_has_open_attempt() -> Any:
+    """Correlated open-attempt predicate for the stranded item's read and write."""
+
+    return exists().where(
+        RestoreItemAttempt.restore_request_item_id == RestoreRequestItem.id,
+        RestoreItemAttempt.ended_at.is_(None),
+        RestoreItemAttempt.closed_at.is_(None),
+    )
+
+
+def _recovery_lease_rule(lease_cutoff: dt.datetime) -> Any:
+    """Positive lease evidence rechecked by the conditional end under the write lock.
+
+    A negative live-lease test has different READ COMMITTED snapshot behaviour
+    on PostgreSQL. Keep the attempt's own generation in this positive predicate.
+    """
+
+    return or_(
+        RestoreItemAttempt.lease_generation.is_(None),
+        exists().where(
+            RestoreOpenSession.restore_request_item_id
+            == RestoreItemAttempt.restore_request_item_id,
+            RestoreOpenSession.generation == RestoreItemAttempt.lease_generation,
+            RestoreOpenSession.expires_at < lease_cutoff,
+        ),
+    )
 
 
 def _lease_matches(lease: _Lease) -> Any:

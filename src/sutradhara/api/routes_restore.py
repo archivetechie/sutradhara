@@ -5,13 +5,15 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, NoReturn
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, func, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from sutradhara.api.console import (
     iso_utc,
@@ -47,6 +49,7 @@ from sutradhara.hdcache.manager import (
     restore_config_from_env,
 )
 from sutradhara.hdcache.models import RestoreRequest, RestoreRequestItem
+from sutradhara.hdcache.restore_retry import attempt_summaries, retry_payload, retry_policy_from_env
 from sutradhara.jobs.engine import submit
 from sutradhara.jobs.models import ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_SATISFIED
@@ -187,7 +190,8 @@ def get_restore_requests(
         if state is not None:
             query = query.where(RestoreRequest.state == state)
         rows = list(session.scalars(query.limit(limit)))
-        return {"requests": [_request_payload(row) for row in rows]}
+        retry_by_item = _page_retry_payloads(session, rows)
+        return {"requests": [_request_payload(row, retry_by_item) for row in rows]}
 
 
 @router.get("/api/ui/restore-requests/{request_id}")
@@ -199,7 +203,7 @@ def get_restore_request(request: Request, request_id: str) -> dict[str, object]:
         row = session.get(RestoreRequest, request_id)
         if row is None:
             _raise(404, "not_found", f"unknown restore request {request_id!r}")
-        return _request_payload(row)
+        return _request_payload(row, _page_retry_payloads(session, [row]))
 
 
 @router.get("/api/ui/reconciliation")
@@ -329,8 +333,26 @@ def _restore_request_for_idempotency(session: Any, key: str) -> RestoreRequest |
     return row
 
 
-def _request_payload(row: RestoreRequest) -> dict[str, object]:
-    item_payloads = [_item_payload(item) for item in row.items]
+def _page_retry_payloads(
+    session: Session, rows: list[RestoreRequest]
+) -> dict[int, dict[str, object]]:
+    """Read all agent histories on the page once, using the database clock and shared policy."""
+
+    items = [item for row in rows if row.delivery_mode == "agent" for item in row.items]
+    summaries = attempt_summaries(session, [item.id for item in items])
+    now = session.scalar(select(func.now()))
+    assert now is not None
+    policy = retry_policy_from_env()
+    return {item.id: retry_payload(item.state, summaries[item.id], policy, now) for item in items}
+
+
+def _request_payload(
+    row: RestoreRequest, retry_by_item: Mapping[int, dict[str, object]]
+) -> dict[str, object]:
+    item_payloads = [
+        _item_payload(item, retry_by_item[item.id] if row.delivery_mode == "agent" else None)
+        for item in row.items
+    ]
     bytes_total = sum(item.size_bytes or 0 for item in row.items)
     bytes_restored = sum(item.bytes_restored or 0 for item in row.items)
     return {
@@ -347,7 +369,12 @@ def _request_payload(row: RestoreRequest) -> dict[str, object]:
     }
 
 
-def _item_payload(item: RestoreRequestItem) -> dict[str, object]:
+def _item_payload(item: RestoreRequestItem, retry: dict[str, object] | None) -> dict[str, object]:
+    if retry is not None:
+        retry = dict(retry)
+        last_error = retry["last_error"]
+        if last_error is not None:
+            retry["last_error"] = _sanitize_detail(str(last_error))
     return {
         "content_sha256": item.content_sha256.hex(),
         "artifactclass": item.artifactclass,
@@ -359,6 +386,7 @@ def _item_payload(item: RestoreRequestItem) -> dict[str, object]:
         "bytes_restored": item.bytes_restored,
         "source": item.source,
         "updated_at": _iso(item.updated_at),
+        "retry": retry,
         "checkpoint": (
             None
             if item.checkpoint is None

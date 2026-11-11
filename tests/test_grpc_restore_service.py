@@ -90,7 +90,13 @@ from sutradhara.hdcache.models import (
     RestoreRequestItem,
     RestoreServerInstance,
 )
-from sutradhara.hdcache.restore_retry import compose_last_error, giveup_agreement_violations
+from sutradhara.hdcache.restore_retry import (
+    attempt_summaries,
+    compose_last_error,
+    giveup_agreement_violations,
+    retry_payload,
+    retry_policy_from_env,
+)
 from sutradhara.hdcache.store import (
     AEAD_REPRESENTATION,
     RAW_REPRESENTATION,
@@ -265,6 +271,18 @@ def _started(service: RestoreService) -> RestoreService:
 
     service.start(background=False)
     return service
+
+
+def _retry_for_request(session: Session, row: RestoreRequest) -> dict[int, dict[str, object]]:
+    """Build the API caller's mapping from one summary query, as a page does."""
+
+    summaries = attempt_summaries(session, [item.id for item in row.items])
+    now = session.scalar(select(func.now()))
+    assert now is not None
+    policy = retry_policy_from_env()
+    return {
+        item.id: retry_payload(item.state, summaries[item.id], policy, now) for item in row.items
+    }
 
 
 class _HookService(RestoreService):
@@ -1082,7 +1100,10 @@ def test_completed_stream_is_sent_without_job_or_local_write_and_console_is_acti
         assert item.source == "cache"
         assert item.bytes_restored == len(payload)
         assert item.request.state == "active"
-        assert _request_payload(item.request)["state"] == "active"
+        assert (
+            _request_payload(item.request, _retry_for_request(session, item.request))["state"]
+            == "active"
+        )
         assert session.scalar(select(func.count()).select_from(Job)) == 0
     assert not forbidden_local.exists()
     (row,) = _attempt_rows(rig, item_id)
@@ -1299,7 +1320,10 @@ def test_revealed_is_terminal_idempotent_and_completes_only_after_every_item(rig
         assert first.state == "done"
         assert second.state == "sent"
         assert first.request.state == "active"
-        assert _request_payload(first.request)["state"] == "active"
+        assert (
+            _request_payload(first.request, _retry_for_request(session, first.request))["state"]
+            == "active"
+        )
 
     second_reply = rig.service.CommitRestore(
         _commit_request(*commits[1], committed_index=1, revealed=True),
