@@ -729,9 +729,10 @@ xattrs, no multi-file manifests yet.
 
 Each admitted open is recorded as an attempt with how it ends; failed tries
 are retried with a growing delay, and an item is given up after the configured
-number of failures or consecutive interruptions. A delivered item waits for
-the receiver to confirm it. A recovery pass at startup and at intervals closes
-attempts that a stopped server leaves open.
+number of failures or consecutive interruptions, or at once for a cause that
+cannot succeed. A delivered item waits for the receiver to confirm it. A
+recovery pass at startup and at intervals closes attempts that a stopped
+server leaves open.
 
 Partial file restore (`pfr.py`, `sutra pfr cut`) shortcuts step 3 for
 indexed members: a `pfr-index-v1` sidecar plus `ReadObjectRange` byte

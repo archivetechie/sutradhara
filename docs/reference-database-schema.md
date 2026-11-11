@@ -898,9 +898,9 @@ heartbeat to distinguish an active server from one that leaves attempts open;
 | Field | Type / key | Meaning |
 |---|---|---|
 | `id` | integer, PK | Server-instance identifier. |
-| `host` | varchar(255) | Host running the process. |
+| `host` | text | Host running the process. |
 | `pid` | integer | Process identifier. |
-| `code_version` | varchar(128) | Code version running in this instance. |
+| `code_version` | text | Code version running in this instance. |
 | `started_at` | time | Instance start time. |
 | `heartbeat_at` | time | Most recent successful heartbeat. |
 
@@ -915,22 +915,22 @@ as `lost`; a byte count it cannot reconstruct remains null.
 | `id` | integer, PK | Attempt identifier. |
 | `restore_request_item_id` | integer, FK -> `restore_request_item.id` | Item being opened; deletion is restricted. |
 | `attempt_no` | integer, unique with `restore_request_item_id` | Per-item sequence number, at least 1. |
-| `receiver_device_id` | varchar(256) | Recorded receiver identity; evidence, with no device FK. |
+| `receiver_device_id` | text | Recorded receiver identity; evidence, with no device FK. |
 | `server_instance_id` | integer, FK -> `restore_server_instance.id`, indexed | Instance admitting the open; deletion is restricted. |
-| `opened_from_state` | varchar(16) | `queued`, `sent`, `streaming`, or `done`. |
+| `opened_from_state` | enum | `queued`, `sent`, `streaming`, or `done`. |
 | `opened_at` | time | Admission time. |
-| `probe_source` | varchar(16), optional | `cache` or `disk`. |
+| `probe_source` | enum, optional | `cache` or `disk`. |
 | `probe_candidates_tried` | integer, optional | Number of candidates probed; non-negative when known. |
 | `probe_ended_at` | time, optional | Source-probe completion time. |
 | `lease_generation` | integer, optional | Granted lease generation, at least 1 when present. |
 | `blocked_until` | time, optional | Earlier lease's expiry; permitted only with cause `lease_live`. |
 | `bytes_sent` | bigint, optional | Bytes transmitted; non-negative when known, null when unknown. |
 | `ended_at` | time, optional | End time for `job_end`, `error`, or `cancelled`. |
-| `end_kind` | varchar(16), optional | `job_end`, `error`, `cancelled`, or `lost`; null while open. |
-| `cause` | varchar(32), optional | Closed outcome vocabulary listed below. |
+| `end_kind` | enum, optional | `job_end`, `error`, `cancelled`, or `lost`; null while open. |
+| `cause` | enum, optional | Closed outcome vocabulary listed below. |
 | `message` | text, optional | Raw outcome message, at most 2000 characters. |
 | `closed_at` | time, optional | Recovery close time for `lost`. |
-| `code_version` | varchar(128) | Code version admitting the attempt. |
+| `code_version` | text | Code version admitting the attempt. |
 
 CHECK constraints enforce the state, probe-source, count, generation, byte-count,
 end-kind, cause and message limits above. The allowed causes are
@@ -963,11 +963,11 @@ compares, so the item's failure can be explained from its attempts.
 | `id` | integer, PK | Give-up identifier. |
 | `restore_request_item_id` | integer, unique FK -> `restore_request_item.id` | Failed item; deletion is restricted. |
 | `decisive_attempt_id` | integer, unique FK -> `restore_item_attempt.id` | Attempt that triggers the decision; deletion is restricted. |
-| `rule` | varchar(32) | `terminal_cause`, `max_failures`, or `max_interruptions`. |
+| `rule` | enum | `terminal_cause`, `max_failures`, or `max_interruptions`. |
 | `counted` | integer, optional | Count compared with the threshold. |
 | `threshold` | integer, optional | Configured limit used for the decision. |
 | `decided_at` | time | Decision time. |
-| `code_version` | varchar(128) | Code version recording the decision. |
+| `code_version` | text | Code version recording the decision. |
 
 CHECK constraints restrict `rule` to the three values above and require
 `counted` and `threshold` to be both null for `terminal_cause` and both
@@ -1056,8 +1056,9 @@ capability)` is unique.
 
 Besides the primary and foreign keys shown above, the implementation enforces
 state-value checks, unique path/identity pairs, the `copy` asset-or-bundle XOR,
-and partial unique indexes for active tags and live job deduplication. Those
-are part of the application contract, not mere performance hints.
+and partial unique indexes for active tags, live job deduplication and one open
+attempt per restore item. Those are part of the application contract, not mere
+performance hints.
 
 For a production database, apply changes with `alembic upgrade head` under the
 deployment procedure. `sutra db init` is a local-development convenience only.
