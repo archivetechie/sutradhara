@@ -19,8 +19,9 @@ from typing import Any
 
 import grpc
 import pytest
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, event, func, select
 from sqlalchemy import update as sql_update
+from sqlalchemy.orm import Session
 
 from sutradhara._proto import restore_pb2, restore_pb2_grpc
 from sutradhara.api.live_capabilities import LiveCapabilityResolver
@@ -442,6 +443,7 @@ def _build_rig(root: Path) -> _Rig:
         max_concurrent_streams=4,
         lease_duration=dt.timedelta(minutes=5),
         assignment_poll_seconds=0.01,
+        acknowledgement_poll_seconds=0.01,
     )
     service = RestoreService(config)
     service.start(background=False)
@@ -501,8 +503,11 @@ def test_open_restore_real_socket_streams_ordered_plaintext_with_bounded_memory(
     tracemalloc.start()
     baseline, _ = tracemalloc.get_traced_memory()
     try:
-        for frame in stub.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), timeout=20
+        for frame in _receive(
+            stub.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), timeout=20
+            ),
+            lambda ack: stub.CommitRestore(ack, timeout=20),
         ):
             kind = frame.WhichOneof("payload")
             assert kind is not None
@@ -555,9 +560,13 @@ def test_open_restore_real_socket_streams_rem_encrypt_plaintext(
 
     channel = _receiver_channel(rig, socket_port)
     try:
-        frames = restore_pb2_grpc.RestoreServiceStub(  # type: ignore[no-untyped-call]
-            channel
-        ).OpenRestore(restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), timeout=20)
+        stub = restore_pb2_grpc.RestoreServiceStub(channel)  # type: ignore[no-untyped-call]
+        frames = _receive(
+            stub.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), timeout=20
+            ),
+            lambda ack: stub.CommitRestore(ack, timeout=20),
+        )
         digest = hashlib.sha256()
         kinds: list[str] = []
         for frame in frames:
@@ -583,9 +592,12 @@ def test_cache_hit_streams_plaintext_bounded_without_archive_read(rig: _Rig) -> 
     tracemalloc.start()
     baseline, _ = tracemalloc.get_traced_memory()
     try:
-        for frame in rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        for frame in _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         ):
             if frame.HasField("chunk"):
                 digest.update(frame.chunk.data)
@@ -618,9 +630,12 @@ def test_private_cache_hit_aead_opens_verified_plaintext_without_archive_read(ri
     try:
         rig.capabilities["ada"] = frozenset({"can_restore", "can_restore_p2"})
         frames = list(
-            rig.service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-                rig.context("receiver"),
+            _receive(
+                rig.service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                    rig.context("receiver"),
+                ),
+                lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
             )
         )
     finally:
@@ -636,9 +651,12 @@ def test_cache_miss_falls_back_to_verified_archive_disk(rig: _Rig) -> None:
     archive_opens = rig.backend.open_calls
 
     frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
 
@@ -654,9 +672,12 @@ def test_corrupt_cache_degrades_to_verified_archive(rig: _Rig) -> None:
     archive_opens = rig.backend.open_calls
 
     frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
 
@@ -676,9 +697,12 @@ def test_archive_integrity_failure_marks_suspect_and_uses_next_disk_candidate(
     primary_path.write_bytes(b"archive-prefix" + corrupt)
 
     frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
 
@@ -698,9 +722,12 @@ def test_manifest_digest_is_source_independent_between_archive_and_cache(rig: _R
     payload = b"manifest identity ignores selected source"
     item_id = _seed_item(rig, "manifest-source", payload, receiver="receiver")
     archive_frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     _seed_cache_entry(rig, item_id, payload)
@@ -709,9 +736,12 @@ def test_manifest_digest_is_source_independent_between_archive_and_cache(rig: _R
         assert lease is not None
         lease.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
     cache_frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
 
@@ -730,9 +760,12 @@ def test_manifest_digest_golden_vectors_and_cross_frame_consistency(rig: _Rig) -
     for suffix, payload, final_rel_path in fixed_files:
         item_id = _seed_item(rig, suffix, payload, receiver="receiver")
         frames = list(
-            rig.service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-                rig.context("receiver"),
+            _receive(
+                rig.service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                    rig.context("receiver"),
+                ),
+                lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
             )
         )
         manifest_head = next(
@@ -795,9 +828,12 @@ def test_open_restore_enforces_live_p2_capability_before_streaming(rig: _Rig) ->
 
         rig.capabilities["ada"] = frozenset({"can_restore", "can_restore_p2"})
         frames = list(
-            rig.service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-                rig.context("receiver"),
+            _receive(
+                rig.service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                    rig.context("receiver"),
+                ),
+                lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
             )
         )
         assert frames[-1].HasField("job_end")
@@ -936,11 +972,21 @@ def test_duplicate_open_rejected_then_expired_generation_reopens(rig: _Rig) -> N
         rig, "lease-delivered", b"delivered then expired", receiver="receiver"
     )
     delivered_request = restore_pb2.OpenRestoreRequest(restore_request_item_id=delivered_id)
-    delivered = list(rig.service.OpenRestore(delivered_request, rig.context("receiver")))
+    delivered = list(
+        _receive(
+            rig.service.OpenRestore(delivered_request, rig.context("receiver")),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
+        )
+    )
     first_generation = delivered[0].manifest_head.lease_token.generation
     assert delivered[-1].HasField("job_end")
     _expire_lease(rig, delivered_id)
-    reopened = list(rig.service.OpenRestore(delivered_request, rig.context("receiver")))
+    reopened = list(
+        _receive(
+            rig.service.OpenRestore(delivered_request, rig.context("receiver")),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
+        )
+    )
     assert reopened[0].manifest_head.lease_token.generation == first_generation + 1
     assert reopened[-1].HasField("job_end")
 
@@ -1019,9 +1065,12 @@ def test_completed_stream_is_sent_without_job_or_local_write_and_console_is_acti
     forbidden_local = rig.root / "agent-destinations" / "receiver" / "exports" / "sent.bin"
 
     frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     assert frames[-1].HasField("job_end")
@@ -1117,12 +1166,11 @@ def test_commit_restore_rejects_an_invalid_request(rig: _Rig) -> None:
 
 def test_commit_staged_is_durable_monotonic_and_checks_all_cas_bindings(rig: _Rig) -> None:
     item_id = _seed_item(rig, "commit-staged", b"durable staged", receiver="receiver")
-    frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
-        )
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+        rig.context("receiver"),
     )
+    frames = _pull_until_file_end(stream)
     token = frames[0].manifest_head.lease_token
     digest = frames[0].manifest_head.manifest_sha256
 
@@ -1130,6 +1178,8 @@ def test_commit_staged_is_durable_monotonic_and_checks_all_cas_bindings(rig: _Ri
         _commit_request(item_id, digest, token, committed_index=1),
         rig.context("receiver"),
     )
+    frames.extend(stream)
+    assert frames[-1].HasField("job_end")
     unchanged = rig.service.CommitRestore(
         _commit_request(item_id, digest, token, committed_index=0),
         rig.context("receiver"),
@@ -1176,12 +1226,11 @@ def test_commit_staged_is_durable_monotonic_and_checks_all_cas_bindings(rig: _Ri
 
 def test_concurrent_staged_commits_keep_the_highest_index(rig: _Rig) -> None:
     item_id = _seed_item(rig, "commit-race", b"race safely", receiver="receiver")
-    frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
-        )
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+        rig.context("receiver"),
     )
+    frames = _pull_until_file_end(stream)
     token = frames[0].manifest_head.lease_token
     digest = frames[0].manifest_head.manifest_sha256
 
@@ -1194,6 +1243,8 @@ def test_concurrent_staged_commits_keep_the_highest_index(rig: _Rig) -> None:
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(commit, (1, 0)))
+    frames.extend(stream)
+    assert frames[-1].HasField("job_end")
 
     assert {index for _status, index in results} <= {0, 1}
     with session_scope(rig.engine) as session:
@@ -1218,9 +1269,12 @@ def test_revealed_is_terminal_idempotent_and_completes_only_after_every_item(rig
     commits: list[tuple[int, bytes, Any]] = []
     for item_id in (first_id, second_id):
         frames = list(
-            rig.service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-                rig.context("receiver"),
+            _receive(
+                rig.service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                    rig.context("receiver"),
+                ),
+                lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
             )
         )
         commits.append(
@@ -1277,17 +1331,20 @@ def test_resume_redrives_in_progress_file_from_start_and_reveals(rig: _Rig) -> N
     stream.close()  # type: ignore[attr-defined]
 
     resumed = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(
-                restore_request_item_id=item_id,
-                lease_token=head.lease_token,
-                resume_token=restore_pb2.ResumeToken(
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(
                     restore_request_item_id=item_id,
-                    manifest_sha256=head.manifest_sha256,
-                    committed_index=1,
+                    lease_token=head.lease_token,
+                    resume_token=restore_pb2.ResumeToken(
+                        restore_request_item_id=item_id,
+                        manifest_sha256=head.manifest_sha256,
+                        committed_index=1,
+                    ),
                 ),
+                rig.context("receiver"),
             ),
-            rig.context("receiver"),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     assert resumed[3].file_header.index == 0
@@ -1311,9 +1368,12 @@ def test_resume_skips_committed_file_and_revealed_resume_is_already_done(rig: _R
 
     item_id = _seed_item(rig, "resume-skip", b"already staged", receiver="receiver")
     initial = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     head = initial[0].manifest_head
@@ -1328,17 +1388,20 @@ def test_resume_skips_committed_file_and_revealed_resume_is_already_done(rig: _R
         lease.expires_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
 
     resumed = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(
-                restore_request_item_id=item_id,
-                lease_token=head.lease_token,
-                resume_token=restore_pb2.ResumeToken(
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(
                     restore_request_item_id=item_id,
-                    manifest_sha256=head.manifest_sha256,
-                    committed_index=1,
+                    lease_token=head.lease_token,
+                    resume_token=restore_pb2.ResumeToken(
+                        restore_request_item_id=item_id,
+                        manifest_sha256=head.manifest_sha256,
+                        committed_index=1,
+                    ),
                 ),
+                rig.context("receiver"),
             ),
-            rig.context("receiver"),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     assert [frame.WhichOneof("payload") for frame in resumed] == [
@@ -1353,17 +1416,20 @@ def test_resume_skips_committed_file_and_revealed_resume_is_already_done(rig: _R
         rig.context("receiver"),
     )
     already_done = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(
-                restore_request_item_id=item_id,
-                lease_token=resumed_token,
-                resume_token=restore_pb2.ResumeToken(
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(
                     restore_request_item_id=item_id,
-                    manifest_sha256=head.manifest_sha256,
-                    committed_index=1,
+                    lease_token=resumed_token,
+                    resume_token=restore_pb2.ResumeToken(
+                        restore_request_item_id=item_id,
+                        manifest_sha256=head.manifest_sha256,
+                        committed_index=1,
+                    ),
                 ),
+                rig.context("receiver"),
             ),
-            rig.context("receiver"),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     assert len(already_done) == 1
@@ -1374,9 +1440,12 @@ def test_resume_skips_committed_file_and_revealed_resume_is_already_done(rig: _R
 def test_resume_manifest_mismatch_is_refused(rig: _Rig) -> None:
     item_id = _seed_item(rig, "resume-mismatch", b"frozen plan", receiver="receiver")
     initial = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     head = initial[0].manifest_head
@@ -1415,9 +1484,12 @@ def test_expired_sent_lease_reconciles_reopenable_and_gets_new_generation(rig: _
     item_id = _seed_item(rig, "lease-reconcile", payload, receiver="receiver")
     forbidden = rig.root / "agent-destinations" / "receiver" / "exports" / "lease-reconcile.bin"
     initial = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     first_generation = initial[0].manifest_head.lease_token.generation
@@ -1435,9 +1507,12 @@ def test_expired_sent_lease_reconciles_reopenable_and_gets_new_generation(rig: _
         assert item.detail == restore_open_reconciler.REOPENABLE_DETAIL
 
     reopened = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     assert reopened[0].manifest_head.lease_token.generation == first_generation + 1
@@ -1901,9 +1976,12 @@ def test_unstarted_service_refuses_open_and_watch_and_writes_nothing(rig: _Rig) 
         assert session.scalar(select(func.count(RestoreServerInstance.id))) == instances_before
     # The started rig service still serves the same item.
     frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     assert frames[-1].HasField("job_end")
@@ -2108,9 +2186,12 @@ def test_cache_recovery_on_absent_disk_commits_without_alarm_lock_stall(rig: _Ri
     try:
         started = time.monotonic()
         frames = list(
-            service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-                rig.context("receiver"),
+            _receive(
+                service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                    rig.context("receiver"),
+                ),
+                lambda ack: service.CommitRestore(ack, rig.context("receiver")),
             )
         )
         elapsed = time.monotonic() - started
@@ -2256,28 +2337,71 @@ def _open_collect(
     frames: list[Any] = []
     request = restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id, **fields)
     try:
-        frames.extend(service.OpenRestore(request, context))
+        frames.extend(
+            _receive(
+                service.OpenRestore(request, context),
+                lambda ack: service.CommitRestore(ack, context),
+            )
+        )
     except BaseException as exc:
         return frames, exc, service
     return frames, None, service
 
 
-def _pull_until_job_end(stream: Iterator[Any]) -> list[Any]:
+def _receive(stream: Iterator[Any], commit: Callable[[Any], Any]) -> Iterator[Any]:
+    """Drain as the receiver does: acknowledge each verified file before reading on."""
+
+    head = None
+    for frame in stream:
+        if frame.HasField("manifest_head"):
+            head = frame.manifest_head
+        elif frame.HasField("file_end"):
+            assert head is not None
+            commit(
+                _commit_request(
+                    head.lease_token.restore_request_item_id,
+                    head.manifest_sha256,
+                    head.lease_token,
+                    frame.file_end.index + 1,
+                )
+            )
+        yield frame
+
+
+def _pull_until_file_end(stream: Iterator[Any]) -> list[Any]:
+    """Pause before acknowledgement so a test can inspect or commit staged progress."""
+
     frames: list[Any] = []
-    while True:
-        frame = next(stream)
+    for frame in stream:
+        frames.append(frame)
+        if frame.HasField("file_end"):
+            return frames
+    raise AssertionError("stream ended before file_end")
+
+
+def _pull_until_job_end(
+    stream: Iterator[Any], service: RestoreService, context: _Context
+) -> list[Any]:
+    """Acknowledge the file, then pause in the post-job_end window used by E5/E6."""
+
+    frames: list[Any] = []
+    for frame in _receive(stream, lambda ack: service.CommitRestore(ack, context)):
         frames.append(frame)
         if frame.HasField("job_end"):
             return frames
+    raise AssertionError("stream ended before job_end")
 
 
 def _deliver(rig: _Rig, item_id: int) -> Any:
     """Stream the item to ``sent`` with the rig's service; return its manifest head."""
 
     frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
     assert frames[-1].HasField("job_end")
@@ -3039,7 +3163,7 @@ def test_e5_an_end_on_a_closed_attempt_rolls_back_including_the_sent_cas(
     stream = rig.service.OpenRestore(
         restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), rig.context("receiver")
     )
-    _pull_until_job_end(stream)
+    _pull_until_job_end(stream, rig.service, rig.context("receiver"))
     (open_row,) = _attempt_rows(rig, item_id)
     assert open_row.end_kind is None
     _close_attempt(rig, open_row.id)
@@ -3066,7 +3190,7 @@ def test_e6_a_delivery_whose_lease_expired_before_the_client_pulled_past_job_end
     stream = rig.service.OpenRestore(
         restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), rig.context("receiver")
     )
-    _pull_until_job_end(stream)
+    _pull_until_job_end(stream, rig.service, rig.context("receiver"))
     _expire_lease(rig, item_id)
     with pytest.raises(_Abort) as aborted:
         next(stream)
@@ -3382,12 +3506,18 @@ def _acknowledged(rig: _Rig, suffix: str) -> tuple[int, bytes, Any]:
 
     payload = _pl(suffix)
     item_id = _seed_item(rig, suffix, payload, receiver="receiver")
-    head = _deliver(rig, item_id)
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), rig.context("receiver")
+    )
+    frames = _pull_until_file_end(stream)
+    head = frames[0].manifest_head
     staged = rig.service.CommitRestore(
         _commit_request(item_id, head.manifest_sha256, head.lease_token, 1),
         rig.context("receiver"),
     )
     assert (staged.status, staged.committed_index) == ("advanced", 1)
+    frames.extend(stream)
+    assert frames[-1].HasField("job_end")
     assert _checkpoint_of(rig, item_id) == (1, False)
     return item_id, payload, head
 
@@ -3414,21 +3544,27 @@ def test_k1_a_lost_acknowledgement_resume_claiming_zero_streams_the_file_and_low
     item_id, payload, head = _acknowledged(rig, "k1-lost-ack")
     _expire_lease(rig, item_id)
 
-    frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(
-                restore_request_item_id=item_id, **_resume_fields(item_id, head, 0)
-            ),
-            rig.context("receiver"),
-        )
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(
+            restore_request_item_id=item_id, **_resume_fields(item_id, head, 0)
+        ),
+        rig.context("receiver"),
     )
+    frames = _pull_until_file_end(stream)
+    # Observe the lowered claim before acknowledging this delivery.
+    assert _checkpoint_of(rig, item_id) == (0, False)
+    opened_head = frames[0].manifest_head
+    rig.service.CommitRestore(
+        _commit_request(item_id, opened_head.manifest_sha256, opened_head.lease_token, 1),
+        rig.context("receiver"),
+    )
+    frames.extend(stream)
+    assert _checkpoint_of(rig, item_id) == (1, False)
 
     assert _kinds(frames)[:4] == ["manifest_head", "manifest_entry", "manifest_end", "file_header"]
     assert frames[-1].job_end.files == 1
     assert _payload_digest(frames) == hashlib.sha256(payload).digest()
     assert frames[0].manifest_head.lease_token.generation == head.lease_token.generation + 1
-    # The stored value is the receiver's claim once the open won its lease.
-    assert _checkpoint_of(rig, item_id) == (0, False)
     _delivered, resumed = _attempt_rows(rig, item_id)
     assert (resumed.end_kind, resumed.cause, resumed.lease_generation) == ("job_end", None, 2)
 
@@ -3437,18 +3573,25 @@ def test_k2_a_fresh_open_after_discarded_staging_streams_the_file_and_lowers(rig
     item_id, payload, head = _acknowledged(rig, "k2-discarded")
     _expire_lease(rig, item_id)
 
-    frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-            rig.context("receiver"),
-        )
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+        rig.context("receiver"),
     )
+    frames = _pull_until_file_end(stream)
+    # Observe the lowered claim before acknowledging this delivery.
+    assert _checkpoint_of(rig, item_id) == (0, False)
+    opened_head = frames[0].manifest_head
+    rig.service.CommitRestore(
+        _commit_request(item_id, opened_head.manifest_sha256, opened_head.lease_token, 1),
+        rig.context("receiver"),
+    )
+    frames.extend(stream)
+    assert _checkpoint_of(rig, item_id) == (1, False)
 
     assert "file_header" in _kinds(frames)
     assert frames[-1].job_end.files == 1
     assert _payload_digest(frames) == hashlib.sha256(payload).digest()
     assert frames[0].manifest_head.lease_token.generation == head.lease_token.generation + 1
-    assert _checkpoint_of(rig, item_id) == (0, False)
 
 
 def test_k3_a_claim_equal_to_the_stored_value_takes_the_committed_path_without_a_read(
@@ -3460,11 +3603,14 @@ def test_k3_a_claim_equal_to_the_stored_value_takes_the_committed_path_without_a
     archive_opens = rig.backend.open_calls
 
     frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(
-                restore_request_item_id=item_id, **_resume_fields(item_id, head, 1)
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(
+                    restore_request_item_id=item_id, **_resume_fields(item_id, head, 1)
+                ),
+                rig.context("receiver"),
             ),
-            rig.context("receiver"),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
 
@@ -3487,11 +3633,14 @@ def test_k3_a_claim_above_the_stored_value_is_not_adopted(rig: _Rig) -> None:
     _expire_lease(rig, item_id)
 
     frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(
-                restore_request_item_id=item_id, **_resume_fields(item_id, head, 5)
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(
+                    restore_request_item_id=item_id, **_resume_fields(item_id, head, 5)
+                ),
+                rig.context("receiver"),
             ),
-            rig.context("receiver"),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
 
@@ -3502,7 +3651,7 @@ def test_k3_a_claim_above_the_stored_value_is_not_adopted(rig: _Rig) -> None:
 
 def test_k3_a_claim_above_a_stored_zero_streams_the_file_and_stores_zero(rig: _Rig) -> None:
     """A claim of 1 against a stored 0 is not adopted: the plan starts from the
-    server's lower value, the file is sent, and the stored value stays 0."""
+    server's lower value; the stored value stays 0 until the file is acknowledged."""
 
     payload = _pl("k3-claim-one")
     item_id = _seed_item(rig, "k3-claim-one", payload, receiver="receiver")
@@ -3516,19 +3665,26 @@ def test_k3_a_claim_above_a_stored_zero_streams_the_file_and_stores_zero(rig: _R
     stream.close()  # type: ignore[attr-defined]
     assert _checkpoint_of(rig, item_id) == (0, False)
 
-    frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(
-                restore_request_item_id=item_id, **_resume_fields(item_id, head, 1)
-            ),
-            rig.context("receiver"),
-        )
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(
+            restore_request_item_id=item_id, **_resume_fields(item_id, head, 1)
+        ),
+        rig.context("receiver"),
     )
+    frames = _pull_until_file_end(stream)
+    # Observe the lowered claim before acknowledging this delivery.
+    assert _checkpoint_of(rig, item_id) == (0, False)
+    opened_head = frames[0].manifest_head
+    rig.service.CommitRestore(
+        _commit_request(item_id, opened_head.manifest_sha256, opened_head.lease_token, 1),
+        rig.context("receiver"),
+    )
+    frames.extend(stream)
+    assert _checkpoint_of(rig, item_id) == (1, False)
 
     assert "file_header" in _kinds(frames)
     assert frames[-1].job_end.files == 1
     assert _payload_digest(frames) == hashlib.sha256(payload).digest()
-    assert _checkpoint_of(rig, item_id) == (0, False)
 
 
 class _CountingFactory:
@@ -3576,9 +3732,12 @@ def test_the_probe_path_opens_no_second_session_during_preparation(rig: _Rig) ->
         cache_id = _seed_item(rig, "no2s-cache", payload, receiver="receiver")
         _seed_cache_entry(rig, cache_id, payload)
         frames = list(
-            service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=cache_id),
-                rig.context("receiver"),
+            _receive(
+                service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=cache_id),
+                    rig.context("receiver"),
+                ),
+                lambda ack: service.CommitRestore(ack, rig.context("receiver")),
             )
         )
         assert _payload_digest(frames) == hashlib.sha256(payload).digest()
@@ -3587,9 +3746,12 @@ def test_the_probe_path_opens_no_second_session_during_preparation(rig: _Rig) ->
         corrupt_id = _seed_item(rig, "no2s-corrupt", payload, receiver="receiver")
         _seed_cache_entry(rig, corrupt_id, payload).write_bytes(b"corrupt cache bytes")
         frames = list(
-            service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=corrupt_id),
-                rig.context("receiver"),
+            _receive(
+                service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=corrupt_id),
+                    rig.context("receiver"),
+                ),
+                lambda ack: service.CommitRestore(ack, rig.context("receiver")),
             )
         )
         assert _payload_digest(frames) == hashlib.sha256(payload).digest()
@@ -3639,11 +3801,14 @@ def test_k3_a_revealed_checkpoint_replays_unchanged_and_is_never_lowered(rig: _R
     assert revealed.revealed
 
     frames = list(
-        rig.service.OpenRestore(
-            restore_pb2.OpenRestoreRequest(
-                restore_request_item_id=item_id, **_resume_fields(item_id, head, 0)
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(
+                    restore_request_item_id=item_id, **_resume_fields(item_id, head, 0)
+                ),
+                rig.context("receiver"),
             ),
-            rig.context("receiver"),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
         )
     )
 
@@ -3778,9 +3943,12 @@ def test_k4_a_corrupt_cache_entry_goes_through_the_funnel_once_and_falls_back_to
     archive_opens = rig.backend.open_calls
     try:
         frames = list(
-            service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-                rig.context("receiver"),
+            _receive(
+                service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                    rig.context("receiver"),
+                ),
+                lambda ack: service.CommitRestore(ack, rig.context("receiver")),
             )
         )
     finally:
@@ -3859,9 +4027,12 @@ def test_k4_a_cache_read_deadline_counts_one_breaker_failure_and_leaves_the_entr
     service = _funnel_service(rig, events, breaker=breaker)
     try:
         frames = list(
-            service.OpenRestore(
-                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
-                rig.context("receiver"),
+            _receive(
+                service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                    rig.context("receiver"),
+                ),
+                lambda ack: service.CommitRestore(ack, rig.context("receiver")),
             )
         )
     finally:
@@ -3928,3 +4099,540 @@ def test_k8_probe_evidence_records_the_source_and_the_candidates_read(rig: _Rig)
         None,
         None,
     )
+
+
+# ---- RSR-1d: acknowledged delivery and same-stream offers (D5, D11) -----------
+
+
+def test_d2_delivery_waits_for_the_receivers_staged_checkpoint(rig: _Rig) -> None:
+    """Transporting file_end leaves the item streaming until STAGED is durable."""
+
+    item_id = _seed_item(rig, "d2-wait", _pl("d2-wait"), receiver="receiver")
+    context = rig.context("receiver")
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), context
+    )
+    frames = _pull_until_file_end(stream)
+    head = frames[0].manifest_head
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(list, stream)
+        try:
+            with pytest.raises(TimeoutError):
+                pending.result(timeout=0.1)
+            assert _checkpoint_of(rig, item_id) == (0, False)
+            (row,) = _attempt_rows(rig, item_id)
+            assert row.end_kind is None
+            reply = rig.service.CommitRestore(
+                _commit_request(item_id, head.manifest_sha256, head.lease_token, 1),
+                rig.context("receiver"),
+            )
+            assert (reply.status, reply.committed_index) == ("advanced", 1)
+            tail = pending.result(timeout=2)
+        finally:
+            context.active = False
+    assert _kinds(tail) == ["job_end"]
+    (row,) = _attempt_rows(rig, item_id)
+    assert (row.end_kind, row.cause) == ("job_end", None)
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreRequestItem, item_id).state == "sent"
+
+
+def test_d2_rejecting_file_end_without_acknowledgement_is_an_interruption(rig: _Rig) -> None:
+    """A receiver rejecting the file cannot turn transport completion into sent."""
+
+    item_id = _seed_item(rig, "d2-reject", _pl("d2-reject"), receiver="receiver")
+    context = rig.context("receiver")
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), context
+    )
+    _pull_until_file_end(stream)
+    context.active = False
+    error = None
+    try:
+        list(stream)
+    except grpc.RpcError as exc:
+        error = exc
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreRequestItem, item_id).state == "queued"
+    assert error is not None
+    (row,) = _attempt_rows(rig, item_id)
+    assert (row.end_kind, row.cause) == ("cancelled", None)
+    assert _checkpoint_of(rig, item_id) == (0, False)
+
+
+def test_d2_acknowledgement_must_match_the_open_generation(rig: _Rig) -> None:
+    """A checkpoint attached to another lease generation cannot unblock this open."""
+
+    item_id = _seed_item(rig, "d2-generation", _pl("d2-generation"), receiver="receiver")
+    context = rig.context("receiver")
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), context
+    )
+    head = _pull_until_file_end(stream)[0].manifest_head
+    with session_scope(rig.engine) as session:
+        session.get(RestoreOpenSession, item_id).generation += 1
+        session.get(RestoreItemCheckpoint, item_id).committed_index = 1
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(list, stream)
+        try:
+            with pytest.raises(TimeoutError):
+                pending.result(timeout=0.1)
+            with session_scope(rig.engine) as session:
+                session.get(RestoreOpenSession, item_id).generation = head.lease_token.generation
+            assert _kinds(pending.result(timeout=2)) == ["job_end"]
+        finally:
+            context.active = False
+
+
+def test_d3_lease_expiry_while_waiting_for_acknowledgement_is_terminal(fresh_rig: _Rig) -> None:
+    """No acknowledgement by the lease deadline gives up with the deterministic cause."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "d3-expired", _pl("d3-expired"), receiver="receiver")
+    service = _started(
+        RestoreService(replace(rig.service_config, lease_duration=dt.timedelta(seconds=0.3)))
+    )
+    try:
+        stream = service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), rig.context("receiver")
+        )
+        _pull_until_file_end(stream)
+        with pytest.raises(_Abort) as expired:
+            next(stream)
+        assert expired.value.code == grpc.StatusCode.ABORTED
+        assert expired.value.details == (
+            "the receiver did not acknowledge the delivery before its lease expired"
+        )
+        (row,) = _attempt_rows(rig, item_id)
+        assert (row.end_kind, row.cause) == ("cancelled", "lease_expired")
+        with session_scope(rig.engine) as session:
+            item = session.get(RestoreRequestItem, item_id)
+            assert item.state == "failed"
+            assert item.detail == _LEASE_EXPIRED_SENTENCE
+            assert giveup_agreement_violations(session) == []
+    finally:
+        service.stop()
+
+
+@pytest.mark.parametrize("interval", [0, -0.01, float("nan")])
+def test_d2_acknowledgement_poll_interval_must_be_positive(rig: _Rig, interval: float) -> None:
+    """Reject poll intervals that cannot advance the acknowledgement wait."""
+
+    with pytest.raises(ValueError, match="acknowledgement poll interval must be positive"):
+        replace(rig.service_config, acknowledgement_poll_seconds=interval)
+
+
+class _PollingWatchContext(_Context):
+    """Bound a watch by poll count and drive state changes between its polls."""
+
+    def __init__(
+        self, rig: _Rig, polls: int, before_poll: Callable[[int], None] | None = None
+    ) -> None:
+        super().__init__("receiver", rig.fingerprints["receiver"])
+        self.poll = 0
+        self.limit = polls
+        self.before_poll = before_poll
+
+    def is_active(self) -> bool:
+        self.poll += 1
+        if not self.active or self.poll > self.limit:
+            return False
+        if self.before_poll is not None:
+            self.before_poll(self.poll)
+        return self.active
+
+
+def test_d1_counted_failure_reoffers_after_backoff(fresh_rig: _Rig) -> None:
+    """One stream suppresses a counted failure during backoff, then offers its new key."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "d1-counted", _pl("d1-counted"), receiver="receiver")
+    offered: list[int] = []
+
+    def before_poll(poll: int) -> None:
+        if poll == 2:
+            assert offered == [item_id]
+            _corrupt_archive(rig, "d1-counted")
+            _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+            assert isinstance(exc, _Abort)
+            (row,) = _attempt_rows(rig, item_id)
+            assert row.cause == "source_integrity"
+        elif poll == 3:
+            assert offered == [item_id]  # the preceding backoff poll offered nothing
+            _age_history(rig, item_id)
+
+    context = _PollingWatchContext(rig, 4, before_poll)
+    offered.extend(
+        assignment.restore_request_item_id
+        for assignment in rig.service.WatchAssignments(
+            restore_pb2.WatchRequest(device_id="receiver"), context
+        )
+    )
+    assert offered == [item_id, item_id]
+
+
+def test_d1_rejected_delivery_reoffers_immediately(fresh_rig: _Rig) -> None:
+    """T-d2's unacknowledged rejection is offered again on the original watch."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "d1-rejected", _pl("d1-rejected"), receiver="receiver")
+    offered: list[int] = []
+
+    def before_poll(poll: int) -> None:
+        if poll == 2:
+            assert offered == [item_id]
+            receiver = rig.context("receiver")
+            stream = rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), receiver
+            )
+            _pull_until_file_end(stream)
+            receiver.active = False
+            with pytest.raises(grpc.RpcError):
+                list(stream)
+            (row,) = _attempt_rows(rig, item_id)
+            assert (row.end_kind, row.cause) == ("cancelled", None)
+        elif poll == 3:
+            assert offered == [item_id, item_id]  # no delay after the first interruption
+
+    context = _PollingWatchContext(rig, 3, before_poll)
+    offered.extend(
+        assignment.restore_request_item_id
+        for assignment in rig.service.WatchAssignments(
+            restore_pb2.WatchRequest(device_id="receiver"), context
+        )
+    )
+    assert offered == [item_id, item_id]
+
+
+@pytest.mark.parametrize("history", ["open", "pending_give_up", "given_up"])
+def test_d1_open_and_given_up_items_are_not_offered(fresh_rig: _Rig, history: str) -> None:
+    """An open attempt or pending give-up suppresses a queued item without writing it."""
+
+    rig = fresh_rig
+    tag = f"d1-{history}"
+    if history == "given_up":
+        item_id = _fail_tape_only(rig, tag)
+    else:
+        item_id = _seed_item(rig, tag, _pl(tag), receiver="receiver")
+        with session_scope(rig.engine) as session:
+            pending = history == "pending_give_up"
+            session.add(
+                RestoreItemAttempt(
+                    restore_request_item_id=item_id,
+                    attempt_no=1,
+                    receiver_device_id="receiver",
+                    server_instance_id=rig.service.instance_id,
+                    opened_from_state="queued",
+                    opened_at=func.now(),
+                    code_version="test-rsr-1d",
+                    end_kind="error" if pending else None,
+                    cause="tape_only" if pending else None,
+                    ended_at=func.now() if pending else None,
+                )
+            )
+    context = _PollingWatchContext(rig, 2)
+    assert (
+        list(rig.service.WatchAssignments(restore_pb2.WatchRequest(device_id="receiver"), context))
+        == []
+    )
+    if history != "given_up":
+        with session_scope(rig.engine) as session:
+            assert session.get(RestoreRequestItem, item_id).state == "queued"
+            assert _giveup_of(session, item_id) is None  # recovery, not the watch, applies it
+
+
+def test_d1_delivered_item_stays_suppressed_until_a_new_stream(fresh_rig: _Rig) -> None:
+    """A delivery's changing row and its lease expiry do not repeat the original offer."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "d1-delivered", _pl("d1-delivered"), receiver="receiver")
+    offered: list[int] = []
+
+    def before_poll(poll: int) -> None:
+        if poll == 2:
+            assert offered == [item_id]
+            _deliver(rig, item_id)
+        elif poll == 3:
+            assert offered == [item_id]  # a new delivery row is still the same offer
+            _expire_lease(rig, item_id)
+
+    context = _PollingWatchContext(rig, 4, before_poll)
+    offered.extend(
+        assignment.restore_request_item_id
+        for assignment in rig.service.WatchAssignments(
+            restore_pb2.WatchRequest(device_id="receiver"), context
+        )
+    )
+    assert offered == [item_id]
+    reconnected = rig.service.WatchAssignments(
+        restore_pb2.WatchRequest(device_id="receiver"), _PollingWatchContext(rig, 3)
+    )
+    assert [assignment.restore_request_item_id for assignment in reconnected] == [item_id]
+
+
+def test_d1_lease_live_reoffers_after_blocked_until(fresh_rig: _Rig) -> None:
+    """A wait row becomes a fresh offer once its recorded lease boundary has passed."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "d1-lease-live", _pl("d1-lease-live"), receiver="receiver")
+    _deliver(rig, item_id)
+    offered: list[int] = []
+
+    def before_poll(poll: int) -> None:
+        if poll == 2:
+            assert offered == [item_id]
+            _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+            assert isinstance(exc, _Abort)
+            _delivered, wait = _attempt_rows(rig, item_id)
+            assert wait.cause == "lease_live"
+            assert wait.blocked_until is not None
+        elif poll == 3:
+            assert offered == [item_id]
+            _expire_lease(rig, item_id)
+            with session_scope(rig.engine) as session:
+                wait = session.scalars(
+                    select(RestoreItemAttempt).where(
+                        RestoreItemAttempt.restore_request_item_id == item_id,
+                        RestoreItemAttempt.cause == "lease_live",
+                    )
+                ).one()
+                wait.blocked_until = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=2)
+
+    context = _PollingWatchContext(rig, 4, before_poll)
+    offered.extend(
+        assignment.restore_request_item_id
+        for assignment in rig.service.WatchAssignments(
+            restore_pb2.WatchRequest(device_id="receiver"), context
+        )
+    )
+    assert offered == [item_id, item_id]
+
+
+def test_d1_refusal_before_admission_keeps_the_seen_key(fresh_rig: _Rig) -> None:
+    """A refusal writing no row cannot mint another offer, even after its delay passes."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "d1-no-row", _pl("d1-no-row"), receiver="receiver")
+    _corrupt_archive(rig, "d1-no-row")
+    _frames, exc, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+    assert isinstance(exc, _Abort)
+    _age_history(rig, item_id)
+    offered: list[int] = []
+
+    def before_poll(poll: int) -> None:
+        if poll == 2:
+            assert offered == [item_id]
+            # Simulate the admission re-check seeing a later backoff deadline
+            # for the same row (a database-clock change); admission writes no row.
+            with session_scope(rig.engine) as session:
+                session.connection().execute(
+                    sql_update(RestoreItemAttempt)
+                    .where(RestoreItemAttempt.restore_request_item_id == item_id)
+                    .values(ended_at=func.now())
+                )
+            _frames, refused, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+            assert isinstance(refused, _Abort)
+            assert refused.details == "restore item is waiting before its next try"
+            assert len(_attempt_rows(rig, item_id)) == 1
+        elif poll == 3:
+            _age_history(rig, item_id)
+        elif poll == 4:
+            assert offered == [item_id]  # eligible again, but the key was already offered
+            _frames, failed, _ = _open_collect(rig.service, item_id, rig.context("receiver"))
+            assert isinstance(failed, _Abort)
+            assert len(_attempt_rows(rig, item_id)) == 2
+            _age_history(rig, item_id)
+
+    context = _PollingWatchContext(rig, 5, before_poll)
+    offered.extend(
+        assignment.restore_request_item_id
+        for assignment in rig.service.WatchAssignments(
+            restore_pb2.WatchRequest(device_id="receiver"), context
+        )
+    )
+    assert offered == [item_id, item_id]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_d5_sibling_reveals_rederive_under_the_request_lock(rig: _Rig, reverse: bool) -> None:
+    """Either sibling reveal order locks and reloads the request before deriving its state."""
+
+    tag = f"d5-siblings-{reverse}"
+    first_id = _seed_item(rig, tag + "-a", _pl(tag + "-a"), receiver="receiver")
+    second_id = _seed_item(rig, tag + "-b", _pl(tag + "-b"), receiver="receiver")
+    with session_scope(rig.engine) as session:
+        first = session.get(RestoreRequestItem, first_id)
+        second = session.get(RestoreRequestItem, second_id)
+        old_request = second.request
+        second.request = first.request
+        session.flush()
+        session.delete(old_request)
+    heads = {item_id: _deliver(rig, item_id) for item_id in (first_id, second_id)}
+    locked_reads: list[Any] = []
+
+    def observe_request_lock(state: Any) -> None:
+        # SQLite serializes writes, so also pin the ORM's FOR UPDATE intent for
+        # PostgreSQL; sequential completion alone would not exercise that lock.
+        if (
+            state.is_select
+            and state.statement._for_update_arg is not None
+            and any(
+                description.get("entity") is RestoreRequest
+                for description in state.statement.column_descriptions
+            )
+        ):
+            locked_reads.append(state.statement)
+
+    event.listen(Session, "do_orm_execute", observe_request_lock)
+    try:
+        order = (second_id, first_id) if reverse else (first_id, second_id)
+        for index, item_id in enumerate(order):
+            head = heads[item_id]
+            reply = rig.service.CommitRestore(
+                _commit_request(item_id, head.manifest_sha256, head.lease_token, 1, revealed=True),
+                rig.context("receiver"),
+            )
+            assert reply.status == "revealed"
+            assert len(locked_reads) == index + 1
+            assert _request_state(rig, item_id) == ("active" if index == 0 else "completed")
+    finally:
+        event.remove(Session, "do_orm_execute", observe_request_lock)
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreRequestItem, first_id).state == "done"
+        assert session.get(RestoreRequestItem, second_id).state == "done"
+        assert session.get(RestoreRequestItem, first_id).request.state == "completed"
+
+
+@pytest.mark.parametrize("state", ["sent", "failed"])
+def test_d5_reconciler_reopens_sent_and_preserves_failed(rig: _Rig, state: str) -> None:
+    """Only a sent item's detail changes; terminal items and their request stay intact."""
+
+    tag = f"d5-reconciler-{state}"
+    item_id = _seed_item(rig, tag, _pl(tag), receiver="receiver")
+    _deliver(rig, item_id)
+    _expire_lease(rig, item_id)
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        item.state = state
+        item.detail = "prior detail"
+        item.updated_at = dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
+        item.request.state = "completed_with_errors" if state == "failed" else "completed"
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        before = (item.state, item.detail, item.updated_at, item.request.state)
+        restore_open_reconciler.reconcile_target(session, str(item_id))
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        after = (item.state, item.detail, item.updated_at, item.request.state)
+        if state == "failed":
+            assert after == before
+        else:
+            assert item.state == "sent"
+            assert item.detail == restore_open_reconciler.REOPENABLE_DETAIL
+            assert item.updated_at > before[2]
+            assert item.request.state == "active"
+
+
+@pytest.fixture
+def worker_limit_socket(fresh_rig: _Rig) -> Iterator[tuple[_Rig, int]]:
+    """The production 16-worker mTLS server with a six-second restore lease."""
+
+    rig = fresh_rig
+    port = _unused_port()
+    parts = make_server(
+        GrpcServerConfig(
+            engine=rig.engine,
+            landing_root=rig.root / "landing-limit",
+            pki_dir=rig.pki_dir,
+            bind="127.0.0.1",
+            port=port,
+            validate_artifactclass=False,
+            # Watches only hold workers; fast polling starves opens in this single-process test.
+            restore=replace(
+                rig.service_config,
+                lease_duration=dt.timedelta(seconds=6),
+                assignment_poll_seconds=0.5,
+            ),
+        )
+    )
+    parts.restore_service.start(background=False)
+    parts.server.start()
+    try:
+        yield rig, port
+    finally:
+        parts.server.stop(grace=0).wait()
+        parts.restore_service.stop()
+
+
+def test_real_socket_d4_commits_progress_when_all_shared_workers_are_occupied(
+    worker_limit_socket: tuple[_Rig, int],
+) -> None:
+    """Twelve watches plus four unacknowledged opens cannot starve their STAGED RPCs.
+
+    Collect both RPC outcomes before asserting, so dropping the commit executor
+    attribute exposes the streams' lease_expired rows rather than cancelling them
+    early during test cleanup. The supervisor runs this and its red proof outside
+    the sandbox through make_server's production registration.
+    """
+
+    rig, port = worker_limit_socket
+    item_ids = [_seed_item(rig, f"d4-{n}", _pl(f"d4-{n}"), receiver="receiver") for n in range(4)]
+    channel = _receiver_channel(rig, port)
+    stub = restore_pb2_grpc.RestoreServiceStub(channel)  # type: ignore[no-untyped-call]
+    watches: list[Any] = []
+    streams: list[Any] = []
+    try:
+        for _ in range(12):
+            watch = stub.WatchAssignments(
+                restore_pb2.WatchRequest(device_id="receiver"), timeout=20
+            )
+            watches.append(watch)
+            # A returned assignment proves this long-lived handler has a worker.
+            assert next(watch).restore_request_item_id in item_ids
+        heads: list[Any] = []
+        for item_id in item_ids:
+            stream = stub.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), timeout=20
+            )
+            streams.append(stream)
+            heads.append(_pull_until_file_end(stream)[0].manifest_head)
+        for item_id in item_ids:
+            lease = _lease_of(rig, item_id)
+            assert lease is not None
+            remaining = lease[1].replace(tzinfo=dt.UTC) - dt.datetime.now(dt.UTC)
+            assert remaining.total_seconds() > 3
+        began = time.monotonic()
+        commits = [
+            stub.CommitRestore.future(
+                _commit_request(item_id, head.manifest_sha256, head.lease_token, 1), timeout=2
+            )
+            for item_id, head in zip(item_ids, heads, strict=True)
+        ]
+        replies: list[Any] = []
+        for commit in commits:
+            try:
+                # Under the red mutation these expire while queued. Continue
+                # reading the opens so every lease expiry is recorded as well.
+                replies.append(commit.result(timeout=4))
+            except grpc.RpcError as exc:
+                replies.append(exc)
+        tails: list[Any] = []
+        for stream in streams:
+            try:
+                tails.append(list(stream))
+            except grpc.RpcError as exc:
+                tails.append(exc)
+        elapsed = time.monotonic() - began
+        rows = [_attempt_rows(rig, item_id)[0] for item_id in item_ids]
+        assert [(row.end_kind, row.cause) for row in rows] == [("job_end", None)] * 4
+        assert all(not isinstance(reply, grpc.RpcError) for reply in replies), replies
+        assert [(reply.status, reply.committed_index) for reply in replies] == [("advanced", 1)] * 4
+        assert all(not isinstance(tail, grpc.RpcError) for tail in tails), tails
+        assert all(_kinds(tail) == ["job_end"] for tail in tails)
+        assert elapsed < 3  # well before the six-second lease expires
+    finally:
+        for stream in streams:
+            stream.cancel()
+        for watch in watches:
+            watch.cancel()
+        channel.close()

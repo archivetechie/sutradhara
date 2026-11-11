@@ -19,6 +19,7 @@ import struct
 import threading
 import time
 from collections.abc import Callable, Generator, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -59,7 +60,6 @@ from sutradhara.hdcache.manager import (
     InvalidRestoreDestination,
     RestoreConfig,
     _select_cache_entry,
-    _update_request_state,
     authorize_agent_restore_destination,
     bind_restore_event_sink_to_engine,
     bind_restore_event_sink_to_session,
@@ -134,6 +134,7 @@ class RestoreServiceConfig:
     # Mid-stream lease renewal lands in RM1.3; this default only raises the ceiling.
     lease_duration: dt.timedelta = dt.timedelta(minutes=30)
     assignment_poll_seconds: float = 0.5
+    acknowledgement_poll_seconds: float = 0.25
     # Design RSR, D7: the instance heartbeat and the staleness rule recovery applies.
     heartbeat_seconds: float = 10.0
     staleness_threshold: dt.timedelta = dt.timedelta(minutes=2)
@@ -147,6 +148,8 @@ class RestoreServiceConfig:
             raise ValueError("restore lease duration must be positive")
         if self.assignment_poll_seconds <= 0:
             raise ValueError("assignment poll interval must be positive")
+        if not self.acknowledgement_poll_seconds > 0:
+            raise ValueError("acknowledgement poll interval must be positive")
         if self.heartbeat_seconds <= 0:
             raise ValueError("heartbeat interval must be positive")
         if self.staleness_threshold <= dt.timedelta(0):
@@ -316,6 +319,19 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         # unbroken run began, and the last success.
         self._heartbeat_run_since: float | None = None
         self._heartbeat_last_success: float | None = None
+        # Waiting streams occupy the shared RPC workers. Their acknowledgements
+        # must be served independently, including when all shared workers are busy.
+        self._commit_executor = ThreadPoolExecutor(
+            max_workers=config.max_concurrent_streams, thread_name_prefix="restore-commit"
+        )
+
+        def commit_restore(request: Any, context: Any) -> Any:
+            """Expose grpc's per-handler executor on an instance-local plain function."""
+
+            return RestoreService.CommitRestore(self, request, context)
+
+        commit_restore.experimental_thread_pool = self._commit_executor  # type: ignore[attr-defined]
+        self.CommitRestore = commit_restore  # type: ignore[method-assign]
 
     # ---- lifecycle ---------------------------------------------------------------
 
@@ -358,13 +374,14 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 self._heartbeat_thread.start()
 
     def stop(self) -> None:
-        """End and join the heartbeat thread. Idempotent."""
+        """End the heartbeat and shut down the commit executor. Idempotent."""
 
         self._heartbeat_stop.set()
         thread = self._heartbeat_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join()
         self._heartbeat_thread = None
+        self._commit_executor.shutdown(wait=False)
 
     def heartbeat_once(self) -> None:
         """Set this instance's ``heartbeat_at`` to the database clock (one step)."""
@@ -653,10 +670,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                             grpc.StatusCode.FAILED_PRECONDITION,
                             "restore item has not reached sent",
                         )
-                    session.expire(checkpoint.item)
-                    session.refresh(checkpoint.item)
-                    if checkpoint.item.request is not None:
-                        _update_request_state(checkpoint.item.request)
+                    rederive_request_state(session, checkpoint.item.request_id)
                     status = "revealed"
                 elif checkpoint.revealed and checkpoint.item.state == ITEM_DONE:
                     status = "already_done"
@@ -686,14 +700,15 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 context, grpc.StatusCode.PERMISSION_DENIED, "watch device_id is not the mTLS peer"
             )
         self._require_restore_device(identity, context)
-        seen: set[int] = set()
+        seen: set[tuple[int, int | str]] = set()
         cancelled = threading.Event()
         context.add_callback(cancelled.set)
         while context.is_active():
-            for assignment in self._assignments(identity.device_id):
-                if assignment.restore_request_item_id in seen:
+            for key, assignment in self._assignments(identity.device_id):
+                if key in seen:
                     continue
-                seen.add(assignment.restore_request_item_id)
+                seen.add(key)
+                seen.add((assignment.restore_request_item_id, "delivered"))
                 yield assignment
             cancelled.wait(self.config.assignment_poll_seconds)
 
@@ -1512,6 +1527,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 content_sha256=manifest.content_sha256,
             )
         )
+        self._wait_for_acknowledgement(prepared, lease, context)
         yield restore_pb2.RestoreFrame(
             job_end=restore_pb2.JobEnd(
                 files=1,
@@ -1520,6 +1536,46 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             )
         )
         return offset
+
+    def _wait_for_acknowledgement(
+        self, prepared: _PreparedOpen, lease: _Lease, context: Any
+    ) -> None:
+        """Wait for the receiver's durable checkpoint under this lease generation.
+
+        Each poll owns a short read session. Only the checkpoint joined to the
+        current generation acknowledges the one-file manifest; transport progress
+        alone cannot record a delivery (design RSR, D11).
+        """
+
+        while True:
+            _require_active(context)
+            now = dt.datetime.now(dt.UTC)
+            if now >= lease.expires_at:
+                detail = "the receiver did not acknowledge the delivery before its lease expired"
+                prepared.outcome.set("cancelled", "lease_expired", detail)
+                _abort(context, grpc.StatusCode.ABORTED, detail)
+            with self._factory() as session:
+                acknowledged = session.scalar(
+                    select(RestoreItemCheckpoint.restore_request_item_id)
+                    .join(
+                        RestoreOpenSession,
+                        RestoreOpenSession.restore_request_item_id
+                        == RestoreItemCheckpoint.restore_request_item_id,
+                    )
+                    .where(
+                        RestoreItemCheckpoint.restore_request_item_id == prepared.item_id,
+                        RestoreItemCheckpoint.committed_index >= 1,
+                        RestoreOpenSession.generation == lease.generation,
+                    )
+                )
+            if acknowledged is not None:
+                return
+            time.sleep(
+                min(
+                    self.config.acknowledgement_poll_seconds,
+                    max(0.0, (lease.expires_at - dt.datetime.now(dt.UTC)).total_seconds()),
+                )
+            )
 
     @contextmanager
     def _open_prepared_chunks(self, prepared: _PreparedOpen) -> Iterator[Iterator[bytes]]:
@@ -1727,7 +1783,9 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         )
         rederive_request_state(session, entry.request_id)
 
-    def _assignments(self, device_id: str) -> list[Any]:
+    def _assignments(self, device_id: str) -> list[tuple[tuple[int, int | str], Any]]:
+        """Read eligible items and their attempt keys on one database-clock poll."""
+
         with self._factory() as session:
             items = list(
                 session.scalars(
@@ -1743,7 +1801,30 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     .order_by(RestoreRequestItem.id)
                 )
             )
-            return [_assignment_proto(item) for item in items if item.request is not None]
+            now = session.scalar(select(func.now()))
+            assert now is not None
+            summaries = attempt_summaries(session, [item.id for item in items])
+            assignments: list[tuple[tuple[int, int | str], Any]] = []
+            for item in items:
+                summary = summaries[item.id]
+                if summary.open or item.request is None:
+                    continue
+                if plan_next_offer(summary, now, self._retry_policy).kind in {
+                    OFFER_AT,
+                    OFFER_GIVE_UP,
+                }:
+                    continue
+                latest = summary.latest
+                marker: int | str = (
+                    "delivered"
+                    if latest is not None and latest.klass == "delivered"
+                    else latest.id
+                    if latest is not None
+                    else 0
+                )
+                key = (item.id, marker)
+                assignments.append((key, _assignment_proto(item)))
+            return assignments
 
 
 def _manifest_digest(files: Iterable[_ManifestFile]) -> bytes:

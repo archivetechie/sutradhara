@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
-from sutradhara.hdcache.manager import ITEM_SENT, REQUEST_ACTIVE
+from sutradhara.hdcache.manager import ITEM_SENT, rederive_request_state
 from sutradhara.hdcache.models import RestoreOpenSession, RestoreRequestItem
 from sutradhara.jobs.reconcilers.conditions import OBSERVED_MISSING, OBSERVED_PRESENT
 from sutradhara.jobs.reconcilers.registry import Reconciler, TargetObservation, register_reconciler
@@ -81,10 +81,13 @@ def reconcile_target(session: Session, target_key: str) -> None:
     )
     if item is None or not _awaits_expired_reopen(item):
         return
-    item.detail = REOPENABLE_DETAIL
-    item.updated_at = dt.datetime.now(dt.UTC)
-    if item.request is not None:
-        item.request.state = REQUEST_ACTIVE
+    result = session.connection().execute(
+        update(RestoreRequestItem)
+        .where(RestoreRequestItem.id == item.id, RestoreRequestItem.state == ITEM_SENT)
+        .values(detail=REOPENABLE_DETAIL, updated_at=dt.datetime.now(dt.UTC))
+    )
+    if result.rowcount == 1:
+        rederive_request_state(session, item.request_id)
 
 
 def _observation(item: RestoreRequestItem) -> TargetObservation:
