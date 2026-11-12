@@ -490,7 +490,9 @@ def test_pfr_retryables_never_auto_promote_but_parse_determination_blocks_after_
 def test_pfr_handler_reason_matrix_covers_every_reason(
     engine: Engine,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Keep the reason matrix stable through the handler's caller-owned entry."""
     source = tmp_path / "clip.mxf"
     source.write_bytes(b"bytes")
     with session_scope(engine) as session:
@@ -513,6 +515,12 @@ def test_pfr_handler_reason_matrix_covers_every_reason(
         ctx = JobContext(session=session, job=job, granted_leases={"io": 1, "cpu": 1})
         import sutradhara.jobs.handlers.pfr_index as handler
 
+        def run_failure(failure: ScrapeFailure) -> Any:
+            monkeypatch.setattr(
+                handler, "scrape_path_isolated_120", lambda *args, **kwargs: failure
+            )
+            return handler.handle_pfr_index(ctx)
+
         retryable = {
             ReasonId.SOURCE_CHANGED,
             ReasonId.BUDGET_EXCEEDED,
@@ -529,13 +537,8 @@ def test_pfr_handler_reason_matrix_covers_every_reason(
         loud = set(ReasonId) - retryable - fallback
 
         for reason in sorted(retryable, key=lambda item: item.value):
-            result = handler._failure_result(
-                ctx,
-                item,
-                source=source,
-                sidecar_path=tmp_path / "cache" / f"{reason.value}.json",
-                blob_dir=tmp_path / "cache" / "blobs",
-                failure=_failure(
+            result = run_failure(
+                _failure(
                     reason,
                     plugin="mxf" if reason is ReasonId.INDEX_UNAVAILABLE else "registry",
                     stage="scrape",
@@ -546,13 +549,8 @@ def test_pfr_handler_reason_matrix_covers_every_reason(
             assert result.condition.condition == CONDITION_BACKOFF
             assert result.condition.auto_block is False
 
-        parse_exception = handler._failure_result(
-            ctx,
-            item,
-            source=source,
-            sidecar_path=tmp_path / "cache" / "mxf-parse-exception.json",
-            blob_dir=tmp_path / "cache" / "blobs",
-            failure=_failure(ReasonId.EXCEPTION, plugin="mxf", stage="scrape"),
+        parse_exception = run_failure(
+            _failure(ReasonId.EXCEPTION, plugin="mxf", stage="scrape"),
         )
         assert not parse_exception.ok
         assert parse_exception.condition is not None
@@ -560,27 +558,13 @@ def test_pfr_handler_reason_matrix_covers_every_reason(
         assert parse_exception.condition.auto_block is False
 
         for reason in sorted(fallback, key=lambda item: item.value):
-            result = handler._failure_result(
-                ctx,
-                item,
-                source=source,
-                sidecar_path=tmp_path / "cache" / f"{reason.value}.json",
-                blob_dir=tmp_path / "cache" / "blobs",
-                failure=_failure(reason),
-            )
+            result = run_failure(_failure(reason))
             assert result.ok
             assert result.step_state["pfr_index"]["kind"] == "fallback"
 
         for reason in sorted(loud, key=lambda item: item.value):
             with pytest.raises(RuntimeError, match="unmapped pfr_core ReasonId"):
-                handler._failure_result(
-                    ctx,
-                    item,
-                    source=source,
-                    sidecar_path=tmp_path / "cache" / f"{reason.value}.json",
-                    blob_dir=tmp_path / "cache" / "blobs",
-                    failure=_failure(reason),
-                )
+                run_failure(_failure(reason))
 
 
 def test_atomic_sidecar_write_keeps_old_payload_when_replace_fails(

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -40,6 +41,16 @@ class JobContext:
     observations: list[dict[str, Any]] = field(default_factory=list)
     components: list[str] = field(default_factory=list)
     component_parents: list[dict[str, str]] = field(default_factory=list)
+
+    def outside_transaction(self) -> AbstractContextManager[bool]:
+        """Leave an owned SQLite attempt around external work; yield whether active.
+
+        Caller-owned transactions stay intact. Only an active boundary requires
+        the handler to compare its inputs before publishing results.
+        """
+        from sutradhara.jobs.engine import _outside_transaction
+
+        return _outside_transaction(self)
 
     def observe(self, facts: Mapping[str, Any]) -> None:
         """Append one JSON-safe set of raw facts in observation order."""
@@ -192,6 +203,7 @@ class JobResult:
     detail: str = ""
     step_state: dict[str, Any] = field(default_factory=dict)
     condition: ConditionProjection | None = None
+    superseded: bool = False
 
 
 JobHandler = Callable[[JobContext], JobResult]

@@ -32,6 +32,7 @@ def record_derivation(
     artifactclass: str,
     media_kind: MediaKind,
     generated_by: str,
+    digest: bytes | None = None,
 ) -> IngestItem:
     """Record a derived ingest occurrence and its provenance edge."""
 
@@ -42,7 +43,8 @@ def record_derivation(
     if not output_path.is_file() or stat.st_size <= 0:
         raise ValueError(f"derived output missing or empty: {output_path}")
 
-    digest = sha256_file(output_path)
+    if digest is None:
+        digest = sha256_file(output_path)
     asset = session.get(LogicalAsset, digest)
     if asset is None:
         asset = LogicalAsset(

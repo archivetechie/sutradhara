@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from sqlalchemy import select
+
 from sutradhara.catalog.facts import record_validity
 from sutradhara.catalog.models import LogicalAsset
 from sutradhara.catalog.types import AssetValidity, is_content_hash
@@ -43,31 +45,55 @@ def handle_validate(ctx: JobContext) -> JobResult:
     touch_asset(ctx, asset_hash)
     touch_tool(ctx, validator, "builtin")
 
+    inputs = (asset.validity, asset.validity_note)
     path = Path(path_raw)
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        ctx.observe({"path": str(path), "exception_type": type(exc).__name__, "text": str(exc)})
+    read_error = None
+    decode_error = None
+    with ctx.outside_transaction() as active:
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            read_error = exc
+        else:
+            try:
+                text = data.decode("utf-8")
+                if validator == "json":
+                    json.loads(text)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                decode_error = exc
+
+    if active:
+        current = ctx.session.execute(
+            select(LogicalAsset.validity, LogicalAsset.validity_note).where(
+                LogicalAsset.content_sha256 == asset_hash
+            )
+        ).one_or_none()
+        if current != inputs:
+            return JobResult(ok=False, detail="superseded: validate asset changed", superseded=True)
+    if read_error is not None:
+        ctx.observe(
+            {
+                "path": str(path),
+                "exception_type": type(read_error).__name__,
+                "text": str(read_error),
+            }
+        )
         return JobResult(
             ok=False,
-            detail=f"read error: {exc}",
+            detail=f"read error: {read_error}",
             step_state={"validate": {"kind": "read_error", "path": str(path)}},
         )
 
-    try:
-        text = data.decode("utf-8")
-        if validator == "json":
-            json.loads(text)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    if decode_error is not None:
         ctx.observe(
             {
                 "validator": validator,
                 "bytes_read": len(data),
-                "exception_type": type(exc).__name__,
-                "text": str(exc),
+                "exception_type": type(decode_error).__name__,
+                "text": str(decode_error),
             }
         )
-        note = f"decode error via {validator}: {exc}"
+        note = f"decode error via {validator}: {decode_error}"
         record_validity(ctx.session, asset=asset, validity=AssetValidity.SUSPECT, note=note)
         return JobResult(
             ok=True,

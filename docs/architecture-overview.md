@@ -972,15 +972,39 @@ Honest notes a newcomer would otherwise trip on:
 
 ## Worker SQLite contention
 
-The catalog writer engine uses a 30-second SQLite connection timeout and sets
-`PRAGMA busy_timeout = 30000` on each connection. The worker retries a locked
-attempt transaction up to five times, with delays of 0.1, 0.5, 2, and 5 seconds.
-Both `database is locked` and `database table is locked` trigger rollback and
-replay through the common attempt runner. The committed claim retains one
-attempt number; rolled-back audit inserts do not create extra attempts.
-An explicit SQLite outer transaction keeps handler savepoints inside that
-rollback boundary. External handler effects still require replay tolerance,
-as with worker crash recovery.
+The catalog writer engine defaults to a 30-second SQLite connection timeout and
+`PRAGMA busy_timeout = 30000` on each connection. `sutra worker` requires WAL:
+after the engine's connect hook attempts the switch, startup checks the actual
+journal mode and refuses any other mode. Its connection pool holds at least the
+executor count plus two connections for scheduler work.
+
+Each attempt starts with a plain `BEGIN`. The late writers (`transcode`,
+`pfr-index`, `verify`, and `validate`) use the engine-owned
+`JobContext.outside_transaction()` boundary once, after their reads and before
+external work. The boundary refuses prior writes, leaves the read transaction,
+and prevents SQL during external work. It then waits for `BEGIN IMMEDIATE` on
+the same connection. Each unsuccessful busy-timeout wait emits
+`sutradhara.job.write_lock_wait`; there is no deadline and the external work
+does not replay while waiting. Transcode hashes its outputs outside the
+transaction; PFR prepares a temporary sidecar there and publishes it only after
+re-opening and comparing its inputs.
+
+After re-opening, the engine checks that the job is still RUNNING with the same
+attempt count. A changed job discards the attempt without an audit row or retry
+policy update. Each handler also compares its inputs and projection targets;
+if they changed or disappeared, it publishes nothing. Verify keeps its measured
+observations in the failed attempt record but writes no receipt. A superseded
+result requeues a non-reconciler job for 30 seconds later regardless of its retry
+limit; a reconciler job records BACKOFF with reason `superseded` without automatic
+blocking. Both kinds of supersession emit a finished outcome of `superseded`.
+
+Caller-owned sessions and other database dialects retain their transaction
+shape: the boundary does nothing and no supersession comparisons run. Early
+writers keep their existing transaction and retry behavior. The worker retries
+SQLite lock failures through the common attempt runner up to five times, with
+delays of 0.1, 0.5, 2, and 5 seconds. The committed claim retains one attempt
+number; rolled-back audit inserts do not create extra attempts. Lock retries
+do not replay late writers' external work, but crash recovery still can.
 
 Exhaustion records a failed attempt and allows the worker to continue. If the
 failure record itself cannot be written, the live worker retains it in memory

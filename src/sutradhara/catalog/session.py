@@ -25,7 +25,13 @@ def database_url() -> str:
     return os.environ.get("SUTRADHARA_DB_URL", DEFAULT_DB_URL)
 
 
-def make_engine(url: str | None = None, *, echo: bool = False) -> Engine:
+def make_engine(
+    url: str | None = None,
+    *,
+    echo: bool = False,
+    busy_timeout: float = 30,
+    pool_size: int | None = None,
+) -> Engine:
     """Create a SQLAlchemy Engine with sensible SQLite defaults.
 
     For SQLite: enables WAL mode and foreign key enforcement (the latter
@@ -38,11 +44,14 @@ def make_engine(url: str | None = None, *, echo: bool = False) -> Engine:
         # and in-process harness/job engines share one SQLite file; without a
         # timeout a concurrent writer surfaces as an immediate
         # "database is locked" OperationalError instead of a short wait.
-        connect_args["timeout"] = 30
-    engine = create_engine(final_url, echo=echo, future=True, connect_args=connect_args)
+        connect_args["timeout"] = busy_timeout
+    pool_options = {} if pool_size is None else {"pool_size": pool_size}
+    engine = create_engine(
+        final_url, echo=echo, future=True, connect_args=connect_args, **pool_options
+    )
 
     if final_url.startswith("sqlite"):
-        _install_sqlite_pragmas(engine)
+        _install_sqlite_pragmas(engine, busy_timeout=busy_timeout)
 
     return engine
 
@@ -78,11 +87,11 @@ def make_read_only_engine(url: str | None = None, *, echo: bool = False) -> Engi
     return engine
 
 
-def _install_sqlite_pragmas(engine: Engine) -> None:
+def _install_sqlite_pragmas(engine: Engine, *, busy_timeout: float = 30) -> None:
     @event.listens_for(engine, "connect")
     def _set_pragmas(dbapi_connection: Any, _conn_record: Any) -> None:
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA busy_timeout = 30000")
+        cursor.execute(f"PRAGMA busy_timeout = {int(busy_timeout * 1000)}")
         cursor.execute("PRAGMA foreign_keys = ON")
         cursor.execute("PRAGMA journal_mode = WAL")
         # The catalog can be rebuilt, but retention decisions, enrollment

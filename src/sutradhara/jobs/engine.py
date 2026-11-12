@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import datetime as dt
 import socket
+import time
 import traceback
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from functools import partial
 from typing import Any, cast
 
-from sqlalchemy import select, update
-from sqlalchemy.engine import CursorResult
+from sqlalchemy import event, select, update
+from sqlalchemy.engine import Connection, CursorResult
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -51,6 +53,139 @@ from sutradhara.jobs.runtime_observations import (
     bind_session_open_observer,
     bind_tape_locator_observer,
 )
+from sutradhara.structured_logs import emit_structured_event
+
+
+class AttemptSuperseded(Exception):
+    """The job no longer belongs to the attempt that did the external work."""
+
+
+class AttemptBoundaryError(Exception):
+    """A handler violated the read/external-work/write transaction boundary."""
+
+
+def _begin_immediate(connection: Connection, *, job_id: int, job_kind: str) -> None:
+    """Wait for the writer slot without replaying the handler's external work."""
+    started = time.monotonic()
+    while True:
+        try:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            return
+        except OperationalError as error:
+            if not is_sqlite_lock_error(error):
+                raise
+            emit_structured_event(
+                "sutradhara.job.write_lock_wait",
+                job_id=job_id,
+                job_kind=job_kind,
+                seconds_waited=time.monotonic() - started,
+            )
+
+
+class _AttemptBoundary:
+    """Own the replaceable connection savepoint shared with handler dispatch."""
+
+    def __init__(self, session: Session, handler_session: Session) -> None:
+        self.session = session
+        self.handler_session = handler_session
+        self.connection = session.connection()
+        self.savepoint = self.connection.begin_nested()
+
+    @contextmanager
+    def outside(self, job: Job) -> Iterator[bool]:
+        session = self.session
+        handler_session = self.handler_session
+        connection = self.connection
+        if "attempt_total_changes" not in session.info or connection.dialect.name != "sqlite":
+            yield False
+            return
+        if session.info.get("attempt_boundary_used"):
+            raise AttemptBoundaryError("attempt transaction boundary already used")
+        dbapi = connection.connection.dbapi_connection
+        if dbapi is None:
+            raise AttemptBoundaryError("attempt connection is unavailable")
+        if dbapi.total_changes != session.info["attempt_total_changes"] or any(
+            s.new or s.dirty or s.deleted for s in (session, handler_session)
+        ):
+            raise AttemptBoundaryError("attempt transaction boundary requires no prior writes")
+        job_id, job_kind, attempts = job.id, job.kind, job.attempts
+        session.info["attempt_boundary_used"] = True
+        handler_session.flush()
+        Session.commit(handler_session)
+        self.savepoint.commit()
+        connection.exec_driver_sql("COMMIT")
+        violation: AttemptBoundaryError | None = None
+
+        def refuse_sql(
+            conn: Any,
+            cursor: Any,
+            statement: str,
+            parameters: Any,
+            context: Any,
+            executemany: Any,
+        ) -> None:
+            nonlocal violation
+            # Reject even Session autobegin's SAVEPOINT: a rollback-to alone
+            # would leave that outermost SQLite savepoint transaction open.
+            violation = AttemptBoundaryError("SQL used inside attempt transaction boundary")
+            raise violation
+
+        def refuse_session(*args: Any) -> None:
+            nonlocal violation
+            violation = AttemptBoundaryError("session used inside attempt transaction boundary")
+            raise violation
+
+        event.listen(connection, "before_cursor_execute", refuse_sql)
+        guarded_events = ("do_orm_execute", "before_flush", "before_attach", "before_commit")
+        for guarded_session in (session, handler_session):
+            for name in guarded_events:
+                event.listen(guarded_session, name, refuse_session)
+        try:
+            yield True
+        finally:
+            event.remove(connection, "before_cursor_execute", refuse_sql)
+            for guarded_session in (session, handler_session):
+                for name in guarded_events:
+                    event.remove(guarded_session, name, refuse_session)
+            if any(s.new or s.dirty or s.deleted for s in (session, handler_session)):
+                violation = AttemptBoundaryError(
+                    "session mutated inside attempt transaction boundary"
+                )
+            handler_session.rollback()
+            # The entry guard proved the engine session had no pending work.
+            # Discard any in-memory misuse before the R4 query can autoflush it.
+            for instance in list(session.new):
+                session.expunge(instance)
+            for instance in list(session.deleted):
+                session.add(instance)
+            if dbapi.in_transaction:
+                connection.exec_driver_sql("ROLLBACK")
+                violation = AttemptBoundaryError("attempt driver was not idle before re-opening")
+            _begin_immediate(connection, job_id=job_id, job_kind=job_kind)
+            self.savepoint = connection.begin_nested()
+            session.expire_all()
+            handler_session.expire_all()
+            session.info["attempt_total_changes"] = dbapi.total_changes
+            current = session.execute(
+                select(Job.status, Job.attempts).where(Job.id == job_id)
+            ).one_or_none()
+            if current is None or current != (JobStatus.RUNNING, attempts):
+                raise AttemptSuperseded(
+                    f"superseded: job {job_id} changed from RUNNING attempt {attempts} to {current}"
+                )
+            if violation is not None:
+                raise violation
+
+
+@contextmanager
+def _outside_transaction(ctx: JobContext) -> Iterator[bool]:
+    """Delegate to the engine-owned boundary, or preserve a caller's transaction."""
+    boundary = ctx.session.info.get("attempt_boundary")
+    if boundary is None:
+        yield False
+    else:
+        with boundary.outside(ctx.job) as active:
+            yield active
 
 
 def is_sqlite_lock_error(error: BaseException) -> bool:
@@ -153,6 +288,7 @@ def run_one(
         raise ValueError(f"job id={job_id} is {job.status}; cannot run")
 
     ctx = job_context(session, job, granted_leases=granted_leases)
+    job_kind = job.kind
     try:
         handler = get_handler(job.kind)
     except HandlerNotRegistered as e:
@@ -205,11 +341,13 @@ def run_one(
         )
         return JobResult(ok=False, detail=str(e))
     except Exception as e:
-        if is_sqlite_lock_error(e):
+        if isinstance(e, AttemptSuperseded) or is_sqlite_lock_error(e):
             session.rollback()
             raise
         if not session.is_active:
             session.rollback()
+            if session.info.get("attempt_boundary_used"):
+                _begin_immediate(session.connection(), job_id=job_id, job_kind=job_kind)
             job = session.get(Job, job_id)
             if job is None:
                 raise
@@ -232,9 +370,10 @@ def run_one(
         )
         return JobResult(ok=False, detail=str(e))
 
-    job.status = JobStatus.SUCCEEDED if result.ok else JobStatus.FAILED
+    succeeded = result.ok and not result.superseded
+    job.status = JobStatus.SUCCEEDED if succeeded else JobStatus.FAILED
     job.finished_at = _utcnow()
-    job.last_error = None if result.ok else result.detail
+    job.last_error = None if succeeded else result.detail
     if result.step_state:
         # Merge over existing step_state so handlers can build up state
         # incrementally without clobbering.
@@ -245,7 +384,23 @@ def run_one(
         granted_leases=granted_leases,
         detail=attempt_detail(ctx),
     )
-    if result.condition is not None:
+    if result.superseded:
+        if job.recon_domain is None:
+            job.status = JobStatus.PENDING
+            job.not_before = _utcnow() + dt.timedelta(seconds=30)
+            job.started_at = None
+            job.finished_at = None
+        else:
+            _record_reconciler_condition(
+                session,
+                job,
+                attempt,
+                condition=CONDITION_BACKOFF,
+                reason="superseded",
+                message=result.detail,
+                auto_block=False,
+            )
+    elif result.condition is not None:
         _record_projection_condition(session, job, attempt, result.condition)
     elif result.ok:
         _record_reconciler_condition(session, job, attempt, condition=None)
@@ -276,16 +431,17 @@ def _invoke_handler_in_savepoint(
 
     engine_job = ctx.job
     session.flush()
-    connection_savepoint = session.connection().begin_nested()
     handler_session = _HandlerSession(
         bind=session.connection(),
         join_transaction_mode="create_savepoint",
         expire_on_commit=False,
     )
+    boundary = _AttemptBoundary(session, handler_session)
+    handler_session.info["attempt_boundary"] = boundary
     handler_job = handler_session.get(Job, engine_job.id)
     if handler_job is None:
         handler_session.close()
-        connection_savepoint.rollback()
+        boundary.savepoint.rollback()
         raise ValueError(f"job id={engine_job.id} disappeared before handler dispatch")
     ctx.session = handler_session
     ctx.job = handler_job
@@ -293,15 +449,15 @@ def _invoke_handler_in_savepoint(
         result = handler(ctx)
         Session.commit(handler_session)
         handled_objects = list(handler_session.info.get("handler_flushed_objects", ()))
-        connection_savepoint.commit()
+        boundary.savepoint.commit()
     except BaseException:
         batch_state_touched = bool(handler_session.info.get("checkpoint_batch_state_touched"))
         failed_batch_state = deepcopy(
             dict(handler_job.__dict__.get("step_state") or {}).get(CHECKPOINT_BATCH_STATE_KEY)
         )
         handler_session.rollback()
-        if connection_savepoint.is_active:
-            connection_savepoint.rollback()
+        if boundary.savepoint.is_active:
+            boundary.savepoint.rollback()
         if batch_state_touched:
             session.expire(engine_job)
             prior = dict(engine_job.step_state or {})

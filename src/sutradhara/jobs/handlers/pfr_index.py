@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
+from typing import Any
 
 from pfr_core import PFRSidecar, make_fallback_sidecar
 from pfr_core.failure import ReasonId, ScrapeFailure
 from pfr_core.source import LocalFile
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from sutradhara.catalog.facts import record_index, record_validity
 from sutradhara.catalog.models import IngestItem, LogicalAsset
@@ -89,73 +93,82 @@ def handle_pfr_index(ctx: JobContext) -> JobResult:
     blob_dir.mkdir(parents=True, exist_ok=True)
     sidecar_path = sidecar_dir / f"{item.id}.pfr.json"
 
-    scraped = scrape_path_isolated_120(
-        source,
-        blob_dir=blob_dir,
-        role=resource_role_for_job(ctx.job.kind, ctx.job.params),
-        cpu_lease=cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources),
-    )
-    if isinstance(scraped, ScrapeFailure):
-        return _failure_result(
-            ctx,
-            item,
-            source=source,
-            sidecar_path=sidecar_path,
-            blob_dir=blob_dir,
-            failure=scraped,
-        )
+    role = resource_role_for_job(ctx.job.kind, ctx.job.params)
+    cpu_lease = cpu_lease_from_job(ctx.granted_leases, ctx.job.required_resources)
+    inputs = _index_inputs(ctx.session, item_id)
+    temporary_path: Path | None = None
+    try:
+        with ctx.outside_transaction() as active:
+            scraped = scrape_path_isolated_120(
+                source, blob_dir=blob_dir, role=role, cpu_lease=cpu_lease
+            )
+            sidecar = None
+            if isinstance(scraped, ScrapeFailure):
+                _assert_reason_matrix_closed()
+                if scraped.reason_id in _FALLBACK_REASON_IDS:
+                    fallback = make_fallback_sidecar(LocalFile(source), scraped)
+                    if isinstance(fallback, ScrapeFailure):
+                        raise RuntimeError(
+                            "pfr_core fallback sidecar creation failed: "
+                            f"{fallback.reason_id.value}: {fallback.message}"
+                        )
+                    sidecar = sidecar_with_catalog_identity(fallback, item)
+            else:
+                sidecar = sidecar_with_catalog_identity(scraped, item)
+            if sidecar is not None:
+                fd, name = tempfile.mkstemp(prefix=f".{item_id}.", suffix=".tmp", dir=sidecar_dir)
+                temporary_path = Path(name)
+                os.close(fd)
+                atomic_write_sidecar(sidecar, temporary_path)
+                enforce_blob_lru(blob_dir, protect_sidecar=sidecar)
+                if not sidecar_blobs_complete(sidecar, blob_dir=blob_dir):
+                    raise RuntimeError(
+                        "pfr blob cache trim removed blobs required by the published sidecar"
+                    )
 
-    sidecar = sidecar_with_catalog_identity(scraped, item)
-    _publish_sidecar(ctx, item, sidecar=sidecar, sidecar_path=sidecar_path, blob_dir=blob_dir)
-    kind = "fallback" if sidecar.grammar_id == "fallback" else "ok"
-    return JobResult(
-        ok=True,
-        detail=f"pfr sidecar written ({sidecar.grammar_id})",
-        step_state={
-            "pfr_index": {
-                "kind": kind,
-                "sidecar_path": str(sidecar_path),
-                "grammar_id": sidecar.grammar_id,
-                "recipe_version": sidecar.recipe_version,
-            }
-        },
-    )
+        if active and _index_inputs(ctx.session, item_id) != inputs:
+            return JobResult(
+                ok=False, detail="superseded: pfr-index inputs changed", superseded=True
+            )
+        if sidecar is None:
+            if not isinstance(scraped, ScrapeFailure):
+                raise RuntimeError("pfr-index missing sidecar requires a ScrapeFailure")
+            return _failure_result(ctx, item, failure=scraped)
+        if temporary_path is None:
+            raise RuntimeError("pfr-index sidecar requires a temporary path before publishing")
+        _publish_sidecar(
+            ctx, item, sidecar=sidecar, sidecar_path=sidecar_path, temporary_path=temporary_path
+        )
+        state = {
+            "kind": "fallback" if sidecar.grammar_id == "fallback" else "ok",
+            "sidecar_path": str(sidecar_path),
+            "grammar_id": sidecar.grammar_id,
+            "recipe_version": sidecar.recipe_version,
+        }
+        if isinstance(scraped, ScrapeFailure):
+            return JobResult(
+                ok=True,
+                detail=f"pfr fallback sidecar written ({scraped.reason_id.value})",
+                step_state={
+                    "pfr_index": {**state, "kind": "fallback", "failure": scraped.to_dict()}
+                },
+            )
+        return JobResult(
+            ok=True,
+            detail=f"pfr sidecar written ({sidecar.grammar_id})",
+            step_state={"pfr_index": state},
+        )
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _failure_result(
     ctx: JobContext,
     item: IngestItem,
     *,
-    source: Path,
-    sidecar_path: Path,
-    blob_dir: Path,
     failure: ScrapeFailure,
 ) -> JobResult:
-    _assert_reason_matrix_closed()
-
-    if failure.reason_id in _FALLBACK_REASON_IDS:
-        fallback = make_fallback_sidecar(LocalFile(source), failure)
-        if isinstance(fallback, ScrapeFailure):
-            raise RuntimeError(
-                "pfr_core fallback sidecar creation failed: "
-                f"{fallback.reason_id.value}: {fallback.message}"
-            )
-        sidecar = sidecar_with_catalog_identity(fallback, item)
-        _publish_sidecar(ctx, item, sidecar=sidecar, sidecar_path=sidecar_path, blob_dir=blob_dir)
-        return JobResult(
-            ok=True,
-            detail=f"pfr fallback sidecar written ({failure.reason_id.value})",
-            step_state={
-                "pfr_index": {
-                    "kind": "fallback",
-                    "sidecar_path": str(sidecar_path),
-                    "grammar_id": sidecar.grammar_id,
-                    "recipe_version": sidecar.recipe_version,
-                    "failure": failure.to_dict(),
-                }
-            },
-        )
-
     if _is_parse_determination(failure) and _previous_same_failure(ctx, failure):
         _mark_suspect(ctx, item, failure)
         detail = _failure_detail(failure)
@@ -245,13 +258,9 @@ def _publish_sidecar(
     item: IngestItem,
     *,
     sidecar_path: Path,
-    blob_dir: Path,
+    temporary_path: Path,
     sidecar: PFRSidecar,
 ) -> None:
-    atomic_write_sidecar(sidecar, sidecar_path)
-    enforce_blob_lru(blob_dir, protect_sidecar=sidecar)
-    if not sidecar_blobs_complete(sidecar, blob_dir=blob_dir):
-        raise RuntimeError("pfr blob cache trim removed blobs required by the published sidecar")
     record_index(
         ctx.session,
         item=item,
@@ -262,6 +271,35 @@ def _publish_sidecar(
         **(item.item_metadata or {}),
         PFR_RECIPE_METADATA_KEY: sidecar.recipe_version,
     }
+    ctx.session.flush()
+    os.replace(temporary_path, sidecar_path)
+    directory_fd = os.open(sidecar_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _index_inputs(session: Session, item_id: int) -> tuple[Any, ...] | None:
+    """Snapshot the item and source validity without refreshing deleted objects."""
+    row = session.execute(
+        select(
+            IngestItem.logical_asset_hash,
+            IngestItem.item_metadata,
+            LogicalAsset.validity,
+            LogicalAsset.validity_note,
+        )
+        .outerjoin(LogicalAsset, LogicalAsset.content_sha256 == IngestItem.logical_asset_hash)
+        .where(IngestItem.id == item_id)
+    ).one_or_none()
+    if row is None:
+        return None
+    return (
+        row.logical_asset_hash,
+        (row.item_metadata or {}).get("source_path"),
+        row.validity,
+        row.validity_note,
+    )
 
 
 def _assert_reason_matrix_closed() -> None:

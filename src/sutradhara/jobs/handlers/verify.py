@@ -19,7 +19,11 @@ updates timestamps. Step_state captures the most recent answer.
 from __future__ import annotations
 
 import datetime as dt
-from typing import cast
+from copy import deepcopy
+from typing import Any, cast
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 # Imported as a module (not via `from ... import backend_from_row`) so tests
 # can monkeypatch `factory.backend_from_row` and have the override take
@@ -55,18 +59,23 @@ def handle_verify(ctx: JobContext) -> JobResult:
     ctx.touch(f"backend:{copy.backend.name}")
     touch_copy_tape(ctx, copy)
     backend = factory.backend_from_row(copy.backend)
+    inputs = _copy_inputs(ctx.session, raw_copy_id)
+    native_locator = deepcopy(copy.native_locator)
     try:
-        result = backend.verify(copy.native_locator)
+        with ctx.outside_transaction() as active:
+            result = backend.verify(native_locator)
     except BackendStoredCorruptError as exc:
+        ctx.observe(
+            {"verify_ok": False, "measured": False, "actual_hash": None, "detail": str(exc)}
+        )
+        if active and _copy_inputs(ctx.session, raw_copy_id) != inputs:
+            return JobResult(ok=False, detail="superseded: verify copy changed", superseded=True)
         record_backend_attested_corrupt(
             ctx.session,
             copy,
             detail=str(exc),
             source="verify-job",
             execution_id=str(ctx.job.id),
-        )
-        ctx.observe(
-            {"verify_ok": False, "measured": False, "actual_hash": None, "detail": str(exc)}
         )
         return JobResult(
             ok=True,
@@ -89,6 +98,8 @@ def handle_verify(ctx: JobContext) -> JobResult:
             "detail": result.detail,
         }
     )
+    if active and _copy_inputs(ctx.session, raw_copy_id) != inputs:
+        return JobResult(ok=False, detail="superseded: verify copy changed", superseded=True)
 
     execution_id = str(ctx.job.id)
     if result.measured and result.actual_hash is not None:
@@ -127,3 +138,22 @@ def handle_verify(ctx: JobContext) -> JobResult:
             "copy_health_after": copy.health.value,
         },
     )
+
+
+def _copy_inputs(session: Session, copy_id: int) -> tuple[Any, ...] | None:
+    """Read projection inputs without refreshing an ORM object that may be gone."""
+    row = session.execute(
+        select(
+            Copy.native_locator,
+            Copy.integrity_hash,
+            Copy.integrity_hash_provenance,
+            Copy.logical_asset_hash,
+            Copy.backend_id,
+            Copy.deleted_at,
+            Copy.health,
+            Copy.last_checked_at,
+            Copy.last_measured_digest,
+            Copy.last_measured_at,
+        ).where(Copy.id == copy_id)
+    ).one_or_none()
+    return None if row is None else tuple(row)

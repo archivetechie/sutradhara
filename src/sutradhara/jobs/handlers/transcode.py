@@ -8,6 +8,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from sutradhara.catalog.facts import record_derivation, record_validity
 from sutradhara.catalog.models import IngestItem, LogicalAsset
 from sutradhara.catalog.types import AssetValidity, MediaKind
@@ -59,22 +62,27 @@ def handle_transcode(ctx: JobContext) -> JobResult:
     mezz_path = output_dir / "mezz.mp4"
     preview_path = output_dir / "preview.mp4"
 
-    if os.environ.get("SUTRADHARA_FAKE_TRANSCODE") == "1":
-        tool_version = "1"
-        touch_tool(ctx, "fake-transcode", tool_version)
-        result = _fake_transcode(source_path, mezz_path, preview_path)
-    else:
-        tool_version = current_tool_version("ffmpeg")
-        touch_tool(ctx, "ffmpeg", tool_version)
+    fake = os.environ.get("SUTRADHARA_FAKE_TRANSCODE") == "1"
+    tool_version = "1" if fake else current_tool_version("ffmpeg")
+    touch_tool(ctx, "fake-transcode" if fake else "ffmpeg", tool_version)
+    if not fake:
         threads = _granted_cpu_threads(ctx)
-        result = _run_ffmpeg(
-            source_path,
-            mezz_path,
-            preview_path,
-            threads=threads,
-            role=resource_role_for_job(ctx.job.kind, ctx.job.params),
-        )
+        role = resource_role_for_job(ctx.job.kind, ctx.job.params)
+    inputs = _transcode_inputs(ctx.session, item_id)
+    mezz_digest = preview_digest = None
+    with ctx.outside_transaction() as active:
+        if fake:
+            result = _fake_transcode(source_path, mezz_path, preview_path)
+        else:
+            result = _run_ffmpeg(source_path, mezz_path, preview_path, threads=threads, role=role)
+        if result["kind"] == "ok":
+            mezz_digest = sha256_file(mezz_path)
+            preview_digest = sha256_file(preview_path)
     _observe_transcode_result(ctx, result, tool_version=tool_version)
+    if active and _transcode_inputs(ctx.session, item_id) != inputs:
+        return JobResult(
+            ok=False, detail="superseded: transcode inputs or targets changed", superseded=True
+        )
 
     if result["kind"] == "stderr_pattern":
         # SUSPECT is a validity statement about the asset; a capability match
@@ -121,6 +129,7 @@ def handle_transcode(ctx: JobContext) -> JobResult:
         artifactclass=output_class,
         media_kind=MediaKind.VIDEO,
         generated_by="transcode",
+        digest=mezz_digest,
     )
     preview = record_derivation(
         ctx.session,
@@ -131,6 +140,7 @@ def handle_transcode(ctx: JobContext) -> JobResult:
         artifactclass=output_class,
         media_kind=MediaKind.VIDEO,
         generated_by="transcode",
+        digest=preview_digest,
     )
     ctx.observe(
         {
@@ -157,6 +167,40 @@ def handle_transcode(ctx: JobContext) -> JobResult:
                 "preview_path": str(preview_path),
             }
         },
+    )
+
+
+def _transcode_inputs(session: Session, item_id: int) -> tuple[Any, ...] | None:
+    """Capture source inputs and the identities at both derivation target keys."""
+    row = session.execute(
+        select(
+            IngestItem.intake_id,
+            IngestItem.logical_asset_hash,
+            IngestItem.item_metadata,
+            LogicalAsset.validity,
+            LogicalAsset.validity_note,
+        )
+        .outerjoin(LogicalAsset, LogicalAsset.content_sha256 == IngestItem.logical_asset_hash)
+        .where(IngestItem.id == item_id)
+    ).one_or_none()
+    if row is None:
+        return None
+    targets = tuple(
+        session.execute(
+            select(IngestItem.logical_asset_hash).where(
+                IngestItem.intake_id == row.intake_id,
+                IngestItem.as_received_path == f"derived/{item_id}/{name}.mp4",
+            )
+        ).one_or_none()
+        for name in ("mezz", "preview")
+    )
+    return (
+        row.intake_id,
+        row.logical_asset_hash,
+        (row.item_metadata or {}).get("source_path"),
+        row.validity,
+        row.validity_note,
+        targets,
     )
 
 

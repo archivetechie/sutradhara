@@ -23,6 +23,7 @@ from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register buil
 from sutradhara.jobs.attempts import record_attempt
 from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.engine import (
+    AttemptSuperseded,
     _record_reconciler_condition,
     apply_retry_policy,
     attempt_detail,
@@ -213,6 +214,7 @@ def _execute_job_once(
                 raise RuntimeError("active session must have a DBAPI connection")
             if not dbapi_connection.in_transaction:
                 connection.exec_driver_sql("BEGIN")
+            session.info["attempt_total_changes"] = dbapi_connection.total_changes
         job = session.get(Job, job_id)
         emit_structured_event(
             "sutradhara.job.started",
@@ -221,18 +223,24 @@ def _execute_job_once(
             entity_refs=[{"kind": "job", "id": str(job_id), "confidence": "high"}],
             granted_leases=dict(granted),
         )
-        result = run_one(session, job_id, granted_leases=granted)
+        attempt_superseded = False
+        try:
+            result = run_one(session, job_id, granted_leases=granted)
+        except AttemptSuperseded as error:
+            session.rollback()
+            result = JobResult(ok=False, detail=str(error), superseded=True)
+            attempt_superseded = True
         job = session.get(Job, job_id)
         emit_structured_event(
             "sutradhara.job.finished",
             job_id=job_id,
             job_kind=None if job is None else job.kind,
             job_status=None if job is None else job.status,
-            outcome="ok" if result.ok else "failed",
+            outcome="superseded" if result.superseded else "ok" if result.ok else "failed",
             entity_refs=[{"kind": "job", "id": str(job_id), "confidence": "high"}],
             granted_leases=dict(granted),
         )
-        if job is not None and job.recon_domain is None:
+        if not attempt_superseded and job is not None and job.recon_domain is None:
             apply_retry_policy(session, job, config=config)
         return WorkerJobOutcome(
             job_id=job_id,
@@ -250,8 +258,10 @@ def _execute_job(
     """Retry the entire attempt transaction, including its flushes and commit.
 
     The claim is already committed, so rollback/replay retains one attempt
-    number and writes only one audit row. Handlers must tolerate replay of
-    external effects, as they already must for worker crash recovery.
+    number and writes only one audit row. Lock retries replay no late writer's
+    external work: its boundary waits for BEGIN IMMEDIATE before writing.
+    Crash recovery still may replay external effects; early writers retain
+    their existing transaction and replay semantics.
     """
     for retry in range(len(_LOCK_BACKOFF) + 1):
         try:

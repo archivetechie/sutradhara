@@ -31,7 +31,16 @@ def worker_cmd(once: bool, pools: tuple[str, ...]) -> None:
         url = database_url()
         with worker_lock(url):
             _echo_resource_control()
-            worker = JobWorker(make_engine(url), config=config)
+            engine = make_engine(url, pool_size=max(config.executor_workers or 1, 1) + 2)
+            if engine.dialect.name == "sqlite":
+                with engine.connect() as connection:
+                    journal_mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
+                if str(journal_mode).lower() != "wal":
+                    engine.dispose()
+                    raise click.ClickException(
+                        f"worker requires SQLite WAL journal mode; database reports {journal_mode}"
+                    )
+            worker = JobWorker(engine, config=config)
             if once:
                 outcomes = worker.drain()
                 click.echo(f"worker drained {len(outcomes)} job(s)")
