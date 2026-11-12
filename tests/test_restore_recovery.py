@@ -10,12 +10,14 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import grpc
 import pytest
 from sqlalchemy import event, select, update
 from sqlalchemy.dialects import postgresql
 
+from sutradhara._proto import restore_pb2
 from sutradhara.catalog.session import session_scope
 from sutradhara.grpc import restore_service as service_module
 from sutradhara.grpc.restore_service import RestoreService, _Outcome
@@ -32,9 +34,12 @@ from tests.test_grpc_restore_service import (
     _attempt_rows,
     _build_rig,
     _close_attempt,
+    _commit_request,
+    _kinds,
     _open_collect,
     _pl,
     _Rig,
+    _rlr_service,
     _seed_item,
     _with_hooks,
 )
@@ -82,6 +87,85 @@ def _healthy(service: RestoreService, clock: list[float]) -> None:
 
 def _item(rig: _Rig, name: str) -> int:
     return _seed_item(rig, name, _pl(name), receiver="receiver")
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_rlr_other_instance_respects_renewal_then_fences_stopped_delivery(
+    rig: _Rig,
+    pause: bool,
+) -> None:
+    """Proof 6: actual recovery preserves a renewing stale owner, but closes an idle one."""
+
+    item_id = _seed_item(rig, "rlr-recovery", b"r" * (32 * 256 * 1024), receiver="receiver")
+    observer = RestoreService(
+        replace(
+            rig.service_config,
+            heartbeat_seconds=0.05,
+            staleness_threshold=dt.timedelta(seconds=0.3),
+        )
+    )
+    observer.start(background=False)
+    try:
+        with _rlr_service(rig) as caller:
+            stream = caller.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+            try:
+                head = next(stream).manifest_head
+                with session_scope(rig.engine) as session:
+                    session.get(RestoreServerInstance, caller.instance_id).heartbeat_at = (
+                        dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+                    )
+                started = time.monotonic()
+                checked = False
+                for frame in stream:
+                    if frame.HasField("chunk"):
+                        time.sleep(0.07)
+                        observer.heartbeat_once()
+                        if time.monotonic() - started > 1.1 and not checked:
+                            assert observer.heartbeat_unbroken_seconds() > 0.3
+                            observer.recover_once()
+                            (row,) = _attempt_rows(rig, item_id)
+                            assert (row.end_kind, row.closed_at, row.ended_at) == (None, None, None)
+                            checked = True
+                            if pause:
+                                for _ in range(14):
+                                    time.sleep(0.08)
+                                    observer.heartbeat_once()
+                                observer.recover_once()
+                                _assert_lost(rig, item_id)
+                                closed = _attempt_rows(rig, item_id)[0].closed_at
+                                with patch.object(
+                                    caller, "_end_attempt", wraps=caller._end_attempt
+                                ) as end_attempt:
+                                    with pytest.raises(_Abort) as fenced:
+                                        next(stream)
+                                    end_attempt.assert_not_called()
+                                assert fenced.value.code == grpc.StatusCode.UNAVAILABLE
+                                assert (
+                                    fenced.value.details == "restore attempt was closed by recovery"
+                                )
+                                assert _attempt_rows(rig, item_id)[0].closed_at == closed
+                                assert caller._registry == {}
+                                return
+                    if frame.HasField("file_end"):
+                        caller.CommitRestore(
+                            _commit_request(item_id, head.manifest_sha256, head.lease_token, 1),
+                            rig.context("receiver"),
+                        )
+                        assert _kinds(list(stream)) == ["job_end"]
+                        break
+                assert checked
+                (row,) = _attempt_rows(rig, item_id)
+                assert (row.end_kind, row.cause) == ("job_end", None)
+                with session_scope(rig.engine) as session:
+                    assert session.get(RestoreRequestItem, item_id).state == "sent"
+                    assert giveup_agreement_violations(session) == []
+            finally:
+                stream.close()  # type: ignore[attr-defined]
+    finally:
+        observer.stop()
 
 
 def _abandoned(

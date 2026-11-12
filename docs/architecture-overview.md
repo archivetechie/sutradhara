@@ -715,11 +715,13 @@ SQL-CAS lease (`RestoreOpenSession`, so a live lease can never be
 silently stolen), and streams the manifest frames followed by a
 file header, a run of chunk frames re-sliced to a wire-safe 256 KiB
 regardless of the source's native chunk size, and a closing pair of
-frames. The device durably stages bytes and calls `CommitRestore(...,
+frames. The server renews the lease while the delivery is open. The device
+durably stages bytes and calls `CommitRestore(...,
 STAGED, committed_index)` — a monotonic, idempotent advance — then, once
 the file is fully staged, `CommitRestore(..., REVEALED, ...)`, which is
 terminal and safe to resend regardless of whether the STAGED
-acknowledgement was lost. If a device disconnects mid-stream, the lease
+acknowledgement was lost. A revealed confirmation for the current generation
+is accepted after the lease expires. If a device disconnects mid-stream, the lease
 is released and the item's prior state restored; if the lease later
 expires while the item is stuck unrevealed, the `restore_open`
 reconciler (see "Job engine and reconciler spine") marks it reopenable

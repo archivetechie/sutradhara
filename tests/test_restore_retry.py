@@ -562,14 +562,14 @@ def test_policy_naive_now_is_read_as_utc() -> None:
 # ---- T7: text and configuration ---------------------------------------------------
 
 
-def test_text_owner_sentences_are_verbatim() -> None:
+def test_text_owner_tape_only_and_supervisor_lease_expired_sentences_are_verbatim() -> None:
     assert compose_last_error("error", "tape_only", "deferred to RM3") == (
         "this item's usable copies are on tape, which agent delivery cannot read yet; "
         "request server-local delivery"
     )
     assert compose_last_error("cancelled", "lease_expired", None) == (
-        "the transfer took longer than the 30-minute delivery lease, which is not renewed "
-        "yet; request server-local delivery"
+        "the receiving computer stopped taking data, or did not confirm the delivered file, "
+        "within the 30-minute delivery lease; check the receiving computer and request the restore again"
     )
     assert compose_last_error("job_end", "lease_expired", None) == compose_last_error(
         "cancelled", "lease_expired", None

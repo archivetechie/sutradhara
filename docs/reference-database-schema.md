@@ -886,8 +886,9 @@ a stale or duplicate agent session cannot race a live one.
 | `receiver_device_id` | text, FK -> `grpc_logical_device.device_id` | Device holding the lease. |
 | `manifest_sha256` | hash | Digest of the delivery manifest for this open. |
 | `generation` | integer | Monotonically increasing lease generation, starting at 1. |
-| `expires_at` | time | Lease expiry. |
-| `created_at`, `updated_at` | time | Lease creation and last renewal time. |
+| `expires_at` | time | Lease expiry, renewed while the delivery is open. |
+| `created_at` | time | Lease creation time. |
+| `updated_at` | time | Last lease renewal time. |
 
 ### `restore_server_instance`
 

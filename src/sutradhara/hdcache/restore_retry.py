@@ -550,14 +550,14 @@ _CAUSE_TEXT: Final[dict[str, str]] = {
     "open_conflict": "another open of this item was in progress",
     "lease_live": "an earlier delivery's lease is still live",
     "item_withdrawn": "the item was withdrawn while it was being opened",
-    # The owner's two sentences, verbatim.
+    # tape_only is the owner's sentence; lease_expired is the supervisor's (r3), verbatim.
     "tape_only": (
         "this item's usable copies are on tape, which agent delivery cannot read yet; "
         "request server-local delivery"
     ),
     "lease_expired": (
-        "the transfer took longer than the 30-minute delivery lease, which is not renewed "
-        "yet; request server-local delivery"
+        "the receiving computer stopped taking data, or did not confirm the delivered file, "
+        "within the 30-minute delivery lease; check the receiving computer and request the restore again"
     ),
 }
 _INTERRUPTED_TEXT: Final = "the transfer was interrupted"

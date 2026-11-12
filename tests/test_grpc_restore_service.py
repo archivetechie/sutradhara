@@ -14,14 +14,17 @@ from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import grpc
 import pytest
 from sqlalchemy import Engine, event, func, select
 from sqlalchemy import update as sql_update
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from sutradhara._proto import restore_pb2, restore_pb2_grpc
@@ -2450,6 +2453,526 @@ def _deliver(rig: _Rig, item_id: int) -> Any:
     )
     assert frames[-1].HasField("job_end")
     return frames[0].manifest_head
+
+
+@contextmanager
+def _rlr_service(rig: _Rig) -> Iterator[RestoreService]:
+    """Exercise the real delivery path with a short lease and no background workers."""
+
+    service = _started(
+        RestoreService(
+            replace(
+                rig.service_config,
+                lease_duration=dt.timedelta(seconds=0.6),
+                acknowledgement_poll_seconds=0.04,
+            )
+        )
+    )
+    try:
+        yield service
+    finally:
+        service.stop()
+
+
+def _rlr_lease(rig: _Rig, item_id: int) -> RestoreOpenSession:
+    """Read a detached lease so every observation comes from the database."""
+
+    with session_scope(rig.engine) as session:
+        lease = session.get(RestoreOpenSession, item_id)
+        assert lease is not None
+        session.expunge(lease)
+        return lease
+
+
+def _rlr_first_chunk(stream: Iterator[Any]) -> list[Any]:
+    """Leave the generator suspended at its first data frame."""
+
+    frames = []
+    for frame in stream:
+        frames.append(frame)
+        if frame.HasField("chunk"):
+            return frames
+    raise AssertionError("no chunk delivered")
+
+
+@pytest.mark.parametrize("source", ["archive", "cache"])
+def test_rlr_long_delivery_and_bounded_ack_reads(
+    fresh_rig: _Rig,
+    source: str,
+) -> None:
+    """Proofs 1/7c: renew both sources over three leases, then poll without spinning."""
+
+    rig = fresh_rig
+    payload = b"r" * (32 * 256 * 1024)
+    item_id = _seed_item(rig, "rlr-long", payload, receiver="receiver")
+    if source == "cache":
+        _seed_cache_entry(rig, item_id, payload)
+    with _rlr_service(rig) as service:
+        context = rig.context("receiver")
+        stream = service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), context
+        )
+        observations = []
+        frames = []
+        started = time.monotonic()
+        for frame in stream:
+            frames.append(frame)
+            if frame.HasField("chunk"):
+                assert len(frame.chunk.data) == 256 * 1024
+                observations.append(_rlr_lease(rig, item_id))
+                time.sleep(0.07)
+            if frame.HasField("file_end"):
+                break
+        assert time.monotonic() - started >= 3 * service.config.lease_duration.total_seconds()
+        assert len(observations) == 32
+        changes = [observations[0].updated_at]
+        head = frames[0].manifest_head
+        for row in observations:
+            assert row.generation == head.lease_token.generation
+            assert row.receiver_device_id == "receiver"
+            assert row.manifest_sha256 == head.manifest_sha256
+            if row.updated_at != changes[-1]:
+                assert (row.updated_at - changes[-1]).total_seconds() >= 0.1
+                changes.append(row.updated_at)
+        reads = []
+
+        def count_reads(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+            if "FROM restore_item_checkpoint JOIN restore_open_session" in statement:
+                reads.append(statement)
+
+        event.listen(rig.engine, "before_cursor_execute", count_reads)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending = executor.submit(list, stream)
+                try:
+                    with pytest.raises(TimeoutError):
+                        pending.result(timeout=0.12)
+                    service.CommitRestore(
+                        _commit_request(item_id, head.manifest_sha256, head.lease_token, 1),
+                        rig.context("receiver"),
+                    )
+                    tail = pending.result(timeout=2)
+                finally:
+                    context.active = False
+        finally:
+            event.remove(rig.engine, "before_cursor_execute", count_reads)
+        assert 2 <= len(reads) <= 6
+        assert _kinds(tail) == ["job_end"]
+        assert len(changes) >= 8
+        assert len(changes) < len(observations)
+        assert _payload_digest(frames) == hashlib.sha256(payload).digest()
+        with session_scope(rig.engine) as session:
+            assert session.get(RestoreRequestItem, item_id).state == "sent"
+        reply = service.CommitRestore(
+            _commit_request(item_id, head.manifest_sha256, head.lease_token, 1, revealed=True),
+            rig.context("receiver"),
+        )
+        assert reply.status == "revealed"
+        with session_scope(rig.engine) as session:
+            assert session.get(RestoreRequestItem, item_id).state == "done"
+            assert giveup_agreement_violations(session) == []
+
+
+def test_rlr_delayed_source_open_renews_before_first_chunk(
+    fresh_rig: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proof 2: source opening may outlast acquisition's lease."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "rlr-open", _pl("rlr-open"), receiver="receiver")
+    with _rlr_service(rig) as service:
+        original = service._open_prepared_chunks
+
+        @contextmanager
+        def delayed(prepared: Any) -> Iterator[Iterator[bytes]]:
+            time.sleep(0.75)
+            with original(prepared) as chunks:
+                yield chunks
+
+        monkeypatch.setattr(service, "_open_prepared_chunks", delayed)
+        stream = service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), rig.context("receiver")
+        )
+        try:
+            head = _rlr_first_chunk(stream)[0].manifest_head
+            assert _rlr_lease(rig, item_id).expires_at.replace(tzinfo=dt.UTC) > dt.datetime.now(
+                dt.UTC
+            )
+            # _receive needs the manifest head; acknowledge this remainder explicitly.
+            _pull_until_file_end(stream)
+            service.CommitRestore(
+                _commit_request(item_id, head.manifest_sha256, head.lease_token, 1),
+                rig.context("receiver"),
+            )
+            assert _kinds(list(stream)) == ["job_end"]
+            assert _attempt_rows(rig, item_id)[0].cause is None
+        finally:
+            stream.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("action", ["resume", "cancel_live", "cancel_expired", "recovery"])
+def test_rlr_pause_resume_cancel_and_recovery(fresh_rig: _Rig, action: str) -> None:
+    """Proofs 3/5/7/7b: pulling renews; a stopped receiver and recovery retain their meanings."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "rlr-pause", b"p" * (8 * 256 * 1024), receiver="receiver")
+    with _rlr_service(rig) as service:
+        stream = service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), rig.context("receiver")
+        )
+        head = _rlr_first_chunk(stream)[0].manifest_head
+        time.sleep(0.75)
+        if action == "recovery":
+            (before,) = _attempt_rows(rig, item_id)
+            _close_attempt(rig, before.id)
+            closed = _attempt_rows(rig, item_id)[0]
+            with patch.object(service, "_end_attempt", wraps=service._end_attempt) as end_attempt:
+                with pytest.raises(_Abort) as fenced:
+                    next(stream)
+                assert fenced.value.code == grpc.StatusCode.UNAVAILABLE
+                assert fenced.value.details == "restore attempt was closed by recovery"
+                end_attempt.assert_not_called()
+            (after,) = _attempt_rows(rig, item_id)
+            assert (after.end_kind, after.ended_at, after.closed_at) == (
+                "lost",
+                None,
+                closed.closed_at,
+            )
+            assert service._registry == {}
+            return
+        if action == "cancel_expired":
+            stream.close()  # type: ignore[attr-defined]
+        else:
+            assert next(stream).HasField("chunk")
+            assert _rlr_lease(rig, item_id).expires_at.replace(tzinfo=dt.UTC) > dt.datetime.now(
+                dt.UTC
+            )
+            if action == "cancel_live":
+                stream.close()  # type: ignore[attr-defined]
+            else:
+                _pull_until_file_end(stream)
+                service.CommitRestore(
+                    _commit_request(item_id, head.manifest_sha256, head.lease_token, 1),
+                    rig.context("receiver"),
+                )
+                assert _kinds(list(stream)) == ["job_end"]
+        (row,) = _attempt_rows(rig, item_id)
+        expected = {
+            "resume": ("job_end", None, "sent"),
+            "cancel_live": ("cancelled", None, "queued"),
+            "cancel_expired": ("cancelled", "lease_expired", "failed"),
+        }[action]
+        assert (row.end_kind, row.cause) == expected[:2]
+        with session_scope(rig.engine) as session:
+            item = session.get(RestoreRequestItem, item_id)
+            assert item.state == expected[2]
+            if action == "cancel_expired":
+                assert item.detail == _LEASE_EXPIRED_SENTENCE
+            assert giveup_agreement_violations(session) == []
+
+
+@pytest.mark.parametrize("ending", ["complete", "close"])
+def test_rlr_transient_renewal_errors_retry_and_complete(
+    fresh_rig: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    ending: str,
+) -> None:
+    """Proof 4: spaced retries renew the row and clear failure even on a later close."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "rlr-errors", b"e" * (8 * 256 * 1024), receiver="receiver")
+    with _rlr_service(rig) as service:
+        original = service._renew_lease
+        calls = []
+        before_success = []
+
+        def flaky(prepared: Any, lease: Any) -> bool:
+            calls.append(time.monotonic())
+            if len(calls) == 1:
+                raise OperationalError("renew", {}, RuntimeError("database is locked"))
+            if len(calls) == 2:
+                raise RuntimeError("non-lock write error")
+            if len(calls) == 3:
+                before_success.append(_rlr_lease(rig, item_id).updated_at)
+            return original(prepared, lease)
+
+        monkeypatch.setattr(service, "_renew_lease", flaky)
+        stream = service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), rig.context("receiver")
+        )
+        frames = []
+        for frame in _receive(
+            stream, lambda ack: service.CommitRestore(ack, rig.context("receiver"))
+        ):
+            frames.append(frame)
+            if frame.HasField("chunk"):
+                if len(calls) == 3:
+                    assert len(before_success) == 1
+                    assert _rlr_lease(rig, item_id).updated_at > before_success[0]
+                    if ending == "close":
+                        stream.close()  # type: ignore[attr-defined]
+                        break
+                time.sleep(0.025)
+        if ending == "complete":
+            assert frames[-1].HasField("job_end")
+        else:
+            assert frames[-1].HasField("chunk")
+            assert len(calls) == 3
+        assert len(calls) >= 3
+        assert all(0.02 <= b - a < 0.1 for a, b in pairwise(calls[:3]))
+        assert (
+            sum(
+                record.levelname == "WARNING" and "lease renewal failed" in record.message
+                for record in caplog.records
+            )
+            == 2
+        )
+        assert (_attempt_rows(rig, item_id)[0].end_kind, _attempt_rows(rig, item_id)[0].cause) == (
+            "job_end" if ending == "complete" else "cancelled",
+            None,
+        )
+
+
+@pytest.mark.parametrize("ending", ["close", "wait", "staged", "recover"])
+def test_rlr_outstanding_renewal_is_server_failure_even_with_staged(
+    fresh_rig: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    ending: str,
+) -> None:
+    """Proof 4a/b/c: a pending write owns the failure and holds an acknowledgement."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "rlr-outstanding", b"o" * (8 * 256 * 1024), receiver="receiver")
+    with _rlr_service(rig) as service:
+        original = service._renew_lease
+        calls = []
+        in_wait = [False]
+        staged = []
+
+        def failing(prepared: Any, lease: Any) -> bool:
+            calls.append(time.monotonic())
+            if in_wait[0] and ending in {"staged", "recover"} and not staged:
+                service.CommitRestore(
+                    _commit_request(item_id, head.manifest_sha256, head.lease_token, 1),
+                    rig.context("receiver"),
+                )
+                staged.append(time.monotonic())
+                # Hold this failed write past expiry. The next poll sees a
+                # durable acknowledgement and an expired row together.
+                time.sleep(0.75)
+            elif ending == "recover" and staged:
+                return original(prepared, lease)
+            raise RuntimeError("renewal write unavailable")
+
+        monkeypatch.setattr(service, "_renew_lease", failing)
+        context = rig.context("receiver")
+        stream = service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), context
+        )
+        head = _rlr_first_chunk(stream)[0].manifest_head
+        if ending == "close":
+            time.sleep(0.75)
+            stream.close()  # type: ignore[attr-defined]
+        else:
+            _pull_until_file_end(stream)
+            expiry = _rlr_lease(rig, item_id).expires_at.replace(tzinfo=dt.UTC)
+            in_wait[0] = True
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending = executor.submit(list, stream)
+                try:
+                    with pytest.raises(TimeoutError):
+                        pending.result(timeout=0.7)
+                    if ending == "recover":
+                        assert _kinds(pending.result(timeout=2)) == ["job_end"]
+                    else:
+                        with pytest.raises(_Abort) as failed:
+                            pending.result(timeout=2)
+                        assert failed.value.code == grpc.StatusCode.UNAVAILABLE
+                        assert (
+                            failed.value.details == "the server could not renew the delivery lease"
+                        )
+                        assert dt.datetime.now(dt.UTC) > expiry + service.config.lease_duration
+                finally:
+                    context.active = False
+            assert all(b - a >= 0.02 for a, b in pairwise(calls))
+            if ending in {"staged", "recover"}:
+                assert len(staged) == 1
+        (row,) = _attempt_rows(rig, item_id)
+        if ending == "recover":
+            assert (row.end_kind, row.cause) == ("job_end", None)
+        else:
+            assert (row.end_kind, row.cause, row.message) == (
+                "error",
+                "server_error",
+                "the server could not renew the delivery lease",
+            )
+        with session_scope(rig.engine) as session:
+            assert session.get(RestoreRequestItem, item_id).state == (
+                "sent" if ending == "recover" else "queued"
+            )
+            assert giveup_agreement_violations(session) == []
+
+
+@pytest.mark.parametrize("reconciled", [False, True])
+def test_rlr_revealed_after_expiry_finishes_sent(fresh_rig: _Rig, reconciled: bool) -> None:
+    """Proof 9: the current generation confirms a revealed file even after expiry."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "rlr-revealed", _pl("rlr-revealed"), receiver="receiver")
+    with _rlr_service(rig) as service:
+        frames, error, _ = _open_collect(service, item_id, rig.context("receiver"))
+        assert error is None
+        assert frames[-1].HasField("job_end")
+        head = frames[0].manifest_head
+        _expire_lease(rig, item_id)
+        with session_scope(rig.engine) as session:
+            if reconciled:
+                assert reconcile(session, restore_open_reconciler.DOMAIN, cursor=item_id - 1) == (
+                    1,
+                    1,
+                )
+            item = session.get(RestoreRequestItem, item_id)
+            assert item.state == "sent"
+            if reconciled:
+                assert item.detail == restore_open_reconciler.REOPENABLE_DETAIL
+        lease_before = _rlr_lease(rig, item_id)
+        request = _commit_request(item_id, head.manifest_sha256, head.lease_token, 1, revealed=True)
+        reply = service.CommitRestore(request, rig.context("receiver"))
+        assert (reply.status, reply.committed_index, reply.revealed) == ("revealed", 1, True)
+        assert _checkpoint_of(rig, item_id) == (1, True)
+        with session_scope(rig.engine) as session:
+            item = session.get(RestoreRequestItem, item_id)
+            assert (item.state, item.detail, item.request.state) == ("done", None, "completed")
+            assert giveup_agreement_violations(session) == []
+        lease_after = _rlr_lease(rig, item_id)
+        assert (lease_after.generation, lease_after.expires_at, lease_after.updated_at) == (
+            lease_before.generation,
+            lease_before.expires_at,
+            lease_before.updated_at,
+        )
+        assert service.CommitRestore(request, rig.context("receiver")).status == "already_done"
+
+
+def _rlr_commit_snapshot(rig: _Rig, item_id: int) -> tuple[Any, ...]:
+    """Capture every commit target and the lease to prove a refused commit writes nothing."""
+
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        checkpoint = item.checkpoint
+        lease = item.open_session
+        return tuple(
+            tuple(getattr(row, column.key) for column in row.__table__.columns)
+            for row in (item, item.request, checkpoint, lease)
+        )
+
+
+@pytest.mark.parametrize("case", ["staged", "streaming_revealed", "old_generation"])
+def test_rlr_expiry_preserves_commit_guards(fresh_rig: _Rig, case: str) -> None:
+    """Proof 10: expired STAGED, pre-sent REVEALED and superseded tokens stay refused."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "rlr-guards", _pl("rlr-guards"), receiver="receiver")
+    with _rlr_service(rig) as service:
+        stream = service.OpenRestore(
+            restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), rig.context("receiver")
+        )
+        try:
+            if case == "old_generation":
+                frames = list(
+                    _receive(
+                        stream, lambda ack: service.CommitRestore(ack, rig.context("receiver"))
+                    )
+                )
+                head = frames[0].manifest_head
+                _expire_lease(rig, item_id)
+                stream = service.OpenRestore(
+                    restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                    rig.context("receiver"),
+                )
+                new_head = next(stream).manifest_head
+                assert new_head.lease_token.generation == head.lease_token.generation + 1
+            else:
+                head = _pull_until_file_end(stream)[0].manifest_head
+                _expire_lease(rig, item_id)
+            before = _rlr_commit_snapshot(rig, item_id)
+            with pytest.raises(_Abort) as refused:
+                service.CommitRestore(
+                    _commit_request(
+                        item_id,
+                        head.manifest_sha256,
+                        head.lease_token,
+                        1,
+                        revealed=case != "staged",
+                    ),
+                    rig.context("receiver"),
+                )
+            assert refused.value.code == grpc.StatusCode.FAILED_PRECONDITION
+            assert (
+                refused.value.details
+                == {
+                    "staged": "restore lease has expired",
+                    "streaming_revealed": "restore item has not reached sent",
+                    "old_generation": "manifest, receiver, or lease generation does not match",
+                }[case]
+            )
+            assert _rlr_commit_snapshot(rig, item_id) == before
+            assert _checkpoint_of(rig, item_id) == (0, False)
+        finally:
+            stream.close()  # type: ignore[attr-defined]
+        with session_scope(rig.engine) as session:
+            assert giveup_agreement_violations(session) == []
+
+
+def test_rlr_revealed_between_reopen_admission_and_acquisition_wins(fresh_rig: _Rig) -> None:
+    """Proof 10's race: confirmation wins, and the pending reopen rolls back its lease CAS."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "rlr-reopen-race", _pl("rlr-reopen-race"), receiver="receiver")
+    with _rlr_service(rig) as service:
+        frames, error, _ = _open_collect(service, item_id, rig.context("receiver"))
+        assert error is None
+        head = frames[0].manifest_head
+        _expire_lease(rig, item_id)
+        before = _rlr_lease(rig, item_id)
+
+        def reveal(admitted_id: int) -> None:
+            assert admitted_id == item_id
+            assert len(_attempt_rows(rig, item_id)) == 2
+            assert _attempt_rows(rig, item_id)[-1].lease_generation is None
+            reply = service.CommitRestore(
+                _commit_request(item_id, head.manifest_sha256, head.lease_token, 1, revealed=True),
+                rig.context("receiver"),
+            )
+            assert reply.status == "revealed"
+
+        reopened = _started(_HookService(service.config, before_lease=reveal))
+        try:
+            frames, error, _ = _open_collect(reopened, item_id, rig.context("receiver"))
+        finally:
+            reopened.stop()
+        assert frames == []
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "leased restore item ceased to be streamable"
+        delivered, withdrawn = _attempt_rows(rig, item_id)
+        assert (delivered.end_kind, delivered.cause) == ("job_end", None)
+        assert (withdrawn.end_kind, withdrawn.cause, withdrawn.lease_generation) == (
+            "error",
+            "item_withdrawn",
+            None,
+        )
+        assert _checkpoint_of(rig, item_id) == (1, True)
+        after = _rlr_lease(rig, item_id)
+        assert (after.generation, after.expires_at, after.updated_at) == (
+            before.generation,
+            before.expires_at,
+            before.updated_at,
+        )
+        with session_scope(rig.engine) as session:
+            item = session.get(RestoreRequestItem, item_id)
+            assert (item.state, item.detail, item.request.state) == ("done", None, "completed")
+            assert giveup_agreement_violations(session) == []
 
 
 def _make_tape_only(rig: _Rig, suffix: str) -> None:

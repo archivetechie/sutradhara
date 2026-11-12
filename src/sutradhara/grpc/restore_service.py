@@ -1,11 +1,12 @@
 """Authorized restore-agent streaming over the catalog-backed RestorePlan.
 
-Each OpenRestore owns its backend instances and mutable ``RestorePlan``. SQL
-transactions are kept outside the data loop: admission writes the attempt row
-(design RSR, D2), one transaction validates and leases the open, and one end
-transaction (``_end_attempt``, D6) records what happened, releases the lease
-or records ``sent``, and applies the retry policy's give-up. The agent path
-never resolves or writes an archive-server destination path.
+Each OpenRestore owns its backend instances and mutable ``RestorePlan``. The
+data loop runs one short lease-renewal write at most once a sixth of the lease
+(failed writes retry sooner). Outside that loop, admission writes the attempt
+row (design RSR, D2), one transaction validates and leases the open, and one end
+transaction (``_end_attempt``, D6) records what happened, releases the lease or
+records ``sent``, and applies the retry policy's give-up. The agent path never
+resolves or writes an archive-server destination path.
 """
 
 from __future__ import annotations
@@ -114,6 +115,7 @@ _WAITING_BEFORE_RETRY = "restore item is waiting before its next try"
 _WILL_NOT_RETRY = "restore item will not be retried"
 _CLOSED_BY_RECOVERY = "restore attempt was closed by recovery"
 _DELIVERY_NOT_RECORDED = "the delivery was not recorded"
+_RENEWAL_FAILED = "the server could not renew the delivery lease"
 END_ENDED = "ended"
 END_ALREADY_CLOSED = "already_closed"
 
@@ -133,7 +135,7 @@ class RestoreServiceConfig:
     extractor_factory: ExtractorFactory = RemArchiveExtractor
     cache_config: RestoreConfig | None = None
     max_concurrent_streams: int = 4
-    # Mid-stream lease renewal lands in RM1.3; this default only raises the ceiling.
+    # The lease is renewed while the delivery is open.
     lease_duration: dt.timedelta = dt.timedelta(minutes=30)
     assignment_poll_seconds: float = 0.5
     acknowledgement_poll_seconds: float = 0.25
@@ -190,7 +192,7 @@ class _Outcome:
     the end transaction writes it. Nothing classifies by exception type:
     production ``abort`` raises a bare ``Exception()`` and the test fake raises
     its own class (P16). ``fenced`` marks the one end with no write: recovery
-    closed the attempt before the lease was granted.
+    closed the attempt before the lease was granted or during delivery.
     """
 
     end_kind: str | None = None
@@ -200,6 +202,8 @@ class _Outcome:
     bytes_sent: int | None = 0
     slot_taken: bool = False
     fenced: bool = False
+    renewal_outstanding: bool = False
+    renewal_due_at: float = 0.0
     # The probe's evidence (D2): the source the open streams from and the
     # sources read. A failed cache probe sets no end: the open goes on.
     probe_source: str | None = None
@@ -271,6 +275,7 @@ class _PreparedOpen:
     """Detached stream inputs built during the short authorization transaction."""
 
     item_id: int
+    attempt_id: int
     device_id: str
     artifactclass: str
     manifest: _ManifestFile
@@ -292,7 +297,10 @@ class _PreparedOpen:
 
 @dataclass(frozen=True)
 class _Lease:
-    """Acquired SQL-CAS lease generation."""
+    """Acquired SQL-CAS generation and original expiry carried by manifest_head.
+
+    Renewals extend the persisted row; this acquisition snapshot stays unchanged.
+    """
 
     item_id: int
     device_id: str
@@ -736,7 +744,10 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 # D3 / D-RSRP-7: a closed generator always means the call ended;
                 # otherwise the client's liveness decides.
                 if isinstance(exc, GeneratorExit) or not context.is_active():
-                    cell.set("cancelled", None)
+                    if cell.renewal_outstanding:
+                        cell.set("error", "server_error", _RENEWAL_FAILED)
+                    else:
+                        cell.set("cancelled", None)
                 else:
                     cell.set("error", "server_error", str(exc) or type(exc).__name__)
             raise
@@ -848,7 +859,6 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     update(RestoreItemCheckpoint)
                     .where(
                         *preconditions,
-                        live_lease,
                         RestoreItemCheckpoint.revealed.is_(False),
                     )
                     .values(
@@ -1283,6 +1293,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             if checkpoint.revealed:
                 return _PreparedOpen(
                     item_id=item.id,
+                    attempt_id=entry.attempt_id,
                     device_id=identity.device_id,
                     artifactclass=item.artifactclass,
                     manifest=manifest,
@@ -1316,6 +1327,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             if planned > manifest.index:
                 return _PreparedOpen(
                     item_id=item.id,
+                    attempt_id=entry.attempt_id,
                     device_id=identity.device_id,
                     artifactclass=item.artifactclass,
                     manifest=manifest,
@@ -1408,6 +1420,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     raise
             return _PreparedOpen(
                 item_id=item.id,
+                attempt_id=entry.attempt_id,
                 device_id=identity.device_id,
                 artifactclass=item.artifactclass,
                 manifest=manifest,
@@ -1690,6 +1703,54 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
             expires_at=expires,
         )
 
+    def _renew_lease(self, prepared: _PreparedOpen, lease: _Lease) -> bool:
+        """Extend this generation only while its admitted attempt remains open.
+
+        Lock the attempt before writing the lease, so recovery and renewal agree
+        on whether the attempt is open. Expiry alone never prevents renewal.
+        """
+
+        open_attempt = select(RestoreItemAttempt.id).where(
+            RestoreItemAttempt.id == prepared.attempt_id,
+            RestoreItemAttempt.lease_generation == lease.generation,
+            RestoreItemAttempt.ended_at.is_(None),
+            RestoreItemAttempt.closed_at.is_(None),
+        )
+        with self._factory.begin() as session:
+            if session.scalar(open_attempt.with_for_update()) is None:
+                return False
+            now = dt.datetime.now(dt.UTC)
+            result = session.connection().execute(
+                update(RestoreOpenSession)
+                .where(
+                    RestoreOpenSession.restore_request_item_id == prepared.item_id,
+                    _lease_matches(lease),
+                    open_attempt.exists(),
+                )
+                .values(expires_at=now + self.config.lease_duration, updated_at=now)
+            )
+            return result.rowcount != 0
+
+    def _renew_delivery_lease(self, prepared: _PreparedOpen, lease: _Lease, context: Any) -> bool:
+        """Renew an open delivery, tracking write retries and recovery's fence."""
+
+        cell = prepared.outcome
+        try:
+            renewed = self._renew_lease(prepared, lease)
+        except Exception:
+            LOG.warning(
+                "restore attempt %s: lease renewal failed", prepared.attempt_id, exc_info=True
+            )
+            cell.renewal_outstanding = True
+            cell.renewal_due_at = time.monotonic() + self.config.lease_duration.total_seconds() / 30
+            return False
+        if not renewed:
+            cell.fenced = True
+            _abort(context, grpc.StatusCode.UNAVAILABLE, _CLOSED_BY_RECOVERY)
+        cell.renewal_outstanding = False
+        cell.renewal_due_at = time.monotonic() + self.config.lease_duration.total_seconds() / 6
+        return True
+
     def _stream(
         self, prepared: _PreparedOpen, lease: _Lease, context: Any
     ) -> Generator[Any, None, int | None]:
@@ -1725,8 +1786,11 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
         _require_active(context)
         yield restore_pb2.RestoreFrame(file_header=_file_header_proto(manifest))
         offset = 0
+        cell = prepared.outcome
+
         try:
             with self._open_prepared_chunks(prepared) as chunks:
+                self._renew_delivery_lease(prepared, lease, context)
                 for chunk in chunks:
                     # Re-chunk to a wire-safe size regardless of the source producer's
                     # buffer (archive yields 256 KiB, the hdcache producer yields 1 MiB);
@@ -1741,6 +1805,8 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                         yield restore_pb2.RestoreFrame(
                             chunk=restore_pb2.Chunk(data=piece, offset=offset)
                         )
+                        if time.monotonic() >= cell.renewal_due_at:
+                            self._renew_delivery_lease(prepared, lease, context)
                         offset += len(piece)
         except (ArchiveRestoreError, CacheServeFailed) as exc:
             # B3: the cell is set at the catch, before the error frame is yielded.
@@ -1786,14 +1852,13 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
 
         while True:
             _require_active(context)
-            now = dt.datetime.now(dt.UTC)
-            if now >= lease.expires_at:
-                detail = "the receiver did not acknowledge the delivery before its lease expired"
-                prepared.outcome.set("cancelled", "lease_expired", detail)
-                _abort(context, grpc.StatusCode.ABORTED, detail)
             with self._factory() as session:
-                acknowledged = session.scalar(
-                    select(RestoreItemCheckpoint.restore_request_item_id)
+                committed, generation, expiry = session.execute(
+                    select(
+                        RestoreItemCheckpoint.committed_index,
+                        RestoreOpenSession.generation,
+                        RestoreOpenSession.expires_at,
+                    )
                     .join(
                         RestoreOpenSession,
                         RestoreOpenSession.restore_request_item_id
@@ -1801,18 +1866,37 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                     )
                     .where(
                         RestoreItemCheckpoint.restore_request_item_id == prepared.item_id,
-                        RestoreItemCheckpoint.committed_index >= prepared.manifest.index + 1,
-                        RestoreOpenSession.generation == lease.generation,
                     )
-                )
-            if acknowledged is not None:
+                ).one()
+            cell = prepared.outcome
+            expiry = _as_utc(expiry)
+            now = dt.datetime.now(dt.UTC)
+            if cell.renewal_outstanding:
+                if now > expiry + self.config.lease_duration:
+                    cell.set("error", "server_error", _RENEWAL_FAILED)
+                    _abort(context, grpc.StatusCode.UNAVAILABLE, _RENEWAL_FAILED)
+                if time.monotonic() >= cell.renewal_due_at and self._renew_delivery_lease(
+                    prepared, lease, context
+                ):
+                    # Re-read the renewed expiry before judging the acknowledgement.
+                    continue
+            elif now >= expiry:
+                detail = "the receiver did not acknowledge the delivery before its lease expired"
+                cell.set("cancelled", "lease_expired", detail)
+                _abort(context, grpc.StatusCode.ABORTED, detail)
+            if (
+                not cell.renewal_outstanding
+                and generation == lease.generation
+                and committed >= prepared.manifest.index + 1
+            ):
                 return
-            time.sleep(
-                min(
-                    self.config.acknowledgement_poll_seconds,
-                    max(0.0, (lease.expires_at - dt.datetime.now(dt.UTC)).total_seconds()),
-                )
+            sleep_seconds = min(
+                self.config.acknowledgement_poll_seconds,
+                max(0.0, (expiry - dt.datetime.now(dt.UTC)).total_seconds()),
             )
+            if cell.renewal_outstanding and sleep_seconds == 0:
+                sleep_seconds = self.config.acknowledgement_poll_seconds
+            time.sleep(sleep_seconds)
 
     @contextmanager
     def _open_prepared_chunks(self, prepared: _PreparedOpen) -> Iterator[Iterator[bytes]]:

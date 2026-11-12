@@ -52,6 +52,7 @@ class RestoreServiceStub:
     not apply the live operator-capability gate; OpenRestore fully gates object
     bytes. It is scoped to the authenticated mTLS peer: device_id MUST equal that
     peer's device id.
+    A REVEALED commit is accepted for the current generation after the lease expires, and the server renews a lease while its delivery is open.
     """
 
     def __init__(self, channel):
@@ -104,6 +105,7 @@ class RestoreServiceServicer:
     not apply the live operator-capability gate; OpenRestore fully gates object
     bytes. It is scoped to the authenticated mTLS peer: device_id MUST equal that
     peer's device id.
+    A REVEALED commit is accepted for the current generation after the lease expires, and the server renews a lease while its delivery is open.
     """
 
     def OpenRestore(self, request, context):
@@ -177,6 +179,7 @@ class RestoreService:
     not apply the live operator-capability gate; OpenRestore fully gates object
     bytes. It is scoped to the authenticated mTLS peer: device_id MUST equal that
     peer's device id.
+    A REVEALED commit is accepted for the current generation after the lease expires, and the server renews a lease while its delivery is open.
     """
 
     @staticmethod
