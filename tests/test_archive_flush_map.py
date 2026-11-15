@@ -287,6 +287,12 @@ def _digest(data: bytes) -> bytes:
 class _WriteBackend:
     """Minimal writable backend: keeps objects in memory, serves ranged reads."""
 
+    reissue_after_absent = True
+    holds_names = False
+
+    def lookup_pool_object(self, pool, object_name, *, candidate_digests):
+        return None
+
     def __init__(self, name: str = "rem") -> None:
         self._name = name
         self._objects: dict[str, bytes] = {}
@@ -1059,6 +1065,75 @@ def _two_member_bundle(engine: Engine, tmp_path: Path) -> tuple[str, _WriteBacke
         bundle = _enqueue(s, artifactclass="o-archive", source=a, member_path="a.bin")
         _enqueue(s, artifactclass="o-archive", source=b, member_path="nested/b.bin")
         return bundle.id, backend
+
+
+def test_rba_post_window_manifest_and_exclusions_use_current_members(engine, tmp_path):
+    """Supervisor decision: both projections see the survivor after quarantine/windows."""
+    from dataclasses import replace
+
+    from sutradhara.archive_fanout import BuiltExclusion, HmacManifestSigner
+    from sutradhara.catalog.models import ExclusionRecord
+
+    class ExcludingBuilder(_FailingBuilder):
+        def build(self, **kwargs):
+            artifact = super().build(**kwargs)
+            return replace(
+                artifact, exclusions=(BuiltExclusion(path="a.bin", reason="member-proof"),)
+            )
+
+    bundle_id, backend = _two_member_bundle(engine, tmp_path)
+    builder = ExcludingBuilder(["source map line 3 missing source"])
+    with session_scope(engine) as session:
+        result = flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends=_backends_for(session, backend),
+            builder=builder,
+            deliverables_dir=tmp_path / "receipts",
+            manifest_signer=HmacManifestSigner(b"proof-key", "test"),
+        )
+        receipt = json.loads(Path(result.manifest_path).read_text())
+        assert receipt["member_classes"] == ["o-archive"]
+        assert [entry["stored_member_name"] for entry in receipt["members"]] == ["a.bin"]
+        rows = list(
+            session.scalars(select(ExclusionRecord).where(ExclusionRecord.reason == "member-proof"))
+        )
+        assert len(rows) == 1
+        assert rows[0].artifactclass == "o-archive"
+        assert rows[0].logical_asset_hash == hashlib.sha256(b"alpha body").digest()
+        assert rows[0].ruleset_name == get_artifactclass_policy(session, "o-archive").ruleset
+
+
+def test_rba_all_quarantine_moves_commit_before_error(engine, tmp_path):
+    """T23c: both member verdicts survive the direct caller's exception rollback."""
+    bundle_id, backend = _two_member_bundle(engine, tmp_path)
+    builder = _FailingBuilder(
+        ["source map line 2 missing source", "source map line 2 missing source"]
+    )
+    with (
+        pytest.raises(ArchiveFanoutError, match="no members left to flush"),
+        session_scope(engine) as session,
+    ):
+        flush_bundle(
+            session, bundle_id=bundle_id, backends=_backends_for(session, backend), builder=builder
+        )
+    with session_scope(engine) as session:
+        bundle = session.get(Bundle, bundle_id)
+        assert bundle.status == "open"
+        assert bundle.claimed_by is None
+        assert bundle.member_count == 0
+        assert (
+            list(session.scalars(select(BundleMember).where(BundleMember.bundle_id == bundle_id)))
+            == []
+        )
+        held = session.scalars(select(Bundle).where(Bundle.status == "held")).one()
+        assert held.member_count == 2
+        assert {
+            member.member_path
+            for member in session.scalars(
+                select(BundleMember).where(BundleMember.bundle_id == held.id)
+            )
+        } == {"a.bin", "nested/b.bin"}
 
 
 def test_map_line_failure_quarantines_that_member_re_renders_and_retries(

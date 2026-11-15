@@ -362,6 +362,9 @@ def bundle_flush(
     """
     engine = make_engine()
     with session_scope(engine) as session:
+        from sutradhara.jobs.commit_point import commit_point_for
+
+        commit_point_for(session)
         bundle = session.get(Bundle, bundle_id)
         if bundle is None:
             raise click.ClickException(f"no bundle {bundle_id!r}")
@@ -427,6 +430,9 @@ def bundle_sweep(rem_bin: str, key_epoch: str | None, no_reap: bool) -> None:
     """
     engine = make_engine()
     with session_scope(engine) as session:
+        from sutradhara.jobs.commit_point import commit_point_for
+
+        commit_point_for(session)
         result = sweep_bundles(
             session,
             backends=sweep_backends(session),

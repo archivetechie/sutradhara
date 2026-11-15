@@ -21,8 +21,22 @@ from sutradhara.archive_fanout import (
     ArchiveBuilder,
     ArchiveFanoutError,
     MemberInput,
+    PoolWriteFailure,
     RemArchiveBuilder,
     SealKeyUnavailable,
+    TransientPoolFanoutError,
+    _artifact_from_copy,
+    _copy_problem,
+    _copy_run,
+    _current_bundle_members,
+    _pool_slug,
+    _project_copy_problems,
+    _read_copy_result,
+    _ReadAssetLocatorView,
+    _ReadCopyView,
+    _record_existing_copy_result,
+    _remember_copy_problem,
+    _reset_copy_problems,
     build_bundle_copy_for_pool,
     preflight_seal_keys,
 )
@@ -32,10 +46,20 @@ from sutradhara.archive_restore import (
     select_private_epoch_for_copy,
 )
 from sutradhara.backend import factory
-from sutradhara.backend.port import BackendError
-from sutradhara.catalog.models import ArtifactClassPool, AssetLocator, Backend, Bundle, Pool
+from sutradhara.backend.port import BackendError, BackendStoredCorruptError
+from sutradhara.bundle_copy_ledger import identity_attempts, resolve_identity
+from sutradhara.catalog.models import (
+    ArtifactClassPool,
+    AssetLocator,
+    Backend,
+    Bundle,
+    BundleCopyWriteAttempt,
+    Copy,
+    Pool,
+)
 from sutradhara.catalog.types import CopyHealth
 from sutradhara.durability import BundleTarget, bundle_replication_status
+from sutradhara.jobs.commit_point import commit_point_for
 from sutradhara.jobs.components import touch_asset, touch_copy_tape
 from sutradhara.jobs.reconcilers import bundle_copy
 from sutradhara.jobs.reconcilers.conditions import (
@@ -47,6 +71,7 @@ from sutradhara.jobs.reconcilers.conditions import (
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
 from sutradhara.keys import KeyRegistry
 from sutradhara.replication import (
+    PoolTarget,
     PoolTargetEntry,
     WritableStorageBackend,
     select_source_candidates,
@@ -63,6 +88,7 @@ _HOST_KEY_GUIDANCE = (
 
 @register_handler("bundle-repair")
 def handle_bundle_repair(ctx: JobContext) -> JobResult:
+    commit_point_for(ctx.session)
     params = ctx.job.params
     bundle_id = params.get("bundle_id")
     if not isinstance(bundle_id, str) or not bundle_id:
@@ -186,75 +212,284 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
                 ),
             )
 
-    errors: list[str] = []
-    for source in sources:
-        if source.health != CopyHealth.OK:
-            errors.append(f"copy id={source.id}: health={source.health.value}")
-            continue
-        source_backend = backends.get(source.backend_id)
-        if source_backend is None:
-            errors.append(f"copy id={source.id}: backend_id={source.backend_id} unavailable")
-            continue
-        if source.id in unreadable_sources:
-            errors.append(unreadable_sources[source.id])
-            continue
-        touch_copy_tape(ctx, source)
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix=f"sutradhara-bundle-repair-{bundle.id}-"
-            ) as raw:
-                temp_root = Path(raw)
-                member_sources = _extract_member_sources(
-                    ctx=ctx,
-                    bundle=bundle,
-                    source_copy_id=source.id,
-                    source_backend=source_backend,
-                    scratch=temp_root / "scratch",
-                    rem_bin=rem_bin or "rem",
-                    keys=keys,
+    return _repair_after_preflight(
+        ctx,
+        bundle=bundle,
+        targets=targets,
+        backends=backends,
+        sources=sources,
+        unreadable_sources=unreadable_sources,
+        builder=builder,
+        keys=keys,
+        key_epoch=key_epoch,
+        rem_bin=rem_bin or "rem",
+    )
+
+
+def _repair_after_preflight(
+    ctx: JobContext,
+    *,
+    bundle: Bundle,
+    targets: list[PoolTargetEntry[WritableStorageBackend]],
+    backends: dict[int, WritableStorageBackend],
+    sources: list[Copy],
+    unreadable_sources: dict[int, str],
+    builder: ArchiveBuilder,
+    keys: KeyRegistry,
+    key_epoch: str | None,
+    rem_bin: str,
+) -> JobResult:
+    """Resolve first, re-read doubtful/possibly missing copies, then build once."""
+    bundle_id = bundle.id
+    point = commit_point_for(ctx.session)
+    run, _, _, _ = _copy_run(ctx.session)
+    _reset_copy_problems(ctx.session, bundle_id)
+    writable = {target.pool_id: (backend, target) for backend, target in targets}
+    resolved = dict(writable)
+
+    def pool_entry(pool_id: str) -> PoolTargetEntry[WritableStorageBackend]:
+        if pool_id not in resolved:
+            pool = ctx.session.get(Pool, pool_id)
+            if pool is None:
+                raise RuntimeError(f"repair ledger names missing pool {pool_id!r}")
+            row = ctx.session.get(Backend, pool.backend_id)
+            if row is None:
+                raise RuntimeError(f"repair pool {pool_id!r} has no backend")
+            backend = backends.get(row.id)
+            if backend is None:
+                backend = cast(WritableStorageBackend, factory.backend_from_row(row))
+            resolved[pool_id] = (
+                backend,
+                PoolTarget(
+                    pool_id=pool_id,
+                    artifactclass="",
+                    backend_id=row.id,
+                    backend_name=row.name,
+                    representation=pool.representation,
+                    key_epoch=key_epoch,
+                ),
+            )
+        return resolved[pool_id]
+
+    repaired = set()
+    rebuild = set()
+    reread_copy_ids: set[int] = set()
+    resolved_pool_ids: set[str] = set()
+    with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-repair-{bundle_id}-") as raw:
+        temp_root = Path(raw)
+        pool_ids = list(
+            ctx.session.scalars(
+                select(BundleCopyWriteAttempt.pool_id)
+                .where(
+                    BundleCopyWriteAttempt.bundle_id == bundle_id,
+                    BundleCopyWriteAttempt.generation == 0,
                 )
-                repaired = _repair_missing_targets(
+                .distinct()
+            )
+        )
+        for pool_id in pool_ids:
+            attempts = identity_attempts(
+                ctx.session, bundle_id=bundle_id, pool_id=pool_id, generation=0
+            )
+            if not any(outcome is None for _, outcome in attempts):
+                continue
+            backend, target = pool_entry(pool_id)
+            read_dir = temp_root / f"resolve-{_pool_slug(pool_id)}"
+            read_dir.mkdir(exist_ok=True)
+            copy, problem, may_rebuild = resolve_identity(
+                ctx.session,
+                bundle_id=bundle_id,
+                target=target,
+                backend=backend,
+                builder=builder,
+                work_dir=read_dir,
+            )
+            _remember_copy_problem(ctx.session, bundle_id, pool_id, problem)
+            if copy is not None:
+                reread_copy_ids.add(copy.id)
+            if copy is not None or problem is not None:
+                resolved_pool_ids.add(pool_id)
+            if may_rebuild:
+                rebuild.add(pool_id)
+                if copy is None:
+                    raise RuntimeError(f"resolution permits rebuilding {pool_id!r} without a copy")
+            elif copy is not None and problem is None:
+                repaired.add(pool_id)
+
+        copies = list(
+            ctx.session.scalars(select(Copy).where(Copy.bundle_id == bundle_id).order_by(Copy.id))
+        )
+        for copy in copies:
+            if copy.id in reread_copy_ids:
+                # Step 1 already checked this copy, including any read error.
+                continue
+            if copy.health != CopyHealth.SUSPECT and not (
+                copy.health == CopyHealth.OK
+                and (copy.last_measured_at is None or copy.last_measured_digest is None)
+            ):
+                continue
+            if copy.pool_id is None:
+                raise RuntimeError(f"bundle copy {copy.id} has no pool")
+            pool_id = copy.pool_id
+            backend, target = pool_entry(pool_id)
+            read_dir = temp_root / f"reread-{copy.id}"
+            read_dir.mkdir()
+            artifact = _artifact_from_copy(ctx.session, copy, read_dir)
+            locator, metadata = dict(copy.native_locator), dict(copy.storage_metadata)
+            with point.window():
+                result, error = _read_copy_result(
+                    backend=backend,
+                    locator=locator,
+                    artifact=artifact,
+                    representation=target.representation,
+                    metadata=metadata,
+                    builder=builder,
+                    work_dir=read_dir,
+                )
+            if error is not None and not isinstance(
+                error, (ArchiveFanoutError, BackendStoredCorruptError)
+            ):
+                if not isinstance(error, (BackendError, OSError)):
+                    raise error
+                problem = _copy_problem(pool_id, "transient-backend-failure", str(error))
+            else:
+                attempts = identity_attempts(
+                    ctx.session, bundle_id=bundle_id, pool_id=pool_id, generation=0
+                )
+                reread_run = f"{run}:reread:step2:{attempts[-1][0].id if attempts else 0}"
+                with ctx.session.begin_nested():
+                    _record_existing_copy_result(ctx.session, copy, result, error, run=reread_run)
+                problem = (
+                    None
+                    if error is None and result is not None and result.ok
+                    else _copy_problem(
+                        pool_id,
+                        "post-write-pool-failure",
+                        str(error or (result.detail if result is not None else "no read-back")),
+                        blocked=True,
+                    )
+                )
+            _remember_copy_problem(ctx.session, bundle_id, pool_id, problem)
+
+        missing = _missing_pool_ids(ctx, bundle_id)
+        for pool_id in sorted(missing):
+            if pool_id in rebuild or pool_id in resolved_pool_ids:
+                continue
+            pool_copies = [copy for copy in copies if copy.pool_id == pool_id]
+            if not pool_copies or any(copy.health == CopyHealth.SUSPECT for copy in pool_copies):
+                continue
+            newest = pool_copies[-1]
+            if newest.health not in {CopyHealth.MISSING, CopyHealth.CORRUPT}:
+                continue
+            backend, target = pool_entry(pool_id)
+            read_dir = temp_root / f"lookup-{newest.id}"
+            read_dir.mkdir()
+            copy, problem, may_rebuild = resolve_identity(
+                ctx.session,
+                bundle_id=bundle_id,
+                target=target,
+                backend=backend,
+                builder=builder,
+                work_dir=read_dir,
+                copy_id=newest.id,
+            )
+            _remember_copy_problem(ctx.session, bundle_id, pool_id, problem)
+            if may_rebuild:
+                rebuild.add(pool_id)
+            elif copy is not None and problem is None:
+                repaired.add(pool_id)
+
+        write_targets = []
+        for backend, target in targets:
+            outcomes = [
+                outcome
+                for _, outcome in identity_attempts(
+                    ctx.session, bundle_id=bundle_id, pool_id=target.pool_id, generation=0
+                )
+            ]
+            if "conflict" in outcomes or None in outcomes:
+                continue
+            pool_copies = [copy for copy in copies if copy.pool_id == target.pool_id]
+            if target.pool_id in rebuild or (not pool_copies and "landed" not in outcomes):
+                write_targets.append((backend, target))
+
+        source_id = None
+        if write_targets:
+            errors = []
+            member_sources = None
+            for source in sources:
+                if source.health != CopyHealth.OK:
+                    errors.append(f"copy id={source.id}: health={source.health}")
+                    continue
+                source_backend = backends.get(source.backend_id)
+                if source_backend is None:
+                    errors.append(
+                        f"copy id={source.id}: backend_id={source.backend_id} unavailable"
+                    )
+                    continue
+                if source.id in unreadable_sources:
+                    errors.append(unreadable_sources[source.id])
+                    continue
+                touch_copy_tape(ctx, source)
+                try:
+                    member_sources = _extract_member_sources(
+                        ctx=ctx,
+                        bundle=bundle,
+                        source_copy_id=source.id,
+                        source_backend=source_backend,
+                        scratch=temp_root / f"source-{source.id}",
+                        rem_bin=rem_bin,
+                        keys=keys,
+                    )
+                except _SourceDigestMismatch as exc:
+                    source.health = CopyHealth.SUSPECT
+                    errors.append(f"copy id={source.id}: {exc}")
+                    continue
+                except (ArchiveFanoutError, ArchiveRestoreError, BackendError, OSError) as exc:
+                    errors.append(f"copy id={source.id}: {exc}")
+                    continue
+                source_id = source.id
+                break
+            if member_sources is None:
+                projection, _ = _project_copy_problems(ctx.session, bundle_id)
+                return JobResult(
+                    ok=False,
+                    detail=f"cannot repair bundle {bundle_id}: "
+                    + ("; ".join(errors) if errors else "no healthy source copy"),
+                    condition=projection,
+                )
+            repaired.update(
+                _repair_missing_targets(
                     ctx=ctx,
                     bundle=bundle,
-                    targets=targets,
+                    targets=write_targets,
                     member_sources=member_sources,
                     builder=builder,
                     key_epoch=key_epoch,
                     work_dir=temp_root / "build",
                 )
-        except _SourceDigestMismatch as exc:
-            source.health = CopyHealth.SUSPECT
-            errors.append(f"copy id={source.id}: {exc}")
-            continue
-        except (ArchiveFanoutError, ArchiveRestoreError, BackendError, OSError) as exc:
-            errors.append(f"copy id={source.id}: {exc}")
-            continue
-
-        remaining_missing = _missing_pool_ids(ctx, bundle.id)
-        fenced_missing = _write_fenced_pool_ids(ctx, remaining_missing)
-        if remaining_missing and remaining_missing == fenced_missing:
-            return _fenced_missing_result(
-                ctx,
-                bundle.id,
-                repaired=repaired,
-                fenced_missing=fenced_missing,
-                source_copy_id=source.id,
             )
 
-        return JobResult(
-            ok=True,
-            detail=f"bundle {bundle.id} repaired pools={sorted(repaired)}",
-            step_state={
-                "bundle_repair": {
-                    "bundle_id": bundle.id,
-                    "source_copy_id": source.id,
-                    "repaired_pools": sorted(repaired),
-                }
-            },
+    projection, _ = _project_copy_problems(ctx.session, bundle_id)
+    if projection is not None:
+        return JobResult(ok=False, detail=projection.message or "", condition=projection)
+    remaining = _missing_pool_ids(ctx, bundle_id)
+    fenced = _write_fenced_pool_ids(ctx, remaining)
+    if remaining and remaining == fenced:
+        return _fenced_missing_result(
+            ctx, bundle_id, repaired=repaired, fenced_missing=fenced, source_copy_id=source_id
         )
-
-    detail = "; ".join(errors) if errors else "no healthy source copy"
-    return JobResult(ok=False, detail=f"cannot repair bundle {bundle.id}: {detail}")
+    return JobResult(
+        ok=True,
+        detail=f"bundle {bundle_id} repaired pools={sorted(repaired)}",
+        step_state={
+            "bundle_repair": {
+                "bundle_id": bundle_id,
+                "source_copy_id": source_id,
+                "repaired_pools": sorted(repaired),
+            }
+        },
+    )
 
 
 def make_archive_builder(*, rem_bin: str | None = None) -> ArchiveBuilder:
@@ -435,43 +670,66 @@ def _extract_member_sources(
             )
         )
     }
-    source_copy = next(copy for copy in bundle.copies if copy.id == source_copy_id)
-    member_sources: list[MemberInput] = []
-    for member in bundle.members:
+    source_copy = ctx.session.scalars(
+        select(Copy)
+        .where(
+            Copy.id == source_copy_id,
+            Copy.bundle_id == bundle.id,
+        )
+        .execution_options(populate_existing=True)
+    ).one()
+    copy_view = _ReadCopyView(
+        native_locator=dict(source_copy.native_locator),
+        storage_metadata=dict(source_copy.storage_metadata),
+        id=source_copy.id,
+    )
+    inputs: list[tuple[MemberInput, _ReadAssetLocatorView]] = []
+    for member in _current_bundle_members(ctx.session, bundle.id):
         locator = locators.get((member.logical_asset_hash, member.member_path))
         if locator is None:
             raise ArchiveRestoreError(
                 f"source copy id={source_copy_id} has no locator for {member.member_path!r}"
             )
         dest = _scratch_member_path(scratch, member.member_path)
-        read_member_to_path(
-            backend=source_backend,
-            copy=source_copy,
-            asset_locator=locator,
-            dest=dest,
-            rem_bin=rem_bin,
-            keys=keys,
-        )
-        if dest.stat().st_size != member.size_bytes:
-            raise ArchiveRestoreError(
-                f"member {member.member_path!r} short read {dest.stat().st_size} != "
-                f"{member.size_bytes}"
-            )
-        actual = hashlib.sha256(dest.read_bytes()).digest()
-        if actual != member.file_sha256:
-            raise _SourceDigestMismatch(
-                f"member {member.member_path!r} digest {actual.hex()} != {member.file_sha256.hex()}"
-            )
-        member_sources.append(
-            MemberInput(
-                logical_asset_hash=member.logical_asset_hash,
-                member_path=member.member_path,
-                source_path=dest,
-                size_bytes=member.size_bytes,
-                file_sha256=member.file_sha256,
+        inputs.append(
+            (
+                MemberInput(
+                    logical_asset_hash=member.logical_asset_hash,
+                    member_path=member.member_path,
+                    source_path=dest,
+                    size_bytes=member.size_bytes,
+                    file_sha256=member.file_sha256,
+                ),
+                _ReadAssetLocatorView(
+                    representation=locator.representation,
+                    native_locator=dict(locator.native_locator),
+                    member_path=locator.member_path,
+                ),
             )
         )
-    return member_sources
+    with commit_point_for(ctx.session).window():
+        for member_input, locator_view in inputs:
+            dest = member_input.source_path
+            read_member_to_path(
+                backend=source_backend,
+                copy=copy_view,
+                asset_locator=locator_view,
+                dest=dest,
+                rem_bin=rem_bin,
+                keys=keys,
+            )
+            if dest.stat().st_size != member_input.size_bytes:
+                raise ArchiveRestoreError(
+                    f"member {member_input.member_path!r} short read {dest.stat().st_size} != "
+                    f"{member_input.size_bytes}"
+                )
+            actual = hashlib.sha256(dest.read_bytes()).digest()
+            if actual != member_input.file_sha256:
+                raise _SourceDigestMismatch(
+                    f"member {member_input.member_path!r} digest {actual.hex()} != "
+                    f"{member_input.file_sha256.hex()}"
+                )
+    return [member_input for member_input, _ in inputs]
 
 
 def _repair_missing_targets(
@@ -485,20 +743,32 @@ def _repair_missing_targets(
     work_dir: Path,
 ) -> set[str]:
     repaired: set[str] = set()
-    work_dir.mkdir(parents=True, exist_ok=True)
-    for backend, target in targets:
+    for index, (backend, target) in enumerate(targets):
         if target.pool_id not in _missing_pool_ids(ctx, bundle.id):
             continue
-        copy = build_bundle_copy_for_pool(
-            ctx.session,
-            bundle=bundle,
-            target=target,
-            member_sources=member_sources,
-            builder=builder,
-            backend=backend,
-            key_epoch=key_epoch,
-            work_dir=work_dir,
-        )
+        target_dir = work_dir / f"target-{index:02d}-{_pool_slug(target.pool_id)}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            copy = build_bundle_copy_for_pool(
+                ctx.session,
+                bundle=bundle,
+                target=target,
+                member_sources=member_sources,
+                builder=builder,
+                backend=backend,
+                key_epoch=key_epoch,
+                work_dir=target_dir,
+            )
+        except (PoolWriteFailure, TransientPoolFanoutError):
+            continue
+        except (ArchiveFanoutError, ArchiveRestoreError, BackendError, OSError) as exc:
+            _remember_copy_problem(
+                ctx.session,
+                bundle.id,
+                target.pool_id,
+                _copy_problem(target.pool_id, "transient-backend-failure", str(exc)),
+            )
+            continue
         touch_copy_tape(ctx, copy)
         repaired.add(target.pool_id)
     return repaired

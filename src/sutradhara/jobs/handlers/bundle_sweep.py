@@ -72,7 +72,7 @@ def sweep_backends(session: Session) -> dict[int, WritableStorageBackend]:
     basis it is about to build for.
     """
     pool_ids: set[str] = set()
-    for bundle in session.scalars(select(Bundle).where(Bundle.status == "open")):
+    for bundle in session.scalars(select(Bundle).where(Bundle.status.in_(("open", "flushing")))):
         pool_ids.update(basis_pool_ids(bundle.group_basis))
     if not pool_ids:
         return {}

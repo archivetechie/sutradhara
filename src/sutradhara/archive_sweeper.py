@@ -6,8 +6,8 @@ during an enqueue, and **the age arm ran nowhere at all**. A trickle class
 could therefore hold an open accumulator forever. The sweeper is the missing
 caller, and it runs three things in one pass:
 
-1. **The reaper.** A ``flushing`` bundle whose claimer is gone goes back to
-   ``open`` with an alarm. Liveness is a real mechanism, not a timeout: the
+1. **The reaper.** A dead claim without attempts returns to ``open``; a claim
+   with attempts is released for resolution. Liveness is not a timeout: the
    claim carries the flusher's ``hostname:pid`` and the reaper checks it
    against the worker-lock holder (and, on this host, against the process
    itself, so an operator's foreground CLI flush is never reaped out from
@@ -20,7 +20,7 @@ caller, and it runs three things in one pass:
    accumulator, which is fine and intended. An **empty** orphan is sealed
    ``void`` directly, because ``bundle_due`` refuses empty bundles by design
    and would otherwise strand it forever.
-3. **The due scan.** Every open bundle that ``bundle_due`` says is due gets
+3. **The due scan.** Due open bundles and resumable flushing bundles are
    flushed through the map route.
 
 The due scan covers **open funnel bundles too** (``archive_id IS NOT NULL``),
@@ -55,7 +55,10 @@ from sqlalchemy.orm import Session
 from sutradhara.archive_bundle import bundle_due
 from sutradhara.archive_fanout import ArchiveBuilder, flush_bundle
 from sutradhara.bundle_group import compute_group_basis, fingerprint_basis
-from sutradhara.catalog.models import ArtifactClassPolicyRecord, Bundle
+from sutradhara.catalog.models import ArtifactClassPolicyRecord, Bundle, BundleCopyWriteAttempt
+from sutradhara.jobs.commit_point import commit_point_for
+from sutradhara.jobs.engine import AttemptBoundaryError, AttemptSuperseded, is_sqlite_lock_error
+from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.worker_lock import held_process_lock_identity, process_lockfile_for
 from sutradhara.replication import WritableStorageBackend
 from sutradhara.structured_logs import emit_structured_event
@@ -223,7 +226,8 @@ def claim_is_live(session: Session, token: str | None) -> bool:
         # No claim identity at all: nothing to be alive. (Only reachable for
         # rows that entered `flushing` before the claim column existed.)
         return False
-    lockfile = process_lockfile_for(session.get_bind(), namespace="worker")
+    bind = session.get_bind()
+    lockfile = process_lockfile_for(bind.engine, namespace="worker")
     if held_process_lock_identity(lockfile) == token:
         return True
     host, _, raw_pid = token.rpartition(":")
@@ -245,8 +249,29 @@ def claim_is_live(session: Session, token: str | None) -> bool:
     return True
 
 
+def _owns_bundle_claim(session: Session, bundle: Bundle) -> bool:
+    """Only a job retry with the same attempt owns an existing claim."""
+    point = session.info.get("sutradhara_commit_point")
+    return (
+        point is not None
+        and point._job_id is not None
+        and (bundle.claim_job_id, bundle.claim_job_attempt) == (point._job_id, point._attempt)
+    )
+
+
+def _bundle_claim_is_live(session: Session, bundle: Bundle) -> bool:
+    """A job claim requires both a current RUNNING attempt and a live process."""
+    if bundle.claim_job_id is not None:
+        current = session.execute(
+            select(Job.status, Job.attempts).where(Job.id == bundle.claim_job_id)
+        ).one_or_none()
+        if current != (JobStatus.RUNNING, bundle.claim_job_attempt):
+            return False
+    return claim_is_live(session, bundle.claimed_by)
+
+
 def reap_stuck_flushing(session: Session) -> list[str]:
-    """Return stuck ``flushing`` bundles to ``open``, with an alarm each.
+    """Reopen dead claims without attempts; release attempted ones for resolution.
 
     The reaped bundle keeps its ``archive_id``. That is load-bearing, not
     laziness: while it sat ``flushing`` a fresh accumulator may have opened
@@ -266,7 +291,9 @@ def reap_stuck_flushing(session: Session) -> list[str]:
     )
     for bundle in stuck:
         token = bundle.claimed_by
-        if claim_is_live(session, token):
+        if _owns_bundle_claim(session, bundle):
+            continue
+        if _bundle_claim_is_live(session, bundle):
             # Emitted, not passed over in silence: a claim that reads as live
             # is indistinguishable from a claim that IS live, and the two have
             # opposite meanings. A flush in progress produces one of these per
@@ -281,14 +308,34 @@ def reap_stuck_flushing(session: Session) -> list[str]:
                 flushed_at=None if bundle.flushed_at is None else bundle.flushed_at.isoformat(),
             )
             continue
+        has_attempt = (
+            session.scalar(
+                select(BundleCopyWriteAttempt.id)
+                .where(BundleCopyWriteAttempt.bundle_id == bundle.id)
+                .limit(1)
+            )
+            is not None
+        )
+        if (
+            has_attempt
+            and token is None
+            and bundle.claim_job_id is None
+            and bundle.claim_job_attempt is None
+        ):
+            continue
         result = session.execute(
             update(Bundle)
             .where(Bundle.id == bundle.id, Bundle.status == "flushing")
-            .values(status="open", claimed_by=None)
+            .values(
+                status="flushing" if has_attempt else "open",
+                claimed_by=None,
+                claim_job_id=None,
+                claim_job_attempt=None,
+            )
         )
         if result.rowcount != 1:  # pragma: no cover - lost to a concurrent seal
             continue
-        session.expire(bundle, ["status", "claimed_by"])
+        session.expire(bundle, ["status", "claimed_by", "claim_job_id", "claim_job_attempt"])
         emit_structured_event(
             "bundle_flush_claim_reaped",
             bundle_id=bundle.id,
@@ -312,24 +359,19 @@ def sweep_bundles(
 ) -> SweepResult:
     """Run one full sweeper pass: reap, void-seal, drain, then flush what is due.
 
-    Order matters. Reaping first returns stuck bundles to ``open`` so the same
-    pass can re-flush them. Void-sealing before the due scan keeps empty
+    Order matters. Reaping first makes dead claims resumable in this pass.
+    Void-sealing before the due scan keeps empty
     orphans out of a scan that would refuse them anyway. Draining marks the
     orphaned accumulators that must seal now rather than wait out an age arm
     nothing will ever restart.
 
-    A flush that fails does not abort the pass — one bad bundle must not stop
-    every other group from sealing — but the failure is recorded and returned,
-    and **it rolls back to its own savepoint**. Without that savepoint the pass
-    would carry the failed flush's partial state to the caller's commit: the
-    claim (``status='flushing'`` plus ``claimed_by``), the ``archive_id`` mint,
-    the ``scan_summary`` and any quarantine rows the attempt created. Under the
-    job worker that committed claim is unrecoverable — ``claimed_by`` names the
-    worker's own still-running pid, so the reaper's liveness check says "live"
-    forever, ``_open_bundles`` never sees a ``flushing`` bundle again, and the
-    material silently never reaches media. The savepoint rollback IS the
-    un-claim, which is the design's own rule (§4) applied to the batch caller.
+    Ordinary flush failures are recorded and the pass continues. Each flush
+    handles its own step rollback and durable claim cleanup. Worker control
+    exceptions propagate, preserving the claim for a retry of that attempt.
     """
+    point = commit_point_for(session)
+    with point.window():
+        pass
     result = SweepResult()
     if reap:
         result.reaped = tuple(reap_stuck_flushing(session))
@@ -338,32 +380,32 @@ def sweep_bundles(
 
     drained = {bundle.id: bundle for bundle in drain_candidates(session, live=live)}
     due = {bundle.id: bundle for bundle in due_bundles(session, now=now)}
+    for bundle in session.scalars(select(Bundle).where(Bundle.status == "flushing")):
+        if _owns_bundle_claim(session, bundle) or not _bundle_claim_is_live(session, bundle):
+            due[bundle.id] = bundle
     result.drained = tuple(sorted(drained))
     flushed: list[str] = []
     for bundle_id in sorted({**drained, **due}):
         try:
-            # One savepoint per bundle: a failed flush discards its own partial
-            # catalog state (claim included) and the pass carries on. Nested
-            # inside it, `_fan_out_targets` keeps its per-target savepoints, so
-            # a post-write failure still seals partial rather than unwinding to
-            # here — the two levels encode the pre-write/post-write boundary.
-            with session.begin_nested():
-                flush_bundle(
-                    session,
-                    bundle_id=bundle_id,
-                    backends=backends,
-                    builder=builder,
-                    key_epoch=key_epoch,
-                    deliverables_dir=deliverables_dir,
-                )
+            flush_bundle(
+                session,
+                bundle_id=bundle_id,
+                backends=backends,
+                builder=builder,
+                key_epoch=key_epoch,
+                deliverables_dir=deliverables_dir,
+            )
         except Exception as exc:
+            if isinstance(exc, (AttemptSuperseded, AttemptBoundaryError)) or is_sqlite_lock_error(
+                exc
+            ):
+                raise
             # Deliberately broad: the sweep is a batch over independent
             # bundles, and one group's bad member, missing source, or
             # unreachable backend must not stop every other group from
-            # sealing. Nothing is swallowed and nothing partial survives — the
-            # savepoint above has already rolled this bundle back to ``open``
-            # and un-claimed, and the failure is recorded in the result,
-            # emitted as a structured event, and exits the CLI non-zero.
+            # sealing. The flush has cleaned up its claim while preserving
+            # committed attempts. The result and structured event report the
+            # failure, and the CLI exits non-zero.
             result.failed.append((bundle_id, str(exc)))
             emit_structured_event(
                 "bundle_sweep_flush_failed",

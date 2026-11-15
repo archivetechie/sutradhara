@@ -80,6 +80,12 @@ def engine() -> Iterator[Engine]:
 
 
 class _Backend:
+    reissue_after_absent = True
+    holds_names = False
+
+    def lookup_pool_object(self, pool, object_name, *, candidate_digests):
+        return None
+
     def __init__(self, *, kind: BackendKind = BackendKind.REM_TAPE) -> None:
         self.kind = kind
         self._counter = 0

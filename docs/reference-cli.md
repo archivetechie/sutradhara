@@ -255,7 +255,7 @@ tape is spending the whole group's tape efficiency to do it.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--deliverables-dir DIRECTORY` | | Directory for customer manifest receipts. |
+| `--deliverables-dir DIRECTORY` | | Directory for customer manifest receipts. A resumed flush adopts previously attempted targets without rebuilding them, so it emits no customer manifest and records no build exclusions for those targets. |
 | `--rem-bin TEXT` | `rem` | rem CLI binary. |
 | `--key-epoch TEXT` | | Key epoch for rem-encrypt-v1 pools. |
 | `--manifest-signing-key-file FILE` | | Raw HMAC key file for customer manifest receipts. |
@@ -275,12 +275,13 @@ claimed, and it can no longer take members.
 This is the only caller of the age arm: a quiet class's accumulator seals here
 or not at all. The same pass runs as the `bundle-sweep` job. A flush failure is
 reported per bundle and exits non-zero without stopping the rest of the pass;
-each bundle's flush is transactionally its own, so a failed one leaves nothing
-behind — it is back to `open` and un-claimed, and the next pass retries it. A
-failure *after* bytes reach a pool is different: that pool's copy is recorded
-`suspect`, the bundle still seals with the copies that succeeded, and the
-bundle-copy condition goes to `blocked` for a human, because retrying a tape
-write appends a second object rather than replacing the first.
+each flush commits its write attempts before calling a pool. A failure before
+any attempt returns the bundle to `open`; a failure with recorded attempts
+releases its claim and leaves it `flushing` for the next pass to resume by
+looking up what the pools hold. Successful copies survive a partial seal.
+Uncertain writes back off for resolution; conflicting identities and failed
+verification block as recorded in the bundle-copy condition. Builds and pool
+calls release the database transaction while they run.
 
 | Flag | Default | Meaning |
 |---|---|---|

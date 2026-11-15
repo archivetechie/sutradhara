@@ -128,6 +128,12 @@ class _ArchiveSetup:
 
 
 class _ArchiveWriteBackend:
+    reissue_after_absent = True
+    holds_names = False
+
+    def lookup_pool_object(self, pool, object_name, *, candidate_digests):
+        return None
+
     def __init__(self, name: str) -> None:
         self._name = name
         self._objects: dict[str, bytes] = {}
@@ -2019,7 +2025,10 @@ class _ReadbackKeys(_FakeKeyRegistry):
 def test_readback_verify_value_error_escapes_flush_without_partial_seal(
     encrypted: bool, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """F1/R7: adapter ValueError retains the base's exception and savepoint rollback."""
+    """RBA-2b2/T17: an adapter ValueError leaves a durable unresolved attempt."""
+    from sutradhara.bundle_copy_ledger import attempt_outcome
+    from sutradhara.catalog.models import BundleCopyWriteAttempt
+
     representation = Representation.REM_ENCRYPT_V1 if encrypted else Representation.REM_OBJECT_V1
     bundle_id, backend_id, _ = _readback_bundle(engine, tmp_path, representation, copies=1)
     backend = _ReadbackBackend()
@@ -2034,29 +2043,32 @@ def test_readback_verify_value_error_escapes_flush_without_partial_seal(
     monkeypatch.setattr(backend, "verify", verify)
     monkeypatch.setattr(archive_fanout, "run_rem_archive_build", lambda **kw: _readback_build(kw))
     with session_scope(engine) as session:
-        with pytest.raises(ValueError, match="injected backend verify failure") as caught:
-            flush_bundle(
-                session,
-                bundle_id=bundle_id,
-                backends={backend_id: backend},
-                builder=RemArchiveBuilder(keys=_ReadbackKeys(key_file)),  # type: ignore[arg-type]
-                key_epoch="archive-" + "1" * 32 if encrypted else None,
-            )
-        assert caught.value is error
-        # Inspect inside the caller's transaction: the target savepoint discarded its rows.
+        result = flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends={backend_id: backend},
+            builder=RemArchiveBuilder(keys=_ReadbackKeys(key_file)),  # type: ignore[arg-type]
+            key_epoch="archive-" + "1" * 32 if encrypted else None,
+        )
+        assert result.partial
+        assert result.condition_reason == "write-unresolved"
+        assert str(error) in result.condition_message
         assert list(session.scalars(select(Copy))) == []
         assert list(session.scalars(select(AssetLocator))) == []
         assert list(session.scalars(select(VerifyReceipt))) == []
-        assert list(session.scalars(select(ReconciliationCondition))) == []
-        bundle = session.get(Bundle, bundle_id)
-        assert bundle is not None
-        assert bundle.status == "flushing"
-        session.rollback()
+        attempt = session.scalars(select(BundleCopyWriteAttempt)).one()
+        assert attempt_outcome(session, attempt.id) is None
+        condition = session.scalars(select(ReconciliationCondition)).one()
+        assert condition.condition == "backoff"
+        assert condition.reason == "write-unresolved"
+        assert str(error) in condition.message
     with session_scope(engine) as session:
         bundle = session.get(Bundle, bundle_id)
         assert bundle is not None
-        assert bundle.status == "open"
+        assert bundle.status == "sealed"
         assert list(session.scalars(select(Copy))) == []
+        attempt = session.scalars(select(BundleCopyWriteAttempt)).one()
+        assert attempt_outcome(session, attempt.id) is None
     assert backend.writes == ["readback-0"]
 
 
@@ -2433,3 +2445,44 @@ def test_unmeasured_readback_discards_observations_and_preserves_member_verifica
         assert len(objects) == 2
         assert len(set(objects)) == 1
         assert all(not path.exists() for path in objects)
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, ManifestSigningError])
+def test_fr1_manifest_failure_releases_flush_without_rewrite(engine, tmp_path, error_type):
+    """F4(a)/M23: signing errors escape after the committed attempt, without a rewrite."""
+    from sutradhara.bundle_copy_ledger import identity_attempts
+
+    class FailingSigner:
+        def sign(self, payload):
+            raise error_type("injected manifest signer failure")
+
+    setup = _create_bundle(engine, tmp_path, target_gb=0.000000014)
+    rem_backend, d2_backend = _ArchiveWriteBackend("rem"), _ArchiveWriteBackend("d2")
+    backends = {setup.rem_backend_id: rem_backend, setup.d2_backend_id: d2_backend}
+    with session_scope(engine) as session:
+        with pytest.raises(error_type, match="injected manifest signer failure"):
+            flush_bundle(
+                session,
+                bundle_id=setup.bundle_id,
+                backends=backends,
+                builder=LocalArchiveBuilder(),
+                deliverables_dir=tmp_path / "manifests",
+                manifest_signer=FailingSigner(),
+            )
+        bundle = session.get(Bundle, setup.bundle_id)
+        assert bundle.status == "flushing"
+        assert bundle.claimed_by is None
+        assert any(
+            identity_attempts(session, bundle_id=setup.bundle_id, pool_id=pool, generation=0)
+            for pool in rem_backend.writes
+        )
+    writes = (list(rem_backend.writes), list(d2_backend.writes))
+    with session_scope(engine) as session:
+        flush_bundle(
+            session,
+            bundle_id=setup.bundle_id,
+            backends=backends,
+            builder=LocalArchiveBuilder(),
+        )
+        assert session.get(Bundle, setup.bundle_id).status == "sealed"
+    assert (rem_backend.writes, d2_backend.writes) == writes

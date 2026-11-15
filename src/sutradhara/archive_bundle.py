@@ -521,7 +521,7 @@ def claim_bundle_for_flush(
     worker_id: str | None = None,
     now: dt.datetime | None = None,
 ) -> str:
-    """Claim one open bundle for flushing and return the claim token.
+    """Claim an open bundle or resume a released/dead claim; return its token.
 
     The guarded ``open -> flushing`` compare-and-set (design-bundle-groups §4).
     SQLite is the default dialect, where ``FOR UPDATE`` compiles to nothing, so
@@ -530,21 +530,42 @@ def claim_bundle_for_flush(
     snapshot would let an appender slip a member into a sealing bundle, where
     it would sit unmaterialised.
 
-    The claim, the ``archive_id`` assignment, and everything up to the first
-    physical write belong to one transaction — the caller's. Any
-    pre-physical-write failure rolls back, and that rollback IS the un-claim:
-    the bundle returns to ``open``, visible again to ``bundle_due``, the drain
-    check, and the one-open-accumulator partial index.
+    The claim and member snapshot commit together at the first build window.
+    The flush owns subsequent cleanup: reopen if no attempt exists, otherwise
+    release the claim for resolution. An own job claim resumes in place.
     """
     token = worker_id or default_worker_id()
     stamp = now or dt.datetime.now(dt.UTC)
+    point = session.info.get("sutradhara_commit_point")
+    job_id = None if point is None else point._job_id
+    job_attempt = None if point is None else point._attempt
+    predicates = [Bundle.id == bundle.id, Bundle.status == "open"]
+    values: dict[str, Any] = dict(
+        status="flushing",
+        claimed_by=token,
+        flushed_at=stamp,
+        claim_job_id=job_id,
+        claim_job_attempt=job_attempt,
+    )
+    if bundle.status == "flushing":
+        from sutradhara.archive_sweeper import _bundle_claim_is_live, _owns_bundle_claim
+
+        if _owns_bundle_claim(session, bundle):
+            if bundle.claimed_by is None:
+                raise BundleStateError(f"bundle {bundle.id!r} has an own job claim without a token")
+            return bundle.claimed_by
+        if not _bundle_claim_is_live(session, bundle):
+            predicates = [
+                Bundle.id == bundle.id,
+                Bundle.status == "flushing",
+                Bundle.claimed_by == bundle.claimed_by,
+                Bundle.claim_job_id == bundle.claim_job_id,
+                Bundle.claim_job_attempt == bundle.claim_job_attempt,
+            ]
+            values.pop("flushed_at")
     result = cast(
         CursorResult[Any],
-        session.execute(
-            update(Bundle)
-            .where(Bundle.id == bundle.id, Bundle.status == "open")
-            .values(status="flushing", claimed_by=token, flushed_at=stamp)
-        ),
+        session.execute(update(Bundle).where(*predicates).values(**values)),
     )
     if result.rowcount != 1:
         session.expire(bundle, ["status", "claimed_by", "flushed_at"])
@@ -552,7 +573,9 @@ def claim_bundle_for_flush(
             f"bundle {bundle.id!r} could not be claimed for flush; "
             f"status is {bundle.status!r}, not 'open'"
         )
-    session.expire(bundle, ["status", "claimed_by", "flushed_at"])
+    session.expire(
+        bundle, ["status", "claimed_by", "flushed_at", "claim_job_id", "claim_job_attempt"]
+    )
     return token
 
 
@@ -569,6 +592,13 @@ def close_bundle(session: Session, bundle: Bundle, *, claim_token: str) -> Bundl
     evidence of who sealed it, and the reaper only ever looks at ``flushing``.
     """
     sealed_at = dt.datetime.now(dt.UTC)
+    claim_predicates = []
+    if bundle.claim_job_id is not None:
+        point = session.info.get("sutradhara_commit_point")
+        claim_predicates = [
+            Bundle.claim_job_id == (None if point is None else point._job_id),
+            Bundle.claim_job_attempt == (None if point is None else point._attempt),
+        ]
     result = cast(
         CursorResult[Any],
         session.execute(
@@ -577,6 +607,7 @@ def close_bundle(session: Session, bundle: Bundle, *, claim_token: str) -> Bundl
                 Bundle.id == bundle.id,
                 Bundle.status == "flushing",
                 Bundle.claimed_by == claim_token,
+                *claim_predicates,
             )
             .values(status="sealed", sealed_at=sealed_at)
         ),

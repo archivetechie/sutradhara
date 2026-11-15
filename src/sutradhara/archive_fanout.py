@@ -20,6 +20,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -28,7 +29,9 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
 from sqlalchemy import event, func, select, update
-from sqlalchemy.orm import Session, noload
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, noload, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from sutradhara.archive_bundle import (
     claim_bundle_for_flush,
@@ -45,19 +48,42 @@ from sutradhara.archive_restore import (
     read_member_bytes,
 )
 from sutradhara.arrangement import SourceMapEntry, render_source_map
-from sutradhara.backend.port import BackendError, ByteRange, VerifyResult
+from sutradhara.backend.port import (
+    BackendError,
+    BackendStoredCorruptError,
+    ByteRange,
+    CopyRecord,
+    VerifyResult,
+)
+from sutradhara.bundle_copy_ledger import (
+    BUNDLE_COPY_FAST_PATH_KEY,
+    identity_attempts,
+    record_attempt,
+    resolve_identity,
+)
 from sutradhara.catalog.copies import add_bundle_copy
 from sutradhara.catalog.models import (
     ArtifactClassPolicyRecord,
+    AssetLocator,
     Bundle,
+    BundleCopyWriteAttempt,
+    BundleCopyWriteResolution,
     BundleMember,
     Copy,
     StagingTransform,
     SubmissionMember,
 )
 from sutradhara.catalog.types import CopyHealth, CopySource
-from sutradhara.evidence_recorder import record_measured, record_unmeasured_promotion
+from sutradhara.evidence_recorder import (
+    record_backend_attested_corrupt,
+    record_measured,
+    record_unmeasured_promotion,
+)
 from sutradhara.hdcache.fill import enqueue_post_flush_hdcache_fills
+from sutradhara.jobs.attempts import default_worker_id
+from sutradhara.jobs.commit_point import commit_point_for
+from sutradhara.jobs.engine import AttemptBoundaryError, AttemptSuperseded, is_sqlite_lock_error
+from sutradhara.jobs.models import ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
     CONDITION_BLOCKED,
@@ -65,6 +91,7 @@ from sutradhara.jobs.reconcilers.conditions import (
     record_condition,
     record_observation,
 )
+from sutradhara.jobs.registry import ConditionProjection
 from sutradhara.jobs.runtime_observations import report_tape_locator
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry, assert_key_epoch_domain
 from sutradhara.rem_archive_cli import (
@@ -83,7 +110,293 @@ from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 from sutradhara.structured_logs import emit_structured_event
 
 LOGGER = logging.getLogger(__name__)
-_BUNDLE_COPY_FAST_PATH_KEY = "sutradhara_bundle_copy_fast_path"
+
+
+def _copy_run(session: Session) -> tuple[str, int | None, int | None, str]:
+    """Keep one evidence execution token for this job attempt or command."""
+    point = commit_point_for(session)
+    issued_by = default_worker_id()
+    if point._job_id is not None:
+        return f"job{point._job_id}a{point._attempt}", point._job_id, point._attempt, issued_by
+    run = session.info.setdefault("bundle_copy_command_run", f"cli-{issued_by}-{time.time_ns()}")
+    return run, None, None, issued_by
+
+
+def _copy_problem(
+    pool_id: str, reason: str, detail: str, *, blocked: bool = False
+) -> ConditionProjection:
+    """Describe one pool outcome without recording a reconciliation condition."""
+    return ConditionProjection(
+        condition=CONDITION_BLOCKED if blocked else CONDITION_BACKOFF,
+        reason=reason,
+        message=f"pool {pool_id}: {reason}: {detail}",
+    )
+
+
+def _remember_copy_problem(
+    session: Session, bundle_id: str, pool_id: str, problem: ConditionProjection | None
+) -> None:
+    """Carry per-pool outcomes to the flush or repair's single final projection."""
+    session.info.setdefault("bundle_copy_problems", {})[(bundle_id, pool_id)] = problem
+
+
+def _reset_copy_problems(session: Session, bundle_id: str) -> None:
+    """A replay derives fresh outcomes rather than retaining rolled-back work."""
+    session.info["bundle_copy_problems"] = {
+        key: value
+        for key, value in session.info.get("bundle_copy_problems", {}).items()
+        if key[0] != bundle_id
+    }
+
+
+def _project_copy_problems(
+    session: Session, bundle_id: str
+) -> tuple[ConditionProjection | None, tuple[str, ...]]:
+    """Combine this run and every identity's ledger using the fixed precedence."""
+    problems = {
+        pool: value
+        for (bundle, pool), value in session.info.get("bundle_copy_problems", {}).items()
+        if bundle == bundle_id and value is not None
+    }
+    cleared_pools = {
+        pool
+        for (bundle, pool), value in session.info.get("bundle_copy_problems", {}).items()
+        if bundle == bundle_id and value is None
+    }
+    pool_ids = session.scalars(
+        select(BundleCopyWriteAttempt.pool_id)
+        .where(
+            BundleCopyWriteAttempt.bundle_id == bundle_id, BundleCopyWriteAttempt.generation == 0
+        )
+        .distinct()
+    )
+    prior = session.scalar(
+        select(ReconciliationCondition).where(
+            ReconciliationCondition.domain == "bundle_copy",
+            ReconciliationCondition.target_key == bundle_id,
+        )
+    )
+    for pool_id in pool_ids:
+        outcomes = [
+            outcome
+            for _, outcome in identity_attempts(
+                session, bundle_id=bundle_id, pool_id=pool_id, generation=0
+            )
+        ]
+        if "conflict" in outcomes:
+            problems[pool_id] = _copy_problem(
+                pool_id,
+                "copy-identity-conflict",
+                "pool identity conflicts with the ledger",
+                blocked=True,
+            )
+        elif None in outcomes and pool_id not in problems:
+            reason = "write-unresolved"
+            blocked = False
+            if prior is not None and prior.reason in {"write-unresolved", "write-outcome-unknown"}:
+                reason = prior.reason
+                blocked = prior.condition == CONDITION_BLOCKED
+            problems[pool_id] = _copy_problem(
+                pool_id, reason, "write attempt remains unresolved", blocked=blocked
+            )
+        elif (
+            outcomes
+            and all(outcome == "not-landed" for outcome in outcomes)
+            and pool_id not in problems
+            and pool_id not in cleared_pools
+        ):
+            problems[pool_id] = _copy_problem(
+                pool_id, "transient-backend-failure", "no attempt landed"
+            )
+    if not problems:
+        return None, ()
+    precedence = {
+        CONDITION_BLOCKED: (
+            "copy-identity-conflict",
+            "copy-rewrite-needs-generation",
+            "write-outcome-unknown",
+            "post-write-pool-failure",
+        ),
+        CONDITION_BACKOFF: (
+            "write-outcome-unknown",
+            "write-unresolved",
+            "transient-backend-failure",
+        ),
+    }
+    winner = min(
+        problems.values(),
+        key=lambda value: (
+            value.condition != CONDITION_BLOCKED,
+            precedence[value.condition].index(value.reason),
+        ),
+    )
+    return ConditionProjection(
+        condition=winner.condition,
+        reason=winner.reason,
+        message="; ".join(problems[pool].message for pool in sorted(problems)),
+    ), tuple(sorted(problems))
+
+
+def _artifact_layout(artifact: BuildArtifact) -> dict[str, Any]:
+    """Freeze the complete member and blob-root layout in the write ledger."""
+    return {
+        "members": [
+            dict(
+                logical_asset_hash=member.logical_asset_hash.hex(),
+                member_path=member.member_path,
+                size_bytes=member.size_bytes,
+                file_sha256=member.file_sha256.hex(),
+                native_locator=dict(member.native_locator),
+                ingest_item_id=member.ingest_item_id,
+            )
+            for member in artifact.members
+        ],
+        "blob_roots": [
+            dict(root_path=root.root_path, native_locator=dict(root.native_locator))
+            for root in artifact.blob_roots
+        ],
+    }
+
+
+def _artifact_from_attempt(attempt: BundleCopyWriteAttempt, work_dir: Path) -> BuildArtifact:
+    """Prepare an immutable read/record layout before entering a media window."""
+    return BuildArtifact(
+        artifact_path=work_dir / attempt.object_name,
+        stored_digest=attempt.digest,
+        members=tuple(
+            BuiltMember(
+                logical_asset_hash=bytes.fromhex(value["logical_asset_hash"]),
+                member_path=value["member_path"],
+                size_bytes=value["size_bytes"],
+                file_sha256=bytes.fromhex(value["file_sha256"]),
+                native_locator=dict(value["native_locator"]),
+                ingest_item_id=value.get("ingest_item_id"),
+            )
+            for value in attempt.member_layout["members"]
+        ),
+        blob_roots=tuple(
+            BuiltBlobRoot(
+                root_path=value["root_path"], native_locator=dict(value["native_locator"])
+            )
+            for value in attempt.member_layout["blob_roots"]
+        ),
+        recipient_epochs=tuple(attempt.recipient_epochs or ()),
+    )
+
+
+def _artifact_from_copy(session: Session, copy: Copy, work_dir: Path) -> BuildArtifact:
+    """Snapshot a copy's own member locators for repair's read-back."""
+    members = {
+        member.member_path: member
+        for member in session.scalars(
+            select(BundleMember).where(BundleMember.bundle_id == copy.bundle_id)
+        )
+    }
+    locators = list(session.scalars(select(AssetLocator).where(AssetLocator.copy_id == copy.id)))
+    return BuildArtifact(
+        artifact_path=work_dir / "existing-copy",
+        stored_digest=copy.integrity_hash,
+        members=tuple(
+            BuiltMember(
+                logical_asset_hash=locator.logical_asset_hash,
+                member_path=locator.member_path,
+                size_bytes=members[locator.member_path].size_bytes,
+                file_sha256=members[locator.member_path].file_sha256,
+                native_locator=dict(locator.native_locator),
+            )
+            for locator in locators
+        ),
+        recipient_epochs=tuple(copy.storage_metadata.get("recipient_epochs", ())),
+    )
+
+
+def _read_copy_result(
+    *,
+    backend: WritableStorageBackend,
+    locator: dict[str, Any],
+    artifact: BuildArtifact,
+    representation: str,
+    metadata: Mapping[str, Any],
+    builder: ArchiveBuilder,
+    work_dir: Path,
+) -> tuple[VerifyResult | None, Exception | None]:
+    """Collect read-back evidence while preserving worker control flow."""
+    view = _ReadCopyView(native_locator=dict(locator), storage_metadata=dict(metadata))
+    try:
+        return _verify_members_from_copy(
+            backend=backend,
+            copy_locator=view.native_locator,
+            members=artifact.members,
+            representation=Representation(representation),
+            storage_metadata=view.storage_metadata,
+            builder=builder,
+            work_dir=work_dir,
+        ), None
+    except Exception as exc:
+        if isinstance(exc, (AttemptSuperseded, AttemptBoundaryError)) or is_sqlite_lock_error(exc):
+            raise
+        return None, exc
+
+
+def _record_existing_copy_result(
+    session: Session, copy: Copy, result: VerifyResult | None, error: Exception | None, *, run: str
+) -> None:
+    """Apply measured, trust-only or corrupt evidence under the supplied execution token."""
+    execution_id = f"{copy.bundle_id}:{copy.pool_id}:{copy.native_locator_key}:{run}"
+    if isinstance(error, BackendStoredCorruptError):
+        record_backend_attested_corrupt(
+            session, copy, detail=str(error), source="fanout", execution_id=execution_id
+        )
+    elif error is not None:
+        copy.health = CopyHealth.SUSPECT
+    elif result is not None:
+        if result.measured and result.actual_hash is not None:
+            record_measured(session, copy, result, source="fanout", execution_id=execution_id)
+        elif result.ok:
+            record_unmeasured_promotion(
+                session, copy, result, source="fanout", execution_id=execution_id
+            )
+        else:
+            copy.health = CopyHealth.SUSPECT
+
+
+def _record_copy_result(
+    session: Session,
+    *,
+    bundle_id: str,
+    target: PoolTarget,
+    record: CopyRecord,
+    artifact: BuildArtifact,
+    result: VerifyResult | None,
+    error: Exception | None,
+    run: str,
+) -> Copy:
+    """Adopt the located object, reusing locator/root rows when it already exists."""
+    report_tape_locator(record.native_locator)
+    copy, created = add_bundle_copy(
+        session,
+        bundle_id=bundle_id,
+        backend_id=target.backend_id,
+        pool_id=target.pool_id,
+        native_locator=record.native_locator,
+        integrity_hash=artifact.stored_digest,
+        source=CopySource.INGEST,
+        health=CopyHealth.OK,
+        storage_metadata=_copy_storage_metadata(
+            target.representation,
+            recipient_epochs=artifact.recipient_epochs,
+            stored_size_bytes=record.size_bytes,
+        ),
+    )
+    if created:
+        bundle = session.get(Bundle, bundle_id)
+        if bundle is None:
+            raise RuntimeError(f"copy recording lost bundle {bundle_id!r}")
+        _record_build_locators_and_roots(
+            session, bundle=bundle, target=target, copy_id=copy.id, artifact=artifact
+        )
+    _record_existing_copy_result(session, copy, result, error, run=run)
+    return copy
 
 
 class ArchiveFanoutError(Exception):
@@ -135,17 +448,7 @@ class TransientPoolFanoutError(BackendError, ArchiveFanoutError):
 
 
 class PoolWriteFailure(ArchiveFanoutError):
-    """A target pool failed **after** its bytes reached media, non-transiently.
-
-    The readback verify refused the object, or a post-write catalog step
-    rejected it. Distinct from ``TransientPoolFanoutError`` in both directions:
-    it is not retried on a backoff (a tape append is unreclaimable, so an
-    automatic retry appends a *second* object rather than replacing the first),
-    and it does not abort the flush — the design's "post-write failures seal
-    partial rather than roll back" applies to every post-write failure, not
-    only the retryable ones. Raising it out of the fan-out would roll back the
-    sibling targets whose copies are already on media.
-    """
+    """A blocked target outcome, carried to the flush's final projection."""
 
     def __init__(self, pool_id: str, backend_name: str, cause: BaseException) -> None:
         self.pool_id = pool_id
@@ -605,6 +908,97 @@ def flush_bundle(
     manifest_signer: ManifestSigner | None = None,
     tape_capacity_bytes: int | None = None,
 ) -> FanoutResult:
+    """Commit each I/O boundary and clean up this flush's own failed claim.
+
+    The entry window preserves the caller's preceding work. Later failures
+    roll back only the current step, then durably release a committed claim.
+    Worker control-flow exceptions retain the claim for its owner to resume.
+    A resumed flush adopts previously attempted targets without rebuilding
+    them, so it emits no customer manifest and records no build exclusions for
+    those targets.
+    """
+    point = commit_point_for(session)
+    with point.window():
+        pass
+    _reset_copy_problems(session, bundle_id)
+    claim_state: dict[str, Any] = {}
+    try:
+        return _flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends=backends,
+            builder=builder,
+            key_epoch=key_epoch,
+            deliverables_dir=deliverables_dir,
+            manifest_signer=manifest_signer,
+            tape_capacity_bytes=tape_capacity_bytes,
+            claim_state=claim_state,
+        )
+    except Exception as exc:
+        if isinstance(exc, (AttemptSuperseded, AttemptBoundaryError)) or is_sqlite_lock_error(exc):
+            raise
+        point.rollback_to_step()
+        if claim_state:
+            bundle = session.get(Bundle, bundle_id)
+            if (
+                bundle is not None
+                and bundle.status == "flushing"
+                and bundle.claimed_by == claim_state["token"]
+            ):
+                _unclaim_failed_flush(session, bundle, claim_state)
+                with point.window():
+                    pass
+        raise
+
+
+def _unclaim_failed_flush(session: Session, bundle: Bundle, prior: Mapping[str, Any]) -> None:
+    """Restore a pre-attempt claim without colliding with a new accumulator."""
+    if (
+        session.scalar(
+            select(BundleCopyWriteAttempt.id)
+            .where(BundleCopyWriteAttempt.bundle_id == bundle.id)
+            .limit(1)
+        )
+        is not None
+    ):
+        bundle.claimed_by = None
+        bundle.claim_job_id = None
+        bundle.claim_job_attempt = None
+        session.flush()
+        return
+    other_accumulator = session.scalar(
+        select(Bundle.id)
+        .where(
+            Bundle.id != bundle.id,
+            Bundle.bundle_group == bundle.bundle_group,
+            Bundle.status == "open",
+            Bundle.archive_id.is_(None),
+        )
+        .limit(1)
+    )
+    bundle.status = "open"
+    bundle.claimed_by = None
+    bundle.claim_job_id = None
+    bundle.claim_job_attempt = None
+    bundle.scan_summary = prior["scan_summary"]
+    if prior["archive_id"] is not None or other_accumulator is None:
+        bundle.archive_id = prior["archive_id"]
+        bundle.flushed_at = prior["flushed_at"]
+    session.flush()
+
+
+def _flush_bundle(
+    session: Session,
+    *,
+    bundle_id: str,
+    backends: Mapping[int, WritableStorageBackend],
+    builder: ArchiveBuilder,
+    key_epoch: str | None,
+    deliverables_dir: Path | str | None,
+    manifest_signer: ManifestSigner | None,
+    tape_capacity_bytes: int | None,
+    claim_state: dict[str, Any],
+) -> FanoutResult:
     """Flush one open bundle, build each pool copy, and record catalog state.
 
     Every flush renders its build map from the bundle's own member rows (the
@@ -633,7 +1027,7 @@ def flush_bundle(
         .unique()
         .one()
     )
-    if bundle.status != "open":
+    if bundle.status not in {"open", "flushing"}:
         raise ArchiveFanoutError(f"bundle {bundle.id!r} is not open")
     if bundle.member_count == 0:
         raise ArchiveFanoutError(f"bundle {bundle.id!r} has no members")
@@ -686,10 +1080,15 @@ def flush_bundle(
         )
         # The claim comes FIRST, ahead of the member load: round 3 showed a
         # claim taken after the snapshot lets an appender slip a member into a
-        # sealing bundle, silently unmaterialised. Everything from here to the
-        # first physical write is one transaction (the caller's), so a
-        # pre-write failure rolls back and the rollback IS the un-claim.
+        # sealing bundle, silently unmaterialised. Claim and snapshot commit
+        # together at the build window; flush_bundle owns failure cleanup.
+        prior_claim = dict(
+            archive_id=bundle.archive_id,
+            flushed_at=bundle.flushed_at,
+            scan_summary=bundle.scan_summary,
+        )
         claim_token = claim_bundle_for_flush(session, bundle)
+        claim_state.update(prior_claim, token=claim_token)
         if bundle.archive_id is None:
             bundle.archive_id = f"archive-{bundle.id}"
         # The claim is taken; ``bundle.members`` may now be loaded normally.
@@ -705,6 +1104,9 @@ def flush_bundle(
         while True:
             member_rows = _member_rows_for_flush(session, bundle)
             if not member_rows:
+                _unclaim_failed_flush(session, bundle, claim_state)
+                with commit_point_for(session).window():
+                    pass
                 raise ArchiveFanoutError(
                     f"bundle {bundle.id!r} has no members left to flush; all were quarantined"
                 )
@@ -752,8 +1154,8 @@ def flush_bundle(
                 }
                 (
                     copy_ids,
-                    transient_failures,
-                    write_failures,
+                    _transient_failures,
+                    _write_failures,
                     manifest_receipt,
                 ) = _fan_out_targets(
                     session,
@@ -770,6 +1172,17 @@ def flush_bundle(
                     manifest_signer=manifest_signer,
                 )
             except _MemberBuildFailure as failure:
+                if (
+                    session.scalar(
+                        select(BundleCopyWriteAttempt.id)
+                        .where(BundleCopyWriteAttempt.bundle_id == bundle_id)
+                        .limit(1)
+                    )
+                    is not None
+                ):
+                    raise ArchiveFanoutError(
+                        f"cannot quarantine a member after a write attempt: {failure.message}"
+                    ) from failure
                 attempt += 1
                 if attempt > max_attempts:  # pragma: no cover - structural bound
                     raise ArchiveFanoutError(
@@ -786,36 +1199,45 @@ def flush_bundle(
             break
 
     close_bundle(session, bundle, claim_token=claim_token)
-    condition_message: str | None = None
-    condition_reason: str | None = None
-    if transient_failures:
-        condition_message = _record_bundle_copy_transient_backoff(
+    projection, failed_pools = _project_copy_problems(session, bundle_id)
+    condition_message = None if projection is None else projection.message
+    condition_reason = None if projection is None else projection.reason
+    if projection is not None:
+        record_observation(
             session,
-            bundle.id,
-            transient_failures,
+            domain="bundle_copy",
+            target_key=bundle_id,
+            desired=True,
+            observed_state=OBSERVED_MISSING,
+            reason=projection.reason,
+            message=projection.message,
         )
-        condition_reason = "transient-backend-failure"
-    if write_failures:
-        # Recorded second, deliberately: a post-write failure blocks where a
-        # transient one backs off, and the more severe verdict must own the
-        # condition row. Bytes on media that failed their own check are a
-        # human's call, not a retry timer's.
-        condition_message = _record_bundle_copy_write_failure(
+        record_condition(
             session,
-            bundle.id,
-            write_failures,
+            domain="bundle_copy",
+            target_key=bundle_id,
+            condition=projection.condition,
+            reason=projection.reason,
+            message=projection.message,
         )
-        condition_reason = "post-write-pool-failure"
-    if not transient_failures and not write_failures:
+        if _write_failures:
+            emit_structured_event(
+                "bundle_copy_post_write_failure",
+                bundle_id=bundle_id,
+                pools=[failure.pool_id for failure in _write_failures],
+                message=(projection.message or "")[:500],
+            )
+    else:
         _record_bundle_copy_outbox(session, bundle.id)
     _schedule_bundle_copy_fast_path(session, bundle.id)
+    set_committed_value(bundle, "members", _current_bundle_members(session, bundle_id))
     enqueue_post_flush_hdcache_fills(session, bundle.id)
     return FanoutResult(
         bundle.id,
         tuple(copy_ids),
         manifest_receipt,
-        partial=bool(transient_failures or write_failures),
-        failed_pools=tuple(failure.pool_id for failure in (*transient_failures, *write_failures)),
+        partial=projection is not None,
+        failed_pools=failed_pools,
         condition_reason=condition_reason,
         condition_message=condition_message,
     )
@@ -1157,119 +1579,167 @@ def _fan_out_targets(
     per target for the life of the flush (each target owns a subdirectory) and
     ``_preflight_flush_work_dir`` already reserves ``bundle x targets``.
 
-    It also removes a stated limitation: a member-attributable build failure
-    used to propagate instead of quarantining once any copy existed, because a
-    retry would have rebuilt the written targets. No copy exists during the
-    build phase, so every member failure now reaches the quarantine loop.
-
-    In the write phase **no** failure propagates, transient or not. Design §4's
-    "post-write failures seal partial rather than roll back" is a statement
-    about physics, not about error taxonomy: once ``write_object_to_pool``
-    returns, a tape append is unreclaimable, so an exception that escaped here
-    would undo the *sibling* targets whose bytes are already on media too. The
-    two failure lists carry the verdicts back out, and the flush seals what it
-    placed.
+    Resume resolves previous attempts first and builds only untouched targets.
+    A member failure permits quarantine only before any attempt exists.
+    Ordinary write failures become per-pool outcomes; worker control errors
+    propagate. The flush seals placed copies and projects the whole ledger.
     """
     prepared: list[tuple[WritableStorageBackend, PoolTarget, Path, BuildArtifact]] = []
-    for index, (backend, target) in enumerate(targets):
-        # §8 work-dir hygiene: two same-representation pool targets used to
-        # collide on the work-dir artifact filename; every target now owns a
-        # subdirectory, so artifact filenames are per-target.
-        target_dir = work_dir / f"target-{index:02d}-{_pool_slug(target.pool_id)}"
-        target_dir.mkdir(exist_ok=True)
-        try:
-            artifact = _build_for_target(
-                bundle=bundle,
-                members=members,
-                target=target,
-                builder=builder,
-                key_epoch=key_epoch,
-                work_dir=target_dir,
-                map_path=map_path,
-                source_root=_MAP_SOURCE_ROOT,
-                map_sha256=map_sha256,
-            )
-        except RuntimeError as exc:
-            member_row = _identify_member_failure(str(exc), member_rows)
-            if member_row is not None:
-                # The quarantine-re-render-retry loop in flush_bundle handles
-                # this. Nothing is on media yet, so every attributable member
-                # failure can be quarantined and retried.
-                raise _MemberBuildFailure(member_row, str(exc)) from exc
-            raise
-        validate_built_members(target, artifact, members)
-        prepared.append((backend, target, target_dir, artifact))
-
-    copy_ids: list[int] = []
-    transient_failures: list[TransientPoolFanoutError] = []
+    point = commit_point_for(session)
+    bundle_id = bundle.id
+    fresh_targets = []
+    resolved_copy_ids = []
     write_failures: list[PoolWriteFailure] = []
+    for index, (backend, target) in enumerate(targets):
+        attempts = identity_attempts(
+            session, bundle_id=bundle_id, pool_id=target.pool_id, generation=0
+        )
+        if not attempts:
+            fresh_targets.append((backend, target))
+            continue
+        resolved_copy = None
+        problem = None
+        needs_resolution = any(outcome is None for _, outcome in attempts)
+        if needs_resolution:
+            target_dir = work_dir / f"resolve-{index:02d}-{_pool_slug(target.pool_id)}"
+            target_dir.mkdir(exist_ok=True)
+            resolved_copy, problem, may_rebuild = resolve_identity(
+                session,
+                bundle_id=bundle_id,
+                target=target,
+                backend=backend,
+                builder=builder,
+                work_dir=target_dir,
+            )
+            if may_rebuild:
+                problem = _copy_problem(
+                    target.pool_id,
+                    "post-write-pool-failure",
+                    "existing copy failed read-back and requires repair",
+                    blocked=True,
+                )
+        else:
+            landed = [row for row, outcome in attempts if outcome == "landed"]
+            if landed:
+                copy_id = session.scalars(
+                    select(BundleCopyWriteResolution.copy_id).where(
+                        BundleCopyWriteResolution.attempt_id == landed[-1].id,
+                        BundleCopyWriteResolution.outcome == "landed",
+                    )
+                ).one()
+                resolved_copy = session.get(Copy, copy_id)
+                if resolved_copy is None:
+                    raise RuntimeError(f"landed attempt {landed[-1].id} has no copy")
+                if resolved_copy.health != CopyHealth.OK:
+                    problem = _copy_problem(
+                        target.pool_id,
+                        "post-write-pool-failure",
+                        f"landed copy {resolved_copy.id} is {resolved_copy.health}",
+                        blocked=True,
+                    )
+        if needs_resolution or resolved_copy is not None:
+            _remember_copy_problem(session, bundle_id, target.pool_id, problem)
+        if resolved_copy is not None:
+            resolved_copy_ids.append(resolved_copy.id)
+        if problem is not None and problem.reason == "post-write-pool-failure":
+            write_failures.append(
+                PoolWriteFailure(
+                    target.pool_id, target.backend_name, ArchiveFanoutError(problem.message)
+                )
+            )
+    # The transient value preserves the builder interface without lazy loads.
+    build_bundle = Bundle(id=bundle.id)
+    try:
+        with point.window():
+            for index, (backend, target) in enumerate(fresh_targets):
+                target_dir = work_dir / f"target-{index:02d}-{_pool_slug(target.pool_id)}"
+                target_dir.mkdir(exist_ok=True)
+                artifact = _build_for_target(
+                    bundle=build_bundle,
+                    members=members,
+                    target=target,
+                    builder=builder,
+                    key_epoch=key_epoch,
+                    work_dir=target_dir,
+                    map_path=map_path,
+                    source_root=_MAP_SOURCE_ROOT,
+                    map_sha256=map_sha256,
+                )
+                validate_built_members(target, artifact, members)
+                prepared.append((backend, target, target_dir, artifact))
+    except (AttemptSuperseded, AttemptBoundaryError):
+        raise
+    except RuntimeError as exc:
+        member_row = _identify_member_failure(str(exc), member_rows)
+        if member_row is not None:
+            raise _MemberBuildFailure(member_row, str(exc)) from exc
+        raise
+
+    copy_ids: list[int] = resolved_copy_ids
+    transient_failures: list[TransientPoolFanoutError] = []
     manifest_receipt: str | None = None
     for backend, target, target_dir, artifact in prepared:
-        # Each target owns a savepoint so retryable backend failures do not
-        # erase catalog rows for earlier successful placements.
         copy: Copy | None = None
         try:
-            with session.begin_nested():
-                try:
-                    copy = write_bundle_copy_for_pool(
-                        session,
-                        bundle=bundle,
-                        target=target,
-                        artifact=artifact,
-                        builder=builder,
-                        backend=backend,
-                        work_dir=target_dir,
-                    )
-                except TransientPoolFanoutError:
-                    # Retryable: let it out of the savepoint, which discards
-                    # this target's rows so the copy outbox can re-place it.
-                    raise
-                except ArchiveFanoutError as exc:
-                    # Post-write by construction: the first line of
-                    # `write_bundle_copy_for_pool` is the physical write, so
-                    # everything that raises out of it happened after the bytes
-                    # were committed to media. Caught INSIDE the savepoint so
-                    # the SUSPECT copy row and the measurement evidence survive
-                    # — the same handling `jobs/handlers/bundle_repair.py` gives
-                    # this failure, and the reason is preservation, not
-                    # symmetry: discarding the row would leave an unrecorded
-                    # object on unreclaimable media and let a later repair
-                    # append a second one.
-                    write_failures.append(
-                        PoolWriteFailure(target.pool_id, target.backend_name, exc)
-                    )
-                else:
-                    # Member grain (§5): class and ruleset come from the
-                    # matching member row, not from a representative-class hop.
-                    _record_build_exclusions(
-                        session,
-                        bundle=bundle,
-                        artifact=artifact,
-                    )
+            copy = write_bundle_copy_for_pool(
+                session,
+                bundle=bundle,
+                target=target,
+                artifact=artifact,
+                builder=builder,
+                backend=backend,
+                work_dir=target_dir,
+            )
         except TransientPoolFanoutError as exc:
             transient_failures.append(exc)
             continue
-        if copy is None:
-            continue
-        copy_ids.append(copy.id)
-        if (
-            deliverables_dir is not None
-            and artifact.manifest_path is not None
-            and manifest_receipt is None
-            and Representation(target.representation)
-            in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}
-        ):
-            manifest_receipt = str(
-                # Member grain (§5): the receipt carries per-member classes as
-                # a `member_classes` roll-up, not one bundle-level class.
-                emit_customer_manifest(
-                    bundle=bundle,
-                    manifest_path=artifact.manifest_path,
-                    destination_dir=Path(deliverables_dir),
-                    signer=manifest_signer,
-                )
+        except PoolWriteFailure as exc:
+            write_failures.append(exc)
+        except ArchiveFanoutError as exc:
+            _remember_copy_problem(
+                session,
+                bundle_id,
+                target.pool_id,
+                _copy_problem(target.pool_id, "post-write-pool-failure", str(exc), blocked=True),
             )
-            bundle.customer_manifest_path = manifest_receipt
+            write_failures.append(PoolWriteFailure(target.pool_id, target.backend_name, exc))
+        except Exception as exc:
+            if isinstance(
+                exc, (AttemptSuperseded, AttemptBoundaryError, IntegrityError)
+            ) or is_sqlite_lock_error(exc):
+                raise
+            _remember_copy_problem(
+                session,
+                bundle_id,
+                target.pool_id,
+                _copy_problem(target.pool_id, "write-unresolved", str(exc)),
+            )
+            transient_failures.append(
+                TransientPoolFanoutError(target.pool_id, target.backend_name, exc)
+            )
+        else:
+            copy_ids.append(copy.id)
+            with session.begin_nested():
+                _record_build_exclusions(session, bundle=bundle, artifact=artifact)
+                if (
+                    deliverables_dir is not None
+                    and artifact.manifest_path is not None
+                    and manifest_receipt is None
+                    and Representation(target.representation)
+                    in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}
+                ):
+                    set_committed_value(
+                        bundle, "members", _current_bundle_members(session, bundle_id)
+                    )
+                    manifest_receipt = str(
+                        emit_customer_manifest(
+                            bundle=bundle,
+                            manifest_path=artifact.manifest_path,
+                            destination_dir=Path(deliverables_dir),
+                            signer=manifest_signer,
+                        )
+                    )
+                    bundle.customer_manifest_path = manifest_receipt
     return copy_ids, transient_failures, write_failures, manifest_receipt
 
 
@@ -1398,77 +1868,8 @@ def _record_bundle_copy_outbox(session: Session, bundle_id: str) -> None:
     )
 
 
-def _record_bundle_copy_transient_backoff(
-    session: Session,
-    bundle_id: str,
-    failures: Sequence[TransientPoolFanoutError],
-) -> str:
-    detail = "; ".join(f"pool {failure.pool_id}: {failure.cause}" for failure in failures)
-    message = (
-        f"bundle {bundle_id} sealed with partial fan-out; transient backend failure for {detail}"
-    )
-    record_observation(
-        session,
-        domain="bundle_copy",
-        target_key=bundle_id,
-        desired=True,
-        observed_state=OBSERVED_MISSING,
-        reason="transient-backend-failure",
-        message=message,
-    )
-    record_condition(
-        session,
-        domain="bundle_copy",
-        target_key=bundle_id,
-        condition=CONDITION_BACKOFF,
-        reason="transient-backend-failure",
-        message=message,
-    )
-    return message
-
-
-def _record_bundle_copy_write_failure(
-    session: Session,
-    bundle_id: str,
-    failures: Sequence[PoolWriteFailure],
-) -> str:
-    """Alarm on pools whose bytes reached media and then failed their check.
-
-    ``CONDITION_BLOCKED``, not ``CONDITION_BACKOFF``: the write is not known to
-    have failed — it is known to have *landed and not verified*, and on tape
-    that is unreclaimable. An automatic retry would append a second object; a
-    human decides whether to re-place, re-verify, or condemn the media.
-    """
-    detail = "; ".join(f"pool {failure.pool_id}: {failure.cause}" for failure in failures)
-    message = f"bundle {bundle_id} sealed with partial fan-out; post-write failure for {detail}"
-    record_observation(
-        session,
-        domain="bundle_copy",
-        target_key=bundle_id,
-        desired=True,
-        observed_state=OBSERVED_MISSING,
-        reason="post-write-pool-failure",
-        message=message,
-    )
-    record_condition(
-        session,
-        domain="bundle_copy",
-        target_key=bundle_id,
-        condition=CONDITION_BLOCKED,
-        reason="post-write-pool-failure",
-        message=message,
-    )
-    emit_structured_event(
-        "bundle_copy_post_write_failure",
-        bundle_id=bundle_id,
-        pools=[failure.pool_id for failure in failures],
-        message=message[:500],
-    )
-    return message
-
-
 def _schedule_bundle_copy_fast_path(session: Session, bundle_id: str) -> None:
-    pending = session.info.setdefault(_BUNDLE_COPY_FAST_PATH_KEY, set())
+    pending = session.info.setdefault(BUNDLE_COPY_FAST_PATH_KEY, set())
     pending.add(bundle_id)
 
 
@@ -1478,7 +1879,7 @@ def _run_bundle_copy_fast_path(session: Session) -> None:
         return
     if session.in_nested_transaction():
         return
-    bundle_ids = session.info.pop(_BUNDLE_COPY_FAST_PATH_KEY, set())
+    bundle_ids = session.info.pop(BUNDLE_COPY_FAST_PATH_KEY, set())
     if not bundle_ids:
         return
     try:
@@ -1526,6 +1927,8 @@ def build_bundle_copy_for_pool(
     (bundle repair) get the same guarantee from the composition here.
     """
 
+    point = commit_point_for(session)
+    build_bundle = Bundle(id=bundle.id)
     if map_path is None:
         ordered = sorted(member_sources, key=lambda member: member.member_path)
         map_text = _render_flush_map(session, ordered)
@@ -1535,23 +1938,24 @@ def build_bundle_copy_for_pool(
         map_sha256 = hashlib.sha256(map_bytes).hexdigest()
         source_root = _MAP_SOURCE_ROOT
         member_sources = ordered
-    artifact = _build_for_target(
-        bundle=bundle,
-        members=member_sources,
-        target=target,
-        builder=builder,
-        key_epoch=key_epoch,
-        work_dir=work_dir,
-        # The map route retires build-time rules entirely: `--map` conflicts
-        # with `--rules`, and the member-grain scan already ran at enqueue
-        # under each class's own ruleset. No bundle-level ruleset is derived
-        # here — there is no honest one for a multi-class group bundle.
-        ruleset="",
-        map_path=map_path,
-        source_root=source_root,
-        map_sha256=map_sha256,
-    )
-    validate_built_members(target, artifact, member_sources)
+    with point.window():
+        artifact = _build_for_target(
+            bundle=build_bundle,
+            members=member_sources,
+            target=target,
+            builder=builder,
+            key_epoch=key_epoch,
+            work_dir=work_dir,
+            # The map route retires build-time rules entirely: `--map` conflicts
+            # with `--rules`, and the member-grain scan already ran at enqueue
+            # under each class's own ruleset. No bundle-level ruleset is derived
+            # here — there is no honest one for a multi-class group bundle.
+            ruleset="",
+            map_path=map_path,
+            source_root=source_root,
+            map_sha256=map_sha256,
+        )
+        validate_built_members(target, artifact, member_sources)
     return write_bundle_copy_for_pool(
         session,
         bundle=bundle,
@@ -1573,83 +1977,46 @@ def write_bundle_copy_for_pool(
     backend: WritableStorageBackend,
     work_dir: Path,
 ) -> Copy:
-    """Write one already-built, already-validated artifact and record its copy.
-
-    The first line of this function is the flush's first physical write. Every
-    identity check the design places "before any physical write" has run by the
-    time control reaches here; everything after it is post-write, where a
-    rollback would orphan media (a tape append is unreclaimable and costs a
-    bootstrap row) and the flush therefore seals partial instead.
-    """
-    try:
-        committed_record = backend.write_object_to_pool(
-            artifact.artifact_path,
-            target.pool_id,
-            content_sha256=artifact.stored_digest,
+    """Record an attempt, commit it, then write or resolve within one window."""
+    commit_point_for(session)
+    bundle_id = bundle.id
+    _, job_id, job_attempt, issued_by = _copy_run(session)
+    with session.begin_nested():
+        attempt = record_attempt(
+            session,
+            bundle_id=bundle_id,
+            pool_id=target.pool_id,
+            backend_id=target.backend_id,
+            generation=0,
+            object_name=artifact.artifact_path.name,
+            digest=artifact.stored_digest,
+            size_bytes=artifact.artifact_path.stat().st_size,
+            member_layout=_artifact_layout(artifact),
+            recipient_epochs=list(artifact.recipient_epochs),
+            job_id=job_id,
+            job_attempt=job_attempt,
+            issued_by=issued_by,
         )
-    except (BackendError, OSError) as exc:
-        raise TransientPoolFanoutError(target.pool_id, target.backend_name, exc) from exc
-    report_tape_locator(committed_record.native_locator)
-    storage_metadata = _copy_storage_metadata(
-        target.representation,
-        recipient_epochs=artifact.recipient_epochs,
-        stored_size_bytes=committed_record.size_bytes,
-    )
-    copy, _ = add_bundle_copy(
+    copy, problem, _ = resolve_identity(
         session,
-        bundle_id=bundle.id,
-        backend_id=target.backend_id,
-        pool_id=target.pool_id,
-        native_locator=committed_record.native_locator,
-        integrity_hash=artifact.stored_digest,
-        source=CopySource.INGEST,
-        health=CopyHealth.OK,
-        storage_metadata=storage_metadata,
-    )
-    _record_build_locators_and_roots(
-        session,
-        bundle=bundle,
+        bundle_id=bundle_id,
         target=target,
-        copy_id=copy.id,
-        artifact=artifact,
+        backend=backend,
+        builder=builder,
+        work_dir=work_dir,
+        write_artifact=artifact,
+        write_attempt_id=attempt.id,
     )
-    try:
-        verify_result = _verify_members_from_copy(
-            backend=backend,
-            copy_locator=copy.native_locator,
-            members=artifact.members,
-            representation=Representation(target.representation),
-            storage_metadata=storage_metadata,
-            builder=builder,
-            work_dir=work_dir,
+    _remember_copy_problem(session, bundle_id, target.pool_id, problem)
+    if problem is not None:
+        cause = ArchiveFanoutError(problem.message)
+        if problem.condition == CONDITION_BLOCKED:
+            raise PoolWriteFailure(target.pool_id, target.backend_name, cause)
+        raise TransientPoolFanoutError(target.pool_id, target.backend_name, cause)
+    if copy is None:
+        raise RuntimeError(
+            f"write resolution for pool {target.pool_id!r} returned no copy or problem"
         )
-    except (BackendError, OSError) as exc:
-        copy.health = CopyHealth.SUSPECT
-        raise TransientPoolFanoutError(target.pool_id, target.backend_name, exc) from exc
-    except Exception:
-        copy.health = CopyHealth.SUSPECT
-        raise
-    execution_id = f"{bundle.id}:{target.pool_id}:{copy.native_locator_key}"
-    if verify_result.measured and verify_result.actual_hash is not None:
-        record_measured(
-            session,
-            copy,
-            verify_result,
-            source="fanout",
-            execution_id=execution_id,
-        )
-    elif verify_result.ok:
-        record_unmeasured_promotion(
-            session,
-            copy,
-            verify_result,
-            source="fanout",
-            execution_id=execution_id,
-        )
-    else:
-        copy.health = CopyHealth.SUSPECT
-    if not verify_result.ok:
-        raise ArchiveFanoutError(f"backend verify failed: {verify_result.detail}")
     return copy
 
 
@@ -1689,6 +2056,19 @@ def emit_customer_manifest(
     destination.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
     bundle.archive_id = archive_id
     return destination
+
+
+def _current_bundle_members(session: Session, bundle_id: str) -> list[BundleMember]:
+    """Read current membership and transforms between windows, ignoring sticky noload."""
+    return list(
+        session.scalars(
+            select(BundleMember)
+            .where(BundleMember.bundle_id == bundle_id)
+            .options(selectinload(BundleMember.transforms))
+            .execution_options(populate_existing=True)
+            .order_by(BundleMember.member_path, BundleMember.id)
+        )
+    )
 
 
 def _customer_manifest_members(bundle: Bundle) -> list[dict[str, Any]]:
@@ -1911,8 +2291,9 @@ def _record_build_exclusions(
     recoverable from the build artifact, and P2's enqueue-time scan keys
     these by (class, root) scan identity instead.
     """
-    members_by_path = {member.member_path: member for member in bundle.members}
-    classes = sorted({member.artifactclass for member in bundle.members})
+    members = _current_bundle_members(session, bundle.id)
+    members_by_path = {member.member_path: member for member in members}
+    classes = sorted({member.artifactclass for member in members})
     sole_class = classes[0] if len(classes) == 1 else None
     rulesets: dict[str, str | None] = {}
 

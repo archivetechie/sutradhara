@@ -487,9 +487,11 @@ def _invoke_handler_in_savepoint(
             if inspect(instance).persistent:
                 merged_objects.add(session.merge(instance, load=False))
         session.info["handler_merged_objects"] = merged_objects
-        pending = handler_session.info.pop("sutradhara_bundle_copy_fast_path", set())
+        from sutradhara.bundle_copy_ledger import BUNDLE_COPY_FAST_PATH_KEY
+
+        pending = handler_session.info.pop(BUNDLE_COPY_FAST_PATH_KEY, set())
         if pending:
-            session.info.setdefault("sutradhara_bundle_copy_fast_path", set()).update(pending)
+            session.info.setdefault(BUNDLE_COPY_FAST_PATH_KEY, set()).update(pending)
         return result
     finally:
         point._detach()
