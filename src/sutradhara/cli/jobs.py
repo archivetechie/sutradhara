@@ -14,6 +14,7 @@ from sutradhara.catalog.session import database_url, make_engine, session_scope
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
 from sutradhara.jobs.config import parse_pool_overrides
 from sutradhara.jobs.engine import (
+    AttemptSuperseded,
     _begin_immediate,
     reset_orphaned_running_jobs,
     run_one,
@@ -195,7 +196,7 @@ def jobs_run(job_id: int | None, limit: int) -> None:
     except WorkerAlreadyRunning as e:
         click.echo(f"error: {e}; lock={e.lockfile}", err=True)
         sys.exit(2)
-    except (HandlerNotRegistered, ValueError) as e:
+    except (AttemptSuperseded, HandlerNotRegistered, ValueError) as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(2)
 

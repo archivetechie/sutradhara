@@ -87,7 +87,7 @@ def handle_verify(ctx: JobContext) -> JobResult:
                     "actual_hash": None,
                     "detail": str(exc),
                 },
-                "copy_health_after": copy.health.value,
+                "copy_health_after": str(copy.health),
             },
         )
     ctx.observe(
@@ -135,7 +135,7 @@ def handle_verify(ctx: JobContext) -> JobResult:
                 ),
                 "detail": result.detail,
             },
-            "copy_health_after": copy.health.value,
+            "copy_health_after": str(copy.health),
         },
     )
 

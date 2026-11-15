@@ -46,6 +46,7 @@ from sutradhara.hdcache.models import RestoreRequest, RestoreRequestItem
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
 from sutradhara.jobs.config import RetryPolicy, WorkerConfig
 from sutradhara.jobs.engine import (
+    AttemptSuperseded,
     claim_job_by_id,
     claim_pending,
     reset_orphaned_running_jobs,
@@ -1430,6 +1431,22 @@ def test_jobs_run_missing_id_exits_nonzero_without_traceback(
     result = _run_cli(["jobs", "run", "--id", "999"], expect_exit=2)
     assert "no job with id=999" in result.output
     assert "Traceback" not in result.output
+
+
+def test_jobs_run_superseded_attempt_exits_two_with_message(
+    cli_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI reports an attempt superseded by another process as an operator error."""
+    from sutradhara.jobs import registry
+
+    def superseded(ctx: JobContext) -> JobResult:
+        raise AttemptSuperseded("superseded proof")
+
+    monkeypatch.setitem(registry._HANDLERS, "_test_superseded", superseded)
+    _run_cli(["db", "init"])
+    _run_cli(["jobs", "submit", "_test_superseded"])
+    result = _run_cli(["jobs", "run", "--id", "1"], expect_exit=2)
+    assert "error: superseded proof" in result.stderr
 
 
 def test_jobs_run_terminal_id_exits_nonzero_without_traceback(

@@ -459,6 +459,46 @@ def test_self_heal_raises_when_no_healthy_source_remains(engine: Engine) -> None
         )
 
 
+def test_self_heal_reports_loaded_suspect_copy_health(engine: Engine) -> None:
+    """A catalogue-loaded suspect source reports its health when repair is unavailable."""
+    asset_hash = _add_asset(engine, b"suspect survivor")
+    backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
+    backend = _backend()
+    record = backend.put_object("o-copy-1-pool", b"suspect survivor")
+
+    with session_scope(engine) as s:
+        copy, _ = add_copy(
+            s,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            pool_id="o-copy-1-pool",
+            native_locator=record.native_locator,
+            integrity_hash=record.integrity_hash,
+            source=CopySource.INGEST,
+            health=CopyHealth.SUSPECT,
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
+        )
+        copy_id = copy.id
+
+    with session_scope(engine) as s:
+        loaded = s.get(Copy, copy_id)
+        assert loaded is not None
+        assert type(loaded.health) is str
+        assert loaded.health == "suspect"
+        with pytest.raises(SelfHealUnavailable, match=f"copy id={copy_id}: health=suspect"):
+            self_heal(
+                s,
+                asset_hash,
+                "o-archive",
+                backends={backend_id: backend},
+                key_epoch=ARCHIVE_EPOCH,
+                opener=_FakeOpener(),
+                sealer=_FakeSealer(),
+                execution_id="self-heal:suspect-source",
+            )
+
+
 def test_self_heal_rebuilds_missing_encrypted_copy_from_survivor(
     engine: Engine,
 ) -> None:

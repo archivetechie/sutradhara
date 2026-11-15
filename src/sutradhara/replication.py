@@ -448,7 +448,7 @@ def self_heal(
     errors: list[str] = []
     for source in candidates:
         if source.health != CopyHealth.OK:
-            errors.append(f"copy id={source.id}: health={source.health.value}")
+            errors.append(f"copy id={source.id}: health={source.health}")
             continue
         source_backend = backends.get(source.backend_id)
         if source_backend is None:
