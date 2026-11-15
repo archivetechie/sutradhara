@@ -375,12 +375,14 @@ class PageToken(_message.Message):
     def __init__(self, value: _Optional[bytes] = ...) -> None: ...
 
 class ReleaseTapeIoFenceRequest(_message.Message):
-    __slots__ = ("quarantine_id", "acknowledgment")
+    __slots__ = ("quarantine_id", "acknowledgment", "force")
     QUARANTINE_ID_FIELD_NUMBER: _ClassVar[int]
     ACKNOWLEDGMENT_FIELD_NUMBER: _ClassVar[int]
+    FORCE_FIELD_NUMBER: _ClassVar[int]
     quarantine_id: str
     acknowledgment: str
-    def __init__(self, quarantine_id: _Optional[str] = ..., acknowledgment: _Optional[str] = ...) -> None: ...
+    force: bool
+    def __init__(self, quarantine_id: _Optional[str] = ..., acknowledgment: _Optional[str] = ..., force: _Optional[bool] = ...) -> None: ...
 
 class TapeIoFence(_message.Message):
     __slots__ = ("quarantine_id", "tape_uuid", "barcode", "endpoint_key", "reason", "state", "created_at_utc", "updated_at_utc", "release_ack", "evidence_json", "fence_id")
@@ -1007,7 +1009,7 @@ class DriveAssignment(_message.Message):
     def __init__(self, library_serial: _Optional[str] = ..., bay: _Optional[int] = ..., drive_uuid: _Optional[bytes] = ..., state: _Optional[_Union[DriveAssignment.State, str]] = ..., current_session_id: _Optional[bytes] = ..., loaded_tape_uuid: _Optional[bytes] = ...) -> None: ...
 
 class GetLiveStatusResponse(_message.Message):
-    __slots__ = ("libraries", "operations", "alarms", "snapshot_at_utc", "daemon_epoch", "drive_assignments", "active_tape_io_fence_count", "active_tape_io_fences", "closeout_debt")
+    __slots__ = ("libraries", "operations", "alarms", "snapshot_at_utc", "daemon_epoch", "drive_assignments", "active_tape_io_fence_count", "active_tape_io_fences", "closeout_debt", "library_authority_health")
     LIBRARIES_FIELD_NUMBER: _ClassVar[int]
     OPERATIONS_FIELD_NUMBER: _ClassVar[int]
     ALARMS_FIELD_NUMBER: _ClassVar[int]
@@ -1017,6 +1019,7 @@ class GetLiveStatusResponse(_message.Message):
     ACTIVE_TAPE_IO_FENCE_COUNT_FIELD_NUMBER: _ClassVar[int]
     ACTIVE_TAPE_IO_FENCES_FIELD_NUMBER: _ClassVar[int]
     CLOSEOUT_DEBT_FIELD_NUMBER: _ClassVar[int]
+    LIBRARY_AUTHORITY_HEALTH_FIELD_NUMBER: _ClassVar[int]
     libraries: _containers.RepeatedCompositeFieldContainer[LibraryState]
     operations: _containers.RepeatedCompositeFieldContainer[OperationRef]
     alarms: _containers.RepeatedCompositeFieldContainer[Alarm]
@@ -1026,7 +1029,8 @@ class GetLiveStatusResponse(_message.Message):
     active_tape_io_fence_count: int
     active_tape_io_fences: _containers.RepeatedCompositeFieldContainer[TapeIoFence]
     closeout_debt: _containers.RepeatedCompositeFieldContainer[Tape]
-    def __init__(self, libraries: _Optional[_Iterable[_Union[LibraryState, _Mapping]]] = ..., operations: _Optional[_Iterable[_Union[OperationRef, _Mapping]]] = ..., alarms: _Optional[_Iterable[_Union[Alarm, _Mapping]]] = ..., snapshot_at_utc: _Optional[str] = ..., daemon_epoch: _Optional[int] = ..., drive_assignments: _Optional[_Iterable[_Union[DriveAssignment, _Mapping]]] = ..., active_tape_io_fence_count: _Optional[int] = ..., active_tape_io_fences: _Optional[_Iterable[_Union[TapeIoFence, _Mapping]]] = ..., closeout_debt: _Optional[_Iterable[_Union[Tape, _Mapping]]] = ...) -> None: ...
+    library_authority_health: ComponentHealth
+    def __init__(self, libraries: _Optional[_Iterable[_Union[LibraryState, _Mapping]]] = ..., operations: _Optional[_Iterable[_Union[OperationRef, _Mapping]]] = ..., alarms: _Optional[_Iterable[_Union[Alarm, _Mapping]]] = ..., snapshot_at_utc: _Optional[str] = ..., daemon_epoch: _Optional[int] = ..., drive_assignments: _Optional[_Iterable[_Union[DriveAssignment, _Mapping]]] = ..., active_tape_io_fence_count: _Optional[int] = ..., active_tape_io_fences: _Optional[_Iterable[_Union[TapeIoFence, _Mapping]]] = ..., closeout_debt: _Optional[_Iterable[_Union[Tape, _Mapping]]] = ..., library_authority_health: _Optional[_Union[ComponentHealth, _Mapping]] = ...) -> None: ...
 
 class Slot(_message.Message):
     __slots__ = ("element_address", "voltag", "tape_uuid")

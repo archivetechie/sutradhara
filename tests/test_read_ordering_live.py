@@ -4,7 +4,7 @@ Spawns a **read-only rem-daemon** over a seeded temp state dir — the
 scenario-RO seeding precedent: calibration state goes through the durable
 stores the daemon itself replays (the calibration control journal before
 start, the wrap-map SQLite projection after start), and catalog rows
-(tapes / objects / object_copies / tape_files) are inserted directly into
+(tapes / objects / object_instances / tape_files) are inserted directly into
 the index, which the serve path re-opens read-only per request. No drive,
 no mount, no tape motion — the planner is a pure function of the request
 and the cached wrap map.
@@ -214,9 +214,9 @@ tape_catalog_dir = "{self.state}/cache/tapes"
                 (str(OBJECT_ID), "caller-1", b"\x01" * 32, now),
             )
             conn.execute(
-                "insert into object_copies(object_id, tape_uuid, tape_file_number,"
-                " first_body_lba, status, representation, pool_id)"
-                " values(?, ?, ?, ?, 'committed', 'plaintext', 'pool-a')",
+                "insert into object_instances(object_id, tape_uuid, tape_file_number,"
+                " first_body_lba, status, representation)"
+                " values(?, ?, ?, ?, 'committed', 'plaintext')",
                 (
                     str(OBJECT_ID),
                     bytes.fromhex(TAPE_CAL),
@@ -242,9 +242,9 @@ tape_catalog_dir = "{self.state}/cache/tapes"
                 (str(UNSPANNED_OBJECT_ID), "caller-2", b"\x02" * 32, now),
             )
             conn.execute(
-                "insert into object_copies(object_id, tape_uuid, tape_file_number,"
-                " first_body_lba, status, representation, pool_id)"
-                " values(?, ?, ?, ?, 'committed', 'plaintext', 'pool-a')",
+                "insert into object_instances(object_id, tape_uuid, tape_file_number,"
+                " first_body_lba, status, representation)"
+                " values(?, ?, ?, ?, 'committed', 'plaintext')",
                 (
                     str(UNSPANNED_OBJECT_ID),
                     bytes.fromhex(TAPE_CAL),

@@ -20,8 +20,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: archivetechie/remanence
-          # pin: remanence main after verification as a cancellable operation and its record
-          ref: 9d19ec672769b9cf821d52cd6dc5438a980f5ae5
+          # pin: remanence main after the step-4 rebuild merge
+          ref: 08857a6c5d0c6e2f69386cddc5d4e01046dbba73
           path: .ci/remanence
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:

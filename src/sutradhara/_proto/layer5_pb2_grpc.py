@@ -104,7 +104,9 @@ class DaemonServicer:
         raise NotImplementedError('Method not implemented!')
 
     def CancelOperation(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """An accepted manual finalization refuses cancellation durably and answers
+        RUNNING while its durable operation is open, even after a stopped attempt.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -505,7 +507,10 @@ class LibraryServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def AnnotateDrive(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """AnnotateDrive, RetireDrive and ReinstateDrive are refused after input checks:
+        DriveStewardshipDeferred: drive annotate, retire and reinstate are not recorded
+        by the library log yet; the drive was not changed.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -1556,9 +1561,8 @@ class CatalogServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ReconcileTape(self, request, context):
-        """Reconciliation: ask the daemon to (re-)read a tape's catalog and emit
-        a fresh enumeration that bypasses the SQLite cache. Slow; intended for
-        periodic scrub or after suspected drift.
+        """Refused with ReconcileTapeDeferred: reconciling a tape from a physical scan
+        is deferred; no tape was loaded or scanned. Changes nothing.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -1569,17 +1573,31 @@ class CatalogServicer:
         boundary. This is valid below the pool low watermark and bypasses only
         that automatic trigger; all fit, fence, ownership, and format checks stay
         mandatory. An accepted request can never reopen the tape for Objects.
-        The operation describes one attempt; TapeFinalization describes durable intent.
-        A stopped worker publishes FAILED with a retry summary while intent remains
-        FINALIZING and detail carries that summary. The same idempotency key resumes
-        under the same operation id; retry and startup recovery publish RUNNING.
+        The durable operation stays open across stopped attempts. A stopped worker
+        publishes live FAILED with a summary while intent remains FINALIZING; detail
+        carries that summary. The daemon retries when a drive is ready; the same key
+        follows or resumes the accepted finalization. A new key fails with
+        ALREADY_EXISTS while its intent is pending. Matching live or successful
+        retries return the existing operation. Cancellation after acceptance is
+        refused durably. A tail write failure or an unproved tail leaves completion
+        unknown and needs operator recovery. Its intent remains pending: that terminal
+        head refuses same-key retries with FAILED_PRECONDITION and ClosedOperationRetry,
+        and a new key fails with ALREADY_EXISTS while the intent is pending.
+        Transient motion faults after a bay reservation count toward the existing
+        close-out three-attempt media budget; contention does not consume it.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def CloseoutTape(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Sealed tapes fail immediately with FAILED_PRECONDITION ("tape is sealed"),
+        except matching retries of live or successful operations, which return the
+        existing operation. An operation that ended without success is final under
+        its key: repeating it fails with FAILED_PRECONDITION and ClosedOperationRetry:
+        this closeout operation has ended; a new operation is required for further
+        physical work. A new key starts a new operation.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
