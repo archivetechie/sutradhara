@@ -149,3 +149,81 @@ class _FakeS3Client:
         self.objects.pop((Bucket, Key), None)
         self.metadata.pop((Bucket, Key), None)
         self.extra_args.pop((Bucket, Key), None)
+
+
+def test_s3_pool_lookup_prefix_once_and_metadata(tmp_path, monkeypatch):
+    """T8/M9: upload and head share one prefixed key and preserve the native locator."""
+    client = _FakeS3Client()
+    backend = S3Backend("s3", bucket="bucket", prefix="/prefix/", client=client)
+    source = tmp_path / "artifact.rem"
+    source.write_bytes(b"stored")
+    written = backend.write_object_to_pool(source, "/pool/")
+    assert list(client.objects) == [("bucket", "prefix/pool/artifact.rem")]
+    heads = []
+    original = client.head_object
+
+    def head(**kwargs):
+        heads.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(client, "head_object", head)
+    found = backend.lookup_pool_object("/pool/", source.name, candidate_digests=[])
+    assert heads == [{"Bucket": "bucket", "Key": "prefix/pool/artifact.rem"}]
+    assert found.copy_record == written
+    assert found.content_hash == hashlib.sha256(b"stored").digest()
+    client.metadata[("bucket", "prefix/pool/artifact.rem")]["logical_sha256"] = "00" * 32
+    assert (
+        backend.lookup_pool_object("pool", source.name, candidate_digests=[]).content_hash
+        == found.content_hash
+    )
+    assert backend.reissue_after_absent is True
+    assert backend.holds_names is False
+    assert backend.lookup_pool_object("pool", "absent", candidate_digests=[]) is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"ResponseMetadata": {"HTTPStatusCode": 404}},
+        {"Error": {"Code": "404"}},
+        {"Error": {"Code": "NoSuchKey"}},
+        {"Error": {"Code": "NotFound"}},
+        {"ResponseMetadata": {"HTTPStatusCode": 503}},
+    ],
+)
+def test_s3_pool_lookup_head_errors(monkeypatch, response):
+    """T8: deletion-equivalent 404 handling, with other failures unavailable."""
+    from sutradhara.backend.port import BackendUnavailableError
+
+    class HeadError(Exception):
+        pass
+
+    client = _FakeS3Client()
+    error = HeadError()
+    error.response = response
+
+    def head(**kwargs):
+        raise error
+
+    monkeypatch.setattr(client, "head_object", head)
+    backend = S3Backend("s3", bucket="bucket", client=client)
+    if response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 503:
+        with pytest.raises(BackendUnavailableError):
+            backend.lookup_pool_object("pool", "name", candidate_digests=[])
+    else:
+        assert backend.lookup_pool_object("pool", "name", candidate_digests=[]) is None
+
+
+@pytest.mark.parametrize(
+    "metadata", [{}, {"sha256": ""}, {"sha256": "no-hex"}, {"sha256": "00"}, {"sha256": None}]
+)
+def test_s3_pool_lookup_requires_valid_stored_hash(monkeypatch, metadata):
+    from sutradhara.backend.port import BackendUnavailableError
+
+    client = _FakeS3Client()
+    monkeypatch.setattr(
+        client, "head_object", lambda **kwargs: {"Metadata": metadata, "ContentLength": 7}
+    )
+    backend = S3Backend("s3", bucket="bucket", client=client)
+    with pytest.raises(BackendUnavailableError):
+        backend.lookup_pool_object("pool", "name", candidate_digests=[])

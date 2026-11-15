@@ -60,8 +60,25 @@ class SelfHealUnavailable(ReplicationError):
     """A missing copy cannot be rebuilt from the available healthy copies."""
 
 
+@dataclass(frozen=True)
+class PoolObject:
+    """A pool's committed object, carrying the write path's native locator."""
+
+    copy_record: CopyRecord
+    content_hash: bytes | None
+
+
 class WritableStorageBackend(StorageBackend, Protocol):
     """Storage backend surface needed by the fan-out writer."""
+
+    reissue_after_absent: bool
+    holds_names: bool
+
+    def lookup_pool_object(
+        self, pool: str, object_name: str, *, candidate_digests: Sequence[bytes]
+    ) -> PoolObject | None:
+        """Return committed pool identity, None for absent, or raise if unknowable."""
+        ...
 
     def write_object_to_pool(
         self,

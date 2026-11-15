@@ -229,8 +229,16 @@ class BackendNotFoundError(BackendError):
     """The supplied locator does not address any copy on this backend."""
 
 
+class BackendObjectExistsError(BackendError):
+    """The pool refused a write because it already holds the object's identity."""
+
+
 class BackendUnavailableError(BackendError):
     """The backend itself is unreachable (network, mount, etc.)."""
+
+
+class BackendWriteInDoubtError(BackendUnavailableError):
+    """An identity is live or quarantined; its write outcome is not yet knowable."""
 
 
 class BackendTransientError(BackendUnavailableError):

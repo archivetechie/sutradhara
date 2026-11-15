@@ -811,3 +811,533 @@ def test_transcode_changed_target_is_not_overwritten(boundary_env, tmp_path, mon
         assert target.artifactclass == "other"
         assert session.get(LogicalAsset, seeded.digest).validity == AssetValidity.UNVALIDATED
         assert list(session.scalars(select(AssetDerivation))) == []
+
+
+# RBA-2b1: commit points through the production worker and direct command routes.
+def _commit_point_trace(engine):
+    statements = []
+
+    def trace(connection, cursor, statement, parameters, context, executemany):
+        statements.append((connection, statement))
+
+    event.listen(engine, "before_cursor_execute", trace)
+    return statements
+
+
+def test_commit_point_worker_two_windows_release_writer(boundary_env, monkeypatch):
+    """T1: each window commits progress and lends the writer slot without SQL."""
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, path, config, _events = boundary_env
+    trace = _commit_point_trace(engine)
+    attempt_connections = []
+    windows = []
+
+    def handler(ctx):
+        point = commit_point_for(ctx.session)
+        assert commit_point_for(ctx.session) is point
+        connection = ctx.session.connection()
+        attempt_connections.append(connection)
+        for ordinal in range(2):
+            ctx.session.add(_backend(f"before-{ordinal}"))
+            with point.window():
+                start = len(trace)
+                assert not connection.connection.dbapi_connection.in_transaction
+                with sqlite3.connect(path, timeout=0) as other:
+                    other.execute("BEGIN IMMEDIATE")
+                    assert other.execute(
+                        "SELECT count(*) FROM backend WHERE name = ?", (f"before-{ordinal}",)
+                    ).fetchone() == (1,)
+                    other.execute(
+                        "INSERT INTO backend (name, kind, tier, config, implementation_family, "
+                        "added_at) SELECT ?, kind, tier, config, implementation_family, "
+                        "added_at FROM backend WHERE name = ?",
+                        (f"external-{ordinal}", f"before-{ordinal}"),
+                    )
+                assert len(trace) == start
+            windows.append([sql for conn, sql in trace[start:] if conn is connection])
+            assert windows[-1][0] == "BEGIN IMMEDIATE"
+            assert windows[-1][1].startswith("SAVEPOINT")
+        ctx.session.add(_backend("after"))
+        return JobResult(ok=True)
+
+    _submit_handler(boundary_env, monkeypatch, handler)
+    outcome = JobWorker(engine, config=config).drain()[0]
+    assert outcome.result.ok, outcome.result.detail
+    sql = [sql for conn, sql in trace if conn is attempt_connections[0]]
+    assert sql[0] == "BEGIN"
+    commits = [i for i, statement in enumerate(sql) if statement == "COMMIT"]
+    assert len(commits) == 2
+    for i in commits:
+        assert sql[i - 1].startswith("RELEASE SAVEPOINT")
+        assert sql[i - 2].startswith("RELEASE SAVEPOINT")
+        assert sql[i + 1] == "BEGIN IMMEDIATE"
+        assert sql[i + 2].startswith("SAVEPOINT")
+    with session_scope(engine) as session:
+        assert len(list(session.scalars(select(Backend)))) == 5
+
+
+def test_commit_point_command_initial_rollback_and_window(boundary_env):
+    """T2: SELECT-only installation begins a step; rollback refreshes ORM state."""
+    from sqlalchemy import inspect
+
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, path, _config, _events = boundary_env
+    trace = _commit_point_trace(engine)
+    with session_scope(engine) as session:
+        session.execute(select(Backend))
+        connection = session.connection()
+        assert not connection.connection.dbapi_connection.in_transaction
+        point = commit_point_for(session)
+        assert commit_point_for(session) is point
+        added = _backend("discard")
+        session.add(added)
+        session.flush()
+        point.rollback_to_step()
+        assert inspect(added).detached or inspect(added).transient
+        assert list(session.scalars(select(Backend))) == []
+        session.add(_backend("before"))
+        with point.window():
+            start = len(trace)
+            assert not connection.connection.dbapi_connection.in_transaction
+            with sqlite3.connect(path, timeout=0) as other:
+                other.execute("BEGIN IMMEDIATE")
+                assert other.execute("SELECT name FROM backend").fetchall() == [("before",)]
+            assert len(trace) == start
+        session.add(_backend("after"))
+    sql = [sql for conn, sql in trace if conn is connection]
+    assert sql[1] == "BEGIN IMMEDIATE"
+    assert sql[2].startswith("SAVEPOINT")
+    commit = sql.index("COMMIT")
+    assert sql[commit - 1].startswith("RELEASE SAVEPOINT")
+    assert sql[commit + 1] == "BEGIN IMMEDIATE"
+    assert sql[commit + 2].startswith("SAVEPOINT")
+    with sqlite3.connect(path) as other:
+        assert other.execute("SELECT name FROM backend ORDER BY name").fetchall() == [
+            ("after",),
+            ("before",),
+        ]
+
+
+@pytest.mark.parametrize("failure", ["flush", "statement"])
+def test_commit_point_command_database_error_recovers_step(boundary_env, failure):
+    """F2: a failed ORM step keeps the writer slot and can commit later progress."""
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, path, _config, _events = boundary_env
+    with session_scope(engine) as session:
+        point = commit_point_for(session)
+        connection = session.connection()
+        session.add(_backend("discard"))
+        session.flush()
+        if failure == "flush":
+            session.add(_backend("discard"))
+            with pytest.raises(IntegrityError, match="UNIQUE constraint failed"):
+                session.flush()
+        else:
+            with pytest.raises(IntegrityError, match="UNIQUE constraint failed"):
+                session.execute(
+                    text(
+                        "INSERT INTO backend (name, kind, tier, config, implementation_family, "
+                        "added_at) SELECT name, kind, tier, config, implementation_family, "
+                        "added_at FROM backend WHERE name = 'discard'"
+                    )
+                )
+        point.rollback_to_step()
+        assert session.is_active
+        assert session.connection() is connection
+        assert connection.connection.dbapi_connection.in_transaction
+        with (
+            sqlite3.connect(path, timeout=0) as other,
+            pytest.raises(sqlite3.OperationalError, match="database is locked"),
+        ):
+            other.execute("BEGIN IMMEDIATE")
+        assert list(session.scalars(select(Backend))) == []
+        session.add(_backend("survives"))
+        with point.window(), sqlite3.connect(path, timeout=0) as other:
+            assert other.execute("SELECT name FROM backend").fetchall() == [("survives",)]
+    with sqlite3.connect(path) as other:
+        assert other.execute("SELECT name FROM backend").fetchall() == [("survives",)]
+
+
+def test_commit_point_direct_running_idle_driver(boundary_env, monkeypatch):
+    """T2: releasing the outermost savepoint already commits a direct RUNNING call."""
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, _path, _config, _events = boundary_env
+    trace = _commit_point_trace(engine)
+    observed = []
+
+    def handler(ctx):
+        connection = ctx.session.connection()
+        start = len(trace)
+        with commit_point_for(ctx.session).window():
+            observed.extend(sql for conn, sql in trace[start:] if conn is connection)
+            assert not connection.connection.dbapi_connection.in_transaction
+        return JobResult(ok=True)
+
+    job_id = _submit_handler(boundary_env, monkeypatch, handler)
+    with session_scope(engine) as session:
+        job = session.get(Job, job_id)
+        job.status = JobStatus.RUNNING
+        job.attempts = 4
+    with session_scope(engine) as session:
+        assert not session.connection().connection.dbapi_connection.in_transaction
+        result = run_one(session, job_id)
+        assert result.ok, result.detail
+    assert len(observed) == 2
+    assert all(sql.startswith("RELEASE SAVEPOINT") for sql in observed)
+
+
+def test_commit_point_missing_handler_form_emits_no_sql(boundary_env):
+    """T2: a handler can never silently install the command form."""
+    from sutradhara.jobs.commit_point import CommitPointMissing, commit_point_for
+    from sutradhara.jobs.engine import _HandlerSession
+
+    engine, _path, _config, _events = boundary_env
+    trace = _commit_point_trace(engine)
+    with _HandlerSession(bind=engine) as session, pytest.raises(CommitPointMissing):
+        commit_point_for(session)
+    assert trace == []
+
+
+@pytest.mark.parametrize("route", ["worker", "direct"])
+def test_commit_point_fast_path_after_final_commit(boundary_env, monkeypatch, route):
+    """T4: a window/handler release cannot run the hook before final job COMMIT."""
+    from sutradhara.jobs.commit_point import commit_point_for
+    from sutradhara.jobs.reconcilers import bundle_copy
+
+    engine, _path, config, _events = boundary_env
+    calls = []
+    driver = []
+
+    def refresh(session, bundle_id):
+        assert not driver[0].in_transaction
+        assert session.get_bind() is engine
+        assert session.get(Job, job_id).status == JobStatus.SUCCEEDED
+        calls.append(bundle_id)
+
+    monkeypatch.setattr(bundle_copy, "refresh_condition", refresh)
+
+    def handler(ctx):
+        driver.append(ctx.session.connection().connection.dbapi_connection)
+        ctx.session.info["sutradhara_bundle_copy_fast_path"] = {"bundle-proof"}
+        with commit_point_for(ctx.session).window():
+            assert calls == []
+        assert calls == []
+        return JobResult(ok=True)
+
+    job_id = _submit_handler(boundary_env, monkeypatch, handler)
+    if route == "worker":
+        outcome = JobWorker(engine, config=config).drain()[0]
+        assert outcome.result.ok, outcome.result.detail
+    else:
+        with session_scope(engine) as session:
+            result = run_one(session, job_id)
+            assert result.ok, result.detail
+            assert calls == []
+    assert calls == ["bundle-proof"]
+
+
+@pytest.fixture
+def bundle_copy_fast_path_calls(boundary_env, monkeypatch):
+    """Record production-hook refreshes and an independent writer's availability."""
+    from sutradhara.jobs.reconcilers import bundle_copy
+
+    _engine, path, _config, _events = boundary_env
+    calls = []
+
+    def refresh(session, bundle_id):
+        with sqlite3.connect(path, timeout=0) as other:
+            try:
+                other.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as error:
+                if str(error) != "database is locked":
+                    raise
+                writer_free = False
+            else:
+                writer_free = True
+        calls.append((bundle_id, writer_free))
+
+    monkeypatch.setattr(bundle_copy, "refresh_condition", refresh)
+    return calls
+
+
+def test_commit_point_command_fast_path_after_outermost_commit(
+    boundary_env, bundle_copy_fast_path_calls
+):
+    """G1a: command windows preserve pending refreshes until the root COMMIT."""
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, _path, _config, _events = boundary_env
+    calls = bundle_copy_fast_path_calls
+    with session_scope(engine) as session:
+        point = commit_point_for(session)
+        session.info["sutradhara_bundle_copy_fast_path"] = {"command-proof"}
+        session.add(_backend("command-fast-path"))
+        with point.window():
+            assert calls == []
+        assert calls == []
+        assert session.info["sutradhara_bundle_copy_fast_path"] == {"command-proof"}
+    assert calls == [("command-proof", True)]
+
+
+def test_nested_session_fast_path_after_outermost_commit(boundary_env, bundle_copy_fast_path_calls):
+    """G1b: a non-handler savepoint preserves refreshes until the root COMMIT."""
+    engine, _path, _config, _events = boundary_env
+    calls = bundle_copy_fast_path_calls
+    with session_scope(engine) as session:
+        # A real outer write keeps RELEASE SAVEPOINT from ending SQLite's transaction.
+        session.add(_backend("outer-fast-path"))
+        session.flush()
+        with session.begin_nested():
+            session.info["sutradhara_bundle_copy_fast_path"] = {"nested-proof"}
+            session.add(_backend("nested-fast-path"))
+            assert calls == []
+        assert calls == []
+        assert session.info["sutradhara_bundle_copy_fast_path"] == {"nested-proof"}
+    assert calls == [("nested-proof", True)]
+
+
+def test_commit_point_superseded_preserves_committed_progress(boundary_env, monkeypatch):
+    """T5: another claimant wins, while progress committed before the window survives."""
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, path, config, _events = boundary_env
+
+    def handler(ctx):
+        job_id = ctx.job.id
+        ctx.session.add(_backend("survives"))
+        with commit_point_for(ctx.session).window(), sqlite3.connect(path, timeout=0) as other:
+            other.execute("UPDATE job SET attempts = attempts + 1 WHERE id = ?", (job_id,))
+        pytest.fail("superseded attempt resumed")
+
+    job_id = _submit_handler(boundary_env, monkeypatch, handler)
+    outcome = JobWorker(engine, config=config).drain()[0]
+    assert outcome.result.superseded
+    assert "superseded" in outcome.result.detail
+    with session_scope(engine) as session:
+        assert session.scalars(select(Backend.name)).one() == "survives"
+        assert session.get(Job, job_id).attempts == 2
+        assert list(session.scalars(select(JobAttempt))) == []
+
+
+def test_commit_point_rolled_back_flushed_object_is_not_merged(boundary_env, monkeypatch):
+    """T5c: a transient object from a rolled-back nested savepoint is not merged."""
+    from sqlalchemy import inspect
+
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, _path, config, _events = boundary_env
+
+    def handler(ctx):
+        savepoint = ctx.session.begin_nested()
+        discarded = _backend("discarded")
+        ctx.session.add(discarded)
+        ctx.session.flush()
+        savepoint.rollback()
+        assert inspect(discarded).transient
+        with commit_point_for(ctx.session).window():
+            pass
+        return JobResult(ok=True)
+
+    _submit_handler(boundary_env, monkeypatch, handler)
+    outcome = JobWorker(engine, config=config).drain()[0]
+    assert outcome.result.ok, outcome.result.detail
+    with session_scope(engine) as session:
+        assert list(session.scalars(select(Backend))) == []
+
+
+def test_commit_point_failure_after_window_records_failed(boundary_env, monkeypatch):
+    """T5c: committed progress survives failure and the reopened step records FAILED."""
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, _path, config, _events = boundary_env
+    trace = _commit_point_trace(engine)
+
+    def handler(ctx):
+        ctx.session.add(_backend("survives"))
+        with commit_point_for(ctx.session).window():
+            pass
+        ctx.session.add(_backend("discarded"))
+        ctx.session.flush()
+        raise RuntimeError("after-window failure")
+
+    job_id = _submit_handler(boundary_env, monkeypatch, handler)
+    outcome = JobWorker(engine, config=config).drain()[0]
+    assert not outcome.result.ok
+    assert "after-window failure" in outcome.result.detail
+    assert any(sql == "BEGIN IMMEDIATE" for _conn, sql in trace)
+    with session_scope(engine) as session:
+        assert session.get(Job, job_id).status == JobStatus.FAILED
+        assert session.scalars(select(Backend.name)).one() == "survives"
+        assert session.scalars(select(JobAttempt)).one().outcome == JobStatus.FAILED
+
+
+@pytest.mark.parametrize("written", ["before-window", "after-window"])
+def test_commit_point_failed_attempt_preserves_batch_obligation(boundary_env, monkeypatch, written):
+    """F1: window-committed and later WRITTEN obligations both survive failure."""
+    from sutradhara.jobs.commit_point import commit_point_for
+    from sutradhara.jobs.registry import CHECKPOINT_BATCH_STATE_KEY
+    from sutradhara.jobs.runtime_observations import report_batch_written
+
+    engine, _path, config, _events = boundary_env
+
+    def record():
+        report_batch_written(
+            batch_id="batch-fr1",
+            provisional_ordinal=1,
+            caller_object_id="object-fr1",
+            source="/staging/object-fr1.rem-object",
+        )
+
+    def handler(ctx):
+        if written == "before-window":
+            record()
+        with commit_point_for(ctx.session).window():
+            pass
+        if written == "after-window":
+            record()
+        raise RuntimeError("batch obligation failure")
+
+    job_id = _submit_handler(boundary_env, monkeypatch, handler)
+    outcome = JobWorker(engine, config=config).drain()[0]
+    assert not outcome.result.ok
+    assert "batch obligation failure" in outcome.result.detail
+    with session_scope(engine) as session:
+        job = session.get(Job, job_id)
+        assert job.status == JobStatus.FAILED
+        assert session.scalars(select(JobAttempt)).one().outcome == JobStatus.FAILED
+        assert job.step_state[CHECKPOINT_BATCH_STATE_KEY] == {
+            "batch-fr1": {
+                "objects": [
+                    {
+                        "caller_object_id": "object-fr1",
+                        "provisional_ordinal": 1,
+                        "source": "/staging/object-fr1.rem-object",
+                        "restart_offset": 0,
+                    }
+                ]
+            }
+        }
+
+
+def test_commit_point_worker_rollback_before_first_window(boundary_env, monkeypatch):
+    """F4: the initial job step discards its writes and permits a successful return."""
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, _path, config, _events = boundary_env
+
+    def handler(ctx):
+        ctx.session.add(_backend("discard"))
+        ctx.session.flush()
+        commit_point_for(ctx.session).rollback_to_step()
+        ctx.session.add(_backend("survives"))
+        return JobResult(ok=True)
+
+    job_id = _submit_handler(boundary_env, monkeypatch, handler)
+    outcome = JobWorker(engine, config=config).drain()[0]
+    assert outcome.result.ok, outcome.result.detail
+    with session_scope(engine) as session:
+        assert session.get(Job, job_id).status == JobStatus.SUCCEEDED
+        assert session.scalars(select(JobAttempt)).one().outcome == JobStatus.SUCCEEDED
+        assert list(session.scalars(select(Backend.name))) == ["survives"]
+
+
+@pytest.mark.parametrize("misuse", ["sql", "attach", "dirty", "commit", "exception"])
+def test_commit_point_window_refusal_and_exception_reopen(boundary_env, misuse):
+    """A caught refusal still fails the window; all exits reopen a usable step."""
+    from sutradhara.jobs.commit_point import commit_point_for
+    from sutradhara.jobs.engine import AttemptBoundaryError
+
+    engine, _path, _config, _events = boundary_env
+    with session_scope(engine) as session:
+        point = commit_point_for(session)
+        row = _backend("original")
+        session.add(row)
+        error = RuntimeError if misuse == "exception" else AttemptBoundaryError
+
+        def misuse_window():
+            with point.window():
+                if misuse == "dirty":
+                    row.name = "forbidden"
+                elif misuse == "exception":
+                    raise RuntimeError("backend failed")
+                else:
+                    operation = {
+                        "sql": lambda: session.execute(select(Backend)),
+                        "attach": lambda: session.add(_backend("forbidden")),
+                        "commit": session.commit,
+                    }[misuse]
+                    with pytest.raises(AttemptBoundaryError):
+                        operation()
+
+        with pytest.raises(error):
+            misuse_window()
+        assert session.connection().connection.dbapi_connection.in_transaction
+        assert row.name == "original"
+        session.add(_backend("discard"))
+        session.flush()
+        point.rollback_to_step()
+        assert list(session.scalars(select(Backend.name))) == ["original"]
+
+
+@pytest.mark.parametrize("route", ["command", "worker"])
+def test_commit_point_rollback_restores_deleted_step_objects(boundary_env, monkeypatch, route):
+    """A step rollback restores flushed deletes, edits and added-object identities."""
+    from sqlalchemy import inspect
+
+    from sutradhara.jobs.commit_point import commit_point_for
+
+    engine, _path, config, _events = boundary_env
+    with session_scope(engine) as session:
+        session.add_all([_backend("delete-me"), _backend("edit-me"), _backend("load-later")])
+
+    def exercise(session):
+        rows = {
+            row.name: row
+            for row in session.scalars(select(Backend).where(Backend.name != "load-later"))
+        }
+        point = commit_point_for(session)
+        # In job form the initially loaded rows become this step's baseline
+        # at the first window; command form snapshots them on installation.
+        if route == "worker":
+            with point.window():
+                pass
+        deleted, edited = rows["delete-me"], rows["edit-me"]
+        loaded_later = session.scalars(select(Backend).where(Backend.name == "load-later")).one()
+        loaded_later.name = "also-changed"
+        edited.name = "changed"
+        session.delete(deleted)
+        added = _backend("added")
+        session.add(added)
+        session.flush()
+        if route == "worker":
+            session.commit()  # the handler may release its own joined savepoint
+        point.rollback_to_step()
+        assert inspect(deleted).persistent
+        assert not inspect(deleted).was_deleted
+        assert deleted.name == "delete-me"
+        assert edited.name == "edit-me"
+        assert inspect(loaded_later).persistent
+        assert loaded_later.name == "load-later"
+        assert inspect(added).detached or inspect(added).transient
+        assert sorted(session.scalars(select(Backend.name))) == [
+            "delete-me",
+            "edit-me",
+            "load-later",
+        ]
+
+    if route == "command":
+        with session_scope(engine) as session:
+            exercise(session)
+    else:
+
+        def handler(ctx):
+            exercise(ctx.session)
+            return JobResult(ok=True)
+
+        _submit_handler(boundary_env, monkeypatch, handler)
+        outcome = JobWorker(engine, config=config).drain()[0]
+        assert outcome.result.ok, outcome.result.detail

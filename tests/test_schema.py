@@ -1791,3 +1791,296 @@ def test_retention_journal_backfill_two_cycle_history_targets_by_cycle(
     # Each correction targets its OWN cycle's receipt, by correction identity.
     assert corrections["offsite-revoke:two-cycle:c1"] == receipts[lead_op]
     assert corrections["offsite-revoke:two-cycle:c2"] == (receipts["offsite-confirm:two-cycle:c2"])
+
+
+# RBA-2b1 ledger proofs run against both schema construction routes.
+def _rba_migrate(db_path, revision, *, downgrade=False):
+    env = {**os.environ, "SUTRADHARA_DB_URL": f"sqlite:///{db_path}"}
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade" if downgrade else "upgrade", revision],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _rba_seed_catalog(db_path):
+    """Use base-head columns so populated upgrade and downgrade are both exercised."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(
+            "INSERT INTO backend (id,name,kind,implementation_family,tier,added_at) "
+            "VALUES (1,'ledger-backend','memory','memory','self_describing','2026-11-15')"
+        )
+        conn.execute(
+            "INSERT INTO pool (id,backend_id,representation,location,offsite_gate,tier,"
+            "accepts_writes,retired,created_at) "
+            "VALUES ('ledger-pool',1,'rem-object-v1','',0,'',1,0,'2026-11-15')"
+        )
+        conn.execute(
+            "INSERT INTO bundle (id,bundle_group,group_basis,status,total_bytes,member_count,"
+            "target_bytes,max_age_seconds,opened_at) "
+            "VALUES ('ledger-bundle','ledger-group','{}','sealed',7,1,7,60,'2026-11-15')"
+        )
+        conn.execute(
+            "INSERT INTO copy (id,bundle_id,backend_id,pool_id,native_locator,native_locator_key,"
+            "integrity_hash,health,first_observed_at,source,storage_metadata) "
+            "VALUES (1,'ledger-bundle',1,'ledger-pool','{}','ledger-object',?,'ok',"
+            "'2026-11-15','local_write','{}')",
+            (b"a" * 32,),
+        )
+
+
+@pytest.fixture(params=["migrated", "create_all"])
+def rba_ledger_db(tmp_path, request):
+    from sutradhara.catalog.session import create_all, make_engine, session_scope
+    from sutradhara.jobs.engine import submit
+
+    db_path = tmp_path / "ledger.db"
+    engine = make_engine(f"sqlite:///{db_path}")
+    if request.param == "migrated":
+        _rba_migrate(db_path, "f8b2d4e6a0c1")
+    else:
+        create_all(engine)
+    _rba_seed_catalog(db_path)
+    with session_scope(engine) as session:
+        job_id = submit(session, "_ledger").id
+    yield engine, db_path, job_id
+    engine.dispose()
+
+
+def _rba_attempt(session, **overrides):
+    from sutradhara.bundle_copy_ledger import record_attempt
+
+    values = dict(
+        bundle_id="ledger-bundle",
+        pool_id="ledger-pool",
+        backend_id=1,
+        generation=0,
+        object_name="artifact.rem",
+        digest=b"a" * 32,
+        size_bytes=7,
+        member_layout={"members": [{"member_path": "asset", "size_bytes": 7}], "blob_roots": []},
+    )
+    return record_attempt(session, **{**values, **overrides})
+
+
+def test_bundle_copy_ledger_append_only_and_restrict(rba_ledger_db):
+    """T6: both ledgers refuse UPDATE/DELETE and all their FKs are RESTRICT."""
+    from sqlalchemy import inspect, text
+    from sqlalchemy.exc import IntegrityError
+
+    from sutradhara.bundle_copy_ledger import record_resolution
+    from sutradhara.catalog.models import Backend, Bundle, Copy, Pool
+    from sutradhara.catalog.session import session_scope
+    from sutradhara.jobs.models import Job
+
+    engine, db_path, job_id = rba_ledger_db
+    with session_scope(engine) as session:
+        attempt = _rba_attempt(session, job_id=job_id, job_attempt=1)
+        record_resolution(
+            session,
+            attempt_id=attempt.id,
+            outcome="landed",
+            learned_by="lookup",
+            copy_id=1,
+            job_id=job_id,
+            job_attempt=1,
+        )
+        for table in ("bundle_copy_write_attempt", "bundle_copy_write_resolution"):
+            for sql in (f"UPDATE {table} SET id = id", f"DELETE FROM {table}"):
+                with pytest.raises(IntegrityError, match="append-only"), session.begin_nested():
+                    session.execute(text(sql))
+            assert set(_foreign_key_delete_actions(db_path, table).values()) == {"RESTRICT"}
+        for table in ("bundle", "pool", "backend", "job", "copy"):
+            with pytest.raises(IntegrityError), session.begin_nested():
+                session.execute(text(f"DELETE FROM {table}"))
+        for model in (Bundle, Pool, Backend, Job, Copy):
+            assert not any(
+                relation.mapper.local_table.name.startswith("bundle_copy_write_")
+                for relation in inspect(model).relationships
+            )
+    assert _foreign_key_delete_actions(db_path, "bundle")[("claim_job_id", "job")] == "RESTRICT"
+
+
+def test_bundle_copy_ledger_resolution_transitions(rba_ledger_db):
+    """T6/M7: only lookup/landed may overturn not-landed; terminal facts never change."""
+    from sqlalchemy.exc import IntegrityError
+
+    from sutradhara.bundle_copy_ledger import attempt_outcome, record_resolution
+    from sutradhara.catalog.session import session_scope
+
+    engine, _db_path, _job_id = rba_ledger_db
+    with session_scope(engine) as session:
+        for first in ("landed", "conflict", "not-landed"):
+            attempt = _rba_attempt(session)
+            record_resolution(
+                session,
+                attempt_id=attempt.id,
+                outcome=first,
+                learned_by="write-response",
+                copy_id=1 if first == "landed" else None,
+                observed_hash=b"b" * 32 if first == "conflict" else None,
+            )
+            assert attempt_outcome(session, attempt.id) == first
+            candidates = [
+                ("not-landed", "lookup"),
+                ("conflict", "lookup"),
+                ("landed", "write-response"),
+            ]
+            if first != "not-landed":
+                candidates.append(("landed", "lookup"))
+            for outcome, learned_by in candidates:
+                with (
+                    pytest.raises(IntegrityError, match="resolution transition"),
+                    session.begin_nested(),
+                ):
+                    record_resolution(
+                        session,
+                        attempt_id=attempt.id,
+                        outcome=outcome,
+                        learned_by=learned_by,
+                        copy_id=1 if outcome == "landed" else None,
+                        observed_hash=b"b" * 32 if outcome == "conflict" else None,
+                    )
+            if first == "not-landed":
+                record_resolution(
+                    session, attempt_id=attempt.id, outcome="landed", learned_by="lookup", copy_id=1
+                )
+                assert attempt_outcome(session, attempt.id) == "landed"
+                with (
+                    pytest.raises(IntegrityError, match="resolution transition"),
+                    session.begin_nested(),
+                ):
+                    record_resolution(
+                        session,
+                        attempt_id=attempt.id,
+                        outcome="landed",
+                        learned_by="lookup",
+                        copy_id=1,
+                    )
+
+
+def test_bundle_copy_ledger_checks_on_both_schema_routes(rba_ledger_db):
+    """T6: independent CHECK constraints reject malformed facts and claim pairs."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+
+    from sutradhara.bundle_copy_ledger import record_resolution
+    from sutradhara.catalog.session import session_scope
+
+    engine, _db_path, job_id = rba_ledger_db
+    with session_scope(engine) as session:
+        for invalid in (
+            {"generation": -1},
+            {"size_bytes": -1},
+            {"job_id": job_id},
+            {"job_attempt": 1},
+        ):
+            with pytest.raises(IntegrityError, match="CHECK constraint"), session.begin_nested():
+                _rba_attempt(session, **invalid)
+        attempt = _rba_attempt(session)
+        with pytest.raises(IntegrityError, match="CHECK constraint"), session.begin_nested():
+            session.execute(
+                text(
+                    "INSERT INTO bundle_copy_write_attempt "
+                    "(bundle_id,pool_id,backend_id,generation,object_name,digest_algorithm,digest,"
+                    "size_bytes,member_layout,issued_by,issued_at) "
+                    "SELECT bundle_id,pool_id,backend_id,generation,object_name,'md5',digest,"
+                    "size_bytes,member_layout,issued_by,issued_at FROM bundle_copy_write_attempt"
+                )
+            )
+        for invalid in (
+            {"outcome": "landed"},
+            {"outcome": "conflict"},
+            {"copy_id": 1},
+            {"job_id": job_id},
+            {"job_attempt": 1},
+            {"outcome": "maybe"},
+            {"learned_by": "guess"},
+        ):
+            values = {"attempt_id": attempt.id, "outcome": "not-landed", "learned_by": "lookup"}
+            with pytest.raises(IntegrityError, match="CHECK constraint"), session.begin_nested():
+                record_resolution(session, **{**values, **invalid})
+        for sql in ("claim_job_id = :job", "claim_job_attempt = 1"):
+            with pytest.raises(IntegrityError, match="CHECK constraint"), session.begin_nested():
+                session.execute(text(f"UPDATE bundle SET {sql}"), {"job": job_id})
+        session.execute(
+            text("UPDATE bundle SET claim_job_id = :job, claim_job_attempt = 1"), {"job": job_id}
+        )
+
+
+def test_bundle_copy_ledger_readers_and_caller_transaction(rba_ledger_db):
+    """T6: latest resolution and ordered identity reads, with no writer-side commit."""
+    from sutradhara.bundle_copy_ledger import attempt_outcome, identity_attempts, record_resolution
+    from sutradhara.catalog.session import session_scope
+    from sutradhara.jobs.attempts import default_worker_id
+
+    engine, db_path, _job_id = rba_ledger_db
+    with session_scope(engine) as session:
+        first = _rba_attempt(session)
+        second = _rba_attempt(session)
+        _rba_attempt(session, generation=1)
+        assert first.issued_by == default_worker_id()
+        assert attempt_outcome(session, first.id) is None
+        initial = record_resolution(
+            session, attempt_id=first.id, outcome="not-landed", learned_by="write-response"
+        )
+        latest = record_resolution(
+            session, attempt_id=first.id, outcome="landed", learned_by="lookup", copy_id=1
+        )
+        assert latest.id > initial.id
+        assert latest.resolved_by == default_worker_id()
+        assert attempt_outcome(session, first.id) == "landed"
+        assert [
+            (row.id, outcome)
+            for row, outcome in identity_attempts(
+                session, bundle_id="ledger-bundle", pool_id="ledger-pool", generation=0
+            )
+        ] == [(first.id, "landed"), (second.id, None)]
+        with sqlite3.connect(db_path) as other:
+            assert other.execute("SELECT count(*) FROM bundle_copy_write_attempt").fetchone() == (
+                0,
+            )
+            assert other.execute(
+                "SELECT count(*) FROM bundle_copy_write_resolution"
+            ).fetchone() == (0,)
+    with session_scope(engine) as session:
+        assert attempt_outcome(session, first.id) == "landed"
+
+
+def test_bundle_copy_ledger_migration_populated_round_trip(tmp_path):
+    """T6: populated base -> ledger -> base preserves bundle/copy rows and FK integrity."""
+    from sutradhara.bundle_copy_ledger import record_resolution
+    from sutradhara.catalog.session import make_engine, session_scope
+
+    db_path = tmp_path / "roundtrip.db"
+    _rba_migrate(db_path, "e7a1c3b5d9f2")
+    _rba_seed_catalog(db_path)
+    before = _schema_signatures(db_path)
+    with sqlite3.connect(db_path) as conn:
+        before_bundle = conn.execute("SELECT * FROM bundle").fetchall()
+        before_copy = conn.execute("SELECT * FROM copy").fetchall()
+    _rba_migrate(db_path, "f8b2d4e6a0c1")
+    engine = make_engine(f"sqlite:///{db_path}")
+    with session_scope(engine) as session:
+        attempt = _rba_attempt(session)
+        record_resolution(
+            session, attempt_id=attempt.id, outcome="landed", learned_by="write-response", copy_id=1
+        )
+    engine.dispose()
+    _rba_migrate(db_path, "e7a1c3b5d9f2", downgrade=True)
+    assert _schema_signatures(db_path) == before
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("SELECT * FROM bundle").fetchall() == before_bundle
+        assert conn.execute("SELECT * FROM copy").fetchall() == before_copy
+        assert (
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'trg_bundle_copy_write_%'"
+            ).fetchall()
+            == []
+        )

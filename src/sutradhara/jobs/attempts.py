@@ -1,8 +1,9 @@
 """Append completed job runs to the ``job_attempt`` audit log.
 
 The caller owns the transaction: this module flushes but never commits or rolls
-back. A process crash during a handler commits nothing and therefore records no
-attempt row; orphan recovery resets the live job for a later completed run.
+back. Each commit point is a crash boundary: work before it survives a kill.
+A process crash records no completed attempt row; orphan recovery resets the
+live job for a later completed run.
 """
 
 from __future__ import annotations

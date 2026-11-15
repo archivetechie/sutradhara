@@ -10,16 +10,23 @@ from typing import Any
 import click
 from sqlalchemy import select
 
-from sutradhara.catalog.session import make_engine, session_scope
+from sutradhara.catalog.session import database_url, make_engine, session_scope
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register built-ins
 from sutradhara.jobs.config import parse_pool_overrides
-from sutradhara.jobs.engine import run_one, run_pending, submit
+from sutradhara.jobs.engine import (
+    _begin_immediate,
+    reset_orphaned_running_jobs,
+    run_one,
+    run_pending,
+    submit,
+)
 from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.registry import (
     HandlerNotRegistered,
     JobResult,
     registered_kinds,
 )
+from sutradhara.jobs.worker_lock import WorkerAlreadyRunning, worker_lock
 
 
 @click.group("jobs")
@@ -166,24 +173,31 @@ def jobs_show(job_id: int) -> None:
 )
 def jobs_run(job_id: int | None, limit: int) -> None:
     """Run pending jobs synchronously (or one specific job by --id)."""
-    engine = make_engine()
-    with session_scope(engine) as s:
-        try:
-            if job_id is not None:
-                result = run_one(s, job_id)
-                _emit_result(job_id, result)
-                return
-            results = run_pending(s, limit=limit)
-        except (HandlerNotRegistered, ValueError) as e:
-            click.echo(f"error: {e}", err=True)
-            sys.exit(2)
-
-    if not results:
-        click.echo("(no pending jobs)")
-        return
-
-    for jid, result in results:
-        _emit_result(jid, result)
+    url = database_url()
+    try:
+        with worker_lock(url):
+            engine = make_engine(url)
+            try:
+                with session_scope(engine) as s:
+                    _begin_immediate(s.connection())
+                    reset_orphaned_running_jobs(s)
+                    if job_id is not None:
+                        result = run_one(s, job_id)
+                        _emit_result(job_id, result)
+                        return
+                    results = run_pending(s, limit=limit)
+                if not results:
+                    click.echo("(no pending jobs)")
+                for jid, result in results:
+                    _emit_result(jid, result)
+            finally:
+                engine.dispose()
+    except WorkerAlreadyRunning as e:
+        click.echo(f"error: {e}; lock={e.lockfile}", err=True)
+        sys.exit(2)
+    except (HandlerNotRegistered, ValueError) as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(2)
 
 
 # --- helpers -------------------------------------------------------------

@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sutradhara.backend.port import (
     BackendLocator,
     BackendNotFoundError,
+    BackendUnavailableError,
     ByteRange,
     CopyRecord,
     StreamKind,
@@ -20,9 +21,15 @@ from sutradhara.backend.port import (
 )
 from sutradhara.catalog.types import content_hash
 
+if TYPE_CHECKING:
+    from sutradhara.replication import PoolObject
+
 
 class S3Backend:
     """Thin boto3 adapter for S3-compatible object stores."""
+
+    reissue_after_absent = True
+    holds_names = False
 
     def __init__(
         self,
@@ -86,10 +93,52 @@ class S3Backend:
         content_sha256: bytes | None = None,
     ) -> CopyRecord:
         source_path = Path(source)
-        key = self._join_key(pool.strip("/"), source_path.name)
-        return self.write_object(source_path, key=key, pool=pool)
+        return self._write_object(
+            source_path, final_key=self._pool_key(pool, source_path.name), pool=pool
+        )
+
+    def _pool_key(self, pool: str, object_name: str) -> str:
+        return self._join_key(pool, object_name)
+
+    def lookup_pool_object(
+        self, pool: str, object_name: str, *, candidate_digests: Sequence[bytes]
+    ) -> PoolObject | None:
+        """Head the pool write's exact key; only stored sha256 metadata is evidence."""
+        from sutradhara.replication import PoolObject
+
+        key = self._pool_key(pool, object_name)
+        try:
+            head = self._client.head_object(Bucket=self._bucket, Key=key)
+        except KeyError:
+            return None
+        except Exception as exc:
+            response = getattr(exc, "response", {})
+            status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            code = response.get("Error", {}).get("Code")
+            if status == 404 or code in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise BackendUnavailableError(f"S3 pool lookup failed for {key!r}") from exc
+        try:
+            metadata = dict(head.get("Metadata") or {})
+            digest = content_hash(bytes.fromhex(metadata["sha256"]))
+            size = int(head["ContentLength"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BackendUnavailableError(f"S3 pool object {key!r} has malformed metadata") from exc
+        return PoolObject(
+            CopyRecord(
+                logical_id=digest,
+                native_locator={"bucket": self._bucket, "key": key, "sha256": digest.hex()},
+                integrity_hash=digest,
+                size_bytes=size,
+                metadata=metadata,
+            ),
+            digest,
+        )
 
     def write_object(self, source: Path | str, *, key: str, pool: str | None = None) -> CopyRecord:
+        return self._write_object(source, final_key=self._join_key(key), pool=pool)
+
+    def _write_object(self, source: Path | str, *, final_key: str, pool: str | None) -> CopyRecord:
         source_path = Path(source)
         digest = content_hash(_sha256_file(source_path))
         metadata = {
@@ -101,7 +150,6 @@ class S3Backend:
         extra_args: dict[str, Any] = {"Metadata": metadata}
         if self._storage_class:
             extra_args["StorageClass"] = self._storage_class
-        final_key = self._join_key(key)
         self._client.upload_file(
             str(source_path),
             self._bucket,

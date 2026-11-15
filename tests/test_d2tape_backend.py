@@ -252,3 +252,142 @@ def _calls(path: Path) -> list[dict[str, Any]]:
 
 def _arg_after(args: list[str], flag: str) -> str:
     return args[args.index(flag) + 1]
+
+
+def _lookup_artifact(digest, *, pool="pool", start=2, verified=False):
+    """Complete sidecar entry, including writes not yet verified."""
+    return {
+        "artifact_name": f"n-{digest.hex()[:16]}",
+        "barcode": "D2T002L7",
+        "volume_uuid": "00000000-0000-4000-8000-00000000000f",
+        "start_block": start,
+        "end_block": start + 3,
+        "volume_blocksize": 256000,
+        "archive_blocksize": 512,
+        "pool_id": pool,
+        "logical_id": digest.hex(),
+        "integrity_hash": digest.hex(),
+        "size_bytes": 7,
+        "verified": verified,
+        "hashes": {},
+        "relative_path": "payload.bin",
+    }
+
+
+def _lookup_backend(tmp_path, monkeypatch):
+    """Lookup requires neither a device config nor a Java process."""
+    backend = D2TapeBackend(
+        "d2",
+        jar_path=tmp_path / "unused.jar",
+        java_bin="unused-java",
+        device_env_path=tmp_path / "unused.env",
+        state_dir=tmp_path / "sidecars",
+    )
+
+    def no_jar(*args, **kwargs):
+        pytest.fail("pool lookup invoked the jar")
+
+    monkeypatch.setattr(backend, "_run_d2tape", no_jar)
+    (tmp_path / "sidecars").mkdir()
+    return backend
+
+
+def test_d2_pool_lookup_unverified_pool_filter_and_earliest(tmp_path, monkeypatch):
+    """T10/M10: find unverified entries by digest within the requested pool only."""
+    backend = _lookup_backend(tmp_path, monkeypatch)
+    digest = hashlib.sha256(b"stored bytes").digest()
+    # Another pool's earlier entry must not be chosen, even with the same digest.
+    (tmp_path / "sidecars" / "a.json").write_text(
+        json.dumps(
+            {
+                "artifacts": [
+                    _lookup_artifact(digest, pool="other", start=1),
+                    _lookup_artifact(digest, start=9),
+                    _lookup_artifact(digest, start=20, verified=True),
+                ]
+            }
+        )
+    )
+    (tmp_path / "sidecars" / "b.json").write_text(
+        json.dumps(
+            {
+                "artifacts": [
+                    _lookup_artifact(digest, start=1),
+                ]
+            }
+        )
+    )
+    found = backend.lookup_pool_object("pool", "caller-name-not-stored", candidate_digests=[digest])
+    assert found is not None
+    assert found.copy_record.native_locator["pool_id"] == "pool"
+    assert found.copy_record.native_locator["start_block"] == 9
+    assert found.content_hash == digest
+    assert backend.reissue_after_absent is False
+    assert backend.holds_names is False
+    assert backend.lookup_pool_object("absent-pool", "ignored", candidate_digests=[digest]) is None
+    assert backend.lookup_pool_object("pool", "ignored", candidate_digests=[b"x" * 32]) is None
+
+
+def test_d2_pool_lookup_conflicting_digests_and_empty_candidates(tmp_path, monkeypatch):
+    """T10: two plausible identities or no candidates cannot answer absence."""
+    from sutradhara.backend.port import BackendUnavailableError
+
+    backend = _lookup_backend(tmp_path, monkeypatch)
+    first, second = b"a" * 32, b"b" * 32
+    (tmp_path / "sidecars" / "a.json").write_text(
+        json.dumps({"artifacts": [_lookup_artifact(first)]})
+    )
+    (tmp_path / "sidecars" / "b.json").write_text(
+        json.dumps({"artifacts": [_lookup_artifact(second)]})
+    )
+    with pytest.raises(BackendUnavailableError, match="multiple candidate"):
+        backend.lookup_pool_object("pool", "ignored", candidate_digests=[first, second])
+    with pytest.raises(BackendUnavailableError, match="requires candidate"):
+        backend.lookup_pool_object("pool", "ignored", candidate_digests=[])
+
+
+@pytest.mark.parametrize(
+    "sidecar",
+    ["not-json", "[]", "{}", '{"artifacts":{}}', '{"artifacts":[null]}', '{"artifacts":[{}]}'],
+)
+def test_d2_pool_lookup_malformed_sidecar_is_unavailable(tmp_path, monkeypatch, sidecar):
+    from sutradhara.backend.port import BackendUnavailableError
+
+    backend = _lookup_backend(tmp_path, monkeypatch)
+    # A valid matching entry does not hide a later malformed sidecar.
+    (tmp_path / "sidecars" / "a.json").write_text(
+        json.dumps({"artifacts": [_lookup_artifact(b"a" * 32)]})
+    )
+    (tmp_path / "sidecars" / "z.json").write_text(sidecar)
+    with pytest.raises(BackendUnavailableError):
+        backend.lookup_pool_object("pool", "ignored", candidate_digests=[b"a" * 32])
+
+
+def test_d2_pool_lookup_unreadable_directory_is_unavailable(tmp_path, monkeypatch):
+    """Listing failure cannot be mistaken for absence; a new empty state can."""
+    import os
+
+    from sutradhara.backend.port import BackendUnavailableError
+
+    backend = _lookup_backend(tmp_path, monkeypatch)
+    assert backend.lookup_pool_object("pool", "ignored", candidate_digests=[b"a" * 32]) is None
+    (tmp_path / "sidecars").rmdir()
+    assert backend.lookup_pool_object("pool", "ignored", candidate_digests=[b"a" * 32]) is None
+    (tmp_path / "sidecars").mkdir()
+    original = os.scandir
+    original_listdir = os.listdir
+
+    def refuse_sidecars(path):
+        if Path(path) == tmp_path / "sidecars":
+            raise PermissionError("sidecar directory unreadable")
+        return original(path)
+
+    def refuse_listdir(path):
+        if Path(path) == tmp_path / "sidecars":
+            raise PermissionError("sidecar directory unreadable")
+        return original_listdir(path)
+
+    monkeypatch.setattr(os, "scandir", refuse_sidecars)
+    monkeypatch.setattr(os, "listdir", refuse_listdir)
+    with pytest.raises(BackendUnavailableError):
+        backend.lookup_pool_object("pool", "ignored", candidate_digests=[b"a" * 32])

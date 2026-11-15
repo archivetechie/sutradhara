@@ -334,3 +334,45 @@ def _completed(
     stderr: str = "",
 ) -> CompletedProcess[str]:
     return CompletedProcess(list(argv), returncode, stdout=stdout, stderr=stderr)
+
+
+def test_ssh_pool_lookup_present_absent_and_transport_failure(tmp_path, monkeypatch):
+    """T9: remote size/hash reproduce the write locator; absence and failure differ."""
+    transport = _LocalDirTransport(tmp_path / "remote")
+    backend = SshDiskBackend("ssh", host="unused", root="/unused", transport=transport)
+    source = tmp_path / "artifact.rem"
+    source.write_bytes(b"stored bytes")
+    written = backend.write_object_to_pool(source, "/pool/")
+    found = backend.lookup_pool_object("/pool/", source.name, candidate_digests=[])
+    assert found.copy_record == written
+    assert found.content_hash == written.integrity_hash
+    assert transport.calls[-2:] == [("size", "pool/artifact.rem"), ("sha256", "pool/artifact.rem")]
+    assert backend.reissue_after_absent is True
+    assert backend.holds_names is False
+    assert backend.lookup_pool_object("pool", "missing", candidate_digests=[]) is None
+    transport.missing_hashes.add("pool/artifact.rem")
+    assert backend.lookup_pool_object("pool", source.name, candidate_digests=[]) is None
+    transport.missing_hashes.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "size", lambda _key: None)
+        patch.setattr(transport, "sha256", lambda _key: pytest.fail("absent size needs no hash"))
+        assert backend.lookup_pool_object("pool", source.name, candidate_digests=[]) is None
+
+    def fail(_key):
+        raise OSError("SSH transport failed")
+
+    monkeypatch.setattr(transport, "size", fail)
+    with pytest.raises(BackendUnavailableError):
+        backend.lookup_pool_object("pool", source.name, candidate_digests=[])
+
+
+@pytest.mark.parametrize("digest", ["", "00", "not-hex"])
+def test_ssh_pool_lookup_malformed_hash_is_unavailable(tmp_path, digest):
+    transport = _LocalDirTransport(tmp_path / "remote")
+    backend = SshDiskBackend("ssh", host="unused", root="/unused", transport=transport)
+    source = tmp_path / "object"
+    source.write_bytes(b"stored bytes")
+    backend.write_object_to_pool(source, "pool")
+    transport.hash_overrides["pool/object"] = digest
+    with pytest.raises(BackendUnavailableError):
+        backend.lookup_pool_object("pool", source.name, candidate_digests=[])

@@ -23,13 +23,13 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import grpc
 from google.protobuf.empty_pb2 import Empty
@@ -39,10 +39,12 @@ from sutradhara.backend.port import (
     BackendError,
     BackendLocator,
     BackendNotFoundError,
+    BackendObjectExistsError,
     BackendSessionInvalidatedError,
     BackendStoredCorruptError,
     BackendTransientError,
     BackendUnavailableError,
+    BackendWriteInDoubtError,
     ByteRange,
     CopyRecord,
     StreamKind,
@@ -57,6 +59,9 @@ from sutradhara.jobs.runtime_observations import (
     report_batch_written,
     report_session_open,
 )
+
+if TYPE_CHECKING:
+    from sutradhara.replication import PoolObject
 
 _WRITE_CHUNK_BYTES = 1024 * 1024
 _DRIVE_ASSIGNMENT_POLL_SECONDS = 0.1
@@ -205,6 +210,10 @@ class RemanenceWriteSessionError(BackendUnavailableError):
         self.session_id = session_id
         self.drive_element_address = drive_element_address
         self.requeue_objects = requeue_objects
+
+
+class RemanenceWriteInDoubtError(RemanenceWriteSessionError, BackendWriteInDoubtError):
+    """Remanence holds the write identity live or quarantined after ABORTED."""
 
 
 class _CatalogClient(Protocol):
@@ -438,6 +447,39 @@ class RemanenceBackend:
     Construct via `from_fixture_file()` (dev fixture), `from_objects()` (tests),
     or `from_grpc()` (live daemon Catalog).
     """
+
+    reissue_after_absent = True
+    holds_names = True
+
+    def lookup_pool_object(
+        self, pool: str, object_name: str, *, candidate_digests: Sequence[bytes]
+    ) -> PoolObject | None:
+        """Ask the catalogue for the committed caller name in precisely this pool."""
+        from sutradhara.replication import PoolObject
+
+        try:
+            record = self._require_catalog().GetObject(
+                layer5_pb2.GetObjectRequest(pool_id=pool, caller_object_id=object_name),
+                timeout=_PLAN_METADATA_TIMEOUT_SECONDS,
+            )
+        except grpc.RpcError as exc:
+            if exc.code() == grpc.StatusCode.NOT_FOUND:
+                return None
+            raise BackendUnavailableError(
+                f"Remanence pool lookup failed: {_rpc_error_text(exc)}"
+            ) from exc
+        copies = [cp for cp in record.copies if cp.pool_id == pool]
+        if not copies:
+            return None
+        if len(copies) != 1:
+            raise BackendUnavailableError(f"Remanence pool {pool!r} returned {len(copies)} copies")
+        try:
+            copy_record = _copy_record_from_proto(record, copies[0])
+        except (ValueError, TypeError) as exc:
+            raise BackendUnavailableError(
+                "Remanence pool lookup returned a malformed object"
+            ) from exc
+        return PoolObject(copy_record, bytes(record.content_sha256))
 
     def __init__(
         self,
@@ -1332,7 +1374,14 @@ class BatchWriter:
         self._closed = True
         if isinstance(exc, RemanenceDigestMismatchError):
             return exc
-        return RemanenceWriteSessionError(
+        if isinstance(exc, grpc.RpcError) and exc.code() == grpc.StatusCode.ALREADY_EXISTS:
+            return BackendObjectExistsError(f"Remanence pool already holds the object: {detail}")
+        error_type = (
+            RemanenceWriteInDoubtError
+            if isinstance(exc, grpc.RpcError) and exc.code() == grpc.StatusCode.ABORTED
+            else RemanenceWriteSessionError
+        )
+        return error_type(
             f"Remanence write session at {self._backend._endpoint!r} failed: {detail}",
             session_id=self.session_id,
             drive_element_address=self.drive_element_address,

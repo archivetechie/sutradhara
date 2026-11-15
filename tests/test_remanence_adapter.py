@@ -1923,3 +1923,182 @@ def test_write_then_read_roundtrip_byte_equal(tmp_path: Path) -> None:
         out = backend.read_range(locator, ByteRange(0, 0))
 
     assert out == data
+
+
+def test_commit_point_suspends_batch_observers_during_live_write(tmp_path, monkeypatch):
+    """T5b: a real batch-of-one write commits without touching the guarded job row."""
+    from copy import deepcopy
+
+    from sutradhara.catalog.session import create_all, make_engine, session_scope
+    from sutradhara.jobs import registry
+    from sutradhara.jobs.commit_point import commit_point_for
+    from sutradhara.jobs.config import WorkerConfig
+    from sutradhara.jobs.engine import submit
+    from sutradhara.jobs.models import Job
+    from sutradhara.jobs.registry import CHECKPOINT_BATCH_STATE_KEY, JobResult
+    from sutradhara.jobs.worker import JobWorker
+
+    engine = make_engine(f"sqlite:///{tmp_path / 'observer.db'}")
+    create_all(engine)
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"checkpoint window proof")
+    client = _CheckpointBatchClient()
+    backend = RemanenceBackend("direct-rem", endpoint="direct", write_session=client)
+    recorded = []
+
+    def handler(ctx):
+        before = deepcopy(ctx.job.step_state)
+        with commit_point_for(ctx.session).window():
+            result = backend.write_object_to_pool(source, "checkpoint-pool")
+            assert result.integrity_hash == hashlib.sha256(source.read_bytes()).digest()
+            assert not client.aborted
+        assert ctx.job.step_state == before
+        assert not ctx.session.info.get("checkpoint_batch_state_touched")
+        # Both observer bindings are restored: append records, checkpoint clears.
+        with backend.open_batch("checkpoint-pool") as batch:
+            batch.append(source, "outside-window")
+            assert CHECKPOINT_BATCH_STATE_KEY in ctx.job.step_state
+            recorded.append(deepcopy(ctx.job.step_state))
+            batch.checkpoint()
+            assert CHECKPOINT_BATCH_STATE_KEY not in ctx.job.step_state
+        assert ctx.session.info["checkpoint_batch_state_touched"]
+        return JobResult(ok=True)
+
+    monkeypatch.setitem(registry._HANDLERS, "_rba_observer", handler)
+    with session_scope(engine) as session:
+        job_id = submit(session, "_rba_observer").id
+    outcome = JobWorker(engine, config=WorkerConfig(executor_workers=1)).drain()[0]
+    assert outcome.result.ok, outcome.result.detail
+    assert len(recorded) == 1
+    assert not client.aborted
+    with session_scope(engine) as session:
+        assert CHECKPOINT_BATCH_STATE_KEY not in session.get(Job, job_id).step_state
+    engine.dispose()
+
+
+class _PoolLookupError(grpc.RpcError):
+    def __init__(self, status):
+        self.status = status
+
+    def code(self):
+        return self.status
+
+    def details(self):
+        return "pool lookup/write proof"
+
+
+class _PoolLookupCatalog:
+    """In-process catalogue retaining the precise pool/name request."""
+
+    def __init__(self, obj, *, status=None):
+        self.obj = obj
+        self.status = status
+        self.requests = []
+
+    def GetObject(self, request, timeout=None):
+        self.requests.append(request)
+        if self.status is not None:
+            raise _PoolLookupError(self.status)
+        return self.obj
+
+
+def test_remanence_pool_lookup_name_pool_and_write_locator(proto_object, tmp_path):
+    """T7/M8: GetObject carries both identity fields and returns the write's locator."""
+    source = tmp_path / "artifact.rem"
+    source.write_bytes(b"pool lookup parity")
+    proto_object.content_sha256 = hashlib.sha256(source.read_bytes()).digest()
+    proto_object.logical_size_bytes = source.stat().st_size
+    catalog = _PoolLookupCatalog(proto_object)
+    client = _DirectWriteClient(proto_object)
+    backend = RemanenceBackend("rem", endpoint="direct", catalog=catalog, write_session=client)
+    written = backend.write_object_to_pool(
+        source, "scenario-a", caller_object_id=proto_object.caller_object_id
+    )
+    found = backend.lookup_pool_object(
+        "scenario-a", proto_object.caller_object_id, candidate_digests=[]
+    )
+    assert found is not None
+    assert found.copy_record.native_locator == written.native_locator
+    assert found.content_hash == proto_object.content_sha256
+    assert found.copy_record.integrity_hash == written.integrity_hash
+    assert found.copy_record.size_bytes == source.stat().st_size
+    assert len(catalog.requests) == 1
+    assert catalog.requests[0].pool_id == "scenario-a"
+    assert catalog.requests[0].caller_object_id == proto_object.caller_object_id
+    assert catalog.requests[0].object_id == b""
+    assert backend.reissue_after_absent is True
+    assert backend.holds_names is True
+
+
+@pytest.mark.parametrize(
+    "case", ["not-found", "other-pool", "two-copies", "empty-hash", "bad-hash", "unavailable"]
+)
+def test_remanence_pool_lookup_absence_and_unavailable(proto_object, case):
+    """T7: only authoritative absence is None; ambiguous/malformed answers raise."""
+    from sutradhara.backend.port import BackendUnavailableError
+
+    status = None
+    if case == "not-found":
+        status = grpc.StatusCode.NOT_FOUND
+    elif case == "unavailable":
+        status = grpc.StatusCode.UNAVAILABLE
+    elif case == "other-pool":
+        proto_object.copies[0].pool_id = "other"
+    elif case == "two-copies":
+        proto_object.copies.add().CopyFrom(proto_object.copies[0])
+    elif case == "empty-hash":
+        proto_object.content_sha256 = b""
+    elif case == "bad-hash":
+        proto_object.content_sha256 = b"short"
+    backend = RemanenceBackend(
+        "rem", endpoint="direct", catalog=_PoolLookupCatalog(proto_object, status=status)
+    )
+    if case in {"not-found", "other-pool"}:
+        assert backend.lookup_pool_object("scenario-a", "name", candidate_digests=[]) is None
+    else:
+        with pytest.raises(BackendUnavailableError):
+            backend.lookup_pool_object("scenario-a", "name", candidate_digests=[])
+
+
+@pytest.mark.parametrize("operation", ["append", "checkpoint", "close"])
+@pytest.mark.parametrize(
+    "status", [grpc.StatusCode.ALREADY_EXISTS, grpc.StatusCode.ABORTED, grpc.StatusCode.UNAVAILABLE]
+)
+def test_remanence_write_pool_refusal_mapping(tmp_path, monkeypatch, operation, status):
+    """T7: every batch operation maps refusal/in-doubt and retains abort behavior."""
+    from sutradhara.backend.port import BackendObjectExistsError, BackendWriteInDoubtError
+    from sutradhara.backend.remanence import RemanenceWriteInDoubtError
+
+    client = _CheckpointBatchClient()
+    backend = RemanenceBackend("rem", endpoint="direct", write_session=client)
+    source = tmp_path / "object.bin"
+    source.write_bytes(b"data")
+    batch = backend.open_batch("checkpoint-pool")
+
+    def fail(*args, **kwargs):
+        raise _PoolLookupError(status)
+
+    if operation != "append":
+        batch.append(source, "name")
+    monkeypatch.setattr(
+        client,
+        {"append": "AppendObject", "checkpoint": "CheckpointSession", "close": "CloseWriteSession"}[
+            operation
+        ],
+        fail,
+    )
+    expected = {
+        grpc.StatusCode.ALREADY_EXISTS: BackendObjectExistsError,
+        grpc.StatusCode.ABORTED: RemanenceWriteInDoubtError,
+        grpc.StatusCode.UNAVAILABLE: RemanenceWriteSessionError,
+    }[status]
+    arguments = (source, "name") if operation == "append" else ()
+    with pytest.raises(expected) as error:
+        getattr(batch, operation)(*arguments)
+    assert client.aborted
+    if status == grpc.StatusCode.ABORTED:
+        assert isinstance(error.value, RemanenceWriteSessionError)
+        assert isinstance(error.value, BackendWriteInDoubtError)
+        assert error.value.session_id == client.session_id
+    elif status == grpc.StatusCode.UNAVAILABLE:
+        assert type(error.value) is RemanenceWriteSessionError

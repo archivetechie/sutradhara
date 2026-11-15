@@ -61,8 +61,8 @@ def bind_tape_locator_observer(observer: TapeLocatorObserver) -> Iterator[None]:
 
 @contextmanager
 def bind_batch_observers(
-    written: BatchWrittenObserver,
-    checkpointed: BatchCheckpointedObserver,
+    written: BatchWrittenObserver | None,
+    checkpointed: BatchCheckpointedObserver | None,
 ) -> Iterator[None]:
     """Route provisional batch transitions into the current durable job state."""
 

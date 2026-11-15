@@ -12,7 +12,7 @@ archive path moves from scenario-era routing tags to explicit storage pools.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import (
     DDL,
@@ -26,6 +26,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     String,
+    Table,
     Text,
     UniqueConstraint,
     event,
@@ -1032,6 +1033,13 @@ class Bundle(Base):
     """
 
     __tablename__ = "bundle"
+    __table_args__ = (
+        CheckConstraint(
+            "(claim_job_id IS NULL AND claim_job_attempt IS NULL) OR "
+            "(claim_job_id IS NOT NULL AND claim_job_attempt IS NOT NULL)",
+            name="ck_bundle_claim_job_pair",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     bundle_group: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -1043,6 +1051,10 @@ class Bundle(Base):
     max_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     archive_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     claimed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claim_job_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("job.id", ondelete="RESTRICT"), nullable=True
+    )
+    claim_job_attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
     scan_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     review_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     customer_manifest_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
@@ -1519,5 +1531,127 @@ event.listen(
         "AFTER UPDATE OF health ON copy "
         "FOR EACH ROW WHEN NEW.health IS NOT OLD.health "
         "BEGIN UPDATE copy SET health_changed_at = CURRENT_TIMESTAMP WHERE id = NEW.id; END"
+    ).execute_if(dialect="sqlite"),
+)
+
+
+class BundleCopyWriteAttempt(Base):
+    """Immutable record of one issued write for a bundle/pool/generation/name."""
+
+    __tablename__ = "bundle_copy_write_attempt"
+    __table_args__ = (
+        CheckConstraint("generation >= 0", name="ck_bundle_copy_write_attempt_generation"),
+        CheckConstraint(
+            "digest_algorithm = 'sha256'", name="ck_bundle_copy_write_attempt_algorithm"
+        ),
+        CheckConstraint("size_bytes >= 0", name="ck_bundle_copy_write_attempt_size"),
+        CheckConstraint(
+            "(job_id IS NULL AND job_attempt IS NULL) OR "
+            "(job_id IS NOT NULL AND job_attempt IS NOT NULL)",
+            name="ck_bundle_copy_write_attempt_job_pair",
+        ),
+        Index("ix_bundle_copy_write_attempt_identity", "bundle_id", "pool_id", "generation"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bundle_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("bundle.id", ondelete="RESTRICT"), nullable=False
+    )
+    pool_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("pool.id", ondelete="RESTRICT"), nullable=False
+    )
+    backend_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("backend.id", ondelete="RESTRICT"), nullable=False
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    object_name: Mapped[str] = mapped_column(Text, nullable=False)
+    digest_algorithm: Mapped[str] = mapped_column(Text, nullable=False)
+    digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    recipient_epochs: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    member_layout: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    job_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("job.id", ondelete="RESTRICT"), nullable=True
+    )
+    job_attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    issued_by: Mapped[str] = mapped_column(Text, nullable=False)
+    issued_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BundleCopyWriteResolution(Base):
+    """Append-only conclusion about one write; the latest id is authoritative."""
+
+    __tablename__ = "bundle_copy_write_resolution"
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('landed', 'not-landed', 'conflict')",
+            name="ck_bundle_copy_write_resolution_outcome",
+        ),
+        CheckConstraint(
+            "learned_by IN ('write-response', 'lookup')",
+            name="ck_bundle_copy_write_resolution_learned_by",
+        ),
+        CheckConstraint(
+            "(outcome = 'landed' AND copy_id IS NOT NULL) OR "
+            "(outcome != 'landed' AND copy_id IS NULL)",
+            name="ck_bundle_copy_write_resolution_copy",
+        ),
+        CheckConstraint(
+            "outcome != 'conflict' OR observed_hash IS NOT NULL",
+            name="ck_bundle_copy_write_resolution_conflict_hash",
+        ),
+        CheckConstraint(
+            "(job_id IS NULL AND job_attempt IS NULL) OR "
+            "(job_id IS NOT NULL AND job_attempt IS NOT NULL)",
+            name="ck_bundle_copy_write_resolution_job_pair",
+        ),
+        Index("ix_bundle_copy_write_resolution_attempt", "attempt_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attempt_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("bundle_copy_write_attempt.id", ondelete="RESTRICT"), nullable=False
+    )
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    learned_by: Mapped[str] = mapped_column(Text, nullable=False)
+    copy_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("copy.id", ondelete="RESTRICT"), nullable=True
+    )
+    observed_hash: Mapped[bytes | None] = mapped_column(LargeBinary(32), nullable=True)
+    job_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("job.id", ondelete="RESTRICT"), nullable=True
+    )
+    job_attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resolved_by: Mapped[str] = mapped_column(Text, nullable=False)
+    resolved_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+for _ledger in (
+    cast(Table, BundleCopyWriteAttempt.__table__),
+    cast(Table, BundleCopyWriteResolution.__table__),
+):
+    for _operation in ("UPDATE", "DELETE"):
+        event.listen(
+            _ledger,
+            "after_create",
+            DDL(  # type: ignore[no-untyped-call]  # SQLAlchemy's DDL constructor is untyped.
+                f"CREATE TRIGGER trg_{_ledger.name}_no_{_operation.lower()} "
+                f"BEFORE {_operation} ON {_ledger.name} "
+                "BEGIN SELECT RAISE(ABORT, 'bundle copy write ledger is append-only'); END"
+            ).execute_if(dialect="sqlite"),
+        )
+
+event.listen(
+    BundleCopyWriteResolution.__table__,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]  # SQLAlchemy's DDL constructor is untyped.
+        "CREATE TRIGGER trg_bundle_copy_write_resolution_transition "
+        "BEFORE INSERT ON bundle_copy_write_resolution "
+        "WHEN (SELECT outcome FROM bundle_copy_write_resolution "
+        "WHERE attempt_id = NEW.attempt_id ORDER BY id DESC LIMIT 1) IN ('landed', 'conflict') "
+        "OR ((SELECT outcome FROM bundle_copy_write_resolution "
+        "WHERE attempt_id = NEW.attempt_id ORDER BY id DESC LIMIT 1) = 'not-landed' "
+        "AND NOT (NEW.outcome = 'landed' AND NEW.learned_by = 'lookup')) "
+        "BEGIN SELECT RAISE(ABORT, 'invalid bundle copy write resolution transition'); END"
     ).execute_if(dialect="sqlite"),
 )

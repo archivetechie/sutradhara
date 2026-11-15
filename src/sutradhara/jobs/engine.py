@@ -17,7 +17,7 @@ from copy import deepcopy
 from functools import partial
 from typing import Any, cast
 
-from sqlalchemy import event, select, update
+from sqlalchemy import event, inspect, select, update
 from sqlalchemy.engine import Connection, CursorResult
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
@@ -64,7 +64,9 @@ class AttemptBoundaryError(Exception):
     """A handler violated the read/external-work/write transaction boundary."""
 
 
-def _begin_immediate(connection: Connection, *, job_id: int, job_kind: str) -> None:
+def _begin_immediate(
+    connection: Connection, *, job_id: int | None = None, job_kind: str | None = None
+) -> None:
     """Wait for the writer slot without replaying the handler's external work."""
     started = time.monotonic()
     while True:
@@ -346,7 +348,7 @@ def run_one(
             raise
         if not session.is_active:
             session.rollback()
-            if session.info.get("attempt_boundary_used"):
+            if session.info.get("attempt_boundary_used") or session.info.get("commit_point_used"):
                 _begin_immediate(session.connection(), job_id=job_id, job_kind=job_kind)
             job = session.get(Job, job_id)
             if job is None:
@@ -445,13 +447,23 @@ def _invoke_handler_in_savepoint(
         raise ValueError(f"job id={engine_job.id} disappeared before handler dispatch")
     ctx.session = handler_session
     ctx.job = handler_job
+    from sutradhara.jobs.commit_point import CommitPoint
+
+    point = CommitPoint(session, boundary=boundary, job=handler_job)
+    handler_session.info["sutradhara_commit_point"] = point
     try:
         result = handler(ctx)
         Session.commit(handler_session)
         handled_objects = list(handler_session.info.get("handler_flushed_objects", ()))
         boundary.savepoint.commit()
     except BaseException:
-        batch_state_touched = bool(handler_session.info.get("checkpoint_batch_state_touched"))
+        # An unloaded state may be durable after a window, or expired by a
+        # step/session rollback or explicit expiration without a window.
+        # In either case, leave the committed row as it stands.
+        batch_state_touched = (
+            bool(handler_session.info.get("checkpoint_batch_state_touched"))
+            and "step_state" in handler_job.__dict__
+        )
         failed_batch_state = deepcopy(
             dict(handler_job.__dict__.get("step_state") or {}).get(CHECKPOINT_BATCH_STATE_KEY)
         )
@@ -472,10 +484,15 @@ def _invoke_handler_in_savepoint(
         session.expire_all()
         merged_objects: set[object] = set()
         for instance in handled_objects:
-            merged_objects.add(session.merge(instance, load=False))
+            if inspect(instance).persistent:
+                merged_objects.add(session.merge(instance, load=False))
         session.info["handler_merged_objects"] = merged_objects
+        pending = handler_session.info.pop("sutradhara_bundle_copy_fast_path", set())
+        if pending:
+            session.info.setdefault("sutradhara_bundle_copy_fast_path", set()).update(pending)
         return result
     finally:
+        point._detach()
         handler_session.close()
         ctx.session = session
         ctx.job = engine_job

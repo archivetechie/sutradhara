@@ -1474,11 +1474,17 @@ def _schedule_bundle_copy_fast_path(session: Session, bundle_id: str) -> None:
 
 @event.listens_for(Session, "after_commit")
 def _run_bundle_copy_fast_path(session: Session) -> None:
+    if "attempt_boundary" in session.info:
+        return
+    if session.in_nested_transaction():
+        return
     bundle_ids = session.info.pop(_BUNDLE_COPY_FAST_PATH_KEY, set())
     if not bundle_ids:
         return
     try:
         bind = session.get_bind()
+        if hasattr(bind, "engine"):
+            bind = bind.engine
         with Session(bind=bind, future=True) as fast_session:
             from sutradhara.jobs.reconcilers import bundle_copy
 

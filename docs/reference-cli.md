@@ -402,7 +402,7 @@ reconcilers; `jobs submit` exists for operators and tests.
 |---|---|---|
 | `list` | | List jobs. `--status [pending\|queued\|running\|succeeded\|failed\|cancelled]`, `--limit INTEGER` (default `50`, `0` = unlimited), `--json`. |
 | `show` | `JOB_ID` | Print full detail for one job. |
-| `run` | | Run pending jobs synchronously. `--id INTEGER` runs one specific job; `--limit INTEGER` (default `1`, `0` = drain queue) otherwise. |
+| `run` | | Run pending jobs synchronously. `--id INTEGER` runs one specific job; `--limit INTEGER` (default `1`, `0` = drain queue) otherwise. Takes the worker lock, refuses with exit 2 while a worker runs, and first resets jobs a crash left running. |
 | `submit` | `KIND` | Submit a new job. `-p/--param key=value` (repeatable, values JSON-decoded when possible), `--resource pool=count` (repeatable), `--prereq INTEGER` (prerequisite job id), `--not-before TEXT` (ISO-8601 UTC), `--priority INTEGER` (default `0`, lower runs earlier), `--dedupe-key TEXT` (idempotency key for submit retries). `KIND` must be a registered kind; `restore` is explicitly rejected here (exit 2, "restore jobs must be created from gated restore requests") — server-local restores are submitted only through `POST /api/ui/restores`, never directly. |
 
 ### sutra worker

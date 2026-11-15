@@ -160,3 +160,103 @@ def _sutra_bin() -> str:
     import sys
 
     return str(Path(sys.executable).with_name("sutra"))
+
+
+def _rba_hold_worker_lock(url, ready, release):
+    """Hold the production lock in a distinct process until the test releases it."""
+    with worker_lock(url):
+        ready.set()
+        if not release.wait(15):
+            raise RuntimeError("test did not release worker lock")
+
+
+@pytest.mark.parametrize("by_id", [False, True])
+def test_jobs_run_refuses_worker_lock_before_claim(tmp_path, monkeypatch, by_id):
+    """T3: both CliRunner routes refuse a separate process's lock immediately."""
+    import multiprocessing
+    import time
+
+    from click.testing import CliRunner
+
+    from sutradhara.cli.jobs import jobs_group
+
+    url, engine = _sqlite_db(tmp_path)
+    monkeypatch.setenv("SUTRADHARA_DB_URL", url)
+    with session_scope(engine) as session:
+        job_id = submit(session, "verify", {"copy_id": 999}).id
+    context = multiprocessing.get_context("fork")
+    ready, release = context.Event(), context.Event()
+    holder = context.Process(target=_rba_hold_worker_lock, args=(url, ready, release))
+    holder.start()
+    try:
+        assert ready.wait(5)
+        started = time.monotonic()
+        result = CliRunner().invoke(jobs_group, ["run", *(["--id", str(job_id)] if by_id else [])])
+        assert result.exit_code == 2, result.output
+        assert time.monotonic() - started < 3
+        assert "worker already running" in result.output
+        assert ".worker.lock" in result.output
+        with session_scope(engine) as session:
+            job = session.get(Job, job_id)
+            assert job.status == JobStatus.PENDING
+            assert job.attempts == 0
+    finally:
+        release.set()
+        holder.join(5)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(5)
+        engine.dispose()
+    assert holder.exitcode == 0
+
+
+@pytest.mark.parametrize("by_id", [False, True])
+def test_jobs_run_resets_orphan_under_begin_before_savepoint(tmp_path, monkeypatch, by_id):
+    """T3: orphan reset precedes a fresh attempt under BEGIN IMMEDIATE and the lock."""
+    from click.testing import CliRunner
+    from sqlalchemy import event
+
+    from sutradhara.cli.jobs import jobs_group
+    from sutradhara.jobs import registry
+    from sutradhara.jobs.registry import JobResult
+    from sutradhara.jobs.worker_lock import WorkerAlreadyRunning
+
+    url, engine = _sqlite_db(tmp_path)
+    monkeypatch.setenv("SUTRADHARA_DB_URL", url)
+    monkeypatch.setattr("sutradhara.cli.jobs.make_engine", lambda _url: engine)
+    seen = []
+
+    def handler(ctx):
+        assert ctx.job.attempts == 4
+        assert ctx.job.status == JobStatus.RUNNING
+        assert "orphaned RUNNING" in ctx.job.step_state["engine_observations"][-1]["note"]
+        with pytest.raises(WorkerAlreadyRunning), worker_lock(url):
+            pytest.fail("CLI released the worker lock before handler execution")
+        seen.append(ctx.job.id)
+        return JobResult(ok=True)
+
+    monkeypatch.setitem(registry._HANDLERS, "_rba_cli", handler)
+    with session_scope(engine) as session:
+        job = submit(session, "_rba_cli")
+        job.status = JobStatus.RUNNING
+        job.attempts = 3
+        job_id = job.id
+    statements = []
+
+    def trace(conn, cursor, sql, parameters, context, executemany):
+        statements.append(sql)
+
+    event.listen(engine, "before_cursor_execute", trace)
+    result = CliRunner().invoke(jobs_group, ["run", *(["--id", str(job_id)] if by_id else [])])
+    assert result.exit_code == 0, result.output
+    assert "ok" in result.output
+    assert seen == [job_id]
+    assert statements[0] == "BEGIN IMMEDIATE"
+    savepoint = next(i for i, sql in enumerate(statements) if sql.startswith("SAVEPOINT"))
+    assert any(sql.startswith("UPDATE job") for sql in statements[1:savepoint])
+    assert any(sql.startswith("RELEASE SAVEPOINT") for sql in statements[savepoint:])
+    with session_scope(engine) as session:
+        job = session.get(Job, job_id)
+        assert job.status == JobStatus.SUCCEEDED
+        assert job.attempts == 4
+    engine.dispose()

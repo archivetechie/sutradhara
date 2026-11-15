@@ -20,11 +20,11 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 from sutradhara.backend.port import (
     BackendError,
@@ -41,6 +41,9 @@ from sutradhara.backend.port import (
 from sutradhara.catalog.types import ContentHash, content_hash
 from sutradhara.jobs.runtime_observations import report_tape_locator
 from sutradhara.sealing.port import Representation
+
+if TYPE_CHECKING:
+    from sutradhara.replication import PoolObject
 
 _DEFAULT_DEVICE_ENV = Path("/var/lib/replica/d2tape/device.env")
 _DEFAULT_STATE_DIR = Path("/var/lib/replica/d2tape/volumes")
@@ -64,6 +67,54 @@ class _DeviceConfig:
 
 class D2TapeBackend:
     """Writable adapter for the d2tape CLI's legacy d2-tar format."""
+
+    reissue_after_absent = False
+    holds_names = False
+
+    def lookup_pool_object(
+        self, pool: str, object_name: str, *, candidate_digests: Sequence[bytes]
+    ) -> PoolObject | None:
+        """Read sidecars, including unverified writes, without invoking the jar.
+
+        Sidecar filename order and then append order select the earliest entry
+        when several entries describe the same digest. Caller names are not stored.
+        """
+        from sutradhara.replication import PoolObject
+
+        if not candidate_digests:
+            raise BackendUnavailableError("d2tape lookup requires candidate digests")
+        candidates = set(candidate_digests)
+        found: dict[bytes, CopyRecord] = {}
+        try:
+            try:
+                paths = sorted(self._state_dir.iterdir())
+            except FileNotFoundError:
+                return None
+            # glob() suppresses some directory-listing errors. An unreadable
+            # sidecar directory cannot prove absence, so let iterdir() raise.
+            for path in paths:
+                if not path.name.endswith(".json"):
+                    continue
+                state = _load_json_object(path)
+                artifacts = state.get("artifacts")
+                if not isinstance(artifacts, list):
+                    raise ValueError(f"d2tape sidecar {path} has non-list artifacts")
+                for artifact in artifacts:
+                    if not isinstance(artifact, dict):
+                        raise ValueError(f"d2tape sidecar {path} has malformed artifact")
+                    record = _record_from_sidecar_artifact(artifact)
+                    if artifact["pool_id"] == pool and record.integrity_hash in candidates:
+                        found.setdefault(record.integrity_hash, record)
+        except (OSError, ValueError, BackendError) as exc:
+            raise BackendUnavailableError(
+                "d2tape pool lookup has unreadable or malformed sidecars"
+            ) from exc
+        if not found:
+            return None
+        if len(found) != 1:
+            raise BackendUnavailableError("d2tape pool lookup found multiple candidate digests")
+        digest, record = next(iter(found.items()))
+        return PoolObject(record, digest)
 
     def __init__(
         self,

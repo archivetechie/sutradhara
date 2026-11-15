@@ -17,7 +17,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from subprocess import CompletedProcess
-from typing import BinaryIO, Protocol
+from typing import TYPE_CHECKING, BinaryIO, Protocol
 
 from sutradhara.backend.port import (
     BackendError,
@@ -32,6 +32,9 @@ from sutradhara.backend.port import (
     _hash_observed_chunks,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
+
+if TYPE_CHECKING:
+    from sutradhara.replication import PoolObject
 
 _ABSENT_SENTINEL = 42
 _EXISTS_SENTINEL = 43
@@ -288,6 +291,40 @@ class RsyncSshTransport:
 
 class SshDiskBackend:
     """StorageBackend implementation for a validated relative-key SSH object store."""
+
+    reissue_after_absent = True
+    holds_names = False
+
+    def lookup_pool_object(
+        self, pool: str, object_name: str, *, candidate_digests: Sequence[bytes]
+    ) -> PoolObject | None:
+        """Measure the named pool key through the existing remote transport."""
+        from sutradhara.replication import PoolObject
+
+        clean_pool = pool.strip("/")
+        key = _validate_key(f"{clean_pool}/{object_name}" if clean_pool else object_name)
+        try:
+            size = self._transport.size(key)
+            if size is None:
+                return None
+            digest_hex = self._transport.sha256(key)
+            if digest_hex is None:
+                return None
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise ValueError("invalid remote size")
+            digest = _content_hash_from_hex(digest_hex)
+        except (OSError, ValueError, BackendError) as exc:
+            raise BackendUnavailableError(f"SSH disk pool lookup failed for {key!r}") from exc
+        return PoolObject(
+            CopyRecord(
+                logical_id=digest,
+                native_locator={"key": key, "sha256": digest.hex(), "size_bytes": size},
+                integrity_hash=digest,
+                size_bytes=size,
+                metadata=({"pool": pool} if pool else {}),
+            ),
+            digest,
+        )
 
     def __init__(
         self,
