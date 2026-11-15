@@ -71,7 +71,7 @@ from sutradhara.jobs.worker import JobWorker
 from sutradhara.keys import KeyEpoch
 from sutradhara.sealing.port import Representation, SealResult
 from tests.bundle_group_helpers import bundle_kwargs
-from tests.key_helpers import TEST_RECIPIENT_CODEC, make_test_key_registry
+from tests.key_helpers import TEST_RECIPIENT_CODEC, make_test_key_registry, registry_with_recovery
 
 TEST_HDCACHE_HMAC_SECRET = b"hdcache-fill-test-secret"
 
@@ -780,6 +780,55 @@ class FillIdentityProbe:
             serial=f"SER-{disk_id}",
             fs_uuid=f"fs-{disk_id}",
         )
+
+
+def test_default_fill_fallback_decrypts_sealed_copy(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8: fill_target carries its registry to the decrypting restore fallback."""
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
+    hot = registry.create_epoch("archive")
+    data = b"sealed fill fallback plaintext"
+    memory = MemoryBackend("mem")
+    calls: list[bytes] = []
+
+    @contextlib.contextmanager
+    def decrypt(**kwargs: Any) -> Iterator[Iterator[bytes]]:
+        assert kwargs["private_key"].read_bytes().startswith(b"REMP")
+        locator = kwargs["locator"]
+        assert "offset" not in locator.native_locator
+        calls.append(locator.logical_asset_hash)
+        yield iter((data,))
+
+    monkeypatch.setattr("sutradhara.archive_restore._open_rem_encrypt_plaintext_stream", decrypt)
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "active")
+        target = _seed_archived_asset(session, data=data, memory=memory)
+        copy = session.scalars(select(Copy)).one()
+        copy.storage_metadata = {
+            "representation": Representation.REM_ENCRYPT_V1.value,
+            "recipient_epochs": [hot.key_id, recovery.key_id],
+        }
+        locator = session.scalars(select(AssetLocator)).one()
+        locator.representation = Representation.REM_ENCRYPT_V1.value
+        locator.native_locator = {
+            "member_path": locator.member_path,
+            "size_bytes": len(data),
+            "first_chunk_lba": 0,
+        }
+        pool = session.get(Pool, copy.pool_id)
+        assert pool is not None
+        pool.representation = Representation.REM_ENCRYPT_V1.value
+        result = fill_target(
+            session,
+            target,
+            config=_config(tmp_path),
+            key_registry=registry,
+            restore_backends={copy.backend_id: memory},
+        )
+        assert result.source == "restore"
+        assert entry_path(tmp_path / "active", target.content_sha256).read_bytes() == data
+        assert calls == [target.content_sha256]
 
 
 def _assert_live_cap(session: Any, cap: int) -> None:

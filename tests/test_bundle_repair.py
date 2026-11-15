@@ -18,6 +18,7 @@ from sutradhara.archive_fanout import (
     BuiltBlobRoot,
     BuiltExclusion,
     LocalArchiveBuilder,
+    RemArchiveBuilder,
     flush_bundle,
 )
 from sutradhara.archive_restore import read_member_bytes
@@ -51,7 +52,7 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, CopySource, content_hash
-from sutradhara.durability import bundle_replication_status
+from sutradhara.durability import BundleTarget, bundle_replication_status
 from sutradhara.jobs import handlers as _handlers  # noqa: F401 -- register bundle-repair
 from sutradhara.jobs.engine import run_one, submit
 from sutradhara.jobs.handlers import bundle_repair
@@ -64,8 +65,10 @@ from sutradhara.jobs.reconcilers.conditions import (
     OBSERVED_MISSING,
     OBSERVED_PRESENT,
 )
+from sutradhara.resource_control import ResourceControlUnavailable
 from sutradhara.sealing.port import Representation
 from tests.bundle_group_helpers import bundle_kwargs_for_class
+from tests.key_helpers import make_test_key_registry
 
 
 @pytest.fixture
@@ -83,6 +86,7 @@ class _Backend:
         self.objects: dict[str, bytes] = {}
         self.writes: list[str] = []
         self.read_failures: set[str] = set()
+        self.reads: list[str] = []
         self.fail_next_verify = False
 
     @property
@@ -126,6 +130,7 @@ class _Backend:
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         object_id = str(locator["object_id"])
+        self.reads.append(object_id)
         if object_id in self.read_failures:
             raise BackendError(f"transport unavailable for {object_id}")
         data = self.objects[object_id]
@@ -567,6 +572,302 @@ def test_bundle_copy_duplicate_alarm_logs_once(
             sum(1 for record in caplog.records if record.message == "bundle_copy_condition_blocked")
             == 1
         )
+
+
+def _sealed_pool_copy(session, pool_id: str, *, offset: bool = False) -> Copy:
+    """Turn a seeded copy into a sealed source with unavailable recipient keys."""
+    pool = session.get(Pool, pool_id)
+    assert pool is not None
+    pool.representation = Representation.REM_ENCRYPT_V1.value
+    copy = session.scalars(select(Copy).where(Copy.pool_id == pool_id)).one()
+    copy.storage_metadata = {
+        **copy.storage_metadata,
+        "representation": Representation.REM_ENCRYPT_V1.value,
+        "recipient_epochs": ["archive-" + "e" * 32, "recovery-" + "d" * 32],
+    }
+    for locator in session.scalars(select(AssetLocator).where(AssetLocator.copy_id == copy.id)):
+        locator.representation = Representation.REM_ENCRYPT_V1.value
+        if not offset:
+            locator.native_locator = {
+                key: value for key, value in locator.native_locator.items() if key != "offset"
+            }
+            locator.native_locator = {**locator.native_locator, "first_chunk_lba": 0}
+    session.flush()
+    return copy
+
+
+@pytest.mark.parametrize("reconciled", [True, False], ids=["reconciled", "manual"])
+@pytest.mark.parametrize("epoch", [None, "archive-" + "f" * 32], ids=["missing", "unknown"])
+def test_repair_checks_destination_keys_before_source_read(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    epoch: str | None,
+    reconciled: bool,
+) -> None:
+    """T4/T5: both repair submissions refuse destination keys without I/O or build."""
+    backend = _Backend()
+    bundle_id, _, _ = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
+    registry = make_test_key_registry(tmp_path / "keys")
+    builds: list[object] = []
+
+    class RecordingBuilder(_OutputsBuilder):
+        def build(self, **kwargs: object) -> BuildArtifact:
+            builds.append(kwargs)
+            return super().build(**kwargs)
+
+    monkeypatch.setattr(bundle_repair, "make_key_registry", lambda: registry)
+    monkeypatch.setattr(bundle_repair.factory, "backend_from_row", lambda _row: backend)
+    if epoch is None:
+        monkeypatch.setattr(
+            bundle_repair, "make_archive_builder", lambda rem_bin=None: RecordingBuilder()
+        )
+    else:
+        # The production factory stays intact; record its build method without
+        # bypassing the production preflight's isinstance/registry check.
+        original_build = RemArchiveBuilder.build
+
+        def build(self, **kwargs):
+            builds.append(kwargs)
+            return original_build(self, **kwargs)
+
+        monkeypatch.setattr(RemArchiveBuilder, "build", build)
+
+    with session_scope(engine) as session:
+        _sealed_pool_copy(session, "p2").health = CopyHealth.MISSING
+        params = {"bundle_id": bundle_id}
+        if epoch is not None:
+            params["key_epoch"] = epoch
+        job = submit(
+            session,
+            "bundle-repair",
+            params,
+            recon_domain="bundle_copy" if reconciled else None,
+            recon_target_key=bundle_id if reconciled else None,
+        )
+        backend.reads.clear()
+        result = run_one(session, job.id)
+        assert backend.reads == [], "no source read before destination key validation"
+        assert builds == [], "no build before destination key validation"
+        assert not result.ok
+        assert result.condition is not None
+        assert result.condition.condition == CONDITION_BLOCKED
+        assert result.condition.reason == (
+            "key-epoch-missing" if epoch is None else "key-epoch-unusable"
+        )
+        assert bundle_id in result.detail
+        assert "p2" in result.detail
+        assert "sutra jobs submit bundle-repair" in result.detail
+        assert "-p key_epoch=" in result.detail
+        assert result.condition.reason in result.detail
+        assert "bundle flush" not in result.detail
+        assert "bundle sweep" not in result.detail
+        condition = session.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "bundle_copy",
+                ReconciliationCondition.target_key == bundle_id,
+            )
+        ).one()
+        if reconciled:
+            assert condition.condition == CONDITION_BLOCKED
+            assert condition.reason == result.condition.reason
+        else:
+            assert job.status == JobStatus.FAILED
+            assert condition.condition == CONDITION_SATISFIED
+
+
+@pytest.mark.parametrize("fault_type", [OSError, ResourceControlUnavailable])
+def test_repair_destination_host_fault_returns_handler_failure(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_type: type[Exception],
+) -> None:
+    """Destination host faults return a retried handler result before any source I/O."""
+    backend = _Backend()
+    bundle_id, _, _ = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
+    registry = make_test_key_registry(tmp_path / "keys")
+    builds: list[object] = []
+
+    def host_fault(*_args, **_kwargs):
+        raise fault_type("destination registry unavailable on this host")
+
+    def build(self, **kwargs):
+        builds.append(kwargs)
+        raise AssertionError("no build before destination key validation")
+
+    monkeypatch.setattr(registry, "recipients_for_seal", host_fault)
+    monkeypatch.setattr(bundle_repair, "make_key_registry", lambda: registry)
+    monkeypatch.setattr(RemArchiveBuilder, "build", build)
+    monkeypatch.setattr(bundle_repair.factory, "backend_from_row", lambda _row: backend)
+    with session_scope(engine) as session:
+        _sealed_pool_copy(session, "p2").health = CopyHealth.MISSING
+        job = submit(
+            session,
+            "bundle-repair",
+            {"bundle_id": bundle_id, "key_epoch": "archive-" + "f" * 32},
+            recon_domain="bundle_copy",
+            recon_target_key=bundle_id,
+        )
+        backend.reads.clear()
+        result = run_one(session, job.id)
+        assert backend.reads == [], "no source read before destination key validation"
+        assert builds == []
+        assert not result.ok
+        assert result.condition is None
+        attempt = session.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
+        assert attempt.error == result.detail, "attempt records the handler's failure result"
+        assert attempt.outcome == JobStatus.FAILED
+        assert bundle_id in result.detail
+        assert "missing pools=['p2']" in result.detail
+        assert "destination registry unavailable on this host" in result.detail
+        assert result.detail.endswith(
+            "the key registry or the rem tool on this host could not be used; the repair is retried"
+        )
+        assert "private key" not in result.detail
+        condition = session.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "bundle_copy",
+                ReconciliationCondition.target_key == bundle_id,
+            )
+        ).one()
+        assert condition.condition == CONDITION_BACKOFF
+        assert condition.reason == "unclassified"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["key", "mixed", "host", "wrapped-scope", "scope", "fenced", "offset", "malformed"],
+)
+def test_repair_checks_source_keys_before_reading(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """T6: key-less sources are skipped; host faults retry and fencing reads nothing."""
+    backend = _Backend()
+    pools = ("p1", "p2", "p3") if case in {"mixed", "malformed"} else ("p1", "p2")
+    bundle_id, _, _ = _flushed_bundle(engine, tmp_path, backend, pools)
+    registry = make_test_key_registry(tmp_path / "keys")
+    builds: list[object] = []
+
+    class RecordingBuilder(_OutputsBuilder):
+        def build(self, **kwargs: object) -> BuildArtifact:
+            builds.append(kwargs)
+            return super().build(**kwargs)
+
+    monkeypatch.setattr(bundle_repair, "make_key_registry", lambda: registry)
+    monkeypatch.setattr(
+        bundle_repair, "make_archive_builder", lambda rem_bin=None: RecordingBuilder()
+    )
+    monkeypatch.setattr(bundle_repair.factory, "backend_from_row", lambda _row: backend)
+    if case in {"host", "wrapped-scope", "scope"}:
+
+        def host_fault(*_args, **_kwargs):
+            if case == "host":
+                raise OSError("registry unavailable on this host")
+            raise ResourceControlUnavailable("rem scope unavailable on this host")
+
+        if case == "wrapped-scope":
+            # Raise inside the registry so the real restore selector supplies
+            # the ArchiveRestoreError wrapper and its ResourceControlUnavailable cause.
+            monkeypatch.setattr(registry, "select_private_epoch", host_fault)
+        else:
+            monkeypatch.setattr(bundle_repair, "select_private_epoch_for_copy", host_fault)
+    original_read = bundle_repair.read_member_to_path
+
+    def read_with_registry(*args, **kwargs):
+        assert kwargs["keys"] is registry
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(bundle_repair, "read_member_to_path", read_with_registry)
+    with session_scope(engine) as session:
+        sealed = _sealed_pool_copy(session, "p1", offset=case == "offset")
+        if case == "malformed":
+            for locator in session.scalars(
+                select(AssetLocator).where(AssetLocator.copy_id == sealed.id)
+            ):
+                locator.native_locator = {**locator.native_locator, "size_bytes": None}
+        missing_copy = session.scalars(select(Copy).where(Copy.pool_id == "p2")).one()
+        missing_copy.health = CopyHealth.MISSING
+        if case in {"mixed", "malformed"}:
+            # Prefer this source despite its representation cost: the test must
+            # prove it is skipped, rather than just selecting plaintext first.
+            sealed.last_measured_at = dt.datetime.now(dt.UTC) + dt.timedelta(days=1)
+            sources = bundle_repair.select_source_candidates(
+                session, BundleTarget(bundle_id), purpose="self_heal"
+            )
+            assert sources[0].id == sealed.id
+        if case == "fenced":
+            pool = session.get(Pool, "p2")
+            assert pool is not None
+            pool.accepts_writes = False
+            policy = session.get(ArtifactClassPolicyRecord, "class-a")
+            assert policy is not None
+            policy.min_copies = 1
+        job = submit(
+            session,
+            "bundle-repair",
+            {"bundle_id": bundle_id},
+            recon_domain="bundle_copy",
+            recon_target_key=bundle_id,
+        )
+        backend.reads.clear()
+        result = run_one(session, job.id)
+        if case in {"key", "mixed"}:
+            attempt = session.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
+            assert (
+                f"tape:{sealed.native_locator['tape_uuid']}" not in attempt.detail["components"]
+            ), "unreadable source tape is not touched"
+        if case in {"mixed", "offset", "malformed"}:
+            if case in {"mixed", "malformed"}:
+                assert str(sealed.native_locator["object_id"]) not in backend.reads, (
+                    "no read of a source without private keys"
+                )
+            assert result.ok, result.detail
+            assert builds
+            source_id = result.step_state["bundle_repair"]["source_copy_id"]
+            if case in {"mixed", "malformed"}:
+                assert source_id != sealed.id
+            else:
+                assert source_id == sealed.id
+            return
+        assert backend.reads == [], "no source read before source key validation"
+        assert builds == []
+        if case == "fenced":
+            assert result.ok
+            assert result.condition is not None
+            assert result.condition.reason == "fenced-missing"
+            state = result.step_state["bundle_repair"]
+            assert state["repaired_pools"] == []
+            assert state["remaining_write_fenced_pools"] == ["p2"]
+            assert "source_copy_id" not in state
+            return
+        assert not result.ok
+        assert f"copy id={sealed.id}" in result.detail
+        assert "archive-" + "e" * 32 in result.detail
+        if case in {"host", "wrapped-scope", "scope"}:
+            assert result.condition is None
+            assert (
+                "registry unavailable on this host"
+                if case == "host"
+                else "rem scope unavailable on this host"
+            ) in result.detail
+            assert result.detail.endswith(
+                "the key registry or the rem tool on this host could not be used; the repair is retried"
+            )
+            assert "private key" not in result.detail
+        else:
+            assert "private key" in result.detail
+            assert "this host's key registry" in result.detail
+            assert result.condition is not None
+            assert result.condition.condition == CONDITION_BLOCKED
+            assert result.condition.reason == "source-key-unavailable"
+        condition = session.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "bundle_copy",
+                ReconciliationCondition.target_key == bundle_id,
+            )
+        ).one()
+        assert (condition.condition == CONDITION_BLOCKED) == (case == "key")
 
 
 def _flushed_bundle(

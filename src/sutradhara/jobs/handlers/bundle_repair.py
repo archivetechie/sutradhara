@@ -22,9 +22,15 @@ from sutradhara.archive_fanout import (
     ArchiveFanoutError,
     MemberInput,
     RemArchiveBuilder,
+    SealKeyUnavailable,
     build_bundle_copy_for_pool,
+    preflight_seal_keys,
 )
-from sutradhara.archive_restore import ArchiveRestoreError, read_member_to_path
+from sutradhara.archive_restore import (
+    ArchiveRestoreError,
+    read_member_to_path,
+    select_private_epoch_for_copy,
+)
 from sutradhara.backend import factory
 from sutradhara.backend.port import BackendError
 from sutradhara.catalog.models import ArtifactClassPool, AssetLocator, Backend, Bundle, Pool
@@ -39,14 +45,20 @@ from sutradhara.jobs.reconcilers.conditions import (
     record_observation,
 )
 from sutradhara.jobs.registry import ConditionProjection, JobContext, JobResult, register_handler
+from sutradhara.keys import KeyRegistry
 from sutradhara.replication import (
     PoolTargetEntry,
     WritableStorageBackend,
     select_source_candidates,
     target_pools,
 )
+from sutradhara.resource_control import ResourceControlUnavailable
+from sutradhara.sealing.port import Representation
 
 DOMAIN = "bundle_copy"
+_HOST_KEY_GUIDANCE = (
+    "the key registry or the rem tool on this host could not be used; the repair is retried"
+)
 
 
 @register_handler("bundle-repair")
@@ -91,16 +103,100 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
         return JobResult(ok=True, detail=f"bundle {bundle.id} already has complete placement")
 
     builder = make_archive_builder(rem_bin=rem_bin)
+    keys = make_key_registry()
+    missing_targets = [
+        (backend, target) for backend, target in targets if target.pool_id in missing
+    ]
+    try:
+        preflight_seal_keys(missing_targets, builder)
+    except SealKeyUnavailable as exc:
+        message = (
+            f"cannot repair bundle {bundle.id}, missing pools={sorted(missing)}: {exc}; "
+            f"retry with sutra jobs submit bundle-repair -p bundle_id={bundle.id} "
+            "-p key_epoch=<archive epoch>"
+        )
+        return JobResult(
+            ok=False,
+            detail=message,
+            condition=ConditionProjection(
+                condition=CONDITION_BLOCKED, reason=exc.reason, message=message
+            ),
+        )
+    except (OSError, ResourceControlUnavailable) as exc:
+        return JobResult(
+            ok=False,
+            detail=(
+                f"cannot repair bundle {bundle.id}, missing pools={sorted(missing)}: {exc}; "
+                f"{_HOST_KEY_GUIDANCE}"
+            ),
+        )
+    if not missing_targets and _write_fenced_pool_ids(ctx, missing) == missing:
+        return _fenced_missing_result(ctx, bundle.id, repaired=set(), fenced_missing=missing)
+
+    sources = list(
+        select_source_candidates(ctx.session, BundleTarget(bundle.id), purpose="self_heal")
+    )
+    unreadable_sources: dict[int, str] = {}
+    if missing_targets:
+        candidates = [
+            source
+            for source in sources
+            if source.health == CopyHealth.OK and source.backend_id in backends
+        ]
+        host_fault = False
+        for source in candidates:
+            locators = ctx.session.scalars(
+                select(AssetLocator).where(
+                    AssetLocator.bundle_id == bundle.id,
+                    AssetLocator.copy_id == source.id,
+                    AssetLocator.representation == Representation.REM_ENCRYPT_V1.value,
+                )
+            )
+            needs_key = any(_sealed_locator_needs_private_key(locator) for locator in locators)
+            if not needs_key:
+                continue
+            try:
+                select_private_epoch_for_copy(keys, source.storage_metadata)
+            except (ArchiveRestoreError, OSError, ResourceControlUnavailable) as exc:
+                unreadable_sources[source.id] = (
+                    f"copy id={source.id} recipient_epochs={source.storage_metadata.get('recipient_epochs')!r}: {exc}"
+                )
+                host_fault = (
+                    host_fault
+                    or isinstance(exc, (OSError, ResourceControlUnavailable))
+                    or isinstance(exc.__cause__, (OSError, ResourceControlUnavailable))
+                )
+        if candidates and len(unreadable_sources) == len(candidates):
+            guidance = (
+                _HOST_KEY_GUIDANCE
+                if host_fault
+                else "a private key for one of the named recipient epochs must be in this host's key registry"
+            )
+            message = (
+                f"cannot repair bundle {bundle.id}: {'; '.join(unreadable_sources.values())}; "
+                f"{guidance}"
+            )
+            return JobResult(
+                ok=False,
+                detail=message,
+                condition=None
+                if host_fault
+                else ConditionProjection(
+                    condition=CONDITION_BLOCKED, reason="source-key-unavailable", message=message
+                ),
+            )
+
     errors: list[str] = []
-    for source in select_source_candidates(
-        ctx.session, BundleTarget(bundle.id), purpose="self_heal"
-    ):
+    for source in sources:
         if source.health != CopyHealth.OK:
             errors.append(f"copy id={source.id}: health={source.health.value}")
             continue
         source_backend = backends.get(source.backend_id)
         if source_backend is None:
             errors.append(f"copy id={source.id}: backend_id={source.backend_id} unavailable")
+            continue
+        if source.id in unreadable_sources:
+            errors.append(unreadable_sources[source.id])
             continue
         touch_copy_tape(ctx, source)
         try:
@@ -115,6 +211,7 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
                     source_backend=source_backend,
                     scratch=temp_root / "scratch",
                     rem_bin=rem_bin or "rem",
+                    keys=keys,
                 )
                 repaired = _repair_missing_targets(
                     ctx=ctx,
@@ -136,36 +233,12 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
         remaining_missing = _missing_pool_ids(ctx, bundle.id)
         fenced_missing = _write_fenced_pool_ids(ctx, remaining_missing)
         if remaining_missing and remaining_missing == fenced_missing:
-            message = _write_fenced_missing_message(
+            return _fenced_missing_result(
+                ctx,
                 bundle.id,
                 repaired=repaired,
                 fenced_missing=fenced_missing,
-            )
-            record_observation(
-                ctx.session,
-                domain=DOMAIN,
-                target_key=bundle.id,
-                desired=True,
-                observed_state=OBSERVED_MISSING,
-                reason="fenced-missing",
-                message=message,
-            )
-            return JobResult(
-                ok=True,
-                detail=message,
-                step_state={
-                    "bundle_repair": {
-                        "bundle_id": bundle.id,
-                        "source_copy_id": source.id,
-                        "repaired_pools": sorted(repaired),
-                        "remaining_write_fenced_pools": sorted(fenced_missing),
-                    }
-                },
-                condition=ConditionProjection(
-                    condition=CONDITION_BACKOFF,
-                    reason="fenced-missing",
-                    message=message,
-                ),
+                source_copy_id=source.id,
             )
 
         return JobResult(
@@ -187,7 +260,24 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
 def make_archive_builder(*, rem_bin: str | None = None) -> ArchiveBuilder:
     """Return the production archive builder; tests may monkeypatch this seam."""
 
-    return RemArchiveBuilder(rem_bin or "rem")
+    return RemArchiveBuilder(rem_bin or "rem", keys=make_key_registry())
+
+
+def make_key_registry() -> KeyRegistry:
+    """Use the host registry for repair builds, readability checks and reads."""
+
+    return KeyRegistry()
+
+
+def _sealed_locator_needs_private_key(locator: AssetLocator) -> bool:
+    """Defer malformed sizes to the read primitive and its existing fallback lane."""
+
+    if "offset" in locator.native_locator:
+        return False
+    try:
+        return int(locator.native_locator.get("size_bytes", 0)) != 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _load_sealed_bundle(ctx: JobContext, bundle_id: str) -> Bundle:
@@ -287,6 +377,45 @@ def _write_fenced_missing_message(
     )
 
 
+def _fenced_missing_result(
+    ctx: JobContext,
+    bundle_id: str,
+    *,
+    repaired: set[str],
+    fenced_missing: set[str],
+    source_copy_id: int | None = None,
+) -> JobResult:
+    """Record the existing fenced outcome, including a source only if one was read."""
+
+    message = _write_fenced_missing_message(
+        bundle_id, repaired=repaired, fenced_missing=fenced_missing
+    )
+    record_observation(
+        ctx.session,
+        domain=DOMAIN,
+        target_key=bundle_id,
+        desired=True,
+        observed_state=OBSERVED_MISSING,
+        reason="fenced-missing",
+        message=message,
+    )
+    state: dict[str, object] = {
+        "bundle_id": bundle_id,
+        "repaired_pools": sorted(repaired),
+        "remaining_write_fenced_pools": sorted(fenced_missing),
+    }
+    if source_copy_id is not None:
+        state["source_copy_id"] = source_copy_id
+    return JobResult(
+        ok=True,
+        detail=message,
+        step_state={"bundle_repair": state},
+        condition=ConditionProjection(
+            condition=CONDITION_BACKOFF, reason="fenced-missing", message=message
+        ),
+    )
+
+
 def _extract_member_sources(
     *,
     ctx: JobContext,
@@ -295,6 +424,7 @@ def _extract_member_sources(
     source_backend: WritableStorageBackend,
     scratch: Path,
     rem_bin: str,
+    keys: KeyRegistry,
 ) -> list[MemberInput]:
     locators = {
         (locator.logical_asset_hash, locator.member_path): locator
@@ -320,6 +450,7 @@ def _extract_member_sources(
             asset_locator=locator,
             dest=dest,
             rem_bin=rem_bin,
+            keys=keys,
         )
         if dest.stat().st_size != member.size_bytes:
             raise ArchiveRestoreError(

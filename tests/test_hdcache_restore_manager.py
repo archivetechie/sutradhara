@@ -8,7 +8,10 @@ import json
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -90,6 +93,7 @@ from sutradhara.hdcache.store import (
 )
 from sutradhara.sealing.port import Representation
 from tests.bundle_group_helpers import bundle_kwargs
+from tests.key_helpers import registry_with_recovery
 
 TEST_HDCACHE_HMAC_SECRET = b"restore-manager-test-secret"
 
@@ -1934,6 +1938,75 @@ def test_archive_cli_private_assets_fail_closed_and_override_audits(
     assert allowed.exit_code == 0, allowed.output
     assert (tmp_path / "allowed.mov").read_bytes() == b"private bytes"
     assert "privacy-override" in caplog.text
+
+
+@pytest.mark.parametrize("route", ["serve", "path"])
+def test_default_restore_extractor_decrypts_sealed_copy(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """T7: console serving and path restores stream sealed members using config keys."""
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
+    hot = registry.create_epoch("archive")
+    data = b"sealed restore plaintext"
+    calls: list[tuple[int, bytes]] = []
+
+    @contextmanager
+    def decrypt(**kwargs: Any) -> Iterator[Iterator[bytes]]:
+        assert kwargs["private_key"].read_bytes().startswith(b"REMP")
+        locator = kwargs["locator"]
+        assert "offset" not in locator.native_locator
+        calls.append((kwargs["copy"].id, locator.logical_asset_hash))
+        yield iter((data[:7], data[7:]))
+
+    monkeypatch.setattr("sutradhara.archive_restore._open_rem_encrypt_plaintext_stream", decrypt)
+    root = tmp_path / "restore-root"
+    root.mkdir()
+    with session_scope(engine) as session:
+        digest, backend_id, memory = _seed_archived_asset(session, data=data)
+        copy = session.scalars(select(Copy)).one()
+        copy.storage_metadata = {
+            "representation": Representation.REM_ENCRYPT_V1.value,
+            "recipient_epochs": [hot.key_id, recovery.key_id],
+        }
+        locator = session.scalars(select(AssetLocator)).one()
+        locator.representation = Representation.REM_ENCRYPT_V1.value
+        locator.native_locator = {
+            "member_path": locator.member_path,
+            "size_bytes": len(data),
+            "first_chunk_lba": 0,
+        }
+        pool = session.get(Pool, copy.pool_id)
+        assert pool is not None
+        pool.representation = Representation.REM_ENCRYPT_V1.value
+        config = replace(
+            _config(root, restore_backends={backend_id: memory}), key_registry=registry
+        )
+        assert config.extractor is None
+        output = root / digest.hex()
+        if route == "serve":
+            request = admit_restore_request(
+                session,
+                identity=_identity("sutradhara-ingest"),
+                destination_id="media-server",
+                items=[RestoreItemSpec(digest, "s-masters")],
+                config=config,
+            )
+            item = request.items[0]
+            result = serve_restore_item(session, item, config=config)
+            assert item.state == ITEM_DONE, item.detail
+        else:
+            result = restore_to_path(
+                session,
+                asset_hash=digest,
+                artifactclass="s-masters",
+                destination=output,
+                identity_or_override=_identity("sutradhara-ingest"),
+                backends={backend_id: memory},
+                config=config,
+            )
+        assert result.source == "tape"
+        assert output.read_bytes() == data
+        assert calls == [(copy.id, digest)]
 
 
 def _identity(groups: str):

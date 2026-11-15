@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session, joinedload
 from sutradhara.archive_restore import (
     ArchiveExtractor,
     ArchiveRestoreError,
+    RemArchiveExtractor,
     RestoreResult,
     restore_asset,
     restore_assets_from_bundle,
@@ -744,7 +745,7 @@ def _restore_bundle_group(
         artifactclass=targets[0].artifactclass,
         destination_dir=root / f"bundle-{targets[0].bundle_key}",
         backends=backends,
-        extractor=config.extractor,
+        extractor=config.extractor or RemArchiveExtractor(keys=config.key_registry),
     )
     return {result.asset_hash: result for result in results}
 
@@ -769,7 +770,7 @@ def _restore_single_target(
             artifactclass=target.artifactclass,
             destination=destination,
             backends=backends,
-            extractor=config.extractor,
+            extractor=config.extractor or RemArchiveExtractor(keys=config.key_registry),
         )
     except ArchiveRestoreError as exc:
         raise RepopulationError(str(exc)) from exc

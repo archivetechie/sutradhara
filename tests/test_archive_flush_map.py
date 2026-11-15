@@ -33,10 +33,12 @@ from sutradhara.archive_fanout import (
     FlushPreflightShort,
     LocalArchiveBuilder,
     RemArchiveBuilder,
+    SealKeyUnavailable,
     _member_input,
     _member_rows_for_flush,
     _render_flush_map,
     flush_bundle,
+    preflight_seal_keys,
 )
 from sutradhara.artifactclass_policy import (
     ArtifactClassPolicy,
@@ -77,11 +79,197 @@ from sutradhara.catalog.types import (
     content_hash,
 )
 from sutradhara.rem_archive_cli import RemArchiveBuildResult
+from sutradhara.replication import PoolTarget
+from sutradhara.resource_control import ResourceControlUnavailable
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 from tests.bundle_group_helpers import bundle_kwargs
+from tests.key_helpers import make_test_key_registry, registry_with_recovery
 
 MAP_HEADER = "archive_path\tsource_path\tsha256\tsize\tingest_item_id"
+
+
+class _SealProcessReached(Exception):
+    """Stop a valid sealing leg exactly at the process boundary."""
+
+
+@pytest.mark.parametrize(
+    "case", ["missing", "recovery", "unknown", "retired", "no-recovery", "good"]
+)
+def test_sealed_flush_checks_keys_before_claim(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """T1: key faults leave the live transaction unclaimed; valid keys reach rem."""
+    if case == "no-recovery":
+        registry = make_test_key_registry(tmp_path / "keys")
+        recovery_id = None
+    else:
+        registry, recovery = registry_with_recovery(tmp_path / "keys")
+        recovery_id = recovery.key_id
+    hot = registry.create_epoch("archive")
+    epoch = hot.key_id
+    if case == "missing":
+        epoch = None
+    elif case == "recovery":
+        epoch = recovery_id
+    elif case == "unknown":
+        epoch = "archive-" + "f" * 32
+    elif case == "retired":
+        registry.retire_epoch(hot.key_id)
+    calls: list[dict[str, Any]] = []
+
+    def process(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        raise _SealProcessReached
+
+    monkeypatch.setattr("sutradhara.archive_fanout.run_rem_archive_build", process)
+    source = tmp_path / "sealed.bin"
+    source.write_bytes(b"sealed member")
+    backend = _WriteBackend()
+    with session_scope(engine) as session:
+        _install_class(
+            session, "sealed", pools=(("sealed-pool", Representation.REM_ENCRYPT_V1.value),)
+        )
+        bundle_id = _enqueue(
+            session, artifactclass="sealed", source=source, member_path=source.name
+        ).id
+
+    with session_scope(engine) as session:
+        kwargs = dict(
+            bundle_id=bundle_id,
+            backends=_backends_for(session, backend),
+            builder=RemArchiveBuilder(keys=registry),
+            key_epoch=epoch,
+        )
+        if case == "good":
+            with pytest.raises(_SealProcessReached):
+                flush_bundle(session, **kwargs)
+            assert calls
+            return
+        with pytest.raises(SealKeyUnavailable) as caught:
+            flush_bundle(session, **kwargs)
+        # These assertions precede session exit/rollback: the build also checks keys.
+        bundle = session.get(Bundle, bundle_id)
+        assert bundle is not None
+        assert bundle.claimed_by is None, "no claim before key validation"
+        assert bundle.status == "open"
+        assert bundle.archive_id is None
+        assert calls == []
+        assert caught.value.reason == (
+            "key-epoch-missing" if case == "missing" else "key-epoch-unusable"
+        )
+        assert "sealed-pool" in str(caught.value)
+        assert "sutra archive bundle flush" in str(caught.value)
+        assert "sutra archive bundle sweep" in str(caught.value)
+        assert "--key-epoch" in str(caught.value)
+        assert "-p key_epoch=" in str(caught.value)
+
+
+def test_sealed_build_rejects_unknown_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T3: a real registry refuses an unknown epoch before invoking rem."""
+    registry, _ = registry_with_recovery(tmp_path / "keys")
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "sutradhara.archive_fanout.run_rem_archive_build", lambda **kw: calls.append(kw)
+    )
+    with pytest.raises(SealKeyUnavailable) as caught:
+        RemArchiveBuilder(keys=registry).build(
+            bundle=Bundle(id="sealed-build", **bundle_kwargs(seed="sealed-build")),
+            members=(),
+            representation=Representation.REM_ENCRYPT_V1,
+            ruleset="",
+            key_epoch="archive-" + "f" * 32,
+            work_dir=tmp_path,
+            map_path=tmp_path / "map",
+            source_root=tmp_path,
+        )
+    assert calls == []
+    assert caught.value.reason == "key-epoch-unusable"
+    assert "unknown key epoch" in str(caught.value)
+
+
+@pytest.mark.parametrize("phase", ["recipients", "public-path"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        KeyError("unknown epoch"),
+        ValueError("malformed state"),
+        RuntimeError("invalid material"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid registry text"),
+        OSError("unreadable registry"),
+        ResourceControlUnavailable("scope unavailable"),
+    ],
+    ids=["unknown", "malformed", "invalid", "unicode", "os", "scope"],
+)
+def test_sealed_build_translates_key_faults_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, fault: Exception
+) -> None:
+    """T3: build recipient and public-path faults share the preflight taxonomy."""
+    registry, _ = registry_with_recovery(tmp_path / "keys")
+    epoch = registry.create_epoch("archive")
+    calls: list[object] = []
+
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(
+        registry, "recipients_for_seal" if phase == "recipients" else "public_key_path", fail
+    )
+    monkeypatch.setattr(
+        "sutradhara.archive_fanout.run_rem_archive_build", lambda **kw: calls.append(kw)
+    )
+    expected = (
+        type(fault)
+        if isinstance(fault, (OSError, ResourceControlUnavailable))
+        else SealKeyUnavailable
+    )
+    with pytest.raises(expected) as caught:
+        RemArchiveBuilder(keys=registry).build(
+            bundle=Bundle(id="sealed-build", **bundle_kwargs(seed="sealed-build")),
+            members=(),
+            representation=Representation.REM_ENCRYPT_V1,
+            ruleset="",
+            key_epoch=epoch.key_id,
+            work_dir=tmp_path,
+            map_path=tmp_path / "map",
+            source_root=tmp_path,
+        )
+    assert calls == []
+    if isinstance(caught.value, SealKeyUnavailable):
+        assert caught.value.reason == "key-epoch-unusable"
+        assert str(fault) in str(caught.value)
+    else:
+        assert caught.value is fault
+
+
+def test_seal_preflight_checks_each_epoch_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multiple sealed pools sharing an epoch perform one registry selection."""
+    registry = make_test_key_registry(tmp_path / "keys")
+    builder = RemArchiveBuilder(keys=registry)
+    calls: list[str] = []
+    monkeypatch.setattr(builder, "seal_recipients", lambda epoch: calls.append(epoch))
+    backend = _WriteBackend()
+    epochs = ["archive-" + char * 32 for char in ("1", "1", "2")]
+    targets = [
+        (
+            backend,
+            PoolTarget(
+                pool_id=f"p{i}",
+                artifactclass="sealed",
+                backend_id=1,
+                backend_name="rem",
+                representation=Representation.REM_ENCRYPT_V1.value,
+                key_epoch=epoch,
+            ),
+        )
+        for i, epoch in enumerate(epochs)
+    ]
+    preflight_seal_keys(targets, builder)
+    assert calls == [epochs[0], epochs[2]]
 
 
 @pytest.fixture

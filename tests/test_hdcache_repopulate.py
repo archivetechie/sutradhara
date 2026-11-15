@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,7 @@ from sutradhara.jobs.models import Job, JobStatus, ReconciliationCondition
 from sutradhara.jobs.reconcilers.conditions import CONDITION_OPEN, CONDITION_SATISFIED
 from sutradhara.sealing.port import Representation
 from tests.bundle_group_helpers import bundle_kwargs
+from tests.key_helpers import registry_with_recovery
 
 
 @pytest.fixture
@@ -857,6 +859,86 @@ class CountingBundleExtractor:
             offset = int(locator.native_locator["offset"])
             size = int(locator.native_locator["size_bytes"])
             destinations[locator.logical_asset_hash].write_bytes(blob[offset : offset + size])
+
+
+@pytest.mark.parametrize("member_count", [1, 2], ids=["single", "bundle"])
+def test_default_repopulation_extractor_decrypts_sealed_copy(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member_count: int
+) -> None:
+    """T8: single and grouped refill routes decrypt with the configured registry."""
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
+    hot = registry.create_epoch("archive")
+    memory = MemoryBackend("mem")
+    data = [f"sealed refill plaintext {index}".encode() for index in range(member_count)]
+    by_hash = {hashlib.sha256(payload).digest(): payload for payload in data}
+    calls: list[bytes] = []
+
+    @contextmanager
+    def decrypt(**kwargs: Any) -> Iterator[Iterator[bytes]]:
+        assert kwargs["private_key"].read_bytes().startswith(b"REMP")
+        locator = kwargs["locator"]
+        assert "offset" not in locator.native_locator
+        calls.append(locator.logical_asset_hash)
+        yield iter((by_hash[locator.logical_asset_hash],))
+
+    monkeypatch.setattr("sutradhara.archive_restore._open_rem_encrypt_plaintext_stream", decrypt)
+    with session_scope(engine) as session:
+        _add_disk(session, "d001", tmp_path / "dead", state="dead")
+        _add_disk(session, "d002", tmp_path / "active")
+        targets = _seed_bundle(
+            session, memory, bundle_id="sealed-bundle", members=data, tape_uuid="sealed-tape"
+        )
+        copy = session.scalars(select(Copy)).one()
+        copy.storage_metadata = {
+            "representation": Representation.REM_ENCRYPT_V1.value,
+            "recipient_epochs": [hot.key_id, recovery.key_id],
+        }
+        for index, locator in enumerate(session.scalars(select(AssetLocator))):
+            locator.representation = Representation.REM_ENCRYPT_V1.value
+            locator.native_locator = {
+                "member_path": locator.member_path,
+                "size_bytes": len(by_hash[locator.logical_asset_hash]),
+                "first_chunk_lba": index,
+            }
+        pool = session.get(Pool, copy.pool_id)
+        assert pool is not None
+        pool.representation = Representation.REM_ENCRYPT_V1.value
+        for target in targets:
+            session.add(
+                CacheEntry(
+                    content_sha256=target["digest"],
+                    artifactclass="s-masters",
+                    bundle_key="sealed-bundle",
+                    group_key="s-masters:test",
+                    disk_id="d001",
+                    relpath=target["digest"].hex(),
+                    size_bytes=target["size"],
+                    state="lost",
+                    representation=RAW_REPRESENTATION,
+                    trusted=True,
+                    lost_origin_disk_id="d001",
+                )
+            )
+        config = RepopulationConfig(
+            fill_config=HdcacheFillConfig(scratch_root=tmp_path / "scratch"),
+            scratch_root=tmp_path / "scratch",
+            key_registry=registry,
+            restore_backends={copy.backend_id: memory},
+        )
+        assert config.extractor is None
+        plan = enqueue_repopulation(session, config=config)
+        assert plan.scheduled == 1
+        job = session.scalars(select(Job).where(Job.kind == "hdcache_fill")).one()
+        results = execute_repopulation_batch(session, job.params, config=config)
+        assert {result.source for result in results} == (
+            {"restore"} if member_count == 1 else {"restore-batch"}
+        )
+        assert sorted(calls) == sorted(by_hash)
+        for digest, payload in by_hash.items():
+            entry = session.get(CacheEntry, digest)
+            assert entry is not None
+            assert entry.state == "present"
+            assert entry_path(tmp_path / "active", digest).read_bytes() == payload
 
 
 def _add_disk(

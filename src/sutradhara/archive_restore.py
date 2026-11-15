@@ -420,7 +420,7 @@ class RemArchiveExtractor(LocalArchiveExtractor):
     def open_aead_member_stream(self, member: PlannedMember) -> Iterator[Iterator[bytes]]:
         """Decrypt one planned AEAD member without materializing its stored object."""
 
-        selected = _select_private_epoch(self._keys, member.copy.storage_metadata)
+        selected = select_private_epoch_for_copy(self._keys, member.copy.storage_metadata)
         with (
             self._keys.materialized_private_key(selected) as private_key,
             _open_rem_encrypt_plaintext_stream(
@@ -2001,7 +2001,7 @@ def _extract_rem_object_materialized_member_to_path(
             cmd.extend(["--chunk-size", str(REM_OBJECT_CHUNK_SIZE)])
             _run_rem(cmd)
         elif representation is Representation.REM_ENCRYPT_V1:
-            selected = _select_private_epoch(keys, copy.storage_metadata)
+            selected = select_private_epoch_for_copy(keys, copy.storage_metadata)
             with keys.materialized_private_key(selected) as private_key:
                 cmd.extend(["--private-key", str(private_key)])
                 _run_rem(cmd)
@@ -2058,7 +2058,7 @@ def _recipient_epochs(storage_metadata: dict[str, Any]) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _select_private_epoch(keys: KeyRegistry, storage_metadata: dict[str, Any]) -> str:
+def select_private_epoch_for_copy(keys: KeyRegistry, storage_metadata: dict[str, Any]) -> str:
     recipients = _recipient_epochs(storage_metadata)
     try:
         return keys.select_private_epoch(recipients, domain=KEY_DOMAIN_ARCHIVE).key_id

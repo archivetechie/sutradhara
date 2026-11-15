@@ -33,6 +33,7 @@ from sutradhara.api.identity import Identity
 from sutradhara.archive_restore import (
     ArchiveExtractor,
     ArchiveRestoreError,
+    RemArchiveExtractor,
     RestoreRejectedAsset,
     RestoreResult,
     RestoreSuspectAsset,
@@ -1379,7 +1380,7 @@ def _serve_from_tape(
         artifactclass=artifactclass,
         destination=destination,
         backends=backends,
-        extractor=config.extractor,
+        extractor=config.extractor or RemArchiveExtractor(keys=config.key_registry),
         force_suspect=force_suspect,
         force_rejected=force_rejected,
     )

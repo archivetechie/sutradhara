@@ -77,7 +77,7 @@ from sutradhara.replication import (
     WritableStorageBackend,
     bundle_group_targets,
 )
-from sutradhara.resource_control import run_managed
+from sutradhara.resource_control import ResourceControlUnavailable, run_managed
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
 from sutradhara.structured_logs import emit_structured_event
@@ -88,6 +88,26 @@ _BUNDLE_COPY_FAST_PATH_KEY = "sutradhara_bundle_copy_fast_path"
 
 class ArchiveFanoutError(Exception):
     """Base class for archive fan-out errors."""
+
+
+class SealKeyUnavailable(ArchiveFanoutError):
+    """A sealed target lacks a usable archive sealing epoch."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
+@contextmanager
+def _seal_key_errors() -> Iterator[None]:
+    """Translate registry validation faults while preserving host-fault lanes."""
+
+    try:
+        yield
+    except ResourceControlUnavailable:
+        raise
+    except (KeyError, ValueError, RuntimeError) as exc:
+        raise SealKeyUnavailable("key-epoch-unusable", str(exc)) from exc
 
 
 class FlushPreflightShort(ArchiveFanoutError):
@@ -424,6 +444,14 @@ class RemArchiveBuilder:
         self._rem_bin = None if rem_bin is None else str(rem_bin)
         self._keys = keys or KeyRegistry()
 
+    def seal_recipients(self, key_epoch: str) -> tuple[str, ...]:
+        """Validate an archive epoch and resolve its hot and recovery recipients."""
+
+        with _seal_key_errors():
+            assert_key_epoch_domain(key_epoch, KEY_DOMAIN_ARCHIVE, context="archive sealing")
+            recipients = self._keys.recipients_for_seal(key_epoch, domain=KEY_DOMAIN_ARCHIVE)
+            return tuple(epoch.key_id for epoch in recipients)
+
     def build(
         self,
         *,
@@ -449,19 +477,11 @@ class RemArchiveBuilder:
         if representation is Representation.REM_ENCRYPT_V1:
             if key_epoch is None:
                 raise ArchiveFanoutError("encrypted REM-OBJECT archive build requires key_epoch")
-            try:
-                assert_key_epoch_domain(
-                    key_epoch,
-                    KEY_DOMAIN_ARCHIVE,
-                    context=f"pool sealing for bundle {bundle.id}",
+            expected_recipient_epochs = self.seal_recipients(key_epoch)
+            with _seal_key_errors():
+                recipients = tuple(
+                    self._keys.public_key_path(epoch) for epoch in expected_recipient_epochs
                 )
-            except ValueError as exc:
-                raise ArchiveFanoutError(str(exc)) from exc
-            recipients = self._keys.recipients_for_seal(
-                key_epoch,
-                domain=KEY_DOMAIN_ARCHIVE,
-            )
-            expected_recipient_epochs = tuple(epoch.key_id for epoch in recipients)
             result = run_rem_archive_build(
                 inputs=None,
                 ruleset=None,
@@ -471,7 +491,7 @@ class RemArchiveBuilder:
                 output_path=output_path,
                 manifest_path=manifest_path,
                 rem_bin=self._rem_bin,
-                recipients=tuple(self._keys.public_key_path(epoch.key_id) for epoch in recipients),
+                recipients=recipients,
                 failure_label="rem archive build",
             )
         else:
@@ -627,7 +647,14 @@ def flush_bundle(
     # order (§2/§5) — never from a member class's live policy and never from a
     # representative-class hop.
     targets = bundle_group_targets(session, bundle, backends, key_epoch=key_epoch)
-    _require_key_epoch(targets)
+    try:
+        preflight_seal_keys(targets, builder)
+    except SealKeyUnavailable as exc:
+        guidance = (
+            "supply --key-epoch on sutra archive bundle flush or sutra archive bundle sweep, "
+            "or -p key_epoch= on a bundle-sweep job"
+        )
+        raise SealKeyUnavailable(exc.reason, f"{exc}; {guidance}") from exc
 
     with tempfile.TemporaryDirectory(prefix=f"sutradhara-bundle-{bundle.id}-") as raw:
         work_dir = Path(raw)
@@ -1716,15 +1743,37 @@ def _build_for_target(
     )
 
 
-def _require_key_epoch(
+def preflight_seal_keys(
     targets: Sequence[tuple[WritableStorageBackend, PoolTarget]],
+    builder: ArchiveBuilder,
 ) -> None:
-    for _, target in targets:
-        if (
-            target.representation == Representation.REM_ENCRYPT_V1.value
-            and target.key_epoch is None
-        ):
-            raise ArchiveFanoutError(f"encrypted pool {target.pool_id!r} requires key_epoch")
+    """Check sealed destinations before a flush claim or any repair source read."""
+
+    sealed = [
+        target
+        for _, target in targets
+        if target.representation == Representation.REM_ENCRYPT_V1.value
+    ]
+    checked: set[str] = set()
+    for target in sealed:
+        key_epoch = target.key_epoch
+        pools = sorted(item.pool_id for item in sealed if item.key_epoch == key_epoch)
+        if key_epoch is None:
+            raise SealKeyUnavailable(
+                "key-epoch-missing", f"encrypted pools {pools}: key-epoch-missing"
+            )
+        if key_epoch in checked:
+            continue
+        try:
+            assert_key_epoch_domain(key_epoch, KEY_DOMAIN_ARCHIVE, context=f"pools {pools}")
+            if isinstance(builder, RemArchiveBuilder):
+                builder.seal_recipients(key_epoch)
+        except (ValueError, SealKeyUnavailable) as exc:
+            raise SealKeyUnavailable(
+                "key-epoch-unusable",
+                f"encrypted pools {pools}: key-epoch-unusable: {exc}",
+            ) from exc
+        checked.add(key_epoch)
 
 
 def _copy_storage_metadata(

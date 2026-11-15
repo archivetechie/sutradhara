@@ -23,7 +23,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
-from sutradhara.archive_restore import ArchiveRestoreError, restore_asset
+from sutradhara.archive_restore import ArchiveRestoreError, RemArchiveExtractor, restore_asset
 from sutradhara.artifactclass_policy import hdcache_policy_from_json
 from sutradhara.backend.factory import backend_from_row
 from sutradhara.backend.port import StorageBackend
@@ -654,6 +654,7 @@ def fill_target(
                 session,
                 target,
                 config=final_config,
+                registry=registry,
                 restore_backends=restore_backends,
                 restore_backend_resolver=restore_backend_resolver or resolve_restore_backends,
             ) as source:
@@ -1303,6 +1304,7 @@ def _plaintext_source(
     target: HdcacheFillTarget,
     *,
     config: HdcacheFillConfig,
+    registry: KeyRegistry,
     restore_backends: dict[int, StorageBackend] | None,
     restore_backend_resolver: RestoreBackendResolver,
 ) -> Iterator[_PlaintextSource]:
@@ -1331,6 +1333,7 @@ def _plaintext_source(
                 artifactclass=target.artifactclass,
                 destination=restored,
                 backends=backends,
+                extractor=RemArchiveExtractor(keys=registry),
             )
         except ArchiveRestoreError as exc:
             raise HdcacheFillBlocked("restore-unavailable", str(exc)) from exc

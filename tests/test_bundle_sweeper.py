@@ -775,6 +775,57 @@ def test_a_failing_bundle_in_a_sweep_is_un_claimed_and_the_pass_carries_on(
         assert [candidate.id for candidate in due_bundles(session)] == [broken_id]
 
 
+def test_sweeper_records_missing_seal_key_and_flushes_other_bundle(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T2: one sealed bundle without a key cannot prevent an independent flush."""
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "sutradhara.archive_sweeper.emit_structured_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+    with session_scope(engine) as session:
+        _install_class(session, "sealed", pools=("sealed-pool",), target_bytes=100)
+        pool = session.get(Pool, "sealed-pool")
+        assert pool is not None
+        pool.representation = Representation.REM_ENCRYPT_V1.value
+        session.flush()
+        # Enqueue after changing the representation so the frozen basis is sealed.
+        _install_class(session, "plain", pools=("plain-pool",), target_bytes=100)
+        for index in range(2):
+            sealed = _enqueue(
+                session,
+                artifactclass="sealed",
+                source=_source(tmp_path, f"sealed-{index}", size=60),
+                member_path=f"sealed-{index}",
+            )
+            plain = _enqueue(
+                session,
+                artifactclass="plain",
+                source=_source(tmp_path, f"plain-{index}", size=60),
+                member_path=f"plain-{index}",
+            )
+        sealed_id, plain_id = sealed.id, plain.id
+    backend = _WriteBackend()
+    with session_scope(engine) as session:
+        result = sweep_bundles(
+            session, backends=_backends(session, backend), builder=LocalArchiveBuilder()
+        )
+        assert result.flushed == (plain_id,)
+        assert [bundle_id for bundle_id, _ in result.failed] == [sealed_id]
+        assert "key-epoch-missing" in result.failed[0][1]
+        assert "sealed-pool" in result.failed[0][1]
+        bundle = session.get(Bundle, sealed_id)
+        assert bundle is not None
+        assert bundle.status == "open"
+        assert bundle.claimed_by is None
+        assert bundle.archive_id is None
+    assert backend.writes == ["plain-pool"]
+    failures = [fields for name, fields in events if name == "bundle_sweep_flush_failed"]
+    assert len(failures) == 1
+    assert failures[0]["reason"] == "SealKeyUnavailable"
+
+
 def test_post_write_verify_failure_seals_partial_through_the_sweep(
     engine: Engine, tmp_path: Path
 ) -> None:
