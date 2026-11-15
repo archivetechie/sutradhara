@@ -34,7 +34,9 @@ from sutradhara.backend.port import (
     ByteRange,
     CopyRecord,
     StreamKind,
+    VerifyObserver,
     VerifyResult,
+    _hash_observed_chunks,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
 from sutradhara.jobs.runtime_observations import report_tape_locator
@@ -192,7 +194,10 @@ class D2TapeBackend:
                     chunk_bytes=chunk_bytes,
                 )
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
+        """Gate on d2tape's verify report, then hash and optionally observe its payload."""
         report_tape_locator(locator)
         device = self._device_config()
         artifact = self._artifact_for_locator(locator)
@@ -220,7 +225,14 @@ class D2TapeBackend:
                 device,
             )
             if report.get("ok") is True and _per_file_ok(report):
-                actual = content_hash(_sha256_file(self._restore_payload(locator, scratch)))
+                restored = self._restore_payload(locator, scratch)
+                if observe is None:
+                    actual = content_hash(_sha256_file(restored))
+                else:
+                    with restored.open("rb") as source:
+                        actual = _hash_observed_chunks(
+                            iter(lambda: source.read(256 * 1024), b""), observe
+                        )
                 if actual == expected:
                     return VerifyResult(ok=True, measured=True, actual_hash=actual)
                 return VerifyResult(

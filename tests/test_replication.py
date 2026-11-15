@@ -17,6 +17,7 @@ from sutradhara.backend.port import (
     BackendLocator,
     ByteRange,
     CopyRecord,
+    VerifyObserver,
     VerifyResult,
 )
 from sutradhara.backend.remanence import RemanenceDigestMismatchError
@@ -121,8 +122,12 @@ class _PoolWriteBackend:
         data = self._payload_by_object_id[str(locator["object_id"])]
         return data if byte_range.is_whole_object else data[byte_range.start : byte_range.end]
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         data = self.read_range(locator, ByteRange(0, 0))
+        if observe is not None:
+            observe(0, data)
         actual = content_hash(hashlib.sha256(data).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
         return VerifyResult(

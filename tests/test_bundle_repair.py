@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,6 +33,8 @@ from sutradhara.backend.port import (
     BackendLocator,
     ByteRange,
     CopyRecord,
+    StreamKind,
+    VerifyObserver,
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_bundle_copy
@@ -130,11 +133,16 @@ class _Backend:
             return data
         return data[byte_range.start : byte_range.end]
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         if self.fail_next_verify:
             self.fail_next_verify = False
             return VerifyResult(ok=False, measured=False, detail="forced verify failure")
-        actual = content_hash(hashlib.sha256(self.read_range(locator, ByteRange(0, 0))).digest())
+        data = self.read_range(locator, ByteRange(0, 0))
+        if observe is not None:
+            observe(0, data)
+        actual = content_hash(hashlib.sha256(data).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
         return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)
 
@@ -203,6 +211,81 @@ def test_bundle_repair_rebuilds_missing_pool_after_staging_purge(
             )
         attempt = s.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
         assert "tape:D2BAR000003" in attempt.detail["components"]
+
+
+class _StreamingRepairBackend(_Backend):
+    """Expose source member range sessions separately from target verification reads."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.streams: list[tuple[str, ByteRange]] = []
+
+    @property
+    def stream_kind(self) -> StreamKind:
+        return StreamKind.native_stream
+
+    @contextmanager
+    def open_range_chunks(
+        self, locator: BackendLocator, byte_range: ByteRange, *, chunk_bytes: int
+    ) -> Iterator[Iterator[bytes]]:
+        object_id = str(locator["object_id"])
+        self.streams.append((object_id, byte_range))
+        data = self.objects[object_id]
+        end = len(data) if byte_range.is_whole_object else byte_range.end
+
+        def chunks() -> Iterator[bytes]:
+            for cursor in range(byte_range.start, end, chunk_bytes):
+                yield data[cursor : min(cursor + chunk_bytes, end)]
+
+        yield chunks()
+
+
+def test_bundle_repair_reads_each_source_member_in_one_range(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T5: the repair handler materializes each source member in one opener session."""
+    backend = _StreamingRepairBackend()
+    bundle_id, _, assets = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
+    backend.streams.clear()
+    with session_scope(engine) as session:
+        source_copy = session.scalars(select(Copy).where(Copy.pool_id == "p1")).one()
+        source_id = str(source_copy.native_locator["object_id"])
+        header_end = 8 + int.from_bytes(backend.objects[source_id][:8], "big")
+        source_locators = list(
+            session.scalars(select(AssetLocator).where(AssetLocator.copy_id == source_copy.id))
+        )
+        expected_ranges = [
+            ByteRange(
+                header_end + int(locator.native_locator["offset"]),
+                header_end
+                + int(locator.native_locator["offset"])
+                + int(locator.native_locator["size_bytes"]),
+            )
+            for locator in source_locators
+        ]
+        missing = session.scalars(select(Copy).where(Copy.pool_id == "p2")).one()
+        missing.health = CopyHealth.MISSING
+        bundle = session.get(Bundle, bundle_id)
+        assert bundle is not None
+        for member in bundle.members:
+            member.source_path = str(tmp_path / "purged" / member.member_path)
+        monkeypatch.setattr(bundle_repair.factory, "backend_from_row", lambda _: backend)
+        monkeypatch.setattr(
+            bundle_repair, "make_archive_builder", lambda rem_bin=None: _OutputsBuilder()
+        )
+        job = submit(session, "bundle-repair", {"bundle_id": bundle_id})
+        result = run_one(session, job.id)
+        assert result.ok
+        source_ranges = [span for object_id, span in backend.streams if object_id == source_id]
+        assert sorted(source_ranges, key=lambda span: span.start) == sorted(
+            expected_ranges, key=lambda span: span.start
+        )
+        assert len(source_ranges) == len(assets)
+        assert all(not span.is_whole_object for span in source_ranges)
+        repaired = session.scalars(
+            select(Copy).where(Copy.pool_id == "p2", Copy.health == CopyHealth.OK)
+        ).one()
+        assert repaired.last_measured_digest == repaired.integrity_hash
 
 
 def test_bundle_repair_marks_corrupt_source_suspect_and_falls_back(

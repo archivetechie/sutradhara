@@ -16,15 +16,18 @@ import json
 import logging
 import os
 import re
+import shutil
+import sys
 import tarfile
 import tempfile
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 
-from sqlalchemy import event, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.orm import Session, noload
 
 from sutradhara.archive_bundle import (
@@ -35,7 +38,12 @@ from sutradhara.archive_bundle import (
     record_exclusion,
     submission_links,
 )
-from sutradhara.archive_restore import ArchiveRestoreError, member_byte_base, read_member_bytes
+from sutradhara.archive_restore import (
+    ArchiveRestoreError,
+    _copy_backend_range_to_path,
+    member_byte_base,
+    read_member_bytes,
+)
 from sutradhara.arrangement import SourceMapEntry, render_source_map
 from sutradhara.backend.port import BackendError, ByteRange, VerifyResult
 from sutradhara.catalog.copies import add_bundle_copy
@@ -501,63 +509,69 @@ class RemArchiveBuilder:
             recipient_epochs=recipient_epochs,
         )
 
-    def verify_member_copy(
+    @contextmanager
+    def extract_member_from_path(
         self,
         *,
-        backend: WritableStorageBackend,
-        copy_locator: dict[str, Any],
+        object_path: Path,
         member: BuiltMember,
         representation: Representation,
         storage_metadata: Mapping[str, Any],
         work_dir: Path,
-    ) -> bytes:
-        """Extract one member from the stored copy through rem for verification."""
+    ) -> Iterator[Path]:
+        """Extract from one local read-back object and own the member output's lifetime."""
         if representation not in {Representation.REM_OBJECT_V1, Representation.REM_ENCRYPT_V1}:
             raise ArchiveFanoutError(
                 f"RemArchiveBuilder cannot verify representation {representation.value!r}"
             )
-        object_path = (
-            work_dir
-            / f"verify-{hashlib.sha256(member.member_path.encode()).hexdigest()}.rem-object"
-        )
-        _materialize_copy_to_path(backend, copy_locator, storage_metadata, object_path)
         verify_id = hashlib.sha256(member.member_path.encode() + b"\0" + member.file_sha256)
         dest = work_dir / f"verify-out-{verify_id.hexdigest()}"
         dest.mkdir()
-        cmd = [
-            resolve_rem_bin(self._rem_bin),
-            "archive",
-            "extract",
-            "--object",
-            str(object_path),
-            "--dest",
-            str(dest),
-            "--path",
-            member.member_path,
-            "--first-chunk-lba",
-            str(_member_first_chunk_lba(member.native_locator)),
-            "--file-size-bytes",
-            str(member.size_bytes),
-            "--range",
-            f"0:{member.size_bytes}",
-            "--overwrite",
-        ]
-        if representation is Representation.REM_OBJECT_V1:
-            cmd.extend(["--chunk-size", str(REM_OBJECT_CHUNK_SIZE)])
-            _run_rem(cmd)
-        else:
-            recipient_epochs = _metadata_recipient_epochs(storage_metadata)
-            try:
-                selected = self._keys.select_private_epoch(
-                    recipient_epochs,
-                    domain=KEY_DOMAIN_ARCHIVE,
-                )
-            except (KeyError, ValueError) as exc:
-                raise ArchiveFanoutError(str(exc)) from exc
-            with self._keys.materialized_private_key(selected.key_id) as key_file:
-                cmd.extend(["--private-key", str(key_file)])
+        try:
+            cmd = [
+                resolve_rem_bin(self._rem_bin),
+                "archive",
+                "extract",
+                "--object",
+                str(object_path),
+                "--dest",
+                str(dest),
+                "--path",
+                member.member_path,
+                "--first-chunk-lba",
+                str(_member_first_chunk_lba(member.native_locator)),
+                "--file-size-bytes",
+                str(member.size_bytes),
+                "--range",
+                f"0:{member.size_bytes}",
+                "--overwrite",
+            ]
+            if representation is Representation.REM_OBJECT_V1:
+                cmd.extend(["--chunk-size", str(REM_OBJECT_CHUNK_SIZE)])
                 _run_rem(cmd)
-        return _single_restored_member(dest, member.member_path)
+            else:
+                recipient_epochs = _metadata_recipient_epochs(storage_metadata)
+                try:
+                    selected = self._keys.select_private_epoch(
+                        recipient_epochs,
+                        domain=KEY_DOMAIN_ARCHIVE,
+                    )
+                except (KeyError, ValueError) as exc:
+                    raise ArchiveFanoutError(str(exc)) from exc
+                with self._keys.materialized_private_key(selected.key_id) as key_file:
+                    cmd.extend(["--private-key", str(key_file)])
+                    _run_rem(cmd)
+            yield _single_restored_member(dest, member.member_path)
+        finally:
+            unwinding = sys.exc_info()[0] is not None
+            try:
+                shutil.rmtree(dest)
+            except Exception:
+                if not unwinding:
+                    raise
+                LOGGER.warning(
+                    "Failed to remove member verification directory %s", dest, exc_info=True
+                )
 
 
 def flush_bundle(
@@ -621,10 +635,26 @@ def flush_bundle(
         # Skip-and-alarm BEFORE anything is mutated — the claim, the archive_id
         # mint and the status transition all sit after it, so a short work dir
         # leaves the bundle exactly as it found it (and un-claimed).
+        required_bytes = bundle.total_bytes * max(len(targets), 1)
+        if any(
+            target.representation == Representation.REM_ENCRYPT_V1.value for _, target in targets
+        ):
+            # Aggregate only: the member snapshot must still follow the claim.
+            member_count, largest_member = session.execute(
+                select(func.count(BundleMember.id), func.max(BundleMember.size_bytes)).where(
+                    BundleMember.bundle_id == bundle.id
+                )
+            ).one()
+            required_bytes += (
+                bundle.total_bytes
+                + bundle.total_bytes // 100
+                + (member_count + 2) * REM_OBJECT_CHUNK_SIZE
+                + (largest_member or 0)
+            )
         _preflight_flush_work_dir(
             work_dir,
             bundle_id=bundle.id,
-            required_bytes=bundle.total_bytes * max(len(targets), 1),
+            required_bytes=required_bytes,
             target_count=len(targets),
         )
         # The claim comes FIRST, ahead of the member load: round 3 showed a
@@ -1054,7 +1084,7 @@ def _preflight_flush_work_dir(
     required_bytes: int,
     target_count: int,
 ) -> None:
-    """§8 statvfs preflight sized to the bundle x target count; skip-and-alarm."""
+    """Check build and read-back scratch capacity before the claim; skip-and-alarm."""
     stats = os.statvfs(work_dir)
     available = stats.f_bavail * stats.f_frsize
     if available < required_bytes:
@@ -1856,6 +1886,116 @@ def _record_build_exclusions(
         )
 
 
+def _verification_member_size(member: BuiltMember) -> int:
+    """Parse the same locator size used by the member restore primitive."""
+    value = member.native_locator.get("size_bytes")
+    if value is None:
+        raise ValueError("asset locator is missing size_bytes")
+    size = int(value)
+    if size < 0:
+        raise ValueError(f"invalid size_bytes {value!r}")
+    return size
+
+
+class _ObservedMember:
+    """A member's bounded hash state and its object-relative payload interval."""
+
+    def __init__(self, member: BuiltMember) -> None:
+        self.member = member
+        self.size = _verification_member_size(member)
+        # Empty files have no payload interval, including no base to range-check.
+        self.base = member_byte_base(member.native_locator) if self.size else 0
+        self.digest = hashlib.sha256()
+        self.received = 0
+
+
+class _CopyReadbackObserver:
+    """Record one verify pass without raising; validate only measured results.
+
+    Plaintext chunks feed sorted member intervals without retaining the object.
+    An encrypted pass instead spools ciphertext to one local extraction source.
+    """
+
+    def __init__(
+        self, members: Sequence[BuiltMember] = (), *, sink: BinaryIO | None = None
+    ) -> None:
+        self.total = 0
+        self.contiguous = True
+        self.sink = sink
+        self.write_error: OSError | None = None
+        self.member_error: Exception | None = None
+        self.members: list[_ObservedMember] = []
+        try:
+            self.members = [_ObservedMember(member) for member in members]
+        except (ArchiveRestoreError, ValueError, TypeError) as exc:
+            self.member_error = exc
+        self.ranges = sorted(
+            (member for member in self.members if member.size), key=lambda member: member.base
+        )
+        self.index = 0
+
+    def __call__(self, offset: int, chunk: bytes) -> None:
+        self.contiguous = self.contiguous and offset == self.total
+        self.total += len(chunk)
+        if self.sink is not None and self.write_error is None:
+            try:
+                self.sink.write(chunk)
+            except OSError as exc:
+                self.write_error = exc
+        if not self.contiguous:
+            return
+        end = offset + len(chunk)
+        while self.index < len(self.ranges):
+            member = self.ranges[self.index]
+            if member.base >= end:
+                break
+            member_end = member.base + member.size
+            left, right = max(offset, member.base), min(end, member_end)
+            if left < right:
+                member.digest.update(memoryview(chunk)[left - offset : right - offset])
+                member.received += right - left
+            if member_end > end:
+                break
+            self.index += 1
+
+    def validate(self, storage_metadata: Mapping[str, Any]) -> None:
+        """Refuse malformed observations, intervals, lengths, or member digests."""
+        if not self.contiguous:
+            raise ArchiveFanoutError("backend verify observation is not contiguous")
+        expected_size = storage_metadata.get("stored_size_bytes")
+        if "stored_size_bytes" in storage_metadata and self.total != expected_size:
+            raise ArchiveFanoutError(
+                f"backend verify observed {self.total} bytes, expected {expected_size}"
+            )
+        if self.member_error is not None:
+            raise ArchiveFanoutError(str(self.member_error)) from self.member_error
+        previous_end = 0
+        for member in self.ranges:
+            end = member.base + member.size
+            if member.base < previous_end or end > self.total:
+                raise ArchiveFanoutError(
+                    f"member verification range overlaps or exceeds object for "
+                    f"{member.member.member_path!r}: [{member.base}, {end})"
+                )
+            previous_end = end
+        for member in self.members:
+            if member.received != member.size:
+                raise ArchiveFanoutError(
+                    f"member verification received {member.received} bytes for "
+                    f"{member.member.member_path!r}, expected {member.size}"
+                )
+            _check_member_digest(member.member, member.digest.digest())
+
+
+def _check_member_digest(member: BuiltMember, digest: bytes) -> None:
+    """Compare plaintext read-back evidence without manufacturing adapter provenance."""
+    if digest != member.file_sha256:
+        raise ArchiveFanoutError(
+            f"member verification failed for {member.member_path!r}: "
+            f"{digest.hex()} != {member.file_sha256.hex()}"
+        )
+
+
 def _verify_members_from_copy(
     *,
     backend: WritableStorageBackend,
@@ -1866,28 +2006,116 @@ def _verify_members_from_copy(
     builder: ArchiveBuilder,
     work_dir: Path,
 ) -> VerifyResult:
-    result = backend.verify(copy_locator)
+    """Observe REM copies once; retain the member reader for other representations."""
+    has_offsets = any("offset" in member.native_locator for member in members)
+    if not has_offsets and representation is Representation.REM_ENCRYPT_V1:
+        return _verify_encrypted_members_from_copy(
+            backend=backend,
+            copy_locator=copy_locator,
+            members=members,
+            representation=representation,
+            storage_metadata=storage_metadata,
+            builder=builder,
+            work_dir=work_dir,
+        )
+    observer = (
+        _CopyReadbackObserver(members)
+        if not has_offsets and representation is Representation.REM_OBJECT_V1
+        else None
+    )
+    result = (
+        backend.verify(copy_locator, observe=observer)
+        if observer is not None
+        else backend.verify(copy_locator)
+    )
     if not result.ok:
         return result
-    cached_container: bytes | None = None
+    if result.measured and observer is not None:
+        observer.validate(storage_metadata)
+        return result
     for member in members:
-        data, cached_container = _verified_member_bytes(
+        data = _verified_member_bytes(
             backend=backend,
             copy_locator=copy_locator,
             member=member,
             representation=representation,
             storage_metadata=storage_metadata,
-            builder=builder,
             work_dir=work_dir,
-            cached_container=cached_container,
         )
-        digest = hashlib.sha256(data).digest()
-        if digest != member.file_sha256:
-            raise ArchiveFanoutError(
-                f"member verification failed for {member.member_path!r}: "
-                f"{digest.hex()} != {member.file_sha256.hex()}"
-            )
+        _check_member_digest(member, hashlib.sha256(data).digest())
     return result
+
+
+def _verify_encrypted_members_from_copy(
+    *,
+    backend: WritableStorageBackend,
+    copy_locator: dict[str, Any],
+    members: Sequence[BuiltMember],
+    representation: Representation,
+    storage_metadata: Mapping[str, Any],
+    builder: ArchiveBuilder,
+    work_dir: Path,
+) -> VerifyResult:
+    """Keep one ciphertext read-back file and at most one extracted member on disk."""
+    object_path = work_dir / "verify-copy.rem-object"
+    try:
+        sink = object_path.open("wb")
+        observer = _CopyReadbackObserver(sink=sink)
+        try:
+            result = backend.verify(copy_locator, observe=observer)
+        finally:
+            try:
+                sink.close()
+            except OSError as exc:
+                if observer.write_error is None:
+                    observer.write_error = exc
+        if not result.ok:
+            return result
+        if observer.write_error is not None:
+            raise observer.write_error
+        if result.measured:
+            observer.validate(storage_metadata)
+        else:
+            # Unmeasured observations prove nothing; replace them with one fetch.
+            size = storage_metadata.get("stored_size_bytes")
+            if isinstance(size, int) and size >= 0:
+                try:
+                    _copy_backend_range_to_path(backend, copy_locator, 0, size, object_path)
+                except ArchiveRestoreError as exc:
+                    raise ArchiveFanoutError(str(exc)) from exc
+            else:
+                object_path.write_bytes(backend.read_range(copy_locator, ByteRange(0, 0)))
+        extract = getattr(builder, "extract_member_from_path", None)
+        for member in members:
+            try:
+                member_size = _verification_member_size(member)
+            except (ValueError, TypeError) as exc:
+                raise ArchiveFanoutError(str(exc)) from exc
+            if member_size == 0:
+                digest = hashlib.sha256(b"").digest()
+            else:
+                if extract is None:
+                    raise ArchiveFanoutError(
+                        f"member verification for {representation.value!r} requires builder support"
+                    )
+                with extract(
+                    object_path=object_path,
+                    member=member,
+                    representation=representation,
+                    storage_metadata=storage_metadata,
+                    work_dir=work_dir,
+                ) as restored:
+                    digest = _sha256_file(restored)
+            _check_member_digest(member, digest)
+        return result
+    finally:
+        unwinding = sys.exc_info()[0] is not None
+        try:
+            object_path.unlink(missing_ok=True)
+        except Exception:
+            if not unwinding:
+                raise
+            LOGGER.warning("Failed to remove verification object %s", object_path, exc_info=True)
 
 
 def _verified_member_bytes(
@@ -1897,12 +2125,11 @@ def _verified_member_bytes(
     member: BuiltMember,
     representation: Representation,
     storage_metadata: Mapping[str, Any],
-    builder: ArchiveBuilder,
     work_dir: Path,
-    cached_container: bytes | None,
-) -> tuple[bytes, bytes | None]:
+) -> bytes:
+    """Preserve the member-reader route for offset, tar, and unmeasured plain copies."""
     try:
-        data = read_member_bytes(
+        return read_member_bytes(
             backend,
             _ReadCopyView(
                 native_locator=dict(copy_locator),
@@ -1916,27 +2143,7 @@ def _verified_member_bytes(
             work_dir=work_dir,
         )
     except ArchiveRestoreError as exc:
-        if representation is not Representation.REM_ENCRYPT_V1:
-            raise ArchiveFanoutError(str(exc)) from exc
-        fallback_error = exc
-    else:
-        return data, cached_container
-
-    verifier = getattr(builder, "verify_member_copy", None)
-    if verifier is None:
-        raise ArchiveFanoutError(
-            f"member verification for {representation.value!r} requires builder support: "
-            f"{fallback_error}"
-        )
-    data = verifier(
-        backend=backend,
-        copy_locator=copy_locator,
-        member=member,
-        representation=representation,
-        storage_metadata=storage_metadata,
-        work_dir=work_dir,
-    )
-    return data, cached_container
+        raise ArchiveFanoutError(str(exc)) from exc
 
 
 def _member_input(
@@ -2203,32 +2410,17 @@ def _metadata_recipient_epochs(storage_metadata: Mapping[str, Any]) -> tuple[str
     return tuple(value)
 
 
-def _materialize_copy_to_path(
-    backend: WritableStorageBackend,
-    copy_locator: Mapping[str, Any],
-    storage_metadata: Mapping[str, Any],
-    destination: Path,
-) -> None:
-    size = storage_metadata.get("stored_size_bytes")
-    if isinstance(size, int) and size >= 0:
-        with destination.open("wb") as handle:
-            for start in range(0, size, REM_OBJECT_CHUNK_SIZE):
-                end = min(start + REM_OBJECT_CHUNK_SIZE, size)
-                handle.write(backend.read_range(dict(copy_locator), ByteRange(start, end)))
-        return
-    destination.write_bytes(backend.read_range(dict(copy_locator), ByteRange(0, 0)))
-
-
-def _single_restored_member(dest_dir: Path, member_path: str) -> bytes:
+def _single_restored_member(dest_dir: Path, member_path: str) -> Path:
+    """Locate extracted output so its caller can hash it without loading it whole."""
     candidate = dest_dir / member_path
     if candidate.is_file():
-        return candidate.read_bytes()
+        return candidate
     files = [path for path in dest_dir.rglob("*") if path.is_file()]
     if len(files) != 1:
         raise ArchiveFanoutError(
             f"rem member verification expected one file for {member_path!r}, found {len(files)}"
         )
-    return files[0].read_bytes()
+    return files[0]
 
 
 def _run_rem(cmd: Sequence[str]) -> None:

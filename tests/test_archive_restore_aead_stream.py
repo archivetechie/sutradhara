@@ -28,7 +28,14 @@ from sutradhara.artifactclass_policy import (
     PlacementPolicy,
     apply_artifactclass_policy,
 )
-from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, StreamKind, VerifyResult
+from sutradhara.backend.port import (
+    BackendLocator,
+    ByteRange,
+    CopyRecord,
+    StreamKind,
+    VerifyObserver,
+    VerifyResult,
+)
 from sutradhara.catalog.models import (
     AssetLocator,
     Backend,
@@ -122,7 +129,9 @@ class _StreamingObjectBackend:
 
         yield chunks()
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         del locator
         return VerifyResult(ok=True, measured=False)
 

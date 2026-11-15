@@ -115,7 +115,7 @@ class _TargetBackend(StorageBackend):
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         raise NotImplementedError
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(self, locator: BackendLocator, *, observe: Any = None) -> VerifyResult:
         raise NotImplementedError
 
 

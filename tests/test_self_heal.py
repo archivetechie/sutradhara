@@ -27,6 +27,7 @@ from sutradhara.backend.port import (
     BackendStoredCorruptError,
     ByteRange,
     CopyRecord,
+    VerifyObserver,
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_copy
@@ -137,7 +138,9 @@ class _ReadableTaggedWriteBackend:
             return data
         return data[byte_range.start : byte_range.end]
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         actual = content_hash(hashlib.sha256(self.read_range(locator, ByteRange(0, 0))).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
         return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)

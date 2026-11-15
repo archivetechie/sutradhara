@@ -8,15 +8,18 @@ import threading
 import tracemalloc
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import grpc
 import pytest
 
 from sutradhara._proto import layer5_pb2
+from sutradhara.archive_restore import ArchiveRestoreError, _copy_backend_range_to_path
 from sutradhara.backend.d2tape import D2TapeBackend
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.backend.port import (
+    BackendNotFoundError,
     BackendUnavailableError,
     ByteRange,
     StreamingStorageBackend,
@@ -157,11 +160,15 @@ class _ReadClient:
         self.call = call
         self.events = events
         self.closed = False
+        self.opens = 0
+        self.ranges: list[tuple[int, int]] = []
 
     def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+        self.opens += 1
         return layer5_pb2.ReadSession(session_id=b"session", tape_uuid=_TAPE_UUID)
 
     def ReadObjectRange(self, request: layer5_pb2.ReadObjectRangeRequest) -> Any:
+        self.ranges.append((request.start_byte, request.end_byte))
         return self.call
 
     def CloseReadSession(
@@ -270,8 +277,10 @@ class _S3Client:
     def __init__(self, body: _StreamingBody) -> None:
         self.body = body
         self.kwargs: dict[str, Any] = {}
+        self.get_calls = 0
 
     def get_object(self, **kwargs: Any) -> dict[str, _StreamingBody]:
+        self.get_calls += 1
         self.kwargs = kwargs
         return {"Body": self.body}
 
@@ -347,3 +356,249 @@ def test_capability_query_distinguishes_native_from_materialized(tmp_path: Path)
         {"hash_hex": digest.hex()}, ByteRange(1, 6), chunk_bytes=2
     ) as chunks:
         assert list(chunks) == [b"bc", b"de", b"f"]
+
+
+class _VerifyObservation:
+    """Keep O(1) observation state so the memory test measures the adapter."""
+
+    def __init__(self) -> None:
+        self.digest = hashlib.sha256()
+        self.size = 0
+        self.calls = 0
+        self.contiguous = True
+
+    def __call__(self, offset: int, chunk: bytes) -> None:
+        self.contiguous = self.contiguous and offset == self.size
+        self.digest.update(chunk)
+        self.size += len(chunk)
+        self.calls += 1
+
+
+def test_remanence_verify_observes_one_session_with_bounded_memory() -> None:
+    """T2: a measured verify hashes/observes 64 chunks in one session and range."""
+    chunk_bytes = 256 * 1024
+    chunk_count = 64
+    expected = hashlib.sha256()
+    for _ in range(chunk_count):
+        expected.update(b"x" * chunk_bytes)
+    call = _GeneratedCall(chunks=chunk_count, chunk_bytes=chunk_bytes)
+    backend = _live_backend(call, [])
+    client = backend._read_session
+    assert isinstance(client, _ReadClient)
+    observation = _VerifyObservation()
+
+    tracemalloc.start()
+    try:
+        result = backend.verify(
+            {**_LOCATOR, "content_sha256": expected.hexdigest()}, observe=observation
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.ok
+    assert result.measured
+    assert result.actual_hash == expected.digest() == observation.digest.digest()
+    assert observation.contiguous
+    assert observation.calls == chunk_count
+    assert observation.size == chunk_count * chunk_bytes
+    assert client.opens == 1
+    assert client.ranges == [(0, 0)]
+    assert client.closed
+    assert call.cancelled
+    assert peak < 8 * chunk_bytes
+
+
+class _GeneratedBody(_StreamingBody):
+    """Generate S3 bytes lazily without holding the logical object in memory."""
+
+    def iter_chunks(self, *, chunk_size: int) -> Iterator[bytes]:
+        self.requested_chunk_bytes = chunk_size
+        for _ in range(64):
+            self.yielded += 1
+            yield b"s" * chunk_size
+
+
+def test_s3_verify_observes_one_download_with_bounded_memory() -> None:
+    """T3: S3 observes and hashes every byte with memory bounded by chunk size."""
+    chunk_bytes = 256 * 1024
+    expected = hashlib.sha256()
+    for _ in range(64):
+        expected.update(b"s" * chunk_bytes)
+    body = _GeneratedBody([])
+    client = _S3Client(body)
+    backend = S3Backend("s3", bucket="bucket", client=client)
+    observation = _VerifyObservation()
+
+    tracemalloc.start()
+    try:
+        result = backend.verify(
+            {"key": "object", "sha256": expected.hexdigest()}, observe=observation
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.ok
+    assert result.measured
+    assert result.actual_hash == expected.digest() == observation.digest.digest()
+    assert observation.contiguous
+    assert observation.calls == body.yielded == 64
+    assert observation.size == 64 * chunk_bytes
+    assert client.get_calls == 1
+    assert "Range" not in client.kwargs
+    assert body.closed
+    assert peak < 8 * chunk_bytes
+
+
+def test_memory_verify_observes_its_stored_bytes() -> None:
+    """Memory observation carries the same bytes used for the measured digest."""
+    backend = MemoryBackend("memory")
+    data = b"memory readback"
+    expected = backend.add(data)
+    observation = _VerifyObservation()
+    result = backend.verify({"hash_hex": expected.hex()}, observe=observation)
+    assert result.ok
+    assert result.measured
+    assert observation.contiguous
+    assert observation.size == len(data)
+    assert result.actual_hash == expected == observation.digest.digest()
+
+
+@pytest.mark.parametrize(
+    "case", ["ok", "mismatch", "invalid", "absent", "download_absent", "no_observer"]
+)
+def test_ssh_verify_observer_preserves_gates_and_hashes_download(case: str) -> None:
+    """Observe one downloaded object only after SSH's existing validity checks."""
+    data = b"downloaded bytes"
+    expected = hashlib.sha256(data).hexdigest()
+
+    class Transport(_UnusedTransport):
+        downloads = 0
+
+        def sha256(self, key: str) -> str | None:
+            return None if case == "absent" else expected
+
+        def get(self, key: str, path: Path) -> None:
+            self.downloads += 1
+            if case == "download_absent":
+                raise BackendNotFoundError("gone after remote hash")
+            path.write_bytes(b"different" if case == "mismatch" else data)
+
+    transport = Transport()
+    backend = SshDiskBackend("ssh", host="unused", root="/unused", transport=transport)
+    observation = _VerifyObservation()
+    result = backend.verify(
+        {"key": "object", "sha256": "invalid" if case == "invalid" else expected},
+        observe=None if case == "no_observer" else observation,
+    )
+    if case in {"invalid", "absent", "download_absent"}:
+        assert not result.ok
+        assert not result.measured
+        assert result.detail == ("invalid hash" if case == "invalid" else "absent")
+        assert observation.calls == 0
+        assert transport.downloads == (1 if case == "download_absent" else 0)
+    else:
+        assert result.measured
+        assert result.ok is (case != "mismatch")
+        if case == "no_observer":
+            assert transport.downloads == observation.calls == 0
+        else:
+            assert transport.downloads == 1
+            assert observation.contiguous
+            assert result.actual_hash == observation.digest.digest()
+
+
+@pytest.mark.parametrize("gate_ok", [True, False])
+def test_d2_verify_observer_uses_gated_restored_payload(
+    gate_ok: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed d2tape hashes gate retains its unmeasured result and reads nothing."""
+    backend = D2TapeBackend(
+        "d2",
+        jar_path=tmp_path / "d2.jar",
+        java_bin=tmp_path / "java",
+        device_env_path=tmp_path / "device.env",
+        state_dir=tmp_path / "state",
+    )
+    data = b"d2 payload" * 100_000
+    digest = hashlib.sha256(data).digest()
+    restored: list[Path] = []
+    commands: list[list[str]] = []
+
+    def restore(locator: dict[str, Any], scratch: Path) -> Path:
+        path = scratch / "payload"
+        path.write_bytes(data)
+        restored.append(path)
+        return path
+
+    def run(argv: list[str], device: Any) -> dict[str, Any]:
+        commands.append(argv)
+        return {"ok": gate_ok}
+
+    monkeypatch.setattr(backend, "_device_config", lambda: SimpleNamespace(device="unused"))
+    monkeypatch.setattr(
+        backend,
+        "_artifact_for_locator",
+        lambda _: {"integrity_hash": digest.hex(), "hashes": {}},
+    )
+    monkeypatch.setattr(backend, "_restore_payload", restore)
+    monkeypatch.setattr(backend, "_run_d2tape", run)
+    observation = _VerifyObservation()
+    result = backend.verify(
+        {"artifact_name": "object", "volume_blocksize": 512, "start_block": 0, "end_block": 1},
+        observe=observation,
+    )
+    assert len(commands) == 1
+    assert commands[0][0] == "verify"
+    assert "--hashes" in commands[0]
+    assert result.ok is gate_ok
+    assert result.measured is gate_ok
+    if gate_ok:
+        assert result.actual_hash == digest == observation.digest.digest()
+        assert observation.contiguous
+        assert observation.size == len(data)
+        assert len(restored) == 1
+        assert not restored[0].exists()
+    else:
+        assert observation.calls == 0
+        assert not restored
+
+
+@pytest.mark.parametrize("position", [0, 17])
+def test_ranged_copy_empty_interval_never_opens_backend(position: int, tmp_path: Path) -> None:
+    """T5: both [0, 0) and a later empty interval truncate the destination without I/O."""
+    backend = SshDiskBackend("ssh", host="unused", root="/unused", transport=_UnusedTransport())
+    destination = tmp_path / "empty"
+    destination.write_bytes(b"old contents")
+    _copy_backend_range_to_path(backend, {"key": "object"}, position, position, destination)
+    assert destination.read_bytes() == b""
+
+
+def test_ranged_copy_truncated_materialized_object_is_restore_error(tmp_path: Path) -> None:
+    """T5: a materialized opener's ValueError stays eligible for next-copy fallback."""
+    downloads: list[Path] = []
+
+    class Transport(_UnusedTransport):
+        def get(self, key: str, destination: Path) -> None:
+            downloads.append(destination)
+            destination.write_bytes(b"short")
+
+    backend = SshDiskBackend("ssh", host="unused", root="/unused", transport=Transport())
+    with pytest.raises(ArchiveRestoreError, match="exceeds object size") as caught:
+        _copy_backend_range_to_path(backend, {"key": "object"}, 0, 10, tmp_path / "copy")
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert len(downloads) == 1
+    assert not downloads[0].exists()
+
+
+@pytest.mark.parametrize("payload", [b"short", b"too many bytes"])
+def test_ranged_copy_rejects_native_stream_length_mismatch(payload: bytes, tmp_path: Path) -> None:
+    """Finite streams must return the exact interval length, whether short or long."""
+    body = _StreamingBody([payload])
+    client = _S3Client(body)
+    backend = S3Backend("s3", bucket="bucket", client=client)
+    with pytest.raises(ArchiveRestoreError, match="expected 10"):
+        _copy_backend_range_to_path(backend, {"key": "object"}, 0, 10, tmp_path / "copy")
+    assert client.get_calls == 1
+    assert body.closed

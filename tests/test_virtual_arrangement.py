@@ -24,7 +24,13 @@ from sutradhara.artifactclass_policy import (
     get_artifactclass_policy,
 )
 from sutradhara.backend.memory import MemoryBackend
-from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, VerifyResult
+from sutradhara.backend.port import (
+    BackendLocator,
+    ByteRange,
+    CopyRecord,
+    VerifyObserver,
+    VerifyResult,
+)
 from sutradhara.catalog.copies import add_copy
 from sutradhara.catalog.models import (
     AssetLocator,
@@ -114,8 +120,12 @@ class _ArchiveBackend:
             return data
         return data[byte_range.start : byte_range.end]
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         data = self.read_range(locator, ByteRange(0, 0))
+        if observe is not None:
+            observe(0, data)
         actual = content_hash(hashlib.sha256(data).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
         return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)

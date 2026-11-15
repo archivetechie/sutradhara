@@ -54,7 +54,13 @@ from sutradhara.artifactclass_policy import (
     apply_artifactclass_policy,
     get_artifactclass_policy,
 )
-from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, VerifyResult
+from sutradhara.backend.port import (
+    BackendLocator,
+    ByteRange,
+    CopyRecord,
+    VerifyObserver,
+    VerifyResult,
+)
 from sutradhara.catalog.models import Backend, Bundle, Copy, LogicalAsset, Pool
 from sutradhara.catalog.session import create_all, make_engine, session_scope
 from sutradhara.catalog.types import BackendKind, BackendTier, CopyHealth, content_hash
@@ -163,10 +169,14 @@ class _WriteBackend:
 
         yield chunks()
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         if str(locator["pool_id"]) in self.bad_verify_pools:
             return VerifyResult(ok=False, measured=False, detail="configured verify refusal")
         data = self.read_range(locator, ByteRange(0, 0))
+        if observe is not None:
+            observe(0, data)
         actual = content_hash(hashlib.sha256(data).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
         return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)

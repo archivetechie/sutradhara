@@ -511,7 +511,7 @@ def _late_job(env, tmp_path, monkeypatch, kind, external, *, reconciler=False, c
             ),
         )
 
-    def verify(_locator):
+    def verify(_locator, *, observe=None):
         external()
         if corrupt:
             raise BackendStoredCorruptError("stored bytes corrupt")

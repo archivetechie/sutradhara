@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import tracemalloc
 from collections.abc import Iterator
@@ -14,17 +15,20 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine, select
 
+from sutradhara import archive_fanout
 from sutradhara.archive_bundle import bundle_due, enqueue_artifact
 from sutradhara.archive_fanout import (
     ArchiveFanoutError,
     BuildArtifact,
     BuiltBlobRoot,
     BuiltExclusion,
+    BuiltMember,
     BundleOversize,
     HmacManifestSigner,
     LocalArchiveBuilder,
     ManifestSigningError,
     MemberInput,
+    RemArchiveBuilder,
     _members_from_manifest,
     build_bundle_copy_for_pool,
     flush_bundle,
@@ -60,6 +64,7 @@ from sutradhara.backend.port import (
     CopyRecord,
     StorageBackend,
     StreamKind,
+    VerifyObserver,
     VerifyResult,
 )
 from sutradhara.backend.remanence import RemanenceDigestMismatchError
@@ -98,6 +103,7 @@ from sutradhara.jobs.reconcilers.conditions import (
     OBSERVED_MISSING,
 )
 from sutradhara.keys import KeyEpoch
+from sutradhara.rem_archive_cli import RemArchiveBuildResult
 from sutradhara.replication import target_pools
 from sutradhara.sealing.port import Representation
 from sutradhara.sealing.rem_object import REM_OBJECT_CHUNK_SIZE
@@ -194,8 +200,12 @@ class _ArchiveWriteBackend:
 
         yield chunks()
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         data = self.read_range(locator, ByteRange(0, 0))
+        if observe is not None:
+            observe(0, data)
         actual = content_hash(hashlib.sha256(data).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
         return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)
@@ -1195,7 +1205,7 @@ def test_read_member_primitive_matches_bytes_wrapper_and_streams_large_member(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
-    backend = _ArchiveWriteBackend("rem")
+    backend = _ReadbackBackend()
     payload = (
         b"large member\n" * ((REM_OBJECT_CHUNK_SIZE // len(b"large member\n")) + 2)
     ) + b"tail"
@@ -1214,20 +1224,21 @@ def test_read_member_primitive_matches_bytes_wrapper_and_streams_large_member(
         copy = locator.copy
         assert copy is not None
         output_path = tmp_path / "primitive-large.bin"
-        backend.reads.clear()
+        backend.streams.clear()
+        backend.legacy_reads.clear()
         written = read_member_to_path(backend, copy, locator, output_path)
-        path_ranges = list(backend.reads)
-        backend.reads.clear()
+        path_ranges = list(backend.streams)
+        backend.streams.clear()
         wrapper_bytes = read_member_bytes(backend, copy, locator, work_dir=tmp_path)
-        wrapper_ranges = list(backend.reads)
+        wrapper_ranges = list(backend.streams)
 
     start = first_lba * REM_OBJECT_CHUNK_SIZE
     end = start + len(payload)
     assert written == len(payload)
     assert output_path.read_bytes() == payload
     assert wrapper_bytes == payload
-    assert len(path_ranges) > 1
-    assert path_ranges == wrapper_ranges
+    assert path_ranges == wrapper_ranges == [ByteRange(start, end)]
+    assert backend.legacy_reads == []
     assert all(not byte_range.is_whole_object for byte_range in path_ranges)
     assert path_ranges[0].start == start
     assert path_ranges[-1].end == end
@@ -1783,3 +1794,642 @@ else:
     assert keys.seen == [key_epoch]
     assert ByteRange(2048, 2064) in backend.reads
     assert ByteRange(0, len(stored)) not in backend.reads
+
+
+class _ReadbackBackend(_ArchiveWriteBackend):
+    """Count verification, streams and legacy reads independently for RBA-1."""
+
+    def __init__(self, *, skip_observe: bool = False, measured: bool = True) -> None:
+        super().__init__("readback")
+        self.skip_observe = skip_observe
+        self.measured = measured
+        self.verifications: list[bool] = []
+        self.streams: list[ByteRange] = []
+        self.legacy_reads: list[ByteRange] = []
+
+    def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+        self.legacy_reads.append(byte_range)
+        return super().read_range(locator, byte_range)
+
+    @contextmanager
+    def open_range_chunks(
+        self, locator: BackendLocator, byte_range: ByteRange, *, chunk_bytes: int
+    ) -> Iterator[Iterator[bytes]]:
+        self.streams.append(byte_range)
+        with super().open_range_chunks(locator, byte_range, chunk_bytes=chunk_bytes) as chunks:
+            yield chunks
+
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
+        self.verifications.append(observe is not None)
+        if not self.measured:
+            if observe is not None:
+                observe(99, b"unmeasured observations must be discarded")
+            return VerifyResult(ok=True, measured=False)
+        digest = hashlib.sha256()
+        offset = 0
+        with self.open_range_chunks(
+            locator, ByteRange(0, 0), chunk_bytes=REM_OBJECT_CHUNK_SIZE
+        ) as chunks:
+            for index, chunk in enumerate(chunks):
+                digest.update(chunk)
+                if observe is not None and not (self.skip_observe and index == 1):
+                    observe(offset, chunk)
+                offset += len(chunk)
+        actual = content_hash(digest.digest())
+        return VerifyResult(
+            ok=actual.hex() == locator["content_sha256"], measured=True, actual_hash=actual
+        )
+
+
+def _readback_bundle(
+    engine: Engine, tmp_path: Path, representation: Representation, *, copies: int = 2
+) -> tuple[str, int, dict[str, bytes]]:
+    """Seed a real flush with a multi-chunk member, a short member, and an empty one."""
+    files = {
+        "large.bin": b"L" * (REM_OBJECT_CHUNK_SIZE + 17),
+        "small.bin": b"short member",
+        "empty.bin": b"",
+    }
+    with session_scope(engine) as session:
+        row = Backend(name="readback", kind=BackendKind.REM_TAPE, tier=BackendTier.SELF_DESCRIBING)
+        session.add(row)
+        session.flush()
+        pool_ids = tuple(f"readback-{index}" for index in range(copies))
+        session.add_all(
+            Pool(id=pool, backend_id=row.id, representation=representation.value)
+            for pool in pool_ids
+        )
+        session.flush()
+        apply_artifactclass_policy(
+            session,
+            "readback",
+            ArtifactClassPolicy(
+                ruleset="readback.rules",
+                placements=tuple(PlacementPolicy(pool) for pool in pool_ids),
+                bundling=BundlingPolicy(target_gb=1, max_age_seconds=60),
+                restore_preference=pool_ids,
+                expect="messy",
+                durability=DurabilityPolicy(min_copies=copies, min_impl_families=1),
+            ),
+        )
+        policy = get_artifactclass_policy(session, "readback")
+        for name, data in files.items():
+            source = tmp_path / name
+            source.write_bytes(data)
+            digest = _digest(data)
+            session.add(LogicalAsset(content_sha256=digest, size_bytes=len(data)))
+            session.flush()
+            bundle, _, _ = enqueue_artifact(
+                session,
+                artifactclass="readback",
+                policy=policy,
+                logical_asset_hash=digest,
+                source_path=source,
+                member_path=name,
+            )
+        return bundle.id, row.id, files
+
+
+def _readback_build(kwargs: dict[str, Any], *, wrong_lba: bool = False) -> RemArchiveBuildResult:
+    """Model aligned member payloads at the rem process boundary, with no sockets."""
+    payload = bytearray(REM_OBJECT_CHUNK_SIZE)
+    files: list[dict[str, Any]] = []
+    rows = Path(kwargs["map_path"]).read_text().splitlines()[1:]
+    for archive_path, source_path, sha256, size, _ingest in (row.split("\t") for row in rows):
+        data = Path(source_path).read_bytes()
+        padding = (-len(payload)) % REM_OBJECT_CHUNK_SIZE
+        payload.extend(b"\0" * padding)
+        first_lba = len(payload) // REM_OBJECT_CHUNK_SIZE
+        payload.extend(data)
+        files.append(
+            {
+                "path": archive_path,
+                "size_bytes": int(size),
+                "sha256": sha256,
+                # An empty member's arbitrary base must not be checked as an interval.
+                "first_chunk_lba": (
+                    10**12
+                    if not data
+                    else first_lba + int(wrong_lba and archive_path == "large.bin")
+                ),
+            }
+        )
+    output = Path(kwargs["output_path"])
+    output.write_bytes(payload)
+    report: dict[str, Any] = {"files": files, "chunk_size": REM_OBJECT_CHUNK_SIZE}
+    if kwargs.get("recipients"):
+        report.update(
+            format_version=2,
+            recipient_epochs=[
+                {"label": "archive", "epoch_id": "1" * 32},
+                {"label": "recovery", "epoch_id": "2" * 32},
+            ],
+        )
+    manifest = Path(kwargs["manifest_path"])
+    manifest.write_text(json.dumps(report))
+    return RemArchiveBuildResult(
+        artifact_path=output,
+        stored_digest=_digest(bytes(payload)),
+        stdout_report=report,
+        manifest_path=manifest,
+    )
+
+
+def test_plaintext_readback_uses_one_verify_stream_per_copy(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T1: all plaintext members share one measured stream per stored copy."""
+    bundle_id, backend_id, _ = _readback_bundle(engine, tmp_path, Representation.REM_OBJECT_V1)
+    backend = _ReadbackBackend()
+    monkeypatch.setattr(archive_fanout, "run_rem_archive_build", lambda **kw: _readback_build(kw))
+    with session_scope(engine) as session:
+        result = flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends={backend_id: backend},
+            builder=RemArchiveBuilder(),
+        )
+        assert backend.verifications == [True, True]
+        assert backend.streams == [ByteRange(0, 0), ByteRange(0, 0)]
+        assert backend.legacy_reads == []
+        assert not result.partial
+        assert len(result.copy_ids) == 2
+        for copy in session.scalars(select(Copy)):
+            assert copy.health == CopyHealth.OK
+            assert copy.last_measured_digest == copy.integrity_hash
+
+
+@pytest.mark.parametrize("fault", ["observation_gap", "wrong_lba"])
+def test_plaintext_readback_refuses_gap_or_wrong_member_locator(
+    fault: str, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T1: intact objects cannot conceal missing observation bytes or bad locators."""
+    bundle_id, backend_id, _ = _readback_bundle(engine, tmp_path, Representation.REM_OBJECT_V1)
+    backend = _ReadbackBackend(skip_observe=fault == "observation_gap")
+    monkeypatch.setattr(
+        archive_fanout,
+        "run_rem_archive_build",
+        lambda **kw: _readback_build(kw, wrong_lba=fault == "wrong_lba"),
+    )
+    with session_scope(engine) as session:
+        result = flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends={backend_id: backend},
+            builder=RemArchiveBuilder(),
+        )
+        assert result.partial
+        assert not result.copy_ids
+        assert result.condition_reason == "post-write-pool-failure"
+        assert set(result.failed_pools) == {"readback-0", "readback-1"}
+        bundle = session.get(Bundle, bundle_id)
+        assert bundle is not None
+        assert bundle.status == "sealed"
+        copies = list(session.scalars(select(Copy)))
+        assert len(copies) == 2
+        assert all(copy.health == CopyHealth.SUSPECT for copy in copies)
+        assert all(copy.last_measured_digest is None for copy in copies)
+        condition = session.scalars(
+            select(ReconciliationCondition).where(ReconciliationCondition.target_key == bundle_id)
+        ).one()
+        assert condition.condition == CONDITION_BLOCKED
+    assert backend.verifications == [True, True]
+    assert backend.streams == [ByteRange(0, 0), ByteRange(0, 0)]
+    assert backend.legacy_reads == []
+
+
+class _ReadbackKeys(_FakeKeyRegistry):
+    """Supply deterministic recipient selection while retaining the real extraction argv."""
+
+    def recipients_for_seal(self, key_id: str, *, domain: str) -> tuple[KeyEpoch, ...]:
+        assert domain == "archive"
+        assert key_id == "archive-" + "1" * 32
+        return tuple(
+            KeyEpoch(key_id=label, created_at="2026-01-01T00:00:00+00:00", active=True)
+            for label in (key_id, "recovery-" + "2" * 32)
+        )
+
+    def public_key_path(self, key_id: str) -> Path:
+        return self.key_path
+
+
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_readback_verify_value_error_escapes_flush_without_partial_seal(
+    encrypted: bool, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1/R7: adapter ValueError retains the base's exception and savepoint rollback."""
+    representation = Representation.REM_ENCRYPT_V1 if encrypted else Representation.REM_OBJECT_V1
+    bundle_id, backend_id, _ = _readback_bundle(engine, tmp_path, representation, copies=1)
+    backend = _ReadbackBackend()
+    error = ValueError("injected backend verify failure")
+
+    def verify(locator: BackendLocator, *, observe: VerifyObserver | None = None) -> VerifyResult:
+        assert observe is not None
+        raise error
+
+    key_file = tmp_path / "key"
+    key_file.write_bytes(b"key")
+    monkeypatch.setattr(backend, "verify", verify)
+    monkeypatch.setattr(archive_fanout, "run_rem_archive_build", lambda **kw: _readback_build(kw))
+    with session_scope(engine) as session:
+        with pytest.raises(ValueError, match="injected backend verify failure") as caught:
+            flush_bundle(
+                session,
+                bundle_id=bundle_id,
+                backends={backend_id: backend},
+                builder=RemArchiveBuilder(keys=_ReadbackKeys(key_file)),  # type: ignore[arg-type]
+                key_epoch="archive-" + "1" * 32 if encrypted else None,
+            )
+        assert caught.value is error
+        # Inspect inside the caller's transaction: the target savepoint discarded its rows.
+        assert list(session.scalars(select(Copy))) == []
+        assert list(session.scalars(select(AssetLocator))) == []
+        assert list(session.scalars(select(VerifyReceipt))) == []
+        assert list(session.scalars(select(ReconciliationCondition))) == []
+        bundle = session.get(Bundle, bundle_id)
+        assert bundle is not None
+        assert bundle.status == "flushing"
+        session.rollback()
+    with session_scope(engine) as session:
+        bundle = session.get(Bundle, bundle_id)
+        assert bundle is not None
+        assert bundle.status == "open"
+        assert list(session.scalars(select(Copy))) == []
+    assert backend.writes == ["readback-0"]
+
+
+@pytest.fixture
+def readback_close_error_sink(monkeypatch: pytest.MonkeyPatch) -> io.BytesIO:
+    """Fail the encrypted spool's close once without affecting other file I/O."""
+
+    class CloseErrorSink(io.BytesIO):
+        def close(self) -> None:
+            if not self.closed:
+                super().close()
+                raise OSError("injected spool close failure")
+
+    sink = CloseErrorSink()
+    original_open = Path.open
+
+    def open_path(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if path.name == "verify-copy.rem-object" and mode == "wb":
+            return sink
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_path)
+    return sink
+
+
+@pytest.mark.parametrize("verify_ok", [False, True])
+def test_encrypted_readback_close_error_preserves_verify_outcome(
+    verify_ok: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    readback_close_error_sink: io.BytesIO,
+) -> None:
+    """F2: a corrupt result wins over close failure; an ok result exposes the OSError."""
+    backend = _ReadbackBackend()
+    result = VerifyResult(ok=verify_ok, measured=True, actual_hash=content_hash(_digest(b"bad")))
+
+    def verify(locator: BackendLocator, *, observe: VerifyObserver | None = None) -> VerifyResult:
+        assert observe is not None
+        observe(0, b"bad")
+        return result
+
+    monkeypatch.setattr(backend, "verify", verify)
+
+    def readback() -> VerifyResult:
+        return archive_fanout._verify_encrypted_members_from_copy(
+            backend=backend,
+            copy_locator={},
+            members=(),
+            representation=Representation.REM_ENCRYPT_V1,
+            storage_metadata={"stored_size_bytes": 3},
+            builder=RemArchiveBuilder(),
+            work_dir=tmp_path,
+        )
+
+    if verify_ok:
+        with pytest.raises(OSError, match="injected spool close failure"):
+            readback()
+    else:
+        assert readback() is result
+    assert readback_close_error_sink.closed
+
+
+def test_encrypted_readback_close_error_keeps_corrupt_measurement(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    readback_close_error_sink: io.BytesIO,
+) -> None:
+    """F2: not-ok verification still records its corrupt digest through flush_bundle."""
+    bundle_id, backend_id, _ = _readback_bundle(
+        engine, tmp_path, Representation.REM_ENCRYPT_V1, copies=1
+    )
+    backend = _ReadbackBackend()
+    corrupt_digest = content_hash(_digest(b"corrupt stored object"))
+
+    def verify(locator: BackendLocator, *, observe: VerifyObserver | None = None) -> VerifyResult:
+        assert observe is not None
+        observe(0, b"corrupt stored object")
+        return VerifyResult(
+            ok=False, measured=True, actual_hash=corrupt_digest, detail="injected digest mismatch"
+        )
+
+    key_file = tmp_path / "key"
+    key_file.write_bytes(b"key")
+    monkeypatch.setattr(backend, "verify", verify)
+    monkeypatch.setattr(archive_fanout, "run_rem_archive_build", lambda **kw: _readback_build(kw))
+    with session_scope(engine) as session:
+        result = flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends={backend_id: backend},
+            builder=RemArchiveBuilder(keys=_ReadbackKeys(key_file)),  # type: ignore[arg-type]
+            key_epoch="archive-" + "1" * 32,
+        )
+        assert result.partial
+        assert result.condition_reason == "post-write-pool-failure"
+        [copy] = list(session.scalars(select(Copy)))
+        assert copy.health == CopyHealth.CORRUPT
+        assert copy.last_measured_digest == corrupt_digest
+        [receipt] = list(session.scalars(select(VerifyReceipt)))
+        assert receipt.measured_digest == corrupt_digest
+        assert receipt.backend_ok is False
+        assert receipt.failure_kind == "digest-mismatch"
+    assert readback_close_error_sink.closed
+
+
+@pytest.mark.parametrize(
+    ("outcome", "cleanup_error"),
+    [("ok", False), ("bad_member", False), ("extract_error", False), ("extract_error", True)],
+)
+def test_encrypted_readback_fetches_once_and_cleans_each_extraction(
+    outcome: str,
+    cleanup_error: bool,
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T4: one stored stream/file, real builder extraction, cleanup before outer teardown."""
+    bundle_id, backend_id, files = _readback_bundle(
+        engine, tmp_path, Representation.REM_ENCRYPT_V1, copies=1
+    )
+    backend = _ReadbackBackend()
+    key_file = tmp_path / "private-key"
+    key_file.write_bytes(b"fake-key")
+    keys = _ReadbackKeys(key_file)
+    commands: list[list[str]] = []
+    object_paths: list[Path] = []
+    output_dirs: list[Path] = []
+    snapshots: list[list[str]] = []
+    monkeypatch.setattr(archive_fanout, "run_rem_archive_build", lambda **kw: _readback_build(kw))
+    monkeypatch.setattr(archive_fanout, "resolve_rem_bin", lambda _: "rem")
+
+    def extract(cmd: list[str]) -> None:
+        commands.append(list(cmd))
+        object_path = Path(cmd[cmd.index("--object") + 1])
+        dest = Path(cmd[cmd.index("--dest") + 1])
+        member_path = cmd[cmd.index("--path") + 1]
+        assert object_path.name == "verify-copy.rem-object"
+        assert object_path.exists()
+        assert all(not old.exists() for old in output_dirs)
+        assert list(dest.parent.glob("verify-out-*")) == [dest]
+        object_paths.append(object_path)
+        output_dirs.append(dest)
+        data = files[member_path]
+        assert data  # Empty members must never invoke rem extraction.
+        assert cmd == [
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            str(object_path),
+            "--dest",
+            str(dest),
+            "--path",
+            member_path,
+            "--first-chunk-lba",
+            cmd[cmd.index("--first-chunk-lba") + 1],
+            "--file-size-bytes",
+            str(len(data)),
+            "--range",
+            f"0:{len(data)}",
+            "--overwrite",
+            "--private-key",
+            str(key_file),
+        ]
+        (dest / member_path).write_bytes(
+            b"wrong member" if outcome == "bad_member" and member_path == "small.bin" else data
+        )
+        if outcome == "extract_error" and member_path == "small.bin":
+            if cleanup_error:
+                original_rmtree = archive_fanout.shutil.rmtree
+
+                def rmtree(path: Path, *args: Any, **kwargs: Any) -> None:
+                    if path == dest:
+                        raise OSError("injected member cleanup failure")
+                    original_rmtree(path, *args, **kwargs)
+
+                monkeypatch.setattr(archive_fanout.shutil, "rmtree", rmtree)
+            raise ArchiveFanoutError("injected extraction refusal after output creation")
+
+    original_verify = archive_fanout._verify_members_from_copy
+
+    def snapshot(**kwargs: Any) -> VerifyResult:
+        try:
+            return original_verify(**kwargs)
+        finally:
+            # This runs inside the target work directory's lifetime, on every outcome.
+            snapshots.append([path.name for path in kwargs["work_dir"].iterdir()])
+
+    monkeypatch.setattr(archive_fanout, "_run_rem", extract)
+    monkeypatch.setattr(archive_fanout, "_verify_members_from_copy", snapshot)
+    with session_scope(engine) as session:
+        result = flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends={backend_id: backend},
+            builder=RemArchiveBuilder(keys=keys),  # type: ignore[arg-type]
+            key_epoch="archive-" + "1" * 32,
+        )
+        assert backend.verifications == [True]
+        assert backend.streams == [ByteRange(0, 0)]
+        assert backend.legacy_reads == []
+        assert result.partial is (outcome != "ok")
+        [copy] = list(session.scalars(select(Copy)))
+        if outcome == "ok":
+            assert copy.health == CopyHealth.OK
+            assert copy.last_measured_digest == copy.integrity_hash
+        else:
+            assert copy.health == CopyHealth.SUSPECT
+            assert result.condition_reason == "post-write-pool-failure"
+            condition = session.scalars(
+                select(ReconciliationCondition).where(
+                    ReconciliationCondition.target_key == bundle_id
+                )
+            ).one()
+            assert condition.condition == CONDITION_BLOCKED
+            if outcome == "extract_error":
+                assert "injected extraction refusal" in (result.condition_message or "")
+    assert len(commands) == len(output_dirs) == 2
+    assert len(set(object_paths)) == 1
+    assert len(snapshots) == 1
+    assert snapshots[0]
+    remaining = [name for name in snapshots[0] if name.startswith("verify-")]
+    if cleanup_error:
+        assert remaining == [output_dirs[-1].name]
+        assert "injected member cleanup failure" in caplog.text
+    else:
+        assert not remaining
+    assert keys.seen == ["archive-" + "1" * 32] * 2
+
+
+@pytest.mark.parametrize("body_error", [False, True])
+def test_encrypted_readback_object_cleanup_preserves_active_exception(
+    body_error: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F2: object unlink failures propagate only when no read-back error is active."""
+    backend = _ReadbackBackend()
+    refusal = ArchiveFanoutError("injected readback refusal")
+    original_unlink = Path.unlink
+
+    def verify(locator: BackendLocator, *, observe: VerifyObserver | None = None) -> VerifyResult:
+        if body_error:
+            raise refusal
+        return VerifyResult(ok=False, measured=False)
+
+    def unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.name == "verify-copy.rem-object":
+            raise OSError("injected object cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(backend, "verify", verify)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    error_type = ArchiveFanoutError if body_error else OSError
+    message = "injected readback refusal" if body_error else "injected object cleanup failure"
+    with pytest.raises(error_type, match=message) as caught:
+        archive_fanout._verify_encrypted_members_from_copy(
+            backend=backend,
+            copy_locator={},
+            members=(),
+            representation=Representation.REM_ENCRYPT_V1,
+            storage_metadata={},
+            builder=RemArchiveBuilder(),
+            work_dir=tmp_path,
+        )
+    if body_error:
+        assert caught.value is refusal
+        assert "injected object cleanup failure" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "native_locator",
+    [
+        {"first_chunk_lba": "invalid", "size_bytes": 1},
+        {"first_chunk_lba": [], "size_bytes": 1},
+        {"first_chunk_lba": -1, "size_bytes": 1},
+        {"size_bytes": 1},
+        {"first_chunk_lba": 1, "size_bytes": None},
+        {"first_chunk_lba": 1, "size_bytes": []},
+        {"first_chunk_lba": 1, "size_bytes": -1},
+    ],
+)
+def test_readback_observer_defers_locator_parse_refusals(native_locator: dict[str, Any]) -> None:
+    """All specified parser exceptions become fan-out refusals after observation."""
+    member = BuiltMember(_digest(b"a"), "a", 1, _digest(b"a"), native_locator)
+    observer = archive_fanout._CopyReadbackObserver([member])
+    observer(0, b"a")  # The observer contract forbids raising here.
+    with pytest.raises(ArchiveFanoutError):
+        observer.validate({"stored_size_bytes": 1})
+
+
+@pytest.mark.parametrize("fault", ["overlap", "past_end", "stored_size", "empty_digest"])
+def test_readback_observer_refuses_invalid_intervals_or_digests(fault: str) -> None:
+    """Range geometry, stored length and empty-file hashes are independent gates."""
+    member = BuiltMember(
+        _digest(b"a"),
+        "a",
+        1,
+        _digest(b"a"),
+        {"first_chunk_lba": 0, "size_bytes": 1},
+    )
+    members = [member]
+    if fault == "overlap":
+        members.append(replace(member, member_path="overlap"))
+    elif fault == "past_end":
+        members = [replace(member, native_locator={"first_chunk_lba": 1, "size_bytes": 1})]
+    elif fault == "empty_digest":
+        members.append(replace(member, member_path="empty", native_locator={"size_bytes": 0}))
+    observer = archive_fanout._CopyReadbackObserver(members)
+    observer(0, b"a")
+    with pytest.raises(ArchiveFanoutError):
+        observer.validate({"stored_size_bytes": 2 if fault == "stored_size" else 1})
+
+
+def test_readback_observer_refuses_repeated_offset_as_not_contiguous() -> None:
+    """F3: repeat an offset without a total-length mismatch to isolate contiguity."""
+    member = BuiltMember(
+        _digest(b"ab"), "ab", 2, _digest(b"ab"), {"first_chunk_lba": 0, "size_bytes": 2}
+    )
+    observer = archive_fanout._CopyReadbackObserver([member])
+    observer(0, b"a")
+    observer(0, b"b")
+    with pytest.raises(ArchiveFanoutError, match="not contiguous"):
+        observer.validate({"stored_size_bytes": 2})
+
+
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_unmeasured_readback_discards_observations_and_preserves_member_verification(
+    encrypted: bool, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3/R4: unmeasured bytes are ignored; encrypted fallback materializes only once."""
+    representation = Representation.REM_ENCRYPT_V1 if encrypted else Representation.REM_OBJECT_V1
+    bundle_id, backend_id, files = _readback_bundle(engine, tmp_path, representation, copies=1)
+    backend = _ReadbackBackend(measured=False)
+    key_file = tmp_path / "key"
+    key_file.write_bytes(b"key")
+    keys = _ReadbackKeys(key_file)
+    objects: list[Path] = []
+
+    def extract(cmd: list[str]) -> None:
+        source = Path(cmd[cmd.index("--object") + 1])
+        objects.append(source)
+        # The bogus unmeasured observation was replaced by the actual stored object.
+        with source.open("rb") as handle:
+            assert hashlib.file_digest(handle, "sha256").digest() == _digest(
+                next(iter(backend._objects.values()))
+            )
+        dest = Path(cmd[cmd.index("--dest") + 1])
+        name = cmd[cmd.index("--path") + 1]
+        (dest / name).write_bytes(files[name])
+
+    monkeypatch.setattr(archive_fanout, "run_rem_archive_build", lambda **kw: _readback_build(kw))
+    monkeypatch.setattr(archive_fanout, "resolve_rem_bin", lambda _: "rem")
+    monkeypatch.setattr(archive_fanout, "_run_rem", extract)
+    with session_scope(engine) as session:
+        result = flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends={backend_id: backend},
+            builder=RemArchiveBuilder(keys=keys),  # type: ignore[arg-type]
+            key_epoch="archive-" + "1" * 32 if encrypted else None,
+        )
+        assert not result.partial
+        [copy] = list(session.scalars(select(Copy)))
+        assert copy.last_measured_digest is None
+    assert backend.verifications == [True]
+    if encrypted:
+        stored_size = len(next(iter(backend._objects.values())))
+        assert backend.streams == [ByteRange(0, stored_size)]
+        assert backend.legacy_reads == []
+        assert len(objects) == 2
+        assert len(set(objects)) == 1
+        assert all(not path.exists() for path in objects)

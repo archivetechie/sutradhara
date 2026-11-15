@@ -991,6 +991,7 @@ def test_verify_detects_corruption_marks_corrupt_and_succeeds(
     from sutradhara.backend.port import (
         BackendLocator,
         ByteRange,
+        VerifyObserver,
         VerifyResult,
     )
     from sutradhara.catalog.types import content_hash
@@ -1008,7 +1009,9 @@ def test_verify_detects_corruption_marks_corrupt_and_succeeds(
         def read_range(self, _l: BackendLocator, _r: ByteRange) -> bytes:  # pragma: no cover
             raise NotImplementedError
 
-        def verify(self, _l: BackendLocator) -> VerifyResult:
+        def verify(
+            self, _l: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
             return VerifyResult(
                 ok=False,
                 measured=True,
@@ -1069,6 +1072,7 @@ def test_verify_backend_attested_corruption_marks_corrupt_and_succeeds(
         BackendLocator,
         BackendStoredCorruptError,
         ByteRange,
+        VerifyObserver,
         VerifyResult,
     )
     from sutradhara.catalog.types import content_hash
@@ -1086,7 +1090,9 @@ def test_verify_backend_attested_corruption_marks_corrupt_and_succeeds(
         def read_range(self, _l: BackendLocator, _r: ByteRange) -> bytes:  # pragma: no cover
             raise NotImplementedError
 
-        def verify(self, _l: BackendLocator) -> VerifyResult:
+        def verify(
+            self, _l: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
             raise BackendStoredCorruptError("daemon: stored bytes failed digest check")
 
     monkeypatch.setattr(
@@ -1185,7 +1191,7 @@ def test_trust_verify_promotion_clears_stale_measurement_and_enqueues_remeasure(
 ) -> None:
     """A trust-only success cannot requalify a previously suspect copy."""
 
-    from sutradhara.backend.port import BackendLocator, ByteRange, VerifyResult
+    from sutradhara.backend.port import BackendLocator, ByteRange, VerifyObserver, VerifyResult
 
     copy_id, _ = _seed_memory_backend(engine, b"trust-only", monkeypatch)
 
@@ -1200,7 +1206,9 @@ def test_trust_verify_promotion_clears_stale_measurement_and_enqueues_remeasure(
         def read_range(self, _locator: BackendLocator, _range: ByteRange) -> bytes:
             raise AssertionError("trust-only verification must not read bytes")
 
-        def verify(self, _locator: BackendLocator) -> VerifyResult:
+        def verify(
+            self, _locator: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
             return VerifyResult(ok=True, measured=False, detail="catalog echo")
 
     monkeypatch.setattr(backend_factory, "backend_from_row", lambda _row: _TrustOnlyBackend())

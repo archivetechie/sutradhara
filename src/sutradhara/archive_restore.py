@@ -1872,20 +1872,25 @@ def _copy_backend_range_to_path(
     end: int,
     destination: Path,
 ) -> None:
+    """Copy a finite range in one opener session, preserving restore fallback errors."""
     if start < 0 or end < start:
         raise ArchiveRestoreError(f"invalid backend byte range [{start}, {end})")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("wb") as handle:
-        for cursor in range(start, end, REM_OBJECT_CHUNK_SIZE):
-            chunk_end = min(cursor + REM_OBJECT_CHUNK_SIZE, end)
-            chunk = backend.read_range(locator, ByteRange(cursor, chunk_end))
-            expected = chunk_end - cursor
-            if len(chunk) != expected:
-                raise ArchiveRestoreError(
-                    f"backend returned {len(chunk)} bytes for range "
-                    f"[{cursor}, {chunk_end}), expected {expected}"
-                )
-            handle.write(chunk)
+        if start == end:
+            return
+        total = 0
+        try:
+            with _open_backend_range_chunks(backend, locator, ByteRange(start, end)) as chunks:
+                for chunk in chunks:
+                    handle.write(chunk)
+                    total += len(chunk)
+        except ValueError as exc:
+            raise ArchiveRestoreError(str(exc)) from exc
+        if total != end - start:
+            raise ArchiveRestoreError(
+                f"backend returned {total} bytes for range [{start}, {end}), expected {end - start}"
+            )
 
 
 def _read_whole(backend: StorageBackend, copy: Any) -> bytes:

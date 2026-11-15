@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 import sutradhara.cli.retention as retention_cli
 import sutradhara.retention as retention_module
 from sutradhara.arrangement import ArrangementError, create_from_intake
-from sutradhara.backend.port import ByteRange, VerifyResult, WitnessResult
+from sutradhara.backend.port import ByteRange, VerifyObserver, VerifyResult, WitnessResult
 from sutradhara.catalog.models import (
     Arrangement,
     ArtifactClassPolicyRecord,
@@ -116,7 +116,9 @@ class _DeleteBackend:
     def read_range(self, locator: dict[str, Any], byte_range: ByteRange) -> bytes:
         raise NotImplementedError
 
-    def verify(self, locator: dict[str, Any]) -> VerifyResult:
+    def verify(
+        self, locator: dict[str, Any], *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         raise NotImplementedError
 
     def witness_copy(

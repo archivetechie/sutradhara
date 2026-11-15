@@ -19,6 +19,7 @@ from sutradhara.backend.port import (
     BackendLocator,
     ByteRange,
     CopyRecord,
+    VerifyObserver,
     VerifyResult,
 )
 from sutradhara.catalog.copies import add_copy
@@ -85,7 +86,9 @@ class _MismatchedIntegrityBackend:
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         raise AssertionError("read_range is not used by scrub")
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         raise AssertionError("verify is not used by scrub")
 
 
@@ -113,7 +116,9 @@ class _DuplicateLocatorBackend:
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         raise AssertionError("read_range is not used by scrub")
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         raise AssertionError("verify is not used by scrub")
 
 
@@ -183,7 +188,9 @@ def test_scrub_verified_good_clears_suspect_copy(engine: Engine) -> None:
         def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
             raise AssertionError("read_range is not used by scrub")
 
-        def verify(self, locator: BackendLocator) -> VerifyResult:
+        def verify(
+            self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
             raise AssertionError("verify is not used by scrub")
 
     with session_scope(engine) as s:
@@ -249,7 +256,9 @@ def test_scrub_discovery_is_satisfied_pending_until_verify_runs(
                 else payload[byte_range.start : byte_range.end]
             )
 
-        def verify(self, locator: BackendLocator) -> VerifyResult:
+        def verify(
+            self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
             actual = _hash(self.read_range(locator, ByteRange(0, 0)))
             return VerifyResult(
                 ok=actual == data_hash,
@@ -364,7 +373,9 @@ def test_scrub_quarantines_recognizable_bundle_container_unknown(
         def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
             raise AssertionError("read_range is not used by scrub")
 
-        def verify(self, locator: BackendLocator) -> VerifyResult:
+        def verify(
+            self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
             raise AssertionError("verify is not used by scrub")
 
     with session_scope(engine) as s:
@@ -404,7 +415,9 @@ def test_scrub_still_adopts_unknown_non_container_object(engine: Engine) -> None
         def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
             raise AssertionError("read_range is not used by scrub")
 
-        def verify(self, locator: BackendLocator) -> VerifyResult:
+        def verify(
+            self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
             raise AssertionError("verify is not used by scrub")
 
     with session_scope(engine) as s:
@@ -444,7 +457,9 @@ def test_scrub_existing_rem_object_copy_does_not_create_stored_digest_asset(
         def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
             raise AssertionError("read_range is not used by scrub")
 
-        def verify(self, locator: BackendLocator) -> VerifyResult:
+        def verify(
+            self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
             raise AssertionError("verify is not used by scrub")
 
     with session_scope(engine) as s:
@@ -547,7 +562,9 @@ def test_scrub_during_open_batch_neither_marks_missing_nor_synthesizes(
         def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
             raise AssertionError("read_range is not used by scrub")
 
-        def verify(self, locator: BackendLocator) -> VerifyResult:
+        def verify(
+            self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
             raise AssertionError("verify is not used by scrub")
 
     backend = _CheckpointVisibilityBackend()

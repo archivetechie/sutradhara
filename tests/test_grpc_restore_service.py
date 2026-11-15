@@ -46,7 +46,14 @@ from sutradhara.artifactclass_policy import (
     apply_artifactclass_policy,
     get_artifactclass_policy,
 )
-from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, StreamKind, VerifyResult
+from sutradhara.backend.port import (
+    BackendLocator,
+    ByteRange,
+    CopyRecord,
+    StreamKind,
+    VerifyObserver,
+    VerifyResult,
+)
 from sutradhara.catalog.models import (
     ArtifactClassPool,
     AssetLocator,
@@ -189,7 +196,9 @@ class _DiskArchiveBackend:
         finally:
             handle.close()
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         del locator
         return VerifyResult(ok=True, measured=False)
 

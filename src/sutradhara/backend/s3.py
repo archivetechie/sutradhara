@@ -14,7 +14,9 @@ from sutradhara.backend.port import (
     ByteRange,
     CopyRecord,
     StreamKind,
+    VerifyObserver,
     VerifyResult,
+    _hash_observed_chunks,
 )
 from sutradhara.catalog.types import content_hash
 
@@ -169,10 +171,13 @@ class S3Backend:
             if callable(close):
                 close()
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
+        """Hash one download incrementally and observe the same stored bytes."""
         expected_hex = locator.get("sha256")
-        data = self.read_range(locator, ByteRange(0, 0))
-        actual = content_hash(hashlib.sha256(data).digest())
+        with self.open_range_chunks(locator, ByteRange(0, 0), chunk_bytes=256 * 1024) as chunks:
+            actual = _hash_observed_chunks(chunks, observe)
         if not isinstance(expected_hex, str):
             return VerifyResult(
                 ok=True,

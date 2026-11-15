@@ -18,7 +18,9 @@ from sutradhara.backend.port import (
     ByteRange,
     CopyRecord,
     StreamKind,
+    VerifyObserver,
     VerifyResult,
+    _hash_observed_chunks,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
 
@@ -109,10 +111,13 @@ class MemoryBackend:
 
         yield chunks()
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
+        """Hash the resident stored bytes and pass those bytes to the observer."""
         h = self._locator_to_hash(locator)
         data = self._objects[h]
-        actual = content_hash(hashlib.sha256(data).digest())
+        actual = _hash_observed_chunks((data,), observe)
         if actual == h:
             return VerifyResult(ok=True, measured=True, actual_hash=actual)
         return VerifyResult(

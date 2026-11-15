@@ -8,18 +8,32 @@ verify() re-checks integrity.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import hashlib
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
-from sutradhara.catalog.types import ContentHash
+from sutradhara.catalog.types import ContentHash, content_hash
 
 # A locator is backend-specific structured data. Each backend defines its
 # own shape (e.g. tape: {tape_uuid, tape_file_number}; s3: {bucket, key};
 # disk: {path}). The catalog stores it as JSON; adapters interpret it.
 BackendLocator = dict[str, Any]
+VerifyObserver = Callable[[int, bytes], None]
+
+
+def _hash_observed_chunks(chunks: Iterable[bytes], observe: VerifyObserver | None) -> ContentHash:
+    """Hash a read-back stream and expose precisely those bytes to its observer."""
+    digest = hashlib.sha256()
+    offset = 0
+    for chunk in chunks:
+        digest.update(chunk)
+        if observe is not None:
+            observe(offset, chunk)
+        offset += len(chunk)
+    return content_hash(digest.digest())
 
 
 class StreamKind(StrEnum):
@@ -135,7 +149,9 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         """Re-check the integrity of one copy.
 
         Implementation strategy is backend-specific:
@@ -145,6 +161,13 @@ class StorageBackend(Protocol):
 
         Returns a `VerifyResult.ok=False` (with `actual_hash` if known) on
         mismatch; does NOT raise on integrity failure.
+
+        When observe is supplied and the result is measured=True, every byte
+        of the stored object has been passed exactly once, in order, to
+        observe(offset, chunk). The offset starts at zero and equals the
+        number of bytes already passed; these are the same bytes hashed by
+        the adapter. For an unmeasured result the caller draws no conclusions
+        from what the observer saw. The observer records and never raises.
         """
         ...
 

@@ -51,6 +51,7 @@ from sutradhara.backend.port import (
     ByteRange,
     CopyRecord,
     StreamKind,
+    VerifyObserver,
     VerifyResult,
 )
 from sutradhara.catalog.models import (
@@ -163,8 +164,12 @@ class _WriteBackend:
 
         yield chunks()
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         data = self.read_range(locator, ByteRange(0, 0))
+        if observe is not None:
+            observe(0, data)
         actual = content_hash(hashlib.sha256(data).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
         return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)
@@ -1195,3 +1200,74 @@ def test_flush_preflight_skips_with_an_alarm_and_touches_nothing(
         assert bundle.archive_id is None
         assert bundle.flushed_at is None
         assert list(s.scalars(select(Copy))) == []
+
+
+def test_encrypted_preflight_includes_one_readback_and_largest_member(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T6: the old build-only allowance cannot admit encrypted read-back's disk peak."""
+    backend = _WriteBackend()
+    payloads = (b"alpha body", b"beta body")
+    with session_scope(engine) as session:
+        _install_class(
+            session,
+            "encrypted-preflight",
+            pools=(
+                ("encrypted-a", Representation.REM_ENCRYPT_V1.value),
+                ("encrypted-b", Representation.REM_ENCRYPT_V1.value),
+            ),
+        )
+        for index, data in enumerate(payloads):
+            source = tmp_path / f"{index}.bin"
+            source.write_bytes(data)
+            bundle = _enqueue(
+                session,
+                artifactclass="encrypted-preflight",
+                source=source,
+                member_path=source.name,
+            )
+        bundle_id = bundle.id
+    total = sum(map(len, payloads))
+    old_allowance = total * 2
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "sutradhara.archive_fanout.emit_structured_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+
+    class OldAllowance:
+        f_bavail = old_allowance
+        f_frsize = 1
+
+    monkeypatch.setattr(os, "statvfs", lambda _: OldAllowance())
+    builder = _FailingBuilder([])
+    with session_scope(engine) as session, pytest.raises(FlushPreflightShort):
+        flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends=_backends_for(session, backend),
+            builder=builder,
+            key_epoch="archive-" + "1" * 32,
+        )
+    assert builder.maps == []
+    assert backend._objects == {}
+    assert [name for name, _ in events] == ["bundle_flush_preflight_short"]
+    [(_, fields)] = events
+    assert fields["bundle_id"] == bundle_id
+    assert fields["target_count"] == 2
+    assert fields["available_bytes"] == old_allowance
+    assert fields["required_bytes"] == (
+        old_allowance
+        + total
+        + total // 100
+        + (len(payloads) + 2) * REM_OBJECT_CHUNK_SIZE
+        + max(map(len, payloads))
+    )
+    with session_scope(engine) as session:
+        bundle = session.get(Bundle, bundle_id)
+        assert bundle is not None
+        assert bundle.status == "open"
+        assert bundle.claimed_by is None
+        assert bundle.archive_id is None
+        assert bundle.flushed_at is None
+        assert list(session.scalars(select(Copy))) == []

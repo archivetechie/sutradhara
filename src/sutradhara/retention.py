@@ -28,6 +28,7 @@ from sutradhara.backend.port import (
     ByteRange,
     RetentionWitnessBackend,
     StorageBackend,
+    VerifyObserver,
     VerifyResult,
     WitnessResult,
 )
@@ -252,7 +253,9 @@ class _PolicyBackend(StorageBackend):
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         raise NotImplementedError
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         raise NotImplementedError
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,14 @@ class _FakePaginator:
         return [{"Contents": contents}]
 
 
+class _FakeStreamingBody(io.BytesIO):
+    """Keep read/close semantics while supporting S3's streaming verification."""
+
+    def iter_chunks(self, *, chunk_size: int) -> Iterator[bytes]:
+        while chunk := self.read(chunk_size):
+            yield chunk
+
+
 class _FakeS3Client:
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], bytes] = {}
@@ -123,7 +132,7 @@ class _FakeS3Client:
             start = int(start_raw)
             end = int(end_raw)
             data = data[start : end + 1]
-        return {"Body": io.BytesIO(data)}
+        return {"Body": _FakeStreamingBody(data)}
 
     def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
         data = self.objects[(Bucket, Key)]

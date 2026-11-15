@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import tempfile
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,7 +42,13 @@ from sutradhara.artifactclass_policy import (
     apply_artifactclass_policy,
     get_artifactclass_policy,
 )
-from sutradhara.backend.port import BackendLocator, ByteRange, CopyRecord, VerifyResult
+from sutradhara.backend.port import (
+    BackendLocator,
+    ByteRange,
+    CopyRecord,
+    VerifyObserver,
+    VerifyResult,
+)
 from sutradhara.catalog.models import (
     AssetLocator,
     Backend,
@@ -134,8 +142,12 @@ class _WriteBackend:
             return data
         return data[byte_range.start : byte_range.end]
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         data = self.read_range(locator, ByteRange(0, 0))
+        if observe is not None:
+            observe(0, data)
         actual = content_hash(hashlib.sha256(data).digest())
         expected = content_hash(bytes.fromhex(str(locator["content_sha256"])))
         return VerifyResult(ok=actual == expected, measured=True, actual_hash=actual)
@@ -212,18 +224,30 @@ class _MapArchiveBuilder:
             ),
         )
 
-    def verify_member_copy(
+    @contextmanager
+    def extract_member_from_path(
         self,
         *,
-        backend: _WriteBackend,
-        copy_locator: dict[str, Any],
+        object_path: Path,
         member: BuiltMember,
         representation: Representation,
         storage_metadata: Mapping[str, Any],
         work_dir: Path,
-    ) -> bytes:
+    ) -> Iterator[Path]:
+        """Extract the same fake member bytes from the shared local read-back file."""
         start = int(member.native_locator["first_chunk_lba"]) * REM_OBJECT_CHUNK_SIZE
-        return backend.read_range(copy_locator, ByteRange(start, start + member.size_bytes))
+        with tempfile.TemporaryDirectory(prefix="verify-out-", dir=work_dir) as raw:
+            output = Path(raw) / "member"
+            with object_path.open("rb") as source, output.open("wb") as destination:
+                source.seek(start)
+                remaining = member.size_bytes
+                while remaining:
+                    chunk = source.read(min(remaining, REM_OBJECT_CHUNK_SIZE))
+                    if not chunk:
+                        break
+                    destination.write(chunk)
+                    remaining -= len(chunk)
+            yield output
 
 
 def _flush_all(

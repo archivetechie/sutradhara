@@ -46,8 +46,10 @@ from sutradhara.backend.port import (
     ByteRange,
     CopyRecord,
     StreamKind,
+    VerifyObserver,
     VerifyResult,
     WitnessResult,
+    _hash_observed_chunks,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
 from sutradhara.jobs.runtime_observations import (
@@ -794,10 +796,13 @@ class RemanenceBackend:
             )
         return self._read_plan.PlanBatchRead(request, timeout=_PLAN_RPC_TIMEOUT_SECONDS)
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
+        """Measure the stored object in one read session, observing the hashed bytes."""
         if self._read_session is not None:
-            data = self.read_range(locator, ByteRange(0, 0))
-            actual = content_hash(hashlib.sha256(data).digest())
+            with self.open_range_chunks(locator, ByteRange(0, 0), chunk_bytes=256 * 1024) as chunks:
+                actual = _hash_observed_chunks(chunks, observe)
             expected = _hash_from_locator_required(locator)
             if actual == expected:
                 return VerifyResult(ok=True, measured=True, actual_hash=actual)
@@ -816,7 +821,7 @@ class RemanenceBackend:
                 actual_hash=obj.content_sha256,
                 detail="fixture mode: bytes not available; declared hash assumed",
             )
-        actual = content_hash(hashlib.sha256(obj.content).digest())
+        actual = _hash_observed_chunks((obj.content,), observe)
         if actual == obj.content_sha256:
             return VerifyResult(ok=True, measured=True, actual_hash=actual)
         return VerifyResult(

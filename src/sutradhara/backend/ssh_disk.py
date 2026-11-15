@@ -27,7 +27,9 @@ from sutradhara.backend.port import (
     ByteRange,
     CopyRecord,
     StreamKind,
+    VerifyObserver,
     VerifyResult,
+    _hash_observed_chunks,
 )
 from sutradhara.catalog.types import ContentHash, content_hash
 
@@ -411,7 +413,10 @@ class SshDiskBackend:
                     chunk_bytes=chunk_bytes,
                 )
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
+        """Keep remote checks, then measure one download when observation is requested."""
         key = _locator_key(locator)
         digest_value: object = self._transport.sha256(key)
         if digest_value is None:
@@ -427,6 +432,14 @@ class SshDiskBackend:
             expected = _content_hash_from_hex(expected_hex)
         except ValueError:
             return VerifyResult(ok=False, measured=False, detail="invalid hash")
+        if observe is not None:
+            try:
+                with self.open_materialized_range_chunks(
+                    locator, ByteRange(0, 0), chunk_bytes=256 * 1024
+                ) as chunks:
+                    actual = _hash_observed_chunks(chunks, observe)
+            except BackendNotFoundError:
+                return VerifyResult(ok=False, measured=False, detail="absent")
         if actual == expected:
             return VerifyResult(ok=True, measured=True, actual_hash=actual)
         return VerifyResult(

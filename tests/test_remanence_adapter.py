@@ -221,6 +221,29 @@ def test_verify_happy(backend: RemanenceBackend) -> None:
     assert result.actual_hash is not None
 
 
+@pytest.mark.parametrize("with_bytes", [True, False])
+def test_verify_fixture_observer_only_receives_available_bytes(with_bytes: bool) -> None:
+    """T2 fixture contract: catalog-only objects produce no byte observations."""
+    data = b"fixture observer"
+    digest = hashlib.sha256(data).digest()
+    obj: dict[str, Any] = {
+        "object_id": "1" * 32,
+        "content_sha256": digest.hex(),
+        "logical_size_bytes": len(data),
+        "copies": [{"tape_uuid": "2" * 32, "tape_file_number": 1, "health": "ok"}],
+    }
+    if with_bytes:
+        obj["content_hex"] = data.hex()
+    backend = RemanenceBackend.from_object_dicts("fixture", [obj])
+    [record] = list(backend.enumerate())
+    observed: list[tuple[int, bytes]] = []
+    result = backend.verify(record.native_locator, observe=lambda o, c: observed.append((o, c)))
+    assert result.ok
+    assert result.measured is with_bytes
+    assert result.actual_hash == digest
+    assert observed == ([(0, data)] if with_bytes else [])
+
+
 def test_verify_byte_less_fixture_is_explicitly_unmeasured() -> None:
     """A fixture catalog hash without readable bytes cannot qualify as measured."""
 

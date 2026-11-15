@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from sutradhara.archive_restore import restore_asset
 from sutradhara.artifactclass_policy import ArtifactClassPolicyRecord
-from sutradhara.backend.port import BackendLocator, ByteRange, VerifyResult
+from sutradhara.backend.port import BackendLocator, ByteRange, VerifyObserver, VerifyResult
 from sutradhara.catalog.copies import add_bundle_copy, add_copy
 from sutradhara.catalog.models import (
     ArtifactClassPool,
@@ -71,7 +71,9 @@ class _NoReadBackend:
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         raise NotImplementedError
 
-    def verify(self, locator: BackendLocator) -> VerifyResult:
+    def verify(
+        self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+    ) -> VerifyResult:
         raise NotImplementedError
 
 
