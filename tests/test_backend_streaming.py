@@ -163,7 +163,9 @@ class _ReadClient:
         self.opens = 0
         self.ranges: list[tuple[int, int]] = []
 
-    def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+    def OpenReadSession(
+        self, request: layer5_pb2.OpenReadSessionRequest, timeout: float | None = None
+    ) -> layer5_pb2.ReadSession:
         self.opens += 1
         return layer5_pb2.ReadSession(session_id=b"session", tape_uuid=_TAPE_UUID)
 

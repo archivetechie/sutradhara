@@ -77,6 +77,8 @@ class Job(Base):
     step_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Times found RUNNING at a worker start: its worker died mid-attempt.
+    kills: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     not_before: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow, index=True
     )

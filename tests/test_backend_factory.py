@@ -127,3 +127,37 @@ def test_d2_tape_rejects_obsolete_placements_config(tmp_path: Path) -> None:
     jar.write_text("fake\n")
     with pytest.raises(BackendNotConfigured, match="obsolete"):
         backend_from_row(_d2_tape_row({"jar_path": str(jar), "placements": {}}))
+
+
+@pytest.mark.parametrize("seconds", [None, 0.25])
+def test_rem_tape_read_open_deadline_reaches_backend(seconds) -> None:
+    """T9: live construction forwards the configured budget or its 600s default."""
+    config = {"daemon_endpoint": "unix:/run/remanence/rem.sock"}
+    if seconds is not None:
+        config["read_open_deadline_seconds"] = seconds
+    backend = backend_from_row(_rem_tape_row(config))
+    assert isinstance(backend, RemanenceBackend)
+    assert backend._read_open_deadline_seconds == (600.0 if seconds is None else seconds)
+
+
+@pytest.mark.parametrize(
+    "seconds", [0, -1, "bad", True, "nan", "inf", pytest.param(10**1000, id="overflow")]
+)
+def test_rem_tape_read_open_deadline_refuses_invalid_config(seconds) -> None:
+    """T9: malformed and unbounded budgets are configuration errors."""
+    with pytest.raises(BackendNotConfigured, match="read_open_deadline_seconds"):
+        backend_from_row(
+            _rem_tape_row(
+                {
+                    "daemon_endpoint": "unix:/run/remanence/rem.sock",
+                    "read_open_deadline_seconds": seconds,
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize("seconds", [0, -1, float("inf"), float("nan")])
+def test_remanence_constructor_refuses_invalid_read_open_deadline(seconds) -> None:
+    """T9: direct construction enforces the same finite positive bound."""
+    with pytest.raises(ValueError, match="read_open_deadline_seconds"):
+        RemanenceBackend("invalid-budget", read_open_deadline_seconds=seconds)

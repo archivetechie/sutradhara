@@ -527,6 +527,40 @@ engine.dispose()
     assert _schema_signatures(migration_path) == _schema_signatures(create_all_path)
 
 
+def test_job_kills_migration_defaults_existing_row_and_downgrades(tmp_path: Path) -> None:
+    """T4: the server default backfills existing jobs and downgrade removes it."""
+    db_path = tmp_path / "job-kills.db"
+    env = {**os.environ, "SUTRADHARA_DB_URL": f"sqlite:///{db_path}"}
+    repo_root = Path(__file__).resolve().parents[1]
+
+    def migrate(direction: str, revision: str) -> None:
+        subprocess.run(
+            [sys.executable, "-m", "alembic", direction, revision],
+            cwd=repo_root,
+            env=env,
+            check=True,
+        )
+
+    migrate("upgrade", "f8b2d4e6a0c1")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO job (id, kind, params, status, step_state, attempts, "
+            "not_before, priority, required_resources, prerequisites, created_at) "
+            "VALUES (1, 'verify', '{}', 'pending', '{}', 0, '2026-11-16', 0, '[]', '[]', "
+            "'2026-11-16')"
+        )
+    migrate("upgrade", "head")
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT kills FROM job WHERE id=1").fetchone() == (0,)
+        column = next(row for row in conn.execute("PRAGMA table_info(job)") if row[1] == "kills")
+        assert column[3] == 1
+        assert column[4] == "0"
+    migrate("downgrade", "f8b2d4e6a0c1")
+    with sqlite3.connect(db_path) as conn:
+        assert "kills" not in {row[1] for row in conn.execute("PRAGMA table_info(job)")}
+        assert conn.execute("SELECT id FROM job").fetchall() == [(1,)]
+
+
 def test_rem_object_representation_migration_rewrites_catalog_and_fingerprints(
     tmp_path: Path,
 ) -> None:
@@ -1835,8 +1869,7 @@ def _rba_seed_catalog(db_path):
 
 @pytest.fixture(params=["migrated", "create_all"])
 def rba_ledger_db(tmp_path, request):
-    from sutradhara.catalog.session import create_all, make_engine, session_scope
-    from sutradhara.jobs.engine import submit
+    from sutradhara.catalog.session import create_all, make_engine
 
     db_path = tmp_path / "ledger.db"
     engine = make_engine(f"sqlite:///{db_path}")
@@ -1845,8 +1878,16 @@ def rba_ledger_db(tmp_path, request):
     else:
         create_all(engine)
     _rba_seed_catalog(db_path)
-    with session_scope(engine) as session:
-        job_id = submit(session, "_ledger").id
+    # This fixture deliberately tests the ledger's historical revision. Seed
+    # its job without the current ORM, which can contain later job columns.
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            "INSERT INTO job (kind, params, status, step_state, attempts, "
+            "not_before, priority, required_resources, prerequisites, created_at) "
+            "VALUES ('_ledger', '{}', 'pending', '{}', 0, '2026-11-15', 0, '[]', '[]', "
+            "'2026-11-15')"
+        )
+        job_id = cursor.lastrowid
     yield engine, db_path, job_id
     engine.dispose()
 

@@ -6,6 +6,8 @@ the factory turns it into a live adapter that implements the Protocol.
 
 from __future__ import annotations
 
+import math
+
 from sutradhara.backend.d2tape import D2TapeBackend
 from sutradhara.backend.memory import MemoryBackend
 from sutradhara.backend.port import StorageBackend
@@ -62,10 +64,23 @@ def backend_from_row(row: BackendRow) -> StorageBackend:
                 "and 'fixture_path'; configure exactly one"
             )
         if isinstance(daemon_endpoint, str):
+            try:
+                read_open_deadline_seconds = _optional_float(
+                    cfg, "read_open_deadline_seconds", 600.0
+                )
+            except (ValueError, OverflowError) as exc:
+                raise BackendNotConfigured(
+                    "config.read_open_deadline_seconds must be a number"
+                ) from exc
+            if not math.isfinite(read_open_deadline_seconds) or read_open_deadline_seconds <= 0:
+                raise BackendNotConfigured(
+                    "config.read_open_deadline_seconds must be finite and greater than zero"
+                )
             return RemanenceBackend.from_grpc(
                 row.name,
                 daemon_endpoint,
                 library_identity=_optional_str(cfg, "library_uuid"),
+                read_open_deadline_seconds=read_open_deadline_seconds,
             )
         if isinstance(fixture, str):
             return RemanenceBackend.from_fixture_file(row.name, fixture)

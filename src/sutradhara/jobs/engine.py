@@ -36,6 +36,7 @@ from sutradhara.jobs.models import (
 from sutradhara.jobs.reconcilers.conditions import (
     CONDITION_BACKOFF,
     CONDITION_BLOCKED,
+    block_condition_without_attempt,
     record_condition,
 )
 from sutradhara.jobs.registry import (
@@ -54,6 +55,8 @@ from sutradhara.jobs.runtime_observations import (
     bind_tape_locator_observer,
 )
 from sutradhara.structured_logs import emit_structured_event
+
+KILL_LIMIT = 3
 
 
 class AttemptSuperseded(Exception):
@@ -604,20 +607,40 @@ def claim_job_by_id(
 
 
 def reset_orphaned_running_jobs(session: Session) -> int:
-    """Reset RUNNING jobs and retain the startup-observed crash gap as a fact."""
+    """Count startup-observed worker deaths, stopping jobs at the kill limit."""
 
     now = _utcnow()
     rows = list(session.scalars(select(Job).where(Job.status == JobStatus.RUNNING)))
-    marker = f"orphaned RUNNING at startup, reset to PENDING at {now.isoformat()}"
     for job in rows:
+        job.kills += 1
+        at_limit = job.kills >= KILL_LIMIT
+        marker = (
+            "killed-repeatedly: found running at a worker start for the third time; "
+            "the job is not run again"
+            if at_limit
+            else f"orphaned RUNNING at startup, reset to PENDING at {now.isoformat()}"
+        )
         prior = dict(job.step_state or {})
         engine_observations = list(prior.get("engine_observations") or [])
         engine_observations.append({"note": marker})
         job.step_state = {**prior, "engine_observations": engine_observations}
         job.last_error = marker
-        job.status = JobStatus.PENDING
-        job.started_at = None
-        job.not_before = now
+        if at_limit:
+            job.status = JobStatus.FAILED
+            job.finished_at = now
+            if job.recon_domain is not None and job.recon_target_key is not None:
+                block_condition_without_attempt(
+                    session,
+                    domain=job.recon_domain,
+                    target_key=job.recon_target_key,
+                    reason="killed-repeatedly",
+                    message=marker,
+                    components=attempt_detail(job_context(session, job))["components"],
+                )
+        else:
+            job.status = JobStatus.PENDING
+            job.started_at = None
+            job.not_before = now
     session.flush(rows)
     return len(rows)
 
@@ -705,12 +728,13 @@ def apply_retry_policy(
     if job.status != JobStatus.FAILED:
         return
     retry = config.retry_for_kind(job.kind)
-    if job.attempts >= retry.max_attempts:
+    counted_attempts = job.attempts - job.kills
+    if counted_attempts >= retry.max_attempts:
         return
     base = now or _utcnow()
     job.status = JobStatus.PENDING
     job.not_before = base + dt.timedelta(
-        seconds=retry.delay_seconds(job.attempts, max_seconds=config.max_backoff_seconds)
+        seconds=retry.delay_seconds(counted_attempts, max_seconds=config.max_backoff_seconds)
     )
     job.started_at = None
     job.finished_at = None

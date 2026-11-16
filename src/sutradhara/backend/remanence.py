@@ -21,6 +21,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import math
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -272,7 +273,7 @@ class _ReadRangeCall(Protocol):
 
 class _ReadSessionClient(Protocol):
     def OpenReadSession(
-        self, request: layer5_pb2.OpenReadSessionRequest
+        self, request: layer5_pb2.OpenReadSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.ReadSession: ...
 
     def ReadObjectRange(self, request: layer5_pb2.ReadObjectRangeRequest) -> _ReadRangeCall: ...
@@ -284,7 +285,7 @@ class _ReadSessionClient(Protocol):
 
 class _LibraryClient(Protocol):
     def GetLiveStatus(
-        self, request: layer5_pb2.GetLiveStatusRequest
+        self, request: layer5_pb2.GetLiveStatusRequest, timeout: float | None = None
     ) -> layer5_pb2.GetLiveStatusResponse: ...
 
 
@@ -321,6 +322,31 @@ class TapeReadFacts:
     written_extent_lba: int | None
 
 
+class _ReadOpenBudget:
+    """One open's monotonic budget, excluding only process-local bay-lock waits."""
+
+    def __init__(
+        self, seconds: float, endpoint: str | None, tape_uuid: bytes, *, started_at: float
+    ) -> None:
+        self._deadline = started_at + seconds
+        self._message = (
+            f"Remanence OpenReadSession at {endpoint!r} for tape {tape_uuid.hex()} "
+            f"exhausted its {seconds:g}s budget"
+        )
+
+    def remaining(self) -> float:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise self.expired()
+        return remaining
+
+    def exclude_lock_wait(self, seconds: float) -> None:
+        self._deadline += seconds
+
+    def expired(self) -> BackendTransientError:
+        return BackendTransientError(self._message)
+
+
 class _DriveQueueLease:
     """One process-local turn for an advisory ``(library_serial, bay)`` queue."""
 
@@ -354,11 +380,13 @@ class _DriveRestoreQueue:
         self._guard = threading.Lock()
         self._locks: dict[DriveQueueKey, threading.Lock] = {}
 
-    def acquire(self, tape_uuid: bytes) -> _DriveQueueLease | None:
+    def acquire(
+        self, tape_uuid: bytes, budget: _ReadOpenBudget | None = None
+    ) -> _DriveQueueLease | None:
         # Advisory: with no usable assignment (surface absent / no match for this tape /
         # assignment vanished / unspecified state) return None — the caller opens directly
         # and the atomic bay reservation + FailedPrecondition-requeue still arbitrate.
-        assignments = self._assignments()
+        assignments = self._assignments(budget)
         with self._guard:
             held_keys = frozenset(key for key, lock in self._locks.items() if lock.locked())
             assignment = _select_drive_assignment(assignments, tape_uuid, held_keys)
@@ -366,10 +394,15 @@ class _DriveRestoreQueue:
                 return None
             key = (assignment.library_serial, int(assignment.bay))
             lock = self._locks.setdefault(key, threading.Lock())
+        if budget is not None:
+            budget.remaining()
+        waiting_since = time.monotonic()
         lock.acquire()
         try:
+            if budget is not None:
+                budget.exclude_lock_wait(time.monotonic() - waiting_since)
             while True:
-                current = _assignment_for_key(self._assignments(), key)
+                current = _assignment_for_key(self._assignments(budget), key)
                 if current is None or current.state not in (
                     _DRIVE_ASSIGNMENT_IDLE,
                     _DRIVE_ASSIGNMENT_ACTIVE,
@@ -378,18 +411,29 @@ class _DriveRestoreQueue:
                     return None
                 if current.state == _DRIVE_ASSIGNMENT_IDLE:
                     return _DriveQueueLease(key, lock)
-                time.sleep(self._poll_seconds)
+                time.sleep(
+                    self._poll_seconds
+                    if budget is None
+                    else min(self._poll_seconds, budget.remaining())
+                )
         except BaseException:
             lock.release()
             raise
 
-    def _assignments(self) -> list[layer5_pb2.DriveAssignment]:
+    def _assignments(
+        self, budget: _ReadOpenBudget | None = None
+    ) -> list[layer5_pb2.DriveAssignment]:
         # The drive-assignment surface is ADVISORY. An older daemon without the RPC
         # (UNIMPLEMENTED), or a transient GetLiveStatus failure, degrades to "no
         # assignment info": the caller then opens directly and re-queues on a lost
         # FailedPrecondition race. Never hard-fail a restore on the advisory surface.
         try:
-            response = self._client.GetLiveStatus(layer5_pb2.GetLiveStatusRequest())
+            request = layer5_pb2.GetLiveStatusRequest()
+            response = (
+                self._client.GetLiveStatus(request)
+                if budget is None
+                else self._client.GetLiveStatus(request, timeout=budget.remaining())
+            )
         except grpc.RpcError:
             return []
         return list(response.drive_assignments)
@@ -494,7 +538,11 @@ class RemanenceBackend:
         library_identity: bytes | str | None = None,
         channel: grpc.Channel | None = None,
         read_plan: _ReadPlanClient | None = None,
+        read_open_deadline_seconds: float = 600.0,
     ) -> None:
+        if not math.isfinite(read_open_deadline_seconds) or read_open_deadline_seconds <= 0:
+            raise ValueError("read_open_deadline_seconds must be finite and greater than zero")
+        self._read_open_deadline_seconds = read_open_deadline_seconds
         self._name = name
         self._endpoint = endpoint
         self._catalog = catalog
@@ -564,6 +612,7 @@ class RemanenceBackend:
         endpoint: str | None = None,
         *,
         library_identity: bytes | str | None = None,
+        read_open_deadline_seconds: float = 600.0,
     ) -> RemanenceBackend:
         """Construct a live adapter targeting a local Remanence daemon.
 
@@ -575,6 +624,8 @@ class RemanenceBackend:
         if endpoint is None:
             endpoint = name
             name = "remanence"
+        if not math.isfinite(read_open_deadline_seconds) or read_open_deadline_seconds <= 0:
+            raise ValueError("read_open_deadline_seconds must be finite and greater than zero")
         channel = grpc.insecure_channel(
             _grpc_target(endpoint),
             options=_grpc_channel_options(endpoint),
@@ -609,6 +660,7 @@ class RemanenceBackend:
             library_identity=library_identity,
             channel=channel,
             read_plan=read_plan,
+            read_open_deadline_seconds=read_open_deadline_seconds,
         )
 
     # --- StorageBackend protocol -----------------------------------------
@@ -696,11 +748,19 @@ class RemanenceBackend:
 
         if self._read_session is None:
             return RemanenceReadSession.fixture(self, locator)
+        started_at = time.monotonic()
         client = self._require_read_session()
         tape_uuid = _uuid_bytes_from_locator(locator, "tape_uuid")
         object_id = _uuid_bytes_from_locator(locator, "object_id")
+        budget = _ReadOpenBudget(
+            self._read_open_deadline_seconds, self._endpoint, tape_uuid, started_at=started_at
+        )
         while True:
-            lease = self._drive_queue.acquire(tape_uuid) if self._drive_queue is not None else None
+            lease = (
+                self._drive_queue.acquire(tape_uuid, budget)
+                if self._drive_queue is not None
+                else None
+            )
             try:
                 session = client.OpenReadSession(
                     layer5_pb2.OpenReadSessionRequest(
@@ -708,15 +768,18 @@ class RemanenceBackend:
                             tape_uuid=tape_uuid,
                             mount_if_needed=True,
                         )
-                    )
+                    ),
+                    timeout=budget.remaining(),
                 )
             except grpc.RpcError as e:
                 if lease is not None:
                     lease.release()
+                if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+                    raise budget.expired() from e
                 if self._drive_queue is not None and _is_active_read_session_race(e):
                     # Bounded backoff so a persistently-busy bay (or a degraded advisory
                     # surface that returned no lease) re-queues without busy-spinning.
-                    time.sleep(_DRIVE_ASSIGNMENT_POLL_SECONDS)
+                    time.sleep(min(_DRIVE_ASSIGNMENT_POLL_SECONDS, budget.remaining()))
                     continue
                 raise BackendUnavailableError(
                     f"Remanence OpenReadSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
@@ -725,21 +788,31 @@ class RemanenceBackend:
                 if lease is not None:
                     lease.release()
                 raise
-            break
-        report_session_open(
-            session_id=session.session_id,
-            drive_element_address=session.drive_element_address,
-            tape_uuid=session.tape_uuid,
-            library=self._library_identity,
-        )
-        return RemanenceReadSession.live(
-            backend=self,
-            client=client,
-            session_id=session.session_id,
-            drive_element_address=session.drive_element_address,
-            object_id=object_id,
-            drive_queue_lease=lease,
-        )
+            try:
+                budget.remaining()
+                report_session_open(
+                    session_id=session.session_id,
+                    drive_element_address=session.drive_element_address,
+                    tape_uuid=session.tape_uuid,
+                    library=self._library_identity,
+                )
+                reader = RemanenceReadSession.live(
+                    backend=self,
+                    client=client,
+                    session_id=session.session_id,
+                    drive_element_address=session.drive_element_address,
+                    object_id=object_id,
+                    drive_queue_lease=lease,
+                )
+                budget.remaining()
+                return reader
+            except BaseException:
+                try:
+                    self._safe_close_read(client, session.session_id)
+                finally:
+                    if lease is not None:
+                        lease.release()
+                raise
 
     def get_file(self, locator: BackendLocator, *, path: str) -> layer5_pb2.FileRecord:
         """Return one Remanence file catalog row for a stored object path."""

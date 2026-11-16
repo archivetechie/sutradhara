@@ -677,6 +677,62 @@ def test_worker_startup_resets_orphaned_running_jobs(engine: Engine) -> None:
         assert row.step_state["engine_observations"] == [{"note": row.last_error}]
 
 
+def test_third_worker_kill_fails_without_attempt(engine: Engine) -> None:
+    """T1: real claims earn kills, and the third recovery is terminal."""
+    with session_scope(engine) as session:
+        job = submit(session, "verify", {"copy_id": 1})
+        for kill in range(1, 4):
+            assert claim_job_by_id(session, job.id) is job
+            started = job.started_at
+            due = job.not_before
+            assert reset_orphaned_running_jobs(session) == 1
+            assert job.attempts == job.kills == kill
+            assert len(job.step_state["engine_observations"]) == kill
+            assert list(session.scalars(select(JobAttempt))) == []
+            if kill < 3:
+                assert job.status == JobStatus.PENDING
+                assert job.started_at is None
+            else:
+                assert job.status == JobStatus.FAILED
+                assert job.finished_at is not None
+                assert job.started_at == started
+                assert job.not_before == due
+                assert job.last_error.startswith("killed-repeatedly:")
+                assert job.step_state["engine_observations"][-1]["note"] == job.last_error
+        assert reset_orphaned_running_jobs(session) == 0
+        assert job.kills == 3
+
+
+@pytest.mark.parametrize("killed", [False, True])
+def test_worker_kill_does_not_consume_retry_or_backoff(engine, monkeypatch, killed):
+    """T2: two handler failures exhaust the same policy with or without a kill."""
+    from sutradhara.jobs import registry
+
+    monkeypatch.setitem(
+        registry._HANDLERS, "_rba2e_retry", lambda ctx: JobResult(ok=False, detail="failed")
+    )
+    config = WorkerConfig(
+        per_kind_retry={"_rba2e_retry": RetryPolicy(max_attempts=2, backoff_seconds=60)}
+    )
+    now = dt.datetime.now(dt.UTC)
+    with session_scope(engine) as session:
+        job = submit(session, "_rba2e_retry")
+        if killed:
+            assert claim_job_by_id(session, job.id) is job
+            reset_orphaned_running_jobs(session)
+        for failure in (1, 2):
+            assert claim_job_by_id(session, job.id) is job
+            assert not run_one(session, job.id).ok
+            job_engine.apply_retry_policy(session, job, config=config, now=now)
+            assert job.attempts == failure + int(killed)
+            assert job.kills == int(killed)
+            if failure == 1:
+                assert job.status == JobStatus.PENDING
+                assert 48 <= (_aware_utc(job.not_before) - now).total_seconds() <= 72
+            else:
+                assert job.status == JobStatus.FAILED
+
+
 def test_validate_handler_marks_clean_and_decode_invalid_assets(
     engine: Engine,
     tmp_path: Path,

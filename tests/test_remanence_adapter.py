@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from concurrent import futures
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from sutradhara.backend.port import (
     BackendError,
     BackendNotFoundError,
     BackendStoredCorruptError,
+    BackendTransientError,
     BackendUnavailableError,
     ByteRange,
     CopyRecord,
@@ -524,7 +526,7 @@ class _QueueLibrary:
         self.loaded_tape_uuid = b""
 
     def GetLiveStatus(
-        self, request: layer5_pb2.GetLiveStatusRequest
+        self, request: layer5_pb2.GetLiveStatusRequest, timeout: float | None = None
     ) -> layer5_pb2.GetLiveStatusResponse:
         with self._guard:
             return layer5_pb2.GetLiveStatusResponse(
@@ -560,7 +562,9 @@ class _QueueReadClient:
         self.opened = threading.Event()
         self.second_opened = threading.Event()
 
-    def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+    def OpenReadSession(
+        self, request: layer5_pb2.OpenReadSessionRequest, timeout: float | None = None
+    ) -> layer5_pb2.ReadSession:
         self.open_count += 1
         if self.open_count == 2:
             self.second_opened.set()
@@ -604,7 +608,9 @@ class _OtherPreconditionError(_LostRaceError):
 
 
 class _LostRaceReadClient(_QueueReadClient):
-    def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+    def OpenReadSession(
+        self, request: layer5_pb2.OpenReadSessionRequest, timeout: float | None = None
+    ) -> layer5_pb2.ReadSession:
         self.open_count += 1
         if self.open_count == 1:
             raise _LostRaceError()
@@ -618,15 +624,19 @@ class _LostRaceReadClient(_QueueReadClient):
 
 
 class _TapeMountedReadClient(_LostRaceReadClient):
-    def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+    def OpenReadSession(
+        self, request: layer5_pb2.OpenReadSessionRequest, timeout: float | None = None
+    ) -> layer5_pb2.ReadSession:
         if self.open_count == 0:
             self.open_count += 1
             raise _TapeMountedError()
-        return super().OpenReadSession(request)
+        return super().OpenReadSession(request, timeout=timeout)
 
 
 class _OtherPreconditionReadClient(_QueueReadClient):
-    def OpenReadSession(self, request: layer5_pb2.OpenReadSessionRequest) -> layer5_pb2.ReadSession:
+    def OpenReadSession(
+        self, request: layer5_pb2.OpenReadSessionRequest, timeout: float | None = None
+    ) -> layer5_pb2.ReadSession:
         self.open_count += 1
         raise _OtherPreconditionError()
 
@@ -639,11 +649,17 @@ class _RangeFailureReadClient(_QueueReadClient):
         yield  # pragma: no cover - make this a streaming RPC-shaped method
 
 
-def _queue_backend(library: _QueueLibrary, client: _QueueReadClient) -> RemanenceBackend:
+def _queue_backend(
+    library: _QueueLibrary,
+    client: _QueueReadClient,
+    *,
+    read_open_deadline_seconds: float = 600.0,
+) -> RemanenceBackend:
     backend = RemanenceBackend(
         "queued-rem-tape",
         endpoint="queue-test",
         read_session=client,
+        read_open_deadline_seconds=read_open_deadline_seconds,
     )
     backend._drive_queue = remanence_module._DriveRestoreQueue(library, poll_seconds=0.001)
     return backend
@@ -723,8 +739,8 @@ def test_tape_already_mounted_by_another_session_requeues_and_releases_lease() -
     real_acquire = backend._drive_queue.acquire
     leases: list[Any] = []
 
-    def recording_acquire(tape_uuid: bytes) -> Any:
-        lease = real_acquire(tape_uuid)
+    def recording_acquire(tape_uuid: bytes, *args: Any, **kwargs: Any) -> Any:
+        lease = real_acquire(tape_uuid, *args, **kwargs)
         leases.append(lease)
         return lease
 
@@ -2102,3 +2118,187 @@ def test_remanence_write_pool_refusal_mapping(tmp_path, monkeypatch, operation, 
         assert error.value.session_id == client.session_id
     elif status == grpc.StatusCode.UNAVAILABLE:
         assert type(error.value) is RemanenceWriteSessionError
+
+
+class _BusyUntilLibrary(_QueueLibrary):
+    """Stay externally busy for a finite cap, even with the poll guard mutated."""
+
+    def __init__(self, cap_seconds: float) -> None:
+        super().__init__()
+        self.busy_until = time.monotonic() + cap_seconds
+        self.timeouts: list[float | None] = []
+
+    def GetLiveStatus(self, request, timeout: float | None = None):
+        self.timeouts.append(timeout)
+        self.set_active(time.monotonic() < self.busy_until)
+        return super().GetLiveStatus(request, timeout=timeout)
+
+
+class _RaceUntilClient(_QueueReadClient):
+    """Lose reservations until a finite cap so a broken deadline cannot hang."""
+
+    def __init__(self, library: _QueueLibrary, cap_seconds: float) -> None:
+        super().__init__(library)
+        self.refuse_until = time.monotonic() + cap_seconds
+        self.timeouts: list[float | None] = []
+
+    def OpenReadSession(self, request, timeout: float | None = None):
+        self.timeouts.append(timeout)
+        if time.monotonic() < self.refuse_until:
+            raise _LostRaceError()
+        return super().OpenReadSession(request, timeout=timeout)
+
+
+class _OpenRpcError(grpc.RpcError):  # type: ignore[misc]
+    def __init__(self, status: grpc.StatusCode) -> None:
+        self.status = status
+
+    def code(self) -> grpc.StatusCode:
+        return self.status
+
+    def details(self) -> str:
+        return "injected open failure"
+
+
+def test_read_open_busy_poll_has_budget_and_releases_bay() -> None:
+    """T5: external ACTIVE polling expires promptly and leaves a usable bay."""
+    seconds = 0.2
+    library = _BusyUntilLibrary(5 * seconds)
+    client = _QueueReadClient(library)
+    backend = _queue_backend(library, client, read_open_deadline_seconds=seconds)
+    locator = _read_locator("11" * 32)
+    started = time.monotonic()
+    with pytest.raises(BackendTransientError) as raised:
+        backend.open_read_session(locator)
+    assert time.monotonic() - started < 2 * seconds
+    assert "queue-test" in str(raised.value)
+    assert _TAPE_UUID_HEX in str(raised.value)
+    assert "0.2s" in str(raised.value)
+    assert all(timeout is not None and 0 < timeout <= seconds for timeout in library.timeouts)
+    assert backend._drive_queue is not None
+    assert not any(lock.locked() for lock in backend._drive_queue._locks.values())
+    library.busy_until = 0
+    with backend.open_read_session(locator):
+        pass
+    assert client.open_count == 1
+
+
+def test_read_open_race_requeues_share_budget() -> None:
+    """T6: lost reservations do not restart the open's time budget."""
+    seconds = 0.2
+    library = _QueueLibrary()
+    client = _RaceUntilClient(library, 5 * seconds)
+    backend = _queue_backend(library, client, read_open_deadline_seconds=seconds)
+    started = time.monotonic()
+    with pytest.raises(BackendTransientError):
+        backend.open_read_session(_read_locator("11" * 32))
+    assert time.monotonic() - started < 2 * seconds
+    assert client.timeouts
+    assert backend._drive_queue is not None
+    assert not any(lock.locked() for lock in backend._drive_queue._locks.values())
+
+
+@pytest.mark.parametrize(
+    "status", [None, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE]
+)
+def test_read_open_rpc_timeout_and_error_mapping(status) -> None:
+    """T7: the RPC gets a positive remaining timeout and preserves error typing."""
+    seconds = 0.2
+    library = _QueueLibrary()
+    timeouts = []
+
+    class Client(_QueueReadClient):
+        def OpenReadSession(self, request, timeout: float | None = None):
+            timeouts.append(timeout)
+            if status is not None:
+                raise _OpenRpcError(status)
+            return super().OpenReadSession(request, timeout=timeout)
+
+    backend = _queue_backend(library, Client(library), read_open_deadline_seconds=seconds)
+    if status is None:
+        with backend.open_read_session(_read_locator("11" * 32)):
+            pass
+    else:
+        with pytest.raises(BackendUnavailableError) as raised:
+            backend.open_read_session(_read_locator("11" * 32))
+        assert isinstance(raised.value, BackendTransientError) == (
+            status == grpc.StatusCode.DEADLINE_EXCEEDED
+        )
+        if status == grpc.StatusCode.DEADLINE_EXCEEDED:
+            assert "queue-test" in str(raised.value)
+            assert _TAPE_UUID_HEX in str(raised.value)
+            assert "0.2s" in str(raised.value)
+    assert len(timeouts) == 1
+    assert timeouts[0] is not None
+    assert 0 < timeouts[0] <= seconds
+    assert backend._drive_queue is not None
+    assert not any(lock.locked() for lock in backend._drive_queue._locks.values())
+
+
+def test_read_open_local_lock_wait_is_not_charged() -> None:
+    """T8: a second open succeeds after a local session holds the bay for 3 budgets."""
+    seconds = 0.2
+    library = _QueueLibrary()
+    client = _QueueReadClient(library)
+    backend = _queue_backend(library, client, read_open_deadline_seconds=seconds)
+    errors = []
+    opened = threading.Event()
+
+    def hold_session():
+        try:
+            with backend.open_read_session(_read_locator("11" * 32)):
+                opened.set()
+                time.sleep(3 * seconds)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=hold_session)
+    first.start()
+    try:
+        assert opened.wait(timeout=2)
+        started = time.monotonic()
+        with backend.open_read_session(_read_locator("11" * 32)):
+            assert time.monotonic() - started > 2 * seconds
+    finally:
+        first.join(timeout=2)
+    assert not first.is_alive()
+    assert errors == []
+    assert client.open_count == 2
+
+
+@pytest.mark.parametrize("failure_site", ["report", "reader"])
+def test_read_open_post_rpc_failure_closes_session_and_releases_bay(monkeypatch, failure_site):
+    """An opened daemon session and local lease are cleaned up before propagation."""
+    library = _QueueLibrary()
+    backend = _queue_backend(library, _QueueReadClient(library), read_open_deadline_seconds=0.2)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("post-open failure")
+
+    if failure_site == "report":
+        monkeypatch.setattr(remanence_module, "report_session_open", fail)
+    else:
+        monkeypatch.setattr(remanence_module.RemanenceReadSession, "live", fail)
+    with pytest.raises(RuntimeError, match="post-open failure"):
+        backend.open_read_session(_read_locator("11" * 32))
+    assert not library.active
+    assert backend._drive_queue is not None
+    assert not any(lock.locked() for lock in backend._drive_queue._locks.values())
+
+
+def test_read_open_status_rpc_timeout_remains_advisory() -> None:
+    """A failed advisory status call still permits a direct open within the budget."""
+    timeouts = []
+
+    class Library(_QueueLibrary):
+        def GetLiveStatus(self, request, timeout: float | None = None):
+            timeouts.append(timeout)
+            raise _OpenRpcError(grpc.StatusCode.DEADLINE_EXCEEDED)
+
+    library = Library()
+    backend = _queue_backend(library, _QueueReadClient(library), read_open_deadline_seconds=0.2)
+    with backend.open_read_session(_read_locator("11" * 32)):
+        pass
+    assert len(timeouts) == 1
+    assert timeouts[0] is not None
+    assert 0 < timeouts[0] <= 0.2

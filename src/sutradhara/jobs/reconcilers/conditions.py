@@ -1,14 +1,15 @@
 """Condition projection helpers for the reconciler spine.
 
 The helpers implement the P0.3 two-axis contract: observations own reality and
-create condition rows; job attempts update only the attempt axis after
-``run_one`` records a ``job_attempt``. Callers own transactions; this module
-flushes but never commits or rolls back.
+create condition rows; job attempts and startup recovery update the attempt
+axis. Recovery can block without a completed attempt. Callers own transactions;
+this module flushes but never commits or rolls back.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Sequence
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -170,6 +171,41 @@ def record_condition(
         return row
 
     raise ValueError(f"Axis-B condition must be 'backoff', 'blocked', or None; got {condition!r}")
+
+
+def block_condition_without_attempt(
+    session: Session,
+    *,
+    domain: str,
+    target_key: str,
+    reason: str,
+    message: str,
+    components: Sequence[str],
+) -> ReconciliationCondition | None:
+    """Park an existing condition after worker deaths, without linking an attempt.
+
+    Recovery has no completed attempt or new observation. Missing conditions
+    are left absent, and an already blocked row retains its component snapshot.
+    The caller owns the transaction.
+    """
+    row = _get_condition(session, domain, target_key)
+    if row is None:
+        return None
+    was_blocked = row.condition == CONDITION_BLOCKED
+    row.condition = CONDITION_BLOCKED
+    row.reason = reason
+    row.message = message
+    row.next_eligible_at = None
+    row.updated_at = _utcnow()
+    _set_blocked_tool(row, None)
+    if not was_blocked:
+        session.execute(delete(ConditionComponent).where(ConditionComponent.condition_id == row.id))
+        session.add_all(
+            ConditionComponent(condition_id=row.id, component=component)
+            for component in sorted(set(components))
+        )
+    session.flush()
+    return row
 
 
 def reopen_condition(

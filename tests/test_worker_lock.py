@@ -13,7 +13,7 @@ from sqlalchemy import Engine
 
 import sutradhara.jobs.worker_lock as worker_lock_module
 from sutradhara.catalog.session import create_all, make_engine, session_scope
-from sutradhara.jobs.engine import submit
+from sutradhara.jobs.engine import claim_job_by_id, reset_orphaned_running_jobs, submit
 from sutradhara.jobs.models import Job, JobStatus
 from sutradhara.jobs.worker_lock import (
     exclusive_process_lock,
@@ -259,4 +259,50 @@ def test_jobs_run_resets_orphan_under_begin_before_savepoint(tmp_path, monkeypat
         job = session.get(Job, job_id)
         assert job.status == JobStatus.SUCCEEDED
         assert job.attempts == 4
+    engine.dispose()
+
+
+@pytest.mark.parametrize("case", ["terminal-id", "missing-id", "drain"])
+def test_jobs_run_commits_recovery_before_run_refusal(tmp_path, monkeypatch, case):
+    """T10: errors in the run transaction cannot undo startup recovery."""
+    from click.testing import CliRunner
+
+    from sutradhara.cli.jobs import jobs_group
+
+    url, engine = _sqlite_db(tmp_path)
+    monkeypatch.setenv("SUTRADHARA_DB_URL", url)
+    monkeypatch.setattr("sutradhara.cli.jobs.make_engine", lambda _url: engine)
+    with session_scope(engine) as session:
+        job = submit(session, "verify", {"copy_id": 1}, prerequisites=[999_999])
+        if case != "missing-id":
+            for _ in range(2):
+                assert claim_job_by_id(session, job.id) is job
+                reset_orphaned_running_jobs(session)
+        assert claim_job_by_id(session, job.id) is job
+        job_id = job.id
+    args = (
+        ["--limit", "0"]
+        if case == "drain"
+        else ["--id", "999" if case == "missing-id" else str(job_id)]
+    )
+    result = CliRunner().invoke(jobs_group, ["run", *args])
+    if case == "drain":
+        assert result.exit_code == 0, result.output
+        assert "(no pending jobs)" in result.output
+    else:
+        assert result.exit_code == 2, result.output
+        assert (
+            "no job with id=999"
+            if case == "missing-id"
+            else f"job id={job_id} is in terminal status failed; cannot re-run"
+        ) in result.output
+    with session_scope(engine) as session:
+        row = session.get(Job, job_id)
+        if case == "missing-id":
+            assert row.status == JobStatus.PENDING
+            assert row.kills == 1
+        else:
+            assert row.status == JobStatus.FAILED
+            assert row.kills == 3
+            assert row.last_error.startswith("killed-repeatedly:")
     engine.dispose()

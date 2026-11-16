@@ -18,7 +18,14 @@ from sqlalchemy import Engine, func, select, text
 from sutradhara.catalog.session import create_all, make_engine, make_session_factory, session_scope
 from sutradhara.cli.main import cli
 from sutradhara.jobs.config import RetryPolicy, WorkerConfig
-from sutradhara.jobs.engine import run_one, submit
+from sutradhara.jobs.engine import (
+    attempt_detail,
+    claim_job_by_id,
+    job_context,
+    reset_orphaned_running_jobs,
+    run_one,
+    submit,
+)
 from sutradhara.jobs.models import (
     ConditionComponent,
     Job,
@@ -65,6 +72,59 @@ def test_record_condition_raises_if_row_absent(engine: Engine) -> None:
             condition=CONDITION_BACKOFF,
             reason="drive-error",
         )
+
+
+@pytest.mark.parametrize("initial", ["open", "blocked", "deleted", "no-target"])
+def test_third_kill_blocks_condition_without_attempt(engine: Engine, initial: str) -> None:
+    """T3: recovery snapshots seeded components once, even without an attempt."""
+    old_time = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+    with session_scope(engine) as session:
+        row = record_observation(
+            session,
+            domain="copy",
+            target_key="rba2e",
+            desired=True,
+            observed_state=OBSERVED_MISSING,
+        )
+        row.updated_at = old_time
+        row.attempt_count = 2
+        row.blocked_tool_name = "old-tool"
+        row.blocked_tool_version = "v1"
+        if initial == "blocked":
+            row.condition = CONDITION_BLOCKED
+            session.add(ConditionComponent(condition_id=row.id, component="earlier:component"))
+        elif initial == "deleted":
+            session.delete(row)
+        job = submit(session, "verify", {"tape_id": "rba2e-tape"})
+        job.recon_domain = "copy"
+        job.recon_target_key = None if initial == "no-target" else "rba2e"
+        other = submit(session, "verify", {"copy_id": 2})
+        for _ in range(3):
+            assert claim_job_by_id(session, job.id) is job
+            assert claim_job_by_id(session, other.id) is other
+            assert reset_orphaned_running_jobs(session) == 2
+        assert job.status == other.status == JobStatus.FAILED
+        assert job.kills == other.kills == 3
+        assert list(session.scalars(select(JobAttempt))) == []
+        if initial == "deleted":
+            assert list(session.scalars(select(ReconciliationCondition))) == []
+        elif initial == "no-target":
+            assert row.condition == CONDITION_OPEN
+        else:
+            assert row.condition == CONDITION_BLOCKED
+            assert row.reason == "killed-repeatedly"
+            assert row.message == job.last_error
+            assert row.updated_at > old_time
+            assert row.next_eligible_at is None
+            assert row.blocked_tool_name is row.blocked_tool_version is None
+            assert row.last_attempt_id is row.last_attempt_at is None
+            assert row.attempt_count == 2
+            components = set(session.scalars(select(ConditionComponent.component)))
+            assert components == (
+                {"earlier:component"}
+                if initial == "blocked"
+                else set(attempt_detail(job_context(session, job))["components"])
+            )
 
 
 def test_record_observation_and_condition_do_not_commit(engine: Engine) -> None:

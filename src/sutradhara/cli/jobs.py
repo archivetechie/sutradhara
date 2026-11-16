@@ -182,6 +182,8 @@ def jobs_run(job_id: int | None, limit: int) -> None:
                 with session_scope(engine) as s:
                     _begin_immediate(s.connection())
                     reset_orphaned_running_jobs(s)
+                with session_scope(engine) as s:
+                    _begin_immediate(s.connection())
                     if job_id is not None:
                         result = run_one(s, job_id)
                         _emit_result(job_id, result)
