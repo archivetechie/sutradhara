@@ -2183,9 +2183,10 @@ def test_read_open_busy_poll_has_budget_and_releases_bay() -> None:
     assert client.open_count == 1
 
 
-def test_read_open_race_requeues_share_budget() -> None:
+def test_read_open_race_requeues_share_budget(monkeypatch) -> None:
     """T6: lost reservations do not restart the open's time budget."""
     seconds = 0.2
+    monkeypatch.setattr(remanence_module, "_DRIVE_ASSIGNMENT_POLL_SECONDS", 5 * seconds)
     library = _QueueLibrary()
     client = _RaceUntilClient(library, 5 * seconds)
     backend = _queue_backend(library, client, read_open_deadline_seconds=seconds)
@@ -2228,6 +2229,7 @@ def test_read_open_rpc_timeout_and_error_mapping(status) -> None:
             assert "queue-test" in str(raised.value)
             assert _TAPE_UUID_HEX in str(raised.value)
             assert "0.2s" in str(raised.value)
+            assert "injected open failure" in str(raised.value)
     assert len(timeouts) == 1
     assert timeouts[0] is not None
     assert 0 < timeouts[0] <= seconds
@@ -2264,6 +2266,28 @@ def test_read_open_local_lock_wait_is_not_charged() -> None:
     assert not first.is_alive()
     assert errors == []
     assert client.open_count == 2
+
+
+def test_read_open_success_after_budget_keeps_session_until_close() -> None:
+    """FR1 T1: a successful daemon open survives its budget until the reader closes."""
+    seconds = 0.2
+    library = _QueueLibrary()
+
+    class Client(_QueueReadClient):
+        """Return a live session after the caller's open budget has elapsed."""
+
+        def OpenReadSession(self, request, timeout: float | None = None):
+            time.sleep(1.5 * seconds)
+            return super().OpenReadSession(request, timeout=timeout)
+
+    client = Client(library)
+    backend = _queue_backend(library, client, read_open_deadline_seconds=seconds)
+    with backend.open_read_session(_read_locator("11" * 32)):
+        assert library.active
+        assert client.open_count == 1
+    assert not library.active
+    assert backend._drive_queue is not None
+    assert not any(lock.locked() for lock in backend._drive_queue._locks.values())
 
 
 @pytest.mark.parametrize("failure_site", ["report", "reader"])

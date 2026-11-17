@@ -343,8 +343,10 @@ class _ReadOpenBudget:
     def exclude_lock_wait(self, seconds: float) -> None:
         self._deadline += seconds
 
-    def expired(self) -> BackendTransientError:
-        return BackendTransientError(self._message)
+    def expired(self, detail: str | None = None) -> BackendTransientError:
+        """Keep the budget context and, for a daemon deadline, its RPC detail."""
+        message = self._message if detail is None else f"{self._message}: {detail}"
+        return BackendTransientError(message)
 
 
 class _DriveQueueLease:
@@ -775,7 +777,7 @@ class RemanenceBackend:
                 if lease is not None:
                     lease.release()
                 if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
-                    raise budget.expired() from e
+                    raise budget.expired(_rpc_error_text(e)) from e
                 if self._drive_queue is not None and _is_active_read_session_race(e):
                     # Bounded backoff so a persistently-busy bay (or a degraded advisory
                     # surface that returned no lease) re-queues without busy-spinning.
@@ -789,14 +791,13 @@ class RemanenceBackend:
                     lease.release()
                 raise
             try:
-                budget.remaining()
                 report_session_open(
                     session_id=session.session_id,
                     drive_element_address=session.drive_element_address,
                     tape_uuid=session.tape_uuid,
                     library=self._library_identity,
                 )
-                reader = RemanenceReadSession.live(
+                return RemanenceReadSession.live(
                     backend=self,
                     client=client,
                     session_id=session.session_id,
@@ -804,8 +805,6 @@ class RemanenceBackend:
                     object_id=object_id,
                     drive_queue_lease=lease,
                 )
-                budget.remaining()
-                return reader
             except BaseException:
                 try:
                     self._safe_close_read(client, session.session_id)
