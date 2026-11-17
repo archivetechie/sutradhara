@@ -1,15 +1,17 @@
-"""`bundle-repair` job: rebuild missing bundle pool copies from a healthy copy.
+"""`bundle-repair` job: recover copies, then rebuild missing pool placements.
 
-The handler is the bundle-grain counterpart to asset self-heal. It never uses
-staging paths or reconstituted logical bytes. Instead, it extracts each stored
-bundle member from a surviving copy into a scratch tree and passes those stored
-member bytes to the archive fan-out primitive for each missing pool.
+Healthy copies supply stored member bytes first. Only when the bundle has no
+ok copy can its staging files supply repair: each file must match its recorded
+size and digest, plus recorded xattr names for a final AppleDouble merge.
+Both sources use the same archive fan-out primitive for missing pools.
 """
 
 from __future__ import annotations
 
-import hashlib
+import os
+import stat
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -29,6 +31,7 @@ from sutradhara.archive_fanout import (
     _copy_problem,
     _copy_run,
     _current_bundle_members,
+    _member_inputs_for_flush,
     _pool_slug,
     _project_copy_problems,
     _read_copy_result,
@@ -37,6 +40,7 @@ from sutradhara.archive_fanout import (
     _record_existing_copy_result,
     _remember_copy_problem,
     _reset_copy_problems,
+    _sha256_file,
     build_bundle_copy_for_pool,
     preflight_seal_keys,
 )
@@ -56,9 +60,10 @@ from sutradhara.catalog.models import (
     BundleCopyWriteAttempt,
     Copy,
     Pool,
+    StagingTransform,
 )
 from sutradhara.catalog.types import CopyHealth
-from sutradhara.durability import BundleTarget, bundle_replication_status
+from sutradhara.durability import BundleTarget, bundle_replication_status, durable_placements
 from sutradhara.jobs.commit_point import commit_point_for
 from sutradhara.jobs.components import touch_asset, touch_copy_tape
 from sutradhara.jobs.reconcilers import bundle_copy
@@ -79,6 +84,7 @@ from sutradhara.replication import (
 )
 from sutradhara.resource_control import ResourceControlUnavailable
 from sutradhara.sealing.port import Representation
+from sutradhara.staging import APPLEDOUBLE_MERGE_KIND
 
 DOMAIN = "bundle_copy"
 _HOST_KEY_GUIDANCE = (
@@ -164,53 +170,11 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
     )
     unreadable_sources: dict[int, str] = {}
     if missing_targets:
-        candidates = [
-            source
-            for source in sources
-            if source.health == CopyHealth.OK and source.backend_id in backends
-        ]
-        host_fault = False
-        for source in candidates:
-            locators = ctx.session.scalars(
-                select(AssetLocator).where(
-                    AssetLocator.bundle_id == bundle.id,
-                    AssetLocator.copy_id == source.id,
-                    AssetLocator.representation == Representation.REM_ENCRYPT_V1.value,
-                )
-            )
-            needs_key = any(_sealed_locator_needs_private_key(locator) for locator in locators)
-            if not needs_key:
-                continue
-            try:
-                select_private_epoch_for_copy(keys, source.storage_metadata)
-            except (ArchiveRestoreError, OSError, ResourceControlUnavailable) as exc:
-                unreadable_sources[source.id] = (
-                    f"copy id={source.id} recipient_epochs={source.storage_metadata.get('recipient_epochs')!r}: {exc}"
-                )
-                host_fault = (
-                    host_fault
-                    or isinstance(exc, (OSError, ResourceControlUnavailable))
-                    or isinstance(exc.__cause__, (OSError, ResourceControlUnavailable))
-                )
-        if candidates and len(unreadable_sources) == len(candidates):
-            guidance = (
-                _HOST_KEY_GUIDANCE
-                if host_fault
-                else "a private key for one of the named recipient epochs must be in this host's key registry"
-            )
-            message = (
-                f"cannot repair bundle {bundle.id}: {'; '.join(unreadable_sources.values())}; "
-                f"{guidance}"
-            )
-            return JobResult(
-                ok=False,
-                detail=message,
-                condition=None
-                if host_fault
-                else ConditionProjection(
-                    condition=CONDITION_BLOCKED, reason="source-key-unavailable", message=message
-                ),
-            )
+        unreadable_sources, key_failure = _check_source_keys(
+            ctx, bundle.id, sources=sources, backends=backends, keys=keys
+        )
+        if key_failure is not None:
+            return key_failure
 
     return _repair_after_preflight(
         ctx,
@@ -224,6 +188,66 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
         key_epoch=key_epoch,
         rem_bin=rem_bin or "rem",
     )
+
+
+def _check_source_keys(
+    ctx: JobContext,
+    bundle_id: str,
+    *,
+    sources: list[Copy],
+    backends: dict[int, WritableStorageBackend],
+    keys: KeyRegistry,
+) -> tuple[dict[int, str], JobResult | None]:
+    """Check source keys before any member read, including newly recovered copies."""
+    unreadable_sources: dict[int, str] = {}
+    candidates = [
+        source
+        for source in sources
+        if source.health == CopyHealth.OK and source.backend_id in backends
+    ]
+    host_fault = False
+    for source in candidates:
+        locators = ctx.session.scalars(
+            select(AssetLocator).where(
+                AssetLocator.bundle_id == bundle_id,
+                AssetLocator.copy_id == source.id,
+                AssetLocator.representation == Representation.REM_ENCRYPT_V1.value,
+            )
+        )
+        needs_key = any(_sealed_locator_needs_private_key(locator) for locator in locators)
+        if not needs_key:
+            continue
+        try:
+            select_private_epoch_for_copy(keys, source.storage_metadata)
+        except (ArchiveRestoreError, OSError, ResourceControlUnavailable) as exc:
+            unreadable_sources[source.id] = (
+                f"copy id={source.id} recipient_epochs={source.storage_metadata.get('recipient_epochs')!r}: {exc}"
+            )
+            host_fault = (
+                host_fault
+                or isinstance(exc, (OSError, ResourceControlUnavailable))
+                or isinstance(exc.__cause__, (OSError, ResourceControlUnavailable))
+            )
+    if candidates and len(unreadable_sources) == len(candidates):
+        guidance = (
+            _HOST_KEY_GUIDANCE
+            if host_fault
+            else "a private key for one of the named recipient epochs must be in this host's key registry"
+        )
+        message = (
+            f"cannot repair bundle {bundle_id}: {'; '.join(unreadable_sources.values())}; "
+            f"{guidance}"
+        )
+        return unreadable_sources, JobResult(
+            ok=False,
+            detail=message,
+            condition=None
+            if host_fault
+            else ConditionProjection(
+                condition=CONDITION_BLOCKED, reason="source-key-unavailable", message=message
+            ),
+        )
+    return unreadable_sources, None
 
 
 def _repair_after_preflight(
@@ -414,9 +438,18 @@ def _repair_after_preflight(
                 write_targets.append((backend, target))
 
         source_id = None
+        source_kind = None
         if write_targets:
             errors = []
             member_sources = None
+            sources = list(
+                select_source_candidates(ctx.session, BundleTarget(bundle.id), purpose="self_heal")
+            )
+            unreadable_sources, key_failure = _check_source_keys(
+                ctx, bundle.id, sources=sources, backends=backends, keys=keys
+            )
+            if key_failure is not None:
+                return key_failure
             for source in sources:
                 if source.health != CopyHealth.OK:
                     errors.append(f"copy id={source.id}: health={source.health}")
@@ -449,7 +482,34 @@ def _repair_after_preflight(
                     errors.append(f"copy id={source.id}: {exc}")
                     continue
                 source_id = source.id
+                source_kind = "copy"
                 break
+            if member_sources is None and not durable_placements(
+                ctx.session,
+                BundleTarget(bundle_id),
+                require_verified=False,
+                artifactclass=None,
+            ):
+                member_sources, staging_errors, check_failed = _staging_member_sources(
+                    ctx, bundle_id
+                )
+                errors.extend(staging_errors)
+                if check_failed and _staging_failure_is_final(ctx.session, bundle_id):
+                    message = (
+                        f"cannot repair bundle {bundle_id}: {'; '.join(staging_errors)}; "
+                        "a human decides how to recover the staging source"
+                    )
+                    return JobResult(
+                        ok=False,
+                        detail=message,
+                        condition=ConditionProjection(
+                            condition=CONDITION_BLOCKED,
+                            reason="staging-source-unavailable",
+                            message=message,
+                        ),
+                    )
+                if member_sources is not None:
+                    source_kind = "staging"
             if member_sources is None:
                 projection, _ = _project_copy_problems(ctx.session, bundle_id)
                 return JobResult(
@@ -477,15 +537,22 @@ def _repair_after_preflight(
     fenced = _write_fenced_pool_ids(ctx, remaining)
     if remaining and remaining == fenced:
         return _fenced_missing_result(
-            ctx, bundle_id, repaired=repaired, fenced_missing=fenced, source_copy_id=source_id
+            ctx,
+            bundle_id,
+            repaired=repaired,
+            fenced_missing=fenced,
+            source_copy_id=source_id,
+            source=source_kind,
         )
     return JobResult(
         ok=True,
-        detail=f"bundle {bundle_id} repaired pools={sorted(repaired)}",
+        detail=f"bundle {bundle_id} repaired pools={sorted(repaired)}"
+        + (f" from {source_kind}" if source_kind is not None else ""),
         step_state={
             "bundle_repair": {
                 "bundle_id": bundle_id,
                 "source_copy_id": source_id,
+                **({"source": source_kind} if source_kind is not None else {}),
                 "repaired_pools": sorted(repaired),
             }
         },
@@ -619,12 +686,15 @@ def _fenced_missing_result(
     repaired: set[str],
     fenced_missing: set[str],
     source_copy_id: int | None = None,
+    source: str | None = None,
 ) -> JobResult:
     """Record the existing fenced outcome, including a source only if one was read."""
 
     message = _write_fenced_missing_message(
         bundle_id, repaired=repaired, fenced_missing=fenced_missing
     )
+    if source is not None:
+        message += f"; source={source}"
     record_observation(
         ctx.session,
         domain=DOMAIN,
@@ -641,6 +711,8 @@ def _fenced_missing_result(
     }
     if source_copy_id is not None:
         state["source_copy_id"] = source_copy_id
+    if source is not None:
+        state["source"] = source
     return JobResult(
         ok=True,
         detail=message,
@@ -718,18 +790,103 @@ def _extract_member_sources(
                 rem_bin=rem_bin,
                 keys=keys,
             )
-            if dest.stat().st_size != member_input.size_bytes:
-                raise ArchiveRestoreError(
-                    f"member {member_input.member_path!r} short read {dest.stat().st_size} != "
-                    f"{member_input.size_bytes}"
-                )
-            actual = hashlib.sha256(dest.read_bytes()).digest()
-            if actual != member_input.file_sha256:
-                raise _SourceDigestMismatch(
-                    f"member {member_input.member_path!r} digest {actual.hex()} != "
-                    f"{member_input.file_sha256.hex()}"
-                )
+            _check_member_file(member_input)
     return [member_input for member_input, _ in inputs]
+
+
+def _check_member_file(
+    member: MemberInput, *, xattrs: Sequence[str] = (), staging: bool = False
+) -> None:
+    """Check stored bytes and required metadata without reading the catalogue."""
+    label = f"member {member.member_path!r}"
+    if staging:
+        label = f"staging {label} at {str(member.source_path)!r}"
+    try:
+        status = member.source_path.stat()
+        if not stat.S_ISREG(status.st_mode):
+            raise ArchiveRestoreError(f"{label} is not a regular file")
+        if status.st_size != member.size_bytes:
+            difference = "size" if staging else "short read"
+            raise ArchiveRestoreError(
+                f"{label} {difference} {status.st_size} != {member.size_bytes}"
+            )
+        actual = _sha256_file(member.source_path)
+        if actual != member.file_sha256:
+            raise _SourceDigestMismatch(
+                f"{label} digest {actual.hex()} != {member.file_sha256.hex()}"
+            )
+        if xattrs:
+            missing = sorted(set(xattrs) - set(os.listxattr(member.source_path)))
+            if missing:
+                raise ArchiveRestoreError(f"{label} missing xattrs {missing!r}")
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise ArchiveRestoreError(
+            f"{label} is missing or has a non-directory parent: {exc}"
+        ) from exc
+
+
+def _staging_member_sources(
+    ctx: JobContext, bundle_id: str
+) -> tuple[list[MemberInput] | None, list[str], bool]:
+    """Snapshot staging inputs, check all files in one window, then sort faults."""
+    rows = _current_bundle_members(ctx.session, bundle_id)
+    try:
+        members = _member_inputs_for_flush(ctx.session, rows)
+    except ArchiveFanoutError as exc:
+        return None, [f"staging source: {exc}"], True
+    last_steps: dict[int, StagingTransform] = {}
+    for step in ctx.session.scalars(
+        select(StagingTransform)
+        .where(StagingTransform.bundle_id == bundle_id)
+        .order_by(StagingTransform.step_order.desc())
+    ):
+        last_steps.setdefault(step.bundle_member_id, step)
+    required_xattrs = []
+    for row in rows:
+        last_step = last_steps.get(row.id)
+        required_xattrs.append(
+            tuple(last_step.result["xattrs"])
+            if last_step is not None
+            and last_step.kind == APPLEDOUBLE_MERGE_KIND
+            and last_step.result.get("merged") is True
+            else ()
+        )
+    faults: list[tuple[str, ArchiveRestoreError | OSError]] = []
+    with commit_point_for(ctx.session).window():
+        for member, xattrs in zip(members, required_xattrs, strict=True):
+            try:
+                _check_member_file(member, xattrs=xattrs, staging=True)
+            except (ArchiveRestoreError, OSError) as exc:
+                faults.append((member.member_path, exc))
+    errors = [f"staging member {path!r}: {exc}" for path, exc in faults]
+    check_failed = any(isinstance(exc, ArchiveRestoreError) for _, exc in faults)
+    return (None if faults else members), errors, check_failed
+
+
+def _staging_failure_is_final(session: Session, bundle_id: str) -> bool:
+    """Block only when no live copy or unresolved generation-zero attempt remains."""
+    has_copy = (
+        session.scalar(
+            select(Copy.id).where(Copy.bundle_id == bundle_id, Copy.deleted_at.is_(None)).limit(1)
+        )
+        is not None
+    )
+    pool_ids = session.scalars(
+        select(BundleCopyWriteAttempt.pool_id)
+        .where(
+            BundleCopyWriteAttempt.bundle_id == bundle_id,
+            BundleCopyWriteAttempt.generation == 0,
+        )
+        .distinct()
+    )
+    unresolved = any(
+        outcome is None
+        for pool_id in pool_ids
+        for _, outcome in identity_attempts(
+            session, bundle_id=bundle_id, pool_id=pool_id, generation=0
+        )
+    )
+    return not has_copy and not unresolved
 
 
 def _repair_missing_targets(

@@ -809,10 +809,11 @@ def test_rba_repair_fenced_absence_never_reads_source(engine, tmp_path, monkeypa
 class _RbaBackend(_WriteBackend):
     """New recovery-test fake: committed names and write attempts are observable."""
 
-    def __init__(self, mode="ok", *, failed_pool="p-b"):
+    def __init__(self, mode="ok", *, failed_pool="p-b", pool_modes=None):
         super().__init__()
         self.mode = mode
         self.failed_pool = failed_pool
+        self.pool_modes = dict(pool_modes or {})
         self.calls = Counter()
         self.lookup_calls = []
         self.names = {}
@@ -820,35 +821,39 @@ class _RbaBackend(_WriteBackend):
         self.holds_names = mode == "holds"
         self.read_error = None
         self.lookup_override = None
+        self.read_failures = set()
+
+    def _pool_mode(self, pool):
+        return self.pool_modes.get(pool, self.mode if pool == self.failed_pool else "ok")
 
     def write_object_to_pool(self, source, pool, **kwargs):
         from sutradhara.backend.port import BackendObjectExistsError, BackendWriteInDoubtError
 
         self.calls[pool] += 1
-        if pool == self.failed_pool and self.mode in {"absent", "d2-absent"}:
+        mode = self._pool_mode(pool)
+        if mode in {"absent", "d2-absent"}:
             raise OSError("injected write did not land")
-        if pool == self.failed_pool and self.mode == "stale" and self.calls[pool] == 2:
+        if mode == "stale" and self.calls[pool] == 2:
             raise BackendObjectExistsError("earlier write became visible")
         record = super().write_object_to_pool(source, pool, **kwargs)
         found = PoolObject(record, bytes(record.integrity_hash))
         self.names[(pool, Path(source).name)] = found
-        if pool == self.failed_pool:
-            if self.mode == "conflict":
-                self.names[(pool, Path(source).name)] = replace(found, content_hash=b"x" * 32)
-                raise OSError("name holds another object")
-            if self.mode in {"raised-landed", "stale"}:
-                raise OSError("reply lost after commit")
-            if self.mode == "exists":
-                raise BackendObjectExistsError("object exists")
-            if self.mode == "in-doubt":
-                raise BackendWriteInDoubtError("daemon still owns the write")
+        if mode == "conflict":
+            self.names[(pool, Path(source).name)] = replace(found, content_hash=b"x" * 32)
+            raise OSError("name holds another object")
+        if mode in {"raised-landed", "stale"}:
+            raise OSError("reply lost after commit")
+        if mode == "exists":
+            raise BackendObjectExistsError("object exists")
+        if mode == "in-doubt":
+            raise BackendWriteInDoubtError("daemon still owns the write")
         return record
 
     def lookup_pool_object(self, pool, object_name, *, candidate_digests):
         self.lookup_calls.append((pool, object_name, tuple(candidate_digests)))
         if self.lookup_override is not None:
             return self.lookup_override(pool, object_name, candidate_digests)
-        if pool == self.failed_pool and self.mode == "stale" and self.calls[pool] == 1:
+        if self._pool_mode(pool) == "stale" and self.calls[pool] == 1:
             return None
         return self.names.get((pool, object_name))
 
@@ -856,6 +861,13 @@ class _RbaBackend(_WriteBackend):
         if locator["pool_id"] == self.failed_pool and self.read_error is not None:
             raise self.read_error
         return super().verify(locator, **kwargs)
+
+    def read_range(self, locator, byte_range):
+        from sutradhara.backend.port import BackendUnavailableError
+
+        if locator["object_id"] in self.read_failures:
+            raise BackendUnavailableError("member read is offline")
+        return super().read_range(locator, byte_range)
 
 
 def _rba_seed(engine, tmp_path, *, pools=("p-a", "p-b")):
@@ -888,6 +900,491 @@ def _rba_repair(engine, bundle_id, backend, monkeypatch, *, builder=None):
     outcomes = JobWorker(engine, config=WorkerConfig(executor_workers=1)).drain()
     assert len(outcomes) == 1
     return outcomes[0].result
+
+
+def _rba2d_flush(engine, bundle_id, backend):
+    """Seal through the real flush before testing the repair worker."""
+    with session_scope(engine) as session:
+        result = flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends=_backends(session, backend),
+            builder=LocalArchiveBuilder(),
+        )
+        assert session.get(Bundle, bundle_id).status == "sealed"
+        return result
+
+
+def _rba2d_condition(engine, bundle_id):
+    with session_scope(engine) as session:
+        return session.scalars(
+            select(ReconciliationCondition).where(
+                ReconciliationCondition.domain == "bundle_copy",
+                ReconciliationCondition.target_key == bundle_id,
+            )
+        ).one()
+
+
+def _rba2d_paths(engine, bundle_id):
+    from sutradhara.catalog.models import BundleMember
+
+    with session_scope(engine) as session:
+        return [
+            Path(member.source_path)
+            for member in session.scalars(
+                select(BundleMember)
+                .where(BundleMember.bundle_id == bundle_id)
+                .order_by(BundleMember.id)
+            )
+        ]
+
+
+def test_rba2d_repairs_zero_copy_from_staging(engine, tmp_path, monkeypatch):
+    """T1: every staged member is checked outside the writer before the shared build."""
+    from sutradhara.catalog.types import CopySource
+    from sutradhara.jobs.handlers import bundle_repair
+
+    bundle_id = _rba_seed(engine, tmp_path, pools=("p-a",))
+    backend = _RbaBackend("absent", failed_pool="p-a")
+    assert _rba2d_flush(engine, bundle_id, backend).copy_ids == ()
+    paths = _rba2d_paths(engine, bundle_id)
+    checked = []
+    statements = []
+    real_check = bundle_repair._check_member_file
+
+    def trace(connection, cursor, statement, parameters, context, executemany):
+        statements.append((connection, statement))
+
+    def check(member, **kwargs):
+        connection, statement = statements[-1]
+        assert statement == "COMMIT"
+        assert not connection.connection.dbapi_connection.in_transaction
+        with sqlite3.connect(engine.url.database, timeout=0) as other:
+            other.execute("BEGIN IMMEDIATE")
+        real_check(member, **kwargs)
+        checked.append(member.source_path)
+
+    event.listen(engine, "before_cursor_execute", trace)
+    monkeypatch.setattr(bundle_repair, "_check_member_file", check)
+    backend.mode = "ok"
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    assert result.ok, result.detail
+    assert result.step_state["bundle_repair"]["source"] == "staging"
+    assert result.step_state["bundle_repair"]["source_copy_id"] is None
+    assert "staging" in result.detail
+    assert checked == paths
+    assert backend.calls == {"p-a": 2}
+    with session_scope(engine) as session:
+        copy = session.scalars(select(Copy).where(Copy.bundle_id == bundle_id)).one()
+        assert copy.health == CopyHealth.OK
+        assert copy.source == CopySource.INGEST
+        assert copy.last_measured_digest == copy.integrity_hash
+        assert session.get(Bundle, bundle_id).status == "sealed"
+
+
+@pytest.mark.parametrize("fault", ["digest", "size", "missing"])
+def test_rba2d_bad_staging_blocks_first_repair(engine, tmp_path, monkeypatch, fault):
+    """T2: checked staging failures block immediately, before any backend write."""
+    bundle_id = _rba_seed(engine, tmp_path, pools=("p-a",))
+    backend = _RbaBackend("absent", failed_pool="p-a")
+    assert _rba2d_flush(engine, bundle_id, backend).copy_ids == ()
+    path = _rba2d_paths(engine, bundle_id)[0]
+    if fault == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"x" * (path.stat().st_size + (fault == "size")))
+    backend.mode = "ok"
+    before = backend.calls.copy()
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    condition = _rba2d_condition(engine, bundle_id)
+    assert condition.condition == "blocked"
+    assert condition.reason == "staging-source-unavailable"
+    assert not result.ok
+    assert bundle_id in result.detail
+    assert path.name in result.detail
+    assert fault in result.detail
+    assert "human decides" in result.detail
+    assert backend.calls == before
+
+
+def _rba2d_appledouble_member(engine, tmp_path, bundle_id, *, compress=False):
+    """Add a real merged member, optionally followed by the real zstd transform."""
+    from sutradhara.catalog.models import StagingTransform
+    from sutradhara.staging import stage_and_enqueue_artifact
+    from tests.test_staging import _appledouble, _require_xattrs
+
+    _require_xattrs(tmp_path)
+    source = _source(tmp_path, "photo.tif", size=60)
+    source.with_name("._photo.tif").write_bytes(_appledouble(b"resource-fork", b"F" * 32))
+    with session_scope(engine) as session:
+        policy = get_artifactclass_policy(session, "recovery")
+        policy.staging_config = {
+            "appledouble": {"action": "merge-to-xattrs"},
+            "compression": {"codec": "zstd", "level": 3} if compress else {"codec": "off"},
+        }
+        staged = stage_and_enqueue_artifact(
+            session,
+            artifactclass="recovery",
+            policy=policy,
+            source_path=source,
+            staging_root=tmp_path / "stage",
+            bundle_id=bundle_id,
+        )
+        steps = list(
+            session.scalars(
+                select(StagingTransform)
+                .where(StagingTransform.bundle_id == bundle_id)
+                .order_by(StagingTransform.step_order)
+            )
+        )
+        assert steps[0].kind == "appledouble-merge-v1"
+        assert steps[0].step_order == 0
+        assert steps[0].result["merged"] is True
+        assert steps[0].result["xattrs"]
+        if compress:
+            assert len(steps) == 2
+            assert steps[-1].kind == "zstd-file-v1"
+        else:
+            assert len(steps) == 1
+        return staged.staged_path, steps[0].result["xattrs"]
+
+
+@pytest.mark.parametrize("remove_xattr", [False, True])
+def test_rba2d_merged_staging_requires_xattrs(engine, tmp_path, monkeypatch, remove_xattr):
+    """T3: the final merged file needs its recorded xattrs as well as its data fork."""
+    bundle_id = _rba_seed(engine, tmp_path, pools=("p-a",))
+    path, xattrs = _rba2d_appledouble_member(engine, tmp_path, bundle_id)
+    assert set(xattrs) <= set(os.listxattr(path))
+    backend = _RbaBackend("absent", failed_pool="p-a")
+    assert _rba2d_flush(engine, bundle_id, backend).copy_ids == ()
+    if remove_xattr:
+        os.removexattr(path, xattrs[0])
+    backend.mode = "ok"
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    condition = _rba2d_condition(engine, bundle_id)
+    if remove_xattr:
+        assert condition.condition == "blocked"
+        assert condition.reason == "staging-source-unavailable"
+        assert path.name in result.detail
+        assert xattrs[0] in result.detail
+        assert backend.calls == {"p-a": 1}
+    else:
+        assert result.ok, result.detail
+        assert result.step_state["bundle_repair"]["source"] == "staging"
+        assert backend.calls == {"p-a": 2}
+
+
+def test_rba2d_zstd_after_merge_needs_no_xattrs(engine, tmp_path, monkeypatch):
+    """T4: only the last transform describes metadata on the stored staging file."""
+    bundle_id = _rba_seed(engine, tmp_path, pools=("p-a",))
+    path, xattrs = _rba2d_appledouble_member(engine, tmp_path, bundle_id, compress=True)
+    assert path.suffix == ".zst"
+    assert not set(xattrs) & set(os.listxattr(path))
+    backend = _RbaBackend("absent", failed_pool="p-a")
+    assert _rba2d_flush(engine, bundle_id, backend).copy_ids == ()
+    backend.mode = "ok"
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    assert result.ok, result.detail
+    assert result.step_state["bundle_repair"]["source"] == "staging"
+    assert backend.calls == {"p-a": 2}
+
+
+@pytest.mark.parametrize("resolve", [True, False], ids=["adopt", "unresolved"])
+def test_rba2d_lookup_before_staging(engine, tmp_path, monkeypatch, resolve):
+    """T5/T8: adopt an unresolved copy first; unresolved outcomes defer a staging block."""
+    from sutradhara.backend.port import BackendUnavailableError
+    from sutradhara.bundle_copy_ledger import identity_attempts
+
+    bundle_id = _rba_seed(engine, tmp_path)
+    backend = _RbaBackend("raised-landed", failed_pool="p-a", pool_modes={"p-b": "absent"})
+
+    def lookup(pool, name, digests):
+        if pool == "p-a":
+            raise BackendUnavailableError("lookup is offline")
+        return backend.names.get((pool, name))
+
+    backend.lookup_override = lookup
+    assert _rba2d_flush(engine, bundle_id, backend).copy_ids == ()
+    with session_scope(engine) as session:
+        assert [
+            outcome
+            for _, outcome in identity_attempts(
+                session, bundle_id=bundle_id, pool_id="p-a", generation=0
+            )
+        ] == [None]
+        assert [
+            outcome
+            for _, outcome in identity_attempts(
+                session, bundle_id=bundle_id, pool_id="p-b", generation=0
+            )
+        ] == ["not-landed"]
+    for path in _rba2d_paths(engine, bundle_id):
+        path.write_bytes(b"altered staging")
+    backend.pool_modes.clear()
+    backend.mode = "ok"
+    if resolve:
+        backend.lookup_override = None
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    if resolve:
+        assert result.ok, result.detail
+        with session_scope(engine) as session:
+            copies = {copy.pool_id: copy for copy in session.scalars(select(Copy))}
+            assert set(copies) == {"p-a", "p-b"}
+            assert all(copy.health == CopyHealth.OK for copy in copies.values())
+            assert result.step_state["bundle_repair"]["source_copy_id"] == copies["p-a"].id
+        assert result.step_state["bundle_repair"]["source"] == "copy"
+        assert backend.calls == {"p-a": 1, "p-b": 2}
+    else:
+        condition = _rba2d_condition(engine, bundle_id)
+        assert condition.condition == "backoff"
+        assert condition.reason == "write-outcome-unknown"
+        assert not result.ok
+        assert "staging" in result.detail
+        assert "size" in result.detail
+        assert backend.calls == {"p-a": 1, "p-b": 1}
+
+
+def test_rba2d_healthy_copy_precedes_staging(engine, tmp_path, monkeypatch):
+    """T6: a healthy copy supplies repair even when staged files no longer match."""
+    bundle_id = _rba_seed(engine, tmp_path)
+    backend = _RbaBackend("absent")
+    flushed = _rba2d_flush(engine, bundle_id, backend)
+    assert len(flushed.copy_ids) == 1
+    for path in _rba2d_paths(engine, bundle_id):
+        path.write_bytes(b"altered staging")
+    backend.mode = "ok"
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    assert result.ok, result.detail
+    assert result.step_state["bundle_repair"]["source"] == "copy"
+    assert result.step_state["bundle_repair"]["source_copy_id"] == flushed.copy_ids[0]
+    assert backend.calls == {"p-a": 1, "p-b": 2}
+
+
+def test_rba2d_suspect_copy_defers_staging_block(engine, tmp_path, monkeypatch):
+    """T7: a suspect copy with a host read fault still prevents an immediate block."""
+    from sutradhara.backend.port import BackendUnavailableError
+
+    bundle_id = _rba_seed(engine, tmp_path)
+    backend = _RbaBackend(failed_pool="p-a", pool_modes={"p-b": "absent"})
+    assert len(_rba2d_flush(engine, bundle_id, backend).copy_ids) == 1
+    with session_scope(engine) as session:
+        session.scalars(select(Copy)).one().health = CopyHealth.SUSPECT
+    backend.read_error = BackendUnavailableError("re-read is offline")
+    backend.pool_modes.clear()
+    for path in _rba2d_paths(engine, bundle_id):
+        path.write_bytes(b"altered staging")
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    condition = _rba2d_condition(engine, bundle_id)
+    assert condition.condition == "backoff"
+    assert not result.ok
+    assert "staging" in result.detail
+    assert "size" in result.detail
+    assert backend.calls == {"p-a": 1, "p-b": 1}
+    with session_scope(engine) as session:
+        assert session.scalars(select(Copy)).one().health == CopyHealth.SUSPECT
+
+
+def test_rba2d_ok_copy_read_fault_never_reads_staging(engine, tmp_path, monkeypatch):
+    """T11: a member transport error leaves the copy ok, so staging stays closed."""
+    from sutradhara.jobs.handlers import bundle_repair
+
+    bundle_id = _rba_seed(engine, tmp_path)
+    backend = _RbaBackend("absent")
+    assert len(_rba2d_flush(engine, bundle_id, backend).copy_ids) == 1
+    with session_scope(engine) as session:
+        copy = session.scalars(select(Copy)).one()
+        backend.read_failures.add(copy.native_locator["object_id"])
+    paths = set(_rba2d_paths(engine, bundle_id))
+    checked_staging = []
+    real_check = bundle_repair._check_member_file
+
+    def check(member, **kwargs):
+        if member.source_path in paths:
+            checked_staging.append(member.source_path)
+        return real_check(member, **kwargs)
+
+    monkeypatch.setattr(bundle_repair, "_check_member_file", check)
+    backend.mode = "ok"
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    assert checked_staging == []
+    assert not result.ok
+    assert _rba2d_condition(engine, bundle_id).condition == "backoff"
+    assert "member read is offline" in result.detail
+    assert backend.calls == {"p-a": 1, "p-b": 1}
+    with session_scope(engine) as session:
+        assert session.scalars(select(Copy)).one().health == CopyHealth.OK
+
+
+def test_rba2d_bad_copy_digest_opens_staging(engine, tmp_path, monkeypatch):
+    """T12: a digest mismatch marks the last ok copy suspect before the staging gate."""
+    from sutradhara.catalog.models import AssetLocator
+
+    bundle_id = _rba_seed(engine, tmp_path)
+    backend = _RbaBackend("absent")
+    assert len(_rba2d_flush(engine, bundle_id, backend).copy_ids) == 1
+    with session_scope(engine) as session:
+        copy = session.scalars(select(Copy)).one()
+        assert copy.last_measured_at is not None
+        assert copy.last_measured_digest is not None
+        locator = session.scalars(
+            select(AssetLocator).where(AssetLocator.copy_id == copy.id)
+        ).first()
+        object_id = copy.native_locator["object_id"]
+        data = bytearray(backend.objects[object_id])
+        header_size = int.from_bytes(data[:8], "big")
+        data[8 + header_size + int(locator.native_locator["offset"])] ^= 1
+        backend.objects[object_id] = bytes(data)
+    backend.mode = "ok"
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    assert result.ok, result.detail
+    assert result.step_state["bundle_repair"]["source"] == "staging"
+    assert result.step_state["bundle_repair"]["source_copy_id"] is None
+    assert backend.calls == {"p-a": 1, "p-b": 2}
+    with session_scope(engine) as session:
+        copies = {copy.pool_id: copy for copy in session.scalars(select(Copy))}
+        assert copies["p-a"].health == CopyHealth.SUSPECT
+        assert copies["p-b"].health == CopyHealth.OK
+
+
+@pytest.mark.parametrize("also_bad", [False, True], ids=["host", "check-wins"])
+def test_rba2d_staging_host_fault_backs_off(engine, tmp_path, monkeypatch, also_bad):
+    """T13: host faults back off, but a later member's check failure wins."""
+    from sutradhara.jobs.handlers import bundle_repair
+
+    bundle_id = _rba_seed(engine, tmp_path, pools=("p-a",))
+    backend = _RbaBackend("absent", failed_pool="p-a")
+    assert _rba2d_flush(engine, bundle_id, backend).copy_ids == ()
+    paths = _rba2d_paths(engine, bundle_id)
+    if also_bad:
+        paths[1].write_bytes(b"changed size")
+    real_sha = bundle_repair._sha256_file
+    checked = []
+
+    def sha(path):
+        checked.append(path)
+        if path == paths[0]:
+            raise PermissionError("staging digest access denied")
+        return real_sha(path)
+
+    monkeypatch.setattr(bundle_repair, "_sha256_file", sha)
+    backend.mode = "ok"
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    condition = _rba2d_condition(engine, bundle_id)
+    assert condition.condition == ("blocked" if also_bad else "backoff")
+    assert condition.reason == (
+        "staging-source-unavailable" if also_bad else "transient-backend-failure"
+    )
+    assert not result.ok
+    assert paths[0].name in result.detail
+    assert "staging digest access denied" in result.detail
+    if also_bad:
+        assert paths[1].name in result.detail
+        assert "size" in result.detail
+        assert checked == paths[:1]
+    else:
+        assert checked == paths
+    assert backend.calls == {"p-a": 1}
+
+
+@pytest.mark.parametrize("route", ["direct", "cli"])
+@pytest.mark.parametrize("cause", ["absent", "no-detail"])
+def test_rba2d_sweep_reports_sealed_without_copy(engine, tmp_path, monkeypatch, route, cause):
+    """T9: a returned seal without an ok copy is one failed flush, including in the CLI."""
+    from click.testing import CliRunner
+
+    from sutradhara.cli import archive
+
+    bundle_id = _rba_seed(engine, tmp_path, pools=("p-a",))
+    backend = _RbaBackend("absent", failed_pool="p-a")
+    if cause == "no-detail":
+        # Exercise the optional result fields after a real zero-copy seal.
+        # Fencing every pool before calling flush instead fails its preflight.
+        def flush_without_detail(*args, **kwargs):
+            return replace(
+                flush_bundle(*args, **kwargs), condition_reason=None, condition_message=None
+            )
+
+        monkeypatch.setattr("sutradhara.archive_sweeper.flush_bundle", flush_without_detail)
+    events = []
+    monkeypatch.setattr(
+        "sutradhara.archive_sweeper.emit_structured_event",
+        lambda name, **fields: events.append((name, fields)),
+    )
+    results = []
+
+    def sweep(*args, **kwargs):
+        result = sweep_bundles(*args, **kwargs)
+        results.append(result)
+        return result
+
+    if route == "cli":
+        monkeypatch.setattr(archive, "make_engine", lambda: engine)
+        monkeypatch.setattr(archive, "RemArchiveBuilder", lambda *args: LocalArchiveBuilder())
+        monkeypatch.setattr(archive, "sweep_bundles", sweep)
+        monkeypatch.setattr("sutradhara.backend.factory.backend_from_row", lambda row: backend)
+        output = CliRunner().invoke(archive.bundle_sweep, [])
+        assert output.exit_code == 1, (output.output, output.exception)
+        assert f"failed {bundle_id}: sealed with no copy" in output.stderr
+    else:
+        with session_scope(engine) as session:
+            sweep(session, backends=_backends(session, backend), builder=LocalArchiveBuilder())
+    assert len(results) == 1
+    result = results[0]
+    assert result.flushed == ()
+    assert len(result.failed) == 1
+    failed_id, message = result.failed[0]
+    assert failed_id == bundle_id
+    assert message.startswith("sealed with no copy")
+    if cause == "absent":
+        assert message.startswith("sealed with no copy: transient-backend-failure: ")
+        assert "injected write did not land" in message
+    else:
+        assert message == "sealed with no copy"
+    assert backend.calls == {"p-a": 1}
+    with session_scope(engine) as session:
+        assert session.get(Bundle, bundle_id).status == "sealed"
+        assert list(session.scalars(select(Copy))) == []
+    failures = [fields for name, fields in events if name == "bundle_sweep_flush_failed"]
+    assert len(failures) == 1
+    assert failures[0]["bundle_id"] == bundle_id
+    assert failures[0]["reason"] == "sealed-without-copy"
+    assert failures[0]["message"] == message[:500]
+
+
+@pytest.mark.parametrize("cause", ["absent", "no-detail"])
+def test_rba2d_cli_flush_fails_after_seal_commit(engine, tmp_path, monkeypatch, cause):
+    """T10: exit 1 reports the zero-copy failure without rolling back the sealed bundle."""
+    from click.testing import CliRunner
+
+    from sutradhara.cli import archive
+
+    bundle_id = _rba_seed(engine, tmp_path, pools=("p-a",))
+    backend = _RbaBackend("absent", failed_pool="p-a")
+    if cause == "no-detail":
+
+        def flush_without_detail(*args, **kwargs):
+            return replace(
+                flush_bundle(*args, **kwargs), condition_reason=None, condition_message=None
+            )
+
+        monkeypatch.setattr(archive, "flush_bundle", flush_without_detail)
+    monkeypatch.setattr(archive, "make_engine", lambda: engine)
+    monkeypatch.setattr(archive, "RemArchiveBuilder", lambda *args: LocalArchiveBuilder())
+    monkeypatch.setattr(archive, "backend_from_row", lambda row: backend)
+    output = CliRunner().invoke(archive.bundle_flush, [bundle_id])
+    assert output.exit_code == 1, (output.output, output.exception)
+    assert f"sealed {bundle_id}: copies=[]" in output.stdout
+    failed_line = next(line for line in output.stderr.splitlines() if line.startswith("failed "))
+    prefix = f"failed {bundle_id}: sealed with no copy"
+    if cause == "absent":
+        assert failed_line.startswith(prefix + ": transient-backend-failure: ")
+        assert "injected write did not land" in failed_line
+    else:
+        assert failed_line == prefix
+    assert backend.calls == {"p-a": 1}
+    with session_scope(engine) as session:
+        assert session.get(Bundle, bundle_id).status == "sealed"
+        assert list(session.scalars(select(Copy))) == []
 
 
 @pytest.mark.parametrize(

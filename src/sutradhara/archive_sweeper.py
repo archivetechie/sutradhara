@@ -56,6 +56,7 @@ from sutradhara.archive_bundle import bundle_due
 from sutradhara.archive_fanout import ArchiveBuilder, flush_bundle
 from sutradhara.bundle_group import compute_group_basis, fingerprint_basis
 from sutradhara.catalog.models import ArtifactClassPolicyRecord, Bundle, BundleCopyWriteAttempt
+from sutradhara.durability import BundleTarget, durable_placements
 from sutradhara.jobs.commit_point import commit_point_for
 from sutradhara.jobs.engine import AttemptBoundaryError, AttemptSuperseded, is_sqlite_lock_error
 from sutradhara.jobs.models import Job, JobStatus
@@ -387,7 +388,7 @@ def sweep_bundles(
     flushed: list[str] = []
     for bundle_id in sorted({**drained, **due}):
         try:
-            flush_bundle(
+            flush_result = flush_bundle(
                 session,
                 bundle_id=bundle_id,
                 backends=backends,
@@ -412,6 +413,22 @@ def sweep_bundles(
                 bundle_id=bundle_id,
                 reason=type(exc).__name__,
                 message=str(exc)[:500],
+            )
+            continue
+        if not durable_placements(
+            session, BundleTarget(bundle_id), require_verified=False, artifactclass=None
+        ):
+            message = "sealed with no copy"
+            if flush_result.condition_reason:
+                message += f": {flush_result.condition_reason}"
+            if flush_result.condition_message:
+                message += f": {flush_result.condition_message}"
+            result.failed.append((bundle_id, message))
+            emit_structured_event(
+                "bundle_sweep_flush_failed",
+                bundle_id=bundle_id,
+                reason="sealed-without-copy",
+                message=message[:500],
             )
             continue
         flushed.append(bundle_id)

@@ -71,6 +71,81 @@ from tests.bundle_group_helpers import bundle_kwargs_for_class
 from tests.key_helpers import make_test_key_registry
 
 
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "not-regular",
+        "not-directory",
+        "size",
+        "digest",
+        "xattr",
+        "permission",
+        "io",
+        "unsupported",
+        "value",
+    ],
+)
+def test_rba2d_member_check_fault_classes(tmp_path, monkeypatch, fault):
+    """The shared check distinguishes unavailable bytes from host and programming faults."""
+    import errno
+
+    from sutradhara.archive_fanout import MemberInput
+    from sutradhara.archive_restore import ArchiveRestoreError
+
+    path = tmp_path / "member.bin"
+    data = b"stored member"
+    path.write_bytes(data)
+    expected = ArchiveRestoreError
+    injected = None
+    xattrs = ()
+    if fault == "missing":
+        path.unlink()
+    elif fault == "not-regular":
+        path.unlink()
+        path.mkdir()
+    elif fault == "not-directory":
+        path = path / "child"
+    elif fault == "size":
+        path.write_bytes(data + b"!")
+    elif fault == "digest":
+        path.write_bytes(b"x" * len(data))
+        expected = bundle_repair._SourceDigestMismatch
+    elif fault == "xattr":
+        xattrs = ("user.required",)
+        monkeypatch.setattr(bundle_repair.os, "listxattr", lambda path: [])
+    else:
+        injected = {
+            "permission": PermissionError("denied"),
+            "io": OSError(errno.EIO, "read fault"),
+            "unsupported": OSError(errno.ENOTSUP, "xattr unsupported"),
+            "value": ValueError("embedded null byte"),
+        }[fault]
+        expected = type(injected)
+
+        def fail(path):
+            raise injected
+
+        if fault == "unsupported":
+            xattrs = ("user.required",)
+            monkeypatch.setattr(bundle_repair.os, "listxattr", fail)
+        else:
+            monkeypatch.setattr(bundle_repair, "_sha256_file", fail)
+    member = MemberInput(
+        logical_asset_hash=hashlib.sha256(data).digest(),
+        member_path="member.bin",
+        source_path=path,
+        size_bytes=len(data),
+        file_sha256=hashlib.sha256(data).digest(),
+    )
+    with pytest.raises(expected) as caught:
+        bundle_repair._check_member_file(member, xattrs=xattrs, staging=True)
+    if injected is not None:
+        assert caught.value is injected
+    else:
+        assert "member.bin" in str(caught.value)
+
+
 @pytest.fixture
 def engine() -> Iterator[Engine]:
     eng = make_engine("sqlite:///:memory:")

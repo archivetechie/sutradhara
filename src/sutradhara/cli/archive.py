@@ -45,6 +45,7 @@ from sutradhara.bundle_group import basis_pool_ids
 from sutradhara.bundle_group_report import render_policy_apply_report
 from sutradhara.catalog.models import ArtifactClassPool, Backend, Bundle, Pool, Submission
 from sutradhara.catalog.session import make_engine, make_read_only_engine, session_scope
+from sutradhara.durability import BundleTarget, durable_placements
 from sutradhara.hdcache.manager import (
     PrivacyOverride,
     RestoreDenied,
@@ -388,10 +389,23 @@ def bundle_flush(
         # operator message ("come back with more space"), not a traceback.
         except (ManifestSigningError, FlushPreflightShort) as exc:
             raise click.ClickException(str(exc)) from exc
+        has_ok_copy = bool(
+            durable_placements(
+                session, BundleTarget(bundle_id), require_verified=False, artifactclass=None
+            )
+        )
     click.echo(
         f"sealed {result.bundle_id}: copies={list(result.copy_ids)} "
         f"manifest={result.manifest_path or '(none)'}"
     )
+    if not has_ok_copy:
+        message = "sealed with no copy"
+        if result.condition_reason:
+            message += f": {result.condition_reason}"
+        if result.condition_message:
+            message += f": {result.condition_message}"
+        click.echo(f"failed {bundle_id}: {message}", err=True)
+        raise SystemExit(1)
 
 
 def _force_flush_fill_warning(session: Session, bundle: Bundle) -> list[str]:
