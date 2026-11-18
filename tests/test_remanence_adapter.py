@@ -2557,6 +2557,33 @@ def test_deadline_enumerate_idle_watch(monkeypatch, proto_object):
     assert not [t for t in threading.enumerate() if t.name.startswith("remanence-idle-watch")]
 
 
+@pytest.mark.parametrize("status", [grpc.StatusCode.CANCELLED, grpc.StatusCode.DEADLINE_EXCEEDED])
+def test_deadline_enumerate_server_error_class(status):
+    """FR1 T2(b): catalogue cancellation is unavailable; a deadline is transient."""
+
+    class Call:
+        """Fail on the first next without any idle-watch cancellation."""
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise _PoolLookupError(status)
+
+        def cancel(self):
+            return True
+
+    backend = RemanenceBackend("rem", endpoint="direct", catalog=_DeadlineCatalog(call=Call()))
+    expected = (
+        BackendTransientError
+        if status == grpc.StatusCode.DEADLINE_EXCEEDED
+        else BackendUnavailableError
+    )
+    with pytest.raises(expected, match="direct") as error:
+        list(backend.enumerate())
+    assert type(error.value) is expected
+
+
 def test_read_idle_watch_ends_a_stalled_real_grpc_stream(monkeypatch):
     """RBA-DL H1: a real gRPC next is interrupted by the idle watch."""
     monkeypatch.setattr(remanence_module, "_READ_IDLE_TIMEOUT_SECONDS", 0.2, raising=False)
@@ -2573,7 +2600,7 @@ def test_read_idle_watch_ends_a_stalled_real_grpc_stream(monkeypatch):
         backend = RemanenceBackend.from_grpc("rem", endpoint=endpoint)
         try:
             started = time.monotonic()
-            with pytest.raises(BackendTransientError):
+            with pytest.raises(BackendTransientError, match="idle wait exceeded"):
                 backend.read_range(_read_locator("ab" * 32), ByteRange(0, 0))
             assert time.monotonic() - started < 1.0
             assert servicer.closed

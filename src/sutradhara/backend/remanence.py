@@ -218,7 +218,9 @@ class RemanenceWriteSessionError(BackendUnavailableError):
 
 
 class RemanenceWriteInDoubtError(RemanenceWriteSessionError, BackendWriteInDoubtError):
-    """A write is unresolved after ABORTED or a client deadline expires."""
+    """Remanence holds the write identity live or quarantined after ABORTED.
+    The same holds when a client deadline expires.
+    """
 
 
 class _EnumerateCall(Protocol):
@@ -311,14 +313,13 @@ class _IdleWatch(Generic[_StreamItem]):
 
     def __next__(self) -> _StreamItem:
         with self._lock:
-            if self._stop.is_set():
-                raise StopIteration
-            self._deadline = time.monotonic() + self.timeout
-            if self._thread is None:
-                self._thread = threading.Thread(
-                    target=self._run, name="remanence-idle-watch", daemon=True
-                )
-                self._thread.start()
+            if not self._stop.is_set():
+                self._deadline = time.monotonic() + self.timeout
+                if self._thread is None:
+                    self._thread = threading.Thread(
+                        target=self._run, name="remanence-idle-watch", daemon=True
+                    )
+                    self._thread.start()
         try:
             return next(self._iterator)
         finally:
@@ -329,10 +330,9 @@ class _IdleWatch(Generic[_StreamItem]):
         while not self._stop.wait(self.timeout / 4):
             with self._lock:
                 if self._deadline is not None and time.monotonic() >= self._deadline:
-                    self.fired = True
                     # Fast direct fakes may be plain generators. Access cancel
                     # only on expiry; production gRPC calls are cancellable.
-                    self._call.cancel()
+                    self.fired = bool(self._call.cancel())
                     return
 
     def close(self) -> None:
@@ -1732,11 +1732,13 @@ class RemanenceReadSession:
                 session_id=session_id,
                 drive_element_address=drive_element_address,
             ) from e
-        watch = _IdleWatch(call, _READ_IDLE_TIMEOUT_SECONDS)
+        watch: _IdleWatch[layer5_pb2.BytesChunk] | None = None
         try:
+            watch = _IdleWatch(call, _READ_IDLE_TIMEOUT_SECONDS)
             yield self._grpc_range_chunks(watch)
         finally:
-            watch.close()
+            if watch is not None:
+                watch.close()
             # Correctness-critical ordering: dropping the server receiver must
             # unblock its bounded producer before CloseReadSession reaches the
             # same drive actor.

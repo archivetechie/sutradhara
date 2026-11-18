@@ -156,6 +156,27 @@ class _ServerCancelledCall:
         return True
 
 
+class _AlreadyEndedCall:
+    """Release a server cancellation when the watch's cancel arrives too late."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self._cancel_attempted = threading.Event()
+
+    def __iter__(self) -> _AlreadyEndedCall:
+        return self
+
+    def __next__(self) -> layer5_pb2.BytesChunk:
+        if self._cancel_attempted.wait(5.0):
+            raise _CancelledRpcError()
+        raise RuntimeError("already-ended call fake reached its cap")
+
+    def cancel(self) -> bool:
+        self._events.append("cancel")
+        self._cancel_attempted.set()
+        return False
+
+
 class _IdleReadCall:
     """Cancellable stream with bounded waits, including a deliberate idle stall."""
 
@@ -265,6 +286,47 @@ def test_remanence_server_cancellation_still_cancels_call_then_closes_session() 
 
     assert type(error.value) is BackendUnavailableError
     assert events == ["cancel", "close"]
+
+
+def test_remanence_idle_watch_cancel_too_late_is_server_cancellation(monkeypatch) -> None:
+    """FR1 T1: a rejected idle cancel leaves the server's error unavailable."""
+    import sutradhara.backend.remanence as remanence_module
+
+    monkeypatch.setattr(remanence_module, "_READ_IDLE_TIMEOUT_SECONDS", 0.2, raising=False)
+    events: list[str] = []
+    backend = _live_backend(_AlreadyEndedCall(events), events)
+
+    with (
+        pytest.raises(BackendUnavailableError, match="server cancelled stream") as error,
+        backend.open_range_chunks(_LOCATOR, ByteRange(0, 0), chunk_bytes=5) as chunks,
+    ):
+        next(chunks)
+
+    assert type(error.value) is BackendUnavailableError
+
+
+def test_remanence_read_range_server_cancellation_is_unavailable() -> None:
+    """FR1 T2(a): the eager read also preserves server cancellation's class."""
+    events: list[str] = []
+    backend = _live_backend(_ServerCancelledCall(events), events)
+
+    with pytest.raises(BackendUnavailableError, match="server cancelled stream") as error:
+        backend.read_range(_LOCATOR, ByteRange(0, 0))
+
+    assert type(error.value) is BackendUnavailableError
+
+
+def test_remanence_chunks_after_context_exit_report_server_cancellation() -> None:
+    """FR1 T3: closing an unread stream must not turn cancellation into EOF."""
+    events: list[str] = []
+    backend = _live_backend(_ServerCancelledCall(events), events)
+
+    with backend.open_range_chunks(_LOCATOR, ByteRange(0, 0), chunk_bytes=5) as chunks:
+        pass
+
+    assert events == ["cancel", "close"]
+    with pytest.raises(BackendUnavailableError, match="server cancelled stream"):
+        next(chunks)
 
 
 def test_remanence_large_stream_peak_memory_is_a_few_chunks() -> None:
