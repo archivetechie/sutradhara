@@ -732,7 +732,9 @@ xattrs, no multi-file manifests yet.
 Each admitted open is recorded as an attempt with how it ends; failed tries
 are retried with a growing delay, and an item is given up after the configured
 number of failures or consecutive interruptions, or at once for a cause that
-cannot succeed. A delivered item waits for the receiver to confirm it. A
+cannot succeed. A delivery whose receiver stops taking data, or does not confirm
+the delivered file, for longer than the lease counts as an interruption.
+A delivered item waits for the receiver to confirm it. A
 recovery pass at startup and at intervals closes attempts that a stopped
 server leaves open.
 

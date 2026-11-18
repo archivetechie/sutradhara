@@ -434,7 +434,7 @@ def test_policy_gives_up_at_the_eighth_interruption_in_a_row() -> None:
 
 @pytest.mark.parametrize(
     "terminal",
-    [("error", "tape_only"), ("cancelled", "lease_expired"), ("job_end", "lease_expired")],
+    [("error", "tape_only")],
 )
 def test_policy_gives_up_at_once_on_a_terminal_row(terminal: tuple[str, str]) -> None:
     rows = _history(terminal)
@@ -455,6 +455,66 @@ def test_policy_gives_up_at_once_on_a_terminal_row(terminal: tuple[str, str]) ->
     assert compose_detail("terminal_cause", None, decisive) == compose_last_error(
         terminal[0], terminal[1], None
     )
+
+
+@pytest.mark.parametrize("lapse_kind", ["cancelled", "job_end"])
+def test_rlr2_lapses_share_the_interruption_run_in_python_and_sql(
+    engine: Engine, instance_id: int, lapse_kind: str
+) -> None:
+    """RLR-2 T2: lapses share the delay, limit and reset rules with other interruptions."""
+
+    lapse = (lapse_kind, "lease_expired")
+    seven = [lapse, INTERRUPTED, LOST, lapse, LOST, INTERRUPTED, lapse]
+    histories = {
+        "eight": [*seven, lapse],
+        "seven": seven,
+        "one": [lapse],
+        "two": [lapse, lapse],
+        "counted_reset": [*seven, COUNTED, lapse],
+        "delivered_reset": [*seven, DELIVERED, lapse],
+    }
+    policy = RetryPolicy()
+    for name, shapes in histories.items():
+        item_id = _seed_item(engine, f"rlr2-{lapse_kind}-{name}")
+        for attempt_no, (kind, cause) in enumerate(shapes, start=1):
+            when = T0 + dt.timedelta(minutes=attempt_no)
+            _insert_attempt(
+                engine,
+                _attempt_values(
+                    item_id,
+                    instance_id,
+                    attempt_no,
+                    **_ended(kind, cause, **{"closed_at" if kind == "lost" else "ended_at": when}),
+                ),
+            )
+        with session_scope(engine) as session:
+            rows = list(
+                session.scalars(
+                    select(RestoreItemAttempt)
+                    .where(RestoreItemAttempt.restore_request_item_id == item_id)
+                    .order_by(RestoreItemAttempt.attempt_no)
+                )
+            )
+            twin = summarize_rows(rows)
+            sql = attempt_summaries(session, [item_id])[item_id]
+            assert sql == twin
+            offer = plan_next_offer(twin, T0, policy)
+            assert plan_next_offer(sql, T0, policy) == offer
+            if name == "eight":
+                assert offer.kind == "give_up"
+                assert (offer.rule, offer.counted, offer.threshold) == ("max_interruptions", 8, 8)
+                assert twin.interruptions == 8
+                assert offer.decisive_attempt_id == rows[-1].id
+            elif name == "seven":
+                assert twin.interruptions == 7
+                assert offer.kind == "at"
+            elif name == "two":
+                assert twin.interruptions == 2
+                assert offer.kind == "at"
+                assert offer.not_before == T0 + dt.timedelta(minutes=2) + policy.base_delay
+            else:
+                assert twin.interruptions == 1
+                assert offer.kind == "now"
 
 
 def test_policy_first_interruption_reoffers_now_and_later_ones_back_off() -> None:
@@ -569,11 +629,15 @@ def test_text_owner_tape_only_and_supervisor_lease_expired_sentences_are_verbati
     )
     assert compose_last_error("cancelled", "lease_expired", None) == (
         "the receiving computer stopped taking data, or did not confirm the delivered file, "
-        "within the 30-minute delivery lease; check the receiving computer and request the restore again"
+        "within the 30-minute delivery lease; check the receiving computer"
     )
     assert compose_last_error("job_end", "lease_expired", None) == compose_last_error(
         "cancelled", "lease_expired", None
     )
+    for kind in ("cancelled", "job_end"):
+        text = compose_last_error(kind, "lease_expired", None)
+        assert text is not None
+        assert "request the restore again" not in text
 
 
 def test_text_cache_disk_unavailable_never_says_rm3() -> None:

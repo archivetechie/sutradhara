@@ -101,6 +101,7 @@ from sutradhara.hdcache.models import (
     RestoreServerInstance,
 )
 from sutradhara.hdcache.restore_retry import (
+    RetryPolicy,
     attempt_summaries,
     compose_last_error,
     giveup_agreement_violations,
@@ -969,10 +970,10 @@ def test_open_restore_negative_auth_matrix_streams_nothing(
 
 
 def test_duplicate_open_rejected_then_expired_generation_reopens(rig: _Rig) -> None:
-    """Re-pinned by RSR-1b: the duplicate is refused at admission with no row; a
-    stream closed after its lease expired ends ``cancelled`` / ``lease_expired``
-    and the item fails (the owner's rule); the expired generation of a *delivered*
-    item reopens with generation + 1."""
+    """A duplicate writes no row; a lapsed cancellation is an interruption.
+
+    The expired generation of a delivered item still reopens with generation + 1.
+    """
 
     item_id = _seed_item(rig, "lease", b"lease arbitration", receiver="receiver")
     request = restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id)
@@ -992,12 +993,13 @@ def test_duplicate_open_rejected_then_expired_generation_reopens(rig: _Rig) -> N
     with session_scope(rig.engine) as session:
         item = session.get(RestoreRequestItem, item_id)
         assert item is not None
-        assert item.state == "failed"
+        assert item.state == "queued"
+        assert item.detail is None
+        assert item.request.state == "pending"
         giveup = session.scalar(
             select(RestoreItemGiveup).where(RestoreItemGiveup.restore_request_item_id == item_id)
         )
-        assert giveup is not None
-        assert giveup.rule == "terminal_cause"
+        assert giveup is None
 
     delivered_id = _seed_item(
         rig, "lease-delivered", b"delivered then expired", receiver="receiver"
@@ -2318,9 +2320,8 @@ def test_open_prepared_cache_source_never_probes_recovery(
 
 # ---- RSR-1b: the attempt ledger's writer (design RSR D2, D3, D6) ------------------
 
-# The owner's two terminal sentences (D-RSRP-6), composed by the one composer, not copied.
+# The owner's tape_only sentence (D-RSRP-6), composed by the one composer, not copied.
 _TAPE_ONLY_SENTENCE = compose_last_error("error", "tape_only", None)
-_LEASE_EXPIRED_SENTENCE = compose_last_error("error", "lease_expired", None)
 
 
 def _pl(suffix: str) -> bytes:
@@ -2670,14 +2671,16 @@ def test_rlr_pause_resume_cancel_and_recovery(fresh_rig: _Rig, action: str) -> N
         expected = {
             "resume": ("job_end", None, "sent"),
             "cancel_live": ("cancelled", None, "queued"),
-            "cancel_expired": ("cancelled", "lease_expired", "failed"),
+            "cancel_expired": ("cancelled", "lease_expired", "queued"),
         }[action]
         assert (row.end_kind, row.cause) == expected[:2]
         with session_scope(rig.engine) as session:
             item = session.get(RestoreRequestItem, item_id)
             assert item.state == expected[2]
             if action == "cancel_expired":
-                assert item.detail == _LEASE_EXPIRED_SENTENCE
+                assert item.detail is None
+                assert item.request.state == "pending"
+                assert _giveup_of(session, item_id) is None
             assert giveup_agreement_violations(session) == []
 
 
@@ -3777,12 +3780,11 @@ def test_e6_a_delivery_whose_lease_expired_before_the_client_pulled_past_job_end
     with session_scope(rig.engine) as session:
         item = session.get(RestoreRequestItem, item_id)
         assert item is not None
-        assert item.state == "failed"
-        assert item.detail == _LEASE_EXPIRED_SENTENCE
-        assert item.request.state == "completed_with_errors"
+        assert item.state == "queued"
+        assert item.detail is None
+        assert item.request.state == "pending"
         giveup = _giveup_of(session, item_id)
-        assert giveup is not None
-        assert giveup.rule == "terminal_cause"
+        assert giveup is None
         assert giveup_agreement_violations(session) == []
 
 
@@ -4760,8 +4762,10 @@ def test_d2_acknowledgement_must_match_the_open_generation(rig: _Rig) -> None:
             context.active = False
 
 
-def test_d3_lease_expiry_while_waiting_for_acknowledgement_is_terminal(fresh_rig: _Rig) -> None:
-    """No acknowledgement by the lease deadline gives up with the deterministic cause."""
+def test_d3_lease_expiry_while_waiting_for_acknowledgement_is_an_interruption(
+    fresh_rig: _Rig,
+) -> None:
+    """No acknowledgement by the lease deadline retains the cause and allows a retry."""
 
     rig = fresh_rig
     item_id = _seed_item(rig, "d3-expired", _pl("d3-expired"), receiver="receiver")
@@ -4783,8 +4787,10 @@ def test_d3_lease_expiry_while_waiting_for_acknowledgement_is_terminal(fresh_rig
         assert (row.end_kind, row.cause) == ("cancelled", "lease_expired")
         with session_scope(rig.engine) as session:
             item = session.get(RestoreRequestItem, item_id)
-            assert item.state == "failed"
-            assert item.detail == _LEASE_EXPIRED_SENTENCE
+            assert item.state == "queued"
+            assert item.detail is None
+            assert item.request.state == "pending"
+            assert _giveup_of(session, item_id) is None
             assert giveup_agreement_violations(session) == []
     finally:
         service.stop()
@@ -4878,6 +4884,167 @@ def test_d1_rejected_delivery_reoffers_immediately(fresh_rig: _Rig) -> None:
         )
     )
     assert offered == [item_id, item_id]
+
+
+@pytest.mark.parametrize("site", ["acknowledgement", "sent_cas", "cancelled"])
+def test_rlr2_lapsed_delivery_reoffers_and_receiver_completes(fresh_rig: _Rig, site: str) -> None:
+    """RLR-2 T1: every lapse site re-offers on the same watch and resumes to REVEALED."""
+
+    rig = fresh_rig
+    tag = f"rlr2-{site}"
+    payload = _pl(tag)
+    item_id = _seed_item(rig, tag, payload, receiver="receiver")
+    offered: list[int] = []
+    heads: list[Any] = []
+
+    def before_poll(poll: int) -> None:
+        if poll == 2:
+            assert offered == [item_id]
+            stream = rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+            if site == "sent_cas":
+                frames = _pull_until_job_end(stream, rig.service, rig.context("receiver"))
+            elif site == "acknowledgement":
+                frames = _pull_until_file_end(stream)
+            else:
+                frames = []
+                for frame in stream:
+                    frames.append(frame)
+                    if frame.HasField("chunk"):
+                        break
+                assert frames[-1].HasField("chunk")
+            assert "manifest_end" in _kinds(frames)
+            heads.append(frames[0].manifest_head)
+            _expire_lease(rig, item_id)
+            if site == "cancelled":
+                stream.close()  # type: ignore[attr-defined]
+            else:
+                with pytest.raises(_Abort) as expired:
+                    next(stream)
+                assert expired.value.code == grpc.StatusCode.ABORTED
+                assert expired.value.details == (
+                    "the delivery was not recorded"
+                    if site == "sent_cas"
+                    else "the receiver did not acknowledge the delivery before its lease expired"
+                )
+            (row,) = _attempt_rows(rig, item_id)
+            assert (row.end_kind, row.cause) == (
+                "job_end" if site == "sent_cas" else "cancelled",
+                "lease_expired",
+            )
+            with session_scope(rig.engine) as session:
+                item = session.get(RestoreRequestItem, item_id)
+                assert item.state == "queued"
+                assert item.detail is None
+                assert item.request.state == "pending"
+                assert _giveup_of(session, item_id) is None
+                assert giveup_agreement_violations(session) == []
+        elif poll == 3:
+            assert offered == [item_id, item_id]  # no delay after the first interruption
+
+    offered.extend(
+        assignment.restore_request_item_id
+        for assignment in rig.service.WatchAssignments(
+            restore_pb2.WatchRequest(device_id="receiver"),
+            _PollingWatchContext(rig, 3, before_poll),
+        )
+    )
+    assert offered == [item_id, item_id]
+    (head,) = heads
+    claim = 1 if site == "sent_cas" else 0
+    resumed = list(
+        _receive(
+            rig.service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(
+                    restore_request_item_id=item_id, **_resume_fields(item_id, head, claim)
+                ),
+                rig.context("receiver"),
+            ),
+            lambda ack: rig.service.CommitRestore(ack, rig.context("receiver")),
+        )
+    )
+    assert resumed[-1].HasField("job_end")
+    if claim == 1:
+        assert _kinds(resumed) == ["manifest_head", "manifest_entry", "manifest_end", "job_end"]
+        assert (resumed[-1].job_end.files, resumed[-1].job_end.bytes) == (0, 0)
+    else:
+        assert "file_header" in _kinds(resumed)
+        assert b"".join(frame.chunk.data for frame in resumed if frame.HasField("chunk")) == payload
+        assert resumed[-1].job_end.files == 1
+    with session_scope(rig.engine) as session:
+        assert session.get(RestoreRequestItem, item_id).state == "sent"
+    _lapsed, delivered = _attempt_rows(rig, item_id)
+    assert (delivered.end_kind, delivered.cause) == ("job_end", None)
+    resumed_head = resumed[0].manifest_head
+    reply = rig.service.CommitRestore(
+        _commit_request(
+            item_id, resumed_head.manifest_sha256, resumed_head.lease_token, 1, revealed=True
+        ),
+        rig.context("receiver"),
+    )
+    assert (reply.status, reply.committed_index) == ("revealed", 1)
+    assert _checkpoint_of(rig, item_id) == (1, True)
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item.state == "done"
+        assert item.request.state == "completed"
+        assert _giveup_of(session, item_id) is None
+        assert giveup_agreement_violations(session) == []
+
+
+def test_rlr2_two_lapses_give_up_at_the_service_interruption_limit(fresh_rig: _Rig) -> None:
+    """RLR-2 T3: two real lapsed opens hit a configured shared interruption bound of two."""
+
+    rig = fresh_rig
+    item_id = _seed_item(rig, "rlr2-bound", _pl("rlr2-bound"), receiver="receiver")
+    service = _started(
+        RestoreService(replace(rig.service_config, retry_policy=RetryPolicy(max_interruptions=2)))
+    )
+    try:
+        for attempt_no in (1, 2):
+            stream = service.OpenRestore(
+                restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
+                rig.context("receiver"),
+            )
+            assert next(stream).HasField("manifest_head")
+            _expire_lease(rig, item_id)
+            stream.close()  # type: ignore[attr-defined]
+            rows = _attempt_rows(rig, item_id)
+            assert len(rows) == attempt_no
+            assert (rows[-1].end_kind, rows[-1].cause) == ("cancelled", "lease_expired")
+            with session_scope(rig.engine) as session:
+                item = session.get(RestoreRequestItem, item_id)
+                if attempt_no == 1:
+                    assert item.state == "queued"
+                    assert item.detail is None
+                    assert _giveup_of(session, item_id) is None
+                else:
+                    assert item.state == "failed"
+                    assert item.detail == "gave up after 2 interrupted transfers in a row"
+                    (giveup,) = session.scalars(
+                        select(RestoreItemGiveup).where(
+                            RestoreItemGiveup.restore_request_item_id == item_id
+                        )
+                    ).all()
+                    assert (giveup.rule, giveup.counted, giveup.threshold) == (
+                        "max_interruptions",
+                        2,
+                        2,
+                    )
+                    assert giveup.decisive_attempt_id == rows[-1].id
+                assert giveup_agreement_violations(session) == []
+            if attempt_no == 1:
+                offers = list(
+                    service.WatchAssignments(
+                        restore_pb2.WatchRequest(device_id="receiver"),
+                        _PollingWatchContext(rig, 1),
+                    )
+                )
+                assert [offer.restore_request_item_id for offer in offers] == [item_id]
+    finally:
+        service.stop()
 
 
 @pytest.mark.parametrize("history", ["open", "pending_give_up", "given_up"])

@@ -524,7 +524,7 @@ def test_r3_cancelled_end_whose_first_try_outlasted_its_lease_is_an_interruption
 def test_r3_cancelled_end_whose_lease_had_expired_at_the_first_try_stays_lease_expired(
     rig: _Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Retrying a genuinely expired cancellation must retain its terminal cause."""
+    """Retrying a genuinely expired cancellation must retain its cause."""
 
     entry = _cancelled_attempt(rig, "r3-cancel-expired", seconds=-1)
 

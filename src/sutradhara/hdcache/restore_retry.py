@@ -92,8 +92,8 @@ CLASS_TABLE: Final[tuple[ClassRow, ...]] = (
     ClassRow(CLASS_INTERRUPTED, "cancelled", None),
     ClassRow(CLASS_INTERRUPTED, "lost", None),
     ClassRow(CLASS_TERMINAL, "error", "tape_only"),
-    ClassRow(CLASS_TERMINAL, "cancelled", "lease_expired"),
-    ClassRow(CLASS_TERMINAL, "job_end", "lease_expired"),
+    ClassRow(CLASS_INTERRUPTED, "cancelled", "lease_expired"),
+    ClassRow(CLASS_INTERRUPTED, "job_end", "lease_expired"),
 )
 
 
@@ -550,14 +550,14 @@ _CAUSE_TEXT: Final[dict[str, str]] = {
     "open_conflict": "another open of this item was in progress",
     "lease_live": "an earlier delivery's lease is still live",
     "item_withdrawn": "the item was withdrawn while it was being opened",
-    # tape_only is the owner's sentence; lease_expired is the supervisor's (r3), verbatim.
+    # tape_only is the owner's sentence; lease_expired is the supervisor's (RLR-2).
     "tape_only": (
         "this item's usable copies are on tape, which agent delivery cannot read yet; "
         "request server-local delivery"
     ),
     "lease_expired": (
         "the receiving computer stopped taking data, or did not confirm the delivered file, "
-        "within the 30-minute delivery lease; check the receiving computer and request the restore again"
+        "within the 30-minute delivery lease; check the receiving computer"
     ),
 }
 _INTERRUPTED_TEXT: Final = "the transfer was interrupted"
