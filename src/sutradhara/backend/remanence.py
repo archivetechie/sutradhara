@@ -39,6 +39,7 @@ from sutradhara._proto import layer5_pb2, layer5_pb2_grpc
 from sutradhara.backend.port import (
     BackendError,
     BackendLocator,
+    BackendMediaError,
     BackendNotFoundError,
     BackendObjectExistsError,
     BackendSessionInvalidatedError,
@@ -2164,6 +2165,24 @@ def _read_idle_error(
     return result
 
 
+def _has_media_finding(error: grpc.RpcError) -> bool:
+    """Read the daemon's finding, tolerating unavailable trailing metadata."""
+    try:
+        trailers = getattr(error, "trailing_metadata", None)
+        if not callable(trailers):
+            return False
+        for key, value in trailers() or ():
+            if isinstance(key, bytes):
+                key = key.decode("utf-8")
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            if key == "remanence-finding" and value == "media-damage":
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _read_object_range_error(
     endpoint: str | None,
     error: grpc.RpcError,
@@ -2173,13 +2192,19 @@ def _read_object_range_error(
 ) -> BackendError:
     text = f"Remanence ReadObjectRange at {endpoint!r} failed: {_rpc_error_text(error)}"
     code = error.code()
-    if code in {
+    if code == grpc.StatusCode.DATA_LOSS:
+        result: BackendError = BackendStoredCorruptError(text)
+    elif _has_media_finding(error):
+        result = BackendMediaError(
+            f"{text}; remanence-finding=media-damage; "
+            f"could not be read at its recorded position; "
+            f"drive_element_address={drive_element_address}"
+        )
+    elif code in {
         grpc.StatusCode.UNAVAILABLE,
         grpc.StatusCode.DEADLINE_EXCEEDED,
     }:
-        result: BackendError = BackendTransientError(text)
-    elif code == grpc.StatusCode.DATA_LOSS:
-        result = BackendStoredCorruptError(text)
+        result = BackendTransientError(text)
     elif code in {
         grpc.StatusCode.NOT_FOUND,
         grpc.StatusCode.FAILED_PRECONDITION,

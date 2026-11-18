@@ -24,6 +24,7 @@ import sutradhara.replicate as replicate_wrapper
 from sutradhara.backend.port import (
     BackendError,
     BackendLocator,
+    BackendMediaError,
     BackendStoredCorruptError,
     ByteRange,
     CopyRecord,
@@ -87,6 +88,7 @@ class _ReadableTaggedWriteBackend:
         self.writes: list[str] = []
         self.read_failures: set[str] = set()
         self.stored_corrupt: set[str] = set()
+        self.media_findings: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -129,6 +131,10 @@ class _ReadableTaggedWriteBackend:
 
     def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
         object_id = str(locator["object_id"])
+        if object_id in self.media_findings:
+            raise BackendMediaError(
+                f"could not be read at its recorded position: {object_id}; drive_element_address=257"
+            )
         if object_id in self.read_failures:
             raise BackendError(f"transport unavailable for {object_id}")
         if object_id in self.stored_corrupt:
@@ -1001,3 +1007,81 @@ def test_self_heal_rebuilt_encrypted_copy_opens_with_epoch_key(
         recipient_epochs=(epoch.key_id, _recovery.key_id),
     ) as plaintext_path:
         assert plaintext_path.read_bytes() == data
+
+
+def test_self_heal_media_finding_records_source_and_repairs_from_next(engine):
+    """T12: self-heal records the failed source before repairing from its sibling."""
+    data = b"original media fallback"
+    asset_hash = _add_asset(engine, data)
+    backend_id = _add_backend(engine)
+    _add_o_archive_pools(engine, backend_id)
+    backend = _backend()
+    first_record = backend.put_object("o-copy-1-pool", b"rem-object-v1::" + data)
+    second_record = backend.put_object(
+        "o-copy-2-pool", b"rem-encrypt-v1:" + ARCHIVE_EPOCH.encode() + b":" + data
+    )
+    with session_scope(engine) as session:
+        session.add(
+            Pool(
+                id="o-copy-3-pool",
+                backend_id=backend_id,
+                representation=Representation.REM_OBJECT_V1.value,
+            )
+        )
+        session.add(
+            ArtifactClassPool(artifactclass="o-archive", pool_id="o-copy-3-pool", sort_order=3)
+        )
+        session.flush()
+        first, _ = add_copy(
+            session,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=first_record.native_locator,
+            integrity_hash=first_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-1-pool",
+            storage_metadata=_metadata(Representation.REM_OBJECT_V1),
+        )
+        _record_fixture_measurement(
+            session, first, backend, measured_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+        )
+        second, _ = add_copy(
+            session,
+            logical_asset_hash=asset_hash,
+            backend_id=backend_id,
+            native_locator=second_record.native_locator,
+            integrity_hash=second_record.integrity_hash,
+            source=CopySource.INGEST,
+            pool_id="o-copy-2-pool",
+            storage_metadata=_metadata(Representation.REM_ENCRYPT_V1, key_epoch=ARCHIVE_EPOCH),
+        )
+        _record_fixture_measurement(
+            session, second, backend, measured_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        )
+        backend.media_findings.add(str(first_record.native_locator["object_id"]))
+        repaired = self_heal(
+            session,
+            asset_hash,
+            "o-archive",
+            backends={backend_id: backend},
+            key_epoch=ARCHIVE_EPOCH,
+            opener=_FakeOpener(),
+            sealer=_FakeSealer(),
+            execution_id="self-heal:media-finding",
+        )
+        receipts = list(
+            session.scalars(
+                select(VerifyReceipt).where(
+                    VerifyReceipt.copy_id == first.id, VerifyReceipt.source == "restore"
+                )
+            )
+        )
+        assert len(receipts) == 1
+        assert receipts[0].failure_kind == "media-damage"
+        assert receipts[0].execution_id == "self-heal:media-finding"
+        assert receipts[0].measured_digest is None
+        assert receipts[0].backend_ok is False
+        assert first.health == CopyHealth.SUSPECT
+        assert first.last_measured_digest is None
+        assert first.last_measured_at is None
+        assert {copy.pool_id for copy in repaired} == {"o-copy-1-pool", "o-copy-3-pool"}

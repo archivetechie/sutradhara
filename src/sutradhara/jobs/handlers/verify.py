@@ -29,12 +29,13 @@ from sqlalchemy.orm import Session
 # can monkeypatch `factory.backend_from_row` and have the override take
 # effect here.
 from sutradhara.backend import factory
-from sutradhara.backend.port import BackendStoredCorruptError
+from sutradhara.backend.port import BackendMediaError, BackendStoredCorruptError
 from sutradhara.catalog.models import Copy
 from sutradhara.catalog.types import CopyHealth
 from sutradhara.evidence_recorder import (
     record_backend_attested_corrupt,
     record_measured,
+    record_media_damage,
     record_unmeasured_promotion,
 )
 from sutradhara.jobs.components import touch_asset, touch_copy_tape
@@ -80,6 +81,32 @@ def handle_verify(ctx: JobContext) -> JobResult:
         return JobResult(
             ok=True,
             detail=f"integrity mismatch: {exc}",
+            step_state={
+                "verify_result": {
+                    "ok": False,
+                    "measured": False,
+                    "actual_hash": None,
+                    "detail": str(exc),
+                },
+                "copy_health_after": str(copy.health),
+            },
+        )
+    except BackendMediaError as exc:
+        ctx.observe(
+            {"verify_ok": False, "measured": False, "actual_hash": None, "detail": str(exc)}
+        )
+        if active and _copy_inputs(ctx.session, raw_copy_id) != inputs:
+            return JobResult(ok=False, detail="superseded: verify copy changed", superseded=True)
+        record_media_damage(
+            ctx.session,
+            copy,
+            detail=str(exc),
+            source="verify-job",
+            execution_id=str(ctx.job.id),
+        )
+        return JobResult(
+            ok=True,
+            detail=f"could not be read at its recorded position: {exc}",
             step_state={
                 "verify_result": {
                     "ok": False,

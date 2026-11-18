@@ -413,12 +413,12 @@ def resolve_identity(
             False,
         )
     from sutradhara.archive_fanout import ArchiveFanoutError
-    from sutradhara.backend.port import BackendError, BackendStoredCorruptError
+    from sutradhara.backend.port import BackendError, BackendMediaError, BackendStoredCorruptError
 
     verification_failed = read_error is not None or read_result is None or not read_result.ok
     verification_detail = str(read_error or (read_result.detail if read_result else "no read-back"))
     read_unavailable = read_error is not None and not isinstance(
-        read_error, (ArchiveFanoutError, BackendStoredCorruptError)
+        read_error, (ArchiveFanoutError, BackendStoredCorruptError, BackendMediaError)
     )
     landed_match = matched_id is not None and any(
         row.id == matched_id and outcome == "landed" for row, outcome in current

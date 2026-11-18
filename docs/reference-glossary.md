@@ -161,6 +161,8 @@ everything, flag validity, gate restore — never preservation.
 
 **suspect** — the sticky attention flag. A scrub hash-conflict marks a
 copy `suspect`; decode trouble marks an asset's validity `suspect`.
+A copy that the tape daemon reports could not be read at its recorded
+position is also marked `suspect`.
 Restores refuse suspect assets unless forced (`--force`).
 
 **reject** — a content-level governance marker on a logical asset

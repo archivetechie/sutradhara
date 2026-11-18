@@ -21,6 +21,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from sutradhara.backend.port import (
+    BackendMediaError,
     BackendStoredCorruptError,
     ByteRange,
     StorageBackend,
@@ -28,7 +29,11 @@ from sutradhara.backend.port import (
 )
 from sutradhara.catalog.models import Copy, LogicalAsset
 from sutradhara.catalog.types import CopyHealth, content_hash
-from sutradhara.evidence_recorder import record_backend_attested_corrupt, record_measured
+from sutradhara.evidence_recorder import (
+    record_backend_attested_corrupt,
+    record_measured,
+    record_media_damage,
+)
 from sutradhara.sealing.port import Opener, Representation
 
 _PROGRESS_CALLBACK: contextvars.ContextVar[Callable[[int], None] | None] = contextvars.ContextVar(
@@ -87,6 +92,16 @@ def restore_copy(
         stored_path = temp_dir / "stored-copy.bin"
         try:
             stored_bytes = backend.read_range(copy.native_locator, ByteRange(0, 0))
+        except BackendMediaError as exc:
+            record_media_damage(
+                session,
+                copy,
+                detail=str(exc),
+                source="restore",
+                execution_id=execution_id,
+                actor=actor,
+            )
+            raise
         except BackendStoredCorruptError as exc:
             record_backend_attested_corrupt(
                 session,

@@ -1,7 +1,7 @@
 """Own the current read-back measurement projection and its atomic receipts.
 
-Only ``record_measured``, ``record_unmeasured_promotion`` and
-``record_backend_attested_corrupt`` may mutate a
+Only ``record_measured``, ``record_unmeasured_promotion``,
+``record_backend_attested_corrupt`` and ``record_media_damage`` may mutate a
 copy's ``last_measured_digest``/``last_measured_at`` pair.  Callers own the
 transaction, so the projection, receipt, and any verification enqueue commit
 or roll back together.
@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import socket
+from collections.abc import Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -159,6 +160,59 @@ def record_backend_attested_corrupt(
 ) -> VerifyReceipt:
     """Record a backend's refusal of the stored bytes: corrupt, with no digest of ours."""
 
+    return _record_read_finding(
+        session,
+        copy,
+        detail=detail,
+        source=source,
+        execution_id=execution_id,
+        actor=actor,
+        checked_at=checked_at,
+        health_rule=lambda _health: CopyHealth.CORRUPT,
+        failure_kind="backend-digest-mismatch",
+    )
+
+
+def record_media_damage(
+    session: Session,
+    copy: Copy,
+    *,
+    detail: str,
+    source: str,
+    execution_id: str,
+    actor: str | None = None,
+    checked_at: dt.datetime | None = None,
+) -> VerifyReceipt:
+    """Record that a copy could not be read at its recorded position."""
+    return _record_read_finding(
+        session,
+        copy,
+        detail=detail,
+        source=source,
+        execution_id=execution_id,
+        actor=actor,
+        checked_at=checked_at,
+        health_rule=lambda health: (
+            CopyHealth.CORRUPT if health == CopyHealth.CORRUPT else CopyHealth.SUSPECT
+        ),
+        failure_kind="media-damage",
+    )
+
+
+def _record_read_finding(
+    session: Session,
+    copy: Copy,
+    *,
+    detail: str,
+    source: str,
+    execution_id: str,
+    actor: str | None,
+    checked_at: dt.datetime | None,
+    health_rule: Callable[[str], CopyHealth],
+    failure_kind: str,
+) -> VerifyReceipt:
+    """Atomically clear measurement evidence and record one backend finding."""
+
     if source not in MEASUREMENT_SOURCES:
         raise ValueError(f"measurement source must be one of {sorted(MEASUREMENT_SOURCES)}")
     if not execution_id:
@@ -172,14 +226,14 @@ def record_backend_attested_corrupt(
     copy.last_checked_at = at
     copy.last_measured_digest = None
     copy.last_measured_at = None
-    copy.health = CopyHealth.CORRUPT
+    copy.health = health_rule(copy.health)
     receipt = VerifyReceipt(
         copy_id=copy.id,
         backend_id=copy.backend_id,
         expected_digest=copy.integrity_hash,
         measured_digest=None,
         backend_ok=False,
-        failure_kind="backend-digest-mismatch",
+        failure_kind=failure_kind,
         failure_detail=detail,
         source=source,
         execution_id=execution_id,

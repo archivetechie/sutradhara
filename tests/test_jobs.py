@@ -1950,3 +1950,136 @@ def test_restore_handler_runs_gated_request_item(
         assert job.step_state["restore"]["source"] == "tape"
         attempt = s.scalars(select(JobAttempt).where(JobAttempt.job_id == job.id)).one()
         assert f"tape:{barcode}" in attempt.detail["components"]
+
+
+def _verify_media_finding_job(engine, monkeypatch, backend, *, wire=False):
+    """Seed measured evidence and check the job and copy after a read refusal."""
+    from sutradhara.backend.port import VerifyResult
+    from sutradhara.catalog.types import content_hash
+    from sutradhara.evidence_recorder import record_measured
+
+    digest = content_hash(hashlib.sha256(b"original").digest())
+    monkeypatch.setattr(backend_factory, "backend_from_row", lambda row: backend)
+    with session_scope(engine) as session:
+        row = Backend(name="media-read", kind=BackendKind.MEMORY, tier=BackendTier.SELF_DESCRIBING)
+        session.add(row)
+        session.add(LogicalAsset(content_sha256=digest, size_bytes=8))
+        session.flush()
+        locator = {
+            "tape_uuid": "21" * 16,
+            "object_id": "31" * 16,
+            "tape_file_number": 1,
+            "content_sha256": digest.hex(),
+        }
+        copy = Copy(
+            logical_asset_hash=digest,
+            backend_id=row.id,
+            native_locator=locator,
+            native_locator_key=locator_key(locator),
+            integrity_hash=digest,
+            health=CopyHealth.OK,
+            source=CopySource.INGEST,
+        )
+        session.add(copy)
+        session.flush()
+        copy_id = copy.id
+        record_measured(
+            session,
+            copy,
+            VerifyResult(ok=True, measured=True, actual_hash=digest),
+            source="fanout",
+            execution_id="seed",
+        )
+    with session_scope(engine) as session:
+        job = submit(session, "verify", {"copy_id": copy_id})
+        job_id = job.id
+        result = run_one(session, job_id)
+        if wire and job.status == JobStatus.FAILED:
+            assert "BackendUnavailableError" in job.last_error, job.last_error
+        assert job.status == JobStatus.SUCCEEDED
+        assert result.ok
+        detail = job.step_state["verify_result"]["detail"]
+        assert result.detail == f"could not be read at its recorded position: {detail}"
+        assert "drive_element_address=257" in detail
+        assert job.step_state["verify_result"] == {
+            "ok": False,
+            "measured": False,
+            "actual_hash": None,
+            "detail": detail,
+        }
+        assert job.step_state["copy_health_after"] == "suspect"
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        assert copy.health == CopyHealth.SUSPECT
+        assert copy.last_measured_digest is None
+        assert copy.last_measured_at is None
+        receipts = list(
+            session.scalars(
+                select(VerifyReceipt).where(
+                    VerifyReceipt.copy_id == copy_id, VerifyReceipt.source == "verify-job"
+                )
+            )
+        )
+        assert len(receipts) == 1
+        assert receipts[0].execution_id == str(job_id)
+        assert receipts[0].failure_kind == "media-damage"
+        assert receipts[0].failure_detail == detail
+        assert receipts[0].measured_digest is None
+        assert receipts[0].backend_ok is False
+
+
+def test_verify_media_finding_marks_suspect_and_succeeds(engine, monkeypatch):
+    """T7: the job succeeds while recording the unmeasured copy refusal."""
+    from sutradhara.backend.port import BackendMediaError
+
+    class RefusingBackend:
+        def verify(self, locator):
+            raise BackendMediaError("recorded position unreadable; drive_element_address=257")
+
+    _verify_media_finding_job(engine, monkeypatch, RefusingBackend())
+
+
+def test_verify_wire_media_finding_marks_suspect_and_succeeds(engine, monkeypatch):
+    """T8: real adapter mapping connects a wire finding to the verify receipt."""
+    import grpc
+
+    from sutradhara._proto import layer5_pb2
+    from sutradhara.backend.remanence import RemanenceBackend
+
+    events = []
+
+    class ReadError(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.INTERNAL
+
+        def details(self):
+            return "recorded position unreadable"
+
+        def trailing_metadata(self):
+            return (("remanence-retry", "media"), ("remanence-finding", "media-damage"))
+
+    class Call:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise ReadError()
+
+        def cancel(self):
+            events.append("cancel")
+            return True
+
+    class Client:
+        def OpenReadSession(self, request, timeout=None):
+            return layer5_pb2.ReadSession(session_id=b"wire-session", drive_element_address=257)
+
+        def ReadObjectRange(self, request):
+            return Call()
+
+        def CloseReadSession(self, request, timeout=None):
+            events.append("close")
+            return layer5_pb2.ReadSession(session_id=request.session_id)
+
+    backend = RemanenceBackend("rem", endpoint="mock", read_session=Client())
+    _verify_media_finding_job(engine, monkeypatch, backend, wire=True)
+    assert events == ["cancel", "close"]

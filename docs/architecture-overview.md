@@ -632,7 +632,9 @@ Both converge on the same chain:
    before tape (see "The HD cache tier"). Beyond cache, server-local
    restore (`archive_restore.restore_asset`) tries every pool-ordered
    candidate copy in turn — including tape — marking a copy `suspect`
-   and moving to the next candidate on any integrity failure. Agent
+   and moving to the next candidate on any integrity failure. A copy that
+   the tape daemon reports could not be read at its recorded position is
+   also marked `suspect`, and the next candidate is tried. Agent
    delivery is more restrictive today: it considers only disk-backed
    archive candidates and explicitly refuses a tape-only source
    (`TapeSourceDeferred`) — wiring tape into the agent protocol is not

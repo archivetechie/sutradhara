@@ -2486,3 +2486,279 @@ def test_fr1_manifest_failure_releases_flush_without_rewrite(engine, tmp_path, e
         )
         assert session.get(Bundle, setup.bundle_id).status == "sealed"
     assert (rem_backend.writes, d2_backend.writes) == writes
+
+
+class _MediaReadbackBackend(_ArchiveWriteBackend):
+    """Name-holding tape fake with a recorded object and a switchable finding."""
+
+    holds_names = True
+
+    def __init__(self):
+        super().__init__("rem")
+        self.refuse_readback = False
+        self.record = None
+
+    def write_object_to_pool(self, *args, **kwargs):
+        self.record = super().write_object_to_pool(*args, **kwargs)
+        return self.record
+
+    def lookup_pool_object(self, pool, object_name, *, candidate_digests):
+        from sutradhara.replication import PoolObject
+
+        if self.record is None:
+            return None
+        return PoolObject(self.record, self.record.integrity_hash)
+
+    def verify(self, locator, *, observe=None):
+        from sutradhara.backend.port import BackendMediaError
+
+        if self.refuse_readback:
+            raise BackendMediaError(
+                "could not be read at its recorded position; drive_element_address=257"
+            )
+        return super().verify(locator, observe=observe)
+
+
+def test_media_finding_flush_records_landed_suspect_copy(engine, tmp_path):
+    """T5: a refused read-back retains its landed write and blocks another append."""
+    from sutradhara.bundle_copy_ledger import identity_attempts
+
+    setup = _create_bundle(engine, tmp_path)
+    rem = _MediaReadbackBackend()
+    rem.refuse_readback = True
+    with session_scope(engine) as session:
+        result = flush_bundle(
+            session,
+            bundle_id=setup.bundle_id,
+            backends={setup.rem_backend_id: rem, setup.d2_backend_id: _ArchiveWriteBackend("d2")},
+            builder=LocalArchiveBuilder(),
+        )
+        copy = session.scalar(select(Copy).where(Copy.pool_id == "o-copy-1-pool"))
+        assert copy is not None
+        assert copy.health == CopyHealth.SUSPECT
+        assert result.condition_reason == "post-write-pool-failure"
+        assert session.get(Bundle, setup.bundle_id).status == "sealed"
+        assert copy.last_measured_digest is None
+        assert copy.last_measured_at is None
+        receipts = list(
+            session.scalars(select(VerifyReceipt).where(VerifyReceipt.copy_id == copy.id))
+        )
+        assert len(receipts) == 1
+        assert receipts[0].source == "fanout"
+        assert receipts[0].failure_kind == "media-damage"
+        assert receipts[0].measured_digest is None
+        assert receipts[0].backend_ok is False
+        assert "drive_element_address=257" in receipts[0].failure_detail
+        attempts = identity_attempts(
+            session, bundle_id=setup.bundle_id, pool_id="o-copy-1-pool", generation=0
+        )
+        assert len(attempts) == 1
+        assert attempts[0][1] == "landed"
+        assert rem.writes == ["o-copy-1-pool"]
+
+
+def test_media_finding_existing_copy_blocks_rewrite_and_clears_pair(engine, tmp_path):
+    """T6: existing-copy lookup records the failed read without rebuilding a held name."""
+    from sutradhara.bundle_copy_ledger import resolve_identity
+    from sutradhara.replication import bundle_group_targets
+
+    setup = _create_bundle(engine, tmp_path)
+    rem = _MediaReadbackBackend()
+    backends = {setup.rem_backend_id: rem, setup.d2_backend_id: _ArchiveWriteBackend("d2")}
+    with session_scope(engine) as session:
+        flush_bundle(
+            session, bundle_id=setup.bundle_id, backends=backends, builder=LocalArchiveBuilder()
+        )
+        copy = session.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
+        assert copy.last_measured_digest is not None
+        assert copy.last_measured_at is not None
+        copy.health = CopyHealth.MISSING
+        rem.refuse_readback = True
+        target = next(
+            target
+            for _, target in bundle_group_targets(
+                session, session.get(Bundle, setup.bundle_id), backends
+            )
+            if target.pool_id == copy.pool_id
+        )
+        found, problem, rebuild = resolve_identity(
+            session,
+            bundle_id=setup.bundle_id,
+            target=target,
+            backend=rem,
+            builder=LocalArchiveBuilder(),
+            work_dir=tmp_path,
+            copy_id=copy.id,
+        )
+        assert problem is not None
+        assert problem.reason == "copy-rewrite-needs-generation"
+        assert problem.condition == CONDITION_BLOCKED
+        assert found is copy
+        assert copy.health == CopyHealth.SUSPECT
+        assert copy.last_measured_digest is None
+        assert copy.last_measured_at is None
+        receipts = list(
+            session.scalars(
+                select(VerifyReceipt).where(
+                    VerifyReceipt.copy_id == copy.id, VerifyReceipt.failure_kind == "media-damage"
+                )
+            )
+        )
+        assert len(receipts) == 1
+        assert receipts[0].source == "fanout"
+        assert ":reread:copy:" in receipts[0].execution_id
+        assert rebuild is False
+        assert rem.writes == ["o-copy-1-pool"]
+
+
+def test_media_finding_single_restore_marks_and_falls_through(engine, tmp_path):
+    """T9: a plaintext read refusal clears the first copy's evidence and tries the next."""
+    from sutradhara.backend.port import BackendMediaError
+
+    class RefusingBackend(_ArchiveWriteBackend):
+        refuse = False
+
+        def read_range(self, locator, byte_range):
+            if self.refuse:
+                raise BackendMediaError(
+                    "plaintext recorded position unreadable; drive_element_address=257"
+                )
+            return super().read_range(locator, byte_range)
+
+        @contextmanager
+        def open_range_chunks(self, locator, byte_range, *, chunk_bytes):
+            if self.refuse:
+                raise BackendMediaError(
+                    "plaintext recorded position unreadable; drive_element_address=257"
+                )
+            with super().open_range_chunks(locator, byte_range, chunk_bytes=chunk_bytes) as chunks:
+                yield chunks
+
+    setup = _create_bundle(engine, tmp_path)
+    rem = RefusingBackend("rem")
+    backends = {setup.rem_backend_id: rem, setup.d2_backend_id: _ArchiveWriteBackend("d2")}
+    asset_hash = next(iter(setup.assets))
+    with session_scope(engine) as session:
+        flush_bundle(
+            session, bundle_id=setup.bundle_id, backends=backends, builder=LocalArchiveBuilder()
+        )
+        first = session.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
+        assert first.last_measured_digest is not None
+        rem.refuse = True
+        result = restore_asset(
+            session,
+            asset_hash=asset_hash,
+            artifactclass="o-archive",
+            destination=tmp_path / "media-fallback",
+            backends=backends,
+        )
+        assert result.pool_id == "d2-shelf-pool"
+        assert result.output_path.read_bytes() == setup.assets[asset_hash]
+        assert first.health == CopyHealth.SUSPECT
+        assert first.last_measured_digest is None
+        assert first.last_measured_at is None
+        receipts = list(
+            session.scalars(
+                select(VerifyReceipt).where(
+                    VerifyReceipt.copy_id == first.id, VerifyReceipt.source == "restore"
+                )
+            )
+        )
+        assert len(receipts) == 1
+        assert receipts[0].failure_kind == "media-damage"
+        assert receipts[0].execution_id
+
+
+@pytest.mark.parametrize("all_fail", [False, True])
+def test_media_finding_bundle_restarts_every_member(engine, tmp_path, all_fail):
+    """T11: retry a whole group after publication; exhaustion records every finding."""
+    from sutradhara.backend.port import BackendMediaError
+
+    setup = _create_bundle(engine, tmp_path)
+    hashes = list(setup.assets)
+    destination = tmp_path / "bundle-media"
+    publications_before_failure = []
+
+    class LaterFailureBackend(_ArchiveWriteBackend):
+        failing = False
+        payload_reads = 0
+
+        @contextmanager
+        def open_range_chunks(self, locator, byte_range, *, chunk_bytes):
+            if self.failing:
+                self.payload_reads += 1
+                if self.payload_reads == 2:
+                    publications_before_failure.append((destination / hashes[0].hex()).read_bytes())
+                    raise BackendMediaError(
+                        "group A recorded position unreadable; drive_element_address=257"
+                    )
+            with super().open_range_chunks(locator, byte_range, chunk_bytes=chunk_bytes) as chunks:
+                yield chunks
+
+    class OtherBackend(_ArchiveWriteBackend):
+        failing = False
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.payload_reads = []
+
+        @contextmanager
+        def open_range_chunks(self, locator, byte_range, *, chunk_bytes):
+            self.payload_reads.append(byte_range)
+            if self.failing:
+                raise BackendMediaError(
+                    "group B recorded position unreadable; drive_element_address=258"
+                )
+            with super().open_range_chunks(locator, byte_range, chunk_bytes=chunk_bytes) as chunks:
+                yield chunks
+
+    rem, d2 = LaterFailureBackend("rem"), OtherBackend("d2")
+    backends = {setup.rem_backend_id: rem, setup.d2_backend_id: d2}
+    with session_scope(engine) as session:
+        flush_bundle(
+            session, bundle_id=setup.bundle_id, backends=backends, builder=LocalArchiveBuilder()
+        )
+        first = session.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
+        second = session.scalars(select(Copy).where(Copy.pool_id == "d2-shelf-pool")).one()
+        rem.failing = True
+        d2.failing = all_fail
+        d2.payload_reads = []
+        kwargs = dict(
+            asset_hashes=hashes,
+            artifactclass="o-archive",
+            destination_dir=destination,
+            backends=backends,
+        )
+        if all_fail:
+            with pytest.raises(RestoreIntegrityError) as caught:
+                restore_assets_from_bundle(session, **kwargs)
+            assert "group A recorded position unreadable" in str(caught.value)
+            assert "group B recorded position unreadable" in str(caught.value)
+            assert second.health == CopyHealth.SUSPECT
+        else:
+            results = restore_assets_from_bundle(session, **kwargs)
+            assert [result.copy_id for result in results] == [second.id] * len(hashes)
+            assert [result.output_path.read_bytes() for result in results] == [
+                setup.assets[h] for h in hashes
+            ]
+            assert len(d2.payload_reads) == len(hashes)
+            assert second.health == CopyHealth.OK
+        assert publications_before_failure == [setup.assets[hashes[0]]]
+        assert rem.payload_reads == 2
+        assert first.health == CopyHealth.SUSPECT
+        failed = [first, second] if all_fail else [first]
+        executions = set()
+        for copy in failed:
+            assert copy.last_measured_digest is None
+            assert copy.last_measured_at is None
+            receipts = list(
+                session.scalars(
+                    select(VerifyReceipt).where(
+                        VerifyReceipt.copy_id == copy.id, VerifyReceipt.source == "restore"
+                    )
+                )
+            )
+            assert len(receipts) == 1
+            assert receipts[0].failure_kind == "media-damage"
+            executions.add(receipts[0].execution_id)
+        assert len(executions) == 1

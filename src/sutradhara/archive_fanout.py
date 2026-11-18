@@ -50,6 +50,7 @@ from sutradhara.archive_restore import (
 from sutradhara.arrangement import SourceMapEntry, render_source_map
 from sutradhara.backend.port import (
     BackendError,
+    BackendMediaError,
     BackendStoredCorruptError,
     ByteRange,
     CopyRecord,
@@ -77,6 +78,7 @@ from sutradhara.catalog.types import CopyHealth, CopySource
 from sutradhara.evidence_recorder import (
     record_backend_attested_corrupt,
     record_measured,
+    record_media_damage,
     record_unmeasured_promotion,
 )
 from sutradhara.hdcache.fill import enqueue_post_flush_hdcache_fills
@@ -345,6 +347,10 @@ def _record_existing_copy_result(
     execution_id = f"{copy.bundle_id}:{copy.pool_id}:{copy.native_locator_key}:{run}"
     if isinstance(error, BackendStoredCorruptError):
         record_backend_attested_corrupt(
+            session, copy, detail=str(error), source="fanout", execution_id=execution_id
+        )
+    elif isinstance(error, BackendMediaError):
+        record_media_damage(
             session, copy, detail=str(error), source="fanout", execution_id=execution_id
         )
     elif error is not None:

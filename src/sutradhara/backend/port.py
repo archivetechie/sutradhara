@@ -251,3 +251,7 @@ class BackendSessionInvalidatedError(BackendError):
 
 class BackendStoredCorruptError(BackendError):
     """The backend read the stored bytes back and they do not match what it recorded at write time."""
+
+
+class BackendMediaError(BackendError):
+    """The tape daemon reports a copy could not be read at its recorded position."""

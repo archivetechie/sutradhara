@@ -24,6 +24,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, BinaryIO, Protocol, cast
+from uuid import uuid4
 
 import zstandard as zstd
 from sqlalchemy import select
@@ -31,7 +32,13 @@ from sqlalchemy.orm import Session, joinedload
 from typing_extensions import Buffer
 
 from sutradhara.artifactclass_policy import get_artifactclass_policy
-from sutradhara.backend.port import BackendError, ByteRange, StorageBackend, StreamingStorageBackend
+from sutradhara.backend.port import (
+    BackendError,
+    BackendMediaError,
+    ByteRange,
+    StorageBackend,
+    StreamingStorageBackend,
+)
 from sutradhara.catalog.models import (
     ArtifactClassPool,
     AssetLocator,
@@ -43,6 +50,7 @@ from sutradhara.catalog.models import (
 )
 from sutradhara.catalog.types import AssetValidity, CopyHealth, is_content_hash
 from sutradhara.durability import locator_artifactclass_filter
+from sutradhara.evidence_recorder import record_media_damage
 from sutradhara.jobs.runtime_observations import report_tape_locator
 from sutradhara.keys import KEY_DOMAIN_ARCHIVE, KeyRegistry
 from sutradhara.resource_control import run_managed
@@ -707,6 +715,7 @@ def restore_asset(
     force_rejected: bool = False,
 ) -> RestoreResult:
     """Restore one asset from the first candidate that reaches verified EOF."""
+    execution_id = uuid4().hex
     if not is_content_hash(asset_hash):
         raise ValueError("asset_hash must be a 32-byte SHA-256 hash")
     check_asset_restore_allowed(
@@ -747,6 +756,16 @@ def restore_asset(
                 member.copy.health = CopyHealth.SUSPECT
                 integrity_errors.append(f"copy id={member.copy.id} pool={member.pool_id}: {exc}")
                 continue
+            except BackendMediaError as exc:
+                record_media_damage(
+                    session,
+                    member.copy,
+                    detail=str(exc),
+                    source="restore",
+                    execution_id=execution_id,
+                )
+                integrity_errors.append(f"copy id={member.copy.id} pool={member.pool_id}: {exc}")
+                continue
             except (
                 ArchiveRestoreError,
                 BackendError,
@@ -783,9 +802,11 @@ def restore_assets_from_bundle(
     function chooses the first healthy copy, in artifactclass restore-pool order,
     that has locators for every requested hash. Each member still reverses its
     own staging transforms and verifies against its logical asset hash before a
-    result is returned.
+    result is returned. If the tape daemon reports that a copy could not be read
+    at its recorded position, mark it suspect and restore every requested member
+    again from the next group. Other failures do not retry across groups.
     """
-
+    execution_id = uuid4().hex
     if not asset_hashes:
         return []
     unique_hashes: list[bytes] = []
@@ -806,49 +827,66 @@ def restore_assets_from_bundle(
 
     destination_root = Path(destination_dir).resolve()
     destination_root.mkdir(parents=True, exist_ok=True)
-    plan = build_bundle_restore_plan(
-        session,
-        asset_hashes=unique_hashes,
-        artifactclass=artifactclass,
-        backends=backends,
-        extractor=extractor,
-    )
-    members = list(plan.iter_members())
-    if not members:
-        hashes = ", ".join(asset_hash.hex() for asset_hash in unique_hashes)
-        raise RestoreSourceUnavailable(
-            f"no healthy bundle copy can restore all requested assets for "
-            f"artifactclass {artifactclass!r}: {hashes}"
+    media_errors: list[str] = []
+    while True:
+        plan = build_bundle_restore_plan(
+            session,
+            asset_hashes=unique_hashes,
+            artifactclass=artifactclass,
+            backends=backends,
+            extractor=extractor,
         )
-    with plan:
-        results_by_hash: dict[bytes, RestoreResult] = {}
-        for member in members:
-            output_path = destination_root / member.asset_hash.hex()
-            try:
-                with plan.open_member_stream(member) as chunks:
-                    atomic_write_verified_chunks(
-                        chunks,
-                        output_path,
-                        expected_sha256=member.asset_hash,
-                        expected_size_bytes=member.expected_logical_size,
+        with plan:
+            members = list(plan.iter_members())
+            if not members:
+                if media_errors:
+                    raise RestoreIntegrityError("; ".join(media_errors))
+                hashes = ", ".join(asset_hash.hex() for asset_hash in unique_hashes)
+                raise RestoreSourceUnavailable(
+                    f"no healthy bundle copy can restore all requested assets for "
+                    f"artifactclass {artifactclass!r}: {hashes}"
+                )
+            results_by_hash: dict[bytes, RestoreResult] = {}
+            for member in members:
+                output_path = destination_root / member.asset_hash.hex()
+                try:
+                    with plan.open_member_stream(member) as chunks:
+                        atomic_write_verified_chunks(
+                            chunks,
+                            output_path,
+                            expected_sha256=member.asset_hash,
+                            expected_size_bytes=member.expected_logical_size,
+                        )
+                except BackendMediaError as exc:
+                    record_media_damage(
+                        session,
+                        member.copy,
+                        detail=str(exc),
+                        source="restore",
+                        execution_id=execution_id,
                     )
-            except (
-                ArchiveRestoreError,
-                BackendError,
-                StagingError,
-                ChunkRestoreIntegrityError,
-            ) as exc:
-                raise RestoreIntegrityError(
-                    f"bundle restore copy id={member.copy.id} pool={member.pool_id}: {exc}"
-                ) from exc
-            results_by_hash[member.asset_hash] = RestoreResult(
-                asset_hash=member.asset_hash,
-                pool_id=member.pool_id,
-                copy_id=member.copy.id,
-                output_path=output_path,
-                size_bytes=member.expected_logical_size,
-            )
-    return [results_by_hash[asset_hash] for asset_hash in asset_hashes]
+                    media_errors.append(
+                        f"bundle restore copy id={member.copy.id} pool={member.pool_id}: {exc}"
+                    )
+                    break
+                except (
+                    ArchiveRestoreError,
+                    BackendError,
+                    StagingError,
+                    ChunkRestoreIntegrityError,
+                ) as exc:
+                    raise RestoreIntegrityError(
+                        f"bundle restore copy id={member.copy.id} pool={member.pool_id}: {exc}"
+                    ) from exc
+                results_by_hash[member.asset_hash] = RestoreResult(
+                    asset_hash=member.asset_hash,
+                    pool_id=member.pool_id,
+                    copy_id=member.copy.id,
+                    output_path=output_path,
+                    size_bytes=member.expected_logical_size,
+                )
+            else:
+                return [results_by_hash[asset_hash] for asset_hash in asset_hashes]
 
 
 def check_asset_restore_allowed(
@@ -1746,6 +1784,8 @@ def _iter_rem_plaintext(
         raise ArchiveRestoreError("helper diagnostic reader did not stop after helper exit")
     if writer_errors:
         error = writer_errors[0]
+        if isinstance(error, BackendMediaError):
+            raise error
         raise ArchiveRestoreError(f"ciphertext backend stream failed: {error}") from error
     if returncode != 0:
         diagnostic = b"".join(stderr_parts).decode("utf-8", errors="replace").strip()

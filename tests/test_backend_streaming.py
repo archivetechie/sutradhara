@@ -765,3 +765,64 @@ def test_remanence_idle_watch_excludes_consumer_time(monkeypatch):
         assert list(chunks) == []
     assert events[-1] == "close"
     _assert_no_idle_watch()
+
+
+@pytest.mark.parametrize("route", ["stream", "verify", "call"])
+def test_remanence_media_finding_stream_teardown(route):
+    """T1(b,c): mid-stream and call-time findings retain identity and cleanup order."""
+    from sutradhara.backend.port import BackendMediaError
+
+    class FindingError(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.INTERNAL
+
+        def details(self):
+            return "recorded position unreadable"
+
+        def trailing_metadata(self):
+            return (("remanence-finding", "media-damage"),)
+
+    events = []
+
+    class FindingCall(_ServerCancelledCall):
+        def __init__(self):
+            super().__init__(events)
+            self.first = True
+
+        def __next__(self):
+            if self.first:
+                self.first = False
+                events.append("chunk")
+                return layer5_pb2.BytesChunk(data=b"first")
+            raise FindingError()
+
+    class FindingClient(_ReadClient):
+        def OpenReadSession(self, request, timeout=None):
+            response = super().OpenReadSession(request, timeout=timeout)
+            response.drive_element_address = 257
+            return response
+
+        def ReadObjectRange(self, request):
+            if route == "call":
+                raise FindingError()
+            return super().ReadObjectRange(request)
+
+    backend = RemanenceBackend(
+        "rem", endpoint="mock-remanence", read_session=FindingClient(FindingCall(), events)
+    )
+
+    def read():
+        if route == "verify":
+            backend.verify(_LOCATOR)
+        else:
+            with backend.open_range_chunks(_LOCATOR, ByteRange(0, 0), chunk_bytes=5) as chunks:
+                assert next(chunks) == b"first"
+                next(chunks)
+
+    with pytest.raises(BackendMediaError) as caught:
+        read()
+    assert type(caught.value) is BackendMediaError
+    assert caught.value.session_id == b"session"
+    assert caught.value.drive_element_address == 257
+    assert "drive_element_address=257" in str(caught.value)
+    assert events == (["close"] if route == "call" else ["chunk", "cancel", "close"])

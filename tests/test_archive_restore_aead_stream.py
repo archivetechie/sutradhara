@@ -80,6 +80,7 @@ class _StreamingObjectBackend:
         self.mount_delay_seconds = mount_delay_seconds
         self.mount_error = mount_error
         self.stream_delay_seconds = stream_delay_seconds
+        self.stream_errors: dict[str, Exception] = {}
 
     @property
     def name(self) -> str:
@@ -122,6 +123,13 @@ class _StreamingObjectBackend:
 
         def chunks() -> Iterator[bytes]:
             time.sleep(self.stream_delay_seconds)
+            error = self.stream_errors.get(str(locator["object_id"]))
+            if error is not None and (
+                byte_range.is_whole_object or byte_range == ByteRange(0, len(data))
+            ):
+                if threading.current_thread().name != "sutradhara-rem-ciphertext-pump":
+                    raise AssertionError("finding must come from the ciphertext pump")
+                raise error
             for cursor in range(byte_range.start, end, chunk_bytes):
                 chunk = data[cursor : min(cursor + chunk_bytes, end)]
                 self.max_chunk_seen = max(self.max_chunk_seen, len(chunk))
@@ -811,3 +819,64 @@ def _extract_stream_rem_bin_or_skip() -> str:
     if "extract-stream" not in result.stdout:
         pytest.skip(f"built Remanence binary lacks extract-stream: {rem_bin}")
     return rem_bin
+
+
+def test_media_finding_ciphertext_pump_marks_and_falls_through(engine, tmp_path):
+    """T10: the pump's original finding survives helper cleanup and reaches the recorder."""
+    from sqlalchemy import select
+
+    from sutradhara.backend.port import BackendMediaError
+    from sutradhara.catalog.models import VerifyReceipt
+    from sutradhara.evidence_recorder import record_measured
+
+    logical = b"verified media fallback"
+    backend = _StreamingObjectBackend()
+    registry, recovery = registry_with_recovery(tmp_path / "keys")
+    epoch = registry.create_epoch()
+    backend_id, copy_ids = _install_candidates(
+        engine,
+        backend,
+        logical=logical,
+        stored_candidates=[logical, logical],
+        recipient_epochs=(epoch.key_id, recovery.key_id),
+    )
+    with session_scope(engine) as session:
+        first = session.get(Copy, copy_ids[0])
+        record_measured(
+            session,
+            first,
+            VerifyResult(ok=True, measured=True, actual_hash=first.integrity_hash),
+            source="fanout",
+            execution_id="seed-aead",
+        )
+        backend.stream_errors[str(first.native_locator["object_id"])] = BackendMediaError(
+            "ciphertext recorded position unreadable; drive_element_address=257"
+        )
+        result = restore_asset(
+            session,
+            asset_hash=_sha(logical),
+            artifactclass="aead-test",
+            destination=tmp_path / "aead-media-fallback",
+            backends={backend_id: backend},
+            extractor=RemArchiveExtractor(
+                _write_stream_helper(tmp_path / "media-rem"), keys=registry
+            ),
+        )
+        assert result.copy_id == copy_ids[1]
+        assert result.output_path.read_bytes() == logical
+        assert first.health == CopyHealth.SUSPECT
+        assert first.last_measured_digest is None
+        assert first.last_measured_at is None
+        receipts = list(
+            session.scalars(
+                select(VerifyReceipt).where(
+                    VerifyReceipt.copy_id == first.id, VerifyReceipt.source == "restore"
+                )
+            )
+        )
+        assert len(receipts) == 1
+        assert receipts[0].failure_kind == "media-damage"
+        assert (
+            receipts[0].failure_detail
+            == "ciphertext recorded position unreadable; drive_element_address=257"
+        )

@@ -2635,3 +2635,141 @@ def test_append_deadline_over_real_grpc_is_in_doubt(monkeypatch, tmp_path, proto
             assert servicer.aborted
         finally:
             backend._channel.close()
+
+
+class _FindingRpcError(grpc.RpcError):
+    """Socket-free read status with controllable trailing metadata."""
+
+    def __init__(self, code, trailers):
+        self._code = code
+        self._trailers = trailers
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return "recorded position unreadable"
+
+    def trailing_metadata(self):
+        return self._trailers
+
+
+class _FindingRangeClient(_QueueReadClient):
+    """Preserve the normal session lifecycle while failing its range call."""
+
+    def __init__(self, library, error):
+        super().__init__(library)
+        self.error = error
+
+    def ReadObjectRange(self, request):
+        raise self.error
+        yield  # generator-shaped RPC; the error is raised during iteration
+
+
+@pytest.mark.parametrize("value", ["media-damage", b"media-damage"])
+@pytest.mark.parametrize(
+    "code",
+    [
+        grpc.StatusCode.INTERNAL,
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.FAILED_PRECONDITION,
+        grpc.StatusCode.CANCELLED,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+    ],
+)
+def test_media_finding_read_range_keeps_identity(code, value):
+    """T1(a,d): the finding outranks transport/session statuses, but preserves identity."""
+    from sutradhara.backend.port import BackendMediaError
+
+    library = _QueueLibrary()
+    error = _FindingRpcError(code, (("remanence-retry", "media"), ("remanence-finding", value)))
+    client = _FindingRangeClient(library, error)
+    backend = _queue_backend(library, client)
+    with (
+        backend.open_read_session(_read_locator("11" * 32)) as reader,
+        pytest.raises(BackendMediaError) as caught,
+    ):
+        reader.read_range(ByteRange(0, 1))
+    assert type(caught.value) is BackendMediaError
+    assert not isinstance(caught.value, BackendUnavailableError)
+    assert caught.value.session_id == b"session-1"
+    assert caught.value.drive_element_address == 257
+    assert "drive_element_address=257" in str(caught.value)
+    assert "queue-test" in str(caught.value)
+    assert code.name in str(caught.value)
+    assert "recorded position unreadable" in str(caught.value)
+    assert "remanence-finding=media-damage" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "retry-only",
+        "absent",
+        "raises",
+        "other-finding",
+        "data-loss",
+        "cancelled",
+        "none",
+        "non-callable",
+    ],
+)
+def test_media_finding_contract_edges(case):
+    """T2: only the finding changes a read; DATA_LOSS retains its original class."""
+    code = grpc.StatusCode.INTERNAL
+    trailers = ()
+    if case == "retry-only":
+        trailers = (("remanence-retry", "media"),)
+    elif case == "other-finding":
+        trailers = (("remanence-finding", "another-finding"),)
+    elif case == "data-loss":
+        code = grpc.StatusCode.DATA_LOSS
+        trailers = (("remanence-finding", "media-damage"),)
+    elif case == "cancelled":
+        code = grpc.StatusCode.CANCELLED
+    error = _FindingRpcError(code, None if case == "none" else trailers)
+    if case == "absent":
+
+        class NoTrailers(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.INTERNAL
+
+            def details(self):
+                return "no trailers"
+
+        error = NoTrailers()
+    elif case == "raises":
+
+        def unreadable():
+            raise RuntimeError("trailers unavailable")
+
+        error.trailing_metadata = unreadable
+    elif case == "non-callable":
+        error.trailing_metadata = "unavailable"
+    library = _QueueLibrary()
+    backend = _queue_backend(library, _FindingRangeClient(library, error))
+    with (
+        backend.open_read_session(_read_locator("11" * 32)) as reader,
+        pytest.raises(BackendError) as caught,
+    ):
+        reader.read_range(ByteRange(0, 1))
+    expected = BackendStoredCorruptError if case == "data-loss" else BackendUnavailableError
+    assert type(caught.value) is expected
+
+
+def test_media_finding_over_real_grpc():
+    """T4 hand-back: grpc exposes the daemon finding on the streaming error."""
+    from sutradhara.backend.port import BackendMediaError
+
+    class FindingServicer(_ReadSession):
+        def ReadObjectRange(self, request, context):
+            context.set_trailing_metadata((("remanence-finding", "media-damage"),))
+            context.abort(grpc.StatusCode.INTERNAL, "recorded position unreadable")
+            yield  # streaming RPC
+
+    servicer = FindingServicer(b"x")
+    with _serve_read(servicer) as endpoint:
+        backend = RemanenceBackend.from_grpc("primary-tape", endpoint)
+        with pytest.raises(BackendMediaError):
+            backend.read_range(_read_locator(hashlib.sha256(b"x").hexdigest()), ByteRange(0, 0))
+    assert servicer.closed

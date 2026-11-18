@@ -300,3 +300,85 @@ def _seed_copy(engine: Engine) -> int:
         session.add(copy)
         session.flush()
         return copy.id
+
+
+@pytest.mark.parametrize("already_corrupt", [False, True])
+def test_record_media_damage_clears_pair_and_is_idempotent(engine, already_corrupt):
+    """T3: a finding clears evidence with a receipt, without promoting CORRUPT."""
+    from sutradhara.evidence_recorder import record_media_damage
+    from sutradhara.retention_journal import _projection_mismatches
+
+    copy_id = _seed_copy(engine)
+    good_at = dt.datetime(2026, 7, 19, 12, 0, tzinfo=dt.UTC)
+    bad_at = good_at + dt.timedelta(days=1)
+    detail = "could not be read at its recorded position; drive_element_address=257"
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        record_measured(
+            session,
+            copy,
+            VerifyResult(ok=True, measured=True, actual_hash=copy.integrity_hash),
+            source="fanout",
+            execution_id="seed-ok",
+            measured_at=good_at,
+        )
+        if already_corrupt:
+            record_measured(
+                session,
+                copy,
+                VerifyResult(ok=False, measured=True, actual_hash=b"x" * 32),
+                source="fanout",
+                execution_id="seed-corrupt",
+                measured_at=good_at,
+            )
+        assert copy.last_measured_digest is not None
+        assert copy.last_measured_at is not None
+        receipt = record_media_damage(
+            session,
+            copy,
+            detail=detail,
+            source="verify-job",
+            execution_id="media-7",
+            actor="tester",
+            checked_at=bad_at,
+        )
+        assert copy.health == (CopyHealth.CORRUPT if already_corrupt else CopyHealth.SUSPECT)
+        assert copy.last_measured_digest is None
+        assert copy.last_measured_at is None
+        assert copy.last_checked_at == bad_at
+        assert receipt.copy_id == copy_id
+        assert receipt.backend_id == copy.backend_id
+        assert receipt.expected_digest == copy.integrity_hash
+        assert receipt.measured_digest is None
+        assert receipt.backend_ok is False
+        assert receipt.failure_kind == "media-damage"
+        assert receipt.failure_detail == detail
+        assert receipt.source == "verify-job"
+        assert receipt.actor == "tester"
+        assert receipt.at == bad_at
+        event_id = receipt.event_id
+    with session_scope(engine) as session:
+        copy = session.get(Copy, copy_id)
+        again = record_media_damage(
+            session,
+            copy,
+            detail="repeat",
+            source="verify-job",
+            execution_id="media-7",
+            checked_at=bad_at + dt.timedelta(days=1),
+        )
+        assert again.event_id == event_id
+        assert copy.last_checked_at.replace(tzinfo=dt.UTC) == bad_at
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(VerifyReceipt)
+                .where(VerifyReceipt.execution_id == "media-7")
+            )
+            == 1
+        )
+        with pytest.raises(ValueError, match="measurement source"):
+            record_media_damage(session, copy, detail="x", source="scrub", execution_id="e")
+        with pytest.raises(ValueError, match="execution_id"):
+            record_media_damage(session, copy, detail="x", source="restore", execution_id="")
+    assert list(_projection_mismatches(engine)) == []
