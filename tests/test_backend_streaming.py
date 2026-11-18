@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import resource
 import threading
+import time
 import tracemalloc
 from collections.abc import Iterator
 from pathlib import Path
@@ -155,6 +156,39 @@ class _ServerCancelledCall:
         return True
 
 
+class _IdleReadCall:
+    """Cancellable stream with bounded waits, including a deliberate idle stall."""
+
+    def __init__(self, events, *, chunks=1, delay=0.0, stall=False):
+        self.events = events
+        self.remaining = chunks
+        self.delay = delay
+        self.stall = stall
+        self.cancelled = threading.Event()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.cancelled.is_set():
+            raise _CancelledRpcError()
+        if not self.remaining:
+            if not self.stall:
+                raise StopIteration
+            if self.cancelled.wait(1.0):
+                raise _CancelledRpcError()
+            raise RuntimeError("idle read fake reached its cap")
+        if self.cancelled.wait(self.delay):
+            raise _CancelledRpcError()
+        self.remaining -= 1
+        return layer5_pb2.BytesChunk(data=b"x")
+
+    def cancel(self):
+        self.events.append("cancel")
+        self.cancelled.set()
+        return True
+
+
 class _ReadClient:
     def __init__(self, call: Any, events: list[str]) -> None:
         self.call = call
@@ -174,7 +208,7 @@ class _ReadClient:
         return self.call
 
     def CloseReadSession(
-        self, request: layer5_pb2.CloseReadSessionRequest
+        self, request: layer5_pb2.CloseReadSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.ReadSession:
         self.events.append("close")
         if isinstance(self.call, _BoundedCall):
@@ -224,11 +258,12 @@ def test_remanence_server_cancellation_still_cancels_call_then_closes_session() 
     backend = _live_backend(_ServerCancelledCall(events), events)
 
     with (
-        pytest.raises(BackendUnavailableError, match="server cancelled stream"),
+        pytest.raises(BackendUnavailableError, match="server cancelled stream") as error,
         backend.open_range_chunks(_LOCATOR, ByteRange(0, 0), chunk_bytes=5) as chunks,
     ):
         next(chunks)
 
+    assert type(error.value) is BackendUnavailableError
     assert events == ["cancel", "close"]
 
 
@@ -604,3 +639,67 @@ def test_ranged_copy_rejects_native_stream_length_mismatch(payload: bytes, tmp_p
         _copy_backend_range_to_path(backend, {"key": "object"}, 0, 10, tmp_path / "copy")
     assert client.get_calls == 1
     assert body.closed
+
+
+def _assert_no_idle_watch():
+    assert not [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.is_alive() and thread.name.startswith("remanence-idle-watch")
+    ]
+
+
+@pytest.mark.parametrize("route", ["verify", "read_range"])
+def test_remanence_idle_watch_stalled_read(monkeypatch, route):
+    """RBA-DL T7(a,b,f): idle next cancels, maps transient, closes and joins."""
+    from sutradhara.backend import remanence as remanence_module
+    from sutradhara.backend.port import BackendTransientError
+
+    monkeypatch.setattr(remanence_module, "_READ_IDLE_TIMEOUT_SECONDS", 0.2, raising=False)
+    events = []
+    call = _IdleReadCall(events, stall=True)
+    backend = _live_backend(call, events)
+    operation = getattr(backend, route)
+    arguments = (_LOCATOR,) if route == "verify" else (_LOCATOR, ByteRange(0, 0))
+    started = time.monotonic()
+    with pytest.raises(BackendTransientError, match="mock-remanence") as error:
+        operation(*arguments)
+    assert time.monotonic() - started < 1.0
+    assert error.value.session_id == b"session"
+    assert error.value.drive_element_address == 0
+    assert "0.2" in str(error.value)
+    assert call.cancelled.is_set()
+    assert backend._read_session.closed
+    assert events[-1] == "close"
+    _assert_no_idle_watch()
+
+
+def test_remanence_idle_watch_resets_each_wait(monkeypatch):
+    """RBA-DL T7(c,f): a stream may last longer than one idle bound."""
+    from sutradhara.backend import remanence as remanence_module
+
+    monkeypatch.setattr(remanence_module, "_READ_IDLE_TIMEOUT_SECONDS", 0.2, raising=False)
+    events = []
+    call = _IdleReadCall(events, chunks=8, delay=0.05)
+    backend = _live_backend(call, events)
+    with backend.open_range_chunks(_LOCATOR, ByteRange(0, 0), chunk_bytes=1) as chunks:
+        assert b"".join(chunks) == b"x" * 8
+    assert events[-1] == "close"
+    _assert_no_idle_watch()
+
+
+def test_remanence_idle_watch_excludes_consumer_time(monkeypatch):
+    """RBA-DL T7(d,f): downstream work never spends the next-message budget."""
+    from sutradhara.backend import remanence as remanence_module
+
+    monkeypatch.setattr(remanence_module, "_READ_IDLE_TIMEOUT_SECONDS", 0.2, raising=False)
+    events = []
+    call = _IdleReadCall(events, chunks=2)
+    backend = _live_backend(call, events)
+    with backend.open_range_chunks(_LOCATOR, ByteRange(0, 0), chunk_bytes=1) as chunks:
+        assert next(chunks) == b"x"
+        time.sleep(0.6)
+        assert next(chunks) == b"x"
+        assert list(chunks) == []
+    assert events[-1] == "close"
+    _assert_no_idle_watch()

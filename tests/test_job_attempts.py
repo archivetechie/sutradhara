@@ -310,7 +310,7 @@ class _AttemptWriteClient:
         self.pending: layer5_pb2.ObjectRecord | None = None
 
     def OpenWriteSession(
-        self, request: layer5_pb2.OpenWriteSessionRequest
+        self, request: layer5_pb2.OpenWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession:
         return layer5_pb2.WriteSession(
             session_id=self.session_id,
@@ -319,7 +319,9 @@ class _AttemptWriteClient:
         )
 
     def AppendObject(
-        self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+        self,
+        request_iterator: Iterator[layer5_pb2.AppendObjectMessage],
+        timeout: float | None = None,
     ) -> layer5_pb2.ObjectRecord:
         messages = list(request_iterator)
         if self.fail_after_open:
@@ -359,7 +361,7 @@ class _AttemptWriteClient:
         )
 
     def CloseWriteSession(
-        self, request: layer5_pb2.CloseWriteSessionRequest
+        self, request: layer5_pb2.CloseWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession:
         committed = [] if self.pending is None else [self.pending]
         copies = [] if self.pending is None else [self.pending.copies[0]]
@@ -371,7 +373,7 @@ class _AttemptWriteClient:
         )
 
     def CheckpointSession(
-        self, request: layer5_pb2.CheckpointSessionRequest
+        self, request: layer5_pb2.CheckpointSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.CheckpointSessionResponse:
         committed = [] if self.pending is None else [self.pending]
         copies = [] if self.pending is None else [self.pending.copies[0]]
@@ -383,7 +385,7 @@ class _AttemptWriteClient:
         )
 
     def AbortWriteSession(
-        self, request: layer5_pb2.AbortWriteSessionRequest
+        self, request: layer5_pb2.AbortWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession:
         return layer5_pb2.WriteSession(session_id=request.session_id)
 

@@ -24,13 +24,13 @@ import json
 import math
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
 
 import grpc
 from google.protobuf.empty_pb2 import Empty
@@ -69,6 +69,10 @@ _DRIVE_ASSIGNMENT_POLL_SECONDS = 0.1
 # Read-ordering plan calls are metadata-only and bounded so a dead daemon
 # can never hang restore admission; a timeout degrades to unordered.
 _PLAN_METADATA_TIMEOUT_SECONDS = 15.0
+_SESSION_CALL_TIMEOUT_SECONDS = 1800.0
+_APPEND_MIN_BYTES_PER_SECOND = 10 * 1024 * 1024
+_READ_IDLE_TIMEOUT_SECONDS = 1800.0
+_SESSION_CLEANUP_TIMEOUT_SECONDS = 60.0
 _PLAN_RPC_TIMEOUT_SECONDS = 30.0
 _DRIVE_ASSIGNMENT_ACTIVE = layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_ACTIVE")
 _DRIVE_ASSIGNMENT_IDLE = layer5_pb2.DriveAssignment.State.Value("DRIVE_ASSIGNMENT_STATE_IDLE")
@@ -214,13 +218,19 @@ class RemanenceWriteSessionError(BackendUnavailableError):
 
 
 class RemanenceWriteInDoubtError(RemanenceWriteSessionError, BackendWriteInDoubtError):
-    """Remanence holds the write identity live or quarantined after ABORTED."""
+    """A write is unresolved after ABORTED or a client deadline expires."""
+
+
+class _EnumerateCall(Protocol):
+    """A cancellable catalogue stream, with its call retained during iteration."""
+
+    def __iter__(self) -> Iterator[layer5_pb2.ObjectRecord]: ...
+
+    def cancel(self) -> bool: ...
 
 
 class _CatalogClient(Protocol):
-    def EnumerateObjects(
-        self, request: layer5_pb2.EnumerateObjectsRequest
-    ) -> Iterator[layer5_pb2.ObjectRecord]: ...
+    def EnumerateObjects(self, request: layer5_pb2.EnumerateObjectsRequest) -> _EnumerateCall: ...
 
     def GetObject(
         self,
@@ -238,28 +248,32 @@ class _CatalogClient(Protocol):
         self, request: layer5_pb2.ListTapePoolsRequest
     ) -> layer5_pb2.ListTapePoolsResponse: ...
 
-    def GetFile(self, request: layer5_pb2.GetFileRequest) -> layer5_pb2.FileRecord: ...
+    def GetFile(
+        self, request: layer5_pb2.GetFileRequest, timeout: float | None = None
+    ) -> layer5_pb2.FileRecord: ...
 
 
 class _WriteSessionClient(Protocol):
     def OpenWriteSession(
-        self, request: layer5_pb2.OpenWriteSessionRequest
+        self, request: layer5_pb2.OpenWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession: ...
 
     def AppendObject(
-        self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+        self,
+        request_iterator: Iterator[layer5_pb2.AppendObjectMessage],
+        timeout: float | None = None,
     ) -> layer5_pb2.ObjectRecord: ...
 
     def CheckpointSession(
-        self, request: layer5_pb2.CheckpointSessionRequest
+        self, request: layer5_pb2.CheckpointSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.CheckpointSessionResponse | layer5_pb2.WriteSession: ...
 
     def CloseWriteSession(
-        self, request: layer5_pb2.CloseWriteSessionRequest
+        self, request: layer5_pb2.CloseWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession: ...
 
     def AbortWriteSession(
-        self, request: layer5_pb2.AbortWriteSessionRequest
+        self, request: layer5_pb2.AbortWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession: ...
 
 
@@ -271,6 +285,65 @@ class _ReadRangeCall(Protocol):
     def cancel(self) -> bool: ...
 
 
+_StreamItem = TypeVar("_StreamItem")
+
+
+class _IdleWatch(Generic[_StreamItem]):
+    """Bound each daemon-stream next(), excluding work done by its consumer.
+
+    One lazily started thread cancels under the same lock used to arm and
+    disarm the deadline. The owner closes the watch in its iteration's finally,
+    including when a consumer abandons the stream before exhausting it.
+    """
+
+    def __init__(self, call: Iterable[_StreamItem], timeout: float) -> None:
+        self._call = cast(_ReadRangeCall | _EnumerateCall, call)
+        self._iterator = iter(call)
+        self.timeout = timeout
+        self.fired = False
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._deadline: float | None = None
+        self._thread: threading.Thread | None = None
+
+    def __iter__(self) -> _IdleWatch[_StreamItem]:
+        return self
+
+    def __next__(self) -> _StreamItem:
+        with self._lock:
+            if self._stop.is_set():
+                raise StopIteration
+            self._deadline = time.monotonic() + self.timeout
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="remanence-idle-watch", daemon=True
+                )
+                self._thread.start()
+        try:
+            return next(self._iterator)
+        finally:
+            with self._lock:
+                self._deadline = None
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.timeout / 4):
+            with self._lock:
+                if self._deadline is not None and time.monotonic() >= self._deadline:
+                    self.fired = True
+                    # Fast direct fakes may be plain generators. Access cancel
+                    # only on expiry; production gRPC calls are cancellable.
+                    self._call.cancel()
+                    return
+
+    def close(self) -> None:
+        """Disarm and join before the enclosing RPC/session is released."""
+        with self._lock:
+            self._deadline = None
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+
 class _ReadSessionClient(Protocol):
     def OpenReadSession(
         self, request: layer5_pb2.OpenReadSessionRequest, timeout: float | None = None
@@ -279,7 +352,7 @@ class _ReadSessionClient(Protocol):
     def ReadObjectRange(self, request: layer5_pb2.ReadObjectRangeRequest) -> _ReadRangeCall: ...
 
     def CloseReadSession(
-        self, request: layer5_pb2.CloseReadSessionRequest
+        self, request: layer5_pb2.CloseReadSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.ReadSession: ...
 
 
@@ -675,15 +748,27 @@ class RemanenceBackend:
     def _enumerate_grpc(self) -> Iterator[CopyRecord]:
         catalog = self._require_catalog()
         request = layer5_pb2.EnumerateObjectsRequest(all=Empty())
+        watch: _IdleWatch[layer5_pb2.ObjectRecord] | None = None
         try:
-            for obj in catalog.EnumerateObjects(request):
+            watch = _IdleWatch(catalog.EnumerateObjects(request), _PLAN_METADATA_TIMEOUT_SECONDS)
+            for obj in watch:
                 for cp in obj.copies:
                     yield _copy_record_from_proto(obj, cp)
         except grpc.RpcError as e:
-            raise BackendUnavailableError(
+            text = (
                 f"Remanence Catalog.EnumerateObjects at {self._endpoint!r} failed: "
                 f"{_rpc_error_text(e)}"
-            ) from e
+            )
+            if watch is not None and watch.fired and e.code() == grpc.StatusCode.CANCELLED:
+                raise BackendTransientError(
+                    f"{text}; idle wait exceeded {watch.timeout} seconds"
+                ) from e
+            if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+                raise BackendTransientError(text) from e
+            raise BackendUnavailableError(text) from e
+        finally:
+            if watch is not None:
+                watch.close()
 
     def _enumerate_fixture(self) -> Iterator[CopyRecord]:
         for obj in self._objects:
@@ -823,10 +908,16 @@ class RemanenceBackend:
                     layer5_pb2.GetFileRequest(
                         object_id=object_id,
                         path=path,
-                    )
+                    ),
+                    timeout=_PLAN_METADATA_TIMEOUT_SECONDS,
                 )
             except grpc.RpcError as e:
-                raise BackendUnavailableError(
+                error_type = (
+                    BackendTransientError
+                    if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+                    else BackendUnavailableError
+                )
+                raise error_type(
                     f"Remanence Catalog.GetFile at {self._endpoint!r} failed: {_rpc_error_text(e)}"
                 ) from e
         obj = self._object_for_locator(locator)
@@ -993,10 +1084,16 @@ class RemanenceBackend:
                         pool_id=pool,
                         mount_if_needed=True,
                     )
-                )
+                ),
+                timeout=_SESSION_CALL_TIMEOUT_SECONDS,
             )
         except grpc.RpcError as e:
-            raise BackendUnavailableError(
+            error_type = (
+                BackendTransientError
+                if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+                else BackendUnavailableError
+            )
+            raise error_type(
                 f"Remanence OpenWriteSession at {self._endpoint!r} failed: {_rpc_error_text(e)}"
             ) from e
         report_session_open(
@@ -1086,7 +1183,10 @@ class RemanenceBackend:
         session_id: bytes,
     ) -> None:
         try:
-            client.CloseReadSession(layer5_pb2.CloseReadSessionRequest(session_id=session_id))
+            client.CloseReadSession(
+                layer5_pb2.CloseReadSessionRequest(session_id=session_id),
+                timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS,
+            )
         except grpc.RpcError:
             return
 
@@ -1160,7 +1260,8 @@ class RemanenceBackend:
                 layer5_pb2.AbortWriteSessionRequest(
                     session_id=session_id,
                     reason=reason,
-                )
+                ),
+                timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS,
             )
         except Exception:
             return
@@ -1271,7 +1372,11 @@ class BatchWriter:
                 stream_error = exc
 
         try:
-            response = self._client.AppendObject(messages())
+            size = source.stat().st_size
+            response = self._client.AppendObject(
+                messages(),
+                timeout=_SESSION_CALL_TIMEOUT_SECONDS + size / _APPEND_MIN_BYTES_PER_SECOND,
+            )
             if stream_error is not None:
                 raise stream_error
             receipt, durability = _written_receipt_from_response(
@@ -1322,7 +1427,8 @@ class BatchWriter:
         self._require_open()
         try:
             response = self._client.CheckpointSession(
-                layer5_pb2.CheckpointSessionRequest(session_id=self.session_id)
+                layer5_pb2.CheckpointSessionRequest(session_id=self.session_id),
+                timeout=_SESSION_CALL_TIMEOUT_SECONDS,
             )
             return self._accept_committed(response, operation="CheckpointSession")
         except Exception as exc:
@@ -1337,7 +1443,8 @@ class BatchWriter:
             return []
         try:
             response = self._client.CloseWriteSession(
-                layer5_pb2.CloseWriteSessionRequest(session_id=self.session_id)
+                layer5_pb2.CloseWriteSessionRequest(session_id=self.session_id),
+                timeout=_SESSION_CALL_TIMEOUT_SECONDS,
             )
             committed = self._accept_committed(response, operation="CloseWriteSession")
             self._closed = True
@@ -1450,7 +1557,8 @@ class BatchWriter:
             return BackendObjectExistsError(f"Remanence pool already holds the object: {detail}")
         error_type = (
             RemanenceWriteInDoubtError
-            if isinstance(exc, grpc.RpcError) and exc.code() == grpc.StatusCode.ABORTED
+            if isinstance(exc, grpc.RpcError)
+            and exc.code() in {grpc.StatusCode.ABORTED, grpc.StatusCode.DEADLINE_EXCEEDED}
             else RemanenceWriteSessionError
         )
         return error_type(
@@ -1559,6 +1667,7 @@ class RemanenceReadSession:
             return obj.content[byte_range.start : byte_range.end]
 
         session_id, drive_element_address, object_id = self._require_live_state()
+        watch: _IdleWatch[layer5_pb2.BytesChunk] | None = None
         try:
             stream = self._client.ReadObjectRange(
                 layer5_pb2.ReadObjectRangeRequest(
@@ -1568,14 +1677,26 @@ class RemanenceReadSession:
                     end_byte=byte_range.end,
                 )
             )
-            return b"".join(chunk.data for chunk in stream)
+            watch = _IdleWatch(stream, _READ_IDLE_TIMEOUT_SECONDS)
+            return b"".join(chunk.data for chunk in watch)
         except grpc.RpcError as e:
+            if watch is not None and watch.fired and e.code() == grpc.StatusCode.CANCELLED:
+                raise _read_idle_error(
+                    self._backend._endpoint,
+                    e,
+                    watch.timeout,
+                    session_id=session_id,
+                    drive_element_address=drive_element_address,
+                ) from e
             raise _read_object_range_error(
                 self._backend._endpoint,
                 e,
                 session_id=session_id,
                 drive_element_address=drive_element_address,
             ) from e
+        finally:
+            if watch is not None:
+                watch.close()
 
     @contextmanager
     def open_range_chunks(
@@ -1611,9 +1732,11 @@ class RemanenceReadSession:
                 session_id=session_id,
                 drive_element_address=drive_element_address,
             ) from e
+        watch = _IdleWatch(call, _READ_IDLE_TIMEOUT_SECONDS)
         try:
-            yield self._grpc_range_chunks(call)
+            yield self._grpc_range_chunks(watch)
         finally:
+            watch.close()
             # Correctness-critical ordering: dropping the server receiver must
             # unblock its bounded producer before CloseReadSession reaches the
             # same drive actor.
@@ -1642,18 +1765,28 @@ class RemanenceReadSession:
             yield obj.content[position:next_position]
             position = next_position
 
-    def _grpc_range_chunks(self, call: _ReadRangeCall) -> Iterator[bytes]:
+    def _grpc_range_chunks(self, watch: _IdleWatch[layer5_pb2.BytesChunk]) -> Iterator[bytes]:
         session_id, drive_element_address, _object_id = self._require_live_state()
         try:
-            for chunk in call:
+            for chunk in watch:
                 yield chunk.data
         except grpc.RpcError as e:
+            if watch.fired and e.code() == grpc.StatusCode.CANCELLED:
+                raise _read_idle_error(
+                    self._backend._endpoint,
+                    e,
+                    watch.timeout,
+                    session_id=session_id,
+                    drive_element_address=drive_element_address,
+                ) from e
             raise _read_object_range_error(
                 self._backend._endpoint,
                 e,
                 session_id=session_id,
                 drive_element_address=drive_element_address,
             ) from e
+        finally:
+            watch.close()
 
     def _require_live_state(self) -> tuple[bytes, int, bytes]:
         """Return complete live-session state or fail without relying on assertions."""
@@ -2009,6 +2142,24 @@ def _grpc_channel_options(endpoint: str) -> tuple[tuple[str, str], ...]:
         # sends the socket path as :authority, which the daemon rejects.
         return (("grpc.default_authority", "127.0.0.1:50051"),)
     return ()
+
+
+def _read_idle_error(
+    endpoint: str | None,
+    error: grpc.RpcError,
+    timeout: float,
+    *,
+    session_id: bytes,
+    drive_element_address: int,
+) -> BackendTransientError:
+    """Attach the existing read-session identity to a watch-caused cancellation."""
+    result = BackendTransientError(
+        f"Remanence ReadObjectRange at {endpoint!r} idle wait exceeded {timeout} seconds: "
+        f"{_rpc_error_text(error)}"
+    )
+    result.session_id = session_id  # type: ignore[attr-defined]
+    result.drive_element_address = drive_element_address  # type: ignore[attr-defined]
+    return result
 
 
 def _read_object_range_error(

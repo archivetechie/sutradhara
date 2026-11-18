@@ -583,7 +583,7 @@ class _QueueReadClient:
         yield layer5_pb2.BytesChunk(data=b"payload", is_last=True)
 
     def CloseReadSession(
-        self, request: layer5_pb2.CloseReadSessionRequest
+        self, request: layer5_pb2.CloseReadSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.ReadSession:
         self.library.set_active(False)
         return layer5_pb2.ReadSession(session_id=request.session_id)
@@ -1104,7 +1104,7 @@ class _DirectWriteClient:
         self.pending: list[layer5_pb2.ObjectRecord] = []
 
     def OpenWriteSession(
-        self, request: layer5_pb2.OpenWriteSessionRequest
+        self, request: layer5_pb2.OpenWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession:
         return layer5_pb2.WriteSession(
             session_id=self.session_id,
@@ -1113,7 +1113,9 @@ class _DirectWriteClient:
         )
 
     def AppendObject(
-        self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+        self,
+        request_iterator: Iterator[layer5_pb2.AppendObjectMessage],
+        timeout: float | None = None,
     ) -> layer5_pb2.ObjectRecord:
         messages = []
         for message in request_iterator:
@@ -1126,14 +1128,14 @@ class _DirectWriteClient:
         return _written_ack(caller_object_id, object_id=self.obj.object_id)
 
     def CheckpointSession(
-        self, request: layer5_pb2.CheckpointSessionRequest
+        self, request: layer5_pb2.CheckpointSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.CheckpointSessionResponse | layer5_pb2.WriteSession:
         committed = list(self.pending)
         self.pending.clear()
         return _checkpoint_response(self.session_id, self.obj.copies[0].tape_uuid, committed)
 
     def CloseWriteSession(
-        self, request: layer5_pb2.CloseWriteSessionRequest
+        self, request: layer5_pb2.CloseWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession:
         committed = list(self.pending)
         self.pending.clear()
@@ -1144,7 +1146,7 @@ class _DirectWriteClient:
         )
 
     def AbortWriteSession(
-        self, request: layer5_pb2.AbortWriteSessionRequest
+        self, request: layer5_pb2.AbortWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession:
         self.aborted = True
         return layer5_pb2.WriteSession(session_id=request.session_id)
@@ -1154,7 +1156,7 @@ class _MalformedCommittedWriteClient(_DirectWriteClient):
     """Return a committed response whose written copy cannot be selected."""
 
     def CheckpointSession(
-        self, request: layer5_pb2.CheckpointSessionRequest
+        self, request: layer5_pb2.CheckpointSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.CheckpointSessionResponse:
         malformed = layer5_pb2.ObjectRecord(
             object_id=bytes.fromhex("20" * 16),
@@ -1184,7 +1186,9 @@ class _LegacyWriteSessionClient(_DirectWriteClient):
         self.modern_checkpoint_response = modern_checkpoint_response
 
     def AppendObject(
-        self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+        self,
+        request_iterator: Iterator[layer5_pb2.AppendObjectMessage],
+        timeout: float | None = None,
     ) -> layer5_pb2.ObjectRecord:
         list(request_iterator)
         legacy = layer5_pb2.ObjectRecord()
@@ -1193,7 +1197,7 @@ class _LegacyWriteSessionClient(_DirectWriteClient):
         return legacy
 
     def CheckpointSession(
-        self, request: layer5_pb2.CheckpointSessionRequest
+        self, request: layer5_pb2.CheckpointSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.CheckpointSessionResponse | layer5_pb2.WriteSession:
         if self.modern_checkpoint_response:
             return layer5_pb2.CheckpointSessionResponse(
@@ -1213,7 +1217,7 @@ class _CheckpointBatchClient:
         self.aborted = False
 
     def OpenWriteSession(
-        self, request: layer5_pb2.OpenWriteSessionRequest
+        self, request: layer5_pb2.OpenWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession:
         return layer5_pb2.WriteSession(
             session_id=self.session_id,
@@ -1222,7 +1226,7 @@ class _CheckpointBatchClient:
         )
 
     def AppendObject(
-        self, messages: Iterator[layer5_pb2.AppendObjectMessage]
+        self, messages: Iterator[layer5_pb2.AppendObjectMessage], timeout: float | None = None
     ) -> layer5_pb2.ObjectRecord:
         caller_object_id = ""
         data = bytearray()
@@ -1265,7 +1269,7 @@ class _CheckpointBatchClient:
         )
 
     def CheckpointSession(
-        self, request: layer5_pb2.CheckpointSessionRequest
+        self, request: layer5_pb2.CheckpointSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.CheckpointSessionResponse:
         if self.fail_checkpoint:
             raise _DirectWriteError()
@@ -1274,14 +1278,14 @@ class _CheckpointBatchClient:
         return _checkpoint_response(self.session_id, self.tape_uuid, committed)
 
     def CloseWriteSession(
-        self, request: layer5_pb2.CloseWriteSessionRequest
+        self, request: layer5_pb2.CloseWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession:
         committed = list(self.pending)
         self.pending.clear()
         return _write_session_response(self.session_id, self.tape_uuid, committed)
 
     def AbortWriteSession(
-        self, request: layer5_pb2.AbortWriteSessionRequest
+        self, request: layer5_pb2.AbortWriteSessionRequest, timeout: float | None = None
     ) -> layer5_pb2.WriteSession:
         self.aborted = True
         return layer5_pb2.WriteSession(session_id=request.session_id)
@@ -1606,7 +1610,9 @@ def test_write_digest_mismatch_ends_request_iterator_cleanly(
         """Consume the requests and optionally reject the missing Finish."""
 
         def AppendObject(
-            self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+            self,
+            request_iterator: Iterator[layer5_pb2.AppendObjectMessage],
+            timeout: float | None = None,
         ) -> layer5_pb2.ObjectRecord:
             with futures.ThreadPoolExecutor(max_workers=1) as executor:
                 self.appended.extend(executor.submit(list, request_iterator).result())
@@ -1697,7 +1703,9 @@ def test_interrupted_append_replays_same_file_from_zero(
             self.attempts: list[list[layer5_pb2.AppendObjectMessage]] = []
 
         def AppendObject(
-            self, request_iterator: Iterator[layer5_pb2.AppendObjectMessage]
+            self,
+            request_iterator: Iterator[layer5_pb2.AppendObjectMessage],
+            timeout: float | None = None,
         ) -> layer5_pb2.ObjectRecord:
             messages: list[layer5_pb2.AppendObjectMessage] = []
             self.attempts.append(messages)
@@ -2078,7 +2086,13 @@ def test_remanence_pool_lookup_absence_and_unavailable(proto_object, case):
 
 @pytest.mark.parametrize("operation", ["append", "checkpoint", "close"])
 @pytest.mark.parametrize(
-    "status", [grpc.StatusCode.ALREADY_EXISTS, grpc.StatusCode.ABORTED, grpc.StatusCode.UNAVAILABLE]
+    "status",
+    [
+        grpc.StatusCode.ALREADY_EXISTS,
+        grpc.StatusCode.ABORTED,
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+    ],
 )
 def test_remanence_write_pool_refusal_mapping(tmp_path, monkeypatch, operation, status):
     """T7: every batch operation maps refusal/in-doubt and retains abort behavior."""
@@ -2106,13 +2120,14 @@ def test_remanence_write_pool_refusal_mapping(tmp_path, monkeypatch, operation, 
     expected = {
         grpc.StatusCode.ALREADY_EXISTS: BackendObjectExistsError,
         grpc.StatusCode.ABORTED: RemanenceWriteInDoubtError,
+        grpc.StatusCode.DEADLINE_EXCEEDED: RemanenceWriteInDoubtError,
         grpc.StatusCode.UNAVAILABLE: RemanenceWriteSessionError,
     }[status]
     arguments = (source, "name") if operation == "append" else ()
     with pytest.raises(expected) as error:
         getattr(batch, operation)(*arguments)
     assert client.aborted
-    if status == grpc.StatusCode.ABORTED:
+    if status in {grpc.StatusCode.ABORTED, grpc.StatusCode.DEADLINE_EXCEEDED}:
         assert isinstance(error.value, RemanenceWriteSessionError)
         assert isinstance(error.value, BackendWriteInDoubtError)
         assert error.value.session_id == client.session_id
@@ -2326,3 +2341,270 @@ def test_read_open_status_rpc_timeout_remains_advisory() -> None:
     assert len(timeouts) == 1
     assert timeouts[0] is not None
     assert 0 < timeouts[0] <= 0.2
+
+
+class _DeadlineWriteClient(_CheckpointBatchClient):
+    """Record call bounds and optionally interrupt an append after consuming it."""
+
+    def __init__(self, *, append_error=None, open_error=None):
+        super().__init__()
+        self.timeouts = {}
+        self.append_error = append_error
+        self.open_error = open_error
+
+    def OpenWriteSession(self, request, timeout: float | None = None):
+        self.timeouts["open"] = timeout
+        if self.open_error is not None:
+            raise _PoolLookupError(self.open_error)
+        return super().OpenWriteSession(request)
+
+    def AppendObject(self, messages, timeout: float | None = None):
+        self.timeouts["append"] = timeout
+        if self.append_error is not None:
+            list(messages)
+            raise self.append_error
+        return super().AppendObject(messages)
+
+    def CheckpointSession(self, request, timeout: float | None = None):
+        self.timeouts["checkpoint"] = timeout
+        return super().CheckpointSession(request)
+
+    def CloseWriteSession(self, request, timeout: float | None = None):
+        self.timeouts["close"] = timeout
+        return super().CloseWriteSession(request)
+
+    def AbortWriteSession(self, request, timeout: float | None = None):
+        self.timeouts["abort"] = timeout
+        return super().AbortWriteSession(request)
+
+
+class _DeadlineCatalog:
+    """Direct metadata client recording GetFile bounds and supplying a stream."""
+
+    def __init__(self, *, status=None, call=None):
+        self.status = status
+        self.call = call
+        self.timeout = None
+
+    def GetFile(self, request, timeout: float | None = None):
+        self.timeout = timeout
+        if self.status is not None:
+            raise _PoolLookupError(self.status)
+        return layer5_pb2.FileRecord()
+
+    def EnumerateObjects(self, request):
+        return self.call
+
+
+@pytest.mark.parametrize("operation", ["open", "checkpoint", "close"])
+def test_deadline_session_write_bounds(tmp_path, operation):
+    """RBA-DL T1(a): batch-of-one forwards each session bound."""
+    source = tmp_path / "source"
+    source.write_bytes(b"bounded write")
+    client = _DeadlineWriteClient()
+    backend = RemanenceBackend("rem", endpoint="direct", write_session=client)
+    backend.write_object_to_pool(source, "checkpoint-pool")
+    assert client.timeouts[operation] == 1800.0
+
+
+def test_deadline_abort_bound(tmp_path):
+    """RBA-DL T1(b): even failed appends bound the best-effort abort."""
+    source = tmp_path / "source"
+    source.write_bytes(b"failed append")
+    client = _DeadlineWriteClient(append_error=_DirectWriteError())
+    backend = RemanenceBackend("rem", endpoint="direct", write_session=client)
+    with pytest.raises(RemanenceWriteSessionError):
+        backend.write_object_to_pool(source, "checkpoint-pool")
+    assert client.aborted
+    assert client.timeouts["abort"] == 60.0
+
+
+def test_deadline_read_close_bound():
+    """RBA-DL T1(c): the production range route bounds read-session cleanup."""
+
+    class Client(_QueueReadClient):
+        timeout = None
+
+        def CloseReadSession(self, request, timeout: float | None = None):
+            self.timeout = timeout
+            return super().CloseReadSession(request)
+
+    library = _QueueLibrary()
+    client = Client(library)
+    backend = _queue_backend(library, client)
+    backend.read_range(_read_locator("ab" * 32), ByteRange(0, 1))
+    assert client.timeout == 60.0
+
+
+def test_deadline_get_file_bound():
+    """RBA-DL T1(d): GetFile uses the metadata bound."""
+    catalog = _DeadlineCatalog()
+    backend = RemanenceBackend("rem", endpoint="direct", catalog=catalog)
+    backend.get_file(_read_locator("ab" * 32), path="member")
+    assert catalog.timeout == 15.0
+
+
+@pytest.mark.parametrize("size", [3 * 1024 * 1024 + 1, 0])
+def test_deadline_append_size_bound(tmp_path, size):
+    """RBA-DL T2: append allows a session bound plus source transfer time."""
+    source = tmp_path / "source"
+    source.write_bytes(b"x" * size)
+    client = _DeadlineWriteClient()
+    backend = RemanenceBackend("rem", endpoint="direct", write_session=client)
+    backend.write_object_to_pool(source, "checkpoint-pool")
+    assert client.timeouts["append"] == pytest.approx(1800.0 + size / (10 * 1024 * 1024))
+
+
+@pytest.mark.parametrize("status", [grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE])
+def test_deadline_open_class(status):
+    """RBA-DL T4: only an open deadline is transient."""
+    client = _DeadlineWriteClient(open_error=status)
+    backend = RemanenceBackend("rem", endpoint="direct", write_session=client)
+    expected = (
+        BackendTransientError
+        if status == grpc.StatusCode.DEADLINE_EXCEEDED
+        else BackendUnavailableError
+    )
+    with pytest.raises(expected, match="direct") as error:
+        backend.open_batch("checkpoint-pool")
+    assert type(error.value) is expected
+
+
+@pytest.mark.parametrize("status", [grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE])
+def test_deadline_get_file_class(status):
+    """RBA-DL T5: only a GetFile deadline is transient."""
+    backend = RemanenceBackend("rem", endpoint="direct", catalog=_DeadlineCatalog(status=status))
+    expected = (
+        BackendTransientError
+        if status == grpc.StatusCode.DEADLINE_EXCEEDED
+        else BackendUnavailableError
+    )
+    with pytest.raises(expected, match="direct") as error:
+        backend.get_file(_read_locator("ab" * 32), path="member")
+    assert type(error.value) is expected
+
+
+def test_deadline_funnel_write_outcome_unknown(tmp_path):
+    """RBA-DL T6: append deadline leaves the attempt unresolved without a lookup."""
+    from sutradhara.archive_fanout import LocalArchiveBuilder, flush_bundle
+    from sutradhara.bundle_copy_ledger import identity_attempts
+    from sutradhara.catalog.session import create_all, make_engine, session_scope
+    from tests.test_bundle_sweeper import _backends, _rba_seed
+
+    engine = make_engine(f"sqlite:///{tmp_path / 'deadline.db'}")
+    create_all(engine)
+    try:
+        bundle_id = _rba_seed(engine, tmp_path, pools=("p-a",))
+        client = _DeadlineWriteClient(
+            append_error=_PoolLookupError(grpc.StatusCode.DEADLINE_EXCEEDED)
+        )
+        catalog = _PoolLookupCatalog(layer5_pb2.ObjectRecord(), status=grpc.StatusCode.NOT_FOUND)
+        backend = RemanenceBackend("rem", endpoint="direct", write_session=client, catalog=catalog)
+        with session_scope(engine) as session:
+            result = flush_bundle(
+                session,
+                bundle_id=bundle_id,
+                backends=_backends(session, backend),
+                builder=LocalArchiveBuilder(),
+            )
+            assert result.condition_reason == "write-outcome-unknown"
+            attempts = identity_attempts(session, bundle_id=bundle_id, pool_id="p-a", generation=0)
+            assert len(attempts) == 1
+            assert attempts[0][1] is None
+            assert catalog.requests == []
+            assert client.aborted
+    finally:
+        engine.dispose()
+
+
+class _IdleObjectCall:
+    """A catalogue stream whose second wait ends only on cancellation or its cap."""
+
+    def __init__(self, obj):
+        self.obj = obj
+        self.sent = False
+        self.cancelled = threading.Event()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.cancelled.is_set():
+            raise _PoolLookupError(grpc.StatusCode.CANCELLED)
+        if not self.sent:
+            self.sent = True
+            return self.obj
+        if self.cancelled.wait(1.0):
+            raise _PoolLookupError(grpc.StatusCode.CANCELLED)
+        raise RuntimeError("idle catalogue fake reached its cap")
+
+    def cancel(self):
+        self.cancelled.set()
+        return True
+
+
+def test_deadline_enumerate_idle_watch(monkeypatch, proto_object):
+    """RBA-DL T8: catalogue stalls use the metadata idle bound and map transient."""
+    monkeypatch.setattr(remanence_module, "_PLAN_METADATA_TIMEOUT_SECONDS", 0.2, raising=False)
+    call = _IdleObjectCall(proto_object)
+    backend = RemanenceBackend("rem", endpoint="direct", catalog=_DeadlineCatalog(call=call))
+    started = time.monotonic()
+    with pytest.raises(BackendTransientError, match="direct") as error:
+        list(backend.enumerate())
+    assert time.monotonic() - started < 1.0
+    assert "0.2" in str(error.value)
+    assert call.cancelled.is_set()
+    assert not [t for t in threading.enumerate() if t.name.startswith("remanence-idle-watch")]
+
+
+def test_read_idle_watch_ends_a_stalled_real_grpc_stream(monkeypatch):
+    """RBA-DL H1: a real gRPC next is interrupted by the idle watch."""
+    monkeypatch.setattr(remanence_module, "_READ_IDLE_TIMEOUT_SECONDS", 0.2, raising=False)
+
+    class StalledRead(_ReadSession):
+        def ReadObjectRange(self, request, context):
+            yield layer5_pb2.BytesChunk(data=b"first")
+            cap = time.monotonic() + 5 * 0.2
+            while context.is_active() and time.monotonic() < cap:
+                time.sleep(0.01)
+
+    servicer = StalledRead(b"first")
+    with _serve_read(servicer) as endpoint:
+        backend = RemanenceBackend.from_grpc("rem", endpoint=endpoint)
+        try:
+            started = time.monotonic()
+            with pytest.raises(BackendTransientError):
+                backend.read_range(_read_locator("ab" * 32), ByteRange(0, 0))
+            assert time.monotonic() - started < 1.0
+            assert servicer.closed
+        finally:
+            backend._channel.close()
+
+
+def test_append_deadline_over_real_grpc_is_in_doubt(monkeypatch, tmp_path, proto_object):
+    """RBA-DL H2: a real stream-unary deadline aborts and leaves the write in doubt."""
+    from sutradhara.backend.remanence import RemanenceWriteInDoubtError
+
+    monkeypatch.setattr(remanence_module, "_SESSION_CALL_TIMEOUT_SECONDS", 0.2, raising=False)
+
+    class StalledWrite(_WriteSession):
+        def AppendObject(self, messages, context):
+            self.appended.extend(messages)
+            cap = time.monotonic() + 5 * 0.2
+            while context.is_active() and time.monotonic() < cap:
+                time.sleep(0.01)
+            return self.obj
+
+    source = tmp_path / "source"
+    source.write_bytes(b"write deadline")
+    servicer = StalledWrite(proto_object, bytes.fromhex(_TAPE_UUID_HEX))
+    with _serve_write(servicer) as endpoint:
+        backend = RemanenceBackend.from_grpc("rem", endpoint=endpoint)
+        try:
+            started = time.monotonic()
+            with pytest.raises(RemanenceWriteInDoubtError):
+                backend.write_object_to_pool(source, "scenario-a")
+            assert time.monotonic() - started < 1.0
+            assert servicer.aborted
+        finally:
+            backend._channel.close()
