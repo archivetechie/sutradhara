@@ -1031,9 +1031,13 @@ def test_parallel_serve_respects_publish_stream_pool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Hold publishes together so both stream-pool bounds are observable."""
+
     root = tmp_path / "restore-root"
     root.mkdir()
     lock = threading.Lock()
+    gate = threading.Event()
+    gate_deadline = 0.0
     active = 0
     max_active = 0
 
@@ -1041,10 +1045,17 @@ def test_parallel_serve_respects_publish_stream_pool(
         return restore_manager.DiskIdentityResult(True, "ok", "test identity")
 
     def fake_publish(source: Path, destination: Path) -> None:
-        nonlocal active, max_active
+        nonlocal active, max_active, gate_deadline
         with lock:
             active += 1
             max_active = max(max_active, active)
+            if gate_deadline == 0.0:
+                gate_deadline = time.monotonic() + 5.0
+            if active > 6:
+                gate.set()
+        # One shared deadline; once opened, the gate stays open for later publishes.
+        gate.wait(max(0.0, gate_deadline - time.monotonic()))
+        gate.set()
         time.sleep(0.02)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(source.read_bytes())
@@ -1107,18 +1118,30 @@ def test_parallel_serve_respects_aead_subcap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Hold AEAD entries together so both subcap bounds are observable."""
+
     root = tmp_path / "restore-root"
     root.mkdir()
     lock = threading.Lock()
+    gate = threading.Event()
+    gate_deadline = 0.0
     active_aead = 0
     max_aead = 0
 
     def fake_cache(_session, entry, destination, _config):
-        nonlocal active_aead, max_aead
+        nonlocal active_aead, max_aead, gate_deadline
         with lock:
             if entry.representation == AEAD_REPRESENTATION:
                 active_aead += 1
+                if gate_deadline == 0.0:
+                    gate_deadline = time.monotonic() + 5.0
+                if active_aead > 2:
+                    gate.set()
             max_aead = max(max_aead, active_aead)
+        if entry.representation == AEAD_REPRESENTATION:
+            # Wait outside the counter lock so other AEAD entries can join.
+            gate.wait(max(0.0, gate_deadline - time.monotonic()))
+            gate.set()
         time.sleep(0.02)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(entry.content_sha256)

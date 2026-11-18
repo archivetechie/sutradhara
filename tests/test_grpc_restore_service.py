@@ -2466,14 +2466,14 @@ def _deliver(rig: _Rig, item_id: int) -> Any:
 
 
 @contextmanager
-def _rlr_service(rig: _Rig) -> Iterator[RestoreService]:
+def _rlr_service(rig: _Rig, *, lease_seconds: float = 0.6) -> Iterator[RestoreService]:
     """Exercise the real delivery path with a short lease and no background workers."""
 
     service = _started(
         RestoreService(
             replace(
                 rig.service_config,
-                lease_duration=dt.timedelta(seconds=0.6),
+                lease_duration=dt.timedelta(seconds=lease_seconds),
                 acknowledgement_poll_seconds=0.04,
             )
         )
@@ -2757,7 +2757,8 @@ def test_rlr_outstanding_renewal_is_server_failure_even_with_staged(
 
     rig = fresh_rig
     item_id = _seed_item(rig, "rlr-outstanding", b"o" * (8 * 256 * 1024), receiver="receiver")
-    with _rlr_service(rig) as service:
+    lease_s = 2.0
+    with _rlr_service(rig, lease_seconds=lease_s) as service:
         original = service._renew_lease
         calls = []
         in_wait = [False]
@@ -2773,7 +2774,7 @@ def test_rlr_outstanding_renewal_is_server_failure_even_with_staged(
                 staged.append(time.monotonic())
                 # Hold this failed write past expiry. The next poll sees a
                 # durable acknowledgement and an expired row together.
-                time.sleep(0.75)
+                time.sleep(lease_s + 0.15)
             elif ending == "recover" and staged:
                 return original(prepared, lease)
             raise RuntimeError("renewal write unavailable")
@@ -2785,7 +2786,7 @@ def test_rlr_outstanding_renewal_is_server_failure_even_with_staged(
         )
         head = _rlr_first_chunk(stream)[0].manifest_head
         if ending == "close":
-            time.sleep(0.75)
+            time.sleep(lease_s + 0.15)
             stream.close()  # type: ignore[attr-defined]
         else:
             _pull_until_file_end(stream)
@@ -2797,10 +2798,10 @@ def test_rlr_outstanding_renewal_is_server_failure_even_with_staged(
                     with pytest.raises(TimeoutError):
                         pending.result(timeout=0.7)
                     if ending == "recover":
-                        assert _kinds(pending.result(timeout=2)) == ["job_end"]
+                        assert _kinds(pending.result(timeout=3.5 * lease_s)) == ["job_end"]
                     else:
                         with pytest.raises(_Abort) as failed:
-                            pending.result(timeout=2)
+                            pending.result(timeout=3.5 * lease_s)
                         assert failed.value.code == grpc.StatusCode.UNAVAILABLE
                         assert (
                             failed.value.details == "the server could not renew the delivery lease"
@@ -2808,7 +2809,7 @@ def test_rlr_outstanding_renewal_is_server_failure_even_with_staged(
                         assert dt.datetime.now(dt.UTC) > expiry + service.config.lease_duration
                 finally:
                     context.active = False
-            assert all(b - a >= 0.02 for a, b in pairwise(calls))
+            assert all(b - a >= lease_s / 30 for a, b in pairwise(calls))
             if ending in {"staged", "recover"}:
                 assert len(staged) == 1
         (row,) = _attempt_rows(rig, item_id)

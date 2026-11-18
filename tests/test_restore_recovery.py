@@ -93,6 +93,7 @@ def _item(rig: _Rig, name: str) -> int:
 def test_rlr_other_instance_respects_renewal_then_fences_stopped_delivery(
     rig: _Rig,
     pause: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Proof 6: actual recovery preserves a renewing stale owner, but closes an idle one."""
 
@@ -105,6 +106,7 @@ def test_rlr_other_instance_respects_renewal_then_fences_stopped_delivery(
         )
     )
     observer.start(background=False)
+    monkeypatch.setattr(observer, "_break_seconds", lambda: 60.0)
     try:
         with _rlr_service(rig) as caller:
             stream = caller.OpenRestore(
