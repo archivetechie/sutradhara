@@ -394,9 +394,10 @@ def _repair_after_preflight(
         missing = _missing_pool_ids(ctx, bundle_id)
         for pool_id in sorted(missing):
             if pool_id in rebuild or pool_id in resolved_pool_ids:
-                # Step 1 settled these pools with a copy, problem, or rebuild.
-                # The reconciler counts OK copies awaiting verification. Another lookup
-                # could only re-read the copy, back off, or add a second counted copy.
+                # Step 1 already settled these pools for this pass (a copy, a problem or a
+                # rebuild). An OK copy awaiting verification is counted by the reconciler
+                # meanwhile; another lookup of it could only re-read it, back off, or add a
+                # second counted copy.
                 continue
             pool_copies = [copy for copy in copies if copy.pool_id == pool_id]
             if not pool_copies or any(copy.health == CopyHealth.SUSPECT for copy in pool_copies):

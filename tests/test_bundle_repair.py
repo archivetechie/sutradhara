@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
-from collections.abc import Iterator
+import json
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import Engine, select
@@ -17,6 +19,7 @@ from sutradhara.archive_fanout import (
     BuildArtifact,
     BuiltBlobRoot,
     BuiltExclusion,
+    BuiltMember,
     LocalArchiveBuilder,
     RemArchiveBuilder,
     flush_bundle,
@@ -949,6 +952,119 @@ def test_repair_checks_source_keys_before_reading(
             )
         ).one()
         assert (condition.condition == CONDITION_BLOCKED) == (case == "key")
+
+
+def test_repair_checks_source_keys_after_recovering_suspect_copy(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T2: a sealed source recovered by repair still needs keys before extraction."""
+
+    class RecordingBackend(_Backend):
+        """Distinguish verification reads from repair's source extraction reads."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.in_verify = False
+            self.read_contexts: list[tuple[str, bool]] = []
+
+        def read_range(self, locator: BackendLocator, byte_range: ByteRange) -> bytes:
+            self.read_contexts.append((str(locator["object_id"]), self.in_verify))
+            return super().read_range(locator, byte_range)
+
+        def verify(
+            self, locator: BackendLocator, *, observe: VerifyObserver | None = None
+        ) -> VerifyResult:
+            self.in_verify = True
+            try:
+                return super().verify(locator, observe=observe)
+            finally:
+                self.in_verify = False
+
+    builds: list[object] = []
+
+    class RecordingBuilder(_OutputsBuilder):
+        """Verify relabelled local archives using their header's member offsets."""
+
+        def build(self, **kwargs: object) -> BuildArtifact:
+            builds.append(kwargs)
+            return super().build(**kwargs)
+
+        @contextmanager
+        def extract_member_from_path(
+            self,
+            *,
+            object_path: Path,
+            member: BuiltMember,
+            representation: Representation,
+            storage_metadata: Mapping[str, Any],
+            work_dir: Path,
+        ) -> Iterator[Path]:
+            restored = work_dir / "verified-member.bin"
+            with object_path.open("rb") as source:
+                header_size = int.from_bytes(source.read(8), "big")
+                header = json.loads(source.read(header_size))
+                entry = next(
+                    entry for entry in header["members"] if entry["path"] == member.member_path
+                )
+                source.seek(8 + header_size + entry["offset"])
+                restored.write_bytes(source.read(member.size_bytes))
+            try:
+                yield restored
+            finally:
+                restored.unlink()
+
+    backend = RecordingBackend()
+    bundle_id, _, _ = _flushed_bundle(engine, tmp_path, backend, ("p1", "p2"))
+    registry = make_test_key_registry(tmp_path / "keys")
+    monkeypatch.setattr(bundle_repair, "make_key_registry", lambda: registry)
+    monkeypatch.setattr(
+        bundle_repair, "make_archive_builder", lambda rem_bin=None: RecordingBuilder()
+    )
+    monkeypatch.setattr(bundle_repair.factory, "backend_from_row", lambda _row: backend)
+    with session_scope(engine) as session:
+        sealed = _sealed_pool_copy(session, "p1")
+        sealed.health = CopyHealth.SUSPECT
+        missing_copy = session.scalars(select(Copy).where(Copy.pool_id == "p2")).one()
+        missing_copy.health = CopyHealth.MISSING
+        job = submit(
+            session,
+            "bundle-repair",
+            {"bundle_id": bundle_id, "key_epoch": "archive-" + "f" * 32},
+            recon_domain="bundle_copy",
+            recon_target_key=bundle_id,
+        )
+        sealed_id = sealed.id
+        sealed_object = str(sealed.native_locator["object_id"])
+        writes_before = backend.writes.copy()
+        backend.reads.clear()
+        backend.read_contexts.clear()
+        assert sealed.health == CopyHealth.SUSPECT
+        assert (
+            session.scalars(
+                select(Copy).where(Copy.bundle_id == bundle_id, Copy.health == CopyHealth.OK)
+            ).first()
+            is None
+        )
+        result = run_one(session, job.id)
+
+    assert result.condition is not None
+    assert result.condition.condition == CONDITION_BLOCKED
+    assert result.condition.reason == "source-key-unavailable"
+    assert not result.ok
+    assert f"copy id={sealed_id}" in result.detail
+    assert "archive-" + "e" * 32 in result.detail
+    assert "this host's key registry" in result.detail
+    with session_scope(engine) as session:
+        recovered = session.get(Copy, sealed_id)
+        assert recovered is not None
+        assert recovered.health == CopyHealth.OK
+    sealed_reads = [
+        inside for object_id, inside in backend.read_contexts if object_id == sealed_object
+    ]
+    assert sealed_reads
+    assert all(sealed_reads), "the recovered source must only be read for verification"
+    assert builds == []
+    assert backend.writes == writes_before
 
 
 def _flushed_bundle(

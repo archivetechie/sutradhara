@@ -36,6 +36,7 @@ from sutradhara.archive_bundle import (
     get_or_create_open_bundle,
 )
 from sutradhara.archive_fanout import (
+    BuildArtifact,
     LocalArchiveBuilder,
     flush_bundle,
 )
@@ -1058,6 +1059,49 @@ def test_rba_u1_bad_staging_names_copy_problems(engine, tmp_path, monkeypatch):
     )
     assert result.condition.message == result.detail
     assert backend.calls == before
+
+
+def test_rba_u1b_bad_staging_without_copy_problems(engine, tmp_path, monkeypatch):
+    """T4: with no copy problem to project, the staging block's message stays intact."""
+    from sutradhara.catalog.models import BundleCopyWriteAttempt
+
+    class LostArtifactBuilder(LocalArchiveBuilder):
+        """Lose the built file before fan-out can record a write attempt."""
+
+        def build(self, **kwargs: object) -> BuildArtifact:
+            artifact = super().build(**kwargs)
+            artifact.artifact_path.unlink()
+            return artifact
+
+    bundle_id = _rba_seed(engine, tmp_path, pools=("p-a",))
+    backend = _RbaBackend()
+    with session_scope(engine) as session:
+        flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends=_backends(session, backend),
+            builder=LostArtifactBuilder(),
+        )
+    with session_scope(engine) as session:
+        assert session.get(Bundle, bundle_id).status == "sealed"
+        assert session.scalars(select(Copy).where(Copy.bundle_id == bundle_id)).first() is None
+        assert (
+            session.scalars(
+                select(BundleCopyWriteAttempt).where(BundleCopyWriteAttempt.bundle_id == bundle_id)
+            ).first()
+            is None
+        )
+    path = _rba2d_paths(engine, bundle_id)[0]
+    path.unlink()
+
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    assert result.detail.endswith("a human decides how to recover the staging source")
+    assert result.condition is not None
+    assert result.condition.condition == "blocked"
+    assert result.condition.reason == "staging-source-unavailable"
+    assert result.condition.message == result.detail
+    assert path.name in result.detail
+    assert "missing" in result.detail
 
 
 def _rba2d_appledouble_member(engine, tmp_path, bundle_id, *, compress=False):
