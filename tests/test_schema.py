@@ -561,6 +561,40 @@ def test_job_kills_migration_defaults_existing_row_and_downgrades(tmp_path: Path
         assert conn.execute("SELECT id FROM job").fetchall() == [(1,)]
 
 
+def test_job_stops_migration_defaults_existing_row_and_downgrades(tmp_path: Path) -> None:
+    """GS T4: stop accounting backfills old jobs and downgrades without data loss."""
+    db_path = tmp_path / "job-stops.db"
+    env = {**os.environ, "SUTRADHARA_DB_URL": f"sqlite:///{db_path}"}
+    repo_root = Path(__file__).resolve().parents[1]
+
+    def migrate(direction: str, revision: str) -> None:
+        subprocess.run(
+            [sys.executable, "-m", "alembic", direction, revision],
+            cwd=repo_root,
+            env=env,
+            check=True,
+        )
+
+    migrate("upgrade", "a9c3e5f7b1d2")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO job (id, kind, params, status, step_state, attempts, kills, "
+            "not_before, priority, required_resources, prerequisites, created_at) "
+            "VALUES (1, 'verify', '{}', 'pending', '{}', 2, 2, '2026-11-18', 0, '[]', '[]', "
+            "'2026-11-18')"
+        )
+    migrate("upgrade", "head")
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT stops FROM job WHERE id=1").fetchone() == (0,)
+        column = next(row for row in conn.execute("PRAGMA table_info(job)") if row[1] == "stops")
+        assert column[3] == 1
+        assert column[4] == "0"
+    migrate("downgrade", "a9c3e5f7b1d2")
+    with sqlite3.connect(db_path) as conn:
+        assert "stops" not in {row[1] for row in conn.execute("PRAGMA table_info(job)")}
+        assert conn.execute("SELECT id, kills FROM job").fetchall() == [(1, 2)]
+
+
 def test_rem_object_representation_migration_rewrites_catalog_and_fingerprints(
     tmp_path: Path,
 ) -> None:

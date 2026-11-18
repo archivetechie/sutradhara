@@ -102,7 +102,7 @@ def test_third_kill_blocks_condition_without_attempt(engine: Engine, initial: st
         for _ in range(3):
             assert claim_job_by_id(session, job.id) is job
             assert claim_job_by_id(session, other.id) is other
-            assert reset_orphaned_running_jobs(session) == 2
+            assert reset_orphaned_running_jobs(session).total == 2
         assert job.status == other.status == JobStatus.FAILED
         assert job.kills == other.kills == 3
         assert list(session.scalars(select(JobAttempt))) == []

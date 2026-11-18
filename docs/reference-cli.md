@@ -416,6 +416,15 @@ counted resource pools.
 | `--once` | off | Drain currently eligible jobs and exit. |
 | `--pools TEXT` | | Override counted pool capacity, e.g. `--pools cpu=8 --pools io=2`. Repeatable. |
 
+The first SIGTERM or SIGINT stops new claims and lets running attempts finish;
+a second signal ends the worker immediately. The shipped unit allows 90 seconds
+before cutting off unfinished work. A record in the worker's lock file makes a
+job cut off at that timeout come back as stopped, without consuming a retry or
+counting toward the kill limit; removing the file loses that record.
+`systemctl kill` reaches every process in the unit unless given
+`--kill-whom=main`. Ctrl-C at a terminal also reaches the worker's children, so
+it does not promise that running jobs finish.
+
 <!-- code-anchor: src/sutradhara/cli/backends.py src/sutradhara/backend/factory.py @ 747b3c2 -->
 ## sutra backends
 

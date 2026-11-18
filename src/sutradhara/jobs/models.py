@@ -79,6 +79,8 @@ class Job(Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Times found RUNNING at a worker start: its worker died mid-attempt.
     kills: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    # Times found RUNNING at a worker start that followed a requested stop.
+    stops: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     not_before: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow, index=True
     )

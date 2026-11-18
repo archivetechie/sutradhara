@@ -176,12 +176,14 @@ def jobs_run(job_id: int | None, limit: int) -> None:
     """Run pending jobs synchronously (or one specific job by --id)."""
     url = database_url()
     try:
-        with worker_lock(url):
+        with worker_lock(url) as held:
             engine = make_engine(url)
             try:
                 with session_scope(engine) as s:
                     _begin_immediate(s.connection())
-                    reset_orphaned_running_jobs(s)
+                    reset_orphaned_running_jobs(
+                        s, after_requested_stop=held.previous_holder_stop_requested
+                    )
                 with session_scope(engine) as s:
                     _begin_immediate(s.connection())
                     if job_id is not None:

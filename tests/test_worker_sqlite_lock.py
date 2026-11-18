@@ -176,7 +176,33 @@ def test_orphan_recovery_lock_is_retried_on_next_poll(setup_worker):
         raise lock_error()
 
     event.listen(engine, "before_cursor_execute", fail_query)
-    assert worker.recover_orphans() == 0
+    assert worker.recover_orphans().total == 0
     assert worker.drain(recover_orphans=False) == []
     event.remove(engine, "before_cursor_execute", fail_query)
     assert worker.drain(recover_orphans=False)[0].result.ok
+
+
+def test_requested_stop_survives_refused_reset_and_is_consumed_once(setup_worker):
+    """GS T5: only a successful recovery consumes the previous worker's stop."""
+    from sutradhara.jobs.engine import OrphanReset, claim_job_by_id
+
+    engine, _worker, job_id, _delays = setup_worker
+    worker = JobWorker(engine, previous_worker_stop_requested=True)
+    with session_scope(engine) as session:
+        assert claim_job_by_id(session, job_id) is not None
+
+    def fail_query(conn, cursor, statement, parameters, context, executemany):
+        raise lock_error()
+
+    event.listen(engine, "before_cursor_execute", fail_query)
+    try:
+        assert worker.recover_orphans() == OrphanReset()
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_query)
+    assert worker.recover_orphans() == OrphanReset(requeued_after_stop=(job_id,))
+    with session_scope(engine) as session:
+        assert claim_job_by_id(session, job_id) is not None
+    assert worker.recover_orphans() == OrphanReset(requeued_after_kill=(job_id,))
+    with session_scope(engine) as session:
+        job = session.get(Job, job_id)
+        assert job.stops == job.kills == 1

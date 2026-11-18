@@ -18,6 +18,7 @@ import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TextIO
 
 from sqlalchemy.engine import Engine, make_url
 
@@ -43,14 +44,39 @@ class ProcessLockHeld(RuntimeError):
         super().__init__(f"{purpose} already running; holder pid={pid_text}")
 
 
+class HeldWorkerLock:
+    """A worker's held lock and the stop record inherited from its predecessor."""
+
+    def __init__(self, path: Path, previous_holder_stop_requested: bool, fd: int) -> None:
+        self.path = path
+        self.previous_holder_stop_requested = previous_holder_stop_requested
+        self._fd: int | None = fd
+
+    def record_stop_request(self) -> None:
+        """Append once without waiting for SQLite; a released hold cannot write."""
+        if self._fd is not None:
+            try:
+                os.write(self._fd, b"stop-requested\n")
+            except OSError:
+                return
+
+
 @contextmanager
-def worker_lock(engine_or_url: Engine | str) -> Iterator[Path]:
+def worker_lock(engine_or_url: Engine | str) -> Iterator[HeldWorkerLock]:
     """Acquire the non-blocking worker singleton lock for a database URL."""
 
     lockfile = process_lockfile_for(engine_or_url, namespace="worker")
     try:
-        with exclusive_process_lock(lockfile, purpose="worker"):
-            yield lockfile
+        with _locked_file(lockfile, purpose="worker") as fh:
+            fh.seek(0)
+            previous_stop = any(line.strip() == "stop-requested" for line in fh.read().splitlines())
+            _write_identity(fh, purpose="worker")
+            held = HeldWorkerLock(lockfile, previous_stop, fh.fileno())
+            try:
+                yield held
+            finally:
+                # Invalidate before unlocking: the descriptor number may be reused.
+                held._fd = None
     except ProcessLockHeld as exc:
         raise WorkerAlreadyRunning(exc.lockfile, exc.holder_pid) from exc
 
@@ -59,6 +85,23 @@ def worker_lock(engine_or_url: Engine | str) -> Iterator[Path]:
 def exclusive_process_lock(lockfile: Path, *, purpose: str) -> Iterator[Path]:
     """Acquire the worker-pattern non-blocking flock for another singleton job."""
 
+    with _locked_file(lockfile, purpose=purpose) as fh:
+        _write_identity(fh, purpose=purpose)
+        yield lockfile
+
+
+def _write_identity(fh: TextIO, *, purpose: str) -> None:
+    """Replace old content while preserving the three identity lines and flush."""
+    fh.seek(0)
+    fh.truncate(0)
+    pid = os.getpid()
+    fh.write(f"{socket.gethostname()}:{pid}\npid={pid}\npurpose={purpose}\n")
+    fh.flush()
+
+
+@contextmanager
+def _locked_file(lockfile: Path, *, purpose: str) -> Iterator[TextIO]:
+    """Hold the singleton flock while a caller reads and replaces its record."""
     lockfile.parent.mkdir(parents=True, exist_ok=True)
     with lockfile.open("a+", encoding="utf-8") as fh:
         try:
@@ -68,13 +111,8 @@ def exclusive_process_lock(lockfile: Path, *, purpose: str) -> Iterator[Path]:
                 raise
             fh.seek(0)
             raise ProcessLockHeld(lockfile, _holder_pid(fh.read()), purpose) from exc
-        fh.seek(0)
-        fh.truncate()
-        pid = os.getpid()
-        fh.write(f"{socket.gethostname()}:{pid}\npid={pid}\npurpose={purpose}\n")
-        fh.flush()
         try:
-            yield lockfile
+            yield fh
         finally:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 

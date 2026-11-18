@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import signal
 import socket
 import subprocess
+import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -162,6 +166,44 @@ def _sutra_bin() -> str:
     return str(Path(sys.executable).with_name("sutra"))
 
 
+def test_worker_lock_records_requested_stop(tmp_path, monkeypatch):
+    """GS T1: consume one stop record without changing any identity reader."""
+    from sutradhara.jobs.worker_lock import HeldWorkerLock, WorkerAlreadyRunning
+
+    url = f"sqlite:///{tmp_path / 'stop.db'}"
+    pid = os.getpid()
+    identity = f"{socket.gethostname()}:{pid}"
+    expected = f"{identity}\npid={pid}\npurpose=worker\n"
+    with worker_lock(url) as first:
+        assert isinstance(first, HeldWorkerLock)
+        assert not first.previous_holder_stop_requested
+        first.record_stop_request()
+        assert first.path.read_text() == expected + "stop-requested\n"
+        assert held_process_lock_identity(first.path) == identity
+        with monkeypatch.context() as patch:
+            patch.setattr(worker_lock_module, "_PROC_LOCKS", tmp_path / "missing-proc-locks")
+            assert held_process_lock_identity(first.path) == identity
+        with pytest.raises(WorkerAlreadyRunning) as refused, worker_lock(url):
+            pytest.fail("second holder acquired the worker lock")
+        assert refused.value.holder_pid == pid
+        assert f"pid={pid}" in first.path.read_text()
+    with worker_lock(url) as second:
+        assert second.previous_holder_stop_requested
+        assert second.path.read_text() == expected
+        first.record_stop_request()
+        assert second.path.read_text() == expected
+    with worker_lock(url) as third:
+        assert not third.previous_holder_stop_requested
+
+        def fail_write(*args):
+            raise OSError("injected append failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(worker_lock_module.os, "write", fail_write)
+            third.record_stop_request()
+        assert third.path.read_text() == expected
+
+
 def _rba_hold_worker_lock(url, ready, release):
     """Hold the production lock in a distinct process until the test releases it."""
     with worker_lock(url):
@@ -306,3 +348,291 @@ def test_jobs_run_commits_recovery_before_run_refusal(tmp_path, monkeypatch, cas
             assert row.kills == 3
             assert row.last_error.startswith("killed-repeatedly:")
     engine.dispose()
+
+
+def test_requested_stop_drains_only_running_attempt(tmp_path, monkeypatch):
+    """GS T6: finish A after a stop without admitting its newly eligible B."""
+    import threading
+
+    from sutradhara.jobs import registry
+    from sutradhara.jobs.config import WorkerConfig
+    from sutradhara.jobs.registry import JobResult
+    from sutradhara.jobs.worker import JobWorker
+
+    _url, engine = _sqlite_db(tmp_path)
+    started, release = threading.Event(), threading.Event()
+    outcomes, errors = [], []
+
+    def block(ctx):
+        started.set()
+        if not release.wait(15):
+            return JobResult(ok=False, detail="test did not release attempt")
+        return JobResult(ok=True)
+
+    monkeypatch.setitem(registry._HANDLERS, "_gs_thread", block)
+    with session_scope(engine) as session:
+        a = submit(session, "_gs_thread").id
+        b = submit(session, "_gs_thread", prerequisites=[a]).id
+    worker = JobWorker(engine, config=WorkerConfig(executor_workers=1))
+
+    def drain():
+        try:
+            outcomes.extend(worker.drain())
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=drain, daemon=True)
+    thread.start()
+    try:
+        assert started.wait(15), "A did not start"
+        assert not worker.stop_requested
+        worker.request_stop()
+        assert worker.stop_requested
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive(), "drain did not return within 5 s"
+        assert errors == []
+        assert [outcome.job_id for outcome in outcomes] == [a]
+        with session_scope(engine) as session:
+            assert session.get(Job, a).status == JobStatus.SUCCEEDED
+            assert session.get(Job, b).status == JobStatus.PENDING
+            assert session.get(Job, b).attempts == 0
+    finally:
+        release.set()
+        thread.join(15)
+        engine.dispose()
+
+
+@contextmanager
+def _gs_child(tmp_path, url, *args, name="worker"):
+    """Spawn only our helper and reap that exact child on every exit."""
+    output_path = tmp_path / f"{name}.log"
+    env = {**_worker_env(url), "PYTHONUNBUFFERED": "1"}
+    with output_path.open("w") as output:
+        child = subprocess.Popen(
+            [sys.executable, "tests/graceful_stop_child.py", *args],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            yield child, output_path
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=15)
+
+
+def _gs_wait_for(predicate, reason, *, timeout=15):
+    """Bound marker/output waits without needing a second database writer."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            pytest.fail(reason)
+        time.sleep(0.02)
+
+
+def _gs_wait_for_stop(lockfile):
+    _gs_wait_for(
+        lambda: lockfile.exists() and "stop-requested\n" in lockfile.read_text(),
+        "no stop line within 5 s",
+        timeout=5,
+    )
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+def test_first_signal_finishes_attempt_without_claiming_next(tmp_path, signum):
+    """GS T7: both first signals preserve A and leave dependent B unclaimed."""
+    url, engine = _sqlite_db(tmp_path)
+    try:
+        with session_scope(engine) as session:
+            a = submit(session, "_gs_block", {"directory": str(tmp_path)}).id
+            b = submit(session, "_gs_block", {"directory": str(tmp_path)}, prerequisites=[a]).id
+        with _gs_child(tmp_path, url) as (child, output_path):
+            _gs_wait_for(lambda: (tmp_path / f"started-{a}").exists(), "A did not start")
+            child.send_signal(signum)
+            time.sleep(1)
+            assert child.poll() is None, "worker did not stay alive 1 s after first signal"
+            _gs_wait_for_stop(tmp_path / "worker-lock.db.worker.lock")
+            (tmp_path / "release").touch()
+            assert child.wait(timeout=15) == 0, output_path.read_text()
+            assert "worker stopped" in output_path.read_text()
+        with session_scope(engine) as session:
+            assert session.get(Job, a).status == JobStatus.SUCCEEDED
+            assert session.get(Job, b).status == JobStatus.PENDING
+            assert session.get(Job, b).attempts == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("stopped", [True, False], ids=["stopped", "killed"])
+def test_cut_off_attempt_recovers_stop_or_kill(tmp_path, stopped):
+    """GS T8: the stop record is durable even while the attempt owns SQLite."""
+    import sqlite3
+
+    url, engine = _sqlite_db(tmp_path)
+    try:
+        with session_scope(engine) as session:
+            a = submit(session, "_gs_block", {"directory": str(tmp_path)}).id
+        with _gs_child(tmp_path, url, name="first") as (child, _output_path):
+            _gs_wait_for(lambda: (tmp_path / f"started-{a}").exists(), "A did not start")
+            connection = sqlite3.connect(tmp_path / "worker-lock.db", timeout=0)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                    connection.execute("BEGIN IMMEDIATE")
+            finally:
+                connection.close()
+            if stopped:
+                child.send_signal(signal.SIGTERM)
+                _gs_wait_for_stop(tmp_path / "worker-lock.db.worker.lock")
+            child.kill()
+            assert child.wait(timeout=15) == -signal.SIGKILL
+        (tmp_path / "release").touch()
+        with _gs_child(tmp_path, url, "--once", name="restart") as (child, output_path):
+            assert child.wait(timeout=15) == 0, output_path.read_text()
+        with session_scope(engine) as session:
+            row = session.get(Job, a)
+            assert row.status == JobStatus.SUCCEEDED
+            if stopped:
+                assert row.stops == 1
+                assert row.kills == 0
+            else:
+                assert row.kills == 1
+                assert row.stops == 0
+            assert row.attempts == 2
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+def test_second_signal_ends_worker_immediately(tmp_path, signum):
+    """GS T9: a second signal ends the worker without waiting for A's release."""
+    url, engine = _sqlite_db(tmp_path)
+    try:
+        with session_scope(engine) as session:
+            a = submit(session, "_gs_block", {"directory": str(tmp_path)}).id
+        with _gs_child(tmp_path, url) as (child, _output_path):
+            _gs_wait_for(lambda: (tmp_path / f"started-{a}").exists(), "A did not start")
+            child.send_signal(signal.SIGTERM)
+            _gs_wait_for_stop(tmp_path / "worker-lock.db.worker.lock")
+            child.send_signal(signum)
+            assert child.wait(timeout=2) == -signum
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("stopped", [False, True], ids=["after-kill", "after-stop"])
+def test_startup_reports_requeued_and_ended_jobs_separately(tmp_path, stopped):
+    """GS T10: recovered counts exclude ended jobs, and stops never end them."""
+    url, engine = _sqlite_db(tmp_path)
+    try:
+        with session_scope(engine) as session:
+            x = submit(session, "verify", {"copy_id": 1}, prerequisites=[999_999])
+            y = submit(session, "verify", {"copy_id": 2}, prerequisites=[999_999])
+            for _ in range(2):
+                assert claim_job_by_id(session, x.id) is x
+                reset_orphaned_running_jobs(session)
+            assert x.kills == 2
+            assert y.kills == 0
+            assert claim_job_by_id(session, x.id) is x
+            assert claim_job_by_id(session, y.id) is y
+            x_id = x.id
+        if stopped:
+            with worker_lock(url) as held:
+                held.record_stop_request()
+        with _gs_child(tmp_path, url) as (child, output_path):
+            _gs_wait_for(
+                lambda: "orphaned running job(s)" in output_path.read_text(),
+                "worker did not print its recovery line",
+            )
+            child.send_signal(signal.SIGTERM)
+            returncode = child.wait(timeout=15)
+            output = output_path.read_text()
+            if stopped:
+                assert (
+                    "recovered 2 orphaned running job(s): 0 after a kill, 2 after a requested stop"
+                    in output
+                )
+                assert "ended " not in output
+            else:
+                assert (
+                    "recovered 1 orphaned running job(s): 1 after a kill, 0 after a requested stop"
+                    in output
+                )
+                assert (
+                    "ended 1 job(s) killed-repeatedly (found running at a third worker start): "
+                    f"{x_id}" in output
+                )
+            assert returncode == 0, output
+    finally:
+        engine.dispose()
+
+
+def test_worker_once_installs_and_restores_signal_handlers(tmp_path, monkeypatch):
+    """GS T11: handlers cover the no-argument drain and are restored on exit."""
+    from click.testing import CliRunner
+
+    from sutradhara.cli.worker import worker_cmd
+    from sutradhara.jobs.worker import JobWorker
+
+    url, engine = _sqlite_db(tmp_path)
+    monkeypatch.setenv("SUTRADHARA_DB_URL", url)
+    monkeypatch.setenv("SUTRADHARA_RESOURCE_CONTROL", "0")
+    monkeypatch.setattr("sutradhara.cli.worker.make_engine", lambda *args, **kwargs: engine)
+    signals = (signal.SIGTERM, signal.SIGINT)
+    before = {sig: signal.getsignal(sig) for sig in signals}
+    during = {}
+
+    def inspect_drain(worker):
+        during.update({sig: signal.getsignal(sig) for sig in signals})
+        return []
+
+    monkeypatch.setattr(JobWorker, "drain", inspect_drain)
+    try:
+        result = CliRunner().invoke(worker_cmd, ["--once"])
+        assert result.exit_code == 0, result.output
+        assert all(during[sig] != before[sig] for sig in signals), "during drain"
+        assert {sig: signal.getsignal(sig) for sig in signals} == before, "after drain"
+    finally:
+        for sig, handler in before.items():
+            signal.signal(sig, handler)
+        engine.dispose()
+
+
+def test_worker_unit_sets_stop_scope_and_deadline():
+    """GS T12: the shipped unit protects children until the provisional deadline."""
+    import configparser
+
+    unit = configparser.ConfigParser(interpolation=None)
+    unit.read(Path(__file__).resolve().parents[1] / "systemd/sutradhara-worker.service")
+    assert unit["Service"].get("KillMode") == "mixed"
+    assert unit["Service"].get("TimeoutStopSec") == "90s"
+
+
+def test_jobs_run_consumes_previous_holder_stop(tmp_path, monkeypatch):
+    """GS T13: the synchronous runner forwards the same lock-file stop fact."""
+    from click.testing import CliRunner
+
+    from sutradhara.cli.jobs import jobs_group
+
+    url, engine = _sqlite_db(tmp_path)
+    monkeypatch.setenv("SUTRADHARA_DB_URL", url)
+    monkeypatch.setattr("sutradhara.cli.jobs.make_engine", lambda _url: engine)
+    try:
+        with session_scope(engine) as session:
+            job = submit(session, "verify", {"copy_id": 1}, prerequisites=[999_999])
+            assert claim_job_by_id(session, job.id) is job
+            job_id = job.id
+        with worker_lock(url) as held:
+            held.record_stop_request()
+        result = CliRunner().invoke(jobs_group, ["run", "--limit", "0"])
+        assert result.exit_code == 0, result.output
+        with session_scope(engine) as session:
+            row = session.get(Job, job_id)
+            assert row.status == JobStatus.PENDING
+            assert row.stops == 1
+            assert row.kills == 0
+    finally:
+        engine.dispose()

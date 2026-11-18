@@ -724,6 +724,8 @@ migration.
 | `status` | enum | `pending`, `queued`, `running`, `succeeded`, `failed`, or `cancelled`. |
 | `step_state` | json | Checkpointed handler progress for retry/resume. |
 | `attempts` | integer | Number of dispatch attempts. |
+| `kills` | integer, default `0` | Times found running at startup without a previous worker's stop record; the third ends the job as `killed-repeatedly`. Excluded from the retry count. |
+| `stops` | integer, default `0` | Times found running at startup after a requested worker stop. Excluded from the retry count and kill limit. |
 | `not_before`, `priority` | time / integer | Eligibility time and scheduling priority. |
 | `dedupe_key` | text, optional | Live-job idempotency key; unique while the job is live. |
 | `recon_domain`, `recon_target_key` | text, optional | Reconciler identity for a condition-backed job. |

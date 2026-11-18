@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import threading
+from types import FrameType
+
 import click
 
 from sutradhara.catalog.session import database_url, make_engine
@@ -29,7 +34,7 @@ def worker_cmd(once: bool, pools: tuple[str, ...]) -> None:
 
     try:
         url = database_url()
-        with worker_lock(url):
+        with worker_lock(url) as held:
             _echo_resource_control()
             engine = make_engine(url, pool_size=max(config.executor_workers or 1, 1) + 2)
             if engine.dialect.name == "sqlite":
@@ -40,24 +45,64 @@ def worker_cmd(once: bool, pools: tuple[str, ...]) -> None:
                     raise click.ClickException(
                         f"worker requires SQLite WAL journal mode; database reports {journal_mode}"
                     )
-            worker = JobWorker(engine, config=config)
-            if once:
-                outcomes = worker.drain()
-                click.echo(f"worker drained {len(outcomes)} job(s)")
-                return
-            recovered = worker.recover_orphans()
-            click.echo("worker starting; press Ctrl-C to stop")
-            if recovered:
-                click.echo(f"recovered {recovered} orphaned running job(s)")
+            worker = JobWorker(
+                engine,
+                config=config,
+                previous_worker_stop_requested=held.previous_holder_stop_requested,
+            )
+            stop_delivered = False
+
+            def handle_stop(signum: int, _frame: FrameType | None) -> None:
+                """Record the first signal; let either second signal end the process."""
+                nonlocal stop_delivered
+                if stop_delivered:
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                    signal.signal(signal.SIGINT, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+                    return
+                # Latch before the append, including a signal re-entering that write.
+                stop_delivered = True
+                held.record_stop_request()
+                worker.request_stop()
+
+            previous_handlers = (
+                {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+                if threading.current_thread() is threading.main_thread()
+                else {}
+            )
             try:
-                while True:
+                for sig in previous_handlers:
+                    signal.signal(sig, handle_stop)
+                if once:
+                    outcomes = worker.drain()
+                    click.echo(f"worker drained {len(outcomes)} job(s)")
+                    return
+                recovered = worker.recover_orphans()
+                click.echo("worker starting; press Ctrl-C to stop")
+                if recovered.requeued_after_kill or recovered.requeued_after_stop:
+                    kills = len(recovered.requeued_after_kill)
+                    stops = len(recovered.requeued_after_stop)
+                    click.echo(
+                        f"recovered {kills + stops} orphaned running job(s): "
+                        f"{kills} after a kill, {stops} after a requested stop"
+                    )
+                if recovered.ended_killed_repeatedly:
+                    ended = recovered.ended_killed_repeatedly
+                    click.echo(
+                        f"ended {len(ended)} job(s) killed-repeatedly "
+                        "(found running at a third worker start): "
+                        + ", ".join(str(job_id) for job_id in ended)
+                    )
+                while not worker.stop_requested:
                     outcomes = worker.drain(recover_orphans=False)
                     if not outcomes:
                         import time
 
                         time.sleep(1)
-            except KeyboardInterrupt:
                 click.echo("worker stopped")
+            finally:
+                for sig, handler in previous_handlers.items():
+                    signal.signal(sig, handler)
     except WorkerAlreadyRunning as exc:
         pid = "unknown" if exc.holder_pid is None else str(exc.holder_pid)
         raise click.ClickException(

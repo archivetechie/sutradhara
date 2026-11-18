@@ -660,6 +660,77 @@ def test_retry_policy_delay_has_jitter_and_clamp_bounds() -> None:
     assert retry.delay_seconds(0, max_seconds=450) == 0
 
 
+def test_orphan_reset_separates_requested_stops_from_kills(engine):
+    """GS T2: a requested stop requeues even a job already at two kills."""
+    from sutradhara.jobs.engine import OrphanReset
+
+    with session_scope(engine) as session:
+        p, q, r = [submit(session, "verify", {"copy_id": i}) for i in (1, 2, 3)]
+        for kills in (1, 2):
+            assert claim_job_by_id(session, q.id) is q
+            reset_orphaned_running_jobs(session)
+            assert q.kills == kills
+        for job in (p, q, r):
+            assert claim_job_by_id(session, job.id) is job
+        before = dt.datetime.now(dt.UTC)
+        reset = reset_orphaned_running_jobs(session, after_requested_stop=True)
+        assert reset.requeued_after_stop == (p.id, q.id, r.id)
+        assert reset.requeued_after_kill == reset.ended_killed_repeatedly == ()
+        assert reset.total == 3
+        for job, kills in ((p, 0), (q, 2), (r, 0)):
+            assert job.status == JobStatus.PENDING
+            assert job.started_at is None
+            assert _aware_utc(job.not_before) >= before
+            assert job.stops == 1
+            assert job.kills == kills
+            assert job.last_error.startswith("stopped:")
+            assert f"attempt {job.attempts}" in job.last_error
+            assert job.not_before.isoformat() in job.last_error
+            assert job.step_state["engine_observations"][-1] == {"note": job.last_error}
+        assert list(session.scalars(select(JobAttempt))) == []
+        for job in (p, q, r):
+            assert claim_job_by_id(session, job.id) is job
+        reset = reset_orphaned_running_jobs(session)
+        assert reset == OrphanReset(
+            requeued_after_kill=(p.id, r.id), ended_killed_repeatedly=(q.id,)
+        )
+        assert reset.total == 3
+        assert q.status == JobStatus.FAILED
+        assert q.last_error.startswith("killed-repeatedly:")
+        assert p.status == r.status == JobStatus.PENDING
+        assert p.stops == q.stops == r.stops == 1
+        assert list(session.scalars(select(JobAttempt))) == []
+
+
+def test_requested_stop_does_not_consume_retry_or_backoff(engine, monkeypatch):
+    """GS T3: a cut-off requested stop consumes neither retry nor backoff."""
+    from sutradhara.jobs import registry
+
+    monkeypatch.setitem(
+        registry._HANDLERS, "_gs_retry", lambda ctx: JobResult(ok=False, detail="failed")
+    )
+    config = WorkerConfig(
+        per_kind_retry={"_gs_retry": RetryPolicy(max_attempts=2, backoff_seconds=60)}
+    )
+    now = dt.datetime.now(dt.UTC)
+    with session_scope(engine) as session:
+        job = submit(session, "_gs_retry")
+        assert claim_job_by_id(session, job.id) is job
+        reset_orphaned_running_jobs(session, after_requested_stop=True)
+        for failure in (1, 2):
+            assert claim_job_by_id(session, job.id) is job
+            assert not run_one(session, job.id).ok
+            job_engine.apply_retry_policy(session, job, config=config, now=now)
+            assert job.attempts == failure + 1
+            assert job.stops == 1
+            assert job.kills == 0
+            if failure == 1:
+                assert job.status == JobStatus.PENDING
+                assert 48 <= (_aware_utc(job.not_before) - now).total_seconds() <= 72
+            else:
+                assert job.status == JobStatus.FAILED
+
+
 def test_worker_startup_resets_orphaned_running_jobs(engine: Engine) -> None:
     with session_scope(engine) as s:
         job = submit(s, "verify", {"copy_id": 1})
@@ -667,7 +738,7 @@ def test_worker_startup_resets_orphaned_running_jobs(engine: Engine) -> None:
         job.started_at = dt.datetime.now(dt.UTC)
 
     with session_scope(engine) as s:
-        assert reset_orphaned_running_jobs(s) == 1
+        assert reset_orphaned_running_jobs(s).total == 1
         row = s.get(Job, job.id)
         assert row is not None
         assert row.status == JobStatus.PENDING
@@ -685,7 +756,7 @@ def test_third_worker_kill_fails_without_attempt(engine: Engine) -> None:
             assert claim_job_by_id(session, job.id) is job
             started = job.started_at
             due = job.not_before
-            assert reset_orphaned_running_jobs(session) == 1
+            assert reset_orphaned_running_jobs(session).total == 1
             assert job.attempts == job.kills == kill
             assert len(job.step_state["engine_observations"]) == kill
             assert list(session.scalars(select(JobAttempt))) == []
@@ -699,7 +770,7 @@ def test_third_worker_kill_fails_without_attempt(engine: Engine) -> None:
                 assert job.not_before == due
                 assert job.last_error.startswith("killed-repeatedly:")
                 assert job.step_state["engine_observations"][-1]["note"] == job.last_error
-        assert reset_orphaned_running_jobs(session) == 0
+        assert reset_orphaned_running_jobs(session).total == 0
         assert job.kills == 3
 
 

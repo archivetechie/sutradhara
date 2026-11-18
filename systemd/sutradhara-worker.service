@@ -10,6 +10,10 @@ Group=replica
 WorkingDirectory=/opt/sutradhara
 EnvironmentFile=/etc/sutradhara/sutradhara.env
 ExecStart=/opt/sutradhara/.venv/bin/sutra worker
+# Signal only the worker at stop; children in its control group keep running their attempts.
+KillMode=mixed
+# Write out today's implicit 90 s stop deadline; this value is provisional.
+TimeoutStopSec=90s
 Restart=on-failure
 RestartSec=3
 UMask=0007

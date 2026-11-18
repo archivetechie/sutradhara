@@ -14,6 +14,7 @@ import traceback
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, cast
 
@@ -606,20 +607,57 @@ def claim_job_by_id(
     return _claim_job_by_id(session, job_id, now=now or _utcnow())
 
 
-def reset_orphaned_running_jobs(session: Session) -> int:
-    """Count startup-observed worker deaths, stopping jobs at the kill limit."""
+@dataclass(frozen=True)
+class OrphanReset:
+    """Startup recovery grouped by cause and outcome, in ascending job order."""
+
+    requeued_after_kill: tuple[int, ...] = ()
+    requeued_after_stop: tuple[int, ...] = ()
+    ended_killed_repeatedly: tuple[int, ...] = ()
+
+    @property
+    def total(self) -> int:
+        return (
+            len(self.requeued_after_kill)
+            + len(self.requeued_after_stop)
+            + len(self.ended_killed_repeatedly)
+        )
+
+
+def reset_orphaned_running_jobs(
+    session: Session, *, after_requested_stop: bool = False
+) -> OrphanReset:
+    """Requeue requested stops neutrally; count other deaths toward the kill limit."""
 
     now = _utcnow()
-    rows = list(session.scalars(select(Job).where(Job.status == JobStatus.RUNNING)))
+    rows = list(
+        session.scalars(select(Job).where(Job.status == JobStatus.RUNNING).order_by(Job.id))
+    )
+    requeued_after_kill: list[int] = []
+    requeued_after_stop: list[int] = []
+    ended_killed_repeatedly: list[int] = []
     for job in rows:
-        job.kills += 1
-        at_limit = job.kills >= KILL_LIMIT
-        marker = (
-            "killed-repeatedly: found running at a worker start for the third time; "
-            "the job is not run again"
-            if at_limit
-            else f"orphaned RUNNING at startup, reset to PENDING at {now.isoformat()}"
-        )
+        if after_requested_stop:
+            job.stops += 1
+            at_limit = False
+            marker = (
+                f"stopped: attempt {job.attempts} found RUNNING after a requested worker stop; "
+                f"reset to PENDING at {now.isoformat()}"
+            )
+            requeued_after_stop.append(job.id)
+        else:
+            job.kills += 1
+            at_limit = job.kills >= KILL_LIMIT
+            marker = (
+                "killed-repeatedly: found running at a worker start for the third time; "
+                "the job is not run again"
+                if at_limit
+                else f"orphaned RUNNING at startup, reset to PENDING at {now.isoformat()}"
+            )
+            if at_limit:
+                ended_killed_repeatedly.append(job.id)
+            else:
+                requeued_after_kill.append(job.id)
         prior = dict(job.step_state or {})
         engine_observations = list(prior.get("engine_observations") or [])
         engine_observations.append({"note": marker})
@@ -642,7 +680,11 @@ def reset_orphaned_running_jobs(session: Session) -> int:
             job.started_at = None
             job.not_before = now
     session.flush(rows)
-    return len(rows)
+    return OrphanReset(
+        requeued_after_kill=tuple(requeued_after_kill),
+        requeued_after_stop=tuple(requeued_after_stop),
+        ended_killed_repeatedly=tuple(ended_killed_repeatedly),
+    )
 
 
 def job_context(
@@ -728,7 +770,7 @@ def apply_retry_policy(
     if job.status != JobStatus.FAILED:
         return
     retry = config.retry_for_kind(job.kind)
-    counted_attempts = job.attempts - job.kills
+    counted_attempts = job.attempts - job.kills - job.stops
     if counted_attempts >= retry.max_attempts:
         return
     base = now or _utcnow()

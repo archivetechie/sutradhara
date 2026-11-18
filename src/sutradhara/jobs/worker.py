@@ -24,6 +24,7 @@ from sutradhara.jobs.attempts import record_attempt
 from sutradhara.jobs.config import WorkerConfig
 from sutradhara.jobs.engine import (
     AttemptSuperseded,
+    OrphanReset,
     _record_reconciler_condition,
     apply_retry_policy,
     attempt_detail,
@@ -57,24 +58,45 @@ class WorkerJobOutcome:
 class JobWorker:
     """Lease-aware worker for a single Sutradhara process."""
 
-    def __init__(self, engine: Engine, *, config: WorkerConfig | None = None) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        config: WorkerConfig | None = None,
+        previous_worker_stop_requested: bool = False,
+    ) -> None:
         self.engine = engine
         self.config = config or WorkerConfig.defaults()
         self.leases = LeaseManager(self.config.capacities)
         self._blocked_scans: dict[int, int] = {}
         self._pending_failures: dict[int, WorkerJobOutcome] = {}
         self._recovery_pending = False
+        self._previous_worker_stop_requested = previous_worker_stop_requested
+        self._stop_requested = False
 
-    def recover_orphans(self) -> int:
+    def request_stop(self) -> None:
+        """Stop admitting claim passes while allowing running attempts to finish."""
+        self._stop_requested = True
+
+    @property
+    def stop_requested(self) -> bool:
+        """Whether this worker has been asked to stop, without taking a lock."""
+        return self._stop_requested
+
+    def recover_orphans(self) -> OrphanReset:
+        """Consume the previous holder's stop only after the reset commits."""
         try:
             with session_scope(self.engine) as session:
-                recovered = reset_orphaned_running_jobs(session)
+                recovered = reset_orphaned_running_jobs(
+                    session, after_requested_stop=self._previous_worker_stop_requested
+                )
         except OperationalError as error:
             if not is_sqlite_lock_error(error):
                 raise
             self._recovery_pending = True
-            return 0
+            return OrphanReset()
         self._recovery_pending = False
+        self._previous_worker_stop_requested = False
         return recovered
 
     def drain(self, *, recover_orphans: bool = True) -> list[WorkerJobOutcome]:
@@ -93,7 +115,11 @@ class JobWorker:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             while True:
                 free_slots = max_workers - len(futures)
-                claimed = self._claim_available(max_new=free_slots) if free_slots > 0 else []
+                claimed = (
+                    self._claim_available(max_new=free_slots)
+                    if not self.stop_requested and free_slots > 0
+                    else []
+                )
                 for job_id, granted in claimed:
                     future = executor.submit(
                         _execute_job,
