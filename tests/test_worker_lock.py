@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import os
 import signal
 import socket
@@ -202,6 +203,60 @@ def test_worker_lock_records_requested_stop(tmp_path, monkeypatch):
             patch.setattr(worker_lock_module.os, "write", fail_write)
             third.record_stop_request()
         assert third.path.read_text() == expected
+
+
+def test_worker_lock_syncs_consumed_stop_before_yield(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR1 T14: make stop-record consumption durable before the caller can reset jobs."""
+    url = f"sqlite:///{tmp_path / 'sync-stop.db'}"
+    with worker_lock(url) as first:
+        first.record_stop_request()
+
+    real_fsync = worker_lock_module.os.fsync
+    events: list[tuple[str, int | None, bytes | None]] = []
+
+    def record_fsync(fd: int) -> None:
+        """Capture the flushed lock contents at the sync, then perform the real sync."""
+        events.append(("fsync", fd, first.path.read_bytes()))
+        real_fsync(fd)
+
+    monkeypatch.setattr(worker_lock_module.os, "fsync", record_fsync)
+    pid = os.getpid()
+    expected = f"{socket.gethostname()}:{pid}\npid={pid}\npurpose=worker\n".encode()
+    with worker_lock(url) as second:
+        events.append(("body", None, None))
+        assert [event[0] for event in events] == ["fsync", "body"], "exactly one fsync before body"
+        assert events[0][2] == expected, "the file's bytes are exactly the three identity lines"
+        assert second.previous_holder_stop_requested
+
+
+def test_worker_lock_fsync_failure_releases_lock_after_consuming_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR1 T15: abort before the body on sync failure, releasing the consumed lock."""
+    url = f"sqlite:///{tmp_path / 'failed-sync-stop.db'}"
+    with worker_lock(url) as first:
+        first.record_stop_request()
+
+    body_calls: list[bool] = []
+
+    def body() -> None:
+        """Record whether the caller was allowed to run after the failed sync."""
+        body_calls.append(True)
+
+    def fail_fsync(fd: int) -> None:
+        """Inject an I/O error at the production sync boundary."""
+        raise OSError(errno.EIO, "injected")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker_lock_module.os, "fsync", fail_fsync)
+        with pytest.raises(OSError, match="injected") as failed, worker_lock(url):
+            body()
+        assert failed.value.errno == errno.EIO
+    assert not body_calls
+    with worker_lock(url) as again:
+        assert not again.previous_holder_stop_requested
 
 
 def _rba_hold_worker_lock(url, ready, release):

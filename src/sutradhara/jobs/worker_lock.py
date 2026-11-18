@@ -71,6 +71,7 @@ def worker_lock(engine_or_url: Engine | str) -> Iterator[HeldWorkerLock]:
             fh.seek(0)
             previous_stop = any(line.strip() == "stop-requested" for line in fh.read().splitlines())
             _write_identity(fh, purpose="worker")
+            os.fsync(fh.fileno())
             held = HeldWorkerLock(lockfile, previous_stop, fh.fileno())
             try:
                 yield held
