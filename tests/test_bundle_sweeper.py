@@ -1007,6 +1007,59 @@ def test_rba2d_bad_staging_blocks_first_repair(engine, tmp_path, monkeypatch, fa
     assert backend.calls == before
 
 
+def test_rba_u1_bad_staging_names_copy_problems(engine, tmp_path, monkeypatch):
+    """Keep the staging block primary and report the other pool problems with it."""
+    from sutradhara.bundle_copy_ledger import identity_attempts
+
+    pools = ("p-a", "p-b", "p-c")
+    bundle_id = _rba_seed(engine, tmp_path, pools=pools)
+    backend = _RbaBackend(pool_modes={"p-a": "absent", "p-b": "absent", "p-c": "conflict"})
+    _rba2d_flush(engine, bundle_id, backend)
+    path = _rba2d_paths(engine, bundle_id)[0]
+    path.write_bytes(b"x" * path.stat().st_size)
+    before = backend.calls.copy()
+    with session_scope(engine) as session:
+        assert (
+            session.scalars(
+                select(Copy.id).where(Copy.bundle_id == bundle_id, Copy.deleted_at.is_(None))
+            ).first()
+            is None
+        )
+        outcomes = {
+            pool: [
+                outcome
+                for _, outcome in identity_attempts(
+                    session, bundle_id=bundle_id, pool_id=pool, generation=0
+                )
+            ]
+            for pool in pools
+        }
+        assert None not in outcomes["p-a"]
+        assert None not in outcomes["p-b"]
+        assert "conflict" in outcomes["p-c"]
+
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    assert not result.ok
+    assert result.condition is not None
+    assert result.condition.condition == "blocked"
+    assert result.condition.reason == "staging-source-unavailable"
+    assert bundle_id in result.detail
+    assert path.name in result.detail
+    assert "digest" in result.detail
+    assert "human decides" in result.detail
+    assert "pool p-c: copy-identity-conflict" in result.detail
+    projection_message = (
+        "pool p-a: transient-backend-failure: no attempt landed; "
+        "pool p-b: transient-backend-failure: no attempt landed; "
+        "pool p-c: copy-identity-conflict: pool identity conflicts with the ledger"
+    )
+    assert result.detail.endswith(
+        f"a human decides how to recover the staging source. {projection_message}"
+    )
+    assert result.condition.message == result.detail
+    assert backend.calls == before
+
+
 def _rba2d_appledouble_member(engine, tmp_path, bundle_id, *, compress=False):
     """Add a real merged member, optionally followed by the real zstd transform."""
     from sutradhara.catalog.models import StagingTransform
@@ -3352,6 +3405,161 @@ def test_fr2_repair_step1_unexpected_read_is_not_repeated(engine, tmp_path, monk
         assert condition.condition == "backoff"
         assert condition.reason == "write-unresolved"
         assert "p-b" in condition.message
+
+
+@pytest.mark.parametrize("second_lookup", ["same-object", "absent"])
+def test_rba_u1_repair_skips_pool_pending_verification(
+    engine, tmp_path, monkeypatch, second_lookup
+):
+    """A step-1 copy awaiting verification settles its pool for the entire repair pass."""
+    from sutradhara.bundle_copy_ledger import identity_attempts
+    from sutradhara.catalog.copies import add_bundle_copy
+    from sutradhara.catalog.models import VerifyReceipt
+    from sutradhara.catalog.types import CopySource
+    from sutradhara.durability import bundle_replication_status
+    from sutradhara.evidence_recorder import record_unmeasured_promotion
+    from sutradhara.jobs.config import WorkerConfig
+    from sutradhara.jobs.engine import submit
+    from sutradhara.jobs.models import LIVE_JOB_STATUSES, Job
+    from sutradhara.jobs.reconcilers import bundle_copy
+    from sutradhara.jobs.reconcilers.conditions import OBSERVED_PRESENT
+    from sutradhara.jobs.worker import JobWorker
+
+    class _PendingVerifyBackend(_RbaBackend):
+        """Keep a named copy readable while its measurements are deferred."""
+
+        def __init__(self):
+            super().__init__()
+            self.unmeasured_object_id = None
+            self.verify_calls = Counter()
+
+        def verify(self, locator, **kwargs):
+            object_id = locator["object_id"]
+            self.verify_calls[object_id] += 1
+            if object_id == self.unmeasured_object_id:
+                return VerifyResult(ok=True, measured=False, detail="measurement deferred")
+            return super().verify(locator, **kwargs)
+
+        def lookup_pool_object(self, pool, object_name, *, candidate_digests):
+            found = super().lookup_pool_object(
+                pool, object_name, candidate_digests=candidate_digests
+            )
+            if (
+                pool == "p-b"
+                and second_lookup == "absent"
+                and sum(p == "p-b" for p, _, _ in self.lookup_calls) > 1
+            ):
+                return None
+            return found
+
+    bundle_id = _rba_seed(engine, tmp_path)
+    backend = _PendingVerifyBackend()
+    with session_scope(engine) as session:
+        flush_bundle(
+            session,
+            bundle_id=bundle_id,
+            backends=_backends(session, backend),
+            builder=LocalArchiveBuilder(),
+        )
+    with session_scope(engine) as session:
+        x = session.scalars(
+            select(Copy).where(Copy.bundle_id == bundle_id, Copy.pool_id == "p-b")
+        ).one()
+        x_id = x.id
+        x_object_id = x.native_locator["object_id"]
+        dedupe_key = f"verify:remeasure:{x_id}"
+        not_before = dt.datetime.now(dt.UTC) + dt.timedelta(days=1)
+        job = submit(
+            session, "verify", {"copy_id": x_id}, dedupe_key=dedupe_key, not_before=not_before
+        )
+        job_id = job.id
+        record_unmeasured_promotion(
+            session,
+            x,
+            VerifyResult(ok=True, measured=False, detail="scrub rediscovery"),
+            source="scrub",
+            execution_id="rba-u1-scrub",
+        )
+        y, _ = add_bundle_copy(
+            session,
+            bundle_id=bundle_id,
+            backend_id=x.backend_id,
+            pool_id="p-b",
+            native_locator={"pool_id": "p-b", "object_id": "newer-corrupt"},
+            integrity_hash=b"y" * 32,
+            source=CopySource.INGEST,
+            health=CopyHealth.CORRUPT,
+        )
+        y_id = y.id
+        _fr1_pending_duplicate(session, bundle_id)
+    backend.unmeasured_object_id = x_object_id
+    backend.lookup_calls.clear()
+    backend.verify_calls.clear()
+
+    live_job = select(Job).where(Job.dedupe_key == dedupe_key, Job.status.in_(LIVE_JOB_STATUSES))
+    x_receipts = select(VerifyReceipt).where(VerifyReceipt.copy_id == x_id)
+    y_receipts = select(VerifyReceipt).where(VerifyReceipt.copy_id == y_id)
+    with session_scope(engine) as session:
+        missing = bundle_replication_status(session, bundle_id)["missing"]
+        assert {target.pool_id for target in missing} == {"p-b"}
+        x, y = session.get(Copy, x_id), session.get(Copy, y_id)
+        assert x.health == CopyHealth.OK
+        assert x.last_measured_digest is None
+        job = session.scalars(live_job).one()
+        assert job.id == job_id
+        assert job.not_before.replace(tzinfo=dt.UTC) == not_before
+        assert job.not_before.replace(tzinfo=dt.UTC) > dt.datetime.now(dt.UTC)
+        job_state = (job.status, job.attempts)
+        assert y.id > x.id
+        assert y.health == CopyHealth.CORRUPT
+        assert [
+            outcome
+            for _, outcome in identity_attempts(
+                session, bundle_id=bundle_id, pool_id="p-b", generation=0
+            )
+        ] == ["landed", None]
+        assert bundle_copy.observe(session, bundle_id).observed_state == OBSERVED_PRESENT
+        before_receipts = {receipt.event_id for receipt in session.scalars(x_receipts)}
+
+    result = _rba_repair(engine, bundle_id, backend, monkeypatch)
+    assert result.ok
+    assert result.condition is None
+    assert backend.calls == {"p-a": 1, "p-b": 1}
+    assert sum(pool == "p-b" for pool, _, _ in backend.lookup_calls) == 1
+    assert backend.verify_calls[x_object_id] == 1
+    with session_scope(engine) as session:
+        x, y = session.get(Copy, x_id), session.get(Copy, y_id)
+        assert y.health == CopyHealth.CORRUPT
+        assert session.scalars(y_receipts).first() is None
+        assert x.health == CopyHealth.OK
+        assert x.last_measured_digest is None
+        added = [
+            receipt
+            for receipt in session.scalars(x_receipts)
+            if receipt.event_id not in before_receipts
+        ]
+        assert [(receipt.source, receipt.failure_kind) for receipt in added] == [
+            ("fanout", "measurement-invalidated")
+        ]
+        job = session.scalars(live_job).one()
+        assert job.id == job_id
+        assert (job.status, job.attempts) == job_state
+        assert job.not_before.replace(tzinfo=dt.UTC) == not_before
+        assert job.not_before.replace(tzinfo=dt.UTC) > dt.datetime.now(dt.UTC)
+
+    backend.unmeasured_object_id = None
+    with session_scope(engine) as session:
+        session.get(Job, job_id).not_before = dt.datetime.now(dt.UTC)
+    outcomes = JobWorker(engine, config=WorkerConfig(executor_workers=1)).drain()
+    assert len(outcomes) == 1
+    assert outcomes[0].result.ok
+    with session_scope(engine) as session:
+        x, y = session.get(Copy, x_id), session.get(Copy, y_id)
+        assert x.last_measured_digest == x.integrity_hash
+        assert bundle_replication_status(session, bundle_id)["complete"]
+        assert backend.calls == {"p-a": 1, "p-b": 1}
+        assert bundle_copy.blocked_projection_for_bundle(session, bundle_id) is None
+        assert y.health == CopyHealth.CORRUPT
 
 
 def _fr1_released_landed_bundle(engine, tmp_path, backend):

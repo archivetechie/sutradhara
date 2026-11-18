@@ -168,9 +168,8 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
     sources = list(
         select_source_candidates(ctx.session, BundleTarget(bundle.id), purpose="self_heal")
     )
-    unreadable_sources: dict[int, str] = {}
     if missing_targets:
-        unreadable_sources, key_failure = _check_source_keys(
+        _, key_failure = _check_source_keys(
             ctx, bundle.id, sources=sources, backends=backends, keys=keys
         )
         if key_failure is not None:
@@ -181,8 +180,6 @@ def handle_bundle_repair(ctx: JobContext) -> JobResult:
         bundle=bundle,
         targets=targets,
         backends=backends,
-        sources=sources,
-        unreadable_sources=unreadable_sources,
         builder=builder,
         keys=keys,
         key_epoch=key_epoch,
@@ -256,8 +253,6 @@ def _repair_after_preflight(
     bundle: Bundle,
     targets: list[PoolTargetEntry[WritableStorageBackend]],
     backends: dict[int, WritableStorageBackend],
-    sources: list[Copy],
-    unreadable_sources: dict[int, str],
     builder: ArchiveBuilder,
     keys: KeyRegistry,
     key_epoch: str | None,
@@ -345,7 +340,8 @@ def _repair_after_preflight(
         )
         for copy in copies:
             if copy.id in reread_copy_ids:
-                # Step 1 already checked this copy, including any read error.
+                # Step 1 settled this copy by reading it or by using another resolver's
+                # landed verdict without re-reading it.
                 continue
             if copy.health != CopyHealth.SUSPECT and not (
                 copy.health == CopyHealth.OK
@@ -398,6 +394,9 @@ def _repair_after_preflight(
         missing = _missing_pool_ids(ctx, bundle_id)
         for pool_id in sorted(missing):
             if pool_id in rebuild or pool_id in resolved_pool_ids:
+                # Step 1 settled these pools with a copy, problem, or rebuild.
+                # The reconciler counts OK copies awaiting verification. Another lookup
+                # could only re-read the copy, back off, or add a second counted copy.
                 continue
             pool_copies = [copy for copy in copies if copy.pool_id == pool_id]
             if not pool_copies or any(copy.health == CopyHealth.SUSPECT for copy in pool_copies):
@@ -499,6 +498,9 @@ def _repair_after_preflight(
                         f"cannot repair bundle {bundle_id}: {'; '.join(staging_errors)}; "
                         "a human decides how to recover the staging source"
                     )
+                    projection, _ = _project_copy_problems(ctx.session, bundle_id)
+                    if projection is not None:
+                        message += f". {projection.message}"
                     return JobResult(
                         ok=False,
                         detail=message,
