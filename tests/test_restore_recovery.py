@@ -97,7 +97,7 @@ def test_rlr_other_instance_respects_renewal_then_fences_stopped_delivery(
 ) -> None:
     """Proof 6: actual recovery preserves a renewing stale owner, but closes an idle one."""
 
-    item_id = _seed_item(rig, "rlr-recovery", b"r" * (32 * 256 * 1024), receiver="receiver")
+    item_id = _seed_item(rig, "rlr-recovery", b"r" * (64 * 256 * 1024), receiver="receiver")
     observer = RestoreService(
         replace(
             rig.service_config,
@@ -108,7 +108,7 @@ def test_rlr_other_instance_respects_renewal_then_fences_stopped_delivery(
     observer.start(background=False)
     monkeypatch.setattr(observer, "_break_seconds", lambda: 60.0)
     try:
-        with _rlr_service(rig) as caller:
+        with _rlr_service(rig, lease_seconds=2.0) as caller:
             stream = caller.OpenRestore(
                 restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id),
                 rig.context("receiver"),
@@ -119,20 +119,22 @@ def test_rlr_other_instance_respects_renewal_then_fences_stopped_delivery(
                     session.get(RestoreServerInstance, caller.instance_id).heartbeat_at = (
                         dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
                     )
-                started = time.monotonic()
+                started: float | None = None
                 checked = False
                 for frame in stream:
                     if frame.HasField("chunk"):
+                        if started is None:
+                            started = time.monotonic()
                         time.sleep(0.07)
                         observer.heartbeat_once()
-                        if time.monotonic() - started > 1.1 and not checked:
+                        if time.monotonic() - started > 3.0 and not checked:
                             assert observer.heartbeat_unbroken_seconds() > 0.3
                             observer.recover_once()
                             (row,) = _attempt_rows(rig, item_id)
                             assert (row.end_kind, row.closed_at, row.ended_at) == (None, None, None)
                             checked = True
                             if pause:
-                                for _ in range(14):
+                                for _ in range(40):
                                     time.sleep(0.08)
                                     observer.heartbeat_once()
                                 observer.recover_once()
