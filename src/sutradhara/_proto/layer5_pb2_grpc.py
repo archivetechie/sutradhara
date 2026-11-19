@@ -2802,6 +2802,7 @@ class ReadSessionServiceServicer:
         stored bytes. Non-empty file_id resolves that catalog member and treats the
         range as member-relative. The daemon does not decrypt or interpret payload
         bytes; both-zero range reads the whole payload/member.
+        Classified read findings carry remanence-finding: media-damage on the failing status.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -2809,6 +2810,7 @@ class ReadSessionServiceServicer:
 
     def ReadFile(self, request, context):
         """Read an entire file from an object.
+        Classified read findings carry remanence-finding: media-damage on the failing status.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -3122,11 +3124,10 @@ class ReadPlanService:
 
 class AuditStub:
     """=============================================================================
-    AUDIT SERVICE — read-only audit log queries.
+    AUDIT SERVICE — read-only history of the library log's records.
 
-    The append-only audit log is daemon-authoritative.
-    Layer 5 exposes query-only surface; mutations only happen through the
-    other services.
+    One history entry per library-log record. Layer 5 exposes queries here;
+    mutations only happen through the other services.
     =============================================================================
 
     """
@@ -3146,11 +3147,10 @@ class AuditStub:
 
 class AuditServicer:
     """=============================================================================
-    AUDIT SERVICE — read-only audit log queries.
+    AUDIT SERVICE — read-only history of the library log's records.
 
-    The append-only audit log is daemon-authoritative.
-    Layer 5 exposes query-only surface; mutations only happen through the
-    other services.
+    One history entry per library-log record. Layer 5 exposes queries here;
+    mutations only happen through the other services.
     =============================================================================
 
     """
@@ -3179,11 +3179,10 @@ def add_AuditServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class Audit:
     """=============================================================================
-    AUDIT SERVICE — read-only audit log queries.
+    AUDIT SERVICE — read-only history of the library log's records.
 
-    The append-only audit log is daemon-authoritative.
-    Layer 5 exposes query-only surface; mutations only happen through the
-    other services.
+    One history entry per library-log record. Layer 5 exposes queries here;
+    mutations only happen through the other services.
     =============================================================================
 
     """
