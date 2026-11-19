@@ -215,10 +215,12 @@ def test_worker_lock_syncs_consumed_stop_before_yield(
 
     real_fsync = worker_lock_module.os.fsync
     events: list[tuple[str, int | None, bytes | None]] = []
+    synced_inodes: list[int] = []
 
     def record_fsync(fd: int) -> None:
         """Capture the flushed lock contents at the sync, then perform the real sync."""
         events.append(("fsync", fd, first.path.read_bytes()))
+        synced_inodes.append(os.fstat(fd).st_ino)
         real_fsync(fd)
 
     monkeypatch.setattr(worker_lock_module.os, "fsync", record_fsync)
@@ -228,6 +230,7 @@ def test_worker_lock_syncs_consumed_stop_before_yield(
         events.append(("body", None, None))
         assert [event[0] for event in events] == ["fsync", "body"], "exactly one fsync before body"
         assert events[0][2] == expected, "the file's bytes are exactly the three identity lines"
+        assert synced_inodes == [second.path.stat().st_ino], "fsync targets the lock file"
         assert second.previous_holder_stop_requested
 
 
@@ -656,6 +659,115 @@ def test_worker_once_installs_and_restores_signal_handlers(tmp_path, monkeypatch
         engine.dispose()
 
 
+def test_signal_reentering_the_stop_append_ends_the_process(tmp_path, monkeypatch):
+    """GS S1: latch the first stop before its append can re-enter the handler."""
+    from click.testing import CliRunner
+
+    from sutradhara.cli.worker import worker_cmd
+    from sutradhara.jobs.worker import JobWorker
+    from sutradhara.jobs.worker_lock import HeldWorkerLock
+
+    url, engine = _sqlite_db(tmp_path)
+    monkeypatch.setenv("SUTRADHARA_DB_URL", url)
+    monkeypatch.setenv("SUTRADHARA_RESOURCE_CONTROL", "0")
+    monkeypatch.setattr("sutradhara.cli.worker.make_engine", lambda *args, **kwargs: engine)
+    signals = (signal.SIGTERM, signal.SIGINT)
+    before = {sig: signal.getsignal(sig) for sig in signals}
+    real_record_stop_request = HeldWorkerLock.record_stop_request
+    kills, workers, lock_paths = [], [], []
+
+    def inspect_drain(worker):
+        """Re-enter once during the append while recording the process-ending signal."""
+        workers.append(worker)
+        h = signal.getsignal(signal.SIGTERM)
+        reentered = False
+
+        def reenter_append(held):
+            """Guard before re-entry so a missing production latch cannot recurse."""
+            nonlocal reentered
+            lock_paths.append(held.path)
+            if not reentered:
+                reentered = True
+                h(signal.SIGTERM, None)
+            real_record_stop_request(held)
+
+        def record_kill(pid, signum):
+            """Observe the second signal without delivering it to the test process."""
+            kills.append((pid, signum))
+
+        with monkeypatch.context() as patch:
+            patch.setattr(HeldWorkerLock, "record_stop_request", reenter_append)
+            patch.setattr("sutradhara.cli.worker.os.kill", record_kill)
+            h(signal.SIGTERM, None)
+        return []
+
+    monkeypatch.setattr(JobWorker, "drain", inspect_drain)
+    try:
+        result = CliRunner().invoke(worker_cmd, ["--once"])
+        assert result.exit_code == 0, result.output
+        assert kills == [(os.getpid(), signal.SIGTERM)]
+        assert lock_paths[0].read_text().splitlines().count("stop-requested") == 1
+        assert workers[0].stop_requested
+        assert {sig: signal.getsignal(sig) for sig in signals} == before, "after drain"
+    finally:
+        for sig, handler in before.items():
+            signal.signal(sig, handler)
+        engine.dispose()
+
+
+def test_stop_is_requested_when_the_stop_append_fails(tmp_path, monkeypatch):
+    """GS S2: an unwritable stop descriptor cannot prevent the worker's stop request."""
+    from click.testing import CliRunner
+
+    from sutradhara.cli.worker import worker_cmd
+    from sutradhara.jobs.worker import JobWorker
+    from sutradhara.jobs.worker_lock import HeldWorkerLock
+
+    url, engine = _sqlite_db(tmp_path)
+    monkeypatch.setenv("SUTRADHARA_DB_URL", url)
+    monkeypatch.setenv("SUTRADHARA_RESOURCE_CONTROL", "0")
+    monkeypatch.setattr("sutradhara.cli.worker.make_engine", lambda *args, **kwargs: engine)
+    signals = (signal.SIGTERM, signal.SIGINT)
+    before = {sig: signal.getsignal(sig) for sig in signals}
+    real_record_stop_request = HeldWorkerLock.record_stop_request
+    handler_returns, workers, lock_paths = [], [], []
+
+    def inspect_drain(worker):
+        """Call the installed handler with its append aimed at a read-only descriptor."""
+        workers.append(worker)
+        h = signal.getsignal(signal.SIGTERM)
+
+        def fail_append(held):
+            """Exercise the real write's EBADF and restore the live lock descriptor."""
+            lock_paths.append(held.path)
+            original_fd = held._fd
+            substitute_fd = os.open(os.devnull, os.O_RDONLY)
+            held._fd = substitute_fd
+            try:
+                real_record_stop_request(held)
+            finally:
+                held._fd = original_fd
+                os.close(substitute_fd)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(HeldWorkerLock, "record_stop_request", fail_append)
+            h(signal.SIGTERM, None)
+            handler_returns.append(True)
+        return []
+
+    monkeypatch.setattr(JobWorker, "drain", inspect_drain)
+    try:
+        result = CliRunner().invoke(worker_cmd, ["--once"])
+        assert handler_returns == [True], "no exception leaves the stop handler"
+        assert workers[0].stop_requested
+        assert "stop-requested" not in lock_paths[0].read_text().splitlines()
+        assert result.exit_code == 0, result.output
+    finally:
+        for sig, handler in before.items():
+            signal.signal(sig, handler)
+        engine.dispose()
+
+
 def test_worker_unit_sets_stop_scope_and_deadline():
     """GS T12: the shipped unit protects children until the provisional deadline."""
     import configparser
@@ -688,6 +800,62 @@ def test_jobs_run_consumes_previous_holder_stop(tmp_path, monkeypatch):
             row = session.get(Job, job_id)
             assert row.status == JobStatus.PENDING
             assert row.stops == 1
+            assert row.kills == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("command", ["worker", "jobs-run"])
+def test_both_commands_abort_when_the_lock_sync_fails(tmp_path, monkeypatch, command):
+    """GS S4: neither CLI may drain or recover jobs after the lock's sync fails."""
+    from click.testing import CliRunner
+
+    from sutradhara.cli.jobs import jobs_group
+    from sutradhara.cli.worker import worker_cmd
+    from sutradhara.jobs.worker import JobWorker
+
+    url, engine = _sqlite_db(tmp_path)
+    monkeypatch.setenv("SUTRADHARA_DB_URL", url)
+    monkeypatch.setenv("SUTRADHARA_RESOURCE_CONTROL", "0")
+    monkeypatch.setattr("sutradhara.cli.worker.make_engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr("sutradhara.cli.jobs.make_engine", lambda _url: engine)
+    drain_calls = []
+
+    def record_drain(worker):
+        """Record entry without performing the recovery that lives inside drain."""
+        drain_calls.append(worker)
+        return []
+
+    def fail_fsync(fd):
+        """Inject the lock sync's I/O failure at the real acquisition boundary."""
+        raise OSError(errno.EIO, "injected")
+
+    monkeypatch.setattr(JobWorker, "drain", record_drain)
+    try:
+        with session_scope(engine) as session:
+            job = submit(session, "verify", {"copy_id": 1}, prerequisites=[999_999])
+            assert claim_job_by_id(session, job.id) is job
+            job_id = job.id
+        with worker_lock(url) as held:
+            held.record_stop_request()
+        with monkeypatch.context() as patch:
+            patch.setattr(worker_lock_module.os, "fsync", fail_fsync)
+            result = (
+                CliRunner().invoke(worker_cmd, ["--once"])
+                if command == "worker"
+                else CliRunner().invoke(jobs_group, ["run", "--limit", "0"])
+            )
+        with session_scope(engine) as session:
+            row = session.get(Job, job_id)
+            if command == "worker":
+                assert drain_calls == [], "worker must abort before drain"
+            else:
+                assert row.status == JobStatus.RUNNING
+            assert result.exit_code != 0, result.output
+            assert isinstance(result.exception, OSError)
+            assert result.exception.errno == errno.EIO
+            assert row.status == JobStatus.RUNNING
+            assert row.stops == 0
             assert row.kills == 0
     finally:
         engine.dispose()
