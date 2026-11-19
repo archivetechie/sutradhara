@@ -14,6 +14,7 @@ from pathlib import Path
 
 import click
 import uvicorn
+from uvicorn.main import STARTUP_FAILURE
 
 from sutradhara.api.app import create_app
 from sutradhara.catalog.session import create_all, make_engine
@@ -158,7 +159,7 @@ def serve_cmd(
         gate.attach(server)
         server.run()
         if not server.started:
-            raise SystemExit(3)
+            raise SystemExit(STARTUP_FAILURE)
 
     try:
         gate.install()

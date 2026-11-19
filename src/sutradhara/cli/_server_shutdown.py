@@ -26,13 +26,17 @@ class ServerShutdown:
     def install(self) -> None:
         if threading.current_thread() is not threading.main_thread():
             raise RuntimeError("server shutdown signals require the main thread")
+        if self._installed:
+            raise RuntimeError("server shutdown signals are already installed")
         self._originals = {
             signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)
         }
+        if any(handler is None for handler in self._originals.values()):
+            raise RuntimeError("server shutdown cannot restore a handler not installed from Python")
         handler = self._handle_signal
         for signum in (signal.SIGTERM, signal.SIGINT):
-            signal.signal(signum, handler)
             self._installed.append(signum)
+            signal.signal(signum, handler)
 
     @property
     def stop_requested(self) -> bool:

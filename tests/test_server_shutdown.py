@@ -36,6 +36,9 @@ def _child_case(tmp_path, monkeypatch, route, scenario):
     # Short names are necessary for Unix sockets. Each invocation owns its PKI,
     # database, control files, logs and process; nothing uses deployment state.
     root = Path(tempfile.mkdtemp(prefix="sd-", dir=tmp_path))
+    assert len(str(root / "api.sock").encode()) < 100, (
+        f"Unix socket path too long: {root / 'api.sock'}"
+    )
     timings = {}
     child = channel = None
     setup_start = time.monotonic()
@@ -139,15 +142,18 @@ def _child_case(tmp_path, monkeypatch, route, scenario):
         timings["readiness"] = time.monotonic() - ready_start
         stop_start = time.monotonic()
         phase, phase_start = "stop_control", stop_start
+        sigint_sent = release_seen = False
         os.kill(child.pid, signal.SIGTERM)
         if scenario == "repeated":
             os.kill(child.pid, signal.SIGTERM)
             if await_marker("draining", time.monotonic() + 20):
                 os.kill(child.pid, signal.SIGINT)
+                sigint_sent = True
                 (root / "release").touch()
         elif scenario == "startup":
             if await_marker("latched", time.monotonic() + 20):
                 (root / "release").touch()
+                release_seen = True
         timings["stop_control"] = time.monotonic() - stop_start
         exit_start = time.monotonic()
         phase, phase_start = "exit", exit_start
@@ -162,6 +168,10 @@ def _child_case(tmp_path, monkeypatch, route, scenario):
         }
         (root / "outcome.json").write_text(json.dumps(diagnostic, indent=2))
         assert child.returncode == 0, diagnostic  # A1
+        if scenario == "repeated":
+            assert sigint_sent
+        elif scenario == "startup":
+            assert release_seen
         stdout = stdout_path.read_text()
         assert stdout.splitlines().count(STOPPED) == 1  # A2: stdout alone
         assert not (root / "api.sock").exists()  # A3
@@ -820,6 +830,83 @@ def test_shutdown_restores_handlers(tmp_path, monkeypatch):
         assert row.calls.index("output") < row.calls.index("restore.enter")
     from sutradhara.cli._server_shutdown import ServerShutdown
 
+    # An interrupt after the real SIGTERM installation must not strand its handler.
+    originals, raw_signal = _handlers(), signal.signal
+    original_term, original_int = originals[signal.SIGTERM], originals[signal.SIGINT]
+    gate, interrupted = ServerShutdown(), False
+
+    def interrupt_after_term(signum, handler):
+        result = raw_signal(signum, handler)
+        if signum == signal.SIGTERM and getattr(handler, "__self__", None) is gate:
+            raise KeyboardInterrupt
+        return result
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(signal, "signal", interrupt_after_term)
+            try:
+                gate.install()
+            except KeyboardInterrupt:
+                interrupted = True
+            finally:
+                gate.restore()
+        assert signal.getsignal(signal.SIGTERM) is original_term
+        assert signal.getsignal(signal.SIGINT) is original_int
+        assert interrupted
+    finally:
+        for signum, handler in originals.items():
+            raw_signal(signum, handler)
+
+    # A non-Python disposition must be refused before either handler changes.
+    originals, raw_signal, raw_getsignal = _handlers(), signal.signal, signal.getsignal
+    gate, raised, message, changes = ServerShutdown(), None, None, []
+
+    def non_python_handler(signum):
+        return None if signum == signal.SIGINT else raw_getsignal(signum)
+
+    def record_change(signum, handler):
+        changes.append((signum, handler))
+        return raw_signal(signum, handler)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(signal, "getsignal", non_python_handler)
+            patch.setattr(signal, "signal", record_change)
+            try:
+                try:
+                    gate.install()
+                finally:
+                    gate.restore()
+            except (RuntimeError, TypeError) as error:
+                raised, message = type(error), str(error)
+        assert raised is RuntimeError
+        assert message == "server shutdown cannot restore a handler not installed from Python"
+        assert changes == []
+        assert _handlers() == originals
+    finally:
+        for signum, handler in originals.items():
+            raw_signal(signum, handler)
+
+    # Refusing a second installation must preserve the first saved originals.
+    originals, raw_signal = _handlers(), signal.signal
+    gate, second_install_raised, message = ServerShutdown(), False, None
+    try:
+        gate.install()
+        installed_handlers = _handlers()
+        try:
+            gate.install()
+        except RuntimeError as error:
+            second_install_raised, message = True, str(error)
+        assert second_install_raised
+        assert message == "server shutdown signals are already installed"
+        assert _handlers() == installed_handlers
+        assert all(getattr(handler, "__self__", None) is gate for handler in _handlers().values())
+        gate.restore()
+        assert _handlers() == originals
+    finally:
+        for signum, handler in originals.items():
+            raw_signal(signum, handler)
+
     originals, raw_signal = _handlers(), signal.signal
     try:
         for partial in (False, True):
@@ -841,7 +928,8 @@ def test_shutdown_restores_handlers(tmp_path, monkeypatch):
                 gate.restore()
                 assert changes == after_first_restore
             assert _handlers() == originals
-            assert len(changes) == (3 if partial else 0)
+            # F1 records SIGINT before its failed install, so restoring its original is call four.
+            assert len(changes) == (4 if partial else 0)
     finally:
         for signum, handler in originals.items():
             raw_signal(signum, handler)
