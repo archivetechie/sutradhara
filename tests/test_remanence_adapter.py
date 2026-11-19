@@ -2701,6 +2701,28 @@ def test_media_finding_read_range_keeps_identity(code, value):
     assert "remanence-finding=media-damage" in str(caught.value)
 
 
+@pytest.mark.parametrize("code", [grpc.StatusCode.INTERNAL, grpc.StatusCode.UNAVAILABLE])
+def test_media_finding_after_undecodable_binary_trailer(code):
+    """An unrelated binary trailer cannot hide the daemon's media finding."""
+    from sutradhara.backend.port import BackendMediaError
+
+    library = _QueueLibrary()
+    error = _FindingRpcError(
+        code,
+        (("remanence-detail-bin", b"\xff\xfe"), ("remanence-finding", "media-damage")),
+    )
+    backend = _queue_backend(library, _FindingRangeClient(library, error))
+    with (
+        backend.open_read_session(_read_locator("11" * 32)) as reader,
+        pytest.raises(BackendMediaError) as caught,
+    ):
+        reader.read_range(ByteRange(0, 1))
+    assert type(caught.value) is BackendMediaError
+    assert caught.value.session_id == b"session-1"
+    assert caught.value.drive_element_address == 257
+    assert "remanence-finding=media-damage" in str(caught.value)
+
+
 @pytest.mark.parametrize(
     "case",
     [

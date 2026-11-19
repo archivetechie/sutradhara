@@ -106,7 +106,7 @@ def handle_verify(ctx: JobContext) -> JobResult:
         )
         return JobResult(
             ok=True,
-            detail=f"could not be read at its recorded position: {exc}",
+            detail=f"media damage: {exc}",
             step_state={
                 "verify_result": {
                     "ok": False,

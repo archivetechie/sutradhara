@@ -1999,7 +1999,9 @@ def _verify_media_finding_job(engine, monkeypatch, backend, *, wire=False):
         assert job.status == JobStatus.SUCCEEDED
         assert result.ok
         detail = job.step_state["verify_result"]["detail"]
-        assert result.detail == f"could not be read at its recorded position: {detail}"
+        assert result.detail == f"media damage: {detail}"
+        if wire:
+            assert result.detail.count("could not be read at its recorded position") == 1
         assert "drive_element_address=257" in detail
         assert job.step_state["verify_result"] == {
             "ok": False,

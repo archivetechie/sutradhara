@@ -2762,3 +2762,82 @@ def test_media_finding_bundle_restarts_every_member(engine, tmp_path, all_fail):
             assert receipts[0].failure_kind == "media-damage"
             executions.add(receipts[0].execution_id)
         assert len(executions) == 1
+
+
+def test_media_finding_bundle_then_other_failure_names_both(engine, tmp_path):
+    """A later unavailable copy leaves the earlier media finding in the failure."""
+    from sutradhara.backend.port import BackendMediaError, BackendUnavailableError
+
+    setup = _create_bundle(engine, tmp_path)
+    hashes = list(setup.assets)
+    destination = tmp_path / "bundle-media-then-unavailable"
+    publications_before_failure = []
+
+    class LaterFailureBackend(_ArchiveWriteBackend):
+        failing = False
+        payload_reads = 0
+
+        @contextmanager
+        def open_range_chunks(self, locator, byte_range, *, chunk_bytes):
+            if self.failing:
+                self.payload_reads += 1
+                if self.payload_reads == 2:
+                    publications_before_failure.append((destination / hashes[0].hex()).read_bytes())
+                    raise BackendMediaError(
+                        "group A recorded position unreadable; drive_element_address=257"
+                    )
+            with super().open_range_chunks(locator, byte_range, chunk_bytes=chunk_bytes) as chunks:
+                yield chunks
+
+    class OtherBackend(_ArchiveWriteBackend):
+        failing = False
+
+        @contextmanager
+        def open_range_chunks(self, locator, byte_range, *, chunk_bytes):
+            if self.failing:
+                raise BackendUnavailableError("group B daemon unavailable")
+            with super().open_range_chunks(locator, byte_range, chunk_bytes=chunk_bytes) as chunks:
+                yield chunks
+
+    rem, d2 = LaterFailureBackend("rem"), OtherBackend("d2")
+    backends = {setup.rem_backend_id: rem, setup.d2_backend_id: d2}
+    with session_scope(engine) as session:
+        flush_bundle(
+            session, bundle_id=setup.bundle_id, backends=backends, builder=LocalArchiveBuilder()
+        )
+        first = session.scalars(select(Copy).where(Copy.pool_id == "o-copy-1-pool")).one()
+        second = session.scalars(select(Copy).where(Copy.pool_id == "d2-shelf-pool")).one()
+        rem.failing = True
+        d2.failing = True
+        with pytest.raises(RestoreIntegrityError) as caught:
+            restore_assets_from_bundle(
+                session,
+                asset_hashes=hashes,
+                artifactclass="o-archive",
+                destination_dir=destination,
+                backends=backends,
+            )
+        detail = str(caught.value)
+        assert "group A recorded position unreadable" in detail
+        assert detail.index("group A recorded position unreadable") < detail.index(
+            "group B daemon unavailable"
+        )
+        assert f"copy id={second.id}" in detail
+        assert publications_before_failure == [setup.assets[hashes[0]]]
+        assert rem.payload_reads == 2
+        assert first.health == CopyHealth.SUSPECT
+        assert second.health == CopyHealth.OK
+        first_receipts = list(
+            session.scalars(
+                select(VerifyReceipt).where(
+                    VerifyReceipt.copy_id == first.id, VerifyReceipt.failure_kind == "media-damage"
+                )
+            )
+        )
+        assert len(first_receipts) == 1
+        assert first_receipts[0].source == "restore"
+        assert not session.scalars(
+            select(VerifyReceipt).where(
+                VerifyReceipt.copy_id == second.id, VerifyReceipt.failure_kind == "media-damage"
+            )
+        ).all()

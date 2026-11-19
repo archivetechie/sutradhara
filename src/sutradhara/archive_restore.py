@@ -876,7 +876,12 @@ def restore_assets_from_bundle(
                     ChunkRestoreIntegrityError,
                 ) as exc:
                     raise RestoreIntegrityError(
-                        f"bundle restore copy id={member.copy.id} pool={member.pool_id}: {exc}"
+                        "; ".join(
+                            [
+                                *media_errors,
+                                f"bundle restore copy id={member.copy.id} pool={member.pool_id}: {exc}",
+                            ]
+                        )
                     ) from exc
                 results_by_hash[member.asset_hash] = RestoreResult(
                     asset_hash=member.asset_hash,

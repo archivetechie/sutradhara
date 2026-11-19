@@ -2166,17 +2166,19 @@ def _read_idle_error(
 
 
 def _has_media_finding(error: grpc.RpcError) -> bool:
-    """Read the daemon's finding, tolerating unavailable trailing metadata."""
+    """Read the daemon's finding without decoding entries; tolerate unavailable metadata."""
     try:
         trailers = getattr(error, "trailing_metadata", None)
         if not callable(trailers):
             return False
         for key, value in trailers() or ():
-            if isinstance(key, bytes):
-                key = key.decode("utf-8")
-            if isinstance(value, bytes):
-                value = value.decode("utf-8")
-            if key == "remanence-finding" and value == "media-damage":
+            if (
+                (isinstance(key, str) and key == "remanence-finding")
+                or (isinstance(key, bytes) and key == b"remanence-finding")
+            ) and (
+                (isinstance(value, str) and value == "media-damage")
+                or (isinstance(value, bytes) and value == b"media-damage")
+            ):
                 return True
     except Exception:
         return False
