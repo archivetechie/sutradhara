@@ -734,11 +734,17 @@ xattrs, no multi-file manifests yet.
 Each admitted open is recorded as an attempt with how it ends; failed tries
 are retried with a growing delay, and an item is given up after the configured
 number of failures or consecutive interruptions, or at once for a cause that
-cannot succeed. A delivery whose receiver stops taking data, or does not confirm
-the delivered file, for longer than the lease counts as an interruption.
-A delivered item waits for the receiver to confirm it. A
-recovery pass at startup and at intervals closes attempts that a stopped
-server leaves open.
+cannot succeed. A delivery counts as an interruption when its receiver goes
+away before the server has recorded it, or, once the server has sent the whole
+file, has not acknowledged it as staged (`STAGED`) when the lease runs out. A
+receiver that pauses while the server is still sending the file keeps its
+delivery when it resumes: the server renews the lease of an attempt that is
+still open as it sends, even after the lease has expired. Unless the server
+itself stops, a delivery that ends while the server cannot record a lease
+renewal counts as a failure instead. A delivered item waits for the receiver
+to confirm it. A recovery pass, repeated at intervals, closes the attempts
+that a stopped server leaves open once their lease has lapsed, and counts each
+as an interruption.
 
 Partial file restore (`pfr.py`, `sutra pfr cut`) shortcuts step 3 for
 indexed members: a `pfr-index-v1` sidecar plus `ReadObjectRange` byte

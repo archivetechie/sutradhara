@@ -3852,6 +3852,38 @@ def test_rba_ao_expired_sent_cas_requires_acknowledgement_under_own_generation(
         assert item.state == ("queued" if case == "unacknowledged" else "streaming")
 
 
+def test_rba_ao_short_circuit_after_expiry_records_sent(fresh_rig: _Rig) -> None:
+    """A claim-covering re-open records sent when the client pulls past job_end after expiry."""
+
+    rig = fresh_rig
+    item_id, _payload, head = _acknowledged(rig, "ao-short-circuit")
+    _expire_lease(rig, item_id)
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(
+            restore_request_item_id=item_id, **_resume_fields(item_id, head, 1)
+        ),
+        rig.context("receiver"),
+    )
+    frames = [next(stream) for _ in range(4)]
+    assert _kinds(frames) == ["manifest_head", "manifest_entry", "manifest_end", "job_end"]
+    assert frames[-1].job_end.files == 0
+    assert frames[0].manifest_head.lease_token.generation == head.lease_token.generation + 1
+    _expire_lease(rig, item_id)
+
+    with pytest.raises(StopIteration):
+        next(stream)
+    _delivered, resumed = _attempt_rows(rig, item_id)
+    assert (resumed.end_kind, resumed.cause) == ("job_end", None)
+    assert _checkpoint_of(rig, item_id) == (1, False)
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        assert item.state == "sent"
+        assert item.detail is None
+        assert _giveup_of(session, item_id) is None
+        assert giveup_agreement_violations(session) == []
+
+
 def test_e7_a_failing_end_transaction_still_releases_the_slot_and_closes_the_plan(
     rig: _Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5096,6 +5128,7 @@ def test_rlr2_two_lapses_give_up_at_the_service_interruption_limit(fresh_rig: _R
                         2,
                     )
                     assert giveup.decisive_attempt_id == rows[-1].id
+                    assert item.request.state == "completed_with_errors"
                 assert giveup_agreement_violations(session) == []
             if attempt_no == 1:
                 offers = list(
