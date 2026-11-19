@@ -3762,7 +3762,37 @@ def test_e5_an_end_on_a_closed_attempt_rolls_back_including_the_sent_cas(
     assert open_row.id not in rig.service._registry
 
 
-def test_e6_a_delivery_whose_lease_expired_before_the_client_pulled_past_job_end_ends_non_ok(
+def test_rba_ao_acknowledgement_accepted_before_expiry_records_delivery_after_expiry(
+    fresh_rig: _Rig,
+) -> None:
+    """An accepted STAGED checkpoint wins when the wait first reads it after expiry."""
+
+    rig = fresh_rig
+    item_id = _seed_item(
+        rig, "ao-ack-before-expiry", _pl("ao-ack-before-expiry"), receiver="receiver"
+    )
+    context = rig.context("receiver")
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), context
+    )
+    head = _pull_until_file_end(stream)[0].manifest_head
+    reply = rig.service.CommitRestore(
+        _commit_request(item_id, head.manifest_sha256, head.lease_token, 1), context
+    )
+    assert (reply.status, reply.committed_index) == ("advanced", 1)
+    _expire_lease(rig, item_id)
+
+    assert _kinds(list(stream)) == ["job_end"]
+    (row,) = _attempt_rows(rig, item_id)
+    assert (row.end_kind, row.cause) == ("job_end", None)
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        assert item.state == "sent"
+        assert giveup_agreement_violations(session) == []
+
+
+def test_e6_a_delivery_whose_lease_expired_before_the_client_pulled_past_job_end_ends_ok(
     fresh_rig: _Rig,
 ) -> None:
     rig = fresh_rig
@@ -3772,6 +3802,44 @@ def test_e6_a_delivery_whose_lease_expired_before_the_client_pulled_past_job_end
     )
     _pull_until_job_end(stream, rig.service, rig.context("receiver"))
     _expire_lease(rig, item_id)
+    with pytest.raises(StopIteration):
+        next(stream)
+    (row,) = _attempt_rows(rig, item_id)
+    assert (row.end_kind, row.cause) == ("job_end", None)
+    with session_scope(rig.engine) as session:
+        item = session.get(RestoreRequestItem, item_id)
+        assert item is not None
+        assert item.state == "sent"
+        assert item.detail is None
+        assert item.request.state == "active"
+        giveup = _giveup_of(session, item_id)
+        assert giveup is None
+        assert giveup_agreement_violations(session) == []
+
+
+@pytest.mark.parametrize("case", ["unacknowledged", "superseded"])
+def test_rba_ao_expired_sent_cas_requires_acknowledgement_under_own_generation(
+    fresh_rig: _Rig, case: str
+) -> None:
+    """The acknowledgement alternative retains both the checkpoint and generation guards."""
+
+    rig = fresh_rig
+    tag = f"ao-expired-{case}"
+    item_id = _seed_item(rig, tag, _pl(tag), receiver="receiver")
+    stream = rig.service.OpenRestore(
+        restore_pb2.OpenRestoreRequest(restore_request_item_id=item_id), rig.context("receiver")
+    )
+    _pull_until_job_end(stream, rig.service, rig.context("receiver"))
+    # Only a test builds these states: a still-open attempt under its own
+    # generation has a checkpoint covering the manifest before job_end; that
+    # checkpoint is never lowered and the lease's generation never moves.
+    with session_scope(rig.engine) as session:
+        if case == "unacknowledged":
+            session.get(RestoreItemCheckpoint, item_id).committed_index = 0
+        else:
+            session.get(RestoreOpenSession, item_id).generation += 1
+    _expire_lease(rig, item_id)
+
     with pytest.raises(_Abort) as aborted:
         next(stream)
     assert aborted.value.code == grpc.StatusCode.ABORTED
@@ -3781,12 +3849,7 @@ def test_e6_a_delivery_whose_lease_expired_before_the_client_pulled_past_job_end
     with session_scope(rig.engine) as session:
         item = session.get(RestoreRequestItem, item_id)
         assert item is not None
-        assert item.state == "queued"
-        assert item.detail is None
-        assert item.request.state == "pending"
-        giveup = _giveup_of(session, item_id)
-        assert giveup is None
-        assert giveup_agreement_violations(session) == []
+        assert item.state == ("queued" if case == "unacknowledged" else "streaming")
 
 
 def test_e7_a_failing_end_transaction_still_releases_the_slot_and_closes_the_plan(
@@ -4907,6 +4970,8 @@ def test_rlr2_lapsed_delivery_reoffers_and_receiver_completes(fresh_rig: _Rig, s
             )
             if site == "sent_cas":
                 frames = _pull_until_job_end(stream, rig.service, rig.context("receiver"))
+                with session_scope(rig.engine) as session:
+                    session.get(RestoreItemCheckpoint, item_id).committed_index = 0
             elif site == "acknowledgement":
                 frames = _pull_until_file_end(stream)
             else:
@@ -4954,7 +5019,7 @@ def test_rlr2_lapsed_delivery_reoffers_and_receiver_completes(fresh_rig: _Rig, s
     )
     assert offered == [item_id, item_id]
     (head,) = heads
-    claim = 1 if site == "sent_cas" else 0
+    claim = 0
     resumed = list(
         _receive(
             rig.service.OpenRestore(
@@ -4967,13 +5032,9 @@ def test_rlr2_lapsed_delivery_reoffers_and_receiver_completes(fresh_rig: _Rig, s
         )
     )
     assert resumed[-1].HasField("job_end")
-    if claim == 1:
-        assert _kinds(resumed) == ["manifest_head", "manifest_entry", "manifest_end", "job_end"]
-        assert (resumed[-1].job_end.files, resumed[-1].job_end.bytes) == (0, 0)
-    else:
-        assert "file_header" in _kinds(resumed)
-        assert b"".join(frame.chunk.data for frame in resumed if frame.HasField("chunk")) == payload
-        assert resumed[-1].job_end.files == 1
+    assert "file_header" in _kinds(resumed)
+    assert b"".join(frame.chunk.data for frame in resumed if frame.HasField("chunk")) == payload
+    assert resumed[-1].job_end.files == 1
     with session_scope(rig.engine) as session:
         assert session.get(RestoreRequestItem, item_id).state == "sent"
     _lapsed, delivered = _attempt_rows(rig, item_id)

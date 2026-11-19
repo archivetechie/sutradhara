@@ -243,6 +243,7 @@ class _AttemptEntry:
     outcome: _Outcome
     lease: _Lease | None = None
     source: str | None = None
+    manifest_index: int | None = None
     cache_entry_hash: bytes | None = None
     ended: bool = False
     klass: str | None = None
@@ -701,6 +702,7 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 cell.slot_taken = True
             prepared = self._prepare_open(request, identity, context, entry)
             entry.source = prepared.source
+            entry.manifest_index = prepared.manifest.index
             entry.cache_entry_hash = prepared.cache_entry_hash
             if prepared.revealed:
                 yield restore_pb2.RestoreFrame(
@@ -1880,16 +1882,12 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 ):
                     # Re-read the renewed expiry before judging the acknowledgement.
                     continue
+            elif generation == lease.generation and committed >= prepared.manifest.index + 1:
+                return
             elif now >= expiry:
                 detail = "the receiver did not acknowledge the delivery before its lease expired"
                 cell.set("cancelled", "lease_expired", detail)
                 _abort(context, grpc.StatusCode.ABORTED, detail)
-            if (
-                not cell.renewal_outstanding
-                and generation == lease.generation
-                and committed >= prepared.manifest.index + 1
-            ):
-                return
             sleep_seconds = min(
                 self.config.acknowledgement_poll_seconds,
                 max(0.0, (expiry - dt.datetime.now(dt.UTC)).total_seconds()),
@@ -2067,7 +2065,20 @@ class RestoreService(restore_pb2_grpc.RestoreServiceServicer):
                 RestoreRequestItem.id == entry.item_id,
                 RestoreRequestItem.state == ITEM_STREAMING,
                 RestoreRequestItem.open_session.has(
-                    and_(_lease_matches(lease), RestoreOpenSession.expires_at > now)
+                    and_(
+                        _lease_matches(lease),
+                        or_(
+                            RestoreOpenSession.expires_at > now,
+                            RestoreRequestItem.checkpoint.has(
+                                and_(
+                                    RestoreItemCheckpoint.manifest_sha256 == lease.manifest_sha256,
+                                    RestoreItemCheckpoint.committed_index > entry.manifest_index,
+                                )
+                            ),
+                        )
+                        if entry.manifest_index is not None
+                        else RestoreOpenSession.expires_at > now,
+                    )
                 ),
             )
             .values(
