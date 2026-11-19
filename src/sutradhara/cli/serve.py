@@ -8,6 +8,8 @@ held by ``DeviceService.Connect``.
 from __future__ import annotations
 
 import os
+import socket
+import threading
 from pathlib import Path
 
 import click
@@ -15,6 +17,7 @@ import uvicorn
 
 from sutradhara.api.app import create_app
 from sutradhara.catalog.session import create_all, make_engine
+from sutradhara.cli._server_shutdown import ServerShutdown
 from sutradhara.cli.api import (
     DEFAULT_API_SOCKET,
     _bind_unix_socket,
@@ -28,6 +31,7 @@ from sutradhara.grpc.server import (
     DEFAULT_GRPC_PORT,
     DEFAULT_LANDING_ROOT,
     GrpcServerConfig,
+    GrpcServerParts,
     make_server,
     start_registry_sweep_loop,
     start_sweep_loop,
@@ -79,61 +83,122 @@ def serve_cmd(
 ) -> None:
     """Serve the operator HTTP API and mTLS gRPC relay in one process."""
 
-    engine = make_engine()
-    create_all(engine)
-    registry = ConnectedDeviceRegistry()
-    progress_registry = ReceiveProgressRegistry()
-    landing_root.mkdir(parents=True, exist_ok=True)
+    parts: GrpcServerParts | None = None
+    sweep_stop: threading.Event | None = None
+    sweep_thread: threading.Thread | None = None
+    registry_stop: threading.Event | None = None
+    registry_thread: threading.Thread | None = None
+    sock: socket.socket | None = None
+    gate = ServerShutdown()
 
-    parts = make_server(
-        GrpcServerConfig(
-            engine=engine,
-            landing_root=landing_root,
-            pki_dir=pki_dir,
-            bind=grpc_bind,
-            port=grpc_port,
-            validate_artifactclass=not skip_artifactclass_validation,
-            registry=registry,
-            progress_registry=progress_registry,
+    def run_body() -> None:
+        nonlocal parts, sweep_stop, sweep_thread, registry_stop, registry_thread, sock
+        engine = make_engine()
+        create_all(engine)
+        registry = ConnectedDeviceRegistry()
+        progress_registry = ReceiveProgressRegistry()
+        landing_root.mkdir(parents=True, exist_ok=True)
+        if gate.check_pending():
+            return
+
+        parts = make_server(
+            GrpcServerConfig(
+                engine=engine,
+                landing_root=landing_root,
+                pki_dir=pki_dir,
+                bind=grpc_bind,
+                port=grpc_port,
+                validate_artifactclass=not skip_artifactclass_validation,
+                registry=registry,
+                progress_registry=progress_registry,
+            )
         )
-    )
-    app = create_app(
-        engine,
-        ensure_schema=False,
-        registry=registry,
-        grpc_pki_dir=pki_dir,
-        grpc_progress_registry=progress_registry,
-    )
-    # The restore service must be started before any call can reach it (RSR D7).
-    parts.restore_service.start()
-    grpc_server = parts.server
-    grpc_server.start()
-    sweep_stop, sweep_thread = start_sweep_loop(landing_root)
-    registry_stop, registry_thread = start_registry_sweep_loop(registry)
-    click.echo(f"serving gRPC intake/control on {grpc_bind}:{grpc_port}")
-    try:
+        if gate.check_pending():
+            return
+        app = create_app(
+            engine,
+            ensure_schema=False,
+            registry=registry,
+            grpc_pki_dir=pki_dir,
+            grpc_progress_registry=progress_registry,
+        )
+        if gate.check_pending():
+            return
+        # The restore service must be started before any call can reach it (RSR D7).
+        parts.restore_service.start()
+        if gate.check_pending():
+            return
+        grpc_server = parts.server
+        grpc_server.start()
+        if gate.check_pending():
+            return
+        sweep_stop, sweep_thread = start_sweep_loop(landing_root)
+        if gate.check_pending():
+            return
+        registry_stop, registry_thread = start_registry_sweep_loop(registry)
+        if gate.check_pending():
+            return
+        click.echo(f"serving gRPC intake/control on {grpc_bind}:{grpc_port}")
         if api_tcp:
             validate_tcp_host(api_host)
             click.echo(f"serving HTTP API on {api_host}:{api_port}")
-            uvicorn.run(app, host=api_host, port=api_port, workers=1, reload=False)
-            return
-
-        sock = _bind_unix_socket(api_socket, mode=_parse_socket_mode(socket_mode))
-        try:
+            if gate.check_pending():
+                return
+            config = uvicorn.Config(app, host=api_host, port=api_port, workers=1, reload=False)
+        else:
+            sock = _bind_unix_socket(api_socket, mode=_parse_socket_mode(socket_mode))
+            if gate.check_pending():
+                return
             click.echo(f"serving HTTP API on {api_socket}")
-            uvicorn.run(app, fd=sock.fileno(), workers=1, reload=False)
+            if gate.check_pending():
+                return
+            config = uvicorn.Config(app, fd=sock.fileno(), workers=1, reload=False)
+        config.load_app()
+        server = uvicorn.Server(config=config)
+        gate.attach(server)
+        server.run()
+        if not server.started:
+            raise SystemExit(3)
+
+    try:
+        gate.install()
+        try:
+            run_body()
         finally:
-            sock.close()
-            if api_socket.exists():
-                api_socket.unlink()
+            try:
+                if sock is not None:
+                    sock.close()
+            finally:
+                try:
+                    if sock is not None and api_socket.exists():
+                        api_socket.unlink()
+                finally:
+                    try:
+                        # Wait for the server to stop before the restore service. The event fires
+                        # once no call is in flight in gRPC's core, which can be before a handler's
+                        # own clean-up has returned; an end that fails after that point is closed
+                        # `lost` by the next instance's recovery.
+                        if parts is not None:
+                            parts.server.stop(grace=5).wait()
+                    finally:
+                        try:
+                            if parts is not None:
+                                parts.restore_service.stop()
+                        finally:
+                            try:
+                                if sweep_stop is not None:
+                                    sweep_stop.set()
+                            finally:
+                                try:
+                                    if registry_stop is not None:
+                                        registry_stop.set()
+                                finally:
+                                    try:
+                                        if sweep_thread is not None:
+                                            sweep_thread.join(timeout=5)
+                                    finally:
+                                        if registry_thread is not None:
+                                            registry_thread.join(timeout=5)
+        click.echo("stopped: gRPC drained, restore service stopped")
     finally:
-        # Wait for the server to stop before the restore service. The event fires
-        # once no call is in flight in gRPC's core, which can be before a handler's
-        # own clean-up has returned; an end that fails after that point is closed
-        # `lost` by the next instance's recovery.
-        grpc_server.stop(grace=5).wait()
-        parts.restore_service.stop()
-        sweep_stop.set()
-        registry_stop.set()
-        sweep_thread.join(timeout=5)
-        registry_thread.join(timeout=5)
+        gate.restore()

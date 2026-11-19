@@ -534,6 +534,25 @@ the split commands exist for running them separately.
 
 Serve the operator HTTP API and the mTLS gRPC relay in one process.
 
+SIGTERM or SIGINT reaches HTTP shutdown, followed by a five-second gRPC
+grace period, restore-service cleanup, and sweep-loop stops and joins. On
+the Unix-socket route, the acquired socket is closed and unlinked before
+the gRPC drain. This also cleans up resources acquired during partial startup.
+A completed handled stop exits with status 0 and prints exactly once to stdout:
+
+```text
+stopped: gRPC drained, restore service stopped
+```
+
+The line means the acquired cleanup calls returned. RPC end writes remain
+best effort, and timed sweep joins do not guarantee that their threads finished.
+An exception escaping startup, serving, or cleanup prevents the line; uvicorn
+can log an internal lifespan shutdown error and still return. Signal-handler
+restoration follows output, so a restoration error or a signal after the
+original disposition resumes can still change the exit status. Under systemd,
+the inherited manager stop timeout can force SIGKILL, preventing cleanup,
+socket unlink, or output. The five-second grace is not an overall stop deadline.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--grpc-bind TEXT` | `127.0.0.1` | gRPC bind address. |
@@ -560,6 +579,24 @@ only; local processes can forge trusted identity headers), `--host TEXT`
 
 Serve streaming intake over gRPC+mTLS, or run enrollment admin actions
 without starting the server.
+
+In server mode, SIGTERM or SIGINT reaches the existing cleanup funnel: a
+five-second gRPC grace period, then restore-service cleanup and sweep-loop
+stops and joins. This includes cleanup of resources acquired during partial
+startup. A completed handled stop exits with status 0 and prints exactly once
+to stdout:
+
+```text
+stopped: gRPC drained, restore service stopped
+```
+
+The line records that the acquired cleanup calls returned, not completion of
+RPC end writes or timed sweep joins. End writes remain best effort. Exceptions
+escaping startup, serving, or cleanup prevent the line; handler restoration
+follows output, with the same restoration and resumed-disposition limits as
+`sutra serve`. Systemd's inherited manager stop timeout can force SIGKILL before
+cleanup or output completes; the five-second grace is not an overall deadline.
+Enrollment admin actions do not install these server signal handlers.
 
 | Flag | Default | Meaning |
 |---|---|---|

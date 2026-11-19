@@ -11,7 +11,9 @@
 - [Data-model walkthrough](guide-data-model-walkthrough.md) — catalog concepts and
   relationships.
 - [CLI reference](reference-cli.md) — operator commands, including retention,
-  offsite confirmation, revocation, and correction surfaces.
+  offsite confirmation, revocation, correction surfaces, and server SIGTERM/SIGINT
+  cleanup with five-second gRPC grace, completed-stop output and status, and
+  best-effort limits.
 - [Configuration reference](reference-config.md) — environment and backend settings.
 - [Remanence proto contract](../proto/README.md) — vendored RPC contract, including
   B9 closeout obligation surfaces; GetTape failures are reported per tape during
