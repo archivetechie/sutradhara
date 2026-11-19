@@ -1393,7 +1393,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "sutradhara-receive", editable = "packages/sutradhara-receive" },
     { name = "types-protobuf", marker = "extra == 'dev'", specifier = ">=4.25" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.49" },
     { name = "zstandard", specifier = ">=0.23" },
 ]
 provides-extras = ["dev"]
