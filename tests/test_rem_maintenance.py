@@ -6,7 +6,12 @@ import grpc
 import pytest
 
 from sutradhara._proto import layer5_pb2 as pb
-from sutradhara.rem_maintenance import CloseoutEnded, closeout_tape, supersede_tail
+from sutradhara.rem_maintenance import (
+    CloseoutEnded,
+    TornTailInspectionOnly,
+    closeout_tape,
+    supersede_tail,
+)
 
 TAPE, KEY, OP = uuid.UUID(int=1), uuid.UUID(int=2), uuid.UUID(int=3)
 
@@ -30,6 +35,12 @@ def test_generated_fields_and_service():
         pb.SupersedeTailRequest.DESCRIPTOR.fields_by_name["observed_tape_log_sequence"].number == 5
     )
     assert pb.SupersedeTailResponse.DESCRIPTOR.fields_by_name["tape_log_sequence"].number == 4
+    assert pb.SupersedeTailResponse.DESCRIPTOR.fields_by_name["inspection"].number == 5
+    assert (
+        pb.SupersedeTailResponse.DESCRIPTOR.fields_by_name["inspection"].message_type.name
+        == "TornTailInspection"
+    )
+    assert not pb.SupersedeTailResponse().HasField("inspection")
     request = pb.SupersedeTailRequest(observed_tape_log_sequence=0)
     assert request.HasField("observed_tape_log_sequence")
 
@@ -62,6 +73,83 @@ def test_supersede_repreviews_and_reconfirms_changed_found_list():
     assert confirmations == [["old"], ["new"]]
     assert calls[1].observed_tape_log_sequence == 10
     assert all(r.tape_uuid == r.ack_tape_uuid == TAPE.bytes for r in calls)
+
+
+def test_supersede_stops_on_inspection_without_confirming():
+    calls, confirmations = [], []
+
+    class Catalog:
+        def SupersedeTail(self, request, **kwargs):
+            calls.append(request)
+            if request.HasField("confirm_supersede"):
+                raise Refusal(
+                    "SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard"
+                )
+            return pb.SupersedeTailResponse(
+                inspection=pb.TornTailInspection(
+                    site="open-first-read",
+                    cursor_lba=7,
+                    file_start_lba=7,
+                    failing_lba=7,
+                    blocks_read=0,
+                    head="unknown",
+                ),
+                tape_log_sequence=9,
+            )
+
+    with pytest.raises(TornTailInspectionOnly) as raised:
+        supersede_tail(Catalog(), TAPE, confirm=lambda p: confirmations.append(p) or True)
+    assert confirmations == []
+    assert len(calls) == 1
+    assert not calls[0].HasField("confirm_supersede")
+    assert raised.value.response.inspection.site == "open-first-read"
+    assert raised.value.response.inspection.failing_lba == 7
+    assert raised.value.response.tape_log_sequence == 9
+
+
+def test_supersede_stops_on_inspection_after_stale_preview():
+    calls, confirmations = [], []
+
+    class Catalog:
+        confirmed_calls = 0
+
+        def SupersedeTail(self, request, **kwargs):
+            calls.append(request)
+            if request.HasField("confirm_supersede"):
+                self.confirmed_calls += 1
+                if self.confirmed_calls == 1:
+                    raise Refusal(
+                        "TailPreviewStale: tape-log sequence changed from 10 to 11; preview supersede-tail again."
+                    )
+                raise Refusal(
+                    "SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard"
+                )
+            if len(calls) == 1:
+                return pb.SupersedeTailResponse(
+                    found=["old"],
+                    required_confirmation="SUPERSEDE TAPE",
+                    tape_log_sequence=10,
+                )
+            return pb.SupersedeTailResponse(
+                inspection=pb.TornTailInspection(
+                    site="open-first-read",
+                    cursor_lba=7,
+                    file_start_lba=7,
+                    failing_lba=7,
+                    blocks_read=0,
+                    head="unknown",
+                ),
+                tape_log_sequence=11,
+            )
+
+    with pytest.raises(TornTailInspectionOnly) as raised:
+        supersede_tail(
+            Catalog(), TAPE, confirm=lambda p: confirmations.append(list(p.found)) or True
+        )
+    assert confirmations == [["old"]]
+    assert len(calls) == 3
+    assert not calls[2].HasField("confirm_supersede")
+    assert raised.value.response.tape_log_sequence == 11
 
 
 @pytest.mark.parametrize("approve", [False, True])

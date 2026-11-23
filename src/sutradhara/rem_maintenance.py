@@ -25,6 +25,19 @@ class CloseoutEnded(RuntimeError):
         self.state = state
 
 
+class TornTailInspectionOnly(RuntimeError):
+    """Remanence found a torn tail at the committed boundary and returned read-only evidence; nothing was superseded.
+
+    ``response`` is the inspection-only preview; its ``inspection`` field carries the evidence.
+    """
+
+    def __init__(self, response: pb.SupersedeTailResponse) -> None:
+        super().__init__(
+            "supersede-tail found a torn tail at the committed boundary: inspection only, nothing was superseded"
+        )
+        self.response = response
+
+
 def supersede_tail(
     catalog: CatalogStub,
     tape_uuid: uuid.UUID,
@@ -33,7 +46,11 @@ def supersede_tail(
     timeout: float = 900,
     max_previews: int = 3,
 ) -> pb.SupersedeTailResponse:
-    """Preview and confirm the exact native sequence; ask again after stale preview."""
+    """Preview and confirm the exact native sequence; ask again after stale preview.
+
+    For each preview that carries a torn-tail inspection, raise TornTailInspectionOnly
+    without calling confirm or sending a confirmed request for that preview.
+    """
     if max_previews < 1:
         raise ValueError("max_previews must be positive")
     for attempt in range(max_previews):
@@ -41,6 +58,8 @@ def supersede_tail(
             pb.SupersedeTailRequest(tape_uuid=tape_uuid.bytes, ack_tape_uuid=tape_uuid.bytes),
             timeout=timeout,
         )
+        if preview.HasField("inspection"):
+            raise TornTailInspectionOnly(preview)
         # Copy before invoking caller code so confirmation cannot mutate the binding.
         request = pb.SupersedeTailRequest(
             tape_uuid=tape_uuid.bytes,
