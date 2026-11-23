@@ -2619,16 +2619,44 @@ class SupersedeTailRequest(_message.Message):
     def __init__(self, tape_uuid: _Optional[bytes] = ..., ack_tape_uuid: _Optional[bytes] = ..., confirm_supersede: _Optional[str] = ..., expected_found: _Optional[_Iterable[str]] = ..., observed_tape_log_sequence: _Optional[int] = ...) -> None: ...
 
 class SupersedeTailResponse(_message.Message):
-    __slots__ = ("found", "required_confirmation", "completed", "tape_log_sequence")
+    __slots__ = ("found", "required_confirmation", "completed", "tape_log_sequence", "inspection")
     FOUND_FIELD_NUMBER: _ClassVar[int]
     REQUIRED_CONFIRMATION_FIELD_NUMBER: _ClassVar[int]
     COMPLETED_FIELD_NUMBER: _ClassVar[int]
     TAPE_LOG_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    INSPECTION_FIELD_NUMBER: _ClassVar[int]
     found: _containers.RepeatedScalarFieldContainer[str]
     required_confirmation: str
     completed: bool
     tape_log_sequence: int
-    def __init__(self, found: _Optional[_Iterable[str]] = ..., required_confirmation: _Optional[str] = ..., completed: _Optional[bool] = ..., tape_log_sequence: _Optional[int] = ...) -> None: ...
+    inspection: TornTailInspection
+    def __init__(self, found: _Optional[_Iterable[str]] = ..., required_confirmation: _Optional[str] = ..., completed: _Optional[bool] = ..., tape_log_sequence: _Optional[int] = ..., inspection: _Optional[_Union[TornTailInspection, _Mapping]] = ...) -> None: ...
+
+class TornTailInspection(_message.Message):
+    __slots__ = ("site", "cursor_partition", "cursor_lba", "file_start_lba", "failing_lba", "blocks_read", "read_sense", "accounted_bytes", "host_bytes", "head", "named_files")
+    SITE_FIELD_NUMBER: _ClassVar[int]
+    CURSOR_PARTITION_FIELD_NUMBER: _ClassVar[int]
+    CURSOR_LBA_FIELD_NUMBER: _ClassVar[int]
+    FILE_START_LBA_FIELD_NUMBER: _ClassVar[int]
+    FAILING_LBA_FIELD_NUMBER: _ClassVar[int]
+    BLOCKS_READ_FIELD_NUMBER: _ClassVar[int]
+    READ_SENSE_FIELD_NUMBER: _ClassVar[int]
+    ACCOUNTED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    HOST_BYTES_FIELD_NUMBER: _ClassVar[int]
+    HEAD_FIELD_NUMBER: _ClassVar[int]
+    NAMED_FILES_FIELD_NUMBER: _ClassVar[int]
+    site: str
+    cursor_partition: int
+    cursor_lba: int
+    file_start_lba: int
+    failing_lba: int
+    blocks_read: int
+    read_sense: str
+    accounted_bytes: int
+    host_bytes: int
+    head: str
+    named_files: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, site: _Optional[str] = ..., cursor_partition: _Optional[int] = ..., cursor_lba: _Optional[int] = ..., file_start_lba: _Optional[int] = ..., failing_lba: _Optional[int] = ..., blocks_read: _Optional[int] = ..., read_sense: _Optional[str] = ..., accounted_bytes: _Optional[int] = ..., host_bytes: _Optional[int] = ..., head: _Optional[str] = ..., named_files: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class CloseoutTapeRequest(_message.Message):
     __slots__ = ("tape_uuid", "expected_pool_id", "idempotency_key")
